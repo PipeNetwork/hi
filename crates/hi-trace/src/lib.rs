@@ -63,6 +63,23 @@ pub struct TraceIdentity {
     pub runtime_descriptor_hash: String,
 }
 
+/// Seam that anchors a finished trace to an external trust domain.
+///
+/// The trace itself is unsigned — its hash chain gives local tamper-evidence
+/// only (see `docs/architecture.md` "Trace trust boundary"). A managed
+/// deployment supplies a `TraceAttestor` that signs the trace's terminal
+/// `root_hash` with a key the candidate cannot read, turning the locally
+/// consistent chain into worker-anchored evidence. The result string is
+/// stored verbatim in the manifest; its format is the attestor's contract
+/// (e.g. a signature, or an explicit `local-unattested:` label for self-hosted
+/// runs so they can never be mistaken for worker-attested evidence).
+pub trait TraceAttestor: Send + Sync {
+    /// Produce an attestation binding `root_hash` (the trace's terminal event
+    /// hash) and `identity` (the worker-provided provenance) to an external
+    /// trust domain.
+    fn attest_trace(&self, root_hash: &str, identity: Option<&TraceIdentity>) -> Result<String>;
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TraceSummary {
     pub mode: TraceMode,
@@ -77,6 +94,10 @@ pub struct TraceSummary {
     pub artifact_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<TraceIdentity>,
+    /// External attestation over `root_hash`, when a [`TraceAttestor`] was
+    /// attached. Absent for local/unattested traces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,6 +115,11 @@ pub struct TraceManifest {
     pub artifact_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<TraceIdentity>,
+    /// External attestation over `root_hash`, when a [`TraceAttestor`] was
+    /// attached. `validate_trace` carries it through unchanged — verifying the
+    /// attestation is the consumer's job, not this crate's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -145,6 +171,9 @@ pub struct TraceWriter {
     fully_observed: bool,
     complete: bool,
     identity: Option<TraceIdentity>,
+    attestor: Option<std::sync::Arc<dyn TraceAttestor>>,
+    /// Set at finalize from the attestor; `None` until then / when unattested.
+    attestation: Option<String>,
 }
 
 impl TraceWriter {
@@ -221,9 +250,32 @@ impl TraceWriter {
             fully_observed: true,
             complete: false,
             identity,
+            attestor: None,
+            attestation: None,
         };
         writer.write_manifest(false)?;
         Ok(writer)
+    }
+
+    /// Attach a [`TraceAttestor`] that anchors the trace at finalize time.
+    ///
+    /// Local traces stay unattested by default; managed deployments attach a
+    /// worker-backed attestor here so the finished manifest carries an
+    /// externally verifiable attestation over the terminal `root_hash`.
+    pub fn with_attestor(mut self, attestor: std::sync::Arc<dyn TraceAttestor>) -> Self {
+        self.attestor = Some(attestor);
+        self
+    }
+
+    /// Compute the attestation for the current terminal `root_hash`, if an
+    /// attestor is attached. Returns `Ok(None)` when unattested.
+    fn compute_attestation(&self) -> Result<Option<String>> {
+        match &self.attestor {
+            Some(attestor) => attestor
+                .attest_trace(&self.root_hash, self.identity.as_ref())
+                .map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Create a fresh local trace beneath `$XDG_STATE_HOME/hi/rsi`.
@@ -370,6 +422,11 @@ impl TraceWriter {
     pub fn finalize(mut self) -> Result<TraceSummary> {
         self.complete = true;
         self.events.sync_all()?;
+        // Anchor the finished trace: the terminal root_hash is final now, so
+        // this is the point to attest. A managed attestor turns the locally
+        // consistent chain into worker-anchored evidence; a failing attestor
+        // fails finalization rather than emitting an unattested managed trace.
+        self.attestation = self.compute_attestation()?;
         self.write_manifest(true)?;
         sync_dir(&self.dir)?;
         Ok(self.summary())
@@ -387,6 +444,7 @@ impl TraceWriter {
             candidate_evidence: true,
             artifact_path: Some(self.dir.display().to_string()),
             identity: self.identity.clone(),
+            attestation: self.attestation.clone(),
         }
     }
 
@@ -403,6 +461,7 @@ impl TraceWriter {
             blobs: self.blobs.values().cloned().collect(),
             artifact_path: Some(self.dir.display().to_string()),
             identity: self.identity.clone(),
+            attestation: self.attestation.clone(),
         };
         atomic_private_write(
             &self.dir.join("manifest.json"),
@@ -1202,6 +1261,95 @@ mod tests {
         assert_eq!(
             validate_trace(&dir, 1024 * 1024, 20).unwrap().identity,
             Some(expected)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Deterministic test attestor: emits `<scheme>:<blake3(root_hash +
+    /// run_id)>`, so a test can verify the attestation binds the exact root
+    /// hash and run identity the worker supplied.
+    struct TestTraceAttestor;
+    impl TraceAttestor for TestTraceAttestor {
+        fn attest_trace(
+            &self,
+            root_hash: &str,
+            identity: Option<&TraceIdentity>,
+        ) -> Result<String> {
+            let run = identity.map(|i| i.run_id.as_str()).unwrap_or("anon");
+            let digest = blake3::hash(format!("{root_hash}:{run}").as_bytes()).to_hex();
+            Ok(format!("test-attested:{digest}"))
+        }
+    }
+
+    #[test]
+    fn unattested_trace_has_no_attestation() {
+        // Default: no attestor attached, so neither summary nor manifest carry
+        // an attestation. This is the local/self-hosted path.
+        let dir = temp();
+        let trace = TraceWriter::create(&dir, TraceMode::Local, 1024 * 1024).unwrap();
+        let summary = trace.finalize().unwrap();
+        assert_eq!(summary.attestation, None);
+        assert_eq!(
+            validate_trace(&dir, 1024 * 1024, 20).unwrap().attestation,
+            None
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn attested_trace_binds_root_hash_and_validates() {
+        // A managed trace with an attestor attached records the attestation at
+        // finalize over the terminal root_hash, and validate_trace carries it
+        // through unchanged (verifying it is the consumer's job, not this
+        // crate's).
+        let dir = temp();
+        let id = identity();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, id.clone())
+                .unwrap()
+                .with_attestor(std::sync::Arc::new(TestTraceAttestor));
+        trace
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        let summary = trace.finalize().unwrap();
+
+        // The attestation is present and binds the *final* root hash + run id.
+        let attestation = summary.attestation.clone().expect("attested");
+        let expected = format!(
+            "test-attested:{}",
+            blake3::hash(format!("{}:{}", summary.root_hash, id.run_id).as_bytes()).to_hex()
+        );
+        assert_eq!(attestation, expected, "attestation not bound to root hash");
+
+        // Round-trips through the manifest and validation.
+        let manifest = validate_trace(&dir, 1024 * 1024, 20).unwrap();
+        assert_eq!(manifest.attestation.as_deref(), Some(attestation.as_str()));
+        assert_eq!(manifest.root_hash, summary.root_hash);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn attestor_receives_terminal_root_hash_not_intermediate() {
+        // Regression: attestation must be over the *terminal* root hash (after
+        // all events), not the initial ZERO_HASH or a mid-run value. Two events
+        // make the terminal hash differ from both.
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity())
+                .unwrap()
+                .with_attestor(std::sync::Arc::new(TestTraceAttestor));
+        for n in 1..=2 {
+            trace
+                .record("step", "step", 1, None, None, serde_json::json!({"n": n}))
+                .unwrap();
+        }
+        let summary = trace.finalize().unwrap();
+        assert_ne!(summary.root_hash, ZERO_HASH);
+        let attestation = summary.attestation.expect("attested");
+        let bound = blake3::hash(format!("{}:run-1", summary.root_hash).as_bytes()).to_hex();
+        assert!(
+            attestation.contains(bound.as_str()),
+            "attestation does not bind the terminal root hash"
         );
         fs::remove_dir_all(dir).unwrap();
     }

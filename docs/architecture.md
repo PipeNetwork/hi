@@ -62,14 +62,17 @@ and foreign-journal splices *of the files on disk* — nothing more. There is
 the trace directory can rewrite the manifest and recompute the chain, and
 `validate_trace` will accept it, because there is no external value to break.
 
-External anchoring is the **worker's** job, through the
-`hi_verifier::Attestor` seam: `AttestingVerifier` hashes each report and calls
-`attestor.attest(hash)`, and a managed deployment supplies an `Attestor` that
-signs with a key the candidate cannot read, binding the evidence to the signed
-control-plane manifest the worker already verified. That worker/coordinator
-lives **outside this repo** — the only `Attestor` impls here are test stubs
-and `LocalAttestor`, which returns an explicit `local-unattested:` label so
-self-hosted output can never be mistaken for worker-attested evidence.
+External anchoring is the **worker's** job. This repo now exposes the seam in
+two places: `hi_verifier::Attestor` (report-level: `AttestingVerifier` hashes
+each report and calls `attestor.attest(hash)`) and `hi_trace::TraceAttestor`
+(trace-level: `TraceWriter::with_attestor` signs the terminal `root_hash` at
+finalize, recorded in the manifest's `attestation` field). A managed
+deployment supplies an implementation that signs with a key the candidate
+cannot read, binding the evidence to the signed control-plane manifest the
+worker already verified. The signing worker/coordinator itself lives **outside
+this repo** — the only in-repo impls are test stubs and `LocalAttestor`, which
+returns an explicit `local-unattested:` label so self-hosted output can never
+be mistaken for worker-attested evidence.
 
 Two rules follow:
 
