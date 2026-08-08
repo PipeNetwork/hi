@@ -929,6 +929,49 @@ mod tests {
     }
 
     #[test]
+    fn tampered_mid_chain_previous_hash_link_is_rejected() {
+        // Sibling negative case: rewriting a middle event's previous_hash
+        // pointer breaks the link itself, not the content hash. This is the
+        // reorder/splice attack — each event's content hash is still valid,
+        // so only the `previous_hash == previous` linkage check can catch it.
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        for n in 1..=3 {
+            trace
+                .record("step", "step", 1, None, None, serde_json::json!({"n": n}))
+                .unwrap();
+        }
+        trace.finalize().unwrap();
+
+        let path = dir.join("events.jsonl");
+        let on_disk = fs::read_to_string(&path).unwrap();
+        let mut events: Vec<Event> = on_disk
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        // Point event 3 at the genesis event instead of event 2, as if event 2
+        // were spliced out. Event 3's own content hash is untouched, so the
+        // link check is the only thing that can fail.
+        events[2].previous_hash = events[0].event_hash.clone();
+        let rewritten = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, format!("{rewritten}\n")).unwrap();
+
+        let error = validate_trace(&dir, 1024 * 1024, 20)
+            .expect_err("a tampered previous_hash link must fail validation");
+        assert!(
+            format!("{error:#}").contains("chain discontinuity"),
+            "expected a chain discontinuity error, got: {error:#}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn pruning_never_removes_an_active_trace() {
         let root = temp();
         create_private_dir(&root).unwrap();
