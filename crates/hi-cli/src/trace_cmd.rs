@@ -62,6 +62,29 @@ fn latest_trace_dir(root: &Path) -> Option<PathBuf> {
     trace_dirs(root).into_iter().next().map(|d| d.path)
 }
 
+/// Resolve a user-supplied trace id (full or an unambiguous prefix, as printed
+/// by `hi trace list`) to its directory under `root`.
+fn find_trace_dir(root: &Path, id: &str) -> Result<PathBuf> {
+    let matches: Vec<PathBuf> = trace_dirs(root)
+        .into_iter()
+        .filter_map(|d| {
+            d.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| name.starts_with(id))
+                .map(|_| d.path.clone())
+        })
+        .collect();
+    match matches.len() {
+        0 => bail!("no trace matching '{id}' under {}", root.display()),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => bail!(
+            "trace id prefix '{id}' is ambiguous ({} matches); use more characters",
+            matches.len()
+        ),
+    }
+}
+
 /// Load and parse a trace directory's manifest.
 fn load_manifest(dir: &Path) -> Result<TraceManifest> {
     let manifest_path = dir.join("manifest.json");
@@ -134,8 +157,10 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str).unwrap_or("show") {
         "show" => {
             let root = trace_root();
-            let Some(dir) = latest_trace_dir(&root) else {
-                bail!("no traces found under {}", root.display());
+            let dir = match args.get(1).map(String::as_str) {
+                Some(id) => find_trace_dir(&root, id)?,
+                None => latest_trace_dir(&root)
+                    .ok_or_else(|| anyhow::anyhow!("no traces found under {}", root.display()))?,
             };
             for line in render(&dir)? {
                 println!("{line}");
@@ -153,7 +178,9 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        other => bail!("usage: hi trace show | hi trace list [n]  (unknown subcommand '{other}')"),
+        other => bail!(
+            "usage: hi trace show [id] | hi trace list [n]  (unknown subcommand '{other}')"
+        ),
     }
 }
 
@@ -263,5 +290,36 @@ mod tests {
         let root = std::env::temp_dir().join(format!("hi-trace-list-empty-{}", std::process::id()));
         let result = render_list(&root, 20);
         assert!(result.is_err(), "expected an error for an empty trace root");
+    }
+
+    #[test]
+    fn find_trace_dir_resolves_exact_and_prefix() {
+        let root = std::env::temp_dir().join(format!("hi-trace-find-{}", std::process::id()));
+        let dir = root.join("a".repeat(32));
+        write_manifest(&dir, None);
+        // Exact id.
+        assert_eq!(find_trace_dir(&root, &"a".repeat(32)).unwrap(), dir);
+        // Unambiguous prefix.
+        assert_eq!(find_trace_dir(&root, &"a".repeat(8)).unwrap(), dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_trace_dir_rejects_unknown_and_ambiguous() {
+        let root = std::env::temp_dir().join(format!("hi-trace-find-err-{}", std::process::id()));
+        // Two traces sharing a prefix: 111… and 11f… — prefix "11" is ambiguous.
+        write_manifest(&root.join("1".repeat(32)), None);
+        write_manifest(&root.join(format!("11{}", "f".repeat(30))), None);
+        // Unknown id.
+        assert!(find_trace_dir(&root, &"9".repeat(32)).is_err());
+        // Ambiguous prefix.
+        let err = find_trace_dir(&root, "11").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ambiguous"),
+            "expected ambiguity error, got: {err:#}"
+        );
+        // Longer prefix disambiguates.
+        assert!(find_trace_dir(&root, "11f").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
