@@ -1,12 +1,14 @@
 //! `hi trace` — human-readable views of recorded run traces.
 //!
-//! `hi trace show` reads the most recent local trace's manifest and prints its
-//! root hash and attestation label; `hi trace list` shows recent runs with
-//! their labels and completeness. A self-hosted run visibly reports
-//! `local-unattested:…` (and a managed run its worker attestation) without
-//! digging through JSON. This surfaces the trust boundary documented in
-//! `docs/architecture.md`: the label is what distinguishes worker-anchored
-//! evidence from a locally consistent, unattested chain.
+//! `hi trace show` reads a trace's manifest and prints its root hash,
+//! attestation label, and inline integrity (tamper) status; `hi trace list`
+//! shows recent runs with their labels and completeness; `hi trace verify`
+//! runs the integrity check alone and fails on a broken chain. A self-hosted
+//! run visibly reports `local-unattested:…` (and a managed run its worker
+//! attestation) without digging through JSON. This surfaces the trust boundary
+//! documented in `docs/architecture.md`: the label is what distinguishes
+//! worker-anchored evidence from a locally consistent, unattested chain, and
+//! integrity is local consistency, not authenticity.
 
 use std::path::{Path, PathBuf};
 
@@ -106,6 +108,16 @@ fn attestation_label(manifest: &TraceManifest) -> &str {
         .unwrap_or("unattested")
 }
 
+/// Run the integrity check and return a human-readable status line. Never
+/// fails — a broken chain is reported as a status, not an error, so `show`
+/// can surface tamper evidence inline.
+fn integrity_status(dir: &Path) -> String {
+    match hi_trace::validate_trace(dir, hi_trace::DEFAULT_RUN_MAX_BYTES, 1_000_000) {
+        Ok(_) => "ok (hash chain + blobs match manifest)".to_string(),
+        Err(e) => format!("TAMPERED ({e:#})"),
+    }
+}
+
 /// Render the human-readable summary lines for a trace directory.
 fn render(dir: &Path) -> Result<Vec<String>> {
     let manifest = load_manifest(dir)?;
@@ -118,6 +130,7 @@ fn render(dir: &Path) -> Result<Vec<String>> {
         format!("trace:       {}", manifest.trace_id),
         format!("mode:        {mode}"),
         format!("complete:    {}", manifest.complete),
+        format!("integrity:   {}", integrity_status(dir)),
         format!("events:      {}", manifest.event_count),
         format!("root_hash:   {}", manifest.root_hash),
         format!("attestation: {attestation}"),
@@ -390,19 +403,7 @@ mod tests {
             std::env::temp_dir().join(format!("hi-trace-verify-bad-{}", std::process::id()));
         let dir = root.join("e".repeat(32));
         write_real_trace(&dir);
-        // Corrupt one event's hash in the journal so the recomputed chain
-        // diverges from the manifest root.
-        let journal = dir.join("events.jsonl");
-        let mut lines: Vec<String> = std::fs::read_to_string(&journal)
-            .unwrap()
-            .lines()
-            .map(str::to_string)
-            .collect();
-        let mut event: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-        let bad = "0".repeat(64);
-        event["event_hash"] = serde_json::json!(bad);
-        lines[0] = serde_json::to_string(&event).unwrap();
-        std::fs::write(&journal, lines.join("\n") + "\n").unwrap();
+        tamper_first_event(&dir);
 
         let result = verify(&dir);
         assert!(result.is_err(), "tampered chain must fail validation");
@@ -410,6 +411,50 @@ mod tests {
         assert!(
             format!("{err:#}").contains("integrity"),
             "expected an integrity error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Corrupt one event's hash in the journal so the recomputed chain diverges
+    /// from the manifest root.
+    fn tamper_first_event(dir: &Path) {
+        let journal = dir.join("events.jsonl");
+        let mut lines: Vec<String> = std::fs::read_to_string(&journal)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let mut event: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        event["event_hash"] = serde_json::json!("0".repeat(64));
+        lines[0] = serde_json::to_string(&event).unwrap();
+        std::fs::write(&journal, lines.join("\n") + "\n").unwrap();
+    }
+
+    #[test]
+    fn show_surfaces_integrity_ok_inline() {
+        let root = std::env::temp_dir().join(format!("hi-trace-show-ok-{}", std::process::id()));
+        let dir = root.join("f".repeat(32));
+        write_real_trace(&dir);
+        let out = render(&dir).unwrap().join("\n");
+        assert!(
+            out.contains("integrity:   ok"),
+            "show must surface ok integrity inline: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn show_surfaces_tamper_status_without_failing() {
+        let root = std::env::temp_dir().join(format!("hi-trace-show-bad-{}", std::process::id()));
+        let dir = root.join("0".repeat(32));
+        write_real_trace(&dir);
+        tamper_first_event(&dir);
+        // Unlike `verify`, `show` must not fail on a broken chain — it reports
+        // the tamper status inline so the user sees it without a separate call.
+        let out = render(&dir).expect("show must not fail on tampered trace").join("\n");
+        assert!(
+            out.contains("integrity:   TAMPERED"),
+            "show must surface tamper status inline: {out}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
