@@ -128,10 +128,16 @@ pub(crate) fn start_rsi_trace(
                         .map(|home| home.join(".local/state"))
                 })
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
+            // Self-hosted runs record an explicit `local-unattested:` label so
+            // their traces can never be mistaken for worker-attested RSI
+            // evidence. Managed runs leave attestation to the external worker.
             TraceWriter::create_local(
                 &state_home,
                 cli.rsi_max_bytes.unwrap_or(hi_trace::DEFAULT_RUN_MAX_BYTES),
             )
+            .map(|trace| {
+                trace.with_attestor(std::sync::Arc::new(hi_trace::LocalAttestor))
+            })
         }
         RsiRequested::Managed => {
             let runtime = runtime.ok_or_else(|| anyhow!("managed RSI runtime is unavailable"))?;
