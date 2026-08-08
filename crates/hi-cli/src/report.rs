@@ -296,6 +296,9 @@ pub(crate) fn rsi_report_block(summary: Option<&TraceSummary>) -> serde_json::Va
                 "complete": false,
                 "fully_observed": false,
                 "candidate_evidence": true,
+                // Keep the key present (null) so consumers can rely on the
+                // field regardless of whether a trace was recorded.
+                "attestation": null,
             })
         },
         |summary| serde_json::to_value(summary).expect("RSI summary serializes"),
@@ -668,4 +671,47 @@ pub(crate) fn report_tool_records(entries: &[hi_agent::ToolCallEntry]) -> Vec<se
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A finished local trace carries the LocalAttestor label; the report
+    /// block must surface it so a self-hosted run visibly reports
+    /// `local-unattested` instead of looking worker-attested or vanishing.
+    #[test]
+    fn rsi_report_block_surfaces_local_unattested_label() {
+        let summary = TraceSummary {
+            mode: TraceMode::Local,
+            trace_schema: hi_trace::TRACE_SCHEMA_VERSION,
+            trace_id: "a".repeat(32),
+            event_count: 1,
+            root_hash: "b".repeat(64),
+            complete: true,
+            fully_observed: true,
+            candidate_evidence: true,
+            artifact_path: None,
+            identity: None,
+            attestation: Some(format!("local-unattested:{}", "b".repeat(64))),
+        };
+        let block = rsi_report_block(Some(&summary));
+        assert_eq!(
+            block["attestation"].as_str().unwrap(),
+            format!("local-unattested:{}", "b".repeat(64)),
+            "report block dropped the attestation label: {block}"
+        );
+    }
+
+    /// The no-trace ("off") branch keeps the `attestation` key present (null)
+    /// so the report schema is stable whether or not a trace was recorded.
+    #[test]
+    fn rsi_report_block_off_keeps_attestation_key() {
+        let block = rsi_report_block(None);
+        assert!(
+            block.get("attestation").is_some(),
+            "off branch must keep the attestation key: {block}"
+        );
+        assert!(block["attestation"].is_null());
+    }
 }
