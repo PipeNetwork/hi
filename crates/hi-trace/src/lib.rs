@@ -804,6 +804,54 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn credential_keyed_payload_is_redacted_in_persisted_events() {
+        // End-to-end: record an event whose data carries a credential-named
+        // key with a bare (prefix-less, shape-less) high-entropy value — the
+        // case only the key-context JSON walk catches — and assert the raw
+        // bytes on disk never contain the secret. Joined at runtime so the
+        // fixture never appears contiguously in source.
+        let secret = ["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="].concat();
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        trace
+            .record(
+                "tool_result",
+                "tools",
+                1,
+                None,
+                None,
+                serde_json::json!({
+                    "command": "printenv",
+                    "output": { "token": secret, "page": 2 },
+                    "note": secret,
+                }),
+            )
+            .unwrap();
+        trace.finalize().unwrap();
+
+        let on_disk = fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        let persisted: Value = serde_json::from_str(on_disk.trim()).unwrap();
+        assert_eq!(
+            persisted["data"]["output"]["token"], "[REDACTED_SECRET]",
+            "credential-keyed value was not redacted: {on_disk}"
+        );
+        assert_eq!(persisted["data"]["output"]["page"], 2);
+        assert_eq!(
+            persisted["data"]["note"], secret,
+            "non-credential key must survive"
+        );
+        // The raw file bytes are the real contract: the secret appears exactly
+        // once (the benign `note` field), never under the credential key.
+        assert_eq!(
+            on_disk.matches(&secret).count(),
+            1,
+            "secret persisted beyond the benign field: {on_disk}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn identity() -> TraceIdentity {
         TraceIdentity {
             run_id: "run-1".into(),
