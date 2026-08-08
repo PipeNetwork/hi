@@ -50,6 +50,13 @@ the explicit upload and retention notice. Human and pull-request outcomes are
 associated by the public run ID and remain supporting evidence rather than
 promotion authority.
 
+The managed trace itself is **local tamper-evidence, not anchored identity**:
+its hash chain and `trace_id` binding detect on-disk corruption and splices,
+but carry no signature, so `validate_trace` proves internal consistency rather
+than authenticity. The bootstrap's independent provenance check (above) is the
+anchor that makes the evidence trustworthy. See
+[Architecture § Trace trust boundary](../architecture.md#trace-trust-boundary-local-tamper-evidence-not-anchored-identity).
+
 ## Consequences
 
 The candidate can vary without recompiling or granting credentials to the
