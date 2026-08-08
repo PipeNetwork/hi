@@ -972,6 +972,54 @@ mod tests {
     }
 
     #[test]
+    fn foreign_trace_journal_is_rejected() {
+        // Identity-swap attack: drop another trace's events.jsonl into this
+        // trace's directory. Each event's hashes are internally consistent,
+        // but the events carry the *foreign* trace_id, so the per-event
+        // `trace_id == manifest.trace_id` binding must reject the splice. This
+        // is what stops one managed run's journal being passed off as
+        // another's evidence.
+        let dir_a = temp();
+        let mut trace_a =
+            TraceWriter::create_bound(&dir_a, TraceMode::Managed, 1024 * 1024, identity())
+                .unwrap();
+        trace_a
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        trace_a.finalize().unwrap();
+
+        let dir_b = temp();
+        let mut trace_b =
+            TraceWriter::create_bound(&dir_b, TraceMode::Managed, 1024 * 1024, identity())
+                .unwrap();
+        trace_b
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        trace_b.finalize().unwrap();
+
+        // Sanity: both traces validate on their own.
+        validate_trace(&dir_a, 1024 * 1024, 20).unwrap();
+        validate_trace(&dir_b, 1024 * 1024, 20).unwrap();
+        assert_ne!(
+            dir_a.file_name().unwrap(),
+            dir_b.file_name().unwrap(),
+            "test needs two distinct trace ids"
+        );
+
+        // Splice B's journal over A's. A's manifest still names trace A, so
+        // the foreign B events must fail the identity binding.
+        fs::copy(dir_b.join("events.jsonl"), dir_a.join("events.jsonl")).unwrap();
+        let error = validate_trace(&dir_a, 1024 * 1024, 20)
+            .expect_err("a foreign trace journal must fail validation");
+        assert!(
+            format!("{error:#}").contains("identity mismatch"),
+            "expected an identity mismatch error, got: {error:#}"
+        );
+        fs::remove_dir_all(dir_a).unwrap();
+        fs::remove_dir_all(dir_b).unwrap();
+    }
+
+    #[test]
     fn pruning_never_removes_an_active_trace() {
         let root = temp();
         create_private_dir(&root).unwrap();
