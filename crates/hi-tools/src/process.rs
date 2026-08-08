@@ -975,6 +975,37 @@ mod tests {
         assert!(run.model_content().contains("[REDACTED_SECRET]"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn entropy_gated_secret_split_across_stream_chunks_is_redacted() {
+        // The entropy gate needs the credential key name AND the value in one
+        // redaction window. When a long secret straddles the 64 KiB
+        // pseudo-line boundary, the streaming per-chunk redact sees only a
+        // fragment, which the value-length floor rejects. The final
+        // re-redaction over the reassembled buffer must still catch the whole
+        // assignment. The key sits at a line boundary, matching real logs.
+        let runner = ProcessRunner::from_current_dir().unwrap();
+        // 65490-char line + newline, then `token=` (6) + a 60-char value pushes
+        // the value across the 65536 flush boundary mid-token.
+        let value = "dGhpc2lzYXJhbmRvbWJhc2U2NHNlY3JldGRHaHBjMmx6WVhKaGJtUnZiVQ==";
+        let cmd = format!("printf '%*s\\n' 65490 ''; printf 'token={value}'");
+        let run = runner
+            .run_shell(&cmd, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let content = run.model_content();
+        assert!(
+            !content.contains(value),
+            "entropy-gated secret leaked across chunk split: ...{}",
+            &content[content.len().saturating_sub(90)..]
+        );
+        assert!(
+            content.contains("[REDACTED_SECRET]"),
+            "expected redaction marker in reassembled output: ...{}",
+            &content[content.len().saturating_sub(90)..]
+        );
+    }
+
     #[test]
     fn sensitive_environment_names_are_removed_conservatively() {
         assert!(sensitive_environment_name(OsStr::new("GITHUB_TOKEN")));

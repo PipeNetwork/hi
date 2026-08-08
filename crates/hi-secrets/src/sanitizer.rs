@@ -59,7 +59,7 @@ static SECRET_ASSIGNMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
           | client[_-]secret
           | password
         )\b
-        (\s*[:=]\s*)
+        (\s*["']?\s*[:=]\s*)
         (?:
             "(?<dq>[^"\s][^"]{4,})"
           | '(?<sq>[^'\s][^']{4,})'
@@ -87,6 +87,9 @@ fn redact_assignments(text: &str) -> String {
                 } else {
                     ""
                 };
+                // Group 2 (the separator) absorbs the key's optional closing
+                // quote and any quote/space before the `:`/`=`, so re-emitting
+                // it keeps `"token":"…"` well-formed while the value redacts.
                 format!("{}{}{quote}{REDACTED}{quote}", &caps[1], &caps[2])
             } else {
                 caps[0].to_string()
@@ -553,6 +556,21 @@ mod tests {
             "base64 secret not redacted: {out}"
         );
         assert!(!out.contains(&secret), "secret survived: {out}");
+    }
+
+    #[test]
+    fn redacts_json_quoted_credential_keys() {
+        // JSON form: the key's closing quote sits between the key name and the
+        // `:`. The separator absorbs it so the value redacts and the document
+        // stays valid JSON.
+        let secret = fixture(&["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="]);
+        let input = format!(r#"{{"token":"{secret}","page":2}}"#);
+        let out = redact_secrets(&input);
+        assert!(!out.contains(&secret), "json secret leaked: {out}");
+        assert!(out.contains(REDACTED), "no redaction in json: {out}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("redacted json must stay valid");
+        assert_eq!(parsed["page"], 2, "benign field altered: {out}");
     }
 
     #[test]
