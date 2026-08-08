@@ -125,6 +125,26 @@ fn render(dir: &Path) -> Result<Vec<String>> {
     ])
 }
 
+/// Verify a trace's integrity: recompute the event hash chain and blob hashes
+/// from the on-disk files and check them against the manifest. This is the
+/// local tamper-evidence check — it proves the trace is internally consistent
+/// (uncorrupted, unspliced), not that it is authentic; authenticity requires
+/// the external worker's attestation (see `docs/architecture.md`).
+fn verify(dir: &Path) -> Result<Vec<String>> {
+    let manifest = hi_trace::validate_trace(dir, hi_trace::DEFAULT_RUN_MAX_BYTES, 1_000_000)
+        .context("trace failed integrity validation")?;
+    let attestation = manifest.attestation.as_deref().unwrap_or("none (unattested)");
+    Ok(vec![
+        format!("trace:       {}", manifest.trace_id),
+        format!("integrity:   ok (hash chain + blobs match manifest)"),
+        format!("events:      {}", manifest.event_count),
+        format!("root_hash:   {}", manifest.root_hash),
+        format!("attestation: {attestation}"),
+        "note:        integrity is local consistency; authenticity needs worker attestation"
+            .to_string(),
+    ])
+}
+
 /// Render the recent-runs table for `hi trace list`, newest first.
 fn render_list(root: &Path, limit: usize) -> Result<Vec<String>> {
     let dirs = trace_dirs(root);
@@ -167,6 +187,18 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        "verify" => {
+            let root = trace_root();
+            let dir = match args.get(1).map(String::as_str) {
+                Some(id) => find_trace_dir(&root, id)?,
+                None => latest_trace_dir(&root)
+                    .ok_or_else(|| anyhow::anyhow!("no traces found under {}", root.display()))?,
+            };
+            for line in verify(&dir)? {
+                println!("{line}");
+            }
+            Ok(())
+        }
         "list" => {
             let limit = args
                 .get(1)
@@ -179,7 +211,7 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
             Ok(())
         }
         other => bail!(
-            "usage: hi trace show [id] | hi trace list [n]  (unknown subcommand '{other}')"
+            "usage: hi trace show [id] | hi trace list [n] | hi trace verify [id]  (unknown subcommand '{other}')"
         ),
     }
 }
@@ -320,6 +352,65 @@ mod tests {
         );
         // Longer prefix disambiguates.
         assert!(find_trace_dir(&root, "11f").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Build a genuine trace (valid hash chain) at `dir` so validate_trace has
+    /// real content to recompute. Returns the TraceWriter's root hash.
+    fn write_real_trace(dir: &Path) -> String {
+        let mut writer = hi_trace::TraceWriter::create(dir, hi_trace::TraceMode::Local, 1 << 20)
+            .unwrap();
+        writer
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        let summary = writer.finalize().unwrap();
+        summary.root_hash
+    }
+
+    #[test]
+    fn verify_valid_trace_reports_ok() {
+        let root = std::env::temp_dir().join(format!("hi-trace-verify-ok-{}", std::process::id()));
+        let dir = root.join("d".repeat(32));
+        let root_hash = write_real_trace(&dir);
+        let out = verify(&dir).unwrap().join("\n");
+        assert!(
+            out.contains("integrity:   ok"),
+            "expected ok integrity: {out}"
+        );
+        assert!(
+            out.contains(&format!("root_hash:   {root_hash}")),
+            "root hash mismatch: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_detects_tampered_event_hash() {
+        let root =
+            std::env::temp_dir().join(format!("hi-trace-verify-bad-{}", std::process::id()));
+        let dir = root.join("e".repeat(32));
+        write_real_trace(&dir);
+        // Corrupt one event's hash in the journal so the recomputed chain
+        // diverges from the manifest root.
+        let journal = dir.join("events.jsonl");
+        let mut lines: Vec<String> = std::fs::read_to_string(&journal)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let mut event: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let bad = "0".repeat(64);
+        event["event_hash"] = serde_json::json!(bad);
+        lines[0] = serde_json::to_string(&event).unwrap();
+        std::fs::write(&journal, lines.join("\n") + "\n").unwrap();
+
+        let result = verify(&dir);
+        assert!(result.is_err(), "tampered chain must fail validation");
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("integrity"),
+            "expected an integrity error: {err:#}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
