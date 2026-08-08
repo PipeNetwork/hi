@@ -1059,11 +1059,18 @@ mod tests {
     #[test]
     fn foreign_trace_journal_is_rejected() {
         // Identity-swap attack: drop another trace's events.jsonl into this
-        // trace's directory. Each event's hashes are internally consistent,
-        // but the events carry the *foreign* trace_id, so the per-event
-        // `trace_id == manifest.trace_id` binding must reject the splice. This
-        // is what stops one managed run's journal being passed off as
-        // another's evidence.
+        // trace's directory. The foreign events carry a different trace_id, so
+        // the per-event `trace_id == manifest.trace_id` binding must reject the
+        // splice. This is what stops one managed run's journal being passed off
+        // as another's evidence.
+        //
+        // To exercise the identity binding specifically (not the earlier
+        // byte-count gate), the foreign journal must be byte-identical in
+        // length to A's. Two same-shape events differ only in timestamps, whose
+        // digit counts can vary, so instead of copying B's file we rewrite A's
+        // own journal: flip the trace_id in place. That keeps total_bytes
+        // exactly equal (ids are fixed-width hex), forcing the identity check
+        // to be the failing gate.
         let dir_a = temp();
         let mut trace_a =
             TraceWriter::create_bound(&dir_a, TraceMode::Managed, 1024 * 1024, identity())
@@ -1072,36 +1079,36 @@ mod tests {
             .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
             .unwrap();
         trace_a.finalize().unwrap();
-
-        let dir_b = temp();
-        let mut trace_b =
-            TraceWriter::create_bound(&dir_b, TraceMode::Managed, 1024 * 1024, identity())
-                .unwrap();
-        trace_b
-            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
-            .unwrap();
-        trace_b.finalize().unwrap();
-
-        // Sanity: both traces validate on their own.
         validate_trace(&dir_a, 1024 * 1024, 20).unwrap();
-        validate_trace(&dir_b, 1024 * 1024, 20).unwrap();
-        assert_ne!(
-            dir_a.file_name().unwrap(),
-            dir_b.file_name().unwrap(),
-            "test needs two distinct trace ids"
-        );
 
-        // Splice B's journal over A's. A's manifest still names trace A, so
-        // the foreign B events must fail the identity binding.
-        fs::copy(dir_b.join("events.jsonl"), dir_a.join("events.jsonl")).unwrap();
+        // Rewrite the journal's trace_id to a foreign (but same-length) id and
+        // recompute nothing else — the manifest still names trace A, so the
+        // identity binding must reject it. Swapping the id breaks each event's
+        // hash too, but the identity check runs before the hash check, so it is
+        // the gate that fires.
+        let journal_path = dir_a.join("events.jsonl");
+        let first_line = fs::read_to_string(&journal_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let first_event: Event = serde_json::from_str(&first_line).unwrap();
+        let original_trace_id = first_event.trace_id.clone();
+        let foreign_id = "f".repeat(32);
+        assert_ne!(original_trace_id, foreign_id);
+        let rewritten = fs::read_to_string(&journal_path)
+            .unwrap()
+            .replace(&original_trace_id, &foreign_id);
+        fs::write(&journal_path, rewritten).unwrap();
+
         let error = validate_trace(&dir_a, 1024 * 1024, 20)
-            .expect_err("a foreign trace journal must fail validation");
+            .expect_err("a foreign trace_id must fail validation");
         assert!(
             format!("{error:#}").contains("identity mismatch"),
             "expected an identity mismatch error, got: {error:#}"
         );
         fs::remove_dir_all(dir_a).unwrap();
-        fs::remove_dir_all(dir_b).unwrap();
     }
 
     #[test]
