@@ -898,6 +898,17 @@ mod tests {
             1,
             "secret persisted beyond the benign field: {on_disk}"
         );
+        // Redaction must run before the event hash is computed (record()
+        // hashes the redacted `data`). If it hashed the pre-redaction payload
+        // the chain would still validate but the hash would be of the secret;
+        // validate_trace recomputes from the persisted (redacted) bytes, so a
+        // passing validation proves the hash matches the redacted content.
+        let manifest = validate_trace(&dir, 1024 * 1024, 20).unwrap();
+        assert_eq!(
+            manifest.root_hash,
+            persisted["event_hash"].as_str().unwrap(),
+            "persisted event hash does not match redacted content"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
