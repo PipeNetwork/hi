@@ -53,6 +53,33 @@ hi-rsi-runtime          shared budget, identity, report types
 and trace observation only. It does **not** drive `WorkflowExecutor` or
 `AttestingVerifier` on the interactive path.
 
+### Trace trust boundary: local tamper-evidence, not anchored identity
+
+`hi-trace` gives **local tamper-evidence only**. The event hash chain and the
+per-event `trace_id == manifest.trace_id` binding detect corruption, reorder,
+and foreign-journal splices *of the files on disk* — nothing more. There is
+**no signature over the trace** anywhere in this repo: an actor who can write
+the trace directory can rewrite the manifest and recompute the chain, and
+`validate_trace` will accept it, because there is no external value to break.
+
+External anchoring is the **worker's** job, through the
+`hi_verifier::Attestor` seam: `AttestingVerifier` hashes each report and calls
+`attestor.attest(hash)`, and a managed deployment supplies an `Attestor` that
+signs with a key the candidate cannot read, binding the evidence to the signed
+control-plane manifest the worker already verified. That worker/coordinator
+lives **outside this repo** — the only `Attestor` impls here are test stubs
+and `LocalAttestor`, which returns an explicit `local-unattested:` label so
+self-hosted output can never be mistaken for worker-attested evidence.
+
+Two rules follow:
+
+- Treat a passing `validate_trace` as "this local trace is internally
+  consistent," never as "this trace is authentic." Authenticity requires the
+  worker to have recorded the trace root out-of-band or signed it via a
+  production `Attestor`.
+- Any code that consumes a managed trace for a trust decision must require a
+  worker-anchored attestation, not just a valid chain.
+
 ## Naming rule
 
 Prefer the disambiguated names in new code and docs:
