@@ -105,9 +105,13 @@ pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if action == Some("verify") {
-        let Some(path) = plan_path else {
-            print_usage();
-            bail!("usage: hi workflow verify <report.json>");
+        // With an explicit path, verify that file. Without one, resolve the
+        // most recently written report under the state root (the path
+        // `run`/`resume` persists to), mirroring `hi trace verify`.
+        let path = match plan_path {
+            Some(path) => path,
+            None => latest_workflow_report()
+                .ok_or_else(|| anyhow!("no workflow report found under the state root; run `hi workflow run` first, or pass a report path"))?,
         };
         return verify_report_cli(&path);
     }
@@ -133,7 +137,7 @@ fn print_usage() {
         "hi workflow — run a plan of objectives through the local workflow engine\n\n\
          USAGE:\n  hi workflow run <plan.md> [--verify CMD] [--parallel N] [--retries N] [--bestof N] [--check-off] [--dry-run]\n  \
          hi workflow resume <plan.md>\n  \
-         hi workflow verify <report.json>\n\n\
+         hi workflow verify [report.json]\n\n\
          Objectives are unchecked markdown checkboxes (`- [ ] …`), else numbered\n\
          items, else bullets. Each objective runs as an isolated delegate child\n\
          that must pass verification before its diff is applied. A final trusted\n\
@@ -147,7 +151,8 @@ fn print_usage() {
          not managed RSI evidence. Checkpoints live under the state root keyed\n\
          by plan content; `resume` continues the latest sealed checkpoint.\n\
          `verify` checks a report's local-signed attestation against the local\n\
-         ed25519 key, failing on a forged or tampered signature."
+         ed25519 key (latest persisted report, or an explicit report.json path),\n\
+         failing on a forged or tampered signature."
     );
 }
 
@@ -387,6 +392,36 @@ impl Attestor for LocalAttestor {
 /// mechanism, unlike a trace's hash chain.
 fn verify_report(path: &Path) -> Result<Vec<String>> {
     verify_report_with_key(path, &hi_trace::local_signing_key_path())
+}
+
+/// The most recently written persisted workflow report
+/// (`<state_root>/workflow/*/report.json`), newest first. This is the path
+/// `run`/`resume` persists the final signed report to.
+fn latest_workflow_report() -> Option<PathBuf> {
+    let (_workspace, state_root) = crate::review_target::resolve_runtime_roots().ok()?;
+    latest_workflow_report_under(&state_root)
+}
+
+/// Key-path-injectable core of [`latest_workflow_report`]: scan a state root
+/// for the newest `workflow/*/report.json`.
+fn latest_workflow_report_under(state_root: &Path) -> Option<PathBuf> {
+    let workflow_root = state_root.join("workflow");
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(workflow_root).ok()? {
+        let entry = entry.ok()?;
+        let report = entry.path().join("report.json");
+        if !report.exists() {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+            best = Some((modified, report));
+        }
+    }
+    best.map(|(_, path)| path)
 }
 
 /// Key-path-injectable core of [`verify_report`] so tests can point at a temp
@@ -1010,6 +1045,25 @@ async fn run(
         "workflow attempt completed",
     )?;
 
+    // Persist the final signed verification report to a known location so
+    // `hi workflow verify` can resolve it without an explicit path. The last
+    // trusted-gate report is the authoritative one; writing it under the
+    // workflow state dir keeps it beside the checkpoints it summarizes.
+    if let Some(report) = state.verification.last() {
+        let report_path = workflow_state.join("report.json");
+        match serde_json::to_vec_pretty(report) {
+            Ok(bytes) => {
+                if let Err(error) = std::fs::write(&report_path, bytes) {
+                    eprintln!(
+                        "could not persist verification report to {}: {error:#}",
+                        report_path.display()
+                    );
+                }
+            }
+            Err(error) => eprintln!("could not serialize verification report: {error:#}"),
+        }
+    }
+
     let failed: Vec<&str> = state
         .failure_evidence
         .iter()
@@ -1286,6 +1340,39 @@ mod tests {
             out.contains("unverifiable"),
             "expected unverifiable note: {out}"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn latest_workflow_report_resolves_newest_persisted_report() {
+        // Two persisted reports under state_root/workflow/<plan>/report.json;
+        // the resolver must return the most recently written one.
+        let base = std::env::temp_dir().join(format!("hi-wf-latest-{}", std::process::id()));
+        let key_path = base.join("hi").join(hi_trace::LOCAL_SIGNING_KEY_FILE);
+        let state_root = base.join("state");
+        let older = state_root.join("workflow").join("plan-aaa");
+        let newer = state_root.join("workflow").join("plan-bbb");
+        write_signed_report(&older, &key_path, true);
+        // Ensure a measurable mtime gap so ordering is deterministic.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let newer_report = write_signed_report(&newer, &key_path, false);
+
+        let resolved = latest_workflow_report_under(&state_root).unwrap();
+        assert_eq!(
+            resolved,
+            newer_report,
+            "resolver must pick the newest report, got {}",
+            resolved.display()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn latest_workflow_report_none_when_no_reports() {
+        let base = std::env::temp_dir().join(format!("hi-wf-latest-none-{}", std::process::id()));
+        let state_root = base.join("state");
+        std::fs::create_dir_all(state_root.join("workflow")).unwrap();
+        assert!(latest_workflow_report_under(&state_root).is_none());
         let _ = std::fs::remove_dir_all(&base);
     }
 
