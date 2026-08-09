@@ -25,8 +25,8 @@ use hi_events::{
 };
 use hi_rsi_runtime::{
     ArtifactRef, FailureDomain, FailureEvidence, RunState, RuntimeBudgets, SharedBudgetLedger,
-    StageDefinition, StageId, StageKind, TransitionCondition, TransitionRule, WorkflowGraph,
-    WorkflowLimits,
+    StageDefinition, StageId, StageKind, TransitionCondition, TransitionRule, VerificationReport,
+    WorkflowGraph, WorkflowLimits,
 };
 use hi_verifier::{AttestingVerifier, Attestor, CheckSpec};
 
@@ -55,6 +55,7 @@ pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
                 action = Some("run");
                 resume = true;
             }
+            "verify" if action.is_none() => action = Some("verify"),
             "--verify" => {
                 verify_override = Some(
                     iter.next()
@@ -103,6 +104,13 @@ pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
         print_usage();
         return Ok(());
     }
+    if action == Some("verify") {
+        let Some(path) = plan_path else {
+            print_usage();
+            bail!("usage: hi workflow verify <report.json>");
+        };
+        return verify_report_cli(&path);
+    }
     if action.is_none() || plan_path.is_none() {
         print_usage();
         bail!("usage: hi workflow run <plan.md>");
@@ -124,7 +132,8 @@ fn print_usage() {
     println!(
         "hi workflow — run a plan of objectives through the local workflow engine\n\n\
          USAGE:\n  hi workflow run <plan.md> [--verify CMD] [--parallel N] [--retries N] [--bestof N] [--check-off] [--dry-run]\n  \
-         hi workflow resume <plan.md>\n\n\
+         hi workflow resume <plan.md>\n  \
+         hi workflow verify <report.json>\n\n\
          Objectives are unchecked markdown checkboxes (`- [ ] …`), else numbered\n\
          items, else bullets. Each objective runs as an isolated delegate child\n\
          that must pass verification before its diff is applied. A final trusted\n\
@@ -136,7 +145,9 @@ fn print_usage() {
          run, so a rerun only retries what failed.\n\
          Reports are signed `local-signed:` — this is the self-hosted mode,\n\
          not managed RSI evidence. Checkpoints live under the state root keyed\n\
-         by plan content; `resume` continues the latest sealed checkpoint."
+         by plan content; `resume` continues the latest sealed checkpoint.\n\
+         `verify` checks a report's local-signed attestation against the local\n\
+         ed25519 key, failing on a forged or tampered signature."
     );
 }
 
@@ -366,6 +377,68 @@ impl Attestor for LocalAttestor {
     fn attest(&self, report_hash: &[u8; 32]) -> Result<String> {
         Self::sign(report_hash)
     }
+}
+
+/// Verify a workflow verification report's `local-signed:` attestation against
+/// the local ed25519 key, mirroring `hi trace verify`. Recomputes the unsigned
+/// report hash (the report with the attestation field cleared, exactly as
+/// `AttestingVerifier` hashed it) and checks the signature. A signature
+/// mismatch is a hard failure — the signature is the report's only integrity
+/// mechanism, unlike a trace's hash chain.
+fn verify_report(path: &Path) -> Result<Vec<String>> {
+    verify_report_with_key(path, &hi_trace::local_signing_key_path())
+}
+
+/// Key-path-injectable core of [`verify_report`] so tests can point at a temp
+/// key without touching the shared default location or the environment.
+fn verify_report_with_key(path: &Path, key_path: &Path) -> Result<Vec<String>> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading report {}", path.display()))?;
+    let report: VerificationReport = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing report {}", path.display()))?;
+    let Some(attestation) = report.supervisor_attestation.clone() else {
+        bail!("report {} has no attestation (unsigned)", path.display());
+    };
+    // Recompute the unsigned hash exactly as AttestingVerifier did: the report
+    // with the attestation field cleared, serialized in field order.
+    let mut unsigned = report.clone();
+    unsigned.supervisor_attestation = None;
+    let unsigned_bytes = serde_json::to_vec(&unsigned)?;
+    let hash_hex = blake3::hash(&unsigned_bytes).to_hex().to_string();
+
+    let mut lines = vec![
+        format!("report:      {}", path.display()),
+        format!("run_id:      {}", report.run_id),
+        format!("passed:      {}", report.passed),
+        format!("attestation: {attestation}"),
+    ];
+    if !attestation.starts_with(hi_trace::LOCAL_SIGNED_PREFIX) {
+        lines.push(
+            "signature:   not locally signed (worker or unknown scheme — not verifiable here)"
+                .to_string(),
+        );
+        return Ok(lines);
+    }
+    if !key_path.exists() {
+        lines.push("signature:   unverifiable (local signing key not found)".to_string());
+        return Ok(lines);
+    }
+    match hi_trace::verify_local_signature(&attestation, &hash_hex, key_path) {
+        Ok(true) => lines.push("signature:   ok (ed25519 signature matches local key)".to_string()),
+        Ok(false) => bail!(
+            "report {} signature does not match the local key (tampered or forged)",
+            path.display()
+        ),
+        Err(e) => bail!("could not validate report signature: {e:#}"),
+    }
+    Ok(lines)
+}
+
+fn verify_report_cli(path: &Path) -> Result<()> {
+    for line in verify_report(path)? {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 /// The objectives gate: passes only when no objective recorded failure
@@ -1099,6 +1172,119 @@ mod tests {
             )
             .unwrap(),
             "tampered report hash must not verify"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Write a VerificationReport whose attestation is a real local-signed:
+    /// signature, produced the same way AttestingVerifier does (clear the
+    /// field, hash the unsigned bytes, sign). Returns the report path.
+    fn write_signed_report(dir: &Path, key_path: &Path, passed: bool) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut report = VerificationReport {
+            report_version: 1,
+            run_id: "run-1".into(),
+            candidate_id: "cand-1".into(),
+            environment_hash: "e".repeat(64),
+            source_tree_hash: "s".repeat(64),
+            checks: vec![],
+            passed,
+            policy_violations: vec![],
+            artifacts: vec![],
+            supervisor_attestation: None,
+        };
+        let unsigned = serde_json::to_vec(&report).unwrap();
+        let hash = blake3::hash(&unsigned);
+        report.supervisor_attestation =
+            Some(LocalAttestor::sign_with_key(hash.as_bytes(), key_path).unwrap());
+        let path = dir.join("report.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn workflow_verify_accepts_valid_signature() {
+        let base = std::env::temp_dir().join(format!("hi-wf-verify-ok-{}", std::process::id()));
+        let key_path = base.join("hi").join(hi_trace::LOCAL_SIGNING_KEY_FILE);
+        let report_path = write_signed_report(&base, &key_path, true);
+        let out = verify_report_with_key(&report_path, &key_path)
+            .unwrap()
+            .join("\n");
+        assert!(out.contains("signature:   ok"), "expected ok: {out}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workflow_verify_rejects_tampered_report() {
+        let base = std::env::temp_dir().join(format!("hi-wf-verify-bad-{}", std::process::id()));
+        let key_path = base.join("hi").join(hi_trace::LOCAL_SIGNING_KEY_FILE);
+        let report_path = write_signed_report(&base, &key_path, true);
+        // Flip the `passed` flag after signing — the recomputed unsigned hash
+        // no longer matches the signature.
+        let mut report: VerificationReport =
+            serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+        report.passed = false;
+        std::fs::write(&report_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        let result = verify_report_with_key(&report_path, &key_path);
+        assert!(result.is_err(), "tampered report must fail verification");
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not match"),
+            "expected a mismatch error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workflow_verify_handles_unsigned_and_foreign_scheme() {
+        let base = std::env::temp_dir().join(format!("hi-wf-verify-none-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let key_path = base.join("hi").join(hi_trace::LOCAL_SIGNING_KEY_FILE);
+        // Unsigned report (no attestation) -> hard error.
+        let unsigned_report = VerificationReport {
+            report_version: 1,
+            run_id: "run-1".into(),
+            candidate_id: "cand-1".into(),
+            environment_hash: "e".repeat(64),
+            source_tree_hash: "s".repeat(64),
+            checks: vec![],
+            passed: true,
+            policy_violations: vec![],
+            artifacts: vec![],
+            supervisor_attestation: None,
+        };
+        let path = base.join("unsigned.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&unsigned_report).unwrap()).unwrap();
+        assert!(verify_report_with_key(&path, &key_path).is_err());
+
+        // A worker-scheme attestation is reported as not locally verifiable.
+        let mut worker = unsigned_report.clone();
+        worker.supervisor_attestation = Some("worker-v1:deadbeef".into());
+        let wpath = base.join("worker.json");
+        std::fs::write(&wpath, serde_json::to_vec_pretty(&worker).unwrap()).unwrap();
+        let out = verify_report_with_key(&wpath, &key_path)
+            .unwrap()
+            .join("\n");
+        assert!(
+            out.contains("not locally signed"),
+            "expected not-locally-signed note: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workflow_verify_reports_missing_key() {
+        let base = std::env::temp_dir().join(format!("hi-wf-verify-key-{}", std::process::id()));
+        let key_path = base.join("hi").join(hi_trace::LOCAL_SIGNING_KEY_FILE);
+        let report_path = write_signed_report(&base, &key_path, true);
+        // Point at a key path that does not exist -> unverifiable, not an error.
+        let missing = base.join("absent").join("key");
+        let out = verify_report_with_key(&report_path, &missing)
+            .unwrap()
+            .join("\n");
+        assert!(
+            out.contains("unverifiable"),
+            "expected unverifiable note: {out}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
