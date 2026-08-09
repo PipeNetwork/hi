@@ -315,7 +315,9 @@ mod tests {
     }
 
     #[test]
-    fn render_shows_local_unattested_label_and_root_hash() {
+    fn render_shows_attestation_label_and_root_hash() {
+        // A legacy local-unattested label (or any attestation string present in
+        // the manifest) renders verbatim in the show output.
         let root = std::env::temp_dir().join(format!("hi-trace-show-{}", std::process::id()));
         let dir = root.join("a".repeat(32));
         write_manifest(&dir, Some(&format!("local-unattested:{}", "b".repeat(64))));
@@ -324,6 +326,27 @@ mod tests {
         assert!(
             out.contains(&format!("attestation: local-unattested:{}", "b".repeat(64))),
             "label not surfaced: {out}"
+        );
+        assert!(
+            out.contains(&format!("root_hash:   {}", "b".repeat(64))),
+            "root hash not surfaced: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn render_shows_local_signed_label_and_root_hash() {
+        // The scheme LocalAttestor currently emits: local-signed:<hex-sig>.
+        // The show path must surface it verbatim like any other label.
+        let root =
+            std::env::temp_dir().join(format!("hi-trace-show-signed-{}", std::process::id()));
+        let dir = root.join("b".repeat(32));
+        let sig = format!("local-signed:{}", "9".repeat(128));
+        write_manifest(&dir, Some(&sig));
+        let out = render(&dir).unwrap().join("\n");
+        assert!(
+            out.contains(&format!("attestation: {sig}")),
+            "local-signed label not surfaced: {out}"
         );
         assert!(
             out.contains(&format!("root_hash:   {}", "b".repeat(64))),
