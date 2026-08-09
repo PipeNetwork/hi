@@ -142,7 +142,7 @@ pub(crate) fn start_rsi_trace(
         }
         RsiRequested::Managed => {
             let runtime = runtime.ok_or_else(|| anyhow!("managed RSI runtime is unavailable"))?;
-            TraceWriter::create_bound(
+            let trace = TraceWriter::create_bound(
                 cli.rsi_trace_dir.as_ref().expect("clap requires trace dir"),
                 TraceMode::Managed,
                 cli.rsi_max_bytes.expect("clap requires trace size"),
@@ -155,7 +155,22 @@ pub(crate) fn start_rsi_trace(
                     repository_snapshot_hash: runtime.identity.repository_snapshot_hash.clone(),
                     runtime_descriptor_hash: runtime.content_hash()?,
                 },
-            )
+            );
+            // Worker attestation: when the deployment exposes a signing socket
+            // (HI_RSI_TRACE_SIGNING_SOCKET), attach a WorkerAttestor so the
+            // terminal root_hash is signed with the worker's key — the anchor
+            // that turns the local chain into worker-anchored evidence. Without
+            // it the managed trace is recorded unattested (today's behavior).
+            #[cfg(unix)]
+            let trace = trace.map(
+                |trace| match std::env::var_os("HI_RSI_TRACE_SIGNING_SOCKET") {
+                    Some(socket) => trace.with_attestor(std::sync::Arc::new(
+                        hi_trace::WorkerAttestor::from_socket(std::path::PathBuf::from(socket)),
+                    )),
+                    None => trace,
+                },
+            );
+            trace
         }
         RsiRequested::Remote => return Ok(None),
     };

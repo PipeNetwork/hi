@@ -128,6 +128,98 @@ impl TraceAttestor for LocalAttestor {
     }
 }
 
+/// Attestation scheme prefix emitted by [`WorkerAttestor`].
+pub const WORKER_SIGNED_PREFIX: &str = "worker-signed:";
+
+/// A worker-provided signing oracle: given the canonical attestation message,
+/// return a signature. The signing key never enters the candidate process —
+/// the worker can back this with a unix-socket signing service, an HSM call,
+/// or a test stub. This indirection is the whole point of the trust boundary:
+/// the candidate cannot forge a worker attestation because it cannot sign.
+pub type SigningOracle = dyn Fn(&[u8]) -> Result<String> + Send + Sync;
+
+/// Worker attestation: delegates signing to a [`SigningOracle`] the external
+/// worker injects, so the trace is anchored with a key the candidate cannot
+/// read. Emits `worker-signed:<hex-signature>` over a domain-separated message
+/// binding the terminal `root_hash` to the run/candidate identity.
+///
+/// Unlike [`LocalAttestor`], this is genuine external attestation — *if* the
+/// oracle is backed by a real worker key. hi-trace defines the message format
+/// and scheme; whether the oracle is trustworthy is the deployment's contract.
+pub struct WorkerAttestor {
+    oracle: std::sync::Arc<SigningOracle>,
+}
+
+impl WorkerAttestor {
+    /// Wrap a worker signing oracle. The oracle receives the canonical message
+    /// bytes (see [`worker_attestation_message`]) and returns a hex signature.
+    pub fn new(oracle: std::sync::Arc<SigningOracle>) -> Self {
+        Self { oracle }
+    }
+
+    /// An attestor whose oracle is a worker-owned unix socket: each call
+    /// connects, writes the canonical message, and reads back a hex signature.
+    /// The signing key never leaves the worker process. Attestation runs once
+    /// at finalize, so the blocking round-trip is immaterial.
+    #[cfg(unix)]
+    pub fn from_socket(path: std::path::PathBuf) -> Self {
+        Self::new(std::sync::Arc::new(move |message: &[u8]| {
+            socket_sign(&path, message)
+        }))
+    }
+}
+
+/// Round-trip a message through a worker signing socket: connect, send the
+/// length-prefixed message, read the hex signature reply.
+#[cfg(unix)]
+fn socket_sign(path: &Path, message: &[u8]) -> Result<String> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(path)
+        .with_context(|| format!("connecting to worker signing socket {}", path.display()))?;
+    let len = u32::try_from(message.len()).context("attestation message too large")?;
+    stream
+        .write_all(&len.to_be_bytes())
+        .and_then(|()| stream.write_all(message))
+        .and_then(|()| stream.flush())
+        .context("writing to worker signing socket")?;
+    // Signal end of request so the worker can reply before we close.
+    stream.shutdown(std::net::Shutdown::Write).ok();
+    let mut reply = String::new();
+    stream
+        .read_to_string(&mut reply)
+        .context("reading from worker signing socket")?;
+    let signature = reply.trim().to_string();
+    ensure!(
+        !signature.is_empty(),
+        "worker signing socket returned an empty signature"
+    );
+    Ok(signature)
+}
+
+/// The canonical message a worker signs: a domain separator plus the identity
+/// and root hash, so a signature over this message cannot be replayed as a
+/// signature over a bare hash (or a different run's trace).
+pub fn worker_attestation_message(root_hash: &str, identity: Option<&TraceIdentity>) -> Vec<u8> {
+    let mut msg = String::from("hi-trace/worker-attestation/v1\n");
+    if let Some(id) = identity {
+        msg.push_str(&format!(
+            "run={}\ntask={}\ncandidate={}\nmanifest={}\n",
+            id.run_id, id.task_id, id.candidate_id, id.manifest_hash
+        ));
+    }
+    msg.push_str(&format!("root_hash={root_hash}"));
+    msg.into_bytes()
+}
+
+impl TraceAttestor for WorkerAttestor {
+    fn attest_trace(&self, root_hash: &str, identity: Option<&TraceIdentity>) -> Result<String> {
+        let message = worker_attestation_message(root_hash, identity);
+        let signature = (self.oracle)(&message)?;
+        Ok(format!("{WORKER_SIGNED_PREFIX}{signature}"))
+    }
+}
+
 /// Default path of the local trace-signing key, resolving the state home the
 /// same way the trace root does (`$XDG_STATE_HOME`, else `$HOME/.local/state`,
 /// else the current directory).
@@ -203,6 +295,28 @@ pub fn verify_local_signature(attestation: &str, root_hash: &str, key_path: &Pat
     )
     .context("invalid local signing key")?;
     Ok(verifying.verify(root_hash.as_bytes(), &signature).is_ok())
+}
+
+/// Verify a `worker-signed:` attestation against the worker's ed25519 public
+/// key. Unlike local verification, the candidate needs only the public key —
+/// the whole point of worker attestation. `identity` must be the trace's
+/// manifest identity so the signed message is reconstructed exactly.
+pub fn verify_worker_signature(
+    attestation: &str,
+    root_hash: &str,
+    identity: Option<&TraceIdentity>,
+    worker_public_key: &[u8; 32],
+) -> Result<bool> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let sig_hex = attestation
+        .strip_prefix(WORKER_SIGNED_PREFIX)
+        .context("not a worker-signed attestation")?;
+    let sig_bytes = hex::decode(sig_hex.trim()).context("invalid worker signature encoding")?;
+    let signature = Signature::from_slice(&sig_bytes).context("invalid worker signature length")?;
+    let verifying =
+        VerifyingKey::from_bytes(worker_public_key).context("invalid worker public key")?;
+    let message = worker_attestation_message(root_hash, identity);
+    Ok(verifying.verify(&message, &signature).is_ok())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1526,6 +1640,112 @@ mod tests {
         assert!(verify_local_signature("local-unattested:abc", &root_hash, &key_path).is_err());
         fs::remove_dir_all(state).unwrap();
         fs::remove_dir_all(other_state).unwrap();
+    }
+
+    /// An in-process worker signing oracle: signs the canonical message with a
+    /// real ed25519 key, exactly what a worker socket service would do — but
+    /// here the "worker" is a local key so the test can check the full path.
+    fn worker_oracle(key: ed25519_dalek::SigningKey) -> std::sync::Arc<SigningOracle> {
+        std::sync::Arc::new(move |message: &[u8]| {
+            use ed25519_dalek::Signer;
+            Ok(hex::encode(key.sign(message).to_bytes()))
+        })
+    }
+
+    #[test]
+    fn worker_attestor_signs_and_verifies_with_public_key() {
+        let dir = temp();
+        let worker_key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let worker_pub = worker_key.verifying_key().to_bytes();
+        let id = identity();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, id.clone())
+                .unwrap()
+                .with_attestor(std::sync::Arc::new(WorkerAttestor::new(worker_oracle(
+                    worker_key,
+                ))));
+        trace
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        let summary = trace.finalize().unwrap();
+
+        let attestation = summary.attestation.clone().expect("worker attested");
+        assert!(
+            attestation.starts_with(WORKER_SIGNED_PREFIX),
+            "expected worker-signed: attestation, got: {attestation}"
+        );
+        // Verifies against the worker public key with the manifest identity.
+        assert!(
+            verify_worker_signature(
+                &attestation,
+                &summary.root_hash,
+                summary.identity.as_ref(),
+                &worker_pub
+            )
+            .unwrap(),
+            "worker signature must verify against the worker public key"
+        );
+        // A different root hash (tampered trace) must not verify.
+        assert!(
+            !verify_worker_signature(
+                &attestation,
+                &"f".repeat(64),
+                summary.identity.as_ref(),
+                &worker_pub
+            )
+            .unwrap(),
+            "tampered root hash must not verify"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn worker_signature_rejects_wrong_key_and_identity() {
+        let dir = temp();
+        let worker_key = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+        let worker_pub = worker_key.verifying_key().to_bytes();
+        let id = identity();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, id.clone())
+                .unwrap()
+                .with_attestor(std::sync::Arc::new(WorkerAttestor::new(worker_oracle(
+                    worker_key,
+                ))));
+        trace
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        let summary = trace.finalize().unwrap();
+        let attestation = summary.attestation.clone().unwrap();
+
+        // Wrong worker public key fails (forgery without the worker key).
+        let other_pub = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(
+            !verify_worker_signature(
+                &attestation,
+                &summary.root_hash,
+                summary.identity.as_ref(),
+                &other_pub
+            )
+            .unwrap(),
+            "signature must not verify under a different worker key"
+        );
+        // A different identity (replayed onto another run) must not verify —
+        // the domain-separated message binds run/task/candidate/manifest.
+        let mut other_id = id.clone();
+        other_id.run_id = "run-other".into();
+        assert!(
+            !verify_worker_signature(
+                &attestation,
+                &summary.root_hash,
+                Some(&other_id),
+                &worker_pub
+            )
+            .unwrap(),
+            "signature must not verify under a different run identity"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
