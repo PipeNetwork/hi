@@ -49,7 +49,7 @@
 945 crates/hi-cli/src/sync_store.rs
 3644 crates/hi-cli/src/sync.rs
 900 crates/hi-cli/src/team_bench.rs
-1257 crates/hi-cli/src/workflow_cmd.rs
+1583 crates/hi-cli/src/workflow_cmd.rs
 1508 crates/hi-eval/src/artifacts.rs
 1846 crates/hi-eval/src/platform.rs
 1399 crates/hi-eval/src/runner.rs
@@ -72,7 +72,7 @@
 1538 crates/hi-tools/src/transaction.rs
 1532 crates/hi-tools/src/web.rs
 1152 crates/hi-tools/src/worktree.rs
-1436 crates/hi-trace/src/lib.rs
+1588 crates/hi-trace/src/lib.rs
 2338 crates/hi-tui/src/app/commands.rs
 2378 crates/hi-tui/src/app/render.rs
 3480 crates/hi-tui/src/app/run/mod.rs
