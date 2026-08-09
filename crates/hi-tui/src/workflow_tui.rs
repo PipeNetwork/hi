@@ -547,7 +547,7 @@ pub(crate) fn handle_plan_workflow(app: &mut App, rest: &str, exe: &Path) {
                         agents_reserved: 0,
                         elapsed_ms: 0,
                         pause_message: None,
-                        result_summary: Some(format!("local-unattested · pid {pid}")),
+                        result_summary: Some(format!("local-signed · pid {pid}")),
                         history: vec![],
                     };
                     app.apply(crate::event::UiEvent::WorkflowUpdated { snapshot });

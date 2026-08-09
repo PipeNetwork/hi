@@ -2,11 +2,11 @@
 //!
 //! ADR-001 carve-out: this entry drives `hi_agent_runtime::WorkflowExecutor`
 //! locally, WITHOUT the managed attestation chain. Verification reports are
-//! attested with an explicit `local-unattested:` label so they can never be
-//! mistaken for worker-attested RSI evidence. Each plan objective executes
-//! through the existing delegate machinery — an isolated worktree child that
-//! must verify before its diff is applied — so "passed" always means applied
-//! AND verified, never narrated.
+//! signed with the shared local ed25519 key (`local-signed:`) — tamper-evident
+//! but not worker-attested, so they can never be mistaken for managed RSI
+//! evidence. Each plan objective executes through the existing delegate
+//! machinery — an isolated worktree child that must verify before its diff is
+//! applied — so "passed" always means applied AND verified, never narrated.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -134,7 +134,7 @@ fn print_usage() {
          passes independent verification.\n\
          `--check-off` marks succeeded objectives `- [x]` in the plan after the\n\
          run, so a rerun only retries what failed.\n\
-         Reports are labeled `local-unattested:` — this is the self-hosted mode,\n\
+         Reports are signed `local-signed:` — this is the self-hosted mode,\n\
          not managed RSI evidence. Checkpoints live under the state root keyed\n\
          by plan content; `resume` continues the latest sealed checkpoint."
     );
@@ -335,15 +335,36 @@ fn edge(from: &str, to: &str, condition: TransitionCondition, priority: u16) -> 
     }
 }
 
-/// Explicitly-labeled local attestation: honest about being self-hosted.
+/// Self-hosted attestation: a real ed25519 signature over the report hash,
+/// made with the shared local key (the same one `hi_trace::LocalAttestor`
+/// uses). Emits `local-signed:<hex-signature>` over the hex report hash.
+///
+/// This is *not* worker attestation — the key lives on the same machine, so it
+/// proves the report is unmodified since signing (tamper-evidence), not that a
+/// trusted external worker anchored it. The `local-signed:` prefix keeps it
+/// distinguishable from a worker scheme. Replaces the earlier
+/// `local-unattested:` placeholder label.
 pub(crate) struct LocalAttestor;
+
+impl LocalAttestor {
+    /// Sign a report hash with the shared local key, returning the
+    /// `local-signed:` attestation string over the hash's hex form.
+    fn sign(report_hash: &[u8; 32]) -> Result<String> {
+        Self::sign_with_key(report_hash, &hi_trace::local_signing_key_path())
+    }
+
+    /// Key-path-injectable core so tests can point at a temp key without
+    /// touching the shared default location or the environment.
+    fn sign_with_key(report_hash: &[u8; 32], key_path: &Path) -> Result<String> {
+        let key = hi_trace::load_or_create_signing_key(key_path)?;
+        let hash_hex = blake3::Hash::from_bytes(*report_hash).to_hex();
+        hi_trace::sign_root_hash(&key, hash_hex.as_str())
+    }
+}
 
 impl Attestor for LocalAttestor {
     fn attest(&self, report_hash: &[u8; 32]) -> Result<String> {
-        Ok(format!(
-            "local-unattested:{}",
-            blake3::Hash::from_bytes(*report_hash).to_hex()
-        ))
+        Self::sign(report_hash)
     }
 }
 
@@ -750,7 +771,7 @@ async fn run(
         timeout: std::time::Duration::from_secs(1_800),
         required: true,
         // Local self-hosted mode: the user's toolchain (rustup, nvm, …)
-        // needs the user's environment. Reports stay `local-unattested:`.
+        // needs the user's environment. Reports stay `local-signed:`.
         inherit_environment: true,
     }];
     let driver = StageDriver::new(
@@ -1051,6 +1072,36 @@ fn git_head(root: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_attestor_signs_and_signature_verifies() {
+        // The workflow LocalAttestor must emit a local-signed: ed25519
+        // signature over the hex report hash, verifiable with the local key.
+        let base = std::env::temp_dir().join(format!("hi-wf-attest-{}", std::process::id()));
+        let key_path = base.join("hi").join(hi_trace::LOCAL_SIGNING_KEY_FILE);
+        let report_hash = [7u8; 32];
+        let attestation = LocalAttestor::sign_with_key(&report_hash, &key_path).unwrap();
+        assert!(
+            attestation.starts_with(hi_trace::LOCAL_SIGNED_PREFIX),
+            "expected local-signed: attestation, got: {attestation}"
+        );
+        let hash_hex = blake3::Hash::from_bytes(report_hash).to_hex();
+        assert!(
+            hi_trace::verify_local_signature(&attestation, hash_hex.as_str(), &key_path).unwrap(),
+            "signature must verify against the local key"
+        );
+        // A different report hash must not verify.
+        assert!(
+            !hi_trace::verify_local_signature(
+                &attestation,
+                blake3::Hash::from_bytes([9u8; 32]).to_hex().as_str(),
+                &key_path
+            )
+            .unwrap(),
+            "tampered report hash must not verify"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn objectives_prefer_unchecked_checkboxes_then_numbers_then_bullets() {

@@ -5,8 +5,8 @@ workflow engine (`hi-agent-runtime::WorkflowExecutor`): each objective runs as
 an isolated, verified delegate child; a final trusted verification gate runs
 the whole-workspace pipeline; every wave seals a resumable checkpoint.
 
-This is the ADR-001 self-hosted carve-out: verification reports are attested
-`local-unattested:` and are never managed RSI evidence.
+This is the ADR-001 self-hosted carve-out: verification reports are signed
+`local-signed:` (ed25519, local key) and are never managed RSI evidence.
 
 ## Usage
 
