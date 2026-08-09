@@ -4,10 +4,10 @@
 //! attestation label, and inline integrity (tamper) status; `hi trace list`
 //! shows recent runs with their labels and completeness; `hi trace verify`
 //! runs the integrity check alone and fails on a broken chain. A self-hosted
-//! run visibly reports `local-unattested:…` (and a managed run its worker
-//! attestation) without digging through JSON. This surfaces the trust boundary
-//! documented in `docs/architecture.md`: the label is what distinguishes
-//! worker-anchored evidence from a locally consistent, unattested chain, and
+//! run visibly reports its `local-signed:…` attestation (and a managed run its
+//! worker attestation) without digging through JSON. This surfaces the trust
+//! boundary documented in `docs/architecture.md`: the label is what
+//! distinguishes worker-anchored evidence from a locally signed chain, and
 //! integrity is local consistency, not authenticity.
 
 use std::path::{Path, PathBuf};
@@ -98,7 +98,7 @@ fn load_manifest(dir: &Path) -> Result<TraceManifest> {
 
 /// Short attestation label for list output: the scheme prefix (the part before
 /// the first `:`), which is what distinguishes worker-anchored evidence from a
-/// self-hosted `local-unattested` chain, without the long hash.
+/// self-hosted `local-signed` chain, without the long hash.
 fn attestation_label(manifest: &TraceManifest) -> &str {
     manifest
         .attestation
@@ -371,19 +371,19 @@ mod tests {
     #[test]
     fn list_shows_recent_runs_with_labels_and_completeness() {
         let root = std::env::temp_dir().join(format!("hi-trace-list-{}", std::process::id()));
-        // Three runs: a complete local-unattested one, an incomplete one, and
+        // Three runs: a complete local-signed one, an incomplete one, and
         // an unattested one. Distinct trace ids let us assert each appears.
         let complete = root.join("d".repeat(32));
         write_manifest_full(
             &complete,
-            Some(&format!("local-unattested:{}", "b".repeat(64))),
+            Some(&format!("local-signed:{}", "b".repeat(128))),
             true,
             5,
         );
         let incomplete = root.join("e".repeat(32));
         write_manifest_full(
             &incomplete,
-            Some(&format!("local-unattested:{}", "b".repeat(64))),
+            Some(&format!("local-signed:{}", "b".repeat(128))),
             false,
             2,
         );
@@ -400,7 +400,7 @@ mod tests {
             assert!(out.contains(&id), "missing trace {id}: {out}");
         }
         // Labels and completeness are surfaced.
-        assert!(out.contains("local-unattested"), "label missing: {out}");
+        assert!(out.contains("local-signed"), "label missing: {out}");
         assert!(
             out.contains("unattested"),
             "unattested marker missing: {out}"

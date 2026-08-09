@@ -65,14 +65,14 @@ pub struct TraceIdentity {
 
 /// Seam that anchors a finished trace to an external trust domain.
 ///
-/// The trace itself is unsigned — its hash chain gives local tamper-evidence
-/// only (see `docs/architecture.md` "Trace trust boundary"). A managed
-/// deployment supplies a `TraceAttestor` that signs the trace's terminal
-/// `root_hash` with a key the candidate cannot read, turning the locally
-/// consistent chain into worker-anchored evidence. The result string is
-/// stored verbatim in the manifest; its format is the attestor's contract
-/// (e.g. a signature, or an explicit `local-unattested:` label for self-hosted
-/// runs so they can never be mistaken for worker-attested evidence).
+/// The trace's hash chain gives local tamper-evidence only (see
+/// `docs/architecture.md` "Trace trust boundary"). A managed deployment
+/// supplies a `TraceAttestor` that signs the trace's terminal `root_hash` with
+/// a key the candidate cannot read, turning the locally consistent chain into
+/// worker-anchored evidence. The result string is stored verbatim in the
+/// manifest; its format is the attestor's contract (e.g. a worker signature,
+/// or [`LocalAttestor`]'s `local-signed:` ed25519 label for self-hosted runs
+/// so they can never be mistaken for worker-attested evidence).
 pub trait TraceAttestor: Send + Sync {
     /// Produce an attestation binding `root_hash` (the trace's terminal event
     /// hash) and `identity` (the worker-provided provenance) to an external

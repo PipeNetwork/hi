@@ -128,9 +128,10 @@ pub(crate) fn start_rsi_trace(
                         .map(|home| home.join(".local/state"))
                 })
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
-            // Self-hosted runs record an explicit `local-unattested:` label so
-            // their traces can never be mistaken for worker-attested RSI
-            // evidence. Managed runs leave attestation to the external worker.
+            // Self-hosted runs sign their trace with the local ed25519 key
+            // (`local-signed:`), proving the trace is unmodified since signing
+            // without claiming worker attestation. Managed runs leave
+            // attestation to the external worker.
             TraceWriter::create_local(
                 &state_home,
                 cli.rsi_max_bytes.unwrap_or(hi_trace::DEFAULT_RUN_MAX_BYTES),
@@ -677,11 +678,12 @@ pub(crate) fn report_tool_records(entries: &[hi_agent::ToolCallEntry]) -> Vec<se
 mod tests {
     use super::*;
 
-    /// A finished local trace carries the LocalAttestor label; the report
-    /// block must surface it so a self-hosted run visibly reports
-    /// `local-unattested` instead of looking worker-attested or vanishing.
+    /// A finished trace's attestation label must surface in the report block.
+    /// Uses a legacy `local-unattested` fixture — the display path renders any
+    /// label verbatim, so this proves the field is not dropped regardless of
+    /// scheme (current local runs emit `local-signed:`).
     #[test]
-    fn rsi_report_block_surfaces_local_unattested_label() {
+    fn rsi_report_block_surfaces_attestation_label() {
         let summary = TraceSummary {
             mode: TraceMode::Local,
             trace_schema: hi_trace::TRACE_SCHEMA_VERSION,
