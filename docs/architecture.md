@@ -98,6 +98,17 @@ traces, validates the ed25519 signature against the local key (reporting
 authenticity — they report local consistency, the local signature, and the
 attestation label.
 
+The workflow side mirrors this. `hi workflow run` attests each verification
+report through the `hi_verifier::Attestor` seam; the self-hosted
+`LocalAttestor` signs the report hash with the **same** local ed25519 key
+(`$XDG_STATE_HOME/hi/trace-signing-key`, fallback `$HOME/.local/state/hi/`),
+so a self-hosted report is tamper-evident but not worker-attested. The final
+signed report is persisted to `<state_root>/workflow/<plan>-<hash>/report.json`,
+and `hi workflow verify [report.json]` recomputes the unsigned report hash and
+validates the signature — resolving the latest persisted report when no path
+is given, and failing hard on a forged or tampered signature (the signature is
+the report's only integrity mechanism; there is no hash chain to fall back on).
+
 ## Naming rule
 
 Prefer the disambiguated names in new code and docs:

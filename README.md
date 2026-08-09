@@ -504,6 +504,31 @@ provenance before upload. Managed evidence remains mandatory and is stored
 server-side; the normal client retains only pending IDs, baseline hashes, and
 result summaries unless artifacts are explicitly downloaded.
 
+## Local traces & workflow evidence (`hi trace`, `hi workflow verify`)
+
+Self-hosted runs record a local trace and (for `hi workflow run`) a signed
+verification report. Both carry a `local-signed:` ed25519 attestation — real
+tamper-evidence, but **not** worker attestation, since the key lives on the
+same machine.
+
+- `hi trace list [n]` — recent traces with an `INTEGRITY` column
+  (`ok`/`TAMPERED`) and the attestation scheme, so tampered or unsigned runs
+  are visible at a glance.
+- `hi trace show [id]` — one trace's detail with the integrity status inline.
+- `hi trace verify [id]` — recompute the hash chain and check it against the
+  manifest root; for `local-signed:` traces, also validate the signature.
+  Fails on a broken chain.
+- `hi workflow verify [report.json]` — validate a workflow report's
+  `local-signed:` attestation against the local key. With no argument it
+  resolves the latest persisted report (under the state root's
+  `workflow/<plan>/report.json`); a forged or tampered signature fails.
+
+The local signing key lives at `$XDG_STATE_HOME/hi/trace-signing-key` (falling
+back to `$HOME/.local/state/hi/trace-signing-key`), created owner-only (`0600`)
+on first signing run. Trace integrity is local consistency, not authenticity —
+external anchoring is the managed worker's job (see
+[ADR 001](docs/adr/001-rsi-runtime-boundary.md) and `docs/architecture.md`).
+
 ## Architecture
 
 A cargo workspace:

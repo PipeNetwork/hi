@@ -152,7 +152,9 @@ fn print_usage() {
          by plan content; `resume` continues the latest sealed checkpoint.\n\
          `verify` checks a report's local-signed attestation against the local\n\
          ed25519 key (latest persisted report, or an explicit report.json path),\n\
-         failing on a forged or tampered signature."
+         failing on a forged or tampered signature. The signing key lives at\n\
+         `$XDG_STATE_HOME/hi/trace-signing-key` (else `$HOME/.local/state/hi/`),\n\
+         created owner-only on first signing run."
     );
 }
 

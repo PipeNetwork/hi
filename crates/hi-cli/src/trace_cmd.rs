@@ -280,7 +280,8 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
             Ok(())
         }
         other => bail!(
-            "usage: hi trace show [id] | hi trace list [n] | hi trace verify [id]  (unknown subcommand '{other}')"
+            "usage: hi trace show [id] | hi trace list [n] | hi trace verify [id]  (unknown subcommand '{other}')\n\
+             local-signed attestations use the key at $XDG_STATE_HOME/hi/trace-signing-key"
         ),
     }
 }
