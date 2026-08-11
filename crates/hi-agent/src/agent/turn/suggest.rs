@@ -125,9 +125,26 @@ impl crate::Agent {
         }
 
         if let Some(suggestion) = sanitize_suggestion(&raw) {
+            // Suppress an identical back-to-back repeat: the suggest call is
+            // grounded only in the current turn, so a stalled session makes the
+            // model propose the same follow-up every turn, which users read as
+            // duplicated ghost text. A *different* suggestion still replaces it.
+            if is_repeat_suggestion(self.last_suggested_prompt.as_deref(), &suggestion) {
+                return;
+            }
+            self.last_suggested_prompt = Some(suggestion.clone());
             ui.suggested_prompt(&suggestion);
         }
     }
+}
+
+/// True when `candidate` is the same suggestion as the one already shown
+/// (`last`), so the UI should not be handed a duplicate ghost. Comparison is on
+/// the trimmed, case-insensitive text so trivial whitespace/case wobble from the
+/// model doesn't defeat the dedup.
+pub(crate) fn is_repeat_suggestion(last: Option<&str>, candidate: &str) -> bool {
+    let Some(last) = last else { return false };
+    last.trim().eq_ignore_ascii_case(candidate.trim())
 }
 
 /// Normalize a model reply into a single ghost-text prompt, or `None` when the
@@ -202,5 +219,20 @@ mod tests {
             Some("commit these changes".into())
         );
         assert_eq!(sanitize_suggestion("- open a PR"), Some("open a PR".into()));
+    }
+
+    #[test]
+    fn repeat_suggestion_detected_case_and_whitespace_insensitively() {
+        use super::is_repeat_suggestion;
+        assert!(is_repeat_suggestion(
+            Some("Run the unit tests"),
+            "Run the unit tests"
+        ));
+        assert!(is_repeat_suggestion(
+            Some("Run the unit tests"),
+            "  run the unit tests  "
+        ));
+        assert!(!is_repeat_suggestion(Some("Run the unit tests"), "Open a PR"));
+        assert!(!is_repeat_suggestion(None, "Run the unit tests"));
     }
 }

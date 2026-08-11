@@ -881,6 +881,10 @@ pub struct Agent {
     /// of the next one. Not serialized — a restored session starts at 0, which
     /// is safe because `max_turns` is a live session knob, not a durable one.
     pub(crate) turn_count: u32,
+    /// The last next-prompt suggestion emitted this session, used to suppress
+    /// an identical back-to-back repeat (users read a repeated ghost as a bug).
+    /// Not serialized — a restored session simply has no prior suggestion.
+    pub(crate) last_suggested_prompt: Option<String>,
     /// In-process lifecycle extension registry. Contributors are fired at
     /// turn start/done/error/abort. `None` when no extensions are installed
     /// (the common case). Distinct from the out-of-process `hi-hooks` system.

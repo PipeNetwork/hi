@@ -176,6 +176,7 @@ impl crate::Agent {
             plan_mode: false,
             permission_mode: crate::PermissionMode::default(),
             turn_count: 0,
+            last_suggested_prompt: None,
             extensions: None,
         })
     }
