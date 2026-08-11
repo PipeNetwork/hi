@@ -278,3 +278,58 @@ fn memory_distills_at_quit_and_reloads_next_session() {
         "memory loaded into the system prompt: {body}"
     );
 }
+
+/// A streamed completion that emits a single `write` tool call (then stops), so
+/// the agent has a planned mutating action to act on.
+fn sse_write_tool_call(path: &str, content: &str) -> String {
+    let arguments = serde_json::to_string(
+        &serde_json::json!({ "path": path, "content": content }).to_string(),
+    )
+    .unwrap();
+    format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"function\":{{\"name\":\"write\",\"arguments\":{arguments}}}}}]}}}}]}}\n\n\
+         data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":5}}}}\n\n\
+         data: [DONE]\n\n"
+    )
+}
+
+#[test]
+fn dry_run_prints_planned_action_without_mutating_workspace() {
+    // Turn 1: model asks to write a file. Subsequent requests (the re-prompt
+    // after the synthetic dry-run result, plus any suggest/finalize call) all
+    // get a terminal prose reply so the turn ends without further tool calls.
+    let mut responses = vec![Response::sse(sse_write_tool_call(
+        "dry_run_marker.txt",
+        "should not be written",
+    ))];
+    responses.extend((0..8).map(|_| Response::sse(sse_with_usage("done"))));
+    let Some(server) = FakeOpenAiServer::new(responses) else {
+        return; // sandbox can't bind a socket → skip
+    };
+    let tmp = TempDir::new("dry-run");
+
+    let output = run_hi_one_shot_output(
+        tmp.path(),
+        server.url(),
+        &["--no-save", "--no-memory", "--no-finalize", "--dry-run"],
+        "create a marker file",
+    );
+    assert!(
+        output.status.success(),
+        "hi failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The planned action is reported as a dry-run, not executed.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[dry-run] would run `write`"),
+        "dry-run planned action printed: {stdout}"
+    );
+    assert!(
+        !tmp.path().join("dry_run_marker.txt").exists(),
+        "dry-run must not create the file"
+    );
+}
