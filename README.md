@@ -462,6 +462,13 @@ Checkpoints cannot undo non-file side effects.
 
 **No nag-prompts — but a guard for the irreversible.** Rather than asking permission for every command (the thing everyone turns off), `hi` lets the model run freely and relies on `/undo` for recovery. The one exception is a small denylist of operations a checkpoint *can't* undo — `sudo`, `rm -rf` of home/root/system paths, `git push --force`, `curl … | sh`, `dd` to a disk, `mkfs`, fork bombs, shutdown — which are refused with a reason the model can act on. It's a seatbelt against accidents, not a security boundary; set `HI_ALLOW_DANGEROUS=1` to disable it.
 
+**Dry run.** Pass `--dry-run` to preview what the model *would* do without
+executing anything. Each tool call that survives policy, budget, and protocol
+checks is printed as a planned action (`[dry-run] would run …`) and a synthetic
+result is returned to the model — mutating calls are flagged as such, but
+nothing touches the workspace and no process is spawned. Useful for inspecting
+an agent's plan before letting it act.
+
 **OS sandbox (default on).** Shell *writes* are confined to the project (plus temp) by default (`HI_SANDBOX=workspace`). Set `HI_SANDBOX=off` when normal tool caches under `$HOME` must stay writable. Enforced on macOS today (Seatbelt); Linux Landlock/bwrap is sketched in [docs/sandbox.md](docs/sandbox.md).
 
 **TUI.** Interactive sessions open a full-screen TUI by default (ratatui): a bordered, scrollable transcript with a title bar showing live token usage, and an input box that turns into a working spinner (with elapsed seconds) while a turn runs. **Keep typing while it works to queue the next command(s)** — they're listed under the prompt and run in order as each turn finishes. Ctrl-C interrupts the current turn (and drops the queue), PgUp/PgDn scrolls, Up/Down recalls history, `/exit` quits. Pass `--plain` (or pipe input) for the line-based REPL.
