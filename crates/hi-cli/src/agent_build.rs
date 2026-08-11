@@ -72,6 +72,7 @@ pub(crate) fn build_agent(
             allow_no_checkpoint: permits_missing_checkpoint(cli),
             lsp_mode: quality.lsp_mode,
             confirm_edits: cli.confirm_edits,
+            dry_run: cli.dry_run,
             ..hi_agent::AgentGates::default()
         },
         loop_limits: hi_agent::AgentLoopLimits {

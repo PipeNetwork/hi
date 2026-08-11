@@ -199,6 +199,12 @@ pub struct Cli {
     #[arg(long)]
     pub confirm_edits: bool,
 
+    /// Print planned tool actions without executing them. Mutating calls
+    /// report what they *would* do; nothing touches the workspace or spawns
+    /// processes.
+    #[arg(long)]
+    pub dry_run: bool,
+
     /// Change into this directory before starting the session (explicit review
     /// target). Prompt text is never parsed for paths — pass the directory here.
     #[arg(long, value_name = "DIR")]

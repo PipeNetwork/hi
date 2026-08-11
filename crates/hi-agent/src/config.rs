@@ -446,6 +446,10 @@ pub struct AgentGates {
     pub read_only_preflight: bool,
     /// When true, ask the user to confirm each write/edit before applying.
     pub confirm_edits: bool,
+    /// When true, print planned tool actions without executing them (dry run).
+    /// Mutating calls report what they *would* do; nothing touches the
+    /// workspace or spawns processes.
+    pub dry_run: bool,
     /// Workspace-local language-server policy.
     pub lsp_mode: LspMode,
 }
@@ -466,6 +470,7 @@ impl Default for AgentGates {
             proactive_verify: false,
             read_only_preflight: true,
             confirm_edits: false,
+            dry_run: false,
             lsp_mode: LspMode::Auto,
         }
     }

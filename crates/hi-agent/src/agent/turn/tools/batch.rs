@@ -339,7 +339,55 @@ impl crate::Agent {
             }
         }
         let mut done = completion_order.len();
-        let initially_executed = done.saturating_sub(budget_denied) as u32;
+        // Dry run: every call that survived policy/budget/protocol denial is a
+        // planned action. Print what it *would* do and synthesize a result
+        // without executing anything — no workspace mutation, no process spawn.
+        if self.config.gates.dry_run {
+            for (i, (id, name, arguments)) in calls.iter().enumerate().take(permitted_prefix) {
+                if completed[i] {
+                    continue;
+                }
+                let mutates = implementation_tool_call_mutates(name, arguments);
+                let path = hi_tools::target_path(name, arguments).unwrap_or_default();
+                let msg = dry_run_message(name, &path, mutates);
+                ui.tool_call_id(id, name, arguments);
+                let mut output = synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
+                output.effects.mutation_attempted = mutates;
+                emit_tool_output(&mut *ui, id, name, &output);
+                let progress_label = ToolProgressLabel::new(
+                    ProgressKind::None,
+                    "dry-run: planned action not executed",
+                    inspection_signature(name, arguments),
+                );
+                progress_tracker.record_tool(&progress_label);
+                tool_progress_labels.push(progress_label.clone());
+                tool_timeline.push(tool_entry(
+                    name.clone(),
+                    path,
+                    0,
+                    &output,
+                    &progress_label,
+                ));
+                results[i] = Some((id.clone(), msg));
+                completed[i] = true;
+                completion_order.push(i);
+                if let Some(entry) = tool_timeline.last_mut() {
+                    entry.completion_index = completion_order.len() as u32;
+                }
+                done += 1;
+                *sched_tool_calls += 1;
+                *sched_serial_runs += 1;
+                *sched_max_concurrent = (*sched_max_concurrent).max(1);
+            }
+        }
+        // The dry-run loop above already accounted its calls in the sched
+        // counters; only count calls completed by the earlier denial
+        // pre-passes here so dry-run stats are not double-counted.
+        let initially_executed = if self.config.gates.dry_run {
+            0
+        } else {
+            done.saturating_sub(budget_denied) as u32
+        };
         if initially_executed > 0 {
             *sched_tool_calls = (*sched_tool_calls).saturating_add(initially_executed);
             *sched_serial_runs = (*sched_serial_runs).saturating_add(initially_executed);
@@ -1825,6 +1873,47 @@ fn wait_flavored_call(name: &str, arguments: &str, output: &hi_tools::ToolOutcom
                 && !crate::steering::implementation_tool_call_validates(name, arguments)
         }
         _ => false,
+    }
+}
+
+/// Human-readable "planned action" line for a dry-run tool call. Pure so the
+/// dry-run path is unit-testable without a live agent/runtime.
+fn dry_run_message(name: &str, path: &str, mutates: bool) -> String {
+    let target = if path.is_empty() {
+        String::new()
+    } else {
+        format!(" on {path}")
+    };
+    let kind = if mutates { "mutating" } else { "read-only" };
+    format!("[dry-run] would run `{name}`{target} ({kind}; not executed)")
+}
+
+#[cfg(test)]
+mod dry_run_tests {
+    use super::*;
+
+    #[test]
+    fn mutating_call_reports_path_and_mutation() {
+        let msg = dry_run_message("edit", "src/main.rs", true);
+        assert_eq!(
+            msg,
+            "[dry-run] would run `edit` on src/main.rs (mutating; not executed)"
+        );
+    }
+
+    #[test]
+    fn read_only_call_reports_read_only() {
+        let msg = dry_run_message("read", "src/main.rs", false);
+        assert_eq!(
+            msg,
+            "[dry-run] would run `read` on src/main.rs (read-only; not executed)"
+        );
+    }
+
+    #[test]
+    fn call_without_path_omits_target() {
+        let msg = dry_run_message("bash", "", true);
+        assert_eq!(msg, "[dry-run] would run `bash` (mutating; not executed)");
     }
 }
 
