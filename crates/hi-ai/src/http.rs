@@ -341,6 +341,23 @@ fn build_agent_http_client(
     let mut builder = reqwest::Client::builder()
         .user_agent(format!("hi/{}", env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
+        // Credentials are attached to requests against a configured base host.
+        // reqwest strips `Authorization` on cross-host redirects but NOT custom
+        // headers like Anthropic's `x-api-key`, so a same-scheme redirect to a
+        // different host would forward the key. Refuse cross-host redirects
+        // outright; same-host redirects (path/version changes) still work.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let from = attempt.previous();
+            let to = attempt.url();
+            let cross_host = from.last().is_some_and(|prev| {
+                prev.host_str() != to.host_str() || prev.port_or_known_default() != to.port_or_known_default()
+            });
+            if cross_host {
+                attempt.error("refusing cross-host redirect with credentials attached")
+            } else {
+                attempt.follow()
+            }
+        }))
         .connect_timeout(Duration::from_secs(connect_timeout_secs))
         .read_timeout(Duration::from_secs(read_timeout_secs))
         .pool_idle_timeout(Some(Duration::from_secs(http_timeout_secs(
@@ -817,6 +834,97 @@ mod tests {
         assert!(load_cache(&key).await.is_none(), "stale entry ignored");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Spin up a minimal HTTP/1.1 server on loopback that answers every
+    /// request with `response`. Returns the bound port.
+    async fn one_shot_server(response: String) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Accept a couple of connections in case the client retries.
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let response = response.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn agent_client_refuses_cross_host_redirect() {
+        // The target server would happily receive the request, but reaching it
+        // requires a cross-host (different-port) redirect, which the client
+        // must refuse so attached credentials are never forwarded off-host.
+        let target_port = one_shot_server(
+            "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_string(),
+        )
+        .await;
+        let redirect_port = one_shot_server(format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{target_port}/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        ))
+        .await;
+
+        let client = agent_http_client_quick();
+        let result = client
+            .get(format!("http://127.0.0.1:{redirect_port}/"))
+            .send()
+            .await;
+        let err = result.expect_err("cross-host redirect must be rejected");
+        assert!(
+            err.is_redirect(),
+            "expected a redirect-policy rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_client_follows_same_host_redirect() {
+        // A redirect to the same host:port (only the path changes) must still
+        // be followed — the policy blocks cross-host hops, not all redirects.
+        // One server issues the redirect, then serves the final 200 on the
+        // follow-up request.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // First request: redirect to /v2 on the same port.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let redirect = format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{port}/v2\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            let _ = socket.write_all(redirect.as_bytes()).await;
+            let _ = socket.flush().await;
+            drop(socket);
+            // Second request (the follow): serve 200.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await;
+            let _ = socket.flush().await;
+        });
+
+        let client = agent_http_client_quick();
+        let body = client
+            .get(format!("http://127.0.0.1:{port}/v1"))
+            .send()
+            .await
+            .expect("same-host redirect should be followed")
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
     }
 }
 
