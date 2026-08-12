@@ -225,11 +225,22 @@ impl TurnReportState {
     }
 
     /// Clear verify flag (e.g. cancel/fail finalizers).
+    ///
+    /// INVARIANT: `last_verify` and the turn's `verified_at` (revision/digest
+    /// evidence) must be cleared together. `classify_turn_outcome` maps
+    /// `Some(true)` → `Passed` and trusts that a surviving `Some(true)` always
+    /// has matching `verified_at` evidence; clearing one but not the other
+    /// would report Passed with no bound revision. Every current clear site
+    /// (cancel/fail finalizers, `reconcile_verified_revision`) upholds this.
     pub(crate) fn clear_verify(&mut self) {
         self.last_verify = None;
     }
 
     /// Record a verify boolean for the settle/report surface.
+    ///
+    /// INVARIANT: setting `Some(true)` must be paired with stamping the turn's
+    /// `verified_at` evidence (see the `clear_verify` invariant). Set/clear
+    /// these two together.
     pub(crate) fn set_verify(&mut self, passed: Option<bool>) {
         self.last_verify = passed;
     }
