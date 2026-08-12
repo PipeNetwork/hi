@@ -243,9 +243,16 @@ async fn run_check(
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            // Drain the killed child's pipes so the reader tasks finish.
-            let _ = stdout.await;
-            let _ = stderr.await;
+            // Drain the killed child's pipes so the reader tasks finish — but
+            // bound the wait. `child.kill()` signals only the direct process;
+            // a grandchild that inherited the stdout/stderr pipe FDs (e.g.
+            // `make &`, a daemonized build) keeps them open after the parent
+            // dies, and an unbounded await on the drain tasks would block on
+            // `read_to_end` forever — hanging the verifier instead of reporting
+            // Failed. On timeout the output is discarded anyway, so give the
+            // pipes a short grace period and then abandon them.
+            let _ = timeout(DRAIN_GRACE, stdout).await;
+            let _ = timeout(DRAIN_GRACE, stderr).await;
             (
                 VerificationStatus::Failed,
                 None,
@@ -258,6 +265,13 @@ async fn run_check(
 /// One stream is capped well under the report's artifact ceiling so the
 /// concatenated stdout+stderr stays meaningful.
 const PIPE_CAPTURE_BYTES: usize = 1024 * 1024;
+
+/// How long to wait for the pipe-drain tasks after a timed-out child is
+/// killed before abandoning them. A grandchild that inherited the pipe FDs
+/// can keep them open past the parent's death; the grace lets the common case
+/// (pipes close on kill) collect output while guaranteeing the verifier never
+/// hangs on a leaked descendant. Output is discarded on timeout regardless.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 async fn read_pipe<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     pipe: Option<R>,
@@ -460,6 +474,47 @@ mod tests {
             output.size_bytes <= PIPE_CAPTURE_BYTES as u64,
             "captured output is capped: {}",
             output.size_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_check_with_pipe_holding_grandchild_does_not_hang() {
+        // Regression: a timed-out command whose background grandchild inherits
+        // the stdout/stderr pipe FDs must still report Failed in bounded time.
+        // `child.kill()` signals only the direct process; the grandchild keeps
+        // the pipes open, so an unbounded drain-await would hang the verifier.
+        // The bounded DRAIN_GRACE lets the verifier abandon the leaked pipes.
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a"), "content").unwrap();
+        let verifier = AttestingVerifier::new(TestAttestor, "a".repeat(64)).unwrap();
+        let start = Instant::now();
+        let report = verifier
+            .verify(
+                workspace.path(),
+                "run",
+                "candidate",
+                &[CheckSpec {
+                    name: "leaky".into(),
+                    program: "/bin/sh".into(),
+                    // Foreground blocks past the timeout; the backgrounded
+                    // `sleep 30` inherits stdout/stderr and survives the kill,
+                    // holding the pipes open well beyond DRAIN_GRACE.
+                    arguments: vec!["-c".into(), "sleep 30 & sleep 30".into()],
+                    timeout: Duration::from_millis(50),
+                    required: true,
+                    inherit_environment: false,
+                }],
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        let check = &report.checks[0];
+        assert_eq!(check.status, VerificationStatus::Failed);
+        assert!(!report.passed);
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "verifier must abandon leaked pipes, not hang: took {elapsed:?}"
         );
     }
 
