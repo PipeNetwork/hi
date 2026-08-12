@@ -498,7 +498,10 @@ pub fn mask_key(key: &str) -> String {
 }
 
 /// Serialize `config` to TOML and write it to `path`, creating parent dirs.
-/// Sets 0600 permissions on Unix so API keys in the file aren't world-readable.
+/// Creates the file with 0600 permissions on Unix so API keys in the file
+/// are never world-readable — the mode is set atomically at creation via
+/// `OpenOptions`, not chmod'd after the write (which left a readable window
+/// and discarded chmod failures).
 pub fn save_config_to(config: &Config, path: &Path) -> Result<()> {
     let toml = toml::to_string_pretty(config)
         .with_context(|| format!("serializing config to {}", path.display()))?;
@@ -506,13 +509,37 @@ pub fn save_config_to(config: &Config, path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating config dir {}", parent.display()))?;
     }
-    std::fs::write(path, toml).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    write_private(path, toml.as_bytes())?;
     Ok(())
+}
+
+/// Write `bytes` to `path` with owner-only permissions from the start.
+/// On Unix the file is created with mode 0600 atomically; if it already
+/// existed with wider permissions, those are tightened too (best-effort is
+/// not acceptable for a key-bearing file, so a chmod failure propagates).
+#[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    // A pre-existing file keeps its old mode through OpenOptions; enforce
+    // 0600 on that path too, and surface a failure instead of ignoring it.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("tightening permissions on {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Persist the two user-facing public-RSI controls without exposing gateway

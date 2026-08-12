@@ -779,6 +779,15 @@ fn config_round_trips_through_toml() {
     let path = dir.join("config.toml");
     save_config_to(&config, &path).unwrap();
 
+    // The file holds API keys, so it must be owner-only from the moment it
+    // is created — not chmod'd after a world-readable window.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config file must be owner-only, got {mode:o}");
+    }
+
     // Re-read and verify.
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("[profiles.sonnet]"));

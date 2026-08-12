@@ -123,12 +123,12 @@ fn first_nonempty(candidates: &[Option<String>]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// True when a sync base URL is safe to receive the API key: `https`, or
+/// True when a base URL is safe to receive a credential: `https`, or
 /// loopback `http` (127.0.0.1 / localhost / [::1]) for local dev and tests.
 /// Anything else (plaintext remote http, non-HTTP schemes, malformed URLs)
 /// is rejected so a misconfigured or attacker-controlled endpoint cannot
 /// harvest the credential.
-fn sync_base_url_is_safe(url: &str) -> bool {
+pub(crate) fn sync_base_url_is_safe(url: &str) -> bool {
     let url = url.trim();
     if let Some(rest) = url.strip_prefix("https://") {
         return !rest.is_empty();

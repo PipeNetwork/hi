@@ -97,6 +97,20 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
         );
         // Validates checkpoint/state identity coherence as a side effect.
         checkpoint.canonical_hash()?;
+        // Bind the checkpoint to *this* run before letting it replace state:
+        // `canonical_hash` only proves the checkpoint is internally consistent
+        // (its own run_id matches its embedded state's), not that it belongs to
+        // the run the caller is resuming. Without this, any sealed checkpoint
+        // from any run could be resumed into this executor, silently replacing
+        // the run's identity and history.
+        ensure!(
+            checkpoint.run_id == state.run_id && checkpoint.candidate_id == state.candidate_id,
+            "checkpoint identity ({}, {}) does not match the run being resumed ({}, {})",
+            checkpoint.run_id,
+            checkpoint.candidate_id,
+            state.run_id,
+            state.candidate_id
+        );
         ensure!(
             !checkpoint.workflow_position.is_empty(),
             "checkpoint has no resumable workflow position"
@@ -761,5 +775,50 @@ mod tests {
                 }),
             "resumed checkpoint sequence continues monotonically"
         );
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_a_checkpoint_from_a_different_run() {
+        let first = std::sync::Arc::new(Driver::default());
+        let mut state1 = state();
+        WorkflowExecutor::new(
+            WorkflowGraph::default_coding(),
+            first.clone(),
+            SharedBudgetLedger::new(&budgets()),
+        )
+        .execute(&mut state1)
+        .await
+        .unwrap();
+        let checkpoint = first
+            .checkpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|checkpoint| {
+                checkpoint.workflow_position == BTreeSet::from([StageId::from("implement")])
+            })
+            .cloned()
+            .expect("plan stage seals a checkpoint whose frontier is implement");
+
+        // The caller's state carries a *different* run identity than the
+        // checkpoint — resume must refuse rather than let the foreign
+        // checkpoint replace this run's state.
+        let mut foreign = state();
+        foreign.run_id = "someone-elses-run".into();
+        let result = WorkflowExecutor::new(
+            WorkflowGraph::default_coding(),
+            std::sync::Arc::new(Driver::default()),
+            SharedBudgetLedger::new(&budgets()),
+        )
+        .resume(&checkpoint, &mut foreign)
+        .await;
+        let err = result.expect_err("a checkpoint from another run must not resume");
+        assert!(
+            err.to_string().contains("does not match the run being resumed"),
+            "unexpected error: {err}"
+        );
+        // State is untouched: the foreign run identity was not overwritten.
+        assert_eq!(foreign.run_id, "someone-elses-run");
+        assert!(foreign.plan.is_none());
     }
 }

@@ -50,8 +50,27 @@ fn xai_oauth_token_source(
         .map(|source| std::sync::Arc::new(source) as std::sync::Arc<dyn hi_ai::TokenSource>)
 }
 
+/// The base URL a provider may send the API key to. The key is attached to
+/// every request, so the configured URL must not be able to redirect it onto
+/// a plaintext or non-HTTP endpoint: only https (or loopback http for local
+/// dev) is honored; anything else falls back to the provider's default
+/// endpoint rather than leaking the credential. Same rule the sync path
+/// applies (`sync_base_url_is_safe`). Pure so the policy is testable offline.
+pub(crate) fn credential_safe_base_url(configured: &str, provider: ProviderName) -> String {
+    let trimmed = configured.trim();
+    if trimmed.is_empty() || crate::orchestration::sync_base_url_is_safe(trimmed) {
+        return configured.to_string();
+    }
+    let fallback = provider.default_base_url().to_string();
+    eprintln!(
+        "warning: base_url '{trimmed}' is not https (or loopback http); \
+         using the provider default '{fallback}' to avoid exposing the API key"
+    );
+    fallback
+}
+
 pub(crate) fn build_provider(settings: &Settings) -> Box<dyn Provider> {
-    let base_url = settings.base_url.clone();
+    let base_url = credential_safe_base_url(&settings.base_url, settings.provider);
     let api_key = settings.api_key.clone();
     if settings.provider.is_anthropic() {
         Box::new(AnthropicProvider::new(base_url, api_key))
@@ -257,5 +276,44 @@ pub(crate) async fn resolve_live_model_metadata_with_timeout(
             context_window: None,
             max_output_tokens: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_safe_base_url_keeps_https_and_loopback() {
+        assert_eq!(
+            credential_safe_base_url("https://api.x.ai/v1", ProviderName::Xai),
+            "https://api.x.ai/v1"
+        );
+        assert_eq!(
+            credential_safe_base_url("http://localhost:11434/v1", ProviderName::Ollama),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            credential_safe_base_url("http://127.0.0.1:8080/v1", ProviderName::Openai),
+            "http://127.0.0.1:8080/v1"
+        );
+    }
+
+    #[test]
+    fn credential_safe_base_url_falls_back_on_plaintext_remote() {
+        // A plaintext-remote or non-HTTP endpoint must never receive the key:
+        // the provider's (https) default is used instead.
+        assert_eq!(
+            credential_safe_base_url("http://evil.example/v1", ProviderName::Xai),
+            "https://api.x.ai/v1"
+        );
+        assert_eq!(
+            credential_safe_base_url("ftp://example.com", ProviderName::Anthropic),
+            hi_provider_config::ProviderName::Anthropic.default_base_url()
+        );
+        assert_eq!(
+            credential_safe_base_url("http://169.254.169.254/latest", ProviderName::Openai),
+            "https://openrouter.ai/api/v1"
+        );
     }
 }
