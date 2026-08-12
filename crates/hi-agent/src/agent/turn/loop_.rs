@@ -12,6 +12,8 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
+
+use crate::domain::VerifyEvidence;
 use hi_ai::{ToolMode, estimate_text_tokens};
 use hi_events::{
     ActivityObject, ActivityState, ActivityVerb, EventContext, EventKind, RunEvent,
@@ -548,7 +550,7 @@ impl crate::Agent {
             && !self.config.subagents.is_subagent
             && self.tools_unavailable_for(input)
         {
-            self.report.last_verify = None;
+            self.report.verify = VerifyEvidence::none();
             self.workspace.last_changed_files.clear();
             self.workspace.last_file_changes.clear();
             self.report.last_compat_fallbacks.clear();
@@ -668,7 +670,7 @@ impl crate::Agent {
             self.messages.push_user_or_fold(&model_turn_input);
         }
         self.persist_durable_boundary("prompt")?;
-        self.report.set_verify(None);
+        self.report.verify = VerifyEvidence::none();
         self.workspace.last_changed_files.clear();
         self.workspace.last_file_changes.clear();
         self.report.last_compat_fallbacks.clear();
@@ -756,8 +758,9 @@ impl crate::Agent {
         let verification_unstable = false;
         // A pass is bound to both the ledger event number and the full content
         // digest observed immediately after the verifier. Later workspace
-        // activity must never inherit that pass.
-        let verified_at: Option<(u64, String)> = None;
+        // activity must never inherit that pass. (The bound evidence now lives
+        // in `TurnReportState::verify` as `VerifyEvidence::Passed`, fused with
+        // the verdict so the two cannot diverge.)
         // Whether the model or deterministic preflight has run a tool this
         // turn (kept for finalization gating — a plain Q&A turn doesn't need a
         // recap).
@@ -942,7 +945,6 @@ impl crate::Agent {
             review_unavailable_reason,
             verification_infrastructure_error,
             verification_unstable,
-            verified_at,
             last_verify_attributions,
             turn_snapshot,
             turn_start,
@@ -1216,7 +1218,6 @@ impl crate::Agent {
                     &mut super::verify_outcome::VerifyOutcomeState {
                         obligation_nudge_fired: &mut turn.flags.obligation_nudge_fired,
                         force_tools_next: &mut turn.flags.force_tools_next,
-                        verified_at: &mut turn.verified_at,
                         independent_review_status: &mut turn.independent_review_status,
                         independent_review_repairs: &mut turn.independent_review_repairs,
                         review_unavailable_reason: &mut turn.review_unavailable_reason,
@@ -1281,15 +1282,14 @@ impl crate::Agent {
         {
             let delta = {
                 let ledger = self.runtime.ledger();
-                match turn.verified_at.as_ref() {
-                    Some((revision, _)) => ledger.changes_since(*revision),
+                match self.report.verify.bound_revision_digest() {
+                    Some((revision, _)) => ledger.changes_since(revision),
                     None => ledger_changes.clone(),
                 }
             };
             let review_was_passed = turn.independent_review_status == ReviewStatus::Passed;
             super::settlement::reconcile_verified_revision(
-                &mut self.report.last_verify,
-                &mut turn.verified_at,
+                &mut self.report.verify,
                 &mut turn.independent_review_status,
                 final_ledger_revision,
                 final_workspace_revision.clone(),
@@ -1358,7 +1358,7 @@ impl crate::Agent {
         // learned skill. The ground-truth turn.verifier is the gate (safe with weak local
         // models); opt-in via `curate_skills`, and capped per session.
         if self.config.memory.curate_skills
-            && self.report.last_verify == Some(true)
+            && self.report.verify.passed()
             && !self.workspace.last_changed_files.is_empty()
             && self.subagents.auto_skills_written < super::super::MAX_AUTO_SKILLS_PER_SESSION
         {
@@ -1367,7 +1367,7 @@ impl crate::Agent {
 
         // Phase K: always-on (cheap, no model call) coding-fact extraction into
         // the decision log + project memory after a green file-changing turn.
-        if self.report.last_verify == Some(true) && !self.workspace.last_changed_files.is_empty() {
+        if self.report.verify.passed() && !self.workspace.last_changed_files.is_empty() {
             self.record_coding_facts_turn_end(ui);
         }
 
@@ -1430,15 +1430,14 @@ impl crate::Agent {
         {
             let delta = {
                 let ledger = self.runtime.ledger();
-                match turn.verified_at.as_ref() {
-                    Some((revision, _)) => ledger.changes_since(*revision),
+                match self.report.verify.bound_revision_digest() {
+                    Some((revision, _)) => ledger.changes_since(revision),
                     None => settled_changes.clone(),
                 }
             };
             let review_was_passed = turn.independent_review_status == ReviewStatus::Passed;
             super::settlement::reconcile_verified_revision(
-                &mut self.report.last_verify,
-                &mut turn.verified_at,
+                &mut self.report.verify,
                 &mut turn.independent_review_status,
                 settled_revision,
                 settled_digest.clone(),
@@ -1471,7 +1470,7 @@ impl crate::Agent {
                     plan_updated_goal: turn.plan_updated_goal,
                     proposed_goal: turn.proposed_goal.clone(),
                     goal_before: turn.goal_before.clone(),
-                    verified_at: turn.verified_at.as_ref(),
+                    verified_at: self.report.verify.bound_revision_digest().as_ref(),
                     turn_ledger_revision: turn.turn_ledger_revision,
                     verification_infrastructure_error: turn.verification_infrastructure_error,
                 },
@@ -1479,7 +1478,7 @@ impl crate::Agent {
             )
             .await;
         if goal_invalidated_verification {
-            turn.verified_at = None;
+            self.report.verify.clear();
             if turn.independent_review_status == ReviewStatus::Passed {
                 turn.independent_review_status = ReviewStatus::Unavailable;
                 turn.review_unavailable_reason =
@@ -1546,22 +1545,21 @@ impl crate::Agent {
             let mut ledger = self.runtime.ledger();
             (ledger.revision(), ledger.workspace_revision())
         };
-        let changed_after_final_hooks = self.report.last_verify == Some(true)
-            && turn.verified_at.as_ref().is_none_or(|(revision, digest)| {
-                *revision != outcome_revision || digest != &outcome_digest
+        let changed_after_final_hooks = self.report.verify.passed()
+            && self.report.verify.bound_revision_digest().is_none_or(|(revision, digest)| {
+                revision != outcome_revision || digest != outcome_digest
             });
         if changed_after_final_hooks {
             let delta = {
                 let ledger = self.runtime.ledger();
-                match turn.verified_at.as_ref() {
-                    Some((revision, _)) => ledger.changes_since(*revision),
+                match self.report.verify.bound_revision_digest() {
+                    Some((revision, _)) => ledger.changes_since(revision),
                     None => ledger.changes_since(turn.turn_ledger_revision),
                 }
             };
             let review_was_passed = turn.independent_review_status == ReviewStatus::Passed;
             let wiped = super::settlement::reconcile_verified_revision_with_message(
-                &mut self.report.last_verify,
-                &mut turn.verified_at,
+                &mut self.report.verify,
                 &mut turn.independent_review_status,
                 outcome_revision,
                 outcome_digest.clone(),
@@ -1644,7 +1642,7 @@ impl crate::Agent {
             super::finalize::classify_turn_outcome(
                 turn.verification_infrastructure_error,
                 turn.verification_unstable,
-                self.report.last_verify,
+                self.report.verify.as_bool(),
                 &self.workspace.last_changed_files,
                 turn_had_mutation,
                 no_check_executed,
@@ -1670,7 +1668,7 @@ impl crate::Agent {
             stop_reason,
             changed_files: self.workspace.last_changed_files.clone(),
             verified_workspace_revision: (verification == VerificationStatus::Passed)
-                .then(|| turn.verified_at.as_ref().map(|(_, digest)| digest.clone()))
+                .then(|| self.report.verify.digest().map(str::to_owned))
                 .flatten(),
             effective_route: effective_model_route(
                 &self.config,

@@ -190,11 +190,96 @@ pub(crate) struct TaskContextState {
 }
 
 /// Post-turn report surface: usage, verify, telemetry, phase, route.
+/// The verification verdict for a turn fused with the workspace evidence it is
+/// bound to. A `Passed` verdict cannot exist without its bound
+/// `(ledger_revision, workspace_digest)` — the pairing invariant the
+/// settlement/classify logic used to hold by convention is now enforced by
+/// construction: the only way to produce `Passed` is [`VerifyEvidence::pass`],
+/// which requires the evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VerifyEvidence {
+    /// No verification ran this turn (or was cleared by a cancel/fail finalizer).
+    None,
+    /// A verification stage ran and failed.
+    Failed,
+    /// A verification stage ran and passed, bound to the workspace ledger
+    /// revision and digest at the moment it passed.
+    Passed {
+        revision: u64,
+        digest: String,
+    },
+}
+
+impl VerifyEvidence {
+    /// The only constructor for `Passed` — requires the bound evidence, so a
+    /// pass can never exist without a revision/digest to vouch for it.
+    pub(crate) fn pass(revision: u64, digest: String) -> Self {
+        Self::Passed { revision, digest }
+    }
+
+    pub(crate) fn fail() -> Self {
+        Self::Failed
+    }
+
+    pub(crate) fn none() -> Self {
+        Self::None
+    }
+
+    /// `true` iff a verification stage passed (and therefore carries evidence).
+    pub(crate) fn passed(&self) -> bool {
+        matches!(self, Self::Passed { .. })
+    }
+
+    /// `true` iff a verification stage ran and failed.
+    pub(crate) fn failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    /// Map to the historical `Option<bool>` verdict shape: `Some(true)` for
+    /// Passed, `Some(false)` for Failed, `None` for no verification. Preserves
+    /// the read semantics of the old `last_verify: Option<bool>` field.
+    pub(crate) fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Passed { .. } => Some(true),
+            Self::Failed => Some(false),
+            Self::None => None,
+        }
+    }
+
+    /// The bound `(revision, digest)` evidence, or `None` when not Passed.
+    /// Replaces reads of the old `turn.verified_at` field.
+    pub(crate) fn bound_revision_digest(&self) -> Option<(u64, String)> {
+        match self {
+            Self::Passed { revision, digest } => Some((*revision, digest.clone())),
+            _ => None,
+        }
+    }
+
+    /// The bound workspace digest, or `None` when not Passed.
+    pub(crate) fn digest(&self) -> Option<&str> {
+        match self {
+            Self::Passed { digest, .. } => Some(digest),
+            _ => None,
+        }
+    }
+
+    /// Reset to no verification (cancel/fail finalizers, settlement invalidation).
+    pub(crate) fn clear(&mut self) {
+        *self = Self::None;
+    }
+}
+
+impl Default for VerifyEvidence {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TurnReportState {
     pub(crate) last_turn_usage: Usage,
     pub(crate) last_user_prompt_tokens: u64,
-    pub(crate) last_verify: Option<bool>,
+    pub(crate) verify: VerifyEvidence,
     pub(crate) context_used: u64,
     pub(crate) last_compat_fallbacks: Vec<String>,
     pub(crate) last_turn_telemetry: TurnTelemetry,
@@ -208,7 +293,7 @@ impl TurnReportState {
         Self {
             last_turn_usage: Usage::default(),
             last_user_prompt_tokens: 0,
-            last_verify: None,
+            verify: VerifyEvidence::None,
             context_used: 0,
             last_compat_fallbacks: Vec::new(),
             last_turn_telemetry: TurnTelemetry::default(),
@@ -224,25 +309,12 @@ impl TurnReportState {
         self.last_turn_outcome = Some(outcome);
     }
 
-    /// Clear verify flag (e.g. cancel/fail finalizers).
-    ///
-    /// INVARIANT: `last_verify` and the turn's `verified_at` (revision/digest
-    /// evidence) must be cleared together. `classify_turn_outcome` maps
-    /// `Some(true)` → `Passed` and trusts that a surviving `Some(true)` always
-    /// has matching `verified_at` evidence; clearing one but not the other
-    /// would report Passed with no bound revision. Every current clear site
-    /// (cancel/fail finalizers, `reconcile_verified_revision`) upholds this.
+    /// Clear verification evidence (cancel/fail finalizers, settlement
+    /// invalidation). The verdict and its bound revision/digest are fused in
+    /// [`VerifyEvidence`], so this clears both atomically — a `Passed` verdict
+    /// can no longer survive without its evidence.
     pub(crate) fn clear_verify(&mut self) {
-        self.last_verify = None;
-    }
-
-    /// Record a verify boolean for the settle/report surface.
-    ///
-    /// INVARIANT: setting `Some(true)` must be paired with stamping the turn's
-    /// `verified_at` evidence (see the `clear_verify` invariant). Set/clear
-    /// these two together.
-    pub(crate) fn set_verify(&mut self, passed: Option<bool>) {
-        self.last_verify = passed;
+        self.verify.clear();
     }
 }
 

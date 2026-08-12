@@ -24,6 +24,8 @@
 
 use std::sync::Arc;
 
+use crate::domain::VerifyEvidence;
+
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
 
 /// How much of the turn diff to show the **goal** skeptic, counted in **Unicode
@@ -197,10 +199,10 @@ impl crate::Agent {
                 .map(|n| format!("\n  — {n}"))
                 .collect::<String>()
         };
-        let verify = match self.report.last_verify {
-            Some(true) => "verify result: PASSED",
-            Some(false) => "verify result: FAILED",
-            None => "verify result: (none configured)",
+        let verify = match self.report.verify {
+            VerifyEvidence::Passed { .. } => "verify result: PASSED",
+            VerifyEvidence::Failed => "verify result: FAILED",
+            VerifyEvidence::None => "verify result: (none configured)",
         };
         let files = if self.workspace.last_changed_files.is_empty() {
             "(none detected)".to_string()

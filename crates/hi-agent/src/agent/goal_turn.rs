@@ -5,6 +5,7 @@
 use crate::Ui;
 use crate::agent::skeptic::SkepticVerdict;
 use crate::decision::Decision;
+use crate::domain::VerifyEvidence;
 use crate::goal::{DEFAULT_SUBGOAL_RETRIES, Goal, GoalStatus, SkepticStatus};
 
 pub(crate) struct GoalTurnState<'a> {
@@ -94,7 +95,7 @@ impl crate::Agent {
         // Phase C: same obligation as the interactive settle path — a done-claim
         // via update_plan or heuristic advance is not enough without a green seal
         // and a non-stalled turn. Skeptic (below) is an extra gate on top.
-        let verified_clean = matches!(self.report.last_verify, Some(true));
+        let verified_clean = self.report.verify.passed();
         let mut clean_success =
             verified_clean && !stalled_unfinished && !stalled_repeating && !hit_step_cap;
 
@@ -268,7 +269,7 @@ impl crate::Agent {
                         changes.iter().map(|change| change.path.clone()).collect();
                     self.workspace.last_file_changes = changes;
                     if !current_pass {
-                        self.report.last_verify = None;
+                        self.report.verify = VerifyEvidence::none();
                         clean_success = false;
                         verification_invalidated = true;
                         self.goals.structured = goal_before.clone();
@@ -279,7 +280,7 @@ impl crate::Agent {
                     }
                 }
                 Err(error) => {
-                    self.report.last_verify = None;
+                    self.report.verify = VerifyEvidence::none();
                     clean_success = false;
                     verification_invalidated = true;
                     self.goals.structured = goal_before.clone();
@@ -314,7 +315,7 @@ impl crate::Agent {
         // A clean read-only turn (investigation, Q&A — no edits, no verify,
         // no stall) is neutral: neither advance nor record failure. The sub-goal
         // stays active for the next turn, which should do the actual work.
-        let no_edit_neutral = self.report.last_verify.is_none()
+        let no_edit_neutral = self.report.verify.as_bool().is_none()
             && !stalled_unfinished
             && !stalled_repeating
             && !hit_step_cap
@@ -536,13 +537,13 @@ impl crate::Agent {
         }
         let reason = if hit_step_cap {
             "hit the per-turn step cap"
-        } else if self.report.last_verify == Some(false) {
+        } else if self.report.verify.failed() {
             "verification failed and the turn ended without fixing it"
         } else if stalled_repeating {
             "stalled repeating the same tool call"
         } else if stalled_unfinished {
             "ended without completing the requested work"
-        } else if self.report.last_verify.is_none() && !self.workspace.last_changed_files.is_empty()
+        } else if self.report.verify.as_bool().is_none() && !self.workspace.last_changed_files.is_empty()
         {
             "ended with unverified workspace changes"
         } else {

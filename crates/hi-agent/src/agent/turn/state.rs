@@ -97,7 +97,6 @@ pub(super) struct TurnState {
     pub review_unavailable_reason: Option<String>,
     pub verification_infrastructure_error: bool,
     pub verification_unstable: bool,
-    pub verified_at: Option<(u64, String)>,
     pub last_verify_attributions: Vec<hi_tools::Attribution>,
     pub turn_snapshot: Option<Snapshot>,
     pub turn_start: usize,

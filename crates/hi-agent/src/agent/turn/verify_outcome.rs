@@ -10,6 +10,7 @@ use anyhow::Result;
 use crate::transcript::NudgeKind;
 use crate::verify::{VerifyOutcome, WorkspaceRepairVerifier, stage_guidance};
 use crate::{ReviewStatus, Ui};
+use crate::domain::VerifyEvidence;
 
 use super::helpers::fallback_review_line_count;
 
@@ -26,7 +27,6 @@ pub(super) enum VerifyOutcomeControl {
 pub(super) struct VerifyOutcomeState<'a> {
     pub(super) obligation_nudge_fired: &'a mut bool,
     pub(super) force_tools_next: &'a mut bool,
-    pub(super) verified_at: &'a mut Option<(u64, String)>,
     pub(super) independent_review_status: &'a mut ReviewStatus,
     pub(super) independent_review_repairs: &'a mut u32,
     pub(super) review_unavailable_reason: &'a mut Option<String>,
@@ -80,7 +80,7 @@ impl crate::Agent {
                         expected_mutation,
                         &changed_now,
                         mutation_now,
-                        self.report.last_verify,
+                        self.report.verify.as_bool(),
                         verifier.executions().len(),
                         state.validation_after_last_mutation,
                     )
@@ -105,7 +105,7 @@ impl crate::Agent {
                         }
                     }
                 }
-                if self.report.last_verify == Some(false) {
+                if self.report.verify.failed() {
                     *state.stalled_unfinished = true;
                     ui.status(
                         "verification still failed after the retry budget; the task may be incomplete. /retry, or send 'continue'.",
@@ -131,7 +131,7 @@ impl crate::Agent {
                         expected_mutation,
                         &[],
                         mutation_now,
-                        self.report.last_verify,
+                        self.report.verify.as_bool(),
                         verifier.executions().len(),
                         state.validation_after_last_mutation,
                     )
@@ -164,7 +164,6 @@ impl crate::Agent {
             }
             VerifyOutcome::Passed => {
                 ui.status("✓ verification passed");
-                self.report.set_verify(Some(true));
                 self.reconcile_workspace_changes().await?;
                 let (verified_revision, verified_digest, current_changes) = {
                     let mut ledger = self.runtime.ledger();
@@ -174,7 +173,10 @@ impl crate::Agent {
                         ledger.changes_since(turn_ledger_revision),
                     )
                 };
-                *state.verified_at = Some((verified_revision, verified_digest.clone()));
+                // Fuse verdict + evidence in one assignment: a Passed verdict
+                // cannot exist without its bound (revision, digest).
+                self.report.verify =
+                    VerifyEvidence::pass(verified_revision, verified_digest.clone());
                 let current_files = current_changes
                     .iter()
                     .map(|change| change.path.clone())
@@ -292,8 +294,7 @@ impl crate::Agent {
                             *state.independent_review_repairs =
                                 state.independent_review_repairs.saturating_add(1);
                             *state.independent_review_status = ReviewStatus::Objected;
-                            self.report.set_verify(None);
-                            *state.verified_at = None;
+                            self.report.verify = VerifyEvidence::none();
                             verifier.allow_review_revalidation();
                             let headline = if large_diff_review {
                                 "Large-diff skeptic found concrete multi-file defects"
@@ -352,8 +353,7 @@ impl crate::Agent {
                 round,
             } => {
                 ui.status(&format!("✗ {} failed; iterating", stage.name));
-                self.report.set_verify(Some(false));
-                *state.verified_at = None;
+                self.report.verify = VerifyEvidence::fail();
                 if round >= 2 && !self.repair_effort_escalated {
                     self.repair_effort_escalated = true;
                     ui.status(
@@ -391,8 +391,7 @@ impl crate::Agent {
                 round,
             } => {
                 *state.verification_infrastructure_error = true;
-                self.report.set_verify(None);
-                *state.verified_at = None;
+                self.report.verify = VerifyEvidence::none();
                 ui.status(&format!(
                     "verification infrastructure failed at {} (round {round}): {output}",
                     stage.name,
@@ -406,8 +405,7 @@ impl crate::Agent {
             } => {
                 *state.verification_unstable = true;
                 *state.stalled_unfinished = true;
-                self.report.set_verify(Some(false));
-                *state.verified_at = None;
+                self.report.verify = VerifyEvidence::fail();
                 ui.status(&format!(
                     "verification is unstable in round {round}: stage {} modified {}",
                     stage.name,

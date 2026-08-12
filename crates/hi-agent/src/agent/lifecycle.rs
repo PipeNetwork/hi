@@ -7,6 +7,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use hi_ai::{Message, Provider, Role, ToolMode, Usage, provider_error_usage};
 
+use crate::domain::VerifyEvidence;
+
 use super::tool_selection::{
     BackgroundToolAvailability, advertised_tools, advertised_tools_with_background,
 };
@@ -365,7 +367,7 @@ impl crate::Agent {
         self.goals.set_plan_if_pending(plan);
         self.workspace.last_changed_files = Vec::new();
         self.report.last_turn_telemetry = TurnTelemetry::default();
-        self.report.last_verify = None;
+        self.report.verify = VerifyEvidence::none();
         // Re-seed the context gauge for the switched-in transcript (see
         // `resume`): carrying the previous session's value either disables
         // graceful compaction or triggers it spuriously.
@@ -1648,7 +1650,7 @@ impl crate::Agent {
 
     /// Whether the most recent turn's verification passed (None if not run).
     pub fn last_verify(&self) -> Option<bool> {
-        self.report.last_verify
+        self.report.verify.as_bool()
     }
 
     /// Files whose content or presence changed in the most recent turn.

@@ -273,7 +273,7 @@ async fn tools_unavailable_fast_path_resets_state_and_shows_message() {
     let mut cfg = config();
     cfg.routing.tool_mode = ToolMode::ChatOnly;
     let mut agent = agent(vec![], cfg);
-    agent.report.last_verify = Some(true);
+    agent.report.verify = crate::domain::VerifyEvidence::pass(0, String::new());
     agent.workspace.last_changed_files = vec!["old.rs".to_string()];
     agent.report.last_compat_fallbacks = vec!["compat fallback".to_string()];
     agent.report.last_turn_telemetry = TurnTelemetry {

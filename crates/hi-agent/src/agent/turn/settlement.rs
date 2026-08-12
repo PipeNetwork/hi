@@ -1,6 +1,7 @@
 //! Post-verification workspace settlement: keep or invalidate a green verify
 //! when the tree moves after the check.
 
+use crate::domain::VerifyEvidence;
 use crate::outcome::ReviewStatus;
 use crate::ui::Ui;
 use hi_tools::FileChange;
@@ -15,8 +16,7 @@ const DEFAULT_INVALIDATED: &str =
 ///
 /// Returns `true` when a green verify was wiped (caller may roll back goal state).
 pub(super) fn reconcile_verified_revision(
-    last_verify: &mut Option<bool>,
-    verified_at: &mut Option<(u64, String)>,
+    evidence: &mut VerifyEvidence,
     independent_review_status: &mut ReviewStatus,
     current_revision: u64,
     current_digest: String,
@@ -24,8 +24,7 @@ pub(super) fn reconcile_verified_revision(
     ui: &mut dyn Ui,
 ) -> bool {
     reconcile_verified_revision_with_message(
-        last_verify,
-        verified_at,
+        evidence,
         independent_review_status,
         current_revision,
         current_digest,
@@ -41,8 +40,7 @@ pub(super) fn reconcile_verified_revision(
     reason = "the helper reconciles several coupled pieces of turn settlement state"
 )]
 pub(super) fn reconcile_verified_revision_with_message(
-    last_verify: &mut Option<bool>,
-    verified_at: &mut Option<(u64, String)>,
+    evidence: &mut VerifyEvidence,
     independent_review_status: &mut ReviewStatus,
     current_revision: u64,
     current_digest: String,
@@ -50,12 +48,11 @@ pub(super) fn reconcile_verified_revision_with_message(
     ui: &mut dyn Ui,
     invalidated_message: &str,
 ) -> bool {
-    if *last_verify != Some(true) {
+    // Only a Passed verdict (which carries bound evidence) can drift.
+    let VerifyEvidence::Passed { revision, digest } = evidence else {
         return false;
-    }
-    let drifted = verified_at.as_ref().is_none_or(|(revision, digest)| {
-        *revision != current_revision || digest != &current_digest
-    });
+    };
+    let drifted = *revision != current_revision || digest != &current_digest;
     if !drifted {
         return false;
     }
@@ -66,11 +63,13 @@ pub(super) fn reconcile_verified_revision_with_message(
     if post_verify_delta_is_benign(delta_since_verified) {
         // Keep the pass; refresh the sealed revision to the new head so
         // later settlement checks compare against the prose write too.
-        *verified_at = Some((current_revision, current_digest));
+        *evidence = VerifyEvidence::pass(current_revision, current_digest);
         false
     } else {
-        *last_verify = None;
-        *verified_at = None;
+        // Wipe verdict + evidence together — a single assignment, since they
+        // are fused in `VerifyEvidence`. A Passed verdict cannot survive
+        // without its bound revision.
+        *evidence = VerifyEvidence::none();
         if *independent_review_status == ReviewStatus::Passed {
             *independent_review_status = ReviewStatus::Unavailable;
         }
@@ -112,13 +111,11 @@ mod tests {
 
     #[test]
     fn prose_delta_keeps_pass_and_refreshes_head() {
-        let mut last = Some(true);
-        let mut verified = Some((1, "old".into()));
+        let mut evidence = VerifyEvidence::pass(1, "old".into());
         let mut review = ReviewStatus::Passed;
         let mut ui = NullUi;
         let wiped = reconcile_verified_revision(
-            &mut last,
-            &mut verified,
+            &mut evidence,
             &mut review,
             2,
             "new".into(),
@@ -126,20 +123,17 @@ mod tests {
             &mut ui,
         );
         assert!(!wiped);
-        assert_eq!(last, Some(true));
-        assert_eq!(verified, Some((2, "new".into())));
+        assert_eq!(evidence, VerifyEvidence::pass(2, "new".into()));
         assert_eq!(review, ReviewStatus::Passed);
     }
 
     #[test]
     fn code_delta_wipes_pass() {
-        let mut last = Some(true);
-        let mut verified = Some((1, "old".into()));
+        let mut evidence = VerifyEvidence::pass(1, "old".into());
         let mut review = ReviewStatus::Passed;
         let mut ui = NullUi;
         let wiped = reconcile_verified_revision(
-            &mut last,
-            &mut verified,
+            &mut evidence,
             &mut review,
             2,
             "new".into(),
@@ -147,8 +141,7 @@ mod tests {
             &mut ui,
         );
         assert!(wiped);
-        assert_eq!(last, None);
-        assert_eq!(verified, None);
+        assert_eq!(evidence, VerifyEvidence::None);
         assert_eq!(review, ReviewStatus::Unavailable);
     }
 
@@ -156,13 +149,11 @@ mod tests {
     fn empty_delta_keeps_pass_when_revision_drifts() {
         // Ledger head can move without a file delta (reconcile/bookkeeping).
         // That must not brand a green turn "checks did not settle".
-        let mut last = Some(true);
-        let mut verified = Some((1, "old".into()));
+        let mut evidence = VerifyEvidence::pass(1, "old".into());
         let mut review = ReviewStatus::Passed;
         let mut ui = NullUi;
         let wiped = reconcile_verified_revision(
-            &mut last,
-            &mut verified,
+            &mut evidence,
             &mut review,
             2,
             "new".into(),
@@ -170,20 +161,17 @@ mod tests {
             &mut ui,
         );
         assert!(!wiped, "empty delta must not wipe a green verify");
-        assert_eq!(last, Some(true));
-        assert_eq!(verified, Some((2, "new".into())));
+        assert_eq!(evidence, VerifyEvidence::pass(2, "new".into()));
         assert_eq!(review, ReviewStatus::Passed);
     }
 
     #[test]
     fn no_op_when_not_green() {
-        let mut last = Some(false);
-        let mut verified = None;
+        let mut evidence = VerifyEvidence::fail();
         let mut review = ReviewStatus::NotRequired;
         let mut ui = NullUi;
         let wiped = reconcile_verified_revision(
-            &mut last,
-            &mut verified,
+            &mut evidence,
             &mut review,
             9,
             "x".into(),
@@ -191,6 +179,6 @@ mod tests {
             &mut ui,
         );
         assert!(!wiped);
-        assert_eq!(last, Some(false));
+        assert_eq!(evidence, VerifyEvidence::fail());
     }
 }

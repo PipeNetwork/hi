@@ -14,7 +14,7 @@ impl crate::Agent {
         if self.subagents.coding_facts_written >= MAX_CODING_FACTS_PER_SESSION {
             return;
         }
-        if self.report.last_verify != Some(true) || self.workspace.last_changed_files.is_empty() {
+        if !self.report.verify.passed() || self.workspace.last_changed_files.is_empty() {
             return;
         }
 
