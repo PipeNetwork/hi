@@ -262,7 +262,8 @@ impl Theme {
     /// band a terminal theme won't match. This is the non-truecolor fallback.
     /// Blue foregrounds use the bright variant (`LightBlue`): the standard
     /// dark ANSI blue is unreadable on the black backgrounds this palette
-    /// targets.
+    /// targets. Error/deletion reds use `LightRed` for the same reason —
+    /// dark red is the next-lowest-luminance slot after blue.
     pub const fn ansi() -> Self {
         Self {
             accent_user: Color::LightBlue,
@@ -270,7 +271,7 @@ impl Theme {
             accent_thinking: Color::DarkGray,
             accent_tool: Color::Cyan,
             accent_system: Color::LightBlue,
-            accent_error: Color::Red,
+            accent_error: Color::LightRed,
             accent_success: Color::Green,
             accent_running: Color::Cyan,
             accent_skill: Color::LightBlue,
@@ -295,7 +296,7 @@ impl Theme {
             syn_number: Color::Yellow,
             syn_comment: Color::DarkGray,
             diff_add: Color::Green,
-            diff_del: Color::Red,
+            diff_del: Color::LightRed,
             diff_hunk: Color::Cyan,
             diff_context: Color::DarkGray,
             diff_gutter: Color::DarkGray,
