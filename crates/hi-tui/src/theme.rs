@@ -260,17 +260,20 @@ impl Theme {
     /// Named-ANSI palette: reproduces hi's historical look and respects the
     /// user's own terminal colors. Backgrounds are `Reset` so nothing paints a
     /// band a terminal theme won't match. This is the non-truecolor fallback.
+    /// Blue foregrounds use the bright variant (`LightBlue`): the standard
+    /// dark ANSI blue is unreadable on the black backgrounds this palette
+    /// targets.
     pub const fn ansi() -> Self {
         Self {
-            accent_user: Color::Blue,
+            accent_user: Color::LightBlue,
             accent_assistant: Color::Magenta,
             accent_thinking: Color::DarkGray,
             accent_tool: Color::Cyan,
-            accent_system: Color::Blue,
+            accent_system: Color::LightBlue,
             accent_error: Color::Red,
             accent_success: Color::Green,
             accent_running: Color::Cyan,
-            accent_skill: Color::Blue,
+            accent_skill: Color::LightBlue,
             accent_plan: Color::Cyan,
             accent_goal: Color::Magenta,
             accent_verify: Color::Cyan,
@@ -283,11 +286,11 @@ impl Theme {
             path: Color::Cyan,
             command: Color::Cyan,
             code: Color::Cyan,
-            link: Color::Blue,
-            status: Color::Blue,
+            link: Color::LightBlue,
+            status: Color::LightBlue,
             syn_keyword: Color::Magenta,
             syn_type: Color::Cyan,
-            syn_function: Color::Blue,
+            syn_function: Color::LightBlue,
             syn_string: Color::Green,
             syn_number: Color::Yellow,
             syn_comment: Color::DarkGray,
