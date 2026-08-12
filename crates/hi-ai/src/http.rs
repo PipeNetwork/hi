@@ -344,20 +344,10 @@ fn build_agent_http_client(
         // Credentials are attached to requests against a configured base host.
         // reqwest strips `Authorization` on cross-host redirects but NOT custom
         // headers like Anthropic's `x-api-key`, so a same-scheme redirect to a
-        // different host would forward the key. Refuse cross-host redirects
-        // outright; same-host redirects (path/version changes) still work.
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            let from = attempt.previous();
-            let to = attempt.url();
-            let cross_host = from.last().is_some_and(|prev| {
-                prev.host_str() != to.host_str() || prev.port_or_known_default() != to.port_or_known_default()
-            });
-            if cross_host {
-                attempt.error("refusing cross-host redirect with credentials attached")
-            } else {
-                attempt.follow()
-            }
-        }))
+        // different host would forward the key. A same-host https→http hop
+        // would also send the key in the clear. Refuse any origin change
+        // (host, port, or scheme); same-origin path/version redirects still work.
+        .redirect(credential_redirect_policy())
         .connect_timeout(Duration::from_secs(connect_timeout_secs))
         .read_timeout(Duration::from_secs(read_timeout_secs))
         .pool_idle_timeout(Some(Duration::from_secs(http_timeout_secs(
@@ -384,23 +374,60 @@ fn build_agent_http_client(
 }
 
 /// Last-resort client that still carries timeouts — never fall back to an
-/// unbounded `Client::new()`.
+/// unbounded `Client::new()`. Keeps the same credential redirect policy as
+/// the primary agent client so a builder failure cannot silently start
+/// forwarding `x-api-key` across hosts or onto http.
 pub fn timed_http_client_fallback(
     connect_timeout_secs: u64,
     read_timeout_secs: u64,
 ) -> reqwest::Client {
     reqwest::Client::builder()
+        .redirect(credential_redirect_policy())
         .connect_timeout(Duration::from_secs(connect_timeout_secs.max(1)))
         .read_timeout(Duration::from_secs(read_timeout_secs.max(1)))
         .build()
         .unwrap_or_else(|_| {
             reqwest::Client::builder()
+                .redirect(credential_redirect_policy())
                 .timeout(Duration::from_secs(
                     read_timeout_secs.max(connect_timeout_secs).max(1),
                 ))
                 .build()
                 .expect("failed to build timed reqwest Client")
         })
+}
+
+/// Redirect policy for HTTP clients that attach credentials (`Authorization`,
+/// Anthropic `x-api-key`, portal `x-api-key`). Follows only same-origin hops
+/// (host, port, and scheme). reqwest strips `Authorization` on a cross-host
+/// redirect but not custom headers, and a same-host https→http hop would
+/// send the key in the clear.
+pub fn credential_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(credential_redirect_action)
+}
+
+/// Follow only same-origin redirects. Credentials (including Anthropic's
+/// `x-api-key`, which reqwest does not strip) stay on the configured host.
+fn credential_redirect_action(
+    attempt: reqwest::redirect::Attempt<'_>,
+) -> reqwest::redirect::Action {
+    let Some(prev) = attempt.previous().last() else {
+        return attempt.error("refusing redirect with empty previous chain");
+    };
+    if redirect_leaves_origin(prev, attempt.url()) {
+        attempt.error("refusing cross-origin redirect with credentials attached")
+    } else {
+        attempt.follow()
+    }
+}
+
+/// True when a redirect would leave the request origin: different host, port,
+/// or scheme. Same-host https→http is included so a key is never sent in the
+/// clear after an https start.
+fn redirect_leaves_origin(from: &reqwest::Url, to: &reqwest::Url) -> bool {
+    from.host_str() != to.host_str()
+        || from.port_or_known_default() != to.port_or_known_default()
+        || from.scheme() != to.scheme()
 }
 
 pub fn auth_refresh_deadline() -> Duration {
@@ -925,6 +952,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, "ok");
+    }
+
+    #[test]
+    fn redirect_leaves_origin_on_host_port_or_scheme_change() {
+        let http_a = reqwest::Url::parse("http://127.0.0.1:8080/v1").unwrap();
+        let http_a_path = reqwest::Url::parse("http://127.0.0.1:8080/v2").unwrap();
+        let http_b_port = reqwest::Url::parse("http://127.0.0.1:8081/v1").unwrap();
+        let http_other_host = reqwest::Url::parse("http://example.test/v1").unwrap();
+        let https_a = reqwest::Url::parse("https://127.0.0.1:8080/v1").unwrap();
+
+        assert!(
+            !redirect_leaves_origin(&http_a, &http_a_path),
+            "same origin path change must still be followable"
+        );
+        assert!(redirect_leaves_origin(&http_a, &http_b_port));
+        assert!(redirect_leaves_origin(&http_a, &http_other_host));
+        assert!(
+            redirect_leaves_origin(&https_a, &http_a),
+            "https→http on the same host must not forward credentials"
+        );
     }
 }
 

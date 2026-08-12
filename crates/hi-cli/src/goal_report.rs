@@ -1,4 +1,4 @@
-pub(crate) fn report_goal(goal: Option<&hi_agent::Goal>) -> Option<serde_json::Value> {
+pub(crate) fn report_goal(goal: Option<&hi_agent::Goal>, stall: u32) -> Option<serde_json::Value> {
     goal.map(|goal| {
         let phases: Vec<serde_json::Value> = goal
             .sub_goals
@@ -16,6 +16,11 @@ pub(crate) fn report_goal(goal: Option<&hi_agent::Goal>) -> Option<serde_json::V
             "total": goal.sub_goals.len(),
             "status": format!("{:?}", goal.status),
             "paused": goal.paused,
+            "drive": hi_agent::goal_drive_status(
+                goal.has_drive_work(),
+                goal.is_paused(),
+                stall,
+            ),
             "active_index": goal.active_index(),
             "sub_goals": goal.sub_goals,
             "phases": phases,
@@ -50,9 +55,9 @@ mod tests {
             "ship the parser",
             vec!["implement parser".into(), "update callers".into()],
         );
-        let before = report_goal(Some(&goal)).unwrap();
+        let before = report_goal(Some(&goal), 0).unwrap();
         assert!(goal.record_failure("first approach broke escaped input", 2));
-        let after = report_goal(Some(&goal)).unwrap();
+        let after = report_goal(Some(&goal), 0).unwrap();
 
         assert_eq!(before["done"], after["done"]);
         assert_eq!(before["total"], after["total"]);
@@ -77,7 +82,7 @@ mod tests {
         goal.sub_goals[1].status = hi_agent::GoalStatus::Active;
         goal.sub_goals[2].status = hi_agent::GoalStatus::Pending;
 
-        let report = report_goal(Some(&goal)).unwrap();
+        let report = report_goal(Some(&goal), 0).unwrap();
         let phases = report["phases"].as_array().unwrap();
         assert_eq!(phases.len(), 3);
         assert_eq!(phases[0]["title"], "step one");
@@ -93,9 +98,22 @@ mod tests {
         let mut goal = hi_agent::Goal::new("x", vec!["a".into(), "b".into()]);
         goal.sub_goals[0].status = hi_agent::GoalStatus::Failed;
         goal.sub_goals[1].status = hi_agent::GoalStatus::Blocked;
-        let report = report_goal(Some(&goal)).unwrap();
+        let report = report_goal(Some(&goal), 0).unwrap();
         let phases = report["phases"].as_array().unwrap();
         assert_eq!(phases[0]["state"], "pending");
         assert_eq!(phases[1]["state"], "pending");
+    }
+
+    #[test]
+    fn drive_field_reports_running_paused_and_parked() {
+        let goal = hi_agent::Goal::new("ship", vec!["step".into()]);
+        let running = report_goal(Some(&goal), 0).unwrap();
+        assert_eq!(running["drive"], "running");
+        let parked = report_goal(Some(&goal), hi_agent::GOAL_DRIVE_STALL_LIMIT).unwrap();
+        assert_eq!(parked["drive"], "parked");
+        let mut paused = goal;
+        paused.pause(hi_agent::GoalPauseReason::User);
+        let paused = report_goal(Some(&paused), 0).unwrap();
+        assert_eq!(paused["drive"], "paused");
     }
 }

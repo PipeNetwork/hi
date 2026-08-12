@@ -361,13 +361,7 @@ impl crate::Agent {
                 );
                 progress_tracker.record_tool(&progress_label);
                 tool_progress_labels.push(progress_label.clone());
-                tool_timeline.push(tool_entry(
-                    name.clone(),
-                    path,
-                    0,
-                    &output,
-                    &progress_label,
-                ));
+                tool_timeline.push(tool_entry(name.clone(), path, 0, &output, &progress_label));
                 results[i] = Some((id.clone(), msg));
                 completed[i] = true;
                 completion_order.push(i);
@@ -1122,6 +1116,7 @@ impl crate::Agent {
                         | "delegate"
                         | "record_decision"
                         | "block_step"
+                        | "ask_user"
                         | "task"
                         | "get_task_output"
                         | "wait_tasks"
@@ -1244,6 +1239,7 @@ impl crate::Agent {
                     "wait_tasks" => self.handle_wait_tasks(arguments).await,
                     "kill_task" => self.handle_kill_task(arguments).await,
                     "block_step" => self.handle_block_step(arguments),
+                    "ask_user" => self.handle_ask_user(arguments, &mut *ui).await,
                     _ => self.handle_record_decision(arguments),
                 };
                 let duration_ms = started.elapsed().as_millis() as u64;

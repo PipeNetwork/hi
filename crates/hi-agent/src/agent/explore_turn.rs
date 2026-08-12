@@ -130,6 +130,7 @@ impl crate::Agent {
                 // A read-only explorer's text output IS its answer — don't nudge it to
                 // keep going after it stops with text.
                 max_silent_continues: 0,
+                max_keep_working: 0,
                 ..crate::AgentLoopLimits::default()
             },
             memory: crate::AgentMemory {

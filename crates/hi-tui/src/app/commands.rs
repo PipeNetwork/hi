@@ -215,6 +215,12 @@ impl crate::App {
                     self.input.save_history(&self.workspace_root);
                     return Some(line);
                 }
+                if let Some(hint) = self.suggested_prompt.take() {
+                    return Some(hint);
+                }
+                if let Some(prompt) = self.last_drive.resume_prompt() {
+                    return Some(prompt.to_string());
+                }
             }
             KeyCode::Char('u') if ctrl => self.input.kill_to_start(),
             KeyCode::Char('a') if ctrl => self.input.home(),
@@ -826,6 +832,7 @@ impl crate::App {
                 let (msg, style) =
                     match agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::None) {
                         Ok(true) => {
+                            agent.reset_goal_drive_stall();
                             let text = if was_review || arg == "accept" {
                                 "✓ plan accepted — goal driving turns again"
                             } else {
@@ -882,6 +889,10 @@ impl crate::App {
             "" | "status" | "show" => {
                 self.refresh_goal(agent);
                 if let Some(g) = agent.structured_goal() {
+                    self.push(Line::styled(
+                        format!("goal drive: {}", agent.goal_drive_status()),
+                        dim(),
+                    ));
                     for line in g.status_report().lines() {
                         self.push(Line::styled(line.to_string(), dim()));
                     }
@@ -907,7 +918,11 @@ impl crate::App {
                 } else {
                     text
                 };
-                let mut error = Self::apply_goal(agent, &text, vec![text.clone()]);
+                let mut error = if let Some(goal) = agent.try_ingest_goal(&text) {
+                    Self::apply_installed_goal(agent, &text, goal)
+                } else {
+                    Self::apply_goal(agent, &text, vec![text.clone()])
+                };
                 if error.is_none()
                     && review
                     && let Err(err) =
@@ -1243,6 +1258,39 @@ impl crate::App {
         self.follow();
     }
 
+    /// Install a goal ingested from a workspace checklist (no planner).
+    pub(crate) fn set_ingested_goal(
+        &mut self,
+        agent: &mut Agent,
+        objective: &str,
+        goal: hi_agent::Goal,
+    ) {
+        let (review, text) = command::parse_goal_objective_flags(objective);
+        let objective = if text.is_empty() {
+            objective
+        } else {
+            text.as_str()
+        };
+        let mut error = Self::apply_installed_goal(agent, objective, goal);
+        if error.is_none()
+            && review
+            && let Err(err) = agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review)
+        {
+            error = Some(format!("goal review mode failed: {err:#}"));
+        }
+        self.refresh_goal(agent);
+        let review_ready = review && agent.structured_goal().is_some() && error.is_none();
+        self.report_goal_result(agent, objective, error);
+        if review_ready {
+            self.push(Line::styled(
+                "review mode — /goal accept to start driving".to_string(),
+                dim(),
+            ));
+        }
+        self.echo_installed_goal(agent);
+        self.follow();
+    }
+
     /// Install a goal whose sub-goals a planner already decomposed (from the run
     /// loop, after [`Agent::decompose_goal`]), then echo the resulting checklist.
     pub(crate) fn set_planned_goal(
@@ -1273,28 +1321,7 @@ impl crate::App {
                 dim(),
             ));
         }
-        if let Some(g) = agent.structured_goal() {
-            for line in g.status_report().lines().take(30) {
-                self.push(Line::styled(line.to_string(), dim()));
-            }
-            // Advisory only — say now which steps name infrastructure this
-            // machine lacks, while it still costs nothing to install. The drive
-            // discovers the same thing eventually, but hours in and one
-            // exhausted retry budget at a time.
-            let descriptions: Vec<String> =
-                g.sub_goals.iter().map(|s| s.description.clone()).collect();
-            if let Some(advisory) = hi_agent::prerequisites::advisory(&descriptions) {
-                for line in advisory.lines() {
-                    self.push(Line::styled(
-                        line.to_string(),
-                        Style::default().fg(crate::theme::theme().accent_running),
-                    ));
-                }
-            }
-            if let Ok(path) = g.export_markdown_to(agent.workspace_root()) {
-                self.push(Line::styled(format!("snapshot: {}", path.display()), dim()));
-            }
-        }
+        self.echo_installed_goal(agent);
         self.follow();
     }
 
@@ -1303,10 +1330,20 @@ impl crate::App {
     /// message on failure. When long-horizon is on, the executor's own
     /// `update_plan` calls report progress onto these sub-goals.
     fn apply_goal(agent: &mut Agent, objective: &str, sub_goals: Vec<String>) -> Option<String> {
+        Self::apply_installed_goal(
+            agent,
+            objective,
+            hi_agent::Goal::new(objective.to_string(), sub_goals),
+        )
+    }
+
+    fn apply_installed_goal(
+        agent: &mut Agent,
+        objective: &str,
+        goal: hi_agent::Goal,
+    ) -> Option<String> {
         if agent.long_horizon() {
-            match agent
-                .set_structured_goal(Some(hi_agent::Goal::new(objective.to_string(), sub_goals)))
-            {
+            match agent.set_structured_goal(Some(goal)) {
                 Ok(true) => None,
                 Ok(false) => agent
                     .set_transient_goal(Some(objective.to_string()))
@@ -1322,6 +1359,27 @@ impl crate::App {
         }
     }
 
+    fn echo_installed_goal(&mut self, agent: &Agent) {
+        if let Some(g) = agent.structured_goal() {
+            for line in g.status_report().lines().take(30) {
+                self.push(Line::styled(line.to_string(), dim()));
+            }
+            let descriptions: Vec<String> =
+                g.sub_goals.iter().map(|s| s.description.clone()).collect();
+            if let Some(advisory) = hi_agent::prerequisites::advisory(&descriptions) {
+                for line in advisory.lines() {
+                    self.push(Line::styled(
+                        line.to_string(),
+                        Style::default().fg(crate::theme::theme().accent_running),
+                    ));
+                }
+            }
+            if let Ok(path) = g.export_markdown_to(agent.workspace_root()) {
+                self.push(Line::styled(format!("snapshot: {}", path.display()), dim()));
+            }
+        }
+    }
+
     /// Mirror the agent's active structured goal and task plan into the `App` so
     /// the pinned plan block and header can render progress. Must run after
     /// interrupt/`/retry` rewinds — those restore agent state without emitting a
@@ -1330,22 +1388,66 @@ impl crate::App {
     pub(crate) fn refresh_goal(&mut self, agent: &Agent) {
         self.goal = agent.structured_goal().cloned();
         self.plan = agent.current_plan().to_vec();
+        self.plan_mode = agent.plan_mode();
+        self.plan_drive_paused = agent.plan_drive_paused();
+        self.last_drive = agent.drive_decision(None);
     }
 
-    /// Queue the synthetic drive prompt when an active, unpaused goal should keep
-    /// moving: the run loop pops it like user input, so the agent works the next
-    /// sub-goal without the user re-prompting. Queued user input always takes
-    /// priority (only queues into an empty queue), and a stall stop holds until a
-    /// user turn resets it.
-    pub(crate) fn maybe_queue_goal_drive(&mut self, agent: &Agent) {
-        if !self.queue.is_empty() || self.goal_drive_stall >= hi_agent::GOAL_DRIVE_STALL_LIMIT {
+    /// Recompute the leftover-work cache from mirrored App fields (tests).
+    #[cfg(test)]
+    pub(crate) fn sync_last_drive(&mut self) {
+        let plan_incomplete = self.plan.iter().any(|step| {
+            matches!(
+                step.status,
+                hi_agent::PlanStatus::Pending | hi_agent::PlanStatus::Active
+            )
+        });
+        let plan = hi_agent::PlanDriveAction::decide(
+            plan_incomplete,
+            self.plan_mode,
+            self.plan_drive_paused,
+            0,
+            false,
+            self.last_stop_reason,
+        );
+        if self.plan_mode {
+            self.last_drive = hi_agent::DriveAction::Idle {
+                reason: hi_agent::DriveIdleReason::PlanMode,
+            };
             return;
         }
-        if agent
-            .structured_goal()
-            .is_some_and(hi_agent::Goal::should_auto_drive)
+        if self
+            .goal
+            .as_ref()
+            .is_some_and(hi_agent::Goal::has_drive_work)
         {
-            let _ = self.try_enqueue_prompt(hi_agent::GOAL_CONTINUE_PROMPT);
+            self.last_drive = if self.goal.as_ref().is_some_and(hi_agent::Goal::is_paused) {
+                hi_agent::DriveAction::Idle {
+                    reason: hi_agent::DriveIdleReason::GoalPaused,
+                }
+            } else {
+                hi_agent::DriveAction::Enqueue(hi_agent::DriveKind::Goal)
+            };
+            return;
+        }
+        self.last_drive = hi_agent::DriveAction::from_plan(plan);
+    }
+
+    /// Queue the Agent-owned leftover-work drive when the queue is empty.
+    pub(crate) fn maybe_queue_goal_drive(&mut self, agent: &Agent) {
+        self.maybe_queue_drive(agent, None);
+    }
+
+    pub(crate) fn maybe_queue_drive(
+        &mut self,
+        agent: &Agent,
+        outcome: Option<&hi_agent::TurnOutcome>,
+    ) {
+        if !self.queue.is_empty() {
+            return;
+        }
+        if let Some(prompt) = agent.drive_decision(outcome).prompt() {
+            let _ = self.try_enqueue_prompt(prompt);
         }
     }
 
@@ -1583,6 +1685,7 @@ impl crate::App {
                     for line in effect.message.lines() {
                         self.push(Line::styled(line.to_string(), dim()));
                     }
+                    self.refresh_goal(agent);
                     if let Some(prompt) = effect.follow_up_prompt {
                         // Plan mode and /synth-evals hand back a prompt to run
                         // as the next turn. Prefer front-of-queue even at cap.

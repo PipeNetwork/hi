@@ -10,7 +10,7 @@ use hi_agent::Agent;
 
 use crate::commands::handle_command;
 use crate::config::{self, Settings};
-use crate::goal_drive::initial_goal_drive;
+use crate::goal_drive::pending_drive_prompt;
 use crate::provider::provider_label;
 use crate::session;
 use crate::ui::PlainUi;
@@ -26,6 +26,7 @@ pub(crate) async fn repl(
     config_path: Option<PathBuf>,
     after_turn: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<()> {
+    agent.set_interactive_session(true);
     use hi_agent::Command;
     use hi_agent::CompactionKind;
     use rustyline::Editor;
@@ -66,16 +67,24 @@ pub(crate) async fn repl(
     let mut last_turn_snapshot: Option<hi_agent::AgentStateSnapshot> = None;
     let mut hf_state = hi_tools::HfCommandState::default();
     // Auto-drive feeds a synthetic prompt until the goal finishes; Ctrl-C pauses it.
-    let mut pending_drive = initial_goal_drive(agent.structured_goal());
-    let mut goal_drive_stall: u32 = 0;
+    let mut pending_drive = pending_drive_prompt(agent, None);
+    let mut last_outcome: Option<hi_agent::TurnOutcome> = None;
 
     loop {
         // Refresh profile names for the completer (covers add/edit changes).
         *profiles.borrow_mut() = config::profile_names(config);
         let readline = match pending_drive.take() {
             Some(prompt) => {
-                if let Some(sg) = agent.structured_goal().and_then(|g| g.active_sub_goal()) {
-                    println!("\x1b[2m⟳ goal drive — {}\x1b[0m", sg.description);
+                if prompt == hi_agent::GOAL_CONTINUE_PROMPT {
+                    if let Some(sg) = agent.structured_goal().and_then(|g| g.active_sub_goal()) {
+                        println!("\x1b[2m⟳ goal drive — {}\x1b[0m", sg.description);
+                    }
+                } else if prompt == hi_agent::PLAN_DRIVE_PROMPT {
+                    if let Some(step) = agent.next_plan_step_title() {
+                        println!("\x1b[2m⟳ plan drive — {step}\x1b[0m");
+                    } else {
+                        println!("\x1b[2m⟳ plan drive\x1b[0m");
+                    }
                 }
                 Ok(prompt)
             }
@@ -85,11 +94,16 @@ pub(crate) async fn repl(
             Ok(line) => {
                 let line = line.trim().to_string();
                 if line.is_empty() {
+                    if let Some(prompt) =
+                        agent.drive_decision(last_outcome.as_ref()).resume_prompt()
+                    {
+                        pending_drive = Some(prompt.to_string());
+                    }
                     continue;
                 }
                 // Synthetic drive prompts aren't user input — keep them out of
                 // the line history.
-                if line != hi_agent::GOAL_CONTINUE_PROMPT {
+                if line != hi_agent::GOAL_CONTINUE_PROMPT && line != hi_agent::PLAN_DRIVE_PROMPT {
                     let _ = editor.add_history_entry(&line);
                 }
 
@@ -812,7 +826,7 @@ pub(crate) async fn repl(
                                 .structured_goal()
                                 .is_some_and(hi_agent::Goal::should_auto_drive)
                             {
-                                goal_drive_stall = 0;
+                                agent.reset_goal_drive_stall();
                                 pending_drive = Some(hi_agent::GOAL_CONTINUE_PROMPT.to_string());
                             }
                             continue;
@@ -838,7 +852,7 @@ pub(crate) async fn repl(
                                     .structured_goal()
                                     .is_some_and(hi_agent::Goal::should_auto_drive)
                             {
-                                goal_drive_stall = 0;
+                                agent.reset_goal_drive_stall();
                                 pending_drive = Some(hi_agent::GOAL_CONTINUE_PROMPT.to_string());
                             }
                             continue;
@@ -854,7 +868,9 @@ pub(crate) async fn repl(
                 // Auto-drive bookkeeping: any goal-state change by turn end
                 // (advance, retry note, plan growth) is progress; none is a stall.
                 let goal_drive_turn = input == hi_agent::GOAL_CONTINUE_PROMPT;
+                let plan_drive_turn = input == hi_agent::PLAN_DRIVE_PROMPT;
                 let goal_before = agent.structured_goal().cloned();
+                let plan_step_before = agent.next_plan_step_title().map(str::to_owned);
                 let checkpoint = agent.messages().len();
                 let checkpoint_count = agent.checkpoint_count();
                 last_turn_start = checkpoint;
@@ -904,55 +920,63 @@ pub(crate) async fn repl(
                             "\x1b[33mgoal drive interrupted — paused (user); /goal resume to continue\x1b[0m"
                         );
                     }
+                    if plan_drive_turn {
+                        agent.set_plan_drive_paused(true);
+                        println!(
+                            "\x1b[33mplan drive interrupted — paused; /plan resume to continue\x1b[0m"
+                        );
+                    }
                 } else if driven.as_ref().is_some_and(Result::is_err) {
                     let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
                     if goal_drive_turn {
                         let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Infra);
                     }
                 } else {
-                    // Long-horizon auto-drive: keep pulling toward an active goal.
-                    // Drive turns that change nothing count toward a stall stop;
-                    // any user turn resets it.
+                    // Long-horizon auto-drive: keep pulling toward leftover work.
+                    // Drive turns that change nothing count toward a stall park.
                     if goal_drive_turn {
-                        let goal_changed = match (agent.structured_goal(), goal_before.as_ref()) {
+                        let made_progress = match (agent.structured_goal(), goal_before.as_ref()) {
                             (Some(after), Some(before)) => after.drive_state_changed_since(before),
-                            // A goal disappearing is a state change, and there is
-                            // no goal left for the synthetic driver to continue.
                             _ => true,
                         };
-                        if !goal_changed {
-                            goal_drive_stall = goal_drive_stall.saturating_add(1);
-                            if goal_drive_stall >= hi_agent::GOAL_DRIVE_STALL_LIMIT {
-                                let message = match agent
-                                    .try_set_goal_pause_reason(hi_agent::GoalPauseReason::Stall)
-                                {
-                                    Ok(true) => format!(
-                                        "goal drive paused (stall): no progress for {} turns — /goal resume after guidance, or /goal clear",
-                                        hi_agent::GOAL_DRIVE_STALL_LIMIT
-                                    ),
-                                    Ok(false) => {
-                                        "goal drive stopped — the active goal disappeared".into()
-                                    }
-                                    Err(error) => format!(
-                                        "goal drive parked for this session after {} stalled turns; could not persist the pause ({error:#}) — /goal resume to retry",
-                                        hi_agent::GOAL_DRIVE_STALL_LIMIT
-                                    ),
-                                };
-                                println!("\x1b[33m{message}\x1b[0m");
+                        match agent.note_goal_drive_progress(made_progress) {
+                            hi_agent::GoalDriveProgress::Skipped { failed, next } => {
+                                println!(
+                                    "\x1b[33m{}\x1b[0m",
+                                    hi_agent::goal_drive_skip_message(&failed, next.as_deref())
+                                );
                             }
-                        } else {
-                            goal_drive_stall = 0;
+                            hi_agent::GoalDriveProgress::Parked => {
+                                println!(
+                                    "\x1b[33m{}\x1b[0m",
+                                    hi_agent::goal_drive_park_message(
+                                        agent.leftover_work().as_deref()
+                                    )
+                                );
+                            }
+                            _ => {}
                         }
-                    } else {
-                        goal_drive_stall = 0;
                     }
-                    if goal_drive_stall < hi_agent::GOAL_DRIVE_STALL_LIMIT
-                        && agent
-                            .structured_goal()
-                            .is_some_and(hi_agent::Goal::should_auto_drive)
-                    {
-                        pending_drive = Some(hi_agent::GOAL_CONTINUE_PROMPT.to_string());
+                    if plan_drive_turn {
+                        let made_progress = hi_agent::plan_drive_made_progress(
+                            plan_step_before.as_deref(),
+                            agent.next_plan_step_title(),
+                            &agent.last_turn_telemetry().progress_events,
+                            agent.last_changed_files(),
+                        );
+                        agent.note_plan_drive_progress(made_progress);
+                        if agent.plan_drive_status() == "parked" {
+                            println!(
+                                "\x1b[33m{}\x1b[0m",
+                                hi_agent::plan_drive_park_message(
+                                    agent.plan_leftover_work().as_deref()
+                                )
+                            );
+                        }
                     }
+                    let outcome = driven.as_ref().and_then(|r| r.as_ref().ok());
+                    last_outcome = outcome.cloned();
+                    pending_drive = pending_drive_prompt(agent, outcome);
                 }
                 if let Some(state) = restore_model_state.take() {
                     agent.restore_model_state(state);

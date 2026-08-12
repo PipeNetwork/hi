@@ -44,7 +44,8 @@ pub use huggingface::{
 pub use auth_store::StoredToken;
 pub use http::{
     HttpRetryEvent, HttpRetryObserver, agent_http_client, agent_http_client_quick, cache_key,
-    load_cache, save_cache, set_http_retry_observer, timed_http_client_fallback,
+    credential_redirect_policy, load_cache, save_cache, set_http_retry_observer,
+    timed_http_client_fallback,
 };
 pub use mcp::{
     McpDiscoveryProvider, McpTool, PIPE_MCP_DEFAULT_URL, PipeMcpClient, PipeMcpModelHealth,

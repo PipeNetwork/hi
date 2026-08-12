@@ -26,6 +26,17 @@ fn temp_dir_with(marker: &str) -> std::path::PathBuf {
     dir
 }
 
+fn tmp_leftovers(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    std::fs::read_dir(parent).ok().is_some_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+    })
+}
+
 #[test]
 fn detects_layered_pipeline_by_marker() {
     // (marker, expected stage commands in order). Bare package.json, Makefile,
@@ -787,6 +798,10 @@ fn config_round_trips_through_toml() {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "config file must be owner-only, got {mode:o}");
     }
+    assert!(
+        !tmp_leftovers(&path),
+        "atomic save must not leave a sibling temp file"
+    );
 
     // Re-read and verify.
     let text = std::fs::read_to_string(&path).unwrap();
@@ -825,6 +840,56 @@ fn config_round_trips_through_toml() {
         Some(ProviderName::Ollama)
     );
     assert!(reloaded.profiles.get("local").unwrap().model.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn save_config_tightens_preexisting_world_readable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir_with("");
+    let path = dir.join("config.toml");
+    std::fs::write(&path, "default_profile = \"keep-me\"\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let mut config = Config::default();
+    config.default_profile = Some("sonnet".into());
+    save_config_to(&config, &path).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "rewritten config must be owner-only, got {mode:o}"
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("default_profile = \"sonnet\""));
+    assert!(
+        !tmp_leftovers(&path),
+        "atomic save must not leave a sibling temp file"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn save_config_tightens_a_planted_world_readable_temp_before_writing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir_with("");
+    let path = dir.join("config.toml");
+    let tmp = dir.join(format!("config.toml.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, "stale").unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    let mut config = Config::default();
+    config.default_profile = Some("sonnet".into());
+    save_config_to(&config, &path).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "planted world-readable temp must not survive as the key file, got {mode:o}"
+    );
+    assert!(!tmp.exists(), "temp path must be consumed by rename");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("default_profile = \"sonnet\""));
 }
 
 #[test]

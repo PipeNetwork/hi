@@ -33,6 +33,7 @@ pub struct RemoteUi {
 impl RemoteUi {
     pub fn new(config: SyncConfig, session_id: String) -> Self {
         let client = reqwest::Client::builder()
+            .redirect(hi_ai::credential_redirect_policy())
             .timeout(std::time::Duration::from_secs(5))
             .http1_only()
             .build()

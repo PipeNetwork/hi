@@ -19,6 +19,8 @@ pub mod local_skeptic;
 mod memory;
 mod observation;
 mod outcome;
+mod plan_drive;
+mod plan_ingest;
 pub mod prerequisites;
 mod prompt;
 mod session;
@@ -85,7 +87,7 @@ pub use config::{
     detect_verify_pipeline,
 };
 pub use doctor::{Check as DoctorCheck, DoctorInput, DoctorReport, render_report_text, run_doctor};
-pub use heuristics::humanize_count;
+pub use heuristics::{humanize_count, looks_like_new_task};
 pub use hi_tools::{PlanStatus, PlanStep};
 pub use local_skeptic::LocalSkepticOutcome;
 pub use memory::{
@@ -97,6 +99,12 @@ pub use observation::{Observation, ObservationReceipt, ObservationSink};
 pub use outcome::{
     EffectiveModelRoute, ReviewStatus, SessionRollback, TopLevelErrorKind, TurnCleanupKind,
     TurnCleanupResult, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus,
+};
+pub use plan_drive::{
+    DriveAction, DriveIdleReason, DriveKind, GoalDriveProgress, ONE_SHOT_DRIVE_TURN_LIMIT,
+    PlanDriveAction, PlanDriveIdleReason, drive_chrome_line, goal_drive_park_message,
+    goal_drive_skip_message, goal_drive_status, next_plan_drive_stall, plan_drive_made_progress,
+    plan_drive_park_message, plan_drive_status,
 };
 pub use session::SessionSink;
 pub use session_ops::{
@@ -115,7 +123,8 @@ pub use skills::{
 pub use subagent::{DelegateOutcome, DelegateRunner, SubagentRoute};
 pub use task_contract::{RiskLevel, TaskContract, TaskIntent};
 pub use ui::{
-    ConfirmationFuture, ConfirmationRequest, ConfirmationResult, Ui, classify_error, tool_label,
+    AskUserFuture, AskUserResult, ConfirmationFuture, ConfirmationRequest, ConfirmationResult, Ui,
+    classify_error, tool_label,
 };
 pub use verify::VerificationExecution;
 pub use workspace_runtime::WorkspaceRuntime;
@@ -173,7 +182,12 @@ pub use events::{
 pub use goal::{
     CLAIM_NOTE, DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT,
     GOAL_EVENT_LIMIT, Goal, GoalEvent, GoalPauseReason, GoalStatus, MAX_CAP_CONTINUATIONS,
-    REGRESSION_NOTE, SkepticStatus, SubGoal,
+    REGRESSION_NOTE, SkepticStatus, SubGoal, auto_budget_for,
+};
+pub use heuristics::leftover_plan_summary;
+pub use plan_ingest::{
+    IngestedPlan, MAX_PLAN_OBJECTIVES, PlanItem, ingest_plan_document, is_solid_checklist,
+    one_shot_workflow_plan_path, parse_objectives, parse_plan_items, plan_has_checked_objectives,
 };
 
 /// Crate version (from Cargo.toml).
@@ -620,6 +634,10 @@ pub const MAX_REPEAT_NUDGES: u32 = 2;
 /// they actually act — with 3, a single step's stall could exhaust the budget
 /// and end the turn mid-plan.
 pub const MAX_SILENT_CONTINUES: u32 = 5;
+/// Extra in-turn recoveries after a stall budget is spent. The agent keeps
+/// working instead of asking the user to `/retry` or type `continue`. Bounded
+/// so a model that never changes approach cannot loop forever.
+pub const MAX_KEEP_WORKING: u32 = 8;
 /// Maximum number of per-turn git checkpoints retained for `/undo`. Each is a
 /// 40-char SHA, so the memory cost is negligible, but a very long session
 /// (thousands of turns) would grow the vec without bound. Older checkpoints
@@ -640,6 +658,29 @@ pub(crate) const PLAN_CONTINUE_NUDGE: &str = "Your plan still has incomplete ste
 pending step — use your tools to do the work, don't just describe it. Mark the step active in \
 `update_plan`, do the work, then move to the next. If the task is genuinely complete, stop and \
 give your final recap.";
+/// Sent after a stall budget is spent so the turn keeps going without a user
+/// `/retry`. Tells the model to change approach rather than repeat the loop.
+pub(crate) const KEEP_WORKING_NUDGE: &str = "The previous approach stalled. Do not recap and do not wait \
+for the user. Take a different concrete next step with your tools now: edit, run a new check, or \
+mark the current plan step done and start the next one. If the work is genuinely complete, give a \
+short recap and stop.";
+/// Folded into a new user message when an incomplete plan is still pinned so a
+/// new task replaces the checklist instead of getting plan-continue nudges on
+/// stale steps.
+pub(crate) const REPLACE_PLAN_NUDGE: &str = "If this message is a new task, call `update_plan` with a \
+replacement checklist or run `/plan replace` to drop the old steps. If it continues the current work, keep the existing steps.";
+/// Louder fold when the new user message itself looks like a new task.
+pub(crate) const NEW_TASK_REPLACE_PLAN_NUDGE: &str = "This looks like a new task while an unfinished plan is still pinned. \
+Call `update_plan` with a replacement checklist, or run `/plan replace` to drop the old steps. Do not keep working the previous checklist unless this message continues that work.";
+/// Synthetic prompt frontends enqueue between turns when the last turn was
+/// incomplete and the plan still has pending steps. Same role as
+/// [`GOAL_CONTINUE_PROMPT`] for unstructured checklists.
+pub const PLAN_DRIVE_PROMPT: &str = "Continue the unfinished plan: complete the next pending step now. \
+Use your tools to do the work; do not recap and do not wait for the user. Mark the current step \
+done in update_plan when it is finished and start the next one.";
+/// Consecutive plan-drive turns that leave the checklist and workspace unchanged
+/// before the frontend parks. Matches [`GOAL_DRIVE_STALL_LIMIT`].
+pub const PLAN_DRIVE_STALL_LIMIT: u32 = 4;
 /// Sent when the model's output was truncated by the output token cap
 /// (`stop_reason: "length"` / `"max_tokens"`) — the response was cut off
 /// mid-generation, not finished. The nudge tells the model to continue from
@@ -874,6 +915,29 @@ pub struct Agent {
     /// Plan-mode session flag (`/plan` / `/plan off`). When true, frontends
     /// should prefer read-only tool sets and inject plan-mode prompts.
     pub(crate) plan_mode: bool,
+    /// Session-local pause for plan auto-drive (`/plan pause` / `/plan resume`).
+    /// The checklist stays pinned; auto-enqueue stops until resume or a
+    /// leftover empty Enter after the pause is cleared.
+    pub(crate) plan_drive_paused: bool,
+    /// Consecutive no-progress plan-drive turns. Parked at
+    /// [`PLAN_DRIVE_STALL_LIMIT`]. Persisted with pause so resume stays parked.
+    pub(crate) plan_drive_stall: u32,
+    /// Consecutive no-progress goal-drive turns. Parked at
+    /// [`GOAL_DRIVE_STALL_LIMIT`]. Persisted separately from goal pause.
+    pub(crate) goal_drive_stall: u32,
+    /// TUI/REPL set this so synthetic drive turns can demote Always→Auto.
+    /// One-shot and headless leave it false and keep inherited permissions.
+    pub(crate) interactive_session: bool,
+    /// Permission mode to restore after an interactive synthetic drive turn.
+    pub(crate) drive_restore_permission: Option<crate::PermissionMode>,
+    /// `ask_user` calls in the current turn. Reset at turn start; a second
+    /// call fails closed so the model cannot stack overlays.
+    pub(crate) ask_user_calls: u32,
+    /// Successful `ask_user` calls in the current plan/goal drive streak.
+    /// Reset on a user-typed turn.
+    pub(crate) ask_user_drive_streak: u32,
+    /// How the current turn was entered. Set at turn start from the prompt.
+    pub(crate) turn_drive_kind: DriveKind,
     /// Live permission ladder (`/permissions`, `/always-approve`, `/auto`).
     pub(crate) permission_mode: crate::PermissionMode,
     /// How many turns have completed in this session. Incremented at the end of

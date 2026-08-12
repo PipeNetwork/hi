@@ -640,6 +640,36 @@ async fn empty_completion_error_is_resampled_too() {
 }
 
 #[tokio::test]
+async fn keep_working_recovers_after_empty_retry_budget() {
+    let mut cfg = config();
+    cfg.loop_limits.max_empty_retries = 1;
+    cfg.loop_limits.max_keep_working = 2;
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Error(ProviderErrorKind::EmptyCompletion),
+            ProviderStep::Error(ProviderErrorKind::EmptyCompletion),
+            ProviderStep::Completion(bash_completion("true")),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+    assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("still working")),
+        "keep-working should fire after the empty-retry budget: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses.iter().any(|s| s.contains("/retry")),
+        "must not ask the user to retry: {:?}",
+        ui.statuses
+    );
+    assert_eq!(requests.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
 async fn empty_completion_after_tool_results_gets_continuation_nudge() {
     let read_cargo = Content::ToolCall {
         id: "r".into(),
@@ -1025,6 +1055,37 @@ async fn alternating_invalid_tool_turns_hit_the_cumulative_circuit_breaker() {
     assert!(
         ui.statuses.iter().any(|s| s.contains("invalid tool turns")),
         "the circuit-breaker should end the turn once cumulative invalid turns are spent: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn keep_working_recovers_after_invalid_tool_turn_budget() {
+    let mut cfg = config();
+    cfg.loop_limits.max_keep_working = 2;
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+            ProviderStep::Completion(bash_completion("true")),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+    assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("still working")),
+        "keep-working should fire after the invalid-tool-turn budget: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses.iter().any(|s| s.contains("/retry")),
+        "must not ask the user to retry: {:?}",
         ui.statuses
     );
 }

@@ -25,8 +25,16 @@ pub(crate) fn pipeline_command(stages: &[VerifyStage]) -> Option<String> {
     )
 }
 
-pub(crate) fn one_shot_exit_code(outcome: &TurnOutcome, allow_unverified: bool) -> i32 {
-    outcome.exit_code(allow_unverified)
+pub(crate) fn one_shot_exit_code(
+    outcome: &TurnOutcome,
+    allow_unverified: bool,
+    leftover: bool,
+) -> i32 {
+    let code = outcome.exit_code(allow_unverified);
+    if code != 0 {
+        return code;
+    }
+    if leftover { 1 } else { 0 }
 }
 
 pub(crate) fn report_verification_stages(
@@ -370,7 +378,8 @@ pub(crate) fn write_report(
             agent.last_changed_files().to_vec(),
         )
     });
-    let goal = goal_report::report_goal(agent.structured_goal());
+    let goal = goal_report::report_goal(agent.structured_goal(), agent.goal_drive_stall());
+    let plan = report_plan(agent);
     let failure_mode = report_failure_mode(&outcome, error, tel);
     let partial_artifact = write_partial_artifact(path, agent, &outcome, error)?;
     let model_outcome = serde_json::json!({
@@ -510,6 +519,7 @@ pub(crate) fn write_report(
         "compat_fallbacks": agent.last_compat_fallbacks(),
         "tool_mode": tool_mode_label(agent.tool_mode()),
         "goal": goal,
+        "plan": plan,
         "telemetry": telemetry,
         "rsi": rsi_report_block(rsi),
         "assistant_response": agent.messages().iter().rev()
@@ -532,6 +542,24 @@ pub(crate) fn write_report(
     std::fs::write(path, serde_json::to_string_pretty(&report)?)
         .with_context(|| format!("writing report {}", path.display()))?;
     Ok(())
+}
+
+fn report_plan(agent: &hi_agent::Agent) -> Option<serde_json::Value> {
+    let steps = agent.current_plan();
+    if steps.is_empty() {
+        return None;
+    }
+    let done = steps
+        .iter()
+        .filter(|step| step.status == hi_agent::PlanStatus::Done)
+        .count();
+    Some(serde_json::json!({
+        "done": done,
+        "total": steps.len(),
+        "next": agent.next_plan_step_title(),
+        "pending": agent.plan_incomplete(),
+        "drive": agent.plan_drive_status(),
+    }))
 }
 
 fn report_failure_mode(

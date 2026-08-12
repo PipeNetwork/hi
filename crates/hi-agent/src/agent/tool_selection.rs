@@ -133,6 +133,9 @@ pub(super) fn advertised_tools_with_background(
         {
             specs.push(hi_tools::explore_tool_spec());
         }
+        if !specs.is_empty() {
+            specs.push(hi_tools::ask_user_tool_spec());
+        }
         // Delegate: Off never; On for any mutation; Risk only isolation-shaped tasks.
         if !suppress_new_subagents && should_advertise_delegate(config, task_text, mutating) {
             specs.push(hi_tools::delegate_tool_spec());
@@ -810,6 +813,11 @@ mod tests {
         assert!(
             names(&mutation).contains(&"explore"),
             "explore on coding: {:?}",
+            names(&mutation)
+        );
+        assert!(
+            names(&mutation).contains(&"ask_user"),
+            "ask_user on interactive coding: {:?}",
             names(&mutation)
         );
         // Risk policy: single-file "implement the parser" is not isolation-shaped.

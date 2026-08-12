@@ -310,7 +310,7 @@ async fn tools_unavailable_fast_path_resets_state_and_shows_message() {
     assert!(agent.last_changed_files().is_empty());
     assert!(agent.last_compat_fallbacks().is_empty());
     assert_eq!(agent.last_turn_telemetry(), &TurnTelemetry::default());
-    assert!(agent.goals.last_plan.is_empty());
+    assert_eq!(agent.goals.last_plan[0].title, "stale step");
     agent.messages.validate_for_provider().unwrap();
     assert!(
         !agent

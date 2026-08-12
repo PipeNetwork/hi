@@ -244,6 +244,7 @@ pub(crate) fn config() -> AgentConfig {
             // Off so canned-provider tests don't need extra completions for the
             // silent auto-continue; tests that exercise it opt in.
             max_silent_continues: 0,
+            max_keep_working: 0,
             ..crate::AgentLoopLimits::default()
         },
         memory: crate::AgentMemory {
@@ -473,6 +474,7 @@ pub(crate) struct RecUi {
     pub(crate) assistant: String,
     pub(crate) tool_results: Vec<(String, String)>,
     pub(crate) plans: Vec<Vec<PlanStep>>,
+    pub(crate) ask_user_questions: Vec<String>,
 }
 impl Ui for RecUi {
     fn assistant_text(&mut self, t: &str) {
@@ -519,6 +521,10 @@ impl Ui for RecUi {
             format!(" — {guidance}")
         };
         self.statuses.push(format!("{kind}: {message}{suffix}"));
+    }
+    fn ask_user(&mut self, question: &str, _options: &[String]) -> crate::AskUserFuture<'_> {
+        self.ask_user_questions.push(question.to_string());
+        Box::pin(async { crate::AskUserResult::Unavailable })
     }
 }
 

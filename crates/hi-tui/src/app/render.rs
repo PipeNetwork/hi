@@ -75,6 +75,24 @@ fn confirmation_lines(
                 })
                 .collect()
         }
+        ConfirmationRequest::AskUser { question, options } => {
+            let mut lines = vec![Line::styled(
+                question.clone(),
+                Style::default()
+                    .fg(th.text_primary)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            if !options.is_empty() {
+                lines.push(Line::raw(""));
+                for (i, option) in options.iter().enumerate() {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {} ", i + 1), Style::default().fg(th.accent_tool)),
+                        Span::raw(option.clone()),
+                    ]));
+                }
+            }
+            lines
+        }
     }
 }
 
@@ -485,7 +503,20 @@ impl crate::App {
             .count();
         let th = crate::theme::theme();
         let mut out = vec![Line::styled(
-            format!("plan · {done}/{total}"),
+            {
+                let mut header = format!("plan · {done}/{total}");
+                if self.plan_drive_paused {
+                    header.push_str(" · paused");
+                } else if matches!(
+                    self.last_drive,
+                    hi_agent::DriveAction::Idle {
+                        reason: hi_agent::DriveIdleReason::PlanParked
+                    }
+                ) {
+                    header.push_str(" · parked");
+                }
+                header
+            },
             Style::default()
                 .fg(th.accent_plan)
                 .add_modifier(Modifier::BOLD),
@@ -527,7 +558,16 @@ impl crate::App {
             .iter()
             .filter(|s| s.status == hi_agent::GoalStatus::Done)
             .count();
-        let state = if goal.paused { " · paused" } else { "" };
+        let state = match self.last_drive {
+            hi_agent::DriveAction::Idle {
+                reason: hi_agent::DriveIdleReason::GoalPaused,
+            } => " · paused",
+            hi_agent::DriveAction::Idle {
+                reason: hi_agent::DriveIdleReason::GoalParked,
+            } => " · parked",
+            _ if goal.is_paused() => " · paused",
+            _ => "",
+        };
         let mut header = format!("goal · {done}/{total}{state}");
         if !goal.objective.is_empty() {
             header.push_str(" · ");
@@ -1356,20 +1396,35 @@ impl crate::App {
             let visible = rows[1].height.saturating_sub(4) as usize;
             let max_scroll = all.len().saturating_sub(visible);
             let scroll = self.confirmation_scroll.min(max_scroll);
+            let is_ask = matches!(request, hi_agent::ConfirmationRequest::AskUser { .. });
             let mut body = vec![Line::styled(
-                "This action can change your workspace. Review it before approving.",
+                if is_ask {
+                    "The agent needs a decision before it can continue."
+                } else {
+                    "This action can change your workspace. Review it before approving."
+                },
                 Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
             )];
             body.extend(all.iter().skip(scroll).take(visible).cloned());
+            if is_ask {
+                body.push(Line::raw(""));
+                body.push(Line::from(vec![
+                    Span::styled("answer: ", dim()),
+                    Span::raw(if self.ask_user_draft.is_empty() {
+                        String::new()
+                    } else {
+                        self.ask_user_draft.clone()
+                    }),
+                ]));
+            }
+            let hint = if is_ask {
+                " 1-9 pick · type an answer · Enter submit · Esc cancel · Ctrl-C cancel turn "
+            } else {
+                " y approve · a always allow this session · p path · n/Esc reject · ↑↓/PgUp/PgDn scroll · Ctrl-C cancel turn "
+            };
             let block = th
                 .panel_block(request.title(), UiTone::Warning)
-                .title_bottom(
-                    Line::styled(
-                        " y approve · a always allow this session · p path · n/Esc reject · ↑↓/PgUp/PgDn scroll · Ctrl-C cancel turn ",
-                        dim(),
-                    )
-                    .right_aligned(),
-                );
+                .title_bottom(Line::styled(hint, dim()).right_aligned());
             frame.render_widget(
                 Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
                 rows[1],

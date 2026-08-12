@@ -280,6 +280,8 @@ mod tests {
                 model: "m".into(),
             },
             review_same_model: false,
+            leftover: None,
+            plan_leftover: None,
         }
     }
 

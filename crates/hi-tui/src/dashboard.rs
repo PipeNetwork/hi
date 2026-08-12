@@ -37,7 +37,10 @@ use ratatui::widgets::Paragraph;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::dashboard_goal::{RowGoal, next_drive_stall, parse_report, should_retry_goal_turn};
+use crate::dashboard_goal::{
+    RowGoal, drive_action, leftover_step_title, next_drive_stall, parse_report,
+    should_retry_goal_turn,
+};
 use crate::input::InputLine;
 use crate::layout::{UiLayout, cursor_window, truncate_display};
 use crate::render::dim;
@@ -96,6 +99,14 @@ pub(crate) struct FleetRow {
     /// Consecutive drive turns with an unchanged goal — parks the drive at
     /// [`hi_agent::GOAL_DRIVE_STALL_LIMIT`]; any user reply resets it.
     pub(crate) drive_stall: u32,
+    /// Leftover checklist copy from the child's last report, when any.
+    pub(crate) leftover: Option<String>,
+    /// Parsed `plan` block from the child's last report, when any.
+    pub(crate) plan: Option<crate::dashboard_goal::RowPlan>,
+    /// Consecutive plan-drive turns with no real progress.
+    pub(crate) plan_drive_stall: u32,
+    /// Whether the in-flight turn is a synthetic plan-drive prompt.
+    pub(crate) plan_driving: bool,
     /// The real tree has advanced (another row merged) since this row's base.
     pub(crate) stale: bool,
     /// The row is waiting on the user (question, held merge, failure, parked
@@ -187,12 +198,17 @@ pub(crate) fn benchmark_row(id: usize) -> FleetRow {
             total: 3,
             active: id == 1,
             paused: false,
+            drive: None,
             phases: vec![("Scan".into(), "active".into())],
         }),
         goal_objective: None,
         last_goal_json: None,
         driving: false,
         drive_stall: 0,
+        leftover: None,
+        plan: None,
+        plan_drive_stall: 0,
+        plan_driving: false,
         stale: false,
         attention: id.is_multiple_of(11),
         workflow_reply: None,
@@ -1015,6 +1031,10 @@ async fn dispatch_new(
         last_goal_json: None,
         driving: false,
         drive_stall: 0,
+        leftover: None,
+        plan: None,
+        plan_drive_stall: 0,
+        plan_driving: false,
         stale: false,
         attention: false,
         workflow_reply: None,
@@ -1619,6 +1639,10 @@ async fn spawn_workflow_agent(
         last_goal_json: None,
         driving: false,
         drive_stall: 0,
+        leftover: None,
+        plan: None,
+        plan_drive_stall: 0,
+        plan_driving: false,
         stale: false,
         attention: false,
         workflow_reply: Some(reply),
@@ -1674,6 +1698,7 @@ pub(crate) async fn adopt_session(
         total: info.goal_total,
         active: info.goal_active,
         paused: false,
+        drive: None,
         phases: Vec::new(),
     });
     // Preload the peek tail with the session's conversation so attach shows
@@ -1701,6 +1726,10 @@ pub(crate) async fn adopt_session(
         last_goal_json: None,
         driving: false,
         drive_stall: 0,
+        leftover: None,
+        plan: None,
+        plan_drive_stall: 0,
+        plan_driving: false,
         stale: false,
         attention: false,
         workflow_reply: None,
@@ -1816,6 +1845,7 @@ fn send_reply(
     };
     row.attention = false;
     row.drive_stall = 0; // a user reply resets the drive-park guard
+    row.plan_drive_stall = 0;
     if row.state == RowState::Working {
         if row.pending.len() >= MAX_ROW_PENDING {
             row.push_line(format!(
@@ -1848,8 +1878,11 @@ fn start_turn(
     row.started = Some(Instant::now());
     row.activity = "starting…".to_string();
     row.driving = prompt == hi_agent::GOAL_CONTINUE_PROMPT;
+    row.plan_driving = prompt == hi_agent::PLAN_DRIVE_PROMPT;
     if row.driving {
         row.push_line("⟳ goal drive".to_string());
+    } else if row.plan_driving {
+        row.push_line("⟳ plan drive".to_string());
     } else {
         row.push_line(format!("› {prompt}"));
     }
@@ -1967,7 +2000,10 @@ fn finish_turn(
     // the drive-stall comparison (an unchanged goal across a drive turn counts
     // toward parking the drive).
     let was_driving = row.driving;
+    let was_plan_driving = row.plan_driving;
+    let plan_step_before = leftover_step_title(row.leftover.as_deref()).map(str::to_owned);
     row.driving = false;
+    row.plan_driving = false;
     let mut retry_goal_turn = false;
     let report = std::fs::read_to_string(report_path(row))
         .ok()
@@ -1977,12 +2013,21 @@ fn finish_turn(
         if report.total_tokens > 0 {
             row.usage = report.total_tokens;
         }
-        row.drive_stall = next_drive_stall(
-            was_driving,
-            &row.last_goal_json,
-            &report.goal_raw,
-            row.drive_stall,
-        );
+        row.drive_stall = if report
+            .goal
+            .as_ref()
+            .and_then(|goal| goal.drive.as_ref())
+            .is_some()
+        {
+            0
+        } else {
+            next_drive_stall(
+                was_driving,
+                &row.last_goal_json,
+                &report.goal_raw,
+                row.drive_stall,
+            )
+        };
         let was_active = row.goal.as_ref().is_some_and(|g| g.active);
         row.last_goal_json = report.goal_raw;
         row.goal = report.goal;
@@ -2001,6 +2046,16 @@ fn finish_turn(
             report.outcome_status.as_deref(),
             row.goal.as_ref(),
         );
+        let made_progress = hi_agent::plan_drive_made_progress(
+            plan_step_before.as_deref(),
+            leftover_step_title(report.leftover.as_deref()),
+            &report.progress_events,
+            &report.changed_files,
+        );
+        row.plan_drive_stall =
+            hi_agent::next_plan_drive_stall(was_plan_driving, made_progress, row.plan_drive_stall);
+        row.leftover = report.leftover;
+        row.plan = report.plan;
         if was_active
             && row
                 .goal
@@ -2482,28 +2537,68 @@ fn continue_row(
     }
     if let Some(next) = row.pending.pop_front() {
         row.drive_stall = 0; // user input resets the stall guard
+        row.plan_drive_stall = 0;
         start_turn(app, idx, next, launcher, line_tx, in_flight);
         return;
     }
-    let drive = row.goal.as_ref().is_some_and(|g| g.active && !g.paused);
-    if drive {
-        if row.drive_stall >= hi_agent::GOAL_DRIVE_STALL_LIMIT {
-            row.push_line(format!(
-                "⏸ drive parked — no progress for {} turns; reply to steer and resume",
-                hi_agent::GOAL_DRIVE_STALL_LIMIT
-            ));
+    let action = drive_action(
+        row.goal.as_ref(),
+        row.plan.as_ref(),
+        row.leftover.as_deref(),
+        row.plan_drive_stall,
+    );
+    match action {
+        hi_agent::DriveAction::Enqueue(hi_agent::DriveKind::Goal) => {
+            if row
+                .goal
+                .as_ref()
+                .and_then(|goal| goal.drive.as_ref())
+                .is_none()
+                && row.drive_stall >= hi_agent::GOAL_DRIVE_STALL_LIMIT
+            {
+                row.push_line(format!(
+                    "⏸ drive parked — no progress for {} turns; reply to steer and resume",
+                    hi_agent::GOAL_DRIVE_STALL_LIMIT
+                ));
+                flag_attention(app, idx);
+                return;
+            }
+            start_turn(
+                app,
+                idx,
+                hi_agent::GOAL_CONTINUE_PROMPT.to_string(),
+                launcher,
+                line_tx,
+                in_flight,
+            );
+            return;
+        }
+        hi_agent::DriveAction::Enqueue(hi_agent::DriveKind::Plan) => {
+            start_turn(
+                app,
+                idx,
+                hi_agent::PLAN_DRIVE_PROMPT.to_string(),
+                launcher,
+                line_tx,
+                in_flight,
+            );
+            return;
+        }
+        hi_agent::DriveAction::Idle {
+            reason: hi_agent::DriveIdleReason::GoalParked,
+        } => {
+            row.push_line(hi_agent::goal_drive_park_message(row.leftover.as_deref()));
             flag_attention(app, idx);
             return;
         }
-        start_turn(
-            app,
-            idx,
-            hi_agent::GOAL_CONTINUE_PROMPT.to_string(),
-            launcher,
-            line_tx,
-            in_flight,
-        );
-        return;
+        hi_agent::DriveAction::Idle {
+            reason: hi_agent::DriveIdleReason::PlanParked,
+        } if row.leftover.is_some() => {
+            row.push_line(hi_agent::plan_drive_park_message(row.leftover.as_deref()));
+            flag_attention(app, idx);
+            return;
+        }
+        _ => {}
     }
     // Idle with nothing to do: the agent is waiting on the user.
     flag_attention(app, idx);
@@ -3492,6 +3587,10 @@ mod tests {
             last_goal_json: None,
             driving: false,
             drive_stall: 0,
+            leftover: None,
+            plan: None,
+            plan_drive_stall: 0,
+            plan_driving: false,
             stale: false,
             attention: false,
             workflow_reply: None,
@@ -3595,6 +3694,7 @@ mod tests {
             total: 3,
             active: true,
             paused: false,
+            drive: None,
             phases: vec![
                 ("Scan".into(), "done".into()),
                 ("Fix".into(), "active".into()),

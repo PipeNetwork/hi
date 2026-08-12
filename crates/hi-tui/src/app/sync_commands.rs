@@ -482,7 +482,6 @@ impl crate::App {
                 self.mid_turn_offered.clear();
                 self.plan = agent.current_plan().to_vec();
                 self.goal = agent.structured_goal().cloned();
-                self.goal_drive_stall = 0;
                 self.usage = (0, 0);
                 self.usage_estimated = false;
                 self.context_used = 0;

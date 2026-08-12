@@ -154,6 +154,12 @@ pub(crate) async fn drive<T>(
                         } else {
                             app.confirmation = Some(request.request.clone());
                             app.confirmation_scroll = 0;
+                            if matches!(
+                                request.request,
+                                hi_agent::ConfirmationRequest::AskUser { .. }
+                            ) {
+                                app.ask_user_draft.clear();
+                            }
                             pending_confirmation = Some(request);
                         }
                     }
@@ -180,11 +186,107 @@ pub(crate) async fn drive<T>(
             maybe = input.recv() => {
                 match maybe {
                     Some(Event::Mouse(mouse)) => app.handle_mouse(mouse),
-                    Some(Event::Paste(text)) if pending_confirmation.is_none() => app.input.insert_str(&text),
+                    Some(Event::Paste(text))
+                        if pending_confirmation.as_ref().is_some_and(|request| {
+                            matches!(
+                                request.request,
+                                hi_agent::ConfirmationRequest::AskUser { .. }
+                            )
+                        }) =>
+                    {
+                        app.ask_user_draft.push_str(&text);
+                    }
+                    Some(Event::Paste(text)) if pending_confirmation.is_none() => {
+                        app.input.insert_str(&text)
+                    }
                     Some(Event::Paste(_)) => {}
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                         if let Some(request) = pending_confirmation.take() {
+                            if let hi_agent::ConfirmationRequest::AskUser { options, .. } =
+                                &request.request
+                            {
+                                let options = options.clone();
+                                match key.code {
+                                    KeyCode::Char(c)
+                                        if !ctrl && c.is_ascii_digit() && c != '0' =>
+                                    {
+                                        let picked =
+                                            options.get((c as u8 - b'1') as usize).cloned();
+                                        if let Some(option) = picked {
+                                            let _ = request.response.send(
+                                                hi_agent::ConfirmationResult::Answer(option),
+                                            );
+                                            app.confirmation = None;
+                                            app.ask_user_draft.clear();
+                                        } else {
+                                            app.ask_user_draft.push(c);
+                                            pending_confirmation = Some(request);
+                                        }
+                                    }
+                                    KeyCode::Char(c) if !ctrl => {
+                                        app.ask_user_draft.push(c);
+                                        pending_confirmation = Some(request);
+                                    }
+                                    KeyCode::Backspace => {
+                                        app.ask_user_draft.pop();
+                                        pending_confirmation = Some(request);
+                                    }
+                                    KeyCode::Enter => {
+                                        let answer = app.ask_user_draft.trim().to_string();
+                                        if answer.is_empty() {
+                                            pending_confirmation = Some(request);
+                                        } else {
+                                            let _ = request.response.send(
+                                                hi_agent::ConfirmationResult::Answer(answer),
+                                            );
+                                            app.confirmation = None;
+                                            app.ask_user_draft.clear();
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        let _ = request.response.send(
+                                            hi_agent::ConfirmationResult::Cancelled,
+                                        );
+                                        app.confirmation = None;
+                                        app.ask_user_draft.clear();
+                                    }
+                                    KeyCode::Char('c') if ctrl => {
+                                        let _ = request.response.send(
+                                            hi_agent::ConfirmationResult::Cancelled,
+                                        );
+                                        app.confirmation = None;
+                                        app.ask_user_draft.clear();
+                                        signal_turn_cancel(app, &mut cancelled);
+                                        if turn_cancel.is_none() {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    KeyCode::Up => {
+                                        app.confirmation_scroll =
+                                            app.confirmation_scroll.saturating_sub(1);
+                                        pending_confirmation = Some(request);
+                                    }
+                                    KeyCode::Down => {
+                                        app.confirmation_scroll =
+                                            app.confirmation_scroll.saturating_add(1);
+                                        pending_confirmation = Some(request);
+                                    }
+                                    KeyCode::PageUp => {
+                                        app.confirmation_scroll =
+                                            app.confirmation_scroll.saturating_sub(10);
+                                        pending_confirmation = Some(request);
+                                    }
+                                    KeyCode::PageDown => {
+                                        app.confirmation_scroll =
+                                            app.confirmation_scroll.saturating_add(10);
+                                        pending_confirmation = Some(request);
+                                    }
+                                    _ => pending_confirmation = Some(request),
+                                }
+                                continue;
+                            }
                             match key.code {
                                 KeyCode::Char('y') if !ctrl => {
                                     let _ = request.response.send(hi_agent::ConfirmationResult::Approved);

@@ -183,7 +183,7 @@ async fn verify_failure_exhaustion_does_not_finalize_as_done() {
     assert!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("verification still failed after the retry budget")),
+            .any(|s| s.contains("verification still failed after repair")),
         "expected explicit exhausted-verify status, got: {:?}",
         ui.statuses
     );

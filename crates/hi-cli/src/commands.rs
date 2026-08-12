@@ -1022,6 +1022,7 @@ fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
     match arg {
         "" | "status" | "show" => {
             if let Some(g) = agent.structured_goal() {
+                println!("goal drive: {}", agent.goal_drive_status());
                 print!("{}", g.status_report());
             } else {
                 match agent.goal() {
@@ -1066,6 +1067,7 @@ fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
                 .is_some_and(|g| g.pause_reason == hi_agent::GoalPauseReason::Review);
             match agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::None) {
                 Ok(true) => {
+                    agent.reset_goal_drive_stall();
                     if was_review || arg == "accept" {
                         println!("\x1b[32m✓ plan accepted — goal driving turns again\x1b[0m");
                     } else {
@@ -1092,10 +1094,10 @@ fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
                 text
             };
             if agent.long_horizon() {
-                match agent.set_structured_goal(Some(hi_agent::Goal::new(
-                    text.clone(),
-                    vec![text.clone()],
-                ))) {
+                let structured = agent
+                    .try_ingest_goal(&text)
+                    .unwrap_or_else(|| hi_agent::Goal::new(text.clone(), vec![text.clone()]));
+                match agent.set_structured_goal(Some(structured)) {
                     Ok(true) => {
                         let review_persisted = review
                             && match agent
@@ -1195,48 +1197,71 @@ pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: 
     } else {
         text.as_str()
     };
-    println!("\x1b[2mplanning goal with the planner model…\x1b[0m");
-    let sub_goals = match agent.decompose_goal(objective).await {
-        Ok(steps) if !steps.is_empty() => steps,
-        Ok(_) => vec![objective.to_string()],
-        Err(err) => {
-            println!(
-                "\x1b[2mplanner unavailable ({err:#}); using the objective as one step\x1b[0m"
-            );
-            vec![objective.to_string()]
+    let sub_goals = if let Some(goal) = agent.try_ingest_goal(objective) {
+        match agent.set_structured_goal(Some(goal)) {
+            Ok(true) => {
+                echo_planned_goal(agent, review);
+                return;
+            }
+            Ok(false) => {
+                echo_transient_goal(agent, objective);
+                return;
+            }
+            Err(err) => {
+                eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m");
+                return;
+            }
+        }
+    } else {
+        println!("\x1b[2mplanning goal with the planner model…\x1b[0m");
+        match agent.decompose_goal(objective).await {
+            Ok(steps) if !steps.is_empty() => steps,
+            Ok(_) => vec![objective.to_string()],
+            Err(err) => {
+                println!(
+                    "\x1b[2mplanner unavailable ({err:#}); using the objective as one step\x1b[0m"
+                );
+                vec![objective.to_string()]
+            }
         }
     };
     match agent.set_structured_goal(Some(hi_agent::Goal::new(objective.to_string(), sub_goals))) {
-        Ok(true) => {
-            let review_persisted = review
-                && match agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review) {
-                    Ok(true) => true,
-                    Ok(false) => false,
-                    Err(err) => {
-                        eprintln!("\x1b[33mgoal review mode failed: {err:#}\x1b[0m");
-                        false
-                    }
-                };
-            if review_persisted {
-                println!(
-                    "\x1b[32m✓ long-horizon goal planned (review) — inspect, then /goal accept:\x1b[0m"
-                );
-            } else {
-                println!("\x1b[32m✓ long-horizon goal set — driving sub-goals:\x1b[0m");
+        Ok(true) => echo_planned_goal(agent, review),
+        Ok(false) => echo_transient_goal(agent, objective),
+        Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
+    }
+}
+
+fn echo_planned_goal(agent: &mut hi_agent::Agent, review: bool) {
+    let review_persisted = review
+        && match agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(err) => {
+                eprintln!("\x1b[33mgoal review mode failed: {err:#}\x1b[0m");
+                false
             }
-            if let Some(g) = agent.structured_goal() {
-                print!("{}", g.status_report());
-                if let Ok(path) = g.export_markdown_to(agent.workspace_root()) {
-                    println!("\x1b[2m  snapshot: {}\x1b[0m", path.display());
-                }
-            }
+        };
+    if review_persisted {
+        println!(
+            "\x1b[32m✓ long-horizon goal planned (review) — inspect, then /goal accept:\x1b[0m"
+        );
+    } else {
+        println!("\x1b[32m✓ long-horizon goal set — driving sub-goals:\x1b[0m");
+    }
+    if let Some(g) = agent.structured_goal() {
+        print!("{}", g.status_report());
+        if let Ok(path) = g.export_markdown_to(agent.workspace_root()) {
+            println!("\x1b[2m  snapshot: {}\x1b[0m", path.display());
         }
-        Ok(false) => match agent.set_transient_goal(Some(objective.to_string())) {
-            Ok(()) => {
-                println!("\x1b[32m✓ goal set — steers every turn until cleared: {objective}\x1b[0m")
-            }
-            Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
-        },
+    }
+}
+
+fn echo_transient_goal(agent: &mut hi_agent::Agent, objective: &str) {
+    match agent.set_transient_goal(Some(objective.to_string())) {
+        Ok(()) => {
+            println!("\x1b[32m✓ goal set — steers every turn until cleared: {objective}\x1b[0m")
+        }
         Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
     }
 }

@@ -812,20 +812,40 @@ async fn run() -> Result<()> {
             agent.set_model(hi_ai::MOA_MODEL_CONSERVATIVE.to_string(), None, None);
             prompt = arg;
         }
-        // `--goal <objective>` (fleet rows): install a planner-decomposed goal
-        // before the turn — but never re-plan when the resumed session already
-        // carries one (later fleet turns drive the existing goal).
+        // Plain one-shot/headless checklist `plan.md` is the workflow runner's
+        // job. Fleet `--session-file` children already have a worktree — they
+        // ingest in-process below instead of nesting `workflow run`.
+        if let Some(plan_path) = hi_agent::one_shot_workflow_plan_path(
+            cli.session_file.is_some(),
+            agent.workspace_root(),
+            &prompt,
+            cli.goal.as_deref(),
+        ) {
+            let mut args = vec!["run".to_string(), plan_path];
+            if !cli.verify.is_empty() {
+                args.push("--verify".into());
+                args.push(cli.verify.join(" && "));
+            }
+            return workflow_cmd::run_workflow_cli(&args).await;
+        }
+        // `--goal <objective>` (fleet rows): ingest a checklist or planner-
+        // decompose before the turn — but never re-plan when the resumed
+        // session already carries one (later fleet turns drive the existing goal).
         if let Some(objective) = cli.goal.as_deref().map(str::trim).filter(|s| !s.is_empty())
             && agent.structured_goal().is_none()
         {
-            if !cli.quiet {
-                println!("\x1b[2mplanning goal with the planner model…\x1b[0m");
-            }
-            let steps = match agent.decompose_goal(objective).await {
-                Ok(steps) if !steps.is_empty() => steps,
-                _ => vec![objective.to_string()],
+            let mut goal = if let Some(ingested) = agent.try_ingest_goal(objective) {
+                ingested
+            } else {
+                if !cli.quiet {
+                    println!("\x1b[2mplanning goal with the planner model…\x1b[0m");
+                }
+                let steps = match agent.decompose_goal(objective).await {
+                    Ok(steps) if !steps.is_empty() => steps,
+                    _ => vec![objective.to_string()],
+                };
+                hi_agent::Goal::new(objective.to_string(), steps)
             };
-            let mut goal = hi_agent::Goal::new(objective.to_string(), steps);
             // The skeptic gate is on by default for new goals; HI_GOAL_TEAM is a
             // two-way headless override — `0`/`false`/`off` disables it (e.g. a
             // fleet run that wants raw single-model throughput), anything else
@@ -846,68 +866,129 @@ async fn run() -> Result<()> {
                 );
             }
         }
-        let checkpoint_count_before_turn = agent.checkpoint_count();
-        let result = if let Some(ref rui) = remote_ui {
-            // Multiplex: local UI renders normally, remote UI buffers for sync.
-            let primary: Box<dyn hi_agent::Ui> = if cli.quiet {
-                Box::new(ui::QuietUi)
+        let mut current_prompt = prompt;
+        let mut drive_turns = 0u32;
+        let mut result;
+        let mut failed_outcome;
+        loop {
+            let kind = hi_agent::DriveKind::from_prompt(&current_prompt);
+            let goal_before = agent.structured_goal().cloned();
+            let plan_step_before = agent.next_plan_step_title().map(str::to_owned);
+            let checkpoint_count_before_turn = agent.checkpoint_count();
+            let turn_result = if let Some(ref rui) = remote_ui {
+                // Multiplex: local UI renders normally, remote UI buffers for sync.
+                let primary: Box<dyn hi_agent::Ui> = if cli.quiet {
+                    Box::new(ui::QuietUi)
+                } else {
+                    Box::new(PlainUi::new())
+                };
+                let mut multi = sync::MultiplexUi {
+                    primary,
+                    remote: rui.clone(),
+                };
+                let tools = rsi.observer.as_ref().map(|observer| {
+                    ToolObserver::new(
+                        observer.clone() as std::sync::Arc<dyn ObservationSink>,
+                        observer.full_capture(),
+                    )
+                });
+                let mut observed = ObservedUi::new(&mut multi, tools);
+                run_one_shot_cancellable(agent.run_turn(&current_prompt, &mut observed)).await
             } else {
-                Box::new(PlainUi::new())
+                let mut plain = PlainUi::new();
+                let mut quiet = ui::QuietUi;
+                let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
+                let tools = rsi.observer.as_ref().map(|observer| {
+                    ToolObserver::new(
+                        observer.clone() as std::sync::Arc<dyn ObservationSink>,
+                        observer.full_capture(),
+                    )
+                });
+                let mut observed = ObservedUi::new(view, tools);
+                run_one_shot_cancellable(agent.run_turn(&current_prompt, &mut observed)).await
             };
-            let mut multi = sync::MultiplexUi {
-                primary,
-                remote: rui.clone(),
+            result = if let Some(result) = turn_result {
+                result
+            } else {
+                agent
+                    .cleanup_turn(hi_agent::TurnCleanupKind::Cancel {
+                        session: hi_agent::SessionRollback::AgentOwned {
+                            checkpoint_count_before: checkpoint_count_before_turn,
+                        },
+                    })
+                    .await
+                    .map(|r| r.outcome)
             };
-            let tools = rsi.observer.as_ref().map(|observer| {
-                ToolObserver::new(
-                    observer.clone() as std::sync::Arc<dyn ObservationSink>,
-                    observer.full_capture(),
-                )
-            });
-            let mut observed = ObservedUi::new(&mut multi, tools);
-            run_one_shot_cancellable(agent.run_turn(&prompt, &mut observed)).await
-        } else {
-            let mut plain = PlainUi::new();
-            let mut quiet = ui::QuietUi;
-            let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
-            let tools = rsi.observer.as_ref().map(|observer| {
-                ToolObserver::new(
-                    observer.clone() as std::sync::Arc<dyn ObservationSink>,
-                    observer.full_capture(),
-                )
-            });
-            let mut observed = ObservedUi::new(view, tools);
-            run_one_shot_cancellable(agent.run_turn(&prompt, &mut observed)).await
-        };
+            failed_outcome = match &result {
+                Err(_) => Some(
+                    agent
+                        .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
+                        .await
+                        .map(|r| r.outcome)
+                        .unwrap_or_else(|_| agent.finalize_failed_turn()),
+                ),
+                Ok(_) => None,
+            };
+            match &result {
+                Ok(outcome) => {
+                    if kind == hi_agent::DriveKind::Goal {
+                        let made_progress = match (agent.structured_goal(), goal_before.as_ref()) {
+                            (Some(after), Some(before)) => after.drive_state_changed_since(before),
+                            _ => true,
+                        };
+                        let progress = agent.note_goal_drive_progress(made_progress);
+                        if !cli.quiet {
+                            match progress {
+                                hi_agent::GoalDriveProgress::Skipped { failed, next } => {
+                                    println!(
+                                        "\x1b[33m{}\x1b[0m",
+                                        hi_agent::goal_drive_skip_message(&failed, next.as_deref())
+                                    );
+                                }
+                                hi_agent::GoalDriveProgress::Parked => {
+                                    println!(
+                                        "\x1b[33m{}\x1b[0m",
+                                        hi_agent::goal_drive_park_message(
+                                            agent.leftover_work().as_deref()
+                                        )
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else if kind == hi_agent::DriveKind::Plan {
+                        let made_progress = hi_agent::plan_drive_made_progress(
+                            plan_step_before.as_deref(),
+                            agent.next_plan_step_title(),
+                            &agent.last_turn_telemetry().progress_events,
+                            agent.last_changed_files(),
+                        );
+                        agent.note_plan_drive_progress(made_progress);
+                    }
+                    if let Some(next) = agent.drive_decision(Some(outcome)).prompt() {
+                        let drive_limit = agent
+                            .structured_goal()
+                            .map(|goal| hi_agent::auto_budget_for(goal.sub_goals.len()))
+                            .unwrap_or(hi_agent::ONE_SHOT_DRIVE_TURN_LIMIT);
+                        if drive_turns >= drive_limit {
+                            break;
+                        }
+                        drive_turns += 1;
+                        current_prompt = next.to_string();
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            break;
+        }
         if let Some(state) = restore_model_state {
             agent.restore_model_state(state);
         }
-        let result = if let Some(result) = result {
-            result
-        } else {
-            agent
-                .cleanup_turn(hi_agent::TurnCleanupKind::Cancel {
-                    session: hi_agent::SessionRollback::AgentOwned {
-                        checkpoint_count_before: checkpoint_count_before_turn,
-                    },
-                })
-                .await
-                .map(|r| r.outcome)
-        };
-        let failed_outcome = match &result {
-            Err(_) => Some(
-                agent
-                    .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
-                    .await
-                    .map(|r| r.outcome)
-                    .unwrap_or_else(|_| agent.finalize_failed_turn()),
-            ),
-            Ok(_) => None,
-        };
         let rsi_summary = finish_turn_trace(
             rsi.observer.as_ref(),
             &agent,
-            &prompt,
+            &current_prompt,
             result.as_ref().ok().or(failed_outcome.as_ref()),
             result.as_ref().err(),
         );
@@ -935,7 +1016,7 @@ async fn run() -> Result<()> {
             write_report(
                 path,
                 &agent,
-                Some(&prompt),
+                Some(&current_prompt),
                 result.as_ref().ok().or(failed_outcome.as_ref()),
                 result.as_ref().err(),
                 rsi_summary.as_ref(),
@@ -983,7 +1064,11 @@ async fn run() -> Result<()> {
             std::process::exit(3);
         }
         let exit_code = match &result {
-            Ok(outcome) => one_shot_exit_code(outcome, cli.allow_unverified),
+            Ok(outcome) => one_shot_exit_code(
+                outcome,
+                cli.allow_unverified,
+                goal_drive::one_shot_leftover_remains(&agent),
+            ),
             Err(_) => 3,
         };
         if exit_code == 0 {
@@ -1951,6 +2036,8 @@ mod tests {
                 model: "model".into(),
             },
             review_same_model: false,
+            leftover: None,
+            plan_leftover: None,
         };
         assert_eq!(
             one_shot_exit_code(
@@ -1958,6 +2045,7 @@ mod tests {
                     hi_agent::TurnStatus::Completed,
                     hi_agent::VerificationStatus::Passed,
                 ),
+                false,
                 false,
             ),
             0
@@ -1969,6 +2057,7 @@ mod tests {
                     hi_agent::VerificationStatus::Unverified,
                 ),
                 true,
+                false,
             ),
             0
         );
@@ -1978,6 +2067,7 @@ mod tests {
                     hi_agent::TurnStatus::Incomplete,
                     hi_agent::VerificationStatus::Failed,
                 ),
+                false,
                 false,
             ),
             1
@@ -1989,6 +2079,7 @@ mod tests {
                     hi_agent::VerificationStatus::InfrastructureError,
                 ),
                 false,
+                false,
             ),
             3
         );
@@ -1999,8 +2090,20 @@ mod tests {
                     hi_agent::VerificationStatus::Unverified,
                 ),
                 false,
+                false,
             ),
             130
+        );
+        assert_eq!(
+            one_shot_exit_code(
+                &outcome(
+                    hi_agent::TurnStatus::Completed,
+                    hi_agent::VerificationStatus::Passed,
+                ),
+                false,
+                true,
+            ),
+            1
         );
     }
 

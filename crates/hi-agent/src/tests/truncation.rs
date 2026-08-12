@@ -140,7 +140,7 @@ async fn truncation_gives_up_after_retry_budget() {
     assert!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("task may be incomplete")),
+            .any(|s| s.contains("output_truncated") || s.contains("incomplete")),
         "should warn about exhaustion, got: {:?}",
         ui.statuses
     );

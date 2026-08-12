@@ -17,7 +17,7 @@ use crate::{PLAN_CONTINUE_NUDGE, SILENT_CONTINUE_NUDGE, Ui};
 
 use super::super::phase::TurnPhase;
 use super::super::progress::{AWAITING_BACKGROUND_REASON, ProgressKind, ProgressTracker};
-use super::super::retry::{ReviewRepairState, incomplete_status};
+use super::super::retry::ReviewRepairState;
 use super::RoundControl;
 
 impl crate::Agent {
@@ -155,11 +155,23 @@ impl crate::Agent {
                     ui.status("review sprawl force-answer budget spent; accepting the last answer");
                     return RoundControl::BreakInner(false);
                 } else {
+                    if self.keep_working_after_stall(
+                        progress_tracker,
+                        force_tools_next,
+                        stalled_unfinished,
+                        stalled_repeating,
+                        Some(continue_total_nudges),
+                        ui,
+                    ) {
+                        self.messages
+                            .push_assistant(std::mem::take(completion_content));
+                        return RoundControl::Continue;
+                    }
                     *stalled_unfinished = true;
                     let reason = review_repair.exhausted(sprawl_mode);
                     progress_tracker.record(ProgressKind::None, reason, None);
                     let _ = intent;
-                    ui.status(&incomplete_status(reason));
+                    ui.status(&self.incomplete_turn_status(reason));
                     return RoundControl::BreakInner(false);
                 }
             }
@@ -225,9 +237,23 @@ impl crate::Agent {
                     return RoundControl::Continue;
                 }
                 Some(super::impl_cascade::ImplementationCascadeAction::Exhausted { status }) => {
+                    if self.keep_working_after_stall(
+                        progress_tracker,
+                        force_tools_next,
+                        stalled_unfinished,
+                        stalled_repeating,
+                        Some(continue_total_nudges),
+                        ui,
+                    ) {
+                        self.messages
+                            .push_assistant(std::mem::take(completion_content));
+                        return RoundControl::Continue;
+                    }
                     *stalled_unfinished = true;
                     ui.nudge(status);
-                    ui.status(&incomplete_status("implementation_completeness_exhausted"));
+                    ui.status(
+                        &self.incomplete_turn_status("implementation_completeness_exhausted"),
+                    );
                     return RoundControl::BreakInner(false);
                 }
                 None => {}
@@ -265,11 +291,23 @@ impl crate::Agent {
                 return RoundControl::Continue;
             }
             Some(super::cascade::QualityCascadeAction::Exhausted { mode, status }) => {
+                if self.keep_working_after_stall(
+                    progress_tracker,
+                    force_tools_next,
+                    stalled_unfinished,
+                    stalled_repeating,
+                    Some(continue_total_nudges),
+                    ui,
+                ) {
+                    self.messages
+                        .push_assistant(std::mem::take(completion_content));
+                    return RoundControl::Continue;
+                }
                 *stalled_unfinished = true;
                 let reason = review_repair.exhausted(mode);
                 progress_tracker.record(ProgressKind::None, reason, None);
                 ui.nudge(&status);
-                ui.status(&incomplete_status(reason));
+                ui.status(&self.incomplete_turn_status(reason));
                 return RoundControl::BreakInner(false);
             }
             None => {}
@@ -311,18 +349,24 @@ impl crate::Agent {
             self.messages.push_nudge(NudgeKind::Continue, nudge);
             return RoundControl::Continue;
         }
-        // If we exhausted the silent-continue budget (at least one
-        // continue was attempted) on a turn that looked unfinished,
-        // let the user know. Don't warn when max_silent_continues
-        // is 0 (no continue was attempted — the feature is off).
-        if (looks_unfinished || plan_incomplete) && *silent_continues > 0 {
-            ui.status(
-                "⚠ the model kept narrating without acting — the task may be \
-         incomplete. /retry, or send 'continue'.",
-            );
-        }
+        // Stall budgets spent: keep working in-turn instead of asking the
+        // user to `/retry`. If that recovery is also spent, settle without
+        // a retry prompt.
         if looks_unfinished || plan_incomplete {
+            if self.keep_working_after_stall(
+                progress_tracker,
+                force_tools_next,
+                stalled_unfinished,
+                stalled_repeating,
+                Some(continue_total_nudges),
+                ui,
+            ) {
+                return RoundControl::Continue;
+            }
             progress_tracker.record(ProgressKind::Weak, "text answer looked unfinished", None);
+            if *silent_continues > 0 {
+                ui.status(&self.incomplete_turn_status("narrating_without_acting"));
+            }
         } else {
             *stalled_repeating = false;
             *stalled_unfinished = false;

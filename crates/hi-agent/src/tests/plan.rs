@@ -350,7 +350,7 @@ async fn plan_with_pending_steps_continues_past_recap() {
 }
 
 #[tokio::test]
-async fn new_task_emits_plan_clear_for_frontends() {
+async fn new_task_keeps_incomplete_plan_and_folds_replace_nudge() {
     let mut agent = agent(
         vec![completion(
             vec![Content::Text("new task done".into())],
@@ -370,8 +370,23 @@ async fn new_task_emits_plan_clear_for_frontends() {
         .await
         .unwrap();
 
-    assert!(agent.goals.last_plan.is_empty());
-    assert_eq!(ui.plans, vec![Vec::<PlanStep>::new()]);
+    assert_eq!(agent.goals.last_plan.len(), 1);
+    assert_eq!(agent.goals.last_plan[0].title, "old unfinished step");
+    assert!(
+        ui.plans.is_empty(),
+        "incomplete plans must stay pinned: {:?}",
+        ui.plans
+    );
+    let prompt = agent
+        .messages()
+        .iter()
+        .find(|m| m.role == hi_ai::Role::User)
+        .map(|m| m.text())
+        .unwrap_or_default();
+    assert!(
+        prompt.contains("If this message is a new task"),
+        "replace-plan nudge should fold into the new-task prompt: {prompt}"
+    );
 }
 
 #[tokio::test]
@@ -682,6 +697,69 @@ async fn plan_stalls_after_max_consecutive_text_only_responses() {
 }
 
 #[tokio::test]
+async fn keep_working_finishes_plan_after_silent_continue_budget() {
+    // After the silent-continue budget is spent, production keeps working
+    // in-turn instead of asking the user to retry. The model then acts and
+    // finishes the plan.
+    let mut cfg = config();
+    cfg.loop_limits.max_silent_continues = 1;
+    cfg.loop_limits.max_keep_working = 2;
+    let plan_call = |id: &str, s1: &str, s2: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: id.into(),
+                name: "update_plan".into(),
+                arguments: format!(
+                    r#"{{"steps":[{{"title":"a","status":"{s1}"}},{{"title":"b","status":"{s2}"}}]}}"#
+                ),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        plan_call("p1", "active", "pending"),
+        completion(
+            vec![Content::ToolCall {
+                id: "r1".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"x"}"#.into(),
+            }],
+            1,
+            1,
+        ),
+        completion(vec![Content::Text("Step 1 done.".into())], 1, 1),
+        completion(vec![Content::Text("Looks good.".into())], 1, 1),
+        // Silent-continue budget spent; keep-working must fire here.
+        completion(vec![Content::Text("Still recapping.".into())], 1, 1),
+        plan_call("p2", "done", "done"),
+        completion(
+            vec![Content::Text("All steps complete. Done.".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent.run_turn("do it", &mut ui).await.unwrap();
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("still working")),
+        "keep-working recovery should fire after silent-continue budget: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses.iter().any(|s| s.contains("/retry")),
+        "must not ask the user to retry: {:?}",
+        ui.statuses
+    );
+    let last_text = agent.messages().last().unwrap().text();
+    assert!(
+        last_text.contains("All steps complete"),
+        "turn should finish the plan, got: {last_text}"
+    );
+}
+
+#[tokio::test]
 async fn plan_persists_across_turns_for_continue() {
     // When a turn ends with an incomplete plan and the user types
     // "continue", the plan state should persist so the plan-aware continue
@@ -746,13 +824,8 @@ async fn plan_persists_across_turns_for_continue() {
     );
 
     // Turn 2: user types "fix a different bug" (NOT "continue"). The plan
-    // should be cleared so a stale plan doesn't cause spurious nudges.
-    // We can't easily run a full turn here (Canned provider is exhausted),
-    // but we can verify the clearing logic by checking that a non-continue
-    // input would clear it. Simulate by calling the clearing logic directly.
-    let mut plan = agent.goals.last_plan.clone();
-    // The agent clears last_plan when input doesn't look like "continue".
-    // Verify the heuristic: "fix a different bug" is NOT a continue command.
+    // stays pinned; a replace-plan nudge tells the model to swap the
+    // checklist if this is a new task.
     assert!(
         !looks_like_continue("fix a different bug"),
         "a new task should not look like continue"
@@ -761,10 +834,581 @@ async fn plan_persists_across_turns_for_continue() {
         looks_like_continue("continue"),
         "'continue' should look like continue"
     );
-    // Simulate the clearing: a new task clears, "continue" doesn't.
-    plan.clear(); // what the agent does on a new task
     assert!(
-        !plan_has_pending_steps(&plan),
-        "plan should be cleared on a new task"
+        plan_has_pending_steps(&agent.goals.last_plan),
+        "incomplete plan must survive a new-task follow-up: {:?}",
+        agent.goals.last_plan
     );
+}
+
+fn pending_step(title: &str) -> PlanStep {
+    PlanStep {
+        title: title.into(),
+        status: PlanStatus::Pending,
+    }
+}
+
+fn completed_outcome(leftover: Option<String>) -> TurnOutcome {
+    TurnOutcome {
+        status: TurnStatus::Completed,
+        verification: VerificationStatus::Unverified,
+        review: ReviewStatus::NotRequired,
+        stop_reason: TurnStopReason::Completed,
+        changed_files: Vec::new(),
+        verified_workspace_revision: None,
+        effective_route: crate::EffectiveModelRoute {
+            provider: Some("test".into()),
+            model: "m".into(),
+        },
+        review_same_model: false,
+        leftover: leftover.clone(),
+        plan_leftover: leftover,
+    }
+}
+
+#[tokio::test]
+async fn plan_drive_prompt_finishes_next_pending_step() {
+    let workspace = IsolatedWorkspace::new("plan-drive-finish");
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    let mut cfg = workspace.config();
+    cfg.loop_limits.max_silent_continues = 0;
+    cfg.loop_limits.max_keep_working = 0;
+    let plan_call = |id: &str, s1: &str, s2: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: id.into(),
+                name: "update_plan".into(),
+                arguments: format!(
+                    r#"{{"steps":[{{"title":"a","status":"{s1}"}},{{"title":"b","status":"{s2}"}}]}}"#
+                ),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        plan_call("p1", "done", "pending"),
+        write_completion(&workspace.path("src/a.rs").to_string_lossy()),
+        completion(vec![Content::Text("Step a is done.".into())], 1, 1),
+        plan_call("p2", "done", "done"),
+        completion(vec![Content::Text("All steps complete.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    let first = agent.run_turn("do it", &mut ui).await.unwrap();
+    assert!(
+        agent.plan_incomplete(),
+        "first turn should leave step b pending: {:?}",
+        agent.current_plan()
+    );
+    assert!(
+        agent.drive_decision(Some(&first)).should_enqueue(),
+        "leftover plan should auto-drive after the first turn: {first:?}"
+    );
+
+    let second = agent
+        .run_turn(crate::PLAN_DRIVE_PROMPT, &mut ui)
+        .await
+        .unwrap();
+    assert!(
+        !agent.plan_incomplete(),
+        "plan-drive should finish the remaining step: {:?}",
+        agent.current_plan()
+    );
+    assert!(!agent.drive_decision(Some(&second)).should_enqueue());
+}
+
+#[test]
+fn completed_turn_with_pending_plan_still_auto_drives() {
+    let mut agent = agent(Vec::new(), config());
+    agent.restore_plan(vec![pending_step("wire the scheduler")]);
+    let leftover = agent.leftover_work();
+    assert_eq!(
+        leftover.as_deref(),
+        Some("1/1 remaining — wire the scheduler")
+    );
+    let outcome = completed_outcome(leftover.clone());
+    assert_eq!(
+        agent.plan_drive_decision(Some(&outcome)),
+        crate::PlanDriveAction::Enqueue
+    );
+    agent.set_plan_mode(true);
+    assert_eq!(
+        agent.plan_drive_decision(Some(&outcome)),
+        crate::PlanDriveAction::Idle {
+            reason: crate::PlanDriveIdleReason::PlanMode
+        }
+    );
+    agent.set_plan_mode(false);
+    agent.set_plan_drive_paused(true);
+    assert_eq!(
+        agent.plan_drive_decision(Some(&outcome)),
+        crate::PlanDriveAction::Idle {
+            reason: crate::PlanDriveIdleReason::Paused
+        }
+    );
+}
+
+#[test]
+fn four_no_progress_plan_drives_park_and_mutation_resets() {
+    let mut agent = agent(Vec::new(), config());
+    agent.restore_plan(vec![pending_step("wire the scheduler")]);
+    let outcome = completed_outcome(agent.leftover_work());
+    assert_eq!(
+        agent.plan_drive_decision(Some(&outcome)),
+        crate::PlanDriveAction::Enqueue
+    );
+    for _ in 0..4 {
+        agent.note_plan_drive_progress(false);
+    }
+    assert_eq!(
+        agent.plan_drive_decision(Some(&outcome)),
+        crate::PlanDriveAction::Idle {
+            reason: crate::PlanDriveIdleReason::Parked
+        }
+    );
+    assert_eq!(agent.plan_drive_status(), "parked");
+    agent.note_plan_drive_progress(true);
+    assert_eq!(
+        agent.plan_drive_decision(Some(&outcome)),
+        crate::PlanDriveAction::Enqueue
+    );
+}
+
+#[tokio::test]
+async fn completed_turn_stamps_leftover_when_plan_pending() {
+    let workspace = IsolatedWorkspace::new("completed-leftover");
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    let mut cfg = workspace.config();
+    cfg.loop_limits.max_silent_continues = 0;
+    cfg.loop_limits.max_keep_working = 0;
+    let mut agent = agent(
+        vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "p1".into(),
+                    name: "update_plan".into(),
+                    arguments: r#"{"steps":[{"title":"a","status":"done"},{"title":"b","status":"pending"}]}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            write_completion(&workspace.path("src/a.rs").to_string_lossy()),
+            completion(vec![Content::Text("Step a is done.".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+    let outcome = agent.run_turn("do it", &mut ui).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert!(
+        outcome
+            .leftover
+            .as_deref()
+            .is_some_and(|line| line.contains("remaining")),
+        "Completed leftover should name remaining work: {outcome:?}"
+    );
+    assert!(agent.drive_decision(Some(&outcome)).should_enqueue());
+}
+
+#[tokio::test]
+async fn new_task_without_update_plan_keeps_stale_pin() {
+    let workspace = IsolatedWorkspace::new("stale-pin");
+    let mut cfg = workspace.config();
+    cfg.loop_limits.max_silent_continues = 0;
+    cfg.loop_limits.max_keep_working = 0;
+    let plan_call = completion(
+        vec![Content::ToolCall {
+            id: "p1".into(),
+            name: "update_plan".into(),
+            arguments: r#"{"steps":[{"title":"old work","status":"pending"}]}"#.into(),
+        }],
+        1,
+        1,
+    );
+    let mut agent = agent(
+        vec![
+            plan_call,
+            completion(vec![Content::Text("planned.".into())], 1, 1),
+            completion(
+                vec![Content::Text("starting the new auth work.".into())],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text("still on the old checklist.".into())],
+                1,
+                1,
+            ),
+            completion(vec![Content::Text("steering noted.".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+    agent.run_turn("do it", &mut ui).await.unwrap();
+    assert!(agent.plan_incomplete());
+
+    agent
+        .run_turn(
+            "implement a new auth system from scratch that replaces the old one",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+    assert!(
+        agent.plan_incomplete(),
+        "new-task without update_plan should keep the pin: {:?}",
+        agent.current_plan()
+    );
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .any(|message| message.text().contains("/plan replace")),
+        "new-task fold should name /plan replace"
+    );
+
+    agent.restore_plan(vec![pending_step("old work")]);
+    agent.run_turn("continue", &mut ui).await.unwrap();
+    assert!(
+        agent.plan_incomplete(),
+        "continue should keep the pin: {:?}",
+        agent.current_plan()
+    );
+
+    agent.run_turn("use a BTreeMap", &mut ui).await.unwrap();
+    assert!(
+        agent.plan_incomplete(),
+        "short steering should keep the pin: {:?}",
+        agent.current_plan()
+    );
+}
+
+#[tokio::test]
+async fn ask_user_rejects_continue_and_caps_at_one() {
+    let mut agent = agent(Vec::new(), config());
+    let mut ui = RecUi::default();
+    let confirm = agent
+        .handle_ask_user(r#"{"question":"should I continue?"}"#, &mut ui)
+        .await;
+    assert_eq!(confirm.status, hi_tools::ToolStatus::Failed);
+    assert!(confirm.content.contains("keep working"));
+    assert!(
+        ui.ask_user_questions.is_empty(),
+        "continue-shaped questions must not open the overlay: {:?}",
+        ui.ask_user_questions
+    );
+
+    let first = agent
+        .handle_ask_user(
+            r#"{"question":"REST or gRPC for the public API?"}"#,
+            &mut ui,
+        )
+        .await;
+    assert_eq!(first.status, hi_tools::ToolStatus::Succeeded);
+    assert_eq!(ui.ask_user_questions.len(), 1);
+
+    let second = agent
+        .handle_ask_user(r#"{"question":"And which error type?"}"#, &mut ui)
+        .await;
+    assert_eq!(second.status, hi_tools::ToolStatus::Failed);
+    assert!(second.content.contains("already asked this turn"));
+    assert_eq!(ui.ask_user_questions.len(), 1);
+}
+
+#[tokio::test]
+async fn ask_user_drive_streak_and_what_next_fail_closed() {
+    let mut agent = agent(Vec::new(), config());
+    agent.restore_plan(vec![pending_step("wire the scheduler")]);
+    agent.begin_drive_turn(crate::DriveKind::Plan);
+    let mut ui = RecUi::default();
+
+    let next = agent
+        .handle_ask_user(r#"{"question":"what should I do next?"}"#, &mut ui)
+        .await;
+    assert_eq!(next.status, hi_tools::ToolStatus::Failed);
+    assert!(next.content.contains("keep working"));
+    assert!(ui.ask_user_questions.is_empty());
+
+    let first = agent
+        .handle_ask_user(
+            r#"{"question":"REST or gRPC for the public API?"}"#,
+            &mut ui,
+        )
+        .await;
+    assert_eq!(first.status, hi_tools::ToolStatus::Succeeded);
+    assert_eq!(ui.ask_user_questions.len(), 1);
+
+    agent.ask_user_calls = 0;
+    let second = agent
+        .handle_ask_user(r#"{"question":"And which error type?"}"#, &mut ui)
+        .await;
+    assert_eq!(second.status, hi_tools::ToolStatus::Failed);
+    assert!(second.content.contains("already asked this drive"));
+    assert_eq!(ui.ask_user_questions.len(), 1);
+}
+
+#[test]
+fn plan_clear_drops_the_pin() {
+    let mut agent = agent(Vec::new(), config());
+    agent.restore_plan(vec![pending_step("old work")]);
+    let clear = handle_session_command(&mut agent, &Command::Plan("clear".into()), &[])
+        .expect("clear effect");
+    assert!(agent.current_plan().is_empty());
+    assert!(clear.follow_up_prompt.is_none());
+    assert!(clear.message.contains("cleared"));
+
+    agent.restore_plan(vec![pending_step("old work")]);
+    let replace = handle_session_command(&mut agent, &Command::Plan("replace".into()), &[])
+        .expect("replace effect");
+    assert!(agent.current_plan().is_empty());
+    assert!(replace.message.contains("update_plan"));
+}
+
+#[test]
+fn plan_pause_and_resume_are_reserved() {
+    let mut agent = agent(Vec::new(), config());
+    agent.restore_plan(vec![pending_step("wire the scheduler")]);
+    let pause = handle_session_command(&mut agent, &Command::Plan("pause".into()), &[])
+        .expect("pause effect");
+    assert!(agent.plan_drive_paused());
+    assert!(pause.follow_up_prompt.is_none());
+    assert!(pause.message.contains("paused"));
+
+    let outcome = completed_outcome(agent.leftover_work());
+    assert!(!agent.drive_decision(Some(&outcome)).should_enqueue());
+
+    let status = handle_session_command(&mut agent, &Command::Plan("status".into()), &[])
+        .expect("status effect");
+    assert!(status.message.contains("plan drive: paused"));
+
+    let resume = handle_session_command(&mut agent, &Command::Plan("resume".into()), &[])
+        .expect("resume effect");
+    assert!(!agent.plan_drive_paused());
+    assert_eq!(
+        resume.follow_up_prompt.as_deref(),
+        Some(crate::PLAN_DRIVE_PROMPT)
+    );
+}
+
+fn goal_agent() -> Agent {
+    let mut cfg = config();
+    cfg.subagents.long_horizon = true;
+    agent(Vec::new(), cfg)
+}
+
+#[test]
+fn drive_decision_goal_wins_over_plan_and_plan_mode_idles() {
+    let mut agent = goal_agent();
+    agent.restore_plan(vec![pending_step("wire the scheduler")]);
+    assert!(
+        agent
+            .set_structured_goal(Some(crate::Goal::new(
+                "ship it",
+                vec!["implement it".into()],
+            )))
+            .unwrap()
+    );
+    let outcome = completed_outcome(agent.leftover_work());
+    assert_eq!(
+        agent.drive_decision(Some(&outcome)),
+        crate::DriveAction::Enqueue(crate::DriveKind::Goal)
+    );
+    agent.set_plan_mode(true);
+    assert_eq!(
+        agent.drive_decision(Some(&outcome)),
+        crate::DriveAction::Idle {
+            reason: crate::DriveIdleReason::PlanMode
+        }
+    );
+}
+
+#[test]
+fn drive_decision_goal_paused_and_parked() {
+    let mut agent = goal_agent();
+    assert!(
+        agent
+            .set_structured_goal(Some(crate::Goal::new(
+                "ship it",
+                vec!["implement it".into()],
+            )))
+            .unwrap()
+    );
+    let outcome = completed_outcome(agent.leftover_work());
+    assert!(
+        agent
+            .try_set_goal_pause_reason(crate::GoalPauseReason::User)
+            .unwrap()
+    );
+    assert_eq!(
+        agent.drive_decision(Some(&outcome)),
+        crate::DriveAction::Idle {
+            reason: crate::DriveIdleReason::GoalPaused
+        }
+    );
+    assert!(
+        agent
+            .try_set_goal_pause_reason(crate::GoalPauseReason::None)
+            .unwrap()
+    );
+    for _ in 0..crate::GOAL_DRIVE_STALL_LIMIT {
+        agent.note_goal_drive_progress(false);
+    }
+    assert_eq!(
+        agent.drive_decision(Some(&outcome)),
+        crate::DriveAction::Idle {
+            reason: crate::DriveIdleReason::GoalParked
+        }
+    );
+    let goal = agent.structured_goal().expect("goal");
+    assert!(!goal.is_paused());
+    assert_ne!(goal.pause_reason, crate::GoalPauseReason::Stall);
+}
+
+#[test]
+fn begin_drive_turn_resumes_paused_and_parked_goal() {
+    let mut agent = goal_agent();
+    assert!(
+        agent
+            .set_structured_goal(Some(crate::Goal::new(
+                "ship it",
+                vec!["implement it".into()],
+            )))
+            .unwrap()
+    );
+    assert!(
+        agent
+            .try_set_goal_pause_reason(crate::GoalPauseReason::User)
+            .unwrap()
+    );
+    agent.begin_drive_turn(crate::DriveKind::Goal);
+    assert!(!agent.structured_goal().unwrap().is_paused());
+    assert_eq!(agent.goal_drive_stall(), 0);
+
+    for _ in 0..crate::GOAL_DRIVE_STALL_LIMIT {
+        agent.note_goal_drive_progress(false);
+    }
+    assert_eq!(agent.goal_drive_status(), "parked");
+    agent.begin_drive_turn(crate::DriveKind::Goal);
+    assert_eq!(agent.goal_drive_stall(), 0);
+    assert_eq!(agent.goal_drive_status(), "running");
+}
+
+#[test]
+fn interactive_drive_turn_demotes_always_and_restores() {
+    let mut agent = goal_agent();
+    agent.set_interactive_session(true);
+    agent.set_permission_mode(crate::PermissionMode::Always);
+    agent.begin_drive_turn(crate::DriveKind::Plan);
+    assert_eq!(agent.permission_mode(), crate::PermissionMode::Auto);
+    agent.finish_drive_turn();
+    assert_eq!(agent.permission_mode(), crate::PermissionMode::Always);
+
+    agent.set_interactive_session(false);
+    agent.set_permission_mode(crate::PermissionMode::Always);
+    agent.begin_drive_turn(crate::DriveKind::Goal);
+    assert_eq!(agent.permission_mode(), crate::PermissionMode::Always);
+}
+
+#[test]
+fn ingest_checkbox_plan_becomes_sub_goals_without_planner() {
+    let workspace = IsolatedWorkspace::new("ingest-checkbox");
+    std::fs::write(
+        workspace.path("plan.md"),
+        "- [x] already shipped\n- [ ] wire the CLI\n- [ ] pass tests\n",
+    )
+    .unwrap();
+    let mut cfg = workspace.config();
+    cfg.paths.workspace_root = std::fs::canonicalize(&cfg.paths.workspace_root).unwrap();
+    cfg.subagents.long_horizon = true;
+    let agent = agent(Vec::new(), cfg);
+    let goal = agent
+        .try_ingest_goal("implement plan.md")
+        .expect("checklist ingest");
+    assert_eq!(goal.sub_goals.len(), 3);
+    assert_eq!(goal.sub_goals[0].status, crate::GoalStatus::Done);
+    assert_eq!(goal.sub_goals[1].status, crate::GoalStatus::Active);
+    assert_eq!(goal.sub_goals[1].description, "wire the CLI");
+}
+
+#[test]
+fn ingest_prose_plan_falls_back_to_planner() {
+    let workspace = IsolatedWorkspace::new("ingest-prose");
+    std::fs::write(
+        workspace.path("plan.md"),
+        "# Design\n\nThis document describes the architecture in prose.\n",
+    )
+    .unwrap();
+    let mut cfg = workspace.config();
+    cfg.paths.workspace_root = std::fs::canonicalize(&cfg.paths.workspace_root).unwrap();
+    cfg.subagents.long_horizon = true;
+    let agent = agent(Vec::new(), cfg);
+    assert!(agent.try_ingest_goal("implement plan.md").is_none());
+}
+
+#[test]
+fn goal_drive_stall_skips_stuck_step_and_keeps_driving() {
+    let mut agent = goal_agent();
+    assert!(
+        agent
+            .set_structured_goal(Some(crate::Goal::new(
+                "ship it",
+                vec!["first".into(), "second".into(), "third".into()],
+            )))
+            .unwrap()
+    );
+    let outcome = completed_outcome(agent.leftover_work());
+    let mut last = crate::GoalDriveProgress::Unchanged;
+    for _ in 0..crate::GOAL_DRIVE_STALL_LIMIT {
+        last = agent.note_goal_drive_progress(false);
+    }
+    assert!(
+        matches!(
+            last,
+            crate::GoalDriveProgress::Skipped { ref failed, .. } if failed == "first"
+        ),
+        "{last:?}"
+    );
+    assert_eq!(
+        agent.drive_decision(Some(&outcome)),
+        crate::DriveAction::Enqueue(crate::DriveKind::Goal)
+    );
+    assert_eq!(agent.goal_drive_stall(), 0);
+    let goal = agent.structured_goal().expect("goal");
+    assert_eq!(goal.sub_goals[0].status, crate::GoalStatus::Failed);
+    assert_eq!(goal.sub_goals[1].status, crate::GoalStatus::Active);
+    assert_eq!(goal.pause_reason, crate::GoalPauseReason::None);
+}
+
+#[test]
+fn goal_drive_two_skips_without_completion_parks() {
+    let mut agent = goal_agent();
+    assert!(
+        agent
+            .set_structured_goal(Some(crate::Goal::new(
+                "ship it",
+                vec!["first".into(), "second".into(), "third".into()],
+            )))
+            .unwrap()
+    );
+    let outcome = completed_outcome(agent.leftover_work());
+    for _ in 0..crate::GOAL_DRIVE_STALL_LIMIT {
+        agent.note_goal_drive_progress(false);
+    }
+    let mut last = crate::GoalDriveProgress::Unchanged;
+    for _ in 0..crate::GOAL_DRIVE_STALL_LIMIT {
+        last = agent.note_goal_drive_progress(false);
+    }
+    assert_eq!(last, crate::GoalDriveProgress::Parked);
+    assert_eq!(
+        agent.drive_decision(Some(&outcome)),
+        crate::DriveAction::Idle {
+            reason: crate::DriveIdleReason::GoalParked
+        }
+    );
+    let goal = agent.structured_goal().expect("goal");
+    assert!(goal.is_thrashing());
+    assert_eq!(goal.pause_reason, crate::GoalPauseReason::None);
+    assert_eq!(goal.sub_goals[0].status, crate::GoalStatus::Failed);
+    assert_eq!(goal.sub_goals[1].status, crate::GoalStatus::Failed);
 }

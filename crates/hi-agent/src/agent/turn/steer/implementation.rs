@@ -15,7 +15,6 @@ use super::super::progress::{
     AWAITING_BACKGROUND_REASON, NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker,
     WAITING_ROUND_BUDGET, no_progress_signature_for_calls,
 };
-use super::super::retry::incomplete_status;
 use super::super::tools::ToolBatchOutcome;
 use super::RoundControl;
 
@@ -125,9 +124,19 @@ impl crate::Agent {
                 self.messages.push_nudge(NudgeKind::Continue, guidance);
                 return RoundControl::Continue;
             }
+            if self.keep_working_after_stall(
+                progress_tracker,
+                force_tools_next,
+                stalled_unfinished,
+                stalled_repeating,
+                None,
+                ui,
+            ) {
+                return RoundControl::Continue;
+            }
             *stalled_unfinished = true;
             ui.status(&format!(
-                "the model kept emitting invalid tool arguments ({validation_summary}); stopping incomplete so it can be retried"
+                "tool arguments kept failing validation ({validation_summary})"
             ));
             return RoundControl::BreakInner(false);
         }
@@ -297,15 +306,26 @@ impl crate::Agent {
                         );
                         return RoundControl::Continue;
                     }
+                    if self.keep_working_after_stall(
+                        progress_tracker,
+                        force_tools_next,
+                        stalled_unfinished,
+                        stalled_repeating,
+                        None,
+                        ui,
+                    ) {
+                        *prev_call_sig = None;
+                        return RoundControl::Continue;
+                    }
                     *stalled_unfinished = true;
                     progress_tracker.record(
                         ProgressKind::None,
                         "repeat_same_inspection_output",
                         None,
                     );
-                    ui.nudge("review kept getting the same inspection output; stopping incomplete");
+                    ui.nudge("review kept getting the same inspection output");
                     let _ = intent;
-                    ui.status(&incomplete_status("repeat_same_inspection_output"));
+                    ui.status(&self.incomplete_turn_status("repeat_same_inspection_output"));
                     return RoundControl::BreakInner(false);
                 }
                 if (implementation_intent.is_some() || expected_mutation)
@@ -330,6 +350,17 @@ impl crate::Agent {
                         return RoundControl::Continue;
                     }
 
+                    if self.keep_working_after_stall(
+                        progress_tracker,
+                        force_tools_next,
+                        stalled_unfinished,
+                        stalled_repeating,
+                        None,
+                        ui,
+                    ) {
+                        *prev_call_sig = None;
+                        return RoundControl::Continue;
+                    }
                     *stalled_unfinished = true;
                     progress_tracker.record(
                         ProgressKind::None,
@@ -339,7 +370,7 @@ impl crate::Agent {
                     ui.nudge(
                         "implementation repeated equivalent inspection output without editing",
                     );
-                    ui.status(&incomplete_status("implementation_repeat_no_edit"));
+                    ui.status(&self.incomplete_turn_status("implementation_repeat_no_edit"));
                     return RoundControl::BreakInner(false);
                 }
             }

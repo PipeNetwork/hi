@@ -82,6 +82,8 @@ pub(super) struct ProgressTracker {
     /// background work, so plan-continue nudges are suppressed and a status
     /// answer ends the turn. Cleared by a round that does real work.
     pub(super) awaiting_background: bool,
+    /// Extra recoveries after a stall budget was spent (`max_keep_working`).
+    pub(super) keep_working_rounds: u32,
     pub(super) events: Vec<ProgressEvent>,
 }
 
@@ -121,6 +123,16 @@ impl ProgressTracker {
             }
         }
         self.push_event(kind, reason, signature);
+    }
+
+    /// Spend one keep-working recovery. Returns false when the budget is
+    /// exhausted or disabled (`max == 0`).
+    pub(super) fn try_keep_working(&mut self, max: u32) -> bool {
+        if max == 0 || self.keep_working_rounds >= max {
+            return false;
+        }
+        self.keep_working_rounds = self.keep_working_rounds.saturating_add(1);
+        true
     }
 
     pub(super) fn record_no_progress_nudge(

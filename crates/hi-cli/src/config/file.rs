@@ -501,7 +501,8 @@ pub fn mask_key(key: &str) -> String {
 /// Creates the file with 0600 permissions on Unix so API keys in the file
 /// are never world-readable — the mode is set atomically at creation via
 /// `OpenOptions`, not chmod'd after the write (which left a readable window
-/// and discarded chmod failures).
+/// and discarded chmod failures). The live path is replaced by rename so a
+/// crash or disk-full mid-write cannot truncate an existing key file.
 pub fn save_config_to(config: &Config, path: &Path) -> Result<()> {
     let toml = toml::to_string_pretty(config)
         .with_context(|| format!("serializing config to {}", path.display()))?;
@@ -509,14 +510,68 @@ pub fn save_config_to(config: &Config, path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating config dir {}", parent.display()))?;
     }
-    write_private(path, toml.as_bytes())?;
+    write_private_atomic(path, toml.as_bytes())?;
     Ok(())
+}
+
+/// Write `bytes` to `path` via a same-directory temp file, then rename into
+/// place. On Unix the temp is created with mode 0600; a pre-existing temp
+/// with wider permissions is tightened before the write. Failure cleans up
+/// the temp and leaves the previous `path` intact.
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = match path.file_name() {
+        Some(name) => {
+            let mut tmp_name = name.to_os_string();
+            tmp_name.push(format!(".{}.tmp", std::process::id()));
+            path.with_file_name(tmp_name)
+        }
+        None => path.with_extension(format!("{}.tmp", std::process::id())),
+    };
+    let result = write_private(&tmp, bytes).and_then(|_| replace_file(&tmp, path));
+    if result.is_err() && path.exists() {
+        // Dest still holds the previous key file (or a restored backup).
+        // Drop the temp. If dest is missing, leave the temp so the keys
+        // are not deleted from both locations.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Replace `to` with `from`. POSIX `rename` is atomic over an existing file.
+/// Windows cannot rename onto an existing path: move the destination aside,
+/// put the new file in place, then drop the backup. If the new file cannot
+/// be installed, the backup is moved back so the previous key file survives.
+fn replace_file(from: &Path, to: &Path) -> Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => replace_existing(from, to),
+        Err(err) => Err(err).with_context(|| format!("replacing {}", to.display())),
+    }
+}
+
+fn replace_existing(from: &Path, to: &Path) -> Result<()> {
+    let backup = {
+        let mut name = to.as_os_str().to_owned();
+        name.push(".bak");
+        std::path::PathBuf::from(name)
+    };
+    std::fs::rename(to, &backup).with_context(|| format!("replacing {}", to.display()))?;
+    match std::fs::rename(from, to) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = std::fs::rename(&backup, to);
+            Err(err).with_context(|| format!("replacing {}", to.display()))
+        }
+    }
 }
 
 /// Write `bytes` to `path` with owner-only permissions from the start.
 /// On Unix the file is created with mode 0600 atomically; if it already
-/// existed with wider permissions, those are tightened too (best-effort is
-/// not acceptable for a key-bearing file, so a chmod failure propagates).
+/// existed with wider permissions, those are tightened *before* the write
+/// so key material is never flushed into a world-readable file.
 #[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
@@ -528,12 +583,16 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .mode(0o600)
         .open(path)
         .with_context(|| format!("writing {}", path.display()))?;
+    // A pre-existing file keeps its old mode through OpenOptions; tighten
+    // before writing secrets, and surface a failure instead of ignoring it.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("tightening permissions on {}", path.display()))?;
     file.write_all(bytes)
         .with_context(|| format!("writing {}", path.display()))?;
-    // A pre-existing file keeps its old mode through OpenOptions; enforce
-    // 0600 on that path too, and surface a failure instead of ignoring it.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("tightening permissions on {}", path.display()))?;
+    // Durable before rename: without this, a crash after replace can leave
+    // an empty/partial key file whose old contents are already gone.
+    file.sync_all()
+        .with_context(|| format!("flushing {}", path.display()))?;
     Ok(())
 }
 

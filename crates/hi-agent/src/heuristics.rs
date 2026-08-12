@@ -537,6 +537,33 @@ pub(crate) fn plan_has_pending_steps(steps: &[PlanStep]) -> bool {
         .any(|s| s.status == PlanStatus::Pending || s.status == PlanStatus::Active)
 }
 
+/// First Active step title, else first Pending. None when the plan is empty
+/// or fully done.
+pub(crate) fn next_plan_step_title(steps: &[PlanStep]) -> Option<&str> {
+    steps
+        .iter()
+        .find(|step| step.status == PlanStatus::Active)
+        .or_else(|| steps.iter().find(|step| step.status == PlanStatus::Pending))
+        .map(|step| step.title.as_str())
+}
+
+/// Leftover checklist line, e.g. `3/9 remaining — wire the scheduler`.
+pub fn leftover_plan_summary(steps: &[PlanStep]) -> Option<String> {
+    let total = steps.len();
+    if total == 0 {
+        return None;
+    }
+    let remaining = steps
+        .iter()
+        .filter(|step| step.status != PlanStatus::Done)
+        .count();
+    if remaining == 0 {
+        return None;
+    }
+    let title = next_plan_step_title(steps)?;
+    Some(format!("{remaining}/{total} remaining — {title}"))
+}
+
 /// Whether a user input looks like a "continue" command — a short prompt
 /// asking the agent to keep going, as opposed to a new task. Used to decide
 /// whether to persist the plan state across turns: a "continue" on an
@@ -544,7 +571,11 @@ pub(crate) fn plan_has_pending_steps(steps: &[PlanStep]) -> bool {
 /// fire; a new task should clear it so a stale plan doesn't cause spurious
 /// nudges.
 pub(crate) fn looks_like_continue(input: &str) -> bool {
-    let lower = input.trim().to_lowercase();
+    let trimmed = input.trim();
+    if trimmed == crate::PLAN_DRIVE_PROMPT || trimmed == crate::GOAL_CONTINUE_PROMPT {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
     if lower.len() > 50 {
         return false; // A continue command is short; a new task is longer.
     }
@@ -565,6 +596,90 @@ pub(crate) fn looks_like_continue(input: &str) -> bool {
     CONTINUE_PHRASES
         .iter()
         .any(|p| lower == *p || lower.starts_with(p))
+}
+
+/// Whether a user message looks like a new task that should drop a stale
+/// checklist pin if the model never called `update_plan`. Continue/drive
+/// prompts never match. Short steering ("use a BTreeMap", "also tests")
+/// stays a pin; longer prompts or an imperative task verb do not.
+pub fn looks_like_new_task(input: &str) -> bool {
+    if looks_like_continue(input) {
+        return false;
+    }
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.len() > 50 {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    let rest = lower
+        .strip_prefix("please ")
+        .or_else(|| lower.strip_prefix("can you "))
+        .or_else(|| lower.strip_prefix("could you "))
+        .or_else(|| lower.strip_prefix("we need to "))
+        .unwrap_or(lower.as_str());
+    let first = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_ascii_alphabetic());
+    const TASK_VERBS: &[&str] = &[
+        "fix",
+        "implement",
+        "refactor",
+        "add",
+        "build",
+        "create",
+        "write",
+        "update",
+        "change",
+        "remove",
+        "delete",
+        "migrate",
+        "replace",
+        "introduce",
+        "ship",
+        "wire",
+        "port",
+    ];
+    TASK_VERBS.contains(&first)
+}
+
+/// Confirm/continue questions that must not open `ask_user`.
+/// When `plan_incomplete` is set, "what next" / "which first" questions are
+/// also rejected — the pending step already answers them.
+pub(crate) fn looks_like_confirm_question(question: &str, plan_incomplete: bool) -> bool {
+    if looks_like_continue(question) {
+        return true;
+    }
+    let lower = question.to_lowercase();
+    const PHRASES: &[&str] = &[
+        "should i continue",
+        "shall i continue",
+        "is this okay",
+        "is this ok",
+        "keep going",
+        "continue with the plan",
+        "ok to continue",
+        "okay to continue",
+    ];
+    if PHRASES.iter().any(|phrase| lower.contains(phrase)) {
+        return true;
+    }
+    if plan_incomplete {
+        const NEXT_PHRASES: &[&str] = &[
+            "what should i do next",
+            "which should i",
+            "which one first",
+            "what next",
+        ];
+        if NEXT_PHRASES.iter().any(|phrase| lower.contains(phrase)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether a line expresses *intent to act next* rather than a finished result.
@@ -899,6 +1014,48 @@ mod tests {
     }
 
     #[test]
+    fn leftover_plan_summary_names_the_next_step() {
+        let steps = vec![
+            PlanStep {
+                title: "done step".into(),
+                status: PlanStatus::Done,
+            },
+            PlanStep {
+                title: "wire the scheduler".into(),
+                status: PlanStatus::Active,
+            },
+            PlanStep {
+                title: "later".into(),
+                status: PlanStatus::Pending,
+            },
+        ];
+        assert_eq!(
+            leftover_plan_summary(&steps).as_deref(),
+            Some("2/3 remaining — wire the scheduler")
+        );
+        assert_eq!(leftover_plan_summary(&[]), None);
+        assert_eq!(
+            leftover_plan_summary(&[PlanStep {
+                title: "done".into(),
+                status: PlanStatus::Done,
+            }]),
+            None
+        );
+    }
+
+    #[test]
+    fn looks_like_new_task_keeps_short_steering() {
+        assert!(looks_like_new_task("fix the login bug"));
+        assert!(looks_like_new_task(
+            "please implement a new auth system from scratch that replaces the old one"
+        ));
+        assert!(!looks_like_new_task("continue"));
+        assert!(!looks_like_new_task("use a BTreeMap"));
+        assert!(!looks_like_new_task("also tests"));
+        assert!(!looks_like_new_task(crate::PLAN_DRIVE_PROMPT));
+    }
+
+    #[test]
     fn looks_like_continue_heuristic() {
         // Short continue commands.
         for s in [
@@ -918,6 +1075,14 @@ mod tests {
         ] {
             assert!(looks_like_continue(s), "should flag as continue: {s:?}");
         }
+        assert!(
+            looks_like_continue(crate::PLAN_DRIVE_PROMPT),
+            "plan-drive prompt must count as continue"
+        );
+        assert!(
+            looks_like_continue(crate::GOAL_CONTINUE_PROMPT),
+            "goal-drive prompt must count as continue"
+        );
         // New tasks — should NOT be flagged as continue.
         for s in [
             "fix the bug in parser.rs",

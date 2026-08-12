@@ -43,7 +43,8 @@ pub enum Command {
     Turns(String),
     /// Diagnose setup/runtime health (config, credentials, git, MCP).
     Doctor,
-    /// Enter/exit plan mode or show the current plan. Arg: empty/on, `off`, `show`, or a request.
+    /// Enter/exit plan mode, pause leftover-work drive, or show the current plan.
+    /// Arg: empty/on, `off`, `show`, `pause`, `resume`, `clear`, `replace`, or a request.
     Plan(String),
     /// Show the current plan checklist (`update_plan` / plan mode).
     ViewPlan,
@@ -1953,12 +1954,15 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "plan",
-        args: "[off|show|request]",
-        help: "plan mode: design before edits (off exits; show prints checklist)",
+        args: "[off|show|pause|resume|clear|request]",
+        help: "plan mode and leftover-work drive (off exits; show prints checklist)",
         arg_values: &[
             ("off", "leave plan mode"),
             ("show", "print the current plan checklist"),
             ("on", "enter plan mode"),
+            ("pause", "pause leftover-work auto-drive"),
+            ("resume", "resume leftover-work auto-drive"),
+            ("clear", "drop the pinned checklist"),
         ],
     },
     CommandSpec {

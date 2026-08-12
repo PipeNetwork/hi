@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hi_agent::tool_label;
-use hi_agent::{ConfirmationFuture, ConfirmationRequest, ConfirmationResult, Ui};
+use hi_agent::{
+    AskUserFuture, AskUserResult, ConfirmationFuture, ConfirmationRequest, ConfirmationResult, Ui,
+};
 
 pub struct PlainUi {
     /// Set true on the first real output; the REPL's spinner watches it and
@@ -95,6 +97,38 @@ impl Ui for PlainUi {
                 Ok(_) if input.trim().eq_ignore_ascii_case("y") => ConfirmationResult::Approved,
                 Ok(_) => ConfirmationResult::Rejected,
                 Err(_) => ConfirmationResult::Unavailable,
+            }
+        })
+    }
+
+    fn ask_user(&mut self, question: &str, options: &[String]) -> AskUserFuture<'_> {
+        use std::io::Write;
+        self.begin_output();
+        println!("\x1b[33m⏺ {question}\x1b[0m");
+        for (i, option) in options.iter().enumerate() {
+            println!("\x1b[2m  {}. {option}\x1b[0m", i + 1);
+        }
+        print!("\x1b[33m  › \x1b[0m");
+        let _ = std::io::stdout().flush();
+        let options = options.to_vec();
+        Box::pin(async move {
+            let mut input = String::new();
+            match std::io::stdin().read_line(&mut input) {
+                Ok(0) => AskUserResult::Unavailable,
+                Ok(_) => {
+                    let trimmed = input.trim();
+                    if trimmed.is_empty() {
+                        AskUserResult::Cancelled
+                    } else if let Ok(n) = trimmed.parse::<usize>()
+                        && n >= 1
+                        && let Some(option) = options.get(n - 1)
+                    {
+                        AskUserResult::Answer(option.clone())
+                    } else {
+                        AskUserResult::Answer(trimmed.to_string())
+                    }
+                }
+                Err(_) => AskUserResult::Unavailable,
             }
         })
     }

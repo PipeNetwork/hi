@@ -143,7 +143,13 @@ impl crate::App {
             confirmation: None,
             confirmation_scroll: 0,
             goal: None,
-            goal_drive_stall: 0,
+            plan_mode: false,
+            plan_drive_paused: false,
+            last_drive: hi_agent::DriveAction::Idle {
+                reason: hi_agent::DriveIdleReason::None,
+            },
+            last_stop_reason: None,
+            ask_user_draft: String::new(),
             fleet: Vec::new(),
             fleet_next_id: 0,
             workflow_runs: HashMap::new(),
@@ -359,14 +365,17 @@ impl crate::App {
     /// Whether a confirmation should be skipped because of session-wide or
     /// path-scoped auto-approve.
     pub(crate) fn should_auto_approve(&self, request: &hi_agent::ConfirmationRequest) -> bool {
+        if matches!(request, hi_agent::ConfirmationRequest::AskUser { .. }) {
+            return false;
+        }
         if self.auto_approve_session {
             return true;
         }
         match request {
             hi_agent::ConfirmationRequest::FileEdit { path, .. } => self.path_auto_approved(path),
-            // DelegateApply / shell never match path prefixes.
             hi_agent::ConfirmationRequest::DelegateApply { .. }
-            | hi_agent::ConfirmationRequest::ShellMutation { .. } => false,
+            | hi_agent::ConfirmationRequest::ShellMutation { .. }
+            | hi_agent::ConfirmationRequest::AskUser { .. } => false,
         }
     }
 

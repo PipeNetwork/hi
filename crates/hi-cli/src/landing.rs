@@ -115,6 +115,9 @@ pub(crate) struct LoadedAgentSession {
     pub(crate) structured_goal: Option<hi_agent::Goal>,
     pub(crate) decisions: hi_agent::DecisionLog,
     pub(crate) plan: Vec<hi_agent::PlanStep>,
+    pub(crate) plan_drive_paused: bool,
+    pub(crate) plan_drive_stall: u32,
+    pub(crate) goal_drive_stall: u32,
     /// A one-line summary of the resumed session, shown to the user on startup.
     pub(crate) resume_summary: Option<String>,
 }
@@ -179,6 +182,9 @@ pub(crate) fn eval_loaded_session(input: &EvalInput) -> Result<Option<LoadedAgen
         structured_goal: None,
         decisions: hi_agent::DecisionLog::default(),
         plan: Vec::new(),
+        plan_drive_paused: false,
+        plan_drive_stall: 0,
+        goal_drive_stall: 0,
         resume_summary: None,
     }))
 }
@@ -341,6 +347,9 @@ pub(crate) fn resolve_session(
                     structured_goal: loaded.goal,
                     decisions: loaded.decisions,
                     plan: loaded.plan,
+                    plan_drive_paused: loaded.plan_drive_paused,
+                    plan_drive_stall: loaded.plan_drive_stall,
+                    goal_drive_stall: loaded.goal_drive_stall,
                     resume_summary: None,
                 }),
             ));
@@ -360,6 +369,9 @@ pub(crate) fn resolve_session(
                 structured_goal: loaded.goal,
                 decisions: loaded.decisions,
                 plan: loaded.plan,
+                plan_drive_paused: loaded.plan_drive_paused,
+                plan_drive_stall: loaded.plan_drive_stall,
+                goal_drive_stall: loaded.goal_drive_stall,
                 resume_summary: Some(summary),
             }),
         ));
@@ -377,6 +389,9 @@ pub(crate) fn resolve_session(
                     structured_goal: loaded.goal,
                     decisions: loaded.decisions,
                     plan: loaded.plan,
+                    plan_drive_paused: loaded.plan_drive_paused,
+                    plan_drive_stall: loaded.plan_drive_stall,
+                    goal_drive_stall: loaded.goal_drive_stall,
                     resume_summary: Some(summary),
                 }),
             ));

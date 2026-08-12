@@ -151,6 +151,10 @@ pub(crate) fn build_agent(
     };
     let resume_summary = loaded.as_ref().and_then(|l| l.resume_summary.clone());
     let restored_plan = loaded.as_ref().map(|l| l.plan.clone()).unwrap_or_default();
+    let restored_plan_drive = loaded
+        .as_ref()
+        .map(|l| (l.plan_drive_paused, l.plan_drive_stall));
+    let restored_goal_drive = loaded.as_ref().map(|l| l.goal_drive_stall);
     let agent_result = match loaded {
         Some(loaded) => Agent::resume(
             provider,
@@ -165,6 +169,12 @@ pub(crate) fn build_agent(
     };
     let mut agent = agent_result.context("initializing workspace runtime")?;
     agent.restore_plan(restored_plan);
+    if let Some((paused, stall)) = restored_plan_drive {
+        agent.restore_plan_drive(paused, stall);
+    }
+    if let Some(stall) = restored_goal_drive {
+        agent.restore_goal_drive(stall);
+    }
 
     Ok(BuiltAgent {
         agent,

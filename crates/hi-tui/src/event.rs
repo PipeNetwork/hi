@@ -6,7 +6,10 @@ use std::{io, sync::Arc};
 use crossterm::event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
-use hi_agent::{ConfirmationFuture, ConfirmationRequest, ConfirmationResult, PlanStep, Ui};
+use hi_agent::{
+    AskUserFuture, AskUserResult, ConfirmationFuture, ConfirmationRequest, ConfirmationResult,
+    PlanStep, Ui,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -178,6 +181,7 @@ impl ChannelUi {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "interactive".into());
         let (capability, scope, tool, arguments, detail) = match request {
+            ConfirmationRequest::AskUser { .. } => return None,
             ConfirmationRequest::FileEdit { path, diff } => (
                 hi_policy::CapabilityKind::WorkspaceWrite,
                 hi_policy::ResourceScope::Paths {
@@ -222,7 +226,9 @@ impl ChannelUi {
             match request {
                 ConfirmationRequest::FileEdit { diff, .. }
                 | ConfirmationRequest::DelegateApply { diff, .. } => Some(diff.as_str()),
-                ConfirmationRequest::ShellMutation { .. } => None,
+                ConfirmationRequest::ShellMutation { .. } | ConfirmationRequest::AskUser { .. } => {
+                    None
+                }
             },
         );
         let capability_request = hi_policy::approval_request(
@@ -509,6 +515,7 @@ impl Ui for ChannelUi {
                 ConfirmationResult::Rejected => hi_policy::ApprovalDecision::Denied,
                 ConfirmationResult::Cancelled => hi_policy::ApprovalDecision::Cancelled,
                 ConfirmationResult::Unavailable => hi_policy::ApprovalDecision::Unavailable,
+                ConfirmationResult::Answer(_) => hi_policy::ApprovalDecision::Approved,
             };
             if store.decide(&id, mapped).is_err() {
                 return ConfirmationResult::Unavailable;
@@ -555,6 +562,23 @@ impl Ui for ChannelUi {
                 ));
             }
             ConfirmationResult::Approved
+        })
+    }
+    fn ask_user(&mut self, question: &str, options: &[String]) -> AskUserFuture<'_> {
+        let future = self.confirm(ConfirmationRequest::AskUser {
+            question: question.to_string(),
+            options: options.to_vec(),
+        });
+        Box::pin(async move {
+            match future.await {
+                ConfirmationResult::Answer(answer) => AskUserResult::Answer(answer),
+                ConfirmationResult::Cancelled | ConfirmationResult::Rejected => {
+                    AskUserResult::Cancelled
+                }
+                ConfirmationResult::Unavailable | ConfirmationResult::Approved => {
+                    AskUserResult::Unavailable
+                }
+            }
         })
     }
     fn status(&mut self, text: &str) {

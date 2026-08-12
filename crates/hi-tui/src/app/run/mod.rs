@@ -54,6 +54,7 @@ impl Drop for LocalServerGuard {
 }
 
 pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
+    agent.set_interactive_session(true);
     let crate::RunOptions {
         provider,
         base_url,
@@ -194,6 +195,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 // Session listing and renaming run on the TUI command loop;
                 // bound outages so the interface cannot appear frozen for
                 // half a minute when portal sync is unreachable.
+                .redirect(hi_ai::credential_redirect_policy())
                 .connect_timeout(std::time::Duration::from_secs(3))
                 .timeout(std::time::Duration::from_secs(8))
                 .http1_only()
@@ -2884,6 +2886,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     } else {
                         objective.clone()
                     };
+                    if let Some(goal) = agent.try_ingest_goal(&objective) {
+                        app.set_ingested_goal(agent, &goal_argument, goal);
+                        agent.reset_goal_drive_stall();
+                        app.maybe_queue_goal_drive(agent);
+                        continue;
+                    }
                     app.planning = Some(Instant::now());
                     let mut decomposed: Option<Result<Vec<String>>> = None;
                     let mut cancelled = false;
@@ -2938,7 +2946,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     app.set_planned_goal(agent, &goal_argument, sub_goals);
                     // A goal is a contract: start pulling toward it immediately.
                     // The user monitors and steers — pause/Esc stops the drive.
-                    app.goal_drive_stall = 0;
+                    agent.reset_goal_drive_stall();
                     app.maybe_queue_goal_drive(agent);
                     continue;
                 }
@@ -2950,7 +2958,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         hi_agent::command::goal_arg_is_objective(&arg) || arg.trim() == "resume";
                     app.handle_goal(agent, &arg);
                     if could_drive {
-                        app.goal_drive_stall = 0;
+                        agent.reset_goal_drive_stall();
                         app.maybe_queue_goal_drive(agent);
                     }
                     continue;
@@ -2980,8 +2988,18 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         let run_line = expand_file_mentions(&run_line, &app.workspace_root);
 
         // --- Turn phase: run the agent behind a channel, staying responsive. ---
+        let goal_drive_turn = run_line == hi_agent::GOAL_CONTINUE_PROMPT;
+        let plan_drive_turn = run_line == hi_agent::PLAN_DRIVE_PROMPT;
+        let chrome = hi_agent::drive_chrome_line(
+            &run_line,
+            agent.next_plan_step_title(),
+            agent
+                .structured_goal()
+                .and_then(|goal| goal.active_sub_goal())
+                .map(|step| step.description.as_str()),
+        );
         app.push_user_prompt(ratatui::text::Line::styled(
-            format!("❯ {run_line}"),
+            chrome.unwrap_or_else(|| format!("❯ {run_line}")),
             ratatui::style::Style::default().fg(crate::theme::theme().accent_user),
         ));
         app.set_working(true);
@@ -2993,8 +3011,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         // Long-horizon auto-drive bookkeeping: whether this is a synthetic drive
         // turn, and the goal state going in — any change by turn end (advance,
         // retry note, plan growth) counts as progress; no change is a stall.
-        let goal_drive_turn = run_line == hi_agent::GOAL_CONTINUE_PROMPT;
         let goal_before = agent.structured_goal().cloned();
+        let plan_step_before = agent.next_plan_step_title().map(str::to_owned);
         let turn_snapshot = agent.state_snapshot();
         app.last_turn_snapshot = Some(turn_snapshot.clone());
         // Reset the per-turn tool-call counter for the observability panel.
@@ -3121,6 +3139,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     Style::default().fg(crate::theme::theme().warning),
                 ));
             }
+            if plan_drive_turn {
+                agent.set_plan_drive_paused(true);
+                app.refresh_goal(agent);
+                app.push(Line::styled(
+                    "plan drive interrupted — paused; /plan resume to continue".to_string(),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+            }
         } else {
             // Turn finished on its own — ping if you've likely stepped away.
             app.maybe_notify_done();
@@ -3184,50 +3210,50 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 },
             );
         }
-        // Long-horizon auto-drive: keep pulling toward an active goal between
-        // turns. Drive turns that change nothing count toward a stall stop; any
-        // user turn (steering) resets it. Queued user input always wins — the
-        // drive prompt is only queued into an empty queue.
+        // Long-horizon auto-drive: keep pulling toward leftover work between
+        // turns. Drive turns that change nothing count toward a stall park; any
+        // user turn resets it. Queued user input always wins — the drive prompt
+        // is only queued into an empty queue.
         if !cancelled {
             if goal_drive_turn {
-                // `turns_spent` increments at the start of every synthetic
-                // drive turn. Compare only work-bearing goal state, otherwise
-                // neutral turns look like progress forever and the stall
-                // guard never parks a stuck goal.
-                let goal_changed = match (agent.structured_goal(), goal_before.as_ref()) {
+                let made_progress = match (agent.structured_goal(), goal_before.as_ref()) {
                     (Some(after), Some(before)) => after.drive_state_changed_since(before),
-                    // A goal disappearing is a user-visible state change, not
-                    // a stall; there is no goal left to auto-drive anyway.
                     _ => true,
                 };
-                if !goal_changed {
-                    app.goal_drive_stall = app.goal_drive_stall.saturating_add(1);
-                    if app.goal_drive_stall >= hi_agent::GOAL_DRIVE_STALL_LIMIT {
-                        let message = match agent
-                            .try_set_goal_pause_reason(hi_agent::GoalPauseReason::Stall)
-                        {
-                            Ok(true) => format!(
-                                "goal drive paused (stall): no progress for {} turns — /goal resume after guidance, or /goal clear",
-                                hi_agent::GOAL_DRIVE_STALL_LIMIT
-                            ),
-                            Ok(false) => "goal drive stopped — the active goal disappeared".into(),
-                            Err(error) => format!(
-                                "goal drive parked for this session after {} stalled turns; could not persist the pause ({error:#}) — /goal resume to retry",
-                                hi_agent::GOAL_DRIVE_STALL_LIMIT
-                            ),
-                        };
+                let progress = agent.note_goal_drive_progress(made_progress);
+                match progress {
+                    hi_agent::GoalDriveProgress::Skipped { failed, next } => {
                         app.push(Line::styled(
-                            message,
+                            hi_agent::goal_drive_skip_message(&failed, next.as_deref()),
                             Style::default().fg(crate::theme::theme().warning),
                         ));
                     }
-                } else {
-                    app.goal_drive_stall = 0;
+                    hi_agent::GoalDriveProgress::Parked => {
+                        app.push(Line::styled(
+                            hi_agent::goal_drive_park_message(agent.leftover_work().as_deref()),
+                            Style::default().fg(crate::theme::theme().warning),
+                        ));
+                    }
+                    _ => {}
                 }
-            } else {
-                app.goal_drive_stall = 0;
             }
-            app.maybe_queue_goal_drive(agent);
+            if plan_drive_turn {
+                let made_progress = hi_agent::plan_drive_made_progress(
+                    plan_step_before.as_deref(),
+                    agent.next_plan_step_title(),
+                    &agent.last_turn_telemetry().progress_events,
+                    agent.last_changed_files(),
+                );
+                agent.note_plan_drive_progress(made_progress);
+                if agent.plan_drive_status() == "parked" {
+                    app.push(Line::styled(
+                        hi_agent::plan_drive_park_message(agent.plan_leftover_work().as_deref()),
+                        Style::default().fg(crate::theme::theme().warning),
+                    ));
+                }
+            }
+            app.refresh_goal(agent);
+            app.maybe_queue_drive(agent, driven.value.as_ref());
         }
         app.set_working(false);
         // Flush any pending live events from the TUI's /sync on RemoteUi.

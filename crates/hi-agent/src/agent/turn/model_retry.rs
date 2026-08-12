@@ -56,12 +56,12 @@ impl crate::Agent {
         max_steps: u32,
         verifier: &WorkspaceRepairVerifier,
         repeat_nudges: u32,
-        continue_total_nudges: u32,
+        continue_total_nudges: &mut u32,
         truncation_total_retries: u32,
-        progress_tracker: &ProgressTracker,
+        progress_tracker: &mut ProgressTracker,
         ended_at_cap: bool,
-        stalled_unfinished: bool,
-        stalled_repeating: bool,
+        stalled_unfinished: &mut bool,
+        stalled_repeating: &mut bool,
         last_verify_attributions: &[hi_tools::Attribution],
         sched_tool_calls: u32,
         sched_max_concurrent: u32,
@@ -227,12 +227,12 @@ impl crate::Agent {
                     verifier.round(),
                     *empty_retries,
                     repeat_nudges,
-                    continue_total_nudges,
+                    *continue_total_nudges,
                     truncation_total_retries,
                     progress_tracker,
                     ended_at_cap,
-                    stalled_unfinished,
-                    stalled_repeating,
+                    *stalled_unfinished,
+                    *stalled_repeating,
                     last_verify_attributions,
                     verifier.executions(),
                     sched_tool_calls,
@@ -321,50 +321,116 @@ impl crate::Agent {
                 // budgets are spent. A model that alternates a valid tool
                 // call with an invalid turn keeps resetting the consecutive
                 // counter, so without the cumulative cap this nudge-and-retry
-                // loop runs forever (spinning CPU, burning tokens). End the
-                // turn instead so the driver/user regains control; on a
-                // long-horizon drive the next turn resumes with a fresh budget.
+                // loop runs forever (spinning CPU, burning tokens). Keep
+                // working with a fresh approach before settling.
                 ui.assistant_end();
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
-                ui.status(
-                    "⚠ the model kept emitting invalid tool turns — ending the turn; /retry or continue to resume",
-                );
+                if self.keep_working_after_stall(
+                    progress_tracker,
+                    force_tools_next,
+                    stalled_unfinished,
+                    stalled_repeating,
+                    Some(continue_total_nudges),
+                    ui,
+                ) {
+                    return Ok(ProviderStreamResult::Continue);
+                }
+                ui.status("⚠ the model kept emitting invalid tool turns — ending the turn");
                 Ok(ProviderStreamResult::BreakInner(false))
             }
-            // A transient generation flake — a malformed/garbled stream or
-            // an empty completion. Treat it like a content-less response:
-            // flush, then silently re-run with hotter recovery sampling (a
-            // fresh request, with its own transport retries) up to the same
-            // budget, instead of failing the turn. Terminal errors (auth,
-            // rate limits, ...) fall through to the abort below. Invalid tool turns
-            // use the protocol-specific nudge path above.
             Err(err)
-                if *empty_retries < self.config.loop_limits.max_empty_retries
-                    && matches!(
-                        provider_error_kind(&err),
-                        Some(
-                            ProviderErrorKind::MalformedStream | ProviderErrorKind::EmptyCompletion
-                        )
-                    ) =>
+                if matches!(
+                    provider_error_kind(&err),
+                    Some(
+                        ProviderErrorKind::MalformedStream
+                            | ProviderErrorKind::EmptyCompletion
+                            | ProviderErrorKind::QualityRejected
+                    )
+                ) =>
             {
                 ui.assistant_end();
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
-                *empty_retries += 1;
-                retry_state.record_recovery_attempt();
-                if made_tool_call {
-                    self.nudge_after_post_tool_empty_response(
-                        force_tools_next,
-                        implementation_intent.is_some(),
-                    );
+                let empty_or_malformed = matches!(
+                    provider_error_kind(&err),
+                    Some(ProviderErrorKind::MalformedStream | ProviderErrorKind::EmptyCompletion)
+                );
+                if empty_or_malformed && *empty_retries < self.config.loop_limits.max_empty_retries
+                {
+                    *empty_retries += 1;
+                    retry_state.record_recovery_attempt();
+                    if made_tool_call {
+                        self.nudge_after_post_tool_empty_response(
+                            force_tools_next,
+                            implementation_intent.is_some(),
+                        );
+                    }
+                    ui.nudge(&format!(
+                        "⚠ the model's response didn't come through cleanly — \
+                         retrying ({empty_retries}/{})",
+                        self.config.loop_limits.max_empty_retries
+                    ));
+                    return Ok(ProviderStreamResult::Continue);
                 }
-                ui.nudge(&format!(
-                    "⚠ the model's response didn't come through cleanly — \
-                     retrying ({empty_retries}/{})",
-                    self.config.loop_limits.max_empty_retries
-                ));
-                Ok(ProviderStreamResult::Continue)
+                if self.keep_working_after_stall(
+                    progress_tracker,
+                    force_tools_next,
+                    stalled_unfinished,
+                    stalled_repeating,
+                    Some(continue_total_nudges),
+                    ui,
+                ) {
+                    return Ok(ProviderStreamResult::Continue);
+                }
+                if empty_or_malformed {
+                    ui.status("⚠ the model returned no response after retrying");
+                    return Ok(ProviderStreamResult::BreakInner(false));
+                }
+                self.reconcile_error_turn_changes(turn_ledger_revision)
+                    .await?;
+                if self.workspace.last_changed_files.is_empty()
+                    && let Some(turn_snapshot) = turn_snapshot.as_ref()
+                {
+                    self.messages.strip_trailing_nudges();
+                    if let Ok(end_snapshot) = self.snapshot_cached().await {
+                        self.workspace.last_changed_files =
+                            changed_files_between(turn_snapshot, &end_snapshot);
+                    }
+                }
+                if !made_tool_call {
+                    self.truncate_messages(*turn_start);
+                }
+                self.report.last_compat_fallbacks = compat_fallbacks.clone();
+                let wire_audit = std::mem::take(&mut self.report.last_turn_telemetry.wire_audit);
+                self.report.last_turn_telemetry = build_turn_telemetry(
+                    max_steps,
+                    verifier.round(),
+                    *empty_retries,
+                    repeat_nudges,
+                    *continue_total_nudges,
+                    truncation_total_retries,
+                    progress_tracker,
+                    ended_at_cap,
+                    *stalled_unfinished,
+                    *stalled_repeating,
+                    last_verify_attributions,
+                    verifier.executions(),
+                    sched_tool_calls,
+                    sched_max_concurrent,
+                    sched_serial_runs,
+                    tool_timeline,
+                    evidence,
+                    review_repair,
+                    &self.prefix_stability,
+                );
+                self.report.last_turn_telemetry.wire_audit = wire_audit;
+                let _ = self.persist();
+                let (kind, guidance) = crate::ui::classify_error(&err);
+                ui.turn_error(kind, &err.to_string(), guidance);
+                self.report.last_effective_route =
+                    effective_model_route(&self.config, effective_fallback_route.as_deref());
+                Err(err)
             }
             Err(err) => {
                 self.add_error_usage(&err);
@@ -394,12 +460,12 @@ impl crate::Agent {
                     verifier.round(),
                     *empty_retries,
                     repeat_nudges,
-                    continue_total_nudges,
+                    *continue_total_nudges,
                     truncation_total_retries,
                     progress_tracker,
                     ended_at_cap,
-                    stalled_unfinished,
-                    stalled_repeating,
+                    *stalled_unfinished,
+                    *stalled_repeating,
                     last_verify_attributions,
                     verifier.executions(),
                     sched_tool_calls,

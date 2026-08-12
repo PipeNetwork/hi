@@ -461,6 +461,7 @@ impl crate::Agent {
                 max_steps: self.config.loop_limits.max_steps,
                 max_parallel_tools: 4,
                 max_silent_continues: 0,
+                max_keep_working: 0,
                 ..crate::AgentLoopLimits::default()
             },
             subagents: crate::AgentSubagents {

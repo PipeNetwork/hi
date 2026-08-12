@@ -397,8 +397,12 @@ async fn capture_child(
             Ok(Ok(exit)) => (ToolStatus::Failed, exit.code()),
             Ok(Err(err)) => return Err(err).context("waiting for command"),
             Err(_) => {
+                // SIGKILL the group, then bound the reap. `Child::kill()` waits
+                // for exit; a D-state / wedged descendant would otherwise pin
+                // the coding turn past the command deadline.
                 kill_process_group(&child);
-                let _ = child.kill().await;
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(PIPE_DRAIN_GRACE, child.wait()).await;
                 (ToolStatus::TimedOut, None)
             }
         }

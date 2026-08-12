@@ -10,9 +10,23 @@ use std::pin::Pin;
 /// A mutation that requires an explicit user decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfirmationRequest {
-    FileEdit { path: String, diff: String },
-    ShellMutation { command: String, cwd: String },
-    DelegateApply { summary: String, diff: String },
+    FileEdit {
+        path: String,
+        diff: String,
+    },
+    ShellMutation {
+        command: String,
+        cwd: String,
+    },
+    DelegateApply {
+        summary: String,
+        diff: String,
+    },
+    /// Product/design question that must pause the turn. Not a write approval.
+    AskUser {
+        question: String,
+        options: Vec<String>,
+    },
 }
 
 impl ConfirmationRequest {
@@ -21,6 +35,7 @@ impl ConfirmationRequest {
             Self::FileEdit { .. } => "Confirm file edit",
             Self::ShellMutation { .. } => "Confirm shell mutation",
             Self::DelegateApply { .. } => "Confirm delegated changes",
+            Self::AskUser { .. } => "Question for you",
         }
     }
 
@@ -38,7 +53,7 @@ impl ConfirmationRequest {
                 let destructive = diff.lines().filter(|line| line.starts_with('-')).count() > 80;
                 !secretish && !destructive && diff.len() <= 32 * 1024
             }
-            Self::ShellMutation { .. } | Self::DelegateApply { .. } => false,
+            Self::ShellMutation { .. } | Self::DelegateApply { .. } | Self::AskUser { .. } => false,
         }
     }
 
@@ -49,20 +64,45 @@ impl ConfirmationRequest {
                 "working directory: {cwd}\nwarning: this command is likely to mutate the workspace\n\n$ {command}"
             ),
             Self::DelegateApply { summary, diff } => format!("{summary}\n\n{diff}"),
+            Self::AskUser { question, options } => {
+                if options.is_empty() {
+                    question.clone()
+                } else {
+                    let listed = options
+                        .iter()
+                        .enumerate()
+                        .map(|(i, option)| format!("{}. {option}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("{question}\n\n{listed}")
+                }
+            }
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfirmationResult {
     Approved,
     Rejected,
     Cancelled,
     /// The frontend cannot collect an interactive answer. Callers must fail closed.
     Unavailable,
+    /// Free-form or numbered answer to [`ConfirmationRequest::AskUser`].
+    Answer(String),
 }
 
 pub type ConfirmationFuture<'a> = Pin<Box<dyn Future<Output = ConfirmationResult> + Send + 'a>>;
+
+/// Result of [`Ui::ask_user`]: a real decision pause, not a write approval.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AskUserResult {
+    Answer(String),
+    Cancelled,
+    Unavailable,
+}
+
+pub type AskUserFuture<'a> = Pin<Box<dyn Future<Output = AskUserResult> + Send + 'a>>;
 
 /// Best-effort redaction for diagnostic text. It deliberately does not claim
 /// perfect secret detection.
@@ -140,39 +180,33 @@ pub fn user_facing_status(text: &str) -> Option<String> {
     // Keep the useful recovery action while removing implementation vocabulary
     // such as `repeat_no_op_bash` and `inspection_sprawl_exhausted`.
     if candidate.starts_with("turn stopped incomplete") {
-        return Some("turn stopped incomplete — send `continue` to resume".to_string());
+        if let Some(rest) = candidate
+            .strip_prefix("turn stopped incomplete")
+            .map(str::trim)
+            .map(|rest| rest.trim_start_matches('·').trim())
+            .filter(|rest| rest.contains(" remaining — "))
+        {
+            return Some(rest.to_string());
+        }
+        return Some("the turn ended with unfinished work".to_string());
     }
 
     // Guardrails should explain the observable situation, not expose that the
     // model was being steered or how the scheduler detected the situation.
     if candidate.starts_with("background process handles were completed") {
-        return Some(
-            "⚠ a background command became unavailable before completion — send `continue` to resume, or restart it"
-                .to_string(),
-        );
+        return Some("⚠ a background command became unavailable before completion".to_string());
     }
     if candidate.starts_with("⚠ the model kept re-running the same command") {
-        return Some(
-            "⚠ the turn repeated a command without new progress — send `continue` to resume"
-                .to_string(),
-        );
+        return Some("⚠ the turn repeated a command without new progress".to_string());
     }
     if candidate.starts_with("⚠ the model kept emitting invalid tool turns") {
-        return Some(
-            "⚠ tool calls were invalid, so the turn ended — send `continue` or `/retry`"
-                .to_string(),
-        );
+        return Some("⚠ tool calls were invalid, so the turn ended".to_string());
     }
     if candidate.starts_with("⚠ the model kept narrating without acting") {
-        return Some(
-            "⚠ the turn ended without making progress — send `continue` or `/retry`".to_string(),
-        );
+        return Some("⚠ the turn ended without making progress".to_string());
     }
     if candidate.starts_with("the model kept emitting invalid tool arguments") {
-        return Some(
-            "⚠ a tool call did not match its schema, so the turn stopped — send `/retry`"
-                .to_string(),
-        );
+        return Some("⚠ a tool call did not match its schema, so the turn stopped".to_string());
     }
     if candidate.starts_with("DeepSeek tool arguments failed client validation") {
         return Some("retrying the tool call with a compatible schema".to_string());
@@ -185,7 +219,7 @@ pub fn user_facing_status(text: &str) -> Option<String> {
     }
     if candidate.starts_with("⚠ the model returned no response") {
         if candidate.contains("after retrying") {
-            return Some("⚠ no response after retries — try `/retry`".to_string());
+            return Some("⚠ no response after retries".to_string());
         }
         return Some("⚠ no response yet; retrying".to_string());
     }
@@ -408,6 +442,14 @@ pub trait Ui: Send {
     fn confirm(&mut self, _request: ConfirmationRequest) -> ConfirmationFuture<'_> {
         Box::pin(async { ConfirmationResult::Unavailable })
     }
+    /// Pause for a product/design choice the tools cannot resolve.
+    ///
+    /// The default fails closed so headless/one-shot frontends never hang.
+    /// Interactive frontends override this. Do not use this instead of
+    /// keep-working when the next coding step is already known.
+    fn ask_user(&mut self, _question: &str, _options: &[String]) -> AskUserFuture<'_> {
+        Box::pin(async { AskUserResult::Unavailable })
+    }
     /// Emit the transcript header for a tool call, immediately followed by the
     /// matching [`tool_result`]. In a concurrent batch these are emitted in
     /// completion order, as (header, result) pairs, so the two never drift
@@ -552,6 +594,9 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
     fn confirm(&mut self, request: ConfirmationRequest) -> ConfirmationFuture<'_> {
         (**self).confirm(request)
     }
+    fn ask_user(&mut self, question: &str, options: &[String]) -> AskUserFuture<'_> {
+        (**self).ask_user(question, options)
+    }
     fn tool_call(&mut self, name: &str, arguments: &str) {
         (**self).tool_call(name, arguments);
     }
@@ -680,19 +725,19 @@ pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
         ),
         Some(K::QualityRejected) => (
             "quality",
-            "the model did not gather enough evidence for this answer — /retry will ask it to inspect more concrete files",
+            "the model did not gather enough evidence for this answer",
         ),
         Some(K::ToolProtocol) => (
             "tool_protocol",
-            "the tool turn was invalid — /retry usually fixes this",
+            "the tool turn was invalid after automatic recovery",
         ),
         Some(K::MalformedStream) => (
             "malformed",
-            "the response could not be parsed — /retry usually fixes this",
+            "the response could not be parsed after automatic recovery",
         ),
         Some(K::EmptyCompletion) => (
             "empty",
-            "the model returned an empty response — /retry usually fixes this",
+            "the model returned an empty response after automatic recovery",
         ),
         Some(K::Other) | None => ("error", ""),
     }
@@ -778,6 +823,7 @@ fn salient_arg(name: &str, arguments: &str) -> Option<String> {
         // (whose prompt field dwarfs everything else).
         "task" => collapse_ws(str_field("description")?),
         "explore" | "delegate" => collapse_ws(str_field("task")?),
+        "ask_user" => collapse_ws(str_field("question")?),
         "get_task_output" | "wait_tasks" | "kill_task" => match value
             .get("task_ids")
             .or_else(|| value.get("task_id"))
@@ -841,6 +887,13 @@ mod tests {
             !ConfirmationRequest::ShellMutation {
                 command: "npm install".into(),
                 cwd: ".".into(),
+            }
+            .safe_for_auto()
+        );
+        assert!(
+            !ConfirmationRequest::AskUser {
+                question: "which API?".into(),
+                options: vec!["REST".into(), "gRPC".into()],
             }
             .safe_for_auto()
         );
@@ -924,6 +977,13 @@ mod tests {
             tool_label("get_task_output", r#"{"task_ids":["task_1","task_2"]}"#),
             "get_task_output task_1, task_2"
         );
+        assert_eq!(
+            tool_label(
+                "ask_user",
+                r#"{"question":"Which transport should the public API use?"}"#
+            ),
+            "ask_user Which transport should the public API use?"
+        );
     }
 
     #[test]
@@ -934,14 +994,18 @@ mod tests {
         );
         assert!(user_facing_status("MoA aggregating: coder").is_none());
         let status = user_facing_status("turn stopped incomplete · repeat_no_op_bash").unwrap();
-        assert!(status.contains("continue"));
+        assert!(status.contains("unfinished work"));
         assert!(!status.contains("repeat_no_op_bash"));
+        assert!(!status.contains("continue"));
+        let leftover = user_facing_status("3/9 remaining — wire the scheduler").unwrap();
+        assert_eq!(leftover, "3/9 remaining — wire the scheduler");
         let status = user_facing_status(
             "⚠ the model kept re-running the same command without acting on the result — the task may be incomplete. /retry, or send 'continue'.",
         )
         .unwrap();
         assert!(status.contains("repeated a command"));
         assert!(!status.contains("the model"));
+        assert!(!status.contains("continue"));
         assert_eq!(
             user_facing_status(
                 "DeepSeek tool arguments failed client validation; retrying once without strict schemas"
@@ -950,7 +1014,7 @@ mod tests {
         );
         assert_eq!(
             user_facing_status("⚠ the model returned no response after retrying — try /retry."),
-            Some("⚠ no response after retries — try `/retry`".to_string())
+            Some("⚠ no response after retries".to_string())
         );
     }
 
@@ -1075,7 +1139,28 @@ mod tests {
 
             assert_eq!(label, expected_label);
             assert!(!guidance.is_empty());
+            assert!(
+                !guidance.contains("/retry"),
+                "model-glitch guidance must not ask the user to retry: {guidance}"
+            );
             assert!(!error_counts_as_model_issue(&err));
+        }
+    }
+
+    #[test]
+    fn empty_and_malformed_guidance_does_not_ask_the_user_to_retry() {
+        for kind in [
+            ProviderErrorKind::MalformedStream,
+            ProviderErrorKind::EmptyCompletion,
+            ProviderErrorKind::QualityRejected,
+        ] {
+            let err: anyhow::Error = ProviderError::new(kind, "glitch").into();
+            let (_, guidance) = classify_error(&err);
+            assert!(
+                !guidance.contains("/retry"),
+                "{kind:?} guidance must not ask the user to retry: {guidance}"
+            );
+            assert!(!guidance.is_empty());
         }
     }
 

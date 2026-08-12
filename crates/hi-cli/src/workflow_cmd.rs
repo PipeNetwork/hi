@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
-use hi_agent::DelegateRunner;
+use hi_agent::{DelegateRunner, parse_objectives, plan_has_checked_objectives};
 use hi_agent_runtime::{
     GateAuthority, StageDriver, StageModel, StageOutcome, TerminalOutcome, WorkflowExecutor,
     latest_checkpoint,
@@ -32,7 +32,7 @@ use hi_verifier::{AttestingVerifier, Attestor, CheckSpec};
 
 /// Objectives above this need a split plan — a single run of thousands of
 /// delegate children is not a supervisable unit of work.
-const MAX_OBJECTIVES: usize = 512;
+const MAX_OBJECTIVES: usize = hi_agent::MAX_PLAN_OBJECTIVES;
 /// Default concurrent objective delegates per wave; the cross-process
 /// resource governor additionally caps live children machine-wide.
 const DEFAULT_WAVE_CONCURRENCY: u16 = 4;
@@ -156,65 +156,6 @@ fn print_usage() {
          `$XDG_STATE_HOME/hi/trace-signing-key` (else `$HOME/.local/state/hi/`),\n\
          created owner-only on first signing run."
     );
-}
-
-/// Extract objectives: unchecked checkboxes first, then numbered items, then
-/// plain bullets. Checked boxes are respected as already done.
-pub(crate) fn parse_objectives(markdown: &str) -> Vec<String> {
-    let lines: Vec<&str> = markdown.lines().map(str::trim).collect();
-    let checkbox = |line: &&str| -> Option<String> {
-        ["- [ ]", "* [ ]", "+ [ ]"]
-            .iter()
-            .find_map(|prefix| line.strip_prefix(prefix))
-            .map(|rest| rest.trim().to_string())
-    };
-    let unchecked: Vec<String> = lines.iter().filter_map(checkbox).collect();
-    if !unchecked.is_empty() {
-        return unchecked.into_iter().filter(|o| !o.is_empty()).collect();
-    }
-    let numbered: Vec<String> = lines
-        .iter()
-        .filter_map(|line| {
-            let digits = line.chars().take_while(char::is_ascii_digit).count();
-            if digits == 0 {
-                return None;
-            }
-            let rest = &line[digits..];
-            rest.strip_prefix('.')
-                .or_else(|| rest.strip_prefix(')'))
-                .map(|text| text.trim().to_string())
-        })
-        .filter(|objective| !objective.is_empty())
-        .collect();
-    if !numbered.is_empty() {
-        return numbered;
-    }
-    lines
-        .iter()
-        .filter(|line| !checkbox_done(line))
-        .filter_map(|line| {
-            ["- ", "* ", "+ "]
-                .iter()
-                .find_map(|prefix| line.strip_prefix(prefix))
-                .map(|text| text.trim().to_string())
-        })
-        .filter(|objective| !objective.is_empty() && !objective.starts_with("[x]"))
-        .collect()
-}
-
-/// Whether the plan contains checked-off checkbox objectives — used to
-/// distinguish "everything already done" (success) from "not a plan" (error).
-fn plan_has_checked_objectives(markdown: &str) -> bool {
-    markdown
-        .lines()
-        .map(str::trim)
-        .any(|line| checkbox_done(&line))
-}
-
-fn checkbox_done(line: &&str) -> bool {
-    ["- [x]", "* [x]", "+ [x]", "- [X]", "* [X]", "+ [X]"]
-        .iter()
-        .any(|prefix| line.starts_with(prefix))
 }
 
 fn objective_stage_id(index: usize) -> StageId {

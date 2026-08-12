@@ -11,7 +11,7 @@ use hi_tools::{PlanStatus, PlanStep};
 use crate::TurnTelemetry;
 use crate::agent::turn::TurnPhase;
 use crate::goal::Goal;
-use crate::heuristics::plan_has_pending_steps;
+use crate::heuristics::{leftover_plan_summary, plan_has_pending_steps};
 use crate::outcome::{EffectiveModelRoute, TurnOutcome};
 use crate::subagent::DelegateRunner;
 use crate::task_contract::TaskContract;
@@ -37,6 +37,66 @@ impl GoalState {
     /// Whether any plan step is still pending/active.
     pub(crate) fn plan_incomplete(&self) -> bool {
         plan_has_pending_steps(&self.last_plan)
+    }
+
+    /// Title of the first active, else pending, **checklist** step.
+    pub(crate) fn next_checklist_step_title(&self) -> Option<&str> {
+        self.last_plan
+            .iter()
+            .find(|step| step.status == PlanStatus::Active)
+            .or_else(|| {
+                self.last_plan
+                    .iter()
+                    .find(|step| step.status == PlanStatus::Pending)
+            })
+            .map(|step| step.title.as_str())
+    }
+
+    /// Title of the active plan/goal step, else the first pending one.
+    pub(crate) fn next_step_title(&self) -> Option<&str> {
+        if let Some(active) = self
+            .structured
+            .as_ref()
+            .and_then(crate::goal::Goal::active_sub_goal)
+        {
+            return Some(active.description.as_str());
+        }
+        self.next_checklist_step_title()
+    }
+
+    /// Checklist leftover only, e.g. `3/9 remaining — wire the scheduler`.
+    pub(crate) fn plan_leftover_work(&self) -> Option<String> {
+        leftover_plan_summary(&self.last_plan)
+    }
+
+    /// Structured-goal leftover only.
+    pub(crate) fn goal_leftover_work(&self) -> Option<String> {
+        let goal = self.structured.as_ref()?;
+        let remaining = goal
+            .sub_goals
+            .iter()
+            .filter(|step| step.status != crate::goal::GoalStatus::Done)
+            .count();
+        if remaining == 0 {
+            return None;
+        }
+        let title = self.next_step_title()?;
+        Some(format!(
+            "{remaining}/{} remaining — {title}",
+            goal.sub_goals.len()
+        ))
+    }
+
+    /// User-facing leftover: goal line if that goal would auto-drive, else plan.
+    pub(crate) fn leftover_work(&self) -> Option<String> {
+        if self
+            .structured
+            .as_ref()
+            .is_some_and(crate::goal::Goal::should_auto_drive)
+        {
+            return self.goal_leftover_work();
+        }
+        self.plan_leftover_work()
     }
 
     /// Drop the in-memory plan.
@@ -204,10 +264,7 @@ pub(crate) enum VerifyEvidence {
     Failed,
     /// A verification stage ran and passed, bound to the workspace ledger
     /// revision and digest at the moment it passed.
-    Passed {
-        revision: u64,
-        digest: String,
-    },
+    Passed { revision: u64, digest: String },
 }
 
 impl VerifyEvidence {

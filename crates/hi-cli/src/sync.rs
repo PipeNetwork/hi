@@ -935,14 +935,23 @@ impl RemoteSessionSink {
     }
 }
 
-fn remote_session_http_client() -> reqwest::Client {
+/// Builder for portal-sync HTTP clients. Every request carries `x-api-key`,
+/// so redirects are pinned to the configured origin (same policy as the
+/// agent LLM client). Callers add timeouts; [`hi_ai::timed_http_client_fallback`]
+/// is the last-resort build path and uses the same policy.
+fn sync_http_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        .redirect(hi_ai::credential_redirect_policy())
+        .http1_only()
+}
+
+fn remote_session_http_client() -> reqwest::Client {
+    sync_http_builder()
         // A dead endpoint must cost seconds, not tens of seconds: the connect
         // phase gets its own short budget, and the first failure trips the
         // shared circuit breaker so later calls skip the network entirely.
         .connect_timeout(std::time::Duration::from_secs(3))
         .timeout(std::time::Duration::from_secs(10))
-        .http1_only()
         .build()
         .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(5, 10))
 }
@@ -1078,6 +1087,18 @@ impl SessionSink for SyncSession {
         Ok(())
     }
 
+    fn record_plan_drive(&mut self, paused: bool, stall: u32) -> Result<()> {
+        self.local.record_plan_drive(paused, stall)?;
+        self.reconcile_best_effort();
+        Ok(())
+    }
+
+    fn record_goal_drive(&mut self, stall: u32) -> Result<()> {
+        self.local.record_goal_drive(stall)?;
+        self.reconcile_best_effort();
+        Ok(())
+    }
+
     fn record_decisions(&mut self, decisions: &hi_agent::DecisionLog) -> Result<()> {
         self.local.record_decisions(decisions)?;
         self.reconcile_best_effort();
@@ -1120,10 +1141,9 @@ impl RemoteUi {
     /// the caller (e.g. as a `/sessions switch` error line), not panic inside
     /// the alternate-screen TUI.
     pub fn new(config: SyncConfig, session_id: String) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = sync_http_builder()
             .connect_timeout(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(5))
-            .http1_only()
             .build()
             .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(5, 10));
         let store = std::sync::Arc::new(
@@ -1135,9 +1155,8 @@ impl RemoteUi {
 
     #[cfg(test)]
     pub fn new_for_test(config: SyncConfig, session_id: String) -> Self {
-        let client = reqwest::Client::builder()
+        let client = sync_http_builder()
             .timeout(std::time::Duration::from_secs(5))
-            .http1_only()
             .build()
             .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(5, 10));
         Self::with_store(config, session_id, client, unique_test_sync_store())
@@ -1308,6 +1327,9 @@ impl hi_agent::Ui for MultiplexUi {
         // Only the primary UI confirms edits; the remote viewer is read-only.
         self.primary.confirm(request)
     }
+    fn ask_user(&mut self, question: &str, options: &[String]) -> hi_agent::AskUserFuture<'_> {
+        self.primary.ask_user(question, options)
+    }
     fn tool_call(&mut self, name: &str, arguments: &str) {
         self.primary.tool_call(name, arguments);
         self.remote.push_event(hi_tui::event::UiEvent::ToolCall {
@@ -1449,9 +1471,8 @@ pub fn spawn_remote_input_poller(
     tx: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let client = reqwest::Client::builder()
+        let client = sync_http_builder()
             .timeout(std::time::Duration::from_secs(35))
-            .http1_only()
             .build()
             .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(10, 35));
         let input_url = format!("{}/hi/sessions/{session_id}/input", sync_config.base_url);
@@ -1527,9 +1548,8 @@ pub async fn run_daemon_loop(
     sync_handle: Option<std::sync::Arc<RemoteSessionSink>>,
     remote_ui: Option<std::sync::Arc<RemoteUi>>,
 ) -> Result<()> {
-    let client = reqwest::Client::builder()
+    let client = sync_http_builder()
         .timeout(std::time::Duration::from_secs(35))
-        .http1_only()
         .build()
         .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(10, 35));
 
@@ -1789,9 +1809,8 @@ pub async fn fetch_session_detail(
     session_id: &str,
 ) -> Result<serde_json::Value> {
     validate_session_id(session_id)?;
-    let client = reqwest::Client::builder()
+    let client = sync_http_builder()
         .timeout(std::time::Duration::from_secs(15))
-        .http1_only()
         .build()
         .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(5, 15));
     let url = format!("{}/hi/sessions/{session_id}", sync_config.base_url);
@@ -1860,7 +1879,7 @@ pub async fn run_attach_client(
         }
     }
 
-    let client = reqwest::Client::builder()
+    let client = sync_http_builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(60))
         // The long-lived SSE stream overrides the total timeout per request;
@@ -1870,7 +1889,6 @@ pub async fn run_attach_client(
         // cost of one clean resumed reconnect per 5 idle minutes.
         .read_timeout(std::time::Duration::from_secs(300))
         .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
-        .http1_only()
         .build()
         .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(10, 300));
 
@@ -2403,9 +2421,8 @@ pub async fn fetch_session_history(
     session_id: &str,
 ) -> Result<crate::session::LoadedSession> {
     validate_session_id(session_id)?;
-    let client = reqwest::Client::builder()
+    let client = sync_http_builder()
         .timeout(std::time::Duration::from_secs(30))
-        .http1_only()
         .build()
         .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(10, 30));
     let records = fetch_remote_records(&client, sync_config, session_id).await?;
@@ -3114,6 +3131,9 @@ mod tests {
             goal: None,
             decisions: hi_agent::DecisionLog::default(),
             plan: Vec::new(),
+            plan_drive_paused: false,
+            plan_drive_stall: 0,
+            goal_drive_stall: 0,
         };
 
         sink.seed_snapshot(&loaded).unwrap();

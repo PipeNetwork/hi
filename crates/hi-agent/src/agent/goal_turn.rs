@@ -543,7 +543,8 @@ impl crate::Agent {
             "stalled repeating the same tool call"
         } else if stalled_unfinished {
             "ended without completing the requested work"
-        } else if self.report.verify.as_bool().is_none() && !self.workspace.last_changed_files.is_empty()
+        } else if self.report.verify.as_bool().is_none()
+            && !self.workspace.last_changed_files.is_empty()
         {
             "ended with unverified workspace changes"
         } else {
@@ -712,6 +713,76 @@ impl crate::Agent {
                 hi_tools::ToolStatus::Failed,
             ),
         }
+    }
+
+    /// Pause for a product/design choice. Headless frontends get a continue
+    /// instruction instead of hanging.
+    pub(crate) async fn handle_ask_user(
+        &mut self,
+        arguments: &str,
+        ui: &mut dyn crate::Ui,
+    ) -> hi_tools::ToolOutcome {
+        #[derive(serde::Deserialize)]
+        struct AskArgs {
+            question: String,
+            #[serde(default)]
+            options: Vec<String>,
+        }
+        let args = match serde_json::from_str::<AskArgs>(arguments) {
+            Ok(args) => args,
+            Err(err) => {
+                return decision_tool_outcome(
+                    format!("Error: bad ask_user arguments: {err}"),
+                    hi_tools::ToolStatus::Failed,
+                );
+            }
+        };
+        let question = args.question.trim();
+        if question.is_empty() {
+            return decision_tool_outcome(
+                "Error: ask_user needs a non-empty question".to_string(),
+                hi_tools::ToolStatus::Failed,
+            );
+        }
+        if crate::heuristics::looks_like_confirm_question(question, self.plan_incomplete()) {
+            return decision_tool_outcome(
+                "Error: ask_user is for product/design forks only — do not ask to continue or confirm the plan; pick the next coding step and keep working".to_string(),
+                hi_tools::ToolStatus::Failed,
+            );
+        }
+        if self.ask_user_calls >= 1 {
+            return decision_tool_outcome(
+                "Error: already asked this turn; pick and continue".to_string(),
+                hi_tools::ToolStatus::Failed,
+            );
+        }
+        if self.turn_drive_kind.is_drive() && self.ask_user_drive_streak >= 1 {
+            return decision_tool_outcome(
+                "Error: already asked this drive; pick and continue".to_string(),
+                hi_tools::ToolStatus::Failed,
+            );
+        }
+        self.ask_user_calls = self.ask_user_calls.saturating_add(1);
+        if self.turn_drive_kind.is_drive() {
+            self.ask_user_drive_streak = self.ask_user_drive_streak.saturating_add(1);
+        }
+        let content = match ui.ask_user(question, &args.options).await {
+            crate::AskUserResult::Answer(answer) => {
+                let answer = answer.trim();
+                if answer.is_empty() {
+                    "the user sent an empty answer; pick the best option and continue".to_string()
+                } else {
+                    answer.to_string()
+                }
+            }
+            crate::AskUserResult::Cancelled => {
+                "the user cancelled the question; pick the best option and continue".to_string()
+            }
+            crate::AskUserResult::Unavailable => {
+                "this frontend cannot pause; pick the best option and continue".to_string()
+            }
+        };
+        decision_tool_outcome(content, hi_tools::ToolStatus::Succeeded)
     }
 }
 

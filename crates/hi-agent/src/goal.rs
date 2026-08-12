@@ -465,14 +465,17 @@ impl Goal {
         g
     }
 
+    /// Remaining structured-goal work, ignoring pause and stall. Parked and
+    /// paused goals still have leftover work so empty Enter can resume them.
+    pub fn has_drive_work(&self) -> bool {
+        self.status == GoalStatus::Active && !self.sub_goals.is_empty() && !self.objective_complete
+    }
+
     /// Whether frontends should keep auto-driving this goal between turns: it's
     /// still in progress, not paused by the user, and actually has steps. `Done`,
     /// `Failed`, paused, or empty goals are left alone.
     pub fn should_auto_drive(&self) -> bool {
-        self.status == GoalStatus::Active
-            && !self.is_paused()
-            && !self.sub_goals.is_empty()
-            && !self.objective_complete
+        self.has_drive_work() && !self.is_paused()
     }
 
     /// Effective pause: prefers typed reason; falls back to legacy `paused` bool.
@@ -1222,7 +1225,7 @@ impl Goal {
         }
     }
 
-    fn rederive_status(&mut self) {
+    pub(crate) fn rederive_status(&mut self) {
         // Every structural change funnels through here, so this is the one
         // place an automatic budget needs to track plan size from.
         self.refresh_auto_budget();

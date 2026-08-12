@@ -436,11 +436,15 @@ impl Ui for ObservedUi<'_> {
                         ConfirmationResult::Rejected => "rejected",
                         ConfirmationResult::Cancelled => "cancelled",
                         ConfirmationResult::Unavailable => "unavailable",
+                        ConfirmationResult::Answer(_) => "answered",
                     },
                 );
             }
             decision
         })
+    }
+    fn ask_user(&mut self, question: &str, options: &[String]) -> hi_agent::AskUserFuture<'_> {
+        self.inner.ask_user(question, options)
     }
     fn tool_call(&mut self, name: &str, arguments: &str) {
         let position = self

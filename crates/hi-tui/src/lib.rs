@@ -1261,10 +1261,16 @@ pub(crate) struct App {
     /// block and header can show sub-goal progress. Refreshed when `/goal` sets it
     /// and after every turn (the driver may advance it). `None` when no goal is set.
     pub(crate) goal: Option<hi_agent::Goal>,
-    /// Consecutive auto-drive turns that left the goal state unchanged. At
-    /// [`hi_agent::GOAL_DRIVE_STALL_LIMIT`] the drive stops queuing itself (the
-    /// goal stays active); any user turn resets it.
-    pub(crate) goal_drive_stall: u32,
+    /// Mirrored from the agent so empty Enter can respect `/plan` draft mode.
+    pub(crate) plan_mode: bool,
+    /// Mirrored from the agent so chrome can show paused/parked.
+    pub(crate) plan_drive_paused: bool,
+    /// Cached leftover-work gate, refreshed after each turn and `/plan`/`/goal`.
+    pub(crate) last_drive: hi_agent::DriveAction,
+    /// Last turn's stop reason, used to keep Cancelled / infrastructure idle.
+    pub(crate) last_stop_reason: Option<hi_agent::TurnStopReason>,
+    /// In-progress custom answer while an `ask_user` overlay is open.
+    pub(crate) ask_user_draft: String,
     /// The `/dashboard` fleet: dispatched agents (one session each), persisted
     /// across dashboard open/close so rows aren't lost when you drop back to
     /// the chat. In-flight turns live only inside the dashboard loop.

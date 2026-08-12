@@ -23,10 +23,11 @@ use process_tools::{BashArgs, run_bash_tool};
 
 pub use crate::catalog::{
     MINIMAL_TOOL_SPECS, PROTECTED_TOOLS, TOOL_CATALOG, TOOL_SPECS, ToolAdmission, ToolCapability,
-    ToolMetadata, delegate_tool_spec, explore_tool_spec, get_task_output_tool_spec,
-    is_coordination, is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec,
-    memory_get_tool_spec, memory_search_tool_spec, search_tool_tool_spec, skill_tool_spec,
-    target_path, task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
+    ToolMetadata, ask_user_tool_spec, delegate_tool_spec, explore_tool_spec,
+    get_task_output_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
+    is_read_only, kill_task_tool_spec, memory_get_tool_spec, memory_search_tool_spec,
+    search_tool_tool_spec, skill_tool_spec, target_path, task_tool_spec, tool_metadata,
+    use_tool_tool_spec, wait_tasks_tool_spec,
 };
 
 use mutations::run_prepared_mutation;

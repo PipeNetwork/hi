@@ -2202,8 +2202,120 @@ fn edit_key_submits_on_enter_and_clears() {
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(app.edit_key(&enter).as_deref(), Some("queue me"));
     assert!(app.input.is_empty(), "input cleared after submit");
-    // An empty Enter submits nothing.
+    // An empty Enter submits nothing when idle with no plan and no suggestion.
     assert_eq!(app.edit_key(&enter), None);
+}
+
+#[test]
+fn empty_enter_submits_suggested_prompt() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.suggested_prompt = Some("Run the unit tests".into());
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.edit_key(&enter).as_deref(), Some("Run the unit tests"));
+    assert!(app.suggested_prompt.is_none());
+}
+
+#[test]
+fn empty_enter_resumes_incomplete_plan() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.plan = vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }];
+    app.sync_last_drive();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        app.edit_key(&enter).as_deref(),
+        Some(hi_agent::PLAN_DRIVE_PROMPT)
+    );
+}
+
+#[test]
+fn empty_enter_idle_in_plan_mode_resumes_pause_and_park() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.plan = vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }];
+    app.plan_mode = true;
+    app.sync_last_drive();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.edit_key(&enter), None);
+
+    app.plan_mode = false;
+    app.plan_drive_paused = true;
+    app.sync_last_drive();
+    assert_eq!(
+        app.edit_key(&enter).as_deref(),
+        Some(hi_agent::PLAN_DRIVE_PROMPT)
+    );
+
+    app.plan_drive_paused = false;
+    app.last_drive = hi_agent::DriveAction::Idle {
+        reason: hi_agent::DriveIdleReason::PlanParked,
+    };
+    assert_eq!(
+        app.edit_key(&enter).as_deref(),
+        Some(hi_agent::PLAN_DRIVE_PROMPT)
+    );
+}
+
+#[test]
+fn empty_enter_submits_drive_after_completed_leftover() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.plan = vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }];
+    app.last_turn_state = TurnState::Done("verified".into());
+    app.last_stop_reason = Some(hi_agent::TurnStopReason::Completed);
+    app.sync_last_drive();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        app.edit_key(&enter).as_deref(),
+        Some(hi_agent::PLAN_DRIVE_PROMPT)
+    );
+}
+
+#[test]
+fn empty_enter_resumes_paused_and_parked_goal() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.goal = Some(hi_agent::Goal::new("ship it", vec!["implement it".into()]));
+    app.goal
+        .as_mut()
+        .unwrap()
+        .pause(hi_agent::GoalPauseReason::User);
+    app.sync_last_drive();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        app.edit_key(&enter).as_deref(),
+        Some(hi_agent::GOAL_CONTINUE_PROMPT)
+    );
+
+    app.goal.as_mut().unwrap().resume();
+    app.last_drive = hi_agent::DriveAction::Idle {
+        reason: hi_agent::DriveIdleReason::GoalParked,
+    };
+    assert_eq!(
+        app.edit_key(&enter).as_deref(),
+        Some(hi_agent::GOAL_CONTINUE_PROMPT)
+    );
+
+    app.plan_mode = true;
+    app.sync_last_drive();
+    assert_eq!(app.edit_key(&enter), None);
+}
+
+#[test]
+fn drive_chrome_does_not_dump_synthetic_prompt() {
+    let line = hi_agent::drive_chrome_line(
+        hi_agent::PLAN_DRIVE_PROMPT,
+        Some("wire the scheduler"),
+        None,
+    )
+    .expect("plan chrome");
+    assert_eq!(line, "⟳ plan drive — wire the scheduler");
+    assert!(!line.contains(hi_agent::PLAN_DRIVE_PROMPT));
 }
 
 #[test]
@@ -2428,6 +2540,29 @@ fn confirmation_modal_colors_file_edit_diff() {
     assert!(screen.contains("src/main.rs"), "file path shown: {screen}");
     assert!(screen.contains("+new"), "added diff line shown: {screen}");
     assert!(screen.contains("-old"), "removed diff line shown: {screen}");
+}
+
+#[test]
+fn ask_user_modal_shows_question_and_options() {
+    use hi_agent::ConfirmationRequest;
+    let mut app = test_app("openai", "gpt-4o");
+    app.confirmation = Some(ConfirmationRequest::AskUser {
+        question: "Which transport should the public API use?".into(),
+        options: vec!["REST".into(), "gRPC".into()],
+    });
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("Question for you"),
+        "modal title shown: {screen}"
+    );
+    assert!(
+        screen.contains("Which transport"),
+        "question shown: {screen}"
+    );
+    assert!(screen.contains("REST"), "option shown: {screen}");
+    assert!(screen.contains("1-9 pick"), "ask_user hint shown: {screen}");
 }
 
 #[test]
@@ -3276,6 +3411,8 @@ fn turn_outcome(
             model: "model".to_string(),
         },
         review_same_model: false,
+        leftover: None,
+        plan_leftover: None,
     }
 }
 
@@ -3604,6 +3741,23 @@ fn typed_incomplete_outcome_is_visible_after_tool_output_without_usage() {
 }
 
 #[test]
+fn leftover_plan_replaces_stalled_incomplete_banner() {
+    let mut app = test_app("openai", "gpt-4o");
+    let mut outcome = turn_outcome(
+        hi_agent::TurnStatus::Incomplete,
+        hi_agent::VerificationStatus::Unverified,
+        hi_agent::ReviewStatus::NotRequired,
+        hi_agent::TurnStopReason::Stalled,
+    );
+    outcome.leftover = Some("3/9 remaining — wire the scheduler".into());
+    app.note_turn_outcome(&outcome);
+    assert_eq!(
+        app.status,
+        "warning · incomplete · 3/9 remaining — wire the scheduler"
+    );
+}
+
+#[test]
 fn failed_turn_is_visible() {
     let mut app = test_app("openai", "gpt-4o");
     app.note_turn_failed("request failed", "request", "wait a moment, then /retry");
@@ -3878,10 +4032,11 @@ fn internal_steering_statuses_are_humanized_in_the_transcript() {
     });
 
     let text = app.transcript_text();
-    assert!(text.contains("send `continue` to resume"));
+    assert!(text.contains("unfinished work"));
     assert!(text.contains("tool calls were invalid"));
     assert!(!text.contains("repeat_no_op_bash"));
     assert!(!text.contains("the model kept"));
+    assert!(!text.contains("/retry"));
 }
 
 #[test]
@@ -4981,6 +5136,15 @@ fn path_scoped_auto_approve_matches_prefix_only() {
         cwd: "/tmp".into(),
     };
     assert!(!app.should_auto_approve(&shell));
+    app.auto_approve_session = true;
+    let ask = hi_agent::ConfirmationRequest::AskUser {
+        question: "which API?".into(),
+        options: vec!["REST".into(), "gRPC".into()],
+    };
+    assert!(
+        !app.should_auto_approve(&ask),
+        "ask_user must never auto-approve"
+    );
 }
 
 #[test]

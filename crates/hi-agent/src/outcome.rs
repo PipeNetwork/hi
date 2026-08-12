@@ -98,6 +98,13 @@ pub struct TurnOutcome {
     /// older deserialized records so they do not claim same-model review.
     #[serde(default)]
     pub review_same_model: bool,
+    /// Leftover work the next drive would actually run (goal if auto-driving,
+    /// else plan). Does not change the exit code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leftover: Option<String>,
+    /// Checklist leftover even when a structured goal would shadow `leftover`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_leftover: Option<String>,
 }
 
 impl TurnOutcome {
@@ -121,6 +128,8 @@ impl TurnOutcome {
             },
             // Unknown outside Agent; callers with config should overwrite.
             review_same_model: false,
+            leftover: None,
+            plan_leftover: None,
         }
     }
 

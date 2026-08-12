@@ -211,20 +211,17 @@ async fn run_check(
     let stderr = tokio::spawn(read_pipe(child.stderr.take()));
     match timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => {
-            let output = match (stdout.await, stderr.await) {
-                (Ok(Ok(stdout)), Ok(Ok(stderr))) => [stdout, stderr].concat(),
-                (Ok(Err(error)), _) | (_, Ok(Err(error))) => {
+            // Child exited, but a grandchild may still hold the pipes. Bound
+            // the drain the same way as the timeout path — an unbounded
+            // `JoinHandle::await` here stalled coding workflows after a
+            // green `make`/`sh -c "server &"` that left descendants alive.
+            let output = match drain_pipes(stdout, stderr).await {
+                Ok(output) => output,
+                Err(error) => {
                     return (
                         VerificationStatus::InfrastructureError,
                         None,
-                        error.to_string().into_bytes(),
-                    );
-                }
-                (Err(error), _) | (_, Err(error)) => {
-                    return (
-                        VerificationStatus::InfrastructureError,
-                        None,
-                        error.to_string().into_bytes(),
+                        error.into_bytes(),
                     );
                 }
             };
@@ -241,18 +238,15 @@ async fn run_check(
             error.to_string().into_bytes(),
         ),
         Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            // Drain the killed child's pipes so the reader tasks finish — but
-            // bound the wait. `child.kill()` signals only the direct process;
-            // a grandchild that inherited the stdout/stderr pipe FDs (e.g.
-            // `make &`, a daemonized build) keeps them open after the parent
-            // dies, and an unbounded await on the drain tasks would block on
-            // `read_to_end` forever — hanging the verifier instead of reporting
-            // Failed. On timeout the output is discarded anyway, so give the
-            // pipes a short grace period and then abandon them.
-            let _ = timeout(DRAIN_GRACE, stdout).await;
-            let _ = timeout(DRAIN_GRACE, stderr).await;
+            // SIGKILL the direct child, then bound the reap. An uninterruptible
+            // descendant (NFS D-state, wedged fuse) must not pin `wait()` and
+            // freeze the coding workflow past the check deadline.
+            let _ = timeout(DRAIN_GRACE, async {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            })
+            .await;
+            let _ = drain_pipes(stdout, stderr).await;
             (
                 VerificationStatus::Failed,
                 None,
@@ -262,12 +256,37 @@ async fn run_check(
     }
 }
 
+/// Drain stdout/stderr JoinHandles with a grace period, then abort. A
+/// grandchild that inherited the pipe FDs keeps `read_to_end` pending until
+/// EOF; aborting guarantees the verifier returns.
+async fn drain_pipes(
+    mut stdout: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    mut stderr: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>, String> {
+    match timeout(DRAIN_GRACE, async {
+        tokio::join!(&mut stdout, &mut stderr)
+    })
+    .await
+    {
+        Ok((stdout_res, stderr_res)) => match (stdout_res, stderr_res) {
+            (Ok(Ok(stdout)), Ok(Ok(stderr))) => Ok([stdout, stderr].concat()),
+            (Ok(Err(error)), _) | (_, Ok(Err(error))) => Err(error.to_string()),
+            (Err(error), _) | (_, Err(error)) => Err(error.to_string()),
+        },
+        Err(_) => {
+            stdout.abort();
+            stderr.abort();
+            Ok(b"verification output drain timed out".to_vec())
+        }
+    }
+}
+
 /// One stream is capped well under the report's artifact ceiling so the
 /// concatenated stdout+stderr stays meaningful.
 const PIPE_CAPTURE_BYTES: usize = 1024 * 1024;
 
 /// How long to wait for the pipe-drain tasks after a timed-out child is
-/// killed before abandoning them. A grandchild that inherited the pipe FDs
+/// killed before aborting them. A grandchild that inherited the pipe FDs
 /// can keep them open past the parent's death; the grace lets the common case
 /// (pipes close on kill) collect output while guaranteeing the verifier never
 /// hangs on a leaked descendant. Output is discarded on timeout regardless.
@@ -515,6 +534,46 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(20),
             "verifier must abandon leaked pipes, not hang: took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exiting_check_with_pipe_holding_grandchild_does_not_hang() {
+        // The parent can exit 0 while a background grandchild still holds
+        // stdout/stderr. The success-path drain used to `await` those pipes
+        // with no deadline, stalling a green verify (and the coding workflow
+        // waiting on it) until the grandchild died.
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a"), "content").unwrap();
+        let verifier = AttestingVerifier::new(TestAttestor, "a".repeat(64)).unwrap();
+        let start = Instant::now();
+        let report = verifier
+            .verify(
+                workspace.path(),
+                "run",
+                "candidate",
+                &[CheckSpec {
+                    name: "leaky-success".into(),
+                    program: "/bin/sh".into(),
+                    arguments: vec!["-c".into(), "sleep 30 & echo ok".into()],
+                    timeout: Duration::from_secs(5),
+                    required: true,
+                    inherit_environment: false,
+                }],
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        let check = &report.checks[0];
+        assert_eq!(
+            check.status,
+            VerificationStatus::Passed,
+            "parent exited 0; a leaked grandchild must not flip the verdict"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "success-path drain must abandon leaked pipes, not hang: took {elapsed:?}"
         );
     }
 

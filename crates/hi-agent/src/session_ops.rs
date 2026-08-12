@@ -132,9 +132,36 @@ pub fn handle_session_command(
                     agent.set_plan_mode(false);
                     "plan mode off — normal editing resumed".into()
                 }
+                "pause" => {
+                    agent.set_plan_drive_paused(true);
+                    "plan drive paused — checklist stays pinned; /plan resume to continue".into()
+                }
+                "resume" => {
+                    agent.set_plan_drive_paused(false);
+                    agent.reset_plan_drive_stall();
+                    if agent.plan_incomplete() && !agent.plan_mode() {
+                        return Some(SessionCommandEffect {
+                            message: "plan drive resumed".into(),
+                            follow_up_prompt: Some(crate::PLAN_DRIVE_PROMPT.to_string()),
+                        });
+                    }
+                    "plan drive resumed — no leftover checklist work".into()
+                }
+                "clear" => {
+                    agent.clear_pinned_plan();
+                    "plan cleared".into()
+                }
+                "replace" => {
+                    agent.clear_pinned_plan();
+                    "plan cleared — next task should update_plan a new checklist".into()
+                }
                 "show" | "view" | "list" | "status" => {
                     let mode = if agent.plan_mode() { "on" } else { "off" };
-                    format!("plan mode: {mode}\n{}", format_plan(agent.current_plan()))
+                    format!(
+                        "plan mode: {mode}\nplan drive: {}\n{}",
+                        agent.plan_drive_status(),
+                        format_plan(agent.current_plan())
+                    )
                 }
                 "" | "on" => {
                     agent.set_plan_mode(true);
@@ -873,13 +900,20 @@ pub async fn run_hook(workspace: &Path, name: &str, input: &str) -> Result<Strin
     let mut child = command
         .spawn()
         .with_context(|| format!("spawning hook {}", path.display()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt as _;
-        stdin.write_all(input.as_bytes()).await?;
-    }
-    let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
-        .await
-        .with_context(|| format!("hook {name} timed out after 30s"))??;
+    // Write stdin and wait under one deadline. A hook that never reads stdin
+    // used to block forever on `write_all` (pipe buffer full) *before* the
+    // wait timeout started — stalling the coding turn at pre-turn.
+    const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let output = tokio::time::timeout(HOOK_TIMEOUT, async {
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt as _;
+            stdin.write_all(input.as_bytes()).await?;
+            drop(stdin);
+        }
+        child.wait_with_output().await
+    })
+    .await
+    .with_context(|| format!("hook {name} timed out after 30s"))??;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !output.status.success() {

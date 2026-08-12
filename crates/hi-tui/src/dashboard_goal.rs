@@ -4,10 +4,21 @@ pub(crate) struct RowGoal {
     pub(crate) total: usize,
     pub(crate) active: bool,
     pub(crate) paused: bool,
+    /// `running|paused|parked|off` from report `goal.drive`. Absent on old reports.
+    pub(crate) drive: Option<String>,
     /// Phase-level trail from the report's `goal.phases` array: `(title,
     /// state)` where state is `"done"`, `"active"`, or `"pending"`. Empty when
     /// the child didn't emit phases (older binaries or non-goal rows).
     pub(crate) phases: Vec<(String, String)>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RowPlan {
+    pub(crate) done: usize,
+    pub(crate) total: usize,
+    pub(crate) next: Option<String>,
+    pub(crate) pending: bool,
+    pub(crate) drive: String,
 }
 
 /// The fields the dashboard consumes from a child turn's schema-v2 report.
@@ -16,6 +27,10 @@ pub(crate) struct TurnReport {
     pub(crate) goal: Option<RowGoal>,
     pub(crate) goal_raw: Option<String>,
     pub(crate) outcome_status: Option<String>,
+    pub(crate) leftover: Option<String>,
+    pub(crate) plan: Option<RowPlan>,
+    pub(crate) changed_files: Vec<String>,
+    pub(crate) progress_events: Vec<hi_agent::ProgressEvent>,
 }
 
 pub(crate) fn parse_report(text: &str) -> Option<TurnReport> {
@@ -35,6 +50,10 @@ pub(crate) fn parse_report(text: &str) -> Option<TurnReport> {
             .get("paused")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
+        drive: goal
+            .get("drive")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         phases: goal
             .get("phases")
             .and_then(|value| value.as_array())
@@ -54,6 +73,51 @@ pub(crate) fn parse_report(text: &str) -> Option<TurnReport> {
             })
             .unwrap_or_default(),
     });
+    let plan_value = value.get("plan").filter(|plan| !plan.is_null());
+    let plan = plan_value.map(|plan| RowPlan {
+        done: plan
+            .get("done")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
+        total: plan
+            .get("total")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
+        next: plan
+            .get("next")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        pending: plan
+            .get("pending")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        drive: plan
+            .get("drive")
+            .and_then(|value| value.as_str())
+            .unwrap_or("off")
+            .to_string(),
+    });
+    let leftover = value
+        .pointer("/outcome/plan_leftover")
+        .and_then(|leftover| leftover.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .pointer("/outcome/leftover")
+                .and_then(|leftover| leftover.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            plan.as_ref().and_then(|plan| {
+                plan.pending
+                    .then(|| {
+                        plan.next
+                            .as_deref()
+                            .map(|next| format!("remaining — {next}"))
+                    })
+                    .flatten()
+            })
+        });
     Some(TurnReport {
         total_tokens: value
             .pointer("/usage/session/total_tokens")
@@ -66,6 +130,22 @@ pub(crate) fn parse_report(text: &str) -> Option<TurnReport> {
             .pointer("/outcome/status")
             .and_then(|status| status.as_str())
             .map(str::to_string),
+        leftover,
+        plan,
+        changed_files: value
+            .pointer("/outcome/changed_files")
+            .and_then(|files| files.as_array())
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|file| file.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        progress_events: value
+            .pointer("/telemetry/progress_events")
+            .and_then(|events| serde_json::from_value(events.clone()).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -105,6 +185,68 @@ fn same_drive_state(previous: &Option<String>, new: &Option<String>) -> bool {
         }
     }
     previous == new
+}
+
+pub(crate) fn leftover_step_title(leftover: Option<&str>) -> Option<&str> {
+    leftover.and_then(|line| line.split_once(" — ").map(|(_, title)| title))
+}
+
+pub(crate) fn drive_action(
+    goal: Option<&RowGoal>,
+    plan: Option<&RowPlan>,
+    leftover: Option<&str>,
+    plan_drive_stall: u32,
+) -> hi_agent::DriveAction {
+    if let Some(goal) = goal
+        && let Some(drive) = goal.drive.as_deref()
+    {
+        return match drive {
+            "running" => hi_agent::DriveAction::Enqueue(hi_agent::DriveKind::Goal),
+            "paused" => hi_agent::DriveAction::Idle {
+                reason: hi_agent::DriveIdleReason::GoalPaused,
+            },
+            "parked" => hi_agent::DriveAction::Idle {
+                reason: hi_agent::DriveIdleReason::GoalParked,
+            },
+            _ => hi_agent::DriveAction::from_plan(plan_drive_action(
+                Some(goal),
+                plan,
+                leftover,
+                plan_drive_stall,
+            )),
+        };
+    }
+    if goal.is_some_and(|goal| goal.active && !goal.paused) {
+        return hi_agent::DriveAction::Enqueue(hi_agent::DriveKind::Goal);
+    }
+    hi_agent::DriveAction::from_plan(plan_drive_action(goal, plan, leftover, plan_drive_stall))
+}
+
+pub(crate) fn plan_drive_action(
+    goal: Option<&RowGoal>,
+    plan: Option<&RowPlan>,
+    leftover: Option<&str>,
+    plan_drive_stall: u32,
+) -> hi_agent::PlanDriveAction {
+    let goal_driving = goal.is_some_and(|goal| goal.active && !goal.paused);
+    if let Some(plan) = plan {
+        let paused = plan.drive == "paused";
+        let stall = if plan.drive == "parked" {
+            hi_agent::PLAN_DRIVE_STALL_LIMIT
+        } else {
+            0
+        };
+        hi_agent::PlanDriveAction::decide(plan.pending, false, paused, stall, goal_driving, None)
+    } else {
+        hi_agent::PlanDriveAction::decide(
+            leftover.is_some(),
+            false,
+            false,
+            plan_drive_stall,
+            goal_driving,
+            None,
+        )
+    }
 }
 
 pub(crate) fn should_retry_goal_turn(
@@ -211,6 +353,7 @@ mod tests {
             total: 2,
             active: true,
             paused: false,
+            drive: None,
             phases: Vec::new(),
         };
         assert!(should_retry_goal_turn(
@@ -233,5 +376,111 @@ mod tests {
             Some("incomplete"),
             Some(&paused)
         ));
+    }
+
+    #[test]
+    fn leftover_pending_plan_enqueues_drive_when_goal_is_not_driving() {
+        let json = r#"{"schema_version":2,"outcome":{"status":"completed","leftover":"1/2 remaining — wire the scheduler","changed_files":[]}}"#;
+        let report = parse_report(json).unwrap();
+        assert_eq!(
+            report.leftover.as_deref(),
+            Some("1/2 remaining — wire the scheduler")
+        );
+        assert_eq!(
+            leftover_step_title(report.leftover.as_deref()),
+            Some("wire the scheduler")
+        );
+        assert!(
+            plan_drive_action(None, report.plan.as_ref(), report.leftover.as_deref(), 0)
+                .should_enqueue()
+        );
+        let active = RowGoal {
+            done: 0,
+            total: 2,
+            active: true,
+            paused: false,
+            drive: None,
+            phases: Vec::new(),
+        };
+        assert!(
+            !plan_drive_action(
+                Some(&active),
+                report.plan.as_ref(),
+                report.leftover.as_deref(),
+                0
+            )
+            .should_enqueue()
+        );
+        assert!(
+            !plan_drive_action(
+                None,
+                report.plan.as_ref(),
+                report.leftover.as_deref(),
+                hi_agent::PLAN_DRIVE_STALL_LIMIT
+            )
+            .should_enqueue()
+        );
+    }
+
+    #[test]
+    fn report_plan_pending_enqueues_and_paused_parked_do_not() {
+        let json = r#"{"schema_version":2,"plan":{"done":1,"total":2,"next":"wire the scheduler","pending":true,"drive":"running"}}"#;
+        let report = parse_report(json).unwrap();
+        assert!(report.plan.as_ref().is_some_and(|plan| plan.pending));
+        assert!(
+            plan_drive_action(None, report.plan.as_ref(), report.leftover.as_deref(), 0)
+                .should_enqueue()
+        );
+
+        let paused = r#"{"schema_version":2,"plan":{"done":1,"total":2,"next":"wire the scheduler","pending":true,"drive":"paused"}}"#;
+        let paused = parse_report(paused).unwrap();
+        assert!(
+            !plan_drive_action(None, paused.plan.as_ref(), paused.leftover.as_deref(), 0)
+                .should_enqueue()
+        );
+
+        let parked = r#"{"schema_version":2,"plan":{"done":1,"total":2,"next":"wire the scheduler","pending":true,"drive":"parked"}}"#;
+        let parked = parse_report(parked).unwrap();
+        assert_eq!(
+            plan_drive_action(None, parked.plan.as_ref(), parked.leftover.as_deref(), 0),
+            hi_agent::PlanDriveAction::Idle {
+                reason: hi_agent::PlanDriveIdleReason::Parked
+            }
+        );
+    }
+
+    #[test]
+    fn report_goal_drive_enqueues_and_paused_parked_do_not() {
+        let running = r#"{"schema_version":2,"goal":{"done":0,"total":2,"status":"Active","paused":false,"drive":"running"}}"#;
+        let running = parse_report(running).unwrap();
+        assert_eq!(
+            drive_action(running.goal.as_ref(), None, None, 0),
+            hi_agent::DriveAction::Enqueue(hi_agent::DriveKind::Goal)
+        );
+
+        let paused = r#"{"schema_version":2,"goal":{"done":0,"total":2,"status":"Active","paused":true,"drive":"paused"}}"#;
+        let paused = parse_report(paused).unwrap();
+        assert_eq!(
+            drive_action(paused.goal.as_ref(), None, None, 0),
+            hi_agent::DriveAction::Idle {
+                reason: hi_agent::DriveIdleReason::GoalPaused
+            }
+        );
+
+        let parked = r#"{"schema_version":2,"goal":{"done":0,"total":2,"status":"Active","paused":false,"drive":"parked"}}"#;
+        let parked = parse_report(parked).unwrap();
+        assert_eq!(
+            drive_action(parked.goal.as_ref(), None, None, 0),
+            hi_agent::DriveAction::Idle {
+                reason: hi_agent::DriveIdleReason::GoalParked
+            }
+        );
+
+        let plan = r#"{"schema_version":2,"plan":{"done":1,"total":2,"next":"wire the scheduler","pending":true,"drive":"running"}}"#;
+        let plan = parse_report(plan).unwrap();
+        assert_eq!(
+            drive_action(None, plan.plan.as_ref(), plan.leftover.as_deref(), 0),
+            hi_agent::DriveAction::Enqueue(hi_agent::DriveKind::Plan)
+        );
     }
 }

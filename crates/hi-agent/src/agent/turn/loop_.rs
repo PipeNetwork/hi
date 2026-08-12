@@ -23,7 +23,7 @@ use hi_events::{
 use crate::command;
 use crate::compaction;
 use crate::domain::TurnControlFlags;
-use crate::heuristics::{looks_like_continue, tool_mode_label};
+use crate::heuristics::{looks_like_continue, looks_like_new_task, tool_mode_label};
 use crate::steering::{
     EvidenceTracker, IMPLEMENTATION_EMPTY_TUI_NUDGE, ImplementationIntent, ImplementationTracker,
     MutationRecovery, ReviewIntent, ToolLoopGuardrail, classify_implementation_intent,
@@ -115,6 +115,7 @@ impl crate::Agent {
         self.turn_cancellation = None;
         self.interrupt
             .store(false, std::sync::atomic::Ordering::Release);
+        self.finish_drive_turn();
         match body_result {
             Some(Ok(outcome)) => Ok(outcome),
             Some(Err(error)) => {
@@ -173,6 +174,8 @@ impl crate::Agent {
                     Some(self.report.last_effective_route.model.as_str()),
                 ),
                 review_same_model: self.skeptic_shares_session_model(),
+                leftover: None,
+                plan_leftover: None,
             };
             self.report.set_outcome(outcome.clone());
             ui.semantic_event(RunEvent::new(
@@ -373,18 +376,22 @@ impl crate::Agent {
             .begin_turn(turn_ledger_revision, turn_background_baseline.clone());
         let expanded_input =
             command::expand_prompt_macro(input).unwrap_or_else(|| input.to_string());
+        self.begin_drive_turn(crate::DriveKind::from_prompt(&expanded_input));
         // Synthetic goal-drive text is only transport. Contracts, context
         // ranking, review, and implementation guards need the real objective
         // and active milestone—especially explicit paths such as plan.md.
         let goal_context = self.goal_continuation_context(&expanded_input);
         let goal_drive_turn = goal_context.is_some();
+        let plan_context = self.plan_continuation_context(&expanded_input);
         // Charge the turn budget up front: a turn that errors out still spent
         // the time, so counting only successful turns would let a failing goal
         // run past its ceiling indefinitely.
         if goal_drive_turn && let Some(goal) = self.goals.structured.as_mut() {
             goal.spend_turn();
         }
-        let context_task = goal_context.unwrap_or_else(|| expanded_input.clone());
+        let context_task = goal_context
+            .or(plan_context)
+            .unwrap_or_else(|| expanded_input.clone());
         let structurally_read_only_subagent = self.config.subagents.is_subagent
             && self.config.routing.tool_mode == ToolMode::ReadOnly;
         let mut task_contract =
@@ -555,8 +562,7 @@ impl crate::Agent {
             self.workspace.last_file_changes.clear();
             self.report.last_compat_fallbacks.clear();
             self.report.last_turn_telemetry = TurnTelemetry::default();
-            let preserve_plan = (goal_drive_turn || looks_like_continue(&context_task))
-                && self.goals.plan_incomplete();
+            let preserve_plan = self.goals.plan_incomplete();
             if self.goals.clear_plan_unless(preserve_plan) {
                 if let Some(session) = self.session.as_mut() {
                     session.clear_plan()?;
@@ -583,6 +589,8 @@ impl crate::Agent {
                 verified_workspace_revision: None,
                 effective_route: effective_model_route(&self.config, None),
                 review_same_model: self.skeptic_shares_session_model(),
+                leftover: None,
+                plan_leftover: None,
             };
             self.report.last_turn_outcome = Some(outcome.clone());
             self.workspace.clear_active_baselines();
@@ -678,16 +686,31 @@ impl crate::Agent {
             .last_turn_telemetry
             .verification_executions
             .clear();
-        // Preserve only an unfinished plan that the user explicitly continues.
-        // Clearing must also be emitted: the TUI owns a pinned copy and cannot
-        // infer that the agent cleared its internal state.
-        let preserve_plan =
-            (goal_drive_turn || looks_like_continue(&context_task)) && self.goals.plan_incomplete();
+        // Preserve an unfinished plan across follow-ups so the checklist stays
+        // pinned. Completed-only plans still clear. A new user message that is
+        // not a continue/drive prompt gets a replace-plan fold so a new task
+        // can replace stale steps instead of inheriting PLAN_CONTINUE_NUDGE.
+        let preserve_plan = self.goals.plan_incomplete();
         if self.goals.clear_plan_unless(preserve_plan) {
             if let Some(session) = self.session.as_mut() {
                 session.clear_plan()?;
             }
             ui.plan(&[]);
+        }
+        let plan_drive_turn =
+            crate::DriveKind::from_prompt(&expanded_input) == crate::DriveKind::Plan;
+        if preserve_plan
+            && !goal_drive_turn
+            && !plan_drive_turn
+            && !looks_like_continue(&expanded_input)
+            && !self.config.subagents.is_subagent
+        {
+            let nudge = if looks_like_new_task(&expanded_input) {
+                crate::NEW_TASK_REPLACE_PLAN_NUDGE
+            } else {
+                crate::REPLACE_PLAN_NUDGE
+            };
+            self.messages.push_nudge_or_fold(NudgeKind::Continue, nudge);
         }
         let compat_fallbacks = Vec::new();
         let effective_fallback_route: Option<String> = None;
@@ -1232,6 +1255,8 @@ impl crate::Agent {
                         ranked_context_paths: &mut turn.ranked_context_paths,
                         context_generation_seen: &mut turn.context_generation_seen,
                         indexed_ledger_revision: &mut turn.indexed_ledger_revision,
+                        progress_tracker: &mut turn.progress_tracker,
+                        continue_total_nudges: &mut turn.continue_total_nudges,
                     },
                     ui,
                 )
@@ -1546,9 +1571,13 @@ impl crate::Agent {
             (ledger.revision(), ledger.workspace_revision())
         };
         let changed_after_final_hooks = self.report.verify.passed()
-            && self.report.verify.bound_revision_digest().is_none_or(|(revision, digest)| {
-                revision != outcome_revision || digest != outcome_digest
-            });
+            && self
+                .report
+                .verify
+                .bound_revision_digest()
+                .is_none_or(|(revision, digest)| {
+                    revision != outcome_revision || digest != outcome_digest
+                });
         if changed_after_final_hooks {
             let delta = {
                 let ledger = self.runtime.ledger();
@@ -1675,6 +1704,8 @@ impl crate::Agent {
                 turn.effective_fallback_route.as_deref(),
             ),
             review_same_model: self.skeptic_shares_session_model(),
+            leftover: self.goals.leftover_work(),
+            plan_leftover: self.goals.plan_leftover_work(),
         };
         self.report.set_outcome(outcome.clone());
         // Durable per-turn outcome record for post-mortems. Before this, the

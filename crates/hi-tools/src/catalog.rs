@@ -458,6 +458,15 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         "update_plan + prose status"
     ),
     tool_metadata!(
+        "ask_user",
+        Coordination,
+        true,
+        false,
+        false,
+        Structure,
+        "ask in assistant text (cannot pause the turn)"
+    ),
+    tool_metadata!(
         "read",
         Repository,
         true,
@@ -928,6 +937,32 @@ pub fn kill_task_tool_spec() -> ToolSpec {
     }
 }
 
+/// Admission (ADR 002): asking in assistant text cannot pause the turn, so the
+/// human path fails the structure/control-plane gate. Inject-only for
+/// interactive parent sessions — not in [`TOOL_SPECS`], [`MINIMAL_TOOL_SPECS`],
+/// or [`PROTECTED_TOOLS`]. Side-effect class: none (Coordination, read-only).
+pub fn ask_user_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "ask_user".into(),
+        description: "Pause and ask the user a product or design question that tools cannot resolve. Call only when you are blocked on a real choice (API shape, UX copy, which approach to take) — not instead of keep-working on a known next coding step, and not for confirmations the user already answered. Product/design forks only; never instead of the next coding step. Pass `question` and optional `options`. The tool result is the user's answer. If the frontend cannot pause, pick the best option yourself and continue.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The question to ask. Be specific about the decision and why tools cannot resolve it."
+                },
+                "options": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional short choices the user can pick from. They may still type a custom answer."
+                }
+            },
+            "required": ["question"]
+        }),
+    }
+}
+
 /// `use_tool` — call an external MCP (Model Context Protocol) tool by name.
 pub fn use_tool_tool_spec() -> ToolSpec {
     ToolSpec {
@@ -1172,6 +1207,7 @@ mod tests {
         // read-only mode.
         assert!(is_read_only("update_plan"));
         assert!(is_read_only("record_decision"));
+        assert!(is_read_only("ask_user"));
         assert!(is_read_only("bash_output"));
         // Mutating / effecting tools are not safe to run concurrently.
         assert!(!is_read_only("write"));
@@ -1217,6 +1253,7 @@ mod tests {
         }
         assert!(is_known_tool("explore"));
         assert!(is_known_tool("delegate"));
+        assert!(is_known_tool("ask_user"));
         assert!(!is_known_tool("hallucinated_tool"));
     }
 
@@ -1521,6 +1558,7 @@ mod tests {
             ("record_decision", "none"),
             // Records goal bookkeeping only; touches no file and runs nothing.
             ("block_step", "none"),
+            ("ask_user", "none"),
             ("read", "workspace_read"),
             ("list", "workspace_read"),
             ("grep", "workspace_read"),

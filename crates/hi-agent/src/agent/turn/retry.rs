@@ -10,6 +10,10 @@ use std::collections::BTreeMap;
 use hi_ai::OutputCapError;
 
 use crate::steering::{AnswerRepairMode, EvidenceTracker};
+use crate::transcript::NudgeKind;
+use crate::{KEEP_WORKING_NUDGE, Ui};
+
+use super::progress::ProgressTracker;
 
 pub(super) const MAX_PROVIDER_ROUTE_RETRIES: u32 = 1;
 pub(super) const TRANSIENT_ROUTE_RETRY_DELAYS: [u64; 2] = [2, 5];
@@ -19,13 +23,54 @@ pub(super) const MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS: u64 = 120;
 pub(super) const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
 pub(super) const INCOMPLETE_STATUS: &str = "turn stopped incomplete";
 
-/// UI status for a stall break, including the stable reason key when known.
+/// UI status for a stall break, including leftover plan work when known.
 pub(super) fn incomplete_status(reason: &str) -> String {
     let reason = reason.trim();
     if reason.is_empty() {
         INCOMPLETE_STATUS.to_string()
     } else {
         format!("{INCOMPLETE_STATUS} · {reason}")
+    }
+}
+
+impl crate::Agent {
+    /// Stall-break status that prefers leftover checklist copy over a reason key.
+    pub(super) fn incomplete_turn_status(&self, reason: &str) -> String {
+        match self.goals.leftover_work() {
+            Some(leftover) => format!("{INCOMPLETE_STATUS} · {leftover}"),
+            None => incomplete_status(reason),
+        }
+    }
+
+    /// After a stall budget is spent, keep the turn going instead of asking
+    /// the user to `/retry`. Returns true when the caller should continue
+    /// the Model→Tools loop.
+    pub(super) fn keep_working_after_stall(
+        &mut self,
+        progress: &mut ProgressTracker,
+        force_tools_next: &mut bool,
+        stalled_unfinished: &mut bool,
+        stalled_repeating: &mut bool,
+        continue_nudges: Option<&mut u32>,
+        ui: &mut dyn Ui,
+    ) -> bool {
+        if !progress.try_keep_working(self.config.loop_limits.max_keep_working) {
+            return false;
+        }
+        *stalled_unfinished = false;
+        *stalled_repeating = false;
+        *force_tools_next = true;
+        if let Some(n) = continue_nudges {
+            *n = n.saturating_add(1);
+        }
+        self.messages
+            .push_nudge(NudgeKind::Continue, KEEP_WORKING_NUDGE);
+        let status = match self.goals.next_step_title() {
+            Some(step) => format!("still working — {step}"),
+            None => "still working — trying a different next step".to_string(),
+        };
+        ui.status(&status);
+        true
     }
 }
 

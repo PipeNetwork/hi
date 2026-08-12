@@ -76,6 +76,16 @@ pub trait SessionSink: Send {
         Ok(())
     }
 
+    /// Persist plan-drive pause and stall. Last write wins. Default no-op.
+    fn record_plan_drive(&mut self, _paused: bool, _stall: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// Persist goal-drive stall. Last write wins. Default no-op.
+    fn record_goal_drive(&mut self, _stall: u32) -> Result<()> {
+        Ok(())
+    }
+
     /// Persist the intra-session decision log so a resumed session keeps the
     /// same key decisions in its rebuilt system prompt. Last write wins.
     fn record_decisions(&mut self, _decisions: &crate::DecisionLog) -> Result<()> {

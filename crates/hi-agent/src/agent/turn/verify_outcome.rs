@@ -7,10 +7,10 @@ use std::collections::BTreeSet;
 
 use anyhow::Result;
 
+use crate::domain::VerifyEvidence;
 use crate::transcript::NudgeKind;
 use crate::verify::{VerifyOutcome, WorkspaceRepairVerifier, stage_guidance};
 use crate::{ReviewStatus, Ui};
-use crate::domain::VerifyEvidence;
 
 use super::helpers::fallback_review_line_count;
 
@@ -41,6 +41,8 @@ pub(super) struct VerifyOutcomeState<'a> {
     pub(super) ranked_context_paths: &'a mut BTreeSet<String>,
     pub(super) context_generation_seen: &'a mut u64,
     pub(super) indexed_ledger_revision: &'a mut u64,
+    pub(super) progress_tracker: &'a mut super::progress::ProgressTracker,
+    pub(super) continue_total_nudges: &'a mut u32,
 }
 
 impl crate::Agent {
@@ -100,16 +102,38 @@ impl crate::Agent {
                             return Ok(VerifyOutcomeControl::ReenterModel);
                         }
                         super::obligation::ObligationReason::FailedVerify => {
+                            let mut repeating = false;
+                            if self.keep_working_after_stall(
+                                state.progress_tracker,
+                                state.force_tools_next,
+                                state.stalled_unfinished,
+                                &mut repeating,
+                                Some(state.continue_total_nudges),
+                                ui,
+                            ) {
+                                verifier.allow_review_revalidation();
+                                return Ok(VerifyOutcomeControl::ReenterModel);
+                            }
                             *state.stalled_unfinished = true;
                             ui.status(reason.ui_status());
                         }
                     }
                 }
                 if self.report.verify.failed() {
+                    let mut repeating = false;
+                    if self.keep_working_after_stall(
+                        state.progress_tracker,
+                        state.force_tools_next,
+                        state.stalled_unfinished,
+                        &mut repeating,
+                        Some(state.continue_total_nudges),
+                        ui,
+                    ) {
+                        verifier.allow_review_revalidation();
+                        return Ok(VerifyOutcomeControl::ReenterModel);
+                    }
                     *state.stalled_unfinished = true;
-                    ui.status(
-                        "verification still failed after the retry budget; the task may be incomplete. /retry, or send 'continue'.",
-                    );
+                    ui.status("verification still failed after repair");
                 }
                 Ok(VerifyOutcomeControl::BreakTurn)
             }

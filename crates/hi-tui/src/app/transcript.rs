@@ -120,6 +120,7 @@ impl crate::App {
     /// workspace reconciliation. It must therefore never decide whether a turn
     /// succeeded. This is the sole success-state transition for a normal turn.
     pub(crate) fn note_turn_outcome(&mut self, outcome: &TurnOutcome) {
+        self.last_stop_reason = Some(outcome.stop_reason.clone());
         let detail = outcome_detail(outcome);
         match outcome_state(outcome) {
             OutcomeState::Done => {
@@ -1356,13 +1357,46 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
         && outcome.review != ReviewStatus::Objected;
     let base = if green_settled {
         "verified".to_string()
+    } else if outcome.status == TurnStatus::Incomplete {
+        if let Some(leftover) = outcome
+            .leftover
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            leftover.to_string()
+        } else {
+            match outcome.stop_reason {
+                TurnStopReason::Completed => match outcome.verification {
+                    VerificationStatus::Passed => "verified",
+                    VerificationStatus::NotApplicable => "no applicable checks",
+                    VerificationStatus::Unverified => "checks did not settle",
+                    VerificationStatus::Failed => "verification failed",
+                    VerificationStatus::InfrastructureError => {
+                        "verification infrastructure failure"
+                    }
+                },
+                TurnStopReason::NoApplicableVerification => "no applicable checks",
+                TurnStopReason::VerificationUnavailable => "checks did not settle",
+                TurnStopReason::VerificationFailed => "verification failed",
+                TurnStopReason::VerificationUnstable => "verification was unstable",
+                TurnStopReason::ReviewObjected => "review objected",
+                TurnStopReason::ReviewEscalated => "review escalated",
+                TurnStopReason::ToolModeDenied => "required tool was denied",
+                TurnStopReason::StepLimit => "step limit reached",
+                TurnStopReason::TimeLimit => "time budget reached",
+                TurnStopReason::TurnLimit => "turn limit reached",
+                TurnStopReason::Stalled => "stalled",
+                TurnStopReason::Cancelled => "cancelled",
+                TurnStopReason::InfrastructureFailure => "infrastructure failure",
+            }
+            .to_string()
+        }
     } else {
         match outcome.stop_reason {
             TurnStopReason::Completed => match outcome.verification {
                 VerificationStatus::Passed => "verified",
                 VerificationStatus::NotApplicable => "no applicable checks",
-                // Prefer a concrete next step over the vague "unverified changes"
-                // label users repeatedly complained about.
                 VerificationStatus::Unverified => "checks did not settle",
                 VerificationStatus::Failed => "verification failed",
                 VerificationStatus::InfrastructureError => "verification infrastructure failure",

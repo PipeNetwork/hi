@@ -232,7 +232,10 @@ mod tests {
             Some("Run the unit tests"),
             "  run the unit tests  "
         ));
-        assert!(!is_repeat_suggestion(Some("Run the unit tests"), "Open a PR"));
+        assert!(!is_repeat_suggestion(
+            Some("Run the unit tests"),
+            "Open a PR"
+        ));
         assert!(!is_repeat_suggestion(None, "Run the unit tests"));
     }
 }

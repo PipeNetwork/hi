@@ -30,7 +30,7 @@ use super::progress::{
     NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker, STEP_LIMIT_WRAP_UP_NUDGE,
     forced_final_answer_is_unusable, no_progress_signature_for_calls,
 };
-use super::retry::{ReviewRepairState, TurnRetryState, incomplete_status};
+use super::retry::{ReviewRepairState, TurnRetryState};
 
 const BOUNDED_REVIEW_FINAL_MAX_TOKENS: u32 = 768;
 
@@ -620,12 +620,12 @@ impl crate::Agent {
                 max_steps,
                 verifier,
                 repeat_nudges,
-                continue_total_nudges,
+                &mut continue_total_nudges,
                 truncation_total_retries,
-                &progress_tracker,
+                &mut progress_tracker,
                 ended_at_cap,
-                stalled_unfinished,
-                stalled_repeating,
+                &mut stalled_unfinished,
+                &mut stalled_repeating,
                 &last_verify_attributions,
                 sched_tool_calls,
                 sched_max_concurrent,
@@ -764,12 +764,18 @@ impl crate::Agent {
             self.clean_text_tool_calls_from_content(&mut completion.content);
             self.messages
                 .push_assistant_text_only(std::mem::take(&mut completion.content));
+            if self.keep_working_after_stall(
+                &mut progress_tracker,
+                &mut force_tools_next,
+                &mut stalled_unfinished,
+                &mut stalled_repeating,
+                Some(&mut continue_total_nudges),
+                ui,
+            ) {
+                return Ok(ModelRoundControl::Continue);
+            }
             stalled_unfinished = true;
-            ui.nudge(&format!(
-                "⚠ the model hit the output token limit {max} times — the task may be \
-                 incomplete. /retry, or send 'continue'.",
-                max = self.config.loop_limits.max_truncation_retries,
-            ));
+            ui.status(&self.incomplete_turn_status("output_truncated"));
             return Ok(ModelRoundControl::BreakInner(false));
         }
         // A public RSI response is terminal, not a local planning round to nudge.
@@ -1149,33 +1155,62 @@ If the task is already complete, stop and give your final recap."
                 return Ok(ModelRoundControl::Continue);
             }
             if stale_background_handle_call {
-                ui.status(
-                    "background process handles were completed, missing, or pruned (or already killed) and the model kept using them — the task may be incomplete. /retry, or send 'continue'.",
-                );
+                if self.keep_working_after_stall(
+                    &mut progress_tracker,
+                    &mut force_tools_next,
+                    &mut stalled_unfinished,
+                    &mut stalled_repeating,
+                    Some(&mut continue_total_nudges),
+                    ui,
+                ) {
+                    prev_call_sig = None;
+                    return Ok(ModelRoundControl::Continue);
+                }
+                ui.status(&self.incomplete_turn_status("stale_background_handle"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             if has_no_progress_bash {
+                if self.keep_working_after_stall(
+                    &mut progress_tracker,
+                    &mut force_tools_next,
+                    &mut stalled_unfinished,
+                    &mut stalled_repeating,
+                    Some(&mut continue_total_nudges),
+                    ui,
+                ) {
+                    prev_call_sig = None;
+                    return Ok(ModelRoundControl::Continue);
+                }
                 stalled_unfinished = true;
                 progress_tracker.record(
                     ProgressKind::None,
                     "repeat_no_op_bash",
                     None,
                 );
-                ui.nudge("model repeated no-op shell commands; stopping incomplete");
-                ui.status(&incomplete_status("repeat_no_op_bash"));
+                ui.nudge("model repeated no-op shell commands");
+                ui.status(&self.incomplete_turn_status("repeat_no_op_bash"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             if read_only_intent.is_some() && evidence.saw_search && !evidence.saw_read {
+                if self.keep_working_after_stall(
+                    &mut progress_tracker,
+                    &mut force_tools_next,
+                    &mut stalled_unfinished,
+                    &mut stalled_repeating,
+                    Some(&mut continue_total_nudges),
+                    ui,
+                ) {
+                    prev_call_sig = None;
+                    return Ok(ModelRoundControl::Continue);
+                }
                 stalled_unfinished = true;
                 progress_tracker.record(
                     ProgressKind::None,
                     "repeat_search_without_read",
                     None,
                 );
-                ui.nudge(
-                    "review repeated the same search without reading files; stopping incomplete",
-                );
-                ui.status(&incomplete_status("repeat_search_without_read"));
+                ui.nudge("review repeated the same search without reading files");
+                ui.status(&self.incomplete_turn_status("repeat_search_without_read"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             if let Some(intent) = read_only_intent
@@ -1203,17 +1238,26 @@ If the task is already complete, stop and give your final recap."
                     );
                     return Ok(ModelRoundControl::Continue);
                 }
+                if self.keep_working_after_stall(
+                    &mut progress_tracker,
+                    &mut force_tools_next,
+                    &mut stalled_unfinished,
+                    &mut stalled_repeating,
+                    Some(&mut continue_total_nudges),
+                    ui,
+                ) {
+                    prev_call_sig = None;
+                    return Ok(ModelRoundControl::Continue);
+                }
                 stalled_unfinished = true;
                 progress_tracker.record(
                     ProgressKind::None,
                     "repeat_after_inspection",
                     None,
                 );
-                ui.nudge(
-                    "review repeated the same command after inspection; stopping incomplete",
-                );
+                ui.nudge("review repeated the same command after inspection");
                 let _ = (intent, &evidence);
-                ui.status(&incomplete_status("repeat_after_inspection"));
+                ui.status(&self.incomplete_turn_status("repeat_after_inspection"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             // Implementation / explicit-mutation turns that burned the
@@ -1276,6 +1320,17 @@ If the task is already complete, stop and give your final recap."
                     return Ok(ModelRoundControl::Continue);
                 }
 
+                if self.keep_working_after_stall(
+                    &mut progress_tracker,
+                    &mut force_tools_next,
+                    &mut stalled_unfinished,
+                    &mut stalled_repeating,
+                    Some(&mut continue_total_nudges),
+                    ui,
+                ) {
+                    prev_call_sig = None;
+                    return Ok(ModelRoundControl::Continue);
+                }
                 stalled_unfinished = true;
                 progress_tracker.record(
                     ProgressKind::None,
@@ -1285,13 +1340,21 @@ If the task is already complete, stop and give your final recap."
                 ui.nudge(
                     "implementation kept repeating without editing; no file changes were made",
                 );
-                ui.status(&incomplete_status("implementation_no_mutation"));
+                ui.status(&self.incomplete_turn_status("implementation_no_mutation"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
-            ui.status(
-                "⚠ the model kept re-running the same command without acting on the \
-                 result — the task may be incomplete. /retry, or send 'continue'.",
-            );
+            if self.keep_working_after_stall(
+                &mut progress_tracker,
+                &mut force_tools_next,
+                &mut stalled_unfinished,
+                &mut stalled_repeating,
+                Some(&mut continue_total_nudges),
+                ui,
+            ) {
+                prev_call_sig = None;
+                return Ok(ModelRoundControl::Continue);
+            }
+            ui.status(&self.incomplete_turn_status("repeat_same_command"));
             return Ok(ModelRoundControl::BreakInner(false));
         }
         // A different set of calls (or none) this round — the model moved
@@ -1341,12 +1404,21 @@ If the task is already complete, stop and give your final recap."
                 );
                 return Ok(ModelRoundControl::Continue);
             }
+            if self.keep_working_after_stall(
+                &mut progress_tracker,
+                &mut force_tools_next,
+                &mut stalled_unfinished,
+                &mut stalled_repeating,
+                Some(&mut continue_total_nudges),
+                ui,
+            ) {
+                prev_call_sig = None;
+                return Ok(ModelRoundControl::Continue);
+            }
             stalled_unfinished = true;
             progress_tracker.record(ProgressKind::None, "inspection_sprawl_exhausted", None);
-            ui.nudge(
-                    "review kept inspecting new files without producing findings; stopping incomplete",
-                );
-            ui.status(&incomplete_status("inspection_sprawl_exhausted"));
+            ui.nudge("review kept inspecting new files without producing findings");
+            ui.status(&self.incomplete_turn_status("inspection_sprawl_exhausted"));
             return Ok(ModelRoundControl::BreakInner(false));
         }
         if should_nudge_inspection_sprawl(
@@ -1474,6 +1546,16 @@ If the task is already complete, stop and give your final recap."
                     ui.status("forced final answer was weak; accepting available text");
                     return Ok(ModelRoundControl::BreakInner(false));
                 }
+                if self.keep_working_after_stall(
+                    &mut progress_tracker,
+                    &mut force_tools_next,
+                    &mut stalled_unfinished,
+                    &mut stalled_repeating,
+                    Some(&mut continue_total_nudges),
+                    ui,
+                ) {
+                    return Ok(ModelRoundControl::Continue);
+                }
                 self.messages
                     .push_assistant_text_only(std::mem::take(&mut completion.content));
                 stalled_unfinished = true;
@@ -1482,7 +1564,7 @@ If the task is already complete, stop and give your final recap."
                     "forced_final_unusable",
                     None,
                 );
-                ui.status(&incomplete_status("forced_final_unusable"));
+                ui.status(&self.incomplete_turn_status("forced_final_unusable"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             self.messages
@@ -1512,7 +1594,17 @@ If the task is already complete, stop and give your final recap."
                 ));
                 return Ok(ModelRoundControl::Continue);
             }
-            ui.status("⚠ the model returned no response after retrying — try /retry.");
+            if self.keep_working_after_stall(
+                &mut progress_tracker,
+                &mut force_tools_next,
+                &mut stalled_unfinished,
+                &mut stalled_repeating,
+                Some(&mut continue_total_nudges),
+                ui,
+            ) {
+                return Ok(ModelRoundControl::Continue);
+            }
+            ui.status("⚠ the model returned no response after retrying");
             return Ok(ModelRoundControl::BreakInner(false));
         }
         // Real output this round — clear the retry counter so the

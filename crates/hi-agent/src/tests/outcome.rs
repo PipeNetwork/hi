@@ -1130,6 +1130,8 @@ fn turn_outcome_exit_codes_match_one_shot_table() {
         verified_workspace_revision: None,
         effective_route: route.clone(),
         review_same_model: false,
+        leftover: None,
+        plan_leftover: None,
     };
     assert_eq!(
         base(

@@ -152,14 +152,8 @@ mod tests {
         let mut evidence = VerifyEvidence::pass(1, "old".into());
         let mut review = ReviewStatus::Passed;
         let mut ui = NullUi;
-        let wiped = reconcile_verified_revision(
-            &mut evidence,
-            &mut review,
-            2,
-            "new".into(),
-            &[],
-            &mut ui,
-        );
+        let wiped =
+            reconcile_verified_revision(&mut evidence, &mut review, 2, "new".into(), &[], &mut ui);
         assert!(!wiped, "empty delta must not wipe a green verify");
         assert_eq!(evidence, VerifyEvidence::pass(2, "new".into()));
         assert_eq!(review, ReviewStatus::Passed);

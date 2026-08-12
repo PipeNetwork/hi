@@ -60,6 +60,19 @@ enum SessionMeta {
         steps: Vec<hi_agent::PlanStep>,
     },
     PlanCleared,
+    /// Plan auto-drive pause and stall. Last write wins. `default` so older
+    /// session files load as running (paused=false, stall=0).
+    PlanDrive {
+        #[serde(default)]
+        paused: bool,
+        #[serde(default)]
+        stall: u32,
+    },
+    /// Goal auto-drive stall. Last write wins. Pause stays on `Goal`.
+    GoalDrive {
+        #[serde(default)]
+        stall: u32,
+    },
     /// One turn's final outcome, including why review produced no verdict
     /// when it didn't (that reason used to exist only as a transient status
     /// line, unrecoverable in post-mortems). Diagnostic; ignored on resume.
@@ -226,6 +239,14 @@ impl SessionSink for JsonlSession {
         self.append_meta(&SessionMeta::PlanCleared)
     }
 
+    fn record_plan_drive(&mut self, paused: bool, stall: u32) -> Result<()> {
+        self.append_meta(&SessionMeta::PlanDrive { paused, stall })
+    }
+
+    fn record_goal_drive(&mut self, stall: u32) -> Result<()> {
+        self.append_meta(&SessionMeta::GoalDrive { stall })
+    }
+
     fn record_state_replacement(
         &mut self,
         messages: &[Message],
@@ -255,6 +276,12 @@ pub struct LoadedSession {
     pub decisions: hi_agent::DecisionLog,
     /// Unfinished task plan restored into the live plan box.
     pub plan: Vec<hi_agent::PlanStep>,
+    /// Plan-drive pause restored from the last `PlanDrive` record.
+    pub plan_drive_paused: bool,
+    /// Consecutive no-progress plan-drive turns restored with pause.
+    pub plan_drive_stall: u32,
+    /// Consecutive no-progress goal-drive turns. Pause stays on `Goal`.
+    pub goal_drive_stall: u32,
 }
 
 /// Atomically cache reconstructed session state at `path`. A failed restore
@@ -277,6 +304,12 @@ pub fn cache_loaded_session(path: &Path, loaded: &LoadedSession) -> Result<()> {
         )?;
         session.record(&[], loaded.usage)?;
         session.record_checkpoints(&loaded.checkpoint_refs)?;
+        if loaded.plan_drive_paused || loaded.plan_drive_stall > 0 {
+            session.record_plan_drive(loaded.plan_drive_paused, loaded.plan_drive_stall)?;
+        }
+        if loaded.goal_drive_stall > 0 {
+            session.record_goal_drive(loaded.goal_drive_stall)?;
+        }
         if let Some(name) = &loaded.name {
             session.append_meta(&SessionMeta::Name { name: name.clone() })?;
         }
@@ -814,6 +847,9 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let mut loaded_decisions = hi_agent::DecisionLog::default();
     let mut loaded_plan = Vec::new();
     let mut loaded_name = None;
+    let mut loaded_plan_drive_paused = false;
+    let mut loaded_plan_drive_stall = 0;
+    let mut loaded_goal_drive_stall = 0;
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
@@ -863,6 +899,13 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                     loaded_plan = steps;
                 }
                 SessionMeta::PlanCleared => loaded_plan.clear(),
+                SessionMeta::PlanDrive { paused, stall } => {
+                    loaded_plan_drive_paused = paused;
+                    loaded_plan_drive_stall = stall;
+                }
+                SessionMeta::GoalDrive { stall } => {
+                    loaded_goal_drive_stall = stall;
+                }
                 // Diagnostic record for post-mortems; nothing to restore.
                 SessionMeta::TurnOutcome { .. } => {}
                 SessionMeta::StateReplacement {
@@ -905,6 +948,9 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         goal: loaded_goal,
         decisions: loaded_decisions,
         plan: loaded_plan,
+        plan_drive_paused: loaded_plan_drive_paused,
+        plan_drive_stall: loaded_plan_drive_stall,
+        goal_drive_stall: loaded_goal_drive_stall,
     })
 }
 
@@ -930,6 +976,9 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
     let mut loaded_decisions = hi_agent::DecisionLog::default();
     let mut loaded_plan = Vec::new();
     let mut loaded_name = None;
+    let mut loaded_plan_drive_paused = false;
+    let mut loaded_plan_drive_stall = 0;
+    let mut loaded_goal_drive_stall = 0;
 
     for record in records {
         if record.record_type == "message" {
@@ -981,6 +1030,13 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
                 }
                 SessionMeta::Plan { steps } => loaded_plan = steps,
                 SessionMeta::PlanCleared => loaded_plan.clear(),
+                SessionMeta::PlanDrive { paused, stall } => {
+                    loaded_plan_drive_paused = paused;
+                    loaded_plan_drive_stall = stall;
+                }
+                SessionMeta::GoalDrive { stall } => {
+                    loaded_goal_drive_stall = stall;
+                }
                 // Diagnostic record for post-mortems; nothing to restore.
                 SessionMeta::TurnOutcome { .. } => {}
                 SessionMeta::StateReplacement {
@@ -1012,6 +1068,9 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
         goal: loaded_goal,
         decisions: loaded_decisions,
         plan: loaded_plan,
+        plan_drive_paused: loaded_plan_drive_paused,
+        plan_drive_stall: loaded_plan_drive_stall,
+        goal_drive_stall: loaded_goal_drive_stall,
     })
 }
 ///
@@ -1168,6 +1227,9 @@ mod tests {
             goal: None,
             decisions: hi_agent::DecisionLog::default(),
             plan: Vec::new(),
+            plan_drive_paused: false,
+            plan_drive_stall: 0,
+            goal_drive_stall: 0,
         };
 
         cache_loaded_session(&path, &expected).expect("cache restored session");
@@ -1400,6 +1462,8 @@ mod tests {
                 model: "test-model".into(),
             },
             review_same_model: false,
+            leftover: None,
+            plan_leftover: None,
         };
         session
             .record_turn_outcome(&outcome, Some("provider timed out during review"))
@@ -1469,6 +1533,48 @@ mod tests {
         assert_eq!(load_history(&path).unwrap().plan, plan);
         session.clear_plan().unwrap();
         assert!(load_history(&path).unwrap().plan.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn jsonl_session_restores_plan_drive_pause_and_stall() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-plan-drive-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        session.record_plan_drive(true, 4).unwrap();
+        let loaded = load_history(&path).unwrap();
+        assert!(loaded.plan_drive_paused);
+        assert_eq!(loaded.plan_drive_stall, 4);
+        session.record_plan_drive(false, 0).unwrap();
+        let loaded = load_history(&path).unwrap();
+        assert!(!loaded.plan_drive_paused);
+        assert_eq!(loaded.plan_drive_stall, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn jsonl_session_restores_goal_drive_stall() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-goal-drive-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        session.record_goal_drive(4).unwrap();
+        let loaded = load_history(&path).unwrap();
+        assert_eq!(loaded.goal_drive_stall, 4);
+        session.record_goal_drive(0).unwrap();
+        let loaded = load_history(&path).unwrap();
+        assert_eq!(loaded.goal_drive_stall, 0);
         let _ = std::fs::remove_file(path);
     }
 

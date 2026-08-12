@@ -71,6 +71,40 @@ async fn exact_plan_document_goal_becomes_structured_and_starts_driving() {
 }
 
 #[tokio::test]
+async fn checkbox_plan_md_ingests_as_sub_goals_without_planner() {
+    let (root, mut config) = goal_test_config("ingest-checklist");
+    config.paths.workspace_root = std::fs::canonicalize(&root).unwrap();
+    std::fs::write(
+        config.paths.workspace_root.join("plan.md"),
+        "- [x] already shipped\n- [ ] wire the CLI\n- [ ] pass tests\n",
+    )
+    .unwrap();
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    let mut app = test_app("custom", "test-model");
+
+    app.handle_command(
+        &mut agent,
+        hi_agent::Command::Goal("implement plan.md".into()),
+    )
+    .await;
+
+    let goal = agent.structured_goal().expect("structured goal installed");
+    assert_eq!(goal.objective, "implement plan.md");
+    assert_eq!(goal.sub_goals.len(), 3);
+    assert_eq!(goal.sub_goals[0].status, hi_agent::GoalStatus::Done);
+    assert_eq!(goal.sub_goals[1].description, "wire the CLI");
+    assert_eq!(goal.sub_goals[1].status, hi_agent::GoalStatus::Active);
+    app.maybe_queue_goal_drive(&agent);
+    assert_eq!(
+        app.queue.pop_front().as_deref(),
+        Some(hi_agent::GOAL_CONTINUE_PROMPT)
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn goal_budget_refreshes_the_pinned_goal_state() {
     let (root, config) = goal_test_config("budget-refresh");
     let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
@@ -125,6 +159,147 @@ fn resumed_active_goal_is_queued_without_displacing_user_input() {
     assert!(agent.set_goal_paused(true));
     app.maybe_queue_goal_drive(&agent);
     assert!(app.queue.is_empty());
+
+    assert!(agent.set_goal_paused(false));
+    agent.reset_goal_drive_stall();
+    app.maybe_queue_goal_drive(&agent);
+    assert_eq!(app.queue[0], hi_agent::GOAL_CONTINUE_PROMPT);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn incomplete_plan_outcome() -> hi_agent::TurnOutcome {
+    hi_agent::TurnOutcome {
+        status: hi_agent::TurnStatus::Incomplete,
+        verification: hi_agent::VerificationStatus::Unverified,
+        review: hi_agent::ReviewStatus::NotRequired,
+        stop_reason: hi_agent::TurnStopReason::Stalled,
+        changed_files: Vec::new(),
+        verified_workspace_revision: None,
+        effective_route: hi_agent::EffectiveModelRoute {
+            provider: Some("test".into()),
+            model: "model".into(),
+        },
+        review_same_model: false,
+        leftover: Some("1/1 remaining — wire the scheduler".into()),
+        plan_leftover: Some("1/1 remaining — wire the scheduler".into()),
+    }
+}
+
+#[test]
+fn incomplete_plan_enqueues_plan_drive() {
+    let (root, config) = goal_test_config("plan-drive");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    agent.restore_plan(vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }]);
+    let mut app = test_app("custom", "test-model");
+    let outcome = incomplete_plan_outcome();
+
+    app.maybe_queue_drive(&agent, Some(&outcome));
+    assert_eq!(
+        app.queue.pop_front().as_deref(),
+        Some(hi_agent::PLAN_DRIVE_PROMPT)
+    );
+
+    app.queue.push_back("user guidance takes priority".into());
+    app.maybe_queue_drive(&agent, Some(&outcome));
+    assert_eq!(app.queue[0], "user guidance takes priority");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn goal_drive_wins_over_plan_drive() {
+    let (root, config) = goal_test_config("goal-wins-plan");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    agent
+        .set_structured_goal(Some(hi_agent::Goal::new(
+            "ship it",
+            vec!["implement it".into()],
+        )))
+        .unwrap();
+    agent.restore_plan(vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }]);
+    let mut app = test_app("custom", "test-model");
+    let outcome = incomplete_plan_outcome();
+    app.maybe_queue_goal_drive(&agent);
+    app.maybe_queue_drive(&agent, Some(&outcome));
+    assert_eq!(app.queue.len(), 1);
+    assert_eq!(app.queue[0], hi_agent::GOAL_CONTINUE_PROMPT);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn completed_leftover_still_enqueues_plan_drive() {
+    let (root, config) = goal_test_config("completed-leftover-drive");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    agent.restore_plan(vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }]);
+    let mut app = test_app("custom", "test-model");
+    let mut outcome = incomplete_plan_outcome();
+    outcome.status = hi_agent::TurnStatus::Completed;
+    outcome.stop_reason = hi_agent::TurnStopReason::Completed;
+    app.maybe_queue_drive(&agent, Some(&outcome));
+    assert_eq!(
+        app.queue.pop_front().as_deref(),
+        Some(hi_agent::PLAN_DRIVE_PROMPT)
+    );
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn plan_pause_stops_enqueue_and_resume_restarts() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let (root, config) = goal_test_config("plan-pause");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    agent.restore_plan(vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }]);
+    let mut app = test_app("custom", "test-model");
+    let outcome = incomplete_plan_outcome();
+
+    let pause =
+        hi_agent::handle_session_command(&mut agent, &hi_agent::Command::Plan("pause".into()), &[])
+            .expect("pause");
+    assert!(pause.follow_up_prompt.is_none());
+    app.refresh_goal(&agent);
+    app.maybe_queue_drive(&agent, Some(&outcome));
+    assert!(app.queue.is_empty(), "pause must stop auto-enqueue");
+    assert_eq!(
+        app.edit_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .as_deref(),
+        Some(hi_agent::PLAN_DRIVE_PROMPT)
+    );
+
+    let resume = hi_agent::handle_session_command(
+        &mut agent,
+        &hi_agent::Command::Plan("resume".into()),
+        &[],
+    )
+    .expect("resume");
+    assert_eq!(
+        resume.follow_up_prompt.as_deref(),
+        Some(hi_agent::PLAN_DRIVE_PROMPT)
+    );
+    app.refresh_goal(&agent);
+    let _ = app.enqueue_prompt_front(resume.follow_up_prompt.unwrap());
+    assert_eq!(
+        app.queue.pop_front().as_deref(),
+        Some(hi_agent::PLAN_DRIVE_PROMPT)
+    );
 
     drop(agent);
     let _ = std::fs::remove_dir_all(root);
