@@ -257,6 +257,11 @@ pub fn goal_drive_skip_message(failed: &str, next: Option<&str>) -> String {
     }
 }
 
+/// Copy when stall-skipped steps are queued for another pass.
+pub fn goal_drive_requeue_message(count: usize) -> String {
+    format!("goal drive: {count} stalled step(s) queued for a second pass")
+}
+
 /// Result of recording whether a goal-drive turn made progress.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GoalDriveProgress {
@@ -271,6 +276,8 @@ pub enum GoalDriveProgress {
         failed: String,
         next: Option<String>,
     },
+    /// Stall-skipped Failed steps were returned to Pending for a second pass.
+    Requeued { count: usize },
     /// Parked: thrashing, nothing left to skip to, or a single stuck step.
     Parked,
 }

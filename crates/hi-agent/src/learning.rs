@@ -44,6 +44,9 @@ pub struct Finding {
     /// worth deleting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint_active: Option<String>,
+    /// Compact tool-timeline shape (`write_overwrite`, `root_cargo_test`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_shape: Option<String>,
 }
 
 /// Whether a turn outcome warrants a finding record. Completed-and-verified
@@ -154,6 +157,7 @@ pub fn context_hint(state_root: &Path) -> Option<ContextHint> {
         .ok()?
         .as_secs()
         .saturating_sub(7 * 24 * 3600);
+    let mut by_shape: std::collections::BTreeMap<String, usize> = Default::default();
     let mut by_reason: std::collections::BTreeMap<String, usize> = Default::default();
     for line in raw.lines() {
         if let Ok(finding) = serde_json::from_str::<Finding>(line)
@@ -162,7 +166,21 @@ pub fn context_hint(state_root: &Path) -> Option<ContextHint> {
             *by_reason
                 .entry(format!("{:?}", finding.stop_reason))
                 .or_default() += 1;
+            if let Some(shape) = finding.failure_shape.filter(|s| !s.is_empty()) {
+                *by_shape.entry(shape).or_default() += 1;
+            }
         }
+    }
+    if let Some((shape, count)) = by_shape.into_iter().max_by_key(|(_, count)| *count)
+        && count >= 2
+    {
+        let advice = shape_advice(&shape);
+        return Some(ContextHint {
+            text: format!(
+                "Recent harness findings: {count} turn(s) in the last 7 days ended {shape} — {advice}."
+            ),
+            shape,
+        });
     }
     let (reason, count) = by_reason.into_iter().max_by_key(|(_, count)| *count)?;
     if count < 2 {
@@ -182,6 +200,79 @@ pub fn context_hint(state_root: &Path) -> Option<ContextHint> {
         ),
         shape: reason,
     })
+}
+
+fn shape_advice(shape: &str) -> &'static str {
+    match shape {
+        "write_overwrite" => {
+            "use edit/multi_edit/apply_patch instead of rewriting files with write"
+        }
+        "root_cargo_test" => {
+            "run package-local `cargo test -p <crate>` instead of workspace-root cargo test"
+        }
+        "repeat_inspect" => "act on tool evidence immediately instead of re-reading or re-polling",
+        "no_validation" => "run a targeted syntax/build/test command after edits before finishing",
+        _ => "finish with a concrete verified result",
+    }
+}
+
+/// Classify a bad turn's tool timeline into a compact failure shape.
+pub fn tool_failure_shape(timeline: &[crate::ToolCallEntry]) -> Option<String> {
+    if timeline.iter().any(|entry| {
+        entry.tool == "write"
+            && entry.effects.mutation_applied
+            && entry
+                .effects
+                .file_changes
+                .iter()
+                .any(|change| change.kind == hi_tools::FileChangeKind::Modify)
+    }) {
+        return Some("write_overwrite".into());
+    }
+    if timeline.iter().any(|entry| {
+        entry.tool == "bash" && entry.command.as_deref().is_some_and(is_root_cargo_test)
+    }) {
+        return Some("root_cargo_test".into());
+    }
+    let inspect_repeats = timeline
+        .iter()
+        .filter(|entry| {
+            entry.progress_kind == "none"
+                && (entry.progress_reason.contains("repeated")
+                    || entry.progress_reason.contains("inspection"))
+        })
+        .count();
+    if inspect_repeats >= 2 {
+        return Some("repeat_inspect".into());
+    }
+    let mutated = timeline.iter().any(|entry| entry.effects.mutation_applied);
+    let validated = timeline.iter().any(|entry| {
+        entry.tool == "bash"
+            && entry.status == hi_tools::ToolStatus::Succeeded
+            && entry.command.as_deref().is_some_and(|command| {
+                let lower = command.to_ascii_lowercase();
+                lower.contains("test")
+                    || lower.contains("check")
+                    || lower.contains("pytest")
+                    || lower.contains("cargo")
+            })
+    });
+    if mutated && !validated {
+        return Some("no_validation".into());
+    }
+    None
+}
+
+fn is_root_cargo_test(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let has_cargo_test = lower.contains("cargo test") || lower.contains("cargo t ");
+    if !has_cargo_test {
+        return false;
+    }
+    !(lower.contains(" -p ")
+        || lower.contains(" --package ")
+        || lower.contains("--manifest-path")
+        || lower.contains("-p="))
 }
 
 /// Assemble the `/synth-evals` follow-up turn: unprocessed findings past the
@@ -319,6 +410,7 @@ mod tests {
             changed_files: 3,
             model: "test-model".into(),
             hint_active: Some("Stalled".into()),
+            failure_shape: None,
         };
         append_finding(&dir, &finding);
         append_finding(&dir, &finding);
@@ -407,6 +499,64 @@ mod tests {
         assert!(prompt.contains("pending-evals/"));
         // Cursor advanced at dispatch: nothing left to synthesize.
         assert!(synth_evals_prompt(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn bash_entry(command: &str) -> crate::ToolCallEntry {
+        crate::ToolCallEntry {
+            tool: "bash".into(),
+            path: String::new(),
+            duration_ms: 1,
+            queue_delay_ms: 0,
+            completion_index: 0,
+            status: hi_tools::ToolStatus::Succeeded,
+            background: None,
+            process: None,
+            effects: hi_tools::ToolEffects::default(),
+            truncation: hi_tools::TruncationState::Complete,
+            error: false,
+            progress_kind: "meaningful".into(),
+            progress_reason: "ok".into(),
+            normalized_signature: None,
+            command: Some(command.into()),
+        }
+    }
+
+    #[test]
+    fn tool_failure_shape_detects_root_cargo_test() {
+        assert_eq!(
+            tool_failure_shape(&[bash_entry("cargo test --quiet")]).as_deref(),
+            Some("root_cargo_test")
+        );
+        assert!(tool_failure_shape(&[bash_entry("cargo test -p hi-agent --quiet")]).is_none());
+        assert!(
+            tool_failure_shape(&[bash_entry("cargo test --manifest-path crates/x/Cargo.toml")])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn context_hint_prefers_repeated_failure_shape() {
+        let dir = std::env::temp_dir().join(format!("hi-hint-shape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("learning")).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let line = |ts: u64| {
+            format!(
+                r#"{{"ts":{ts},"status":"incomplete","stop_reason":"stalled","verification":"passed","review":"not_required","changed_files":0,"model":"m","failure_shape":"root_cargo_test"}}"#
+            )
+        };
+        std::fs::write(
+            dir.join("learning/findings.jsonl"),
+            format!("{}\n{}\n", line(now - 60), line(now - 120)),
+        )
+        .unwrap();
+        let hint = context_hint(&dir).expect("shape pattern");
+        assert_eq!(hint.shape, "root_cargo_test");
+        assert!(hint.text.contains("cargo test -p"), "{}", hint.text);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

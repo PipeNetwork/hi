@@ -415,7 +415,7 @@ const AUTO_SELECT: [(&str, ProviderName, &str); 3] = [
         ProviderName::Anthropic,
         "claude-opus-4-8",
     ),
-    ("XAI_API_KEY", ProviderName::Xai, "grok-4.3"),
+    ("XAI_API_KEY", ProviderName::Xai, "grok-4.6"),
 ];
 
 /// Infer a provider + model from API keys present in the environment.

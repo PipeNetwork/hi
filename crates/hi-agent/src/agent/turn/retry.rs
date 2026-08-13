@@ -20,6 +20,10 @@ pub(super) const TRANSIENT_ROUTE_RETRY_DELAYS: [u64; 2] = [2, 5];
 pub(super) const MAX_TRANSIENT_ROUTE_RETRY_DELAY_SECS: u64 = 30;
 pub(super) const PROVIDER_OVERLOAD_RETRY_DELAYS: [u64; 2] = [2, 5];
 pub(super) const MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS: u64 = 120;
+/// Capacity / scaling 429s: retry for about two minutes before surfacing.
+pub(super) const MAX_CAPACITY_RETRIES: u32 = 6;
+pub(super) const CAPACITY_RETRY_DELAYS: [u64; 6] = [2, 4, 8, 15, 30, 45];
+pub(super) const MAX_CAPACITY_RETRY_DELAY_SECS: u64 = 60;
 pub(super) const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
 pub(super) const INCOMPLETE_STATUS: &str = "turn stopped incomplete";
 
@@ -54,17 +58,27 @@ impl crate::Agent {
         continue_nudges: Option<&mut u32>,
         ui: &mut dyn Ui,
     ) -> bool {
+        let signature = progress.last_event_signature();
+        if progress.keep_working_blocked_signature.is_some()
+            && progress.keep_working_blocked_signature == signature
+            && signature.is_some()
+        {
+            return false;
+        }
         if !progress.try_keep_working(self.config.loop_limits.max_keep_working) {
             return false;
         }
+        progress.keep_working_blocked_signature = signature.clone();
         *stalled_unfinished = false;
         *stalled_repeating = false;
         *force_tools_next = true;
         if let Some(n) = continue_nudges {
             *n = n.saturating_add(1);
         }
-        self.messages
-            .push_nudge(NudgeKind::Continue, KEEP_WORKING_NUDGE);
+        self.messages.push_nudge(
+            NudgeKind::Continue,
+            keep_working_nudge(&progress.last_stall_reason, signature.as_deref()),
+        );
         let status = match self.goals.next_step_title() {
             Some(step) => format!("still working — {step}"),
             None => "still working — trying a different next step".to_string(),
@@ -72,6 +86,23 @@ impl crate::Agent {
         ui.status(&status);
         true
     }
+}
+
+/// Keep-working nudge specialized with the stall reason and blocked signature.
+pub(super) fn keep_working_nudge(stall_reason: &str, signature: Option<&str>) -> String {
+    let reason = stall_reason.trim();
+    let mut out = if reason.is_empty() {
+        KEEP_WORKING_NUDGE.to_string()
+    } else {
+        format!("The previous approach stalled ({reason}). {KEEP_WORKING_NUDGE}")
+    };
+    if let Some(signature) = signature.filter(|s| !s.is_empty()) {
+        out.push_str(&format!(
+            " Do not repeat `{signature}`. Take a different class of action: edit a new path, \
+             run a package-local check, explore, or delegate — not the same read/poll/bash."
+        ));
+    }
+    out
 }
 
 /// Per-turn budgets for **review-answer** repair modes (Steer phase).
@@ -127,11 +158,14 @@ pub(super) struct TurnRetryState {
     request_attempt: u32,
     pub(super) request_too_large_retried: bool,
     pub(super) output_cap_retry_attempted: bool,
-    /// One shared retry budget for rate limits, capacity, route outages, and
+    /// One shared retry budget for quota rate limits, route outages, and
     /// transport failures. The routed API already exhausts its compatible
     /// provider ladder, so separate budgets multiply one logical turn into a
     /// request storm.
     pub(super) provider_route_retries: u32,
+    /// Separate budget for backend capacity / scaling 429s. Those are expected
+    /// to clear if we wait, unlike a quota limit.
+    pub(super) capacity_retries: u32,
     pub(super) protocol_retries: u32,
     /// Cumulative invalid tool turns this turn — unlike `protocol_retries`, this
     /// never resets on valid output, so an alternating valid/invalid loop still
@@ -163,6 +197,7 @@ impl TurnRetryState {
         self.request_attempt = 0;
         self.output_cap_retry_attempted = false;
         self.provider_route_retries = 0;
+        self.capacity_retries = 0;
     }
 }
 
@@ -184,6 +219,27 @@ pub(super) fn transient_route_retry_delay(retry: u32, err: &anyhow::Error) -> st
         &TRANSIENT_ROUTE_RETRY_DELAYS,
         MAX_TRANSIENT_ROUTE_RETRY_DELAY_SECS,
     )
+}
+
+pub(super) fn capacity_retry_delay(retry: u32, err: &anyhow::Error) -> std::time::Duration {
+    let delay = provider_retry_delay(
+        retry,
+        err,
+        &CAPACITY_RETRY_DELAYS,
+        MAX_CAPACITY_RETRY_DELAY_SECS,
+    );
+    // `retry_after_seconds: 0` means "retry immediately" in tests. In
+    // production a scaling backend that sends 0 still needs the table delay
+    // or we hammer it.
+    if delay.is_zero() && !cfg!(test) {
+        let default = CAPACITY_RETRY_DELAYS
+            .get(retry.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or(*CAPACITY_RETRY_DELAYS.last().unwrap_or(&30))
+            .min(MAX_CAPACITY_RETRY_DELAY_SECS);
+        return std::time::Duration::from_secs(default);
+    }
+    delay
 }
 
 pub(super) fn provider_overload_retry_delay(
@@ -226,14 +282,26 @@ pub(super) fn provider_retry_delay(
     std::time::Duration::from_secs(secs) + std::time::Duration::from_millis(jitter_ms)
 }
 
-/// Rate limits and temporary overload/capacity errors share the extended backoff budget.
+/// Quota rate limits share the short backoff budget. Capacity and temporary
+/// overload use [`MAX_CAPACITY_RETRIES`] instead.
 pub(super) fn provider_error_is_backoff_retryable(err: &anyhow::Error) -> bool {
     if hi_ai::provider_error_retryable(err) == Some(false) {
         return false;
     }
     matches!(
         hi_ai::provider_error_kind(err),
-        Some(hi_ai::ProviderErrorKind::RateLimit | hi_ai::ProviderErrorKind::CapacityUnavailable)
+        Some(hi_ai::ProviderErrorKind::RateLimit)
+    ) && !provider_error_is_capacity_retryable(err)
+}
+
+/// Backend capacity / scaling errors: wait and retry for a while.
+pub(super) fn provider_error_is_capacity_retryable(err: &anyhow::Error) -> bool {
+    if hi_ai::provider_error_retryable(err) == Some(false) {
+        return false;
+    }
+    matches!(
+        hi_ai::provider_error_kind(err),
+        Some(hi_ai::ProviderErrorKind::CapacityUnavailable)
     ) || hi_ai::provider_error_is_temporary_overload(err)
 }
 
@@ -437,5 +505,15 @@ mod review_repair_budget_tests {
                 mode.key()
             );
         }
+    }
+
+    #[test]
+    fn keep_working_nudge_names_the_stall_and_bans_the_signature() {
+        let generic = keep_working_nudge("", None);
+        assert!(generic.contains("stalled"));
+        let specialized = keep_working_nudge("repeated read", Some("read:notes.txt"));
+        assert!(specialized.contains("repeated read"));
+        assert!(specialized.contains("read:notes.txt"));
+        assert!(specialized.contains("different class of action"));
     }
 }

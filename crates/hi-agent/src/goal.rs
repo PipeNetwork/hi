@@ -168,6 +168,15 @@ pub struct SubGoal {
     /// `#[serde(default)]`.
     #[serde(default)]
     pub productive_turns: u32,
+    /// Set when this step was skipped because goal-drive stalled (four
+    /// no-progress turns). Eligible for one second pass after the first sweep
+    /// if anything else completed. `#[serde(default)]`.
+    #[serde(default)]
+    pub stall_skipped: bool,
+    /// This stall-skipped step was already returned to `Pending` for a second
+    /// pass. A second stall stays `Failed`. `#[serde(default)]`.
+    #[serde(default)]
+    pub requeued: bool,
 }
 
 /// A structured, multi-step objective that persists across turns and sessions.
@@ -277,11 +286,19 @@ pub struct Goal {
     /// `#[serde(default)]` so older saved goals load at 0.
     #[serde(default)]
     pub audit_rounds: u32,
+    /// When true, interactive Goal-drive turns run as [`crate::PermissionMode::Always`]
+    /// (auto-approve mutations) and restore the previous mode at turn end.
+    /// Opt-in via `/goal unattended on` or `/goal --unattended`. `#[serde(default)]`.
+    #[serde(default)]
+    pub unattended: bool,
 }
 
 /// Default per-sub-goal retry budget: how many times to retry a failing sub-goal
 /// (with a "reconsider, don't repeat" nudge) before marking it `Failed`.
 pub const DEFAULT_SUBGOAL_RETRIES: u32 = 2;
+
+/// Shown when `/goal unattended` is turned on.
+pub const UNATTENDED_DRIVE_WARNING: &str = "goal unattended: Goal drive turns auto-approve mutations until the goal ends, pauses, or /goal unattended off";
 
 /// Consecutive turns a sub-goal may end unjudged (verification never reached a
 /// verdict) before the drive parks for the user.
@@ -434,6 +451,8 @@ impl Goal {
                 split_depth: 0,
                 unjudged_turns: 0,
                 productive_turns: 0,
+                stall_skipped: false,
+                requeued: false,
             });
         }
         let mut g = Self {
@@ -459,6 +478,7 @@ impl Goal {
             skeptic_escalations: 0,
             last_skeptic_status: None,
             audit_rounds: 0,
+            unattended: false,
         };
         g.refresh_auto_budget();
         g.push_event("set", "goal created");
@@ -998,14 +1018,58 @@ impl Goal {
     /// next, so a blocked step doesn't halt the whole goal. The overall goal
     /// stays `Active` unless this was the last sub-goal.
     pub fn skip_active(&mut self, note: impl Into<String>) {
+        self.skip_active_inner(note, false);
+    }
+
+    /// Stall-skip: same as [`Self::skip_active`], but the step is eligible for
+    /// one second pass after the rest of the checklist lands.
+    pub fn skip_stalled_active(&mut self, note: impl Into<String>) {
+        self.skip_active_inner(note, true);
+    }
+
+    fn skip_active_inner(&mut self, note: impl Into<String>, stalled: bool) {
         if let Some(i) = self.active_index() {
             self.sub_goals[i].status = GoalStatus::Failed;
             self.sub_goals[i].notes.push(note.into());
+            if stalled {
+                self.sub_goals[i].stall_skipped = true;
+            }
             self.consecutive_skips = self.consecutive_skips.saturating_add(1);
-            // A skip is also a cursor transition. Re-derive so a stale Done,
-            // Blocked, or second Active entry cannot become the next target.
             self.rederive_status();
         }
+    }
+
+    /// After the first sweep, return stall-skipped `Failed` steps to `Pending`
+    /// once — only if something actually completed. Thrashing (zero completions)
+    /// does not get a second pass.
+    pub fn maybe_requeue_stall_skips(&mut self) -> usize {
+        if self.completed_count() == 0 {
+            return 0;
+        }
+        if self
+            .sub_goals
+            .iter()
+            .any(|step| matches!(step.status, GoalStatus::Pending | GoalStatus::Active))
+        {
+            return 0;
+        }
+        let mut count = 0;
+        for step in &mut self.sub_goals {
+            if step.status == GoalStatus::Failed && step.stall_skipped && !step.requeued {
+                step.status = GoalStatus::Pending;
+                step.requeued = true;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.consecutive_skips = 0;
+            self.rederive_status();
+            self.push_event(
+                "requeue",
+                format!("{count} stall-skipped step(s) queued for a second pass"),
+            );
+        }
+        count
     }
 
     /// Apply the model's `update_plan` statuses to the sub-goals. The model
@@ -1082,6 +1146,8 @@ impl Goal {
                     split_depth: 0,
                     unjudged_turns: 0,
                     productive_turns: 0,
+                    stall_skipped: false,
+                    requeued: false,
                 };
                 if *status == GoalStatus::Done {
                     push_note_deduped(&mut sub_goal, CLAIM_NOTE);
@@ -1151,6 +1217,8 @@ impl Goal {
                 split_depth: 0,
                 unjudged_turns: 0,
                 productive_turns: 0,
+                stall_skipped: false,
+                requeued: false,
             });
             appended += 1;
         }
@@ -1194,6 +1262,8 @@ impl Goal {
                 split_depth: parent_depth + 1,
                 unjudged_turns: 0,
                 productive_turns: 0,
+                stall_skipped: false,
+                requeued: false,
             });
         }
         if children.len() < 2 {

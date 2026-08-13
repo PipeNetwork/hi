@@ -468,6 +468,9 @@ fn classify_http_error_fallback(status: Option<StatusCode>, text: &str) -> Provi
         // request shape, so the compat ladder retries a request that can never
         // succeed and the user is told to fix their request, not their key.
         _ if is_auth_text(text) => ProviderErrorKind::Auth,
+        StatusCode::TOO_MANY_REQUESTS if is_capacity_unavailable_text(text) => {
+            ProviderErrorKind::CapacityUnavailable
+        }
         StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimit,
         _ if mentions(text, &["request not found"]) => ProviderErrorKind::MalformedStream,
         StatusCode::NOT_FOUND => ProviderErrorKind::ModelUnavailable,
@@ -515,7 +518,11 @@ fn classify_http_error_fallback(status: Option<StatusCode>, text: &str) -> Provi
 
 fn classify_message_fallback(text: &str) -> ProviderErrorKind {
     let lower = text.to_ascii_lowercase();
-    if mentions(&lower, &["rate limit", "too many requests", "429"]) {
+    // Capacity text wins over a wrapping "429 Too Many Requests" prefix so a
+    // scaling backend is not reported as a quota limit.
+    if is_capacity_unavailable_text(text) {
+        ProviderErrorKind::CapacityUnavailable
+    } else if mentions(&lower, &["rate limit", "too many requests", "429"]) {
         ProviderErrorKind::RateLimit
     } else if mentions(
         &lower,
@@ -984,7 +991,7 @@ pub(crate) fn to_openai_messages_with_capabilities(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_body, build_body_with_capabilities, classify_http_error,
+        build_body, build_body_with_capabilities, classify_http_error, classify_message_fallback,
         is_deepseek_strict_schema_text, is_deepseek_strict_schema_unsupported,
         is_quality_rejected_text, is_unsupported_frequency_penalty_text,
         is_unsupported_output_token_text, next_deepseek_reasoning_attempt, next_degraded_attempt,
@@ -1218,6 +1225,22 @@ mod tests {
         assert_eq!(
             build_body(&request, explicit[0], None)["max_completion_tokens"],
             16
+        );
+    }
+
+    #[test]
+    fn http_429_capacity_text_is_capacity_not_quota() {
+        let parsed = parse_api_error(
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            "capacity temporarily unavailable",
+        );
+        assert_eq!(parsed.kind, ProviderErrorKind::CapacityUnavailable);
+        assert_eq!(parsed.retryable, Some(true));
+        assert_eq!(
+            classify_message_fallback(
+                "API error 429 Too Many Requests: capacity temporarily unavailable"
+            ),
+            ProviderErrorKind::CapacityUnavailable
         );
     }
 

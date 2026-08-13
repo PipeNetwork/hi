@@ -267,9 +267,12 @@ pub(crate) fn print_learning_report(sessions_dir: &Path, state_root: &Path) {
         // steering it is direct evidence the hint is not enough.
         let mut recurred: BTreeMap<String, usize> = BTreeMap::new();
         for finding in &findings {
-            let shape = format!("{:?}", finding.stop_reason);
-            if finding.hint_active.as_deref() == Some(shape.as_str()) {
-                *recurred.entry(shape).or_default() += 1;
+            let stop = format!("{:?}", finding.stop_reason);
+            let matches_hint = finding.hint_active.as_ref().is_some_and(|hint| {
+                hint == &stop || finding.failure_shape.as_deref() == Some(hint.as_str())
+            });
+            if matches_hint {
+                *recurred.entry(stop).or_default() += 1;
             }
         }
         if !recurred.is_empty() {

@@ -542,15 +542,7 @@ impl ProviderName {
 
     /// A sensible default model for presets that have an obvious one.
     pub(crate) fn default_model(self) -> Option<&'static str> {
-        match self {
-            ProviderName::Pipenetwork => Some("ipop/coder-balanced"),
-            ProviderName::Anthropic => Some("claude-opus-4-8"),
-            // grok-4.3 speaks Chat Completions, the wire format this client uses.
-            // grok-4.5 is newer but pi routes it through the Responses API, so it
-            // isn't a safe default here until we've confirmed it on /chat/completions.
-            ProviderName::Xai => Some("grok-4.3"),
-            _ => None,
-        }
+        hi_provider_config::ProviderName::from(self).default_model()
     }
 
     /// The lowercase name used in config files / `--provider`.

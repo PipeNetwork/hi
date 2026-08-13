@@ -65,10 +65,11 @@ rounds accepted, or that you did not raise when you first saw this work, is not 
 object now. Reply ESCALATE on the first line — instead of OBJECT — when retrying cannot fix the \
 problem: the sub-goal contradicts the objective or the work already done, or completing/verifying \
 it needs information or a decision only the user can provide. Escalation is rare; a fixable \
-defect is an OBJECT. Do NOT object over style, \
-naming, missing tests (unless the sub-goal demands them), speculative edge cases, or anything you \
-merely cannot verify from the diff. When uncertain, APPROVE — a wrong objection wastes a real \
-retry. After OBJECT or ESCALATE, put one concrete reason per line. The very first \
+defect is an OBJECT. Do NOT object over style or naming. Missing tests ARE grounds \
+to OBJECT when the sub-goal or task contract demands them; otherwise do not object over \
+missing tests, speculative edge cases, or anything you merely cannot verify from the diff. \
+When uncertain, APPROVE — a wrong objection wastes a real retry. After OBJECT or ESCALATE, \
+put one concrete reason per line. The very first \
 non-empty line of your reply must be the single word APPROVE, OBJECT, or ESCALATE — no preamble.";
 
 const INDEPENDENT_REVIEW_PROMPT: &str = "You are the independent completion reviewer for a coding \
@@ -117,6 +118,15 @@ pub enum SkepticVerdict {
     Unavailable(String),
 }
 
+fn verify_ran_test_stage(executions: &[crate::VerificationExecution]) -> bool {
+    executions.iter().any(|execution| {
+        execution.status == hi_tools::ToolStatus::Succeeded
+            && (execution.name.contains("test")
+                || execution.command.contains("test")
+                || execution.command.contains("pytest"))
+    })
+}
+
 impl crate::Agent {
     pub(crate) async fn independent_review(&mut self, context: &str) -> SkepticVerdict {
         let model = self.effective_skeptic_model().to_string();
@@ -146,6 +156,9 @@ impl crate::Agent {
         sub_goal: &str,
         prior_notes: &[String],
     ) -> SkepticVerdict {
+        if let Some(reason) = self.missing_required_tests_objection(sub_goal) {
+            return SkepticVerdict::Object(vec![reason]);
+        }
         let context = self.skeptic_context(objective, sub_goal, prior_notes).await;
         self.skeptic_review(&context).await
     }
@@ -225,6 +238,12 @@ impl crate::Agent {
             diff = diff.chars().take(SKEPTIC_DIFF_BUDGET).collect();
             diff.push_str("\n… (diff truncated)");
         }
+        let acceptance = self
+            .task
+            .last_task_contract
+            .as_ref()
+            .and_then(|c| c.acceptance_section())
+            .unwrap_or_else(|| "(none named)".into());
         format!(
             "Objective: {objective}\n\n\
              Active sub-goal (the one about to be marked done): {sub_goal}\n\n\
@@ -233,7 +252,37 @@ impl crate::Agent {
              {verify}\n\
              Files changed this turn: {files}\n\
              Stub markers present in files changed this turn: {stubs}\n\n\
+             Acceptance criteria:\n{acceptance}\n\n\
              Diff of this turn's changes:\n{diff}"
+        )
+    }
+
+    /// Deterministic OBJECT when the contract/sub-goal is test-gated but this
+    /// turn added no test files and ran no test verification stage.
+    fn missing_required_tests_objection(&self, sub_goal: &str) -> Option<String> {
+        let wants = self
+            .task
+            .last_task_contract
+            .as_ref()
+            .is_some_and(|c| c.wants_tests)
+            || crate::task_contract::prompt_wants_tests(sub_goal);
+        if !wants {
+            return None;
+        }
+        if self
+            .workspace
+            .last_changed_files
+            .iter()
+            .any(|path| crate::task_contract::path_looks_like_test(path))
+        {
+            return None;
+        }
+        if verify_ran_test_stage(self.last_verification_executions()) {
+            return None;
+        }
+        Some(
+            "the task/sub-goal is test-gated but this turn added no tests and ran no test stage"
+                .into(),
         )
     }
 

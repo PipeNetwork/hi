@@ -1254,6 +1254,31 @@ command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"
     }
 
     #[test]
+    fn hygiene_narrow_edit_rejects_sprawling_candidate_paths() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/tasks/hygiene-narrow-edit");
+        let text = std::fs::read_to_string(root.join("task.toml")).unwrap();
+        let task: Task = toml::from_str(&text).unwrap();
+        task.validate().unwrap();
+        validate_task(&root, &task).expect("hygiene task is well-formed");
+        let forbidden = forbidden_changes(
+            &[
+                "solution.py".into(),
+                "extra.py".into(),
+                "pyproject.toml".into(),
+            ],
+            &task.allowed_changes,
+        )
+        .unwrap();
+        assert!(forbidden.contains(&"extra.py".to_string()), "{forbidden:?}");
+        assert!(
+            forbidden.contains(&"pyproject.toml".to_string()),
+            "{forbidden:?}"
+        );
+        assert!(!forbidden.iter().any(|path| path == "solution.py"));
+    }
+
+    #[test]
     #[cfg(unix)]
     fn copy_preserves_modes_and_recreates_only_contained_symlinks() {
         use std::os::unix::fs::PermissionsExt;

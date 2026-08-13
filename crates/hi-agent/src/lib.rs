@@ -14,6 +14,7 @@ mod domain;
 pub mod events;
 mod goal;
 mod heuristics;
+mod hygiene;
 pub mod learning;
 pub mod local_skeptic;
 mod memory;
@@ -103,8 +104,8 @@ pub use outcome::{
 pub use plan_drive::{
     DriveAction, DriveIdleReason, DriveKind, GoalDriveProgress, ONE_SHOT_DRIVE_TURN_LIMIT,
     PlanDriveAction, PlanDriveIdleReason, drive_chrome_line, goal_drive_park_message,
-    goal_drive_skip_message, goal_drive_status, next_plan_drive_stall, plan_drive_made_progress,
-    plan_drive_park_message, plan_drive_status,
+    goal_drive_requeue_message, goal_drive_skip_message, goal_drive_status, next_plan_drive_stall,
+    plan_drive_made_progress, plan_drive_park_message, plan_drive_status,
 };
 pub use session::SessionSink;
 pub use session_ops::{
@@ -182,12 +183,13 @@ pub use events::{
 pub use goal::{
     CLAIM_NOTE, DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT,
     GOAL_EVENT_LIMIT, Goal, GoalEvent, GoalPauseReason, GoalStatus, MAX_CAP_CONTINUATIONS,
-    REGRESSION_NOTE, SkepticStatus, SubGoal, auto_budget_for,
+    REGRESSION_NOTE, SkepticStatus, SubGoal, UNATTENDED_DRIVE_WARNING, auto_budget_for,
 };
 pub use heuristics::leftover_plan_summary;
 pub use plan_ingest::{
-    IngestedPlan, MAX_PLAN_OBJECTIVES, PlanItem, ingest_plan_document, is_solid_checklist,
-    one_shot_workflow_plan_path, parse_objectives, parse_plan_items, plan_has_checked_objectives,
+    IngestedPlan, MAX_PLAN_OBJECTIVES, PlanItem, actionability_issues, goal_workflow_plan_path,
+    ingest_plan_document, is_solid_checklist, objective_is_actionable, one_shot_workflow_plan_path,
+    parse_objectives, parse_plan_items, plan_has_checked_objectives,
 };
 
 /// Crate version (from Cargo.toml).
@@ -575,6 +577,9 @@ pub struct ToolCallEntry {
     pub progress_reason: String,
     /// Normalized safe signature when one is available.
     pub normalized_signature: Option<String>,
+    /// Truncated bash command when `tool == "bash"`. Empty/absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// Auto-compact once the context window is at least this percent full.
@@ -710,7 +715,8 @@ user, in past tense, covering only what you actually did:\n\
 - One headline line stating what you accomplished.\n\
 - A short bullet list of the key changes, grouped by file.\n\
 - The exact command(s) to run or test it.\n\
-If something is incomplete or a check couldn't run, say so honestly. Output only the summary — \
+If something is incomplete or a check couldn't run, say so honestly. If the turn had named \
+acceptance criteria, confirm each was met or say which was not. Output only the summary — \
 no preamble, and don't take any further action.";
 
 /// Instruction appended to a slice of history to summarize it for compaction.
@@ -930,6 +936,9 @@ pub struct Agent {
     pub(crate) interactive_session: bool,
     /// Permission mode to restore after an interactive synthetic drive turn.
     pub(crate) drive_restore_permission: Option<crate::PermissionMode>,
+    /// Set when stall-skipped steps were returned to Pending for a second pass.
+    /// Frontends take this to print a line instead of a park message.
+    pub(crate) goal_requeue_notice: Option<usize>,
     /// `ask_user` calls in the current turn. Reset at turn start; a second
     /// call fails closed so the model cannot stack overlays.
     pub(crate) ask_user_calls: u32,

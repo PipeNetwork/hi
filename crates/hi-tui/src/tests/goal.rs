@@ -304,3 +304,50 @@ fn plan_pause_stops_enqueue_and_resume_restarts() {
     drop(agent);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[tokio::test]
+async fn goal_unattended_toggles_on_the_active_goal() {
+    let (root, config) = goal_test_config("unattended");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    agent
+        .set_structured_goal(Some(hi_agent::Goal::new(
+            "ship it",
+            vec!["implement it".into()],
+        )))
+        .unwrap();
+    let mut app = test_app("custom", "test-model");
+
+    app.handle_command(&mut agent, hi_agent::Command::Goal("unattended on".into()))
+        .await;
+    assert!(agent.structured_goal().is_some_and(|g| g.unattended));
+
+    app.handle_command(&mut agent, hi_agent::Command::Goal("unattended off".into()))
+        .await;
+    assert!(agent.structured_goal().is_some_and(|g| !g.unattended));
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn goal_workflow_without_checklist_errors_and_does_not_install() {
+    let (root, config) = goal_test_config("workflow-missing");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    let mut app = test_app("custom", "test-model");
+
+    app.handle_command(
+        &mut agent,
+        hi_agent::Command::Goal("--workflow missing.md".into()),
+    )
+    .await;
+
+    assert!(agent.structured_goal().is_none());
+    let transcript = app.transcript_text();
+    assert!(
+        transcript.contains("--workflow needs a checklist"),
+        "{transcript}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
+}

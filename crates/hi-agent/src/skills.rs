@@ -2,8 +2,9 @@
 //!
 //! Learned skills are ordinary Markdown files in project/global directories:
 //! `.hi/skills/<slug>/SKILL.md` and `~/.config/hi/skills/<slug>/SKILL.md`.
-//! Startup loads only a compact index. Full bodies are read only when the user
-//! explicitly invokes `/skill <name>`.
+//! Startup loads only a compact index into the stable system prompt. A matching
+//! stack pack (Rust / pytest / TS) is injected into the per-turn volatile
+//! context from repo markers. Other full bodies still load via `/skill <name>`.
 //!
 //! **Built-in stack packs** (Rust workspace, pytest package, TS monorepo) ship
 //! embedded in the binary and appear as `scope: builtin` when not shadowed by a
@@ -17,6 +18,8 @@ use anyhow::{Result, anyhow};
 
 const PROJECT_SKILLS_DIR: &str = ".hi/skills";
 const MAX_SKILL_BYTES: usize = 64 * 1024;
+/// Cap for the auto-injected stack-skill body in the volatile context block.
+const MAX_ACTIVE_STACK_SKILL_CHARS: usize = 4_000;
 
 /// Embedded stack skill packs (Phase N). Order is display order in the index.
 const BUILTIN_SKILL_SOURCES: &[(&str, &str)] = &[
@@ -255,6 +258,56 @@ fn sanitize_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Slug of the builtin/project stack pack that matches `root`'s markers, if any.
+/// Priority matches [`crate::detect_verify_pipeline`]: Cargo.toml, then
+/// package.json, then Python package markers. At most one pack.
+pub fn matching_stack_skill_slug(root: &Path) -> Option<&'static str> {
+    let has = |name: &str| root.join(name).exists();
+    if has("Cargo.toml") {
+        Some("rust-workspace")
+    } else if has("package.json") {
+        Some("ts-monorepo")
+    } else if has("pyproject.toml") || has("setup.py") || has("pytest.ini") || has("tox.ini") {
+        Some("pytest-package")
+    } else {
+        None
+    }
+}
+
+/// Full body of the matching stack skill (project/global shadow builtins).
+pub fn matching_stack_skill(root: &Path) -> Option<SkillContent> {
+    matching_stack_skill_in(root, &skill_roots())
+}
+
+pub fn matching_stack_skill_in(root: &Path, roots: &SkillRoots) -> Option<SkillContent> {
+    let slug = matching_stack_skill_slug(root)?;
+    read_skill_in(roots, slug).ok()
+}
+
+/// Volatile-context section for the matching stack pack. Clipped so it cannot
+/// dominate the turn prompt. `None` when the workspace has no matching markers.
+pub fn active_stack_skill_section(root: &Path) -> Option<String> {
+    active_stack_skill_section_in(root, &skill_roots())
+}
+
+pub fn active_stack_skill_section_in(root: &Path, roots: &SkillRoots) -> Option<String> {
+    let content = matching_stack_skill_in(root, roots)?;
+    let body = clip_chars(&content.content, MAX_ACTIVE_STACK_SKILL_CHARS);
+    Some(format!(
+        "# Active stack skill (`{}`)\nThis pack matches the current workspace. Follow it for this \
+         turn; do not wait for `/skill`.\n\n{body}",
+        content.skill.name
+    ))
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{clipped}…")
+}
+
 /// Render only compact metadata for startup context. Full skill bodies are not
 /// included here.
 pub fn learned_skills_context() -> Option<String> {
@@ -267,9 +320,9 @@ pub fn learned_skills_context_from(skills: &[LearnedSkill]) -> Option<String> {
     }
     let mut out = String::from("# Learned Skills\n");
     out.push_str(
-        "Available learned skills are indexed below. Do not assume their full procedure; \
-         use `/skill <name>` when the user asks to apply one. Built-in stack packs \
-         (`rust-workspace`, `pytest-package`, `ts-monorepo`) cover package-local \
+        "A matching stack pack may already be in this turn's context. For other skills, \
+         do not assume their full procedure — use `/skill <name>` to load one. Built-in \
+         packs (`rust-workspace`, `pytest-package`, `ts-monorepo`) cover package-local \
          check/test loops — prefer them over ad-hoc full-repo suites.\n",
     );
     for skill in skills {
@@ -648,5 +701,62 @@ mod tests {
         let huge = "x".repeat(MAX_SKILL_BYTES + 1);
         assert!(super::write_skill(&roots, "project", "big", "big", &huge).is_err());
         assert!(disk_skills(&roots).is_empty());
+    }
+
+    #[test]
+    fn matching_stack_skill_prefers_cargo_then_js_then_python() {
+        let roots = SkillRoots {
+            project: unique_dir("match-project-empty"),
+            global: unique_dir("match-global-empty"),
+        };
+        let cargo = unique_dir("match-cargo");
+        fs::write(cargo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert_eq!(matching_stack_skill_slug(&cargo), Some("rust-workspace"));
+        let skill = matching_stack_skill_in(&cargo, &roots).unwrap();
+        assert_eq!(skill.skill.name, "rust-workspace");
+        assert!(skill.content.contains("manifest-path"));
+
+        let js = unique_dir("match-js");
+        fs::write(js.join("package.json"), "{}\n").unwrap();
+        assert_eq!(matching_stack_skill_slug(&js), Some("ts-monorepo"));
+
+        let py = unique_dir("match-py");
+        fs::write(py.join("pyproject.toml"), "[project]\nname = \"x\"\n").unwrap();
+        assert_eq!(matching_stack_skill_slug(&py), Some("pytest-package"));
+
+        let empty = unique_dir("match-empty");
+        assert!(matching_stack_skill_slug(&empty).is_none());
+        assert!(active_stack_skill_section_in(&empty, &roots).is_none());
+
+        let mixed = unique_dir("match-mixed");
+        fs::write(mixed.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        fs::write(mixed.join("package.json"), "{}\n").unwrap();
+        assert_eq!(matching_stack_skill_slug(&mixed), Some("rust-workspace"));
+
+        let section = active_stack_skill_section_in(&cargo, &roots).unwrap();
+        assert!(section.contains("# Active stack skill (`rust-workspace`)"));
+        assert!(section.contains("Follow it for this turn"));
+    }
+
+    #[test]
+    fn project_skill_shadows_auto_injected_stack_pack() {
+        let project = unique_dir("match-shadow-project");
+        write_skill(
+            &project,
+            "rust-workspace",
+            "rust-workspace",
+            "Project override.",
+            "project",
+            "CUSTOM STACK BODY",
+        );
+        let roots = SkillRoots {
+            project,
+            global: unique_dir("match-shadow-global"),
+        };
+        let cargo = unique_dir("match-shadow-ws");
+        fs::write(cargo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let content = matching_stack_skill_in(&cargo, &roots).unwrap();
+        assert!(content.content.contains("CUSTOM STACK BODY"));
+        assert!(!content.content.contains("manifest-path"));
     }
 }

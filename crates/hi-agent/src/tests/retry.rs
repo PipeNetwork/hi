@@ -670,6 +670,59 @@ async fn keep_working_recovers_after_empty_retry_budget() {
 }
 
 #[tokio::test]
+async fn keep_working_refuses_a_repeated_identical_read() {
+    let workspace = IsolatedWorkspace::new("keep-working-same-sig");
+    std::fs::write(workspace.path("notes.txt"), "hello\n").unwrap();
+    let mut cfg = workspace.config();
+    cfg.loop_limits.max_empty_retries = 1;
+    cfg.loop_limits.max_keep_working = 2;
+    let read = Content::ToolCall {
+        id: "r".into(),
+        name: "read".into(),
+        arguments: serde_json::json!({ "path": "notes.txt", "limit": 20 }).to_string(),
+    };
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(vec![read.clone()], 5, 1)),
+            ProviderStep::Error(ProviderErrorKind::EmptyCompletion),
+            ProviderStep::Error(ProviderErrorKind::EmptyCompletion),
+            ProviderStep::Completion(completion(vec![read], 5, 1)),
+            ProviderStep::Error(ProviderErrorKind::EmptyCompletion),
+            ProviderStep::Error(ProviderErrorKind::EmptyCompletion),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+    let outcome = agent.run_turn("inspect notes", &mut ui).await.unwrap();
+    let still_working = ui
+        .statuses
+        .iter()
+        .filter(|s| s.contains("still working"))
+        .count();
+    assert_eq!(
+        still_working, 1,
+        "same-signature read after keep-working is not another recovery: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("different class of action") || s.contains("still working")),
+        "first recovery should fire: {:?}",
+        ui.statuses
+    );
+    assert_ne!(
+        outcome.status,
+        TurnStatus::Completed,
+        "repeating the stalled read must not look like progress"
+    );
+    assert!(
+        requests.lock().unwrap().len() >= 4,
+        "read, empty stall, keep-working, repeated read"
+    );
+}
+
+#[tokio::test]
 async fn empty_completion_after_tool_results_gets_continuation_nudge() {
     let read_cargo = Content::ToolCall {
         id: "r".into(),
@@ -804,7 +857,7 @@ async fn retryable_route_rejection_retries_and_recovers() {
 }
 
 #[tokio::test]
-async fn temporary_provider_overload_gets_one_bounded_retry() {
+async fn temporary_provider_overload_retries_on_the_capacity_budget() {
     let overload = || {
         ProviderStep::ErrorMessage(
             ProviderErrorKind::RateLimit,
@@ -869,22 +922,59 @@ async fn ordinary_rate_limit_exhausts_backoff_budget() {
 }
 
 #[tokio::test]
-async fn capacity_and_outage_share_one_retry_budget() {
+async fn capacity_unavailable_retries_until_the_backend_recovers() {
+    let capacity = || {
+        ProviderStep::ErrorMessage(
+            ProviderErrorKind::CapacityUnavailable,
+            r#"API error 429 Too Many Requests: {"error":"capacity temporarily unavailable","code":"capacity_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
+        )
+    };
     let (mut agent, requests) = scripted_agent(
         vec![
-            ProviderStep::ErrorMessage(
-                ProviderErrorKind::CapacityUnavailable,
-                r#"{"error":"capacity temporarily unavailable","code":"capacity_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
-            ),
-            ProviderStep::ErrorMessage(
-                ProviderErrorKind::Outage,
-                r#"{"error":"external model service unavailable","code":"service_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
-            ),
-            ProviderStep::Completion(completion(
-                vec![Content::Text("must not run".into())],
-                5,
-                3,
-            )),
+            capacity(),
+            capacity(),
+            capacity(),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        config(),
+    );
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    assert_eq!(requests.lock().unwrap().len(), 4);
+    assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("capacity limited") && status.contains("1/6")),
+        "should retry capacity before failing: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses.iter().any(|s| s.contains("/retry")),
+        "must not ask the user to retry while capacity retries remain: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn capacity_unavailable_exhausts_then_surfaces_error() {
+    let capacity = || {
+        ProviderStep::ErrorMessage(
+            ProviderErrorKind::CapacityUnavailable,
+            r#"API error 429 Too Many Requests: {"error":"capacity temporarily unavailable","code":"capacity_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
+        )
+    };
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            capacity(),
+            capacity(),
+            capacity(),
+            capacity(),
+            capacity(),
+            capacity(),
+            capacity(),
         ],
         config(),
     );
@@ -893,9 +983,33 @@ async fn capacity_and_outage_share_one_retry_budget() {
 
     assert_eq!(
         hi_ai::provider_error_kind(&err),
-        Some(ProviderErrorKind::Outage)
+        Some(ProviderErrorKind::CapacityUnavailable)
     );
-    assert_eq!(requests.lock().unwrap().len(), 2);
+    // Initial attempt plus MAX_CAPACITY_RETRIES (6) client-owned replays.
+    assert_eq!(requests.lock().unwrap().len(), 7);
+}
+
+#[tokio::test]
+async fn capacity_retries_do_not_consume_route_retry_budget() {
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::ErrorMessage(
+                ProviderErrorKind::CapacityUnavailable,
+                r#"API error 429 Too Many Requests: {"error":"capacity temporarily unavailable","code":"capacity_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
+            ),
+            ProviderStep::ErrorMessage(
+                ProviderErrorKind::Outage,
+                r#"{"error":"external model service unavailable","code":"service_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
+            ),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        config(),
+    );
+
+    agent.run_turn("go", &mut NullUi).await.unwrap();
+
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(agent.messages().last().unwrap().text(), "recovered");
 }
 
 #[tokio::test]

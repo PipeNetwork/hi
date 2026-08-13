@@ -4091,6 +4091,61 @@ async fn system_message_stays_byte_stable_and_context_block_is_singular() {
     );
 }
 
+#[test]
+fn matching_stack_skill_lands_in_volatile_context_not_system_prompt() {
+    let workspace = IsolatedWorkspace::new("stack-skill-volatile");
+    std::fs::write(workspace.path("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let agent = agent(vec![], workspace.config());
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(
+        block.contains("# Active stack skill"),
+        "matching rust-workspace pack should be in volatile context: {block}"
+    );
+    assert!(
+        block.contains("rust-workspace"),
+        "pack slug should be named: {block}"
+    );
+    let system = agent.messages()[0].text();
+    assert!(
+        !system.contains("# Active stack skill"),
+        "skill bodies must not land in the stable system prompt"
+    );
+}
+
+#[tokio::test]
+async fn acceptance_criteria_land_in_volatile_context_after_turn() {
+    let workspace = IsolatedWorkspace::new("acceptance-volatile");
+    let path = workspace.path("parser.rs");
+    let p = path.to_string_lossy().to_string();
+    let mut agent = agent(
+        vec![
+            write_content_completion(&p, "fn parse() -> i32 { 42 }\n"),
+            completion(vec![Content::Text("done".into())], 1, 1),
+        ],
+        workspace.config(),
+    );
+    agent
+        .run_turn(
+            "fix the parser; it must return 42 when the list is empty",
+            &mut NullUi,
+        )
+        .await
+        .unwrap();
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(
+        block.contains("# Acceptance criteria"),
+        "named must/should bullets should be in volatile context: {block}"
+    );
+    assert!(
+        block.contains("must return 42"),
+        "acceptance bullet text missing: {block}"
+    );
+    assert!(
+        !agent.messages()[0].text().contains("# Acceptance criteria"),
+        "acceptance text must not land in the stable system prompt"
+    );
+}
+
 // --- Mid-turn interjection steering --------------------------------------
 
 #[test]

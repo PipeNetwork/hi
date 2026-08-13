@@ -1000,7 +1000,7 @@ pub(crate) fn handle_delegate_command(agent: &mut hi_agent::Agent, arg: &str) {
 fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
     use hi_agent::command::{
         parse_goal_budget, parse_goal_edit, parse_goal_limit, parse_goal_objective_flags,
-        parse_goal_team,
+        parse_goal_team, parse_goal_unattended,
     };
 
     if let Some(limit) = parse_goal_limit(arg) {
@@ -1013,6 +1013,10 @@ fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
     }
     if let Some(team) = parse_goal_team(arg) {
         handle_goal_team(agent, team);
+        return;
+    }
+    if let Some(unattended) = parse_goal_unattended(arg) {
+        handle_goal_unattended(agent, unattended);
         return;
     }
     if let Some(edit) = parse_goal_edit(arg) {
@@ -1082,16 +1086,23 @@ fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
             }
         }
         goal => {
-            let (review, parsed_text) = parse_goal_objective_flags(goal);
-            if review && parsed_text.is_empty() {
+            let flags = parse_goal_objective_flags(goal);
+            if flags.workflow {
+                handle_goal_workflow(agent, &flags.text);
+                return;
+            }
+            if flags.review && flags.text.is_empty() {
                 eprintln!("\x1b[33musage: /goal --review <objective>\x1b[0m");
                 return;
             }
-            let text = parsed_text;
-            let text = if text.is_empty() {
+            if flags.unattended && flags.text.is_empty() {
+                eprintln!("\x1b[33musage: /goal --unattended <objective>\x1b[0m");
+                return;
+            }
+            let text = if flags.text.is_empty() {
                 goal.to_string()
             } else {
-                text
+                flags.text
             };
             if agent.long_horizon() {
                 let structured = agent
@@ -1099,29 +1110,7 @@ fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
                     .unwrap_or_else(|| hi_agent::Goal::new(text.clone(), vec![text.clone()]));
                 match agent.set_structured_goal(Some(structured)) {
                     Ok(true) => {
-                        let review_persisted = review
-                            && match agent
-                                .try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review)
-                            {
-                                Ok(true) => true,
-                                Ok(false) => false,
-                                Err(err) => {
-                                    eprintln!("\x1b[33mgoal review mode failed: {err:#}\x1b[0m");
-                                    false
-                                }
-                            };
-                        if review_persisted {
-                            println!(
-                                "\x1b[32m✓ long-horizon goal set (review) — /goal accept to drive:\x1b[0m"
-                            );
-                        } else {
-                            println!(
-                                "\x1b[32m✓ long-horizon goal set — drives sub-goals across turns:\x1b[0m"
-                            );
-                        }
-                        if let Some(g) = agent.structured_goal() {
-                            print!("{}", g.status_report());
-                        }
+                        echo_planned_goal(agent, flags.review, flags.unattended);
                     }
                     Ok(false) => match agent.set_transient_goal(Some(text.clone())) {
                         Ok(()) => println!(
@@ -1191,16 +1180,20 @@ fn handle_goal_edit(agent: &mut hi_agent::Agent, edit: hi_agent::command::GoalEd
 /// structured goal, and echo the checklist. Falls back to a single sub-goal on
 /// failure so `/goal` always sets *something*.
 pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: &str) {
-    let (review, text) = hi_agent::command::parse_goal_objective_flags(objective);
-    let objective = if text.is_empty() {
+    let flags = hi_agent::command::parse_goal_objective_flags(objective);
+    if flags.workflow {
+        handle_goal_workflow(agent, &flags.text);
+        return;
+    }
+    let objective = if flags.text.is_empty() {
         objective
     } else {
-        text.as_str()
+        flags.text.as_str()
     };
     let sub_goals = if let Some(goal) = agent.try_ingest_goal(objective) {
         match agent.set_structured_goal(Some(goal)) {
             Ok(true) => {
-                echo_planned_goal(agent, review);
+                echo_planned_goal(agent, flags.review, flags.unattended);
                 return;
             }
             Ok(false) => {
@@ -1226,13 +1219,31 @@ pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: 
         }
     };
     match agent.set_structured_goal(Some(hi_agent::Goal::new(objective.to_string(), sub_goals))) {
-        Ok(true) => echo_planned_goal(agent, review),
+        Ok(true) => echo_planned_goal(agent, flags.review, flags.unattended),
         Ok(false) => echo_transient_goal(agent, objective),
         Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
     }
 }
 
-fn echo_planned_goal(agent: &mut hi_agent::Agent, review: bool) {
+fn handle_goal_workflow(agent: &hi_agent::Agent, objective: &str) {
+    match hi_agent::goal_workflow_plan_path(false, agent.workspace_root(), objective) {
+        Ok(path) => match std::env::current_exe() {
+            Ok(exe) => match crate::workflow_cmd::spawn_detached_workflow_run(&exe, &path) {
+                Ok((pid, log)) => {
+                    println!(
+                        "\x1b[32m▶ workflow {path} started (pid {pid})\x1b[0m\n\x1b[2m  log: {} — it checkpoints every wave and survives this session\x1b[0m",
+                        log.display()
+                    );
+                }
+                Err(err) => eprintln!("\x1b[33mworkflow start failed: {err:#}\x1b[0m"),
+            },
+            Err(err) => eprintln!("\x1b[33mcannot resolve hi executable: {err:#}\x1b[0m"),
+        },
+        Err(err) => eprintln!("\x1b[33m{err}\x1b[0m"),
+    }
+}
+
+fn echo_planned_goal(agent: &mut hi_agent::Agent, review: bool, unattended: bool) {
     let review_persisted = review
         && match agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review) {
             Ok(true) => true,
@@ -1242,6 +1253,13 @@ fn echo_planned_goal(agent: &mut hi_agent::Agent, review: bool) {
                 false
             }
         };
+    if unattended {
+        match agent.try_set_goal_unattended(true) {
+            Ok(true) => println!("\x1b[33m{}\x1b[0m", hi_agent::UNATTENDED_DRIVE_WARNING),
+            Ok(false) => {}
+            Err(err) => eprintln!("\x1b[33mgoal unattended failed: {err:#}\x1b[0m"),
+        }
+    }
     if review_persisted {
         println!(
             "\x1b[32m✓ long-horizon goal planned (review) — inspect, then /goal accept:\x1b[0m"
@@ -1250,6 +1268,9 @@ fn echo_planned_goal(agent: &mut hi_agent::Agent, review: bool) {
         println!("\x1b[32m✓ long-horizon goal set — driving sub-goals:\x1b[0m");
     }
     if let Some(g) = agent.structured_goal() {
+        for warning in g.actionability_warnings() {
+            println!("\x1b[33m  {warning} (driving in-session anyway)\x1b[0m");
+        }
         print!("{}", g.status_report());
         if let Ok(path) = g.export_markdown_to(agent.workspace_root()) {
             println!("\x1b[2m  snapshot: {}\x1b[0m", path.display());
@@ -1420,6 +1441,39 @@ fn handle_goal_team(agent: &mut hi_agent::Agent, team: hi_agent::command::GoalTe
         },
         GoalTeamArg::Invalid(value) => {
             eprintln!("\x1b[33mgoal team: '{value}' — use /goal team on|off\x1b[0m");
+        }
+    }
+}
+
+fn handle_goal_unattended(agent: &mut hi_agent::Agent, arg: hi_agent::command::GoalUnattendedArg) {
+    use hi_agent::command::GoalUnattendedArg;
+    match arg {
+        GoalUnattendedArg::Show => match agent.structured_goal() {
+            Some(g) if g.unattended => {
+                println!("\x1b[2mgoal unattended: on — Goal drive turns run as Always\x1b[0m")
+            }
+            Some(_) => {
+                println!("\x1b[2mgoal unattended: off — enable with /goal unattended on\x1b[0m")
+            }
+            None => println!("\x1b[2mno active goal — set one with /goal <text> first\x1b[0m"),
+        },
+        GoalUnattendedArg::On => match agent.try_set_goal_unattended(true) {
+            Ok(true) => {
+                println!("\x1b[32m✓ goal unattended on\x1b[0m");
+                println!("\x1b[33m{}\x1b[0m", hi_agent::UNATTENDED_DRIVE_WARNING);
+            }
+            Ok(false) => println!("\x1b[2mno active goal — set one with /goal <text> first\x1b[0m"),
+            Err(err) => eprintln!("\x1b[33mgoal unattended failed: {err:#}\x1b[0m"),
+        },
+        GoalUnattendedArg::Off => match agent.try_set_goal_unattended(false) {
+            Ok(true) => println!(
+                "\x1b[32m✓ goal unattended off — Goal drive uses the session permission mode\x1b[0m"
+            ),
+            Ok(false) => println!("\x1b[2mno active goal\x1b[0m"),
+            Err(err) => eprintln!("\x1b[33mgoal unattended failed: {err:#}\x1b[0m"),
+        },
+        GoalUnattendedArg::Invalid(value) => {
+            eprintln!("\x1b[33mgoal unattended: '{value}' — use /goal unattended on|off\x1b[0m");
         }
     }
 }

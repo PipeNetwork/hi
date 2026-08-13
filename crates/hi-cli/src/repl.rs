@@ -957,6 +957,12 @@ pub(crate) async fn repl(
                             _ => {}
                         }
                     }
+                    if let Some(count) = agent.take_goal_requeue_notice() {
+                        println!(
+                            "\x1b[33m{}\x1b[0m",
+                            hi_agent::goal_drive_requeue_message(count)
+                        );
+                    }
                     if plan_drive_turn {
                         let made_progress = hi_agent::plan_drive_made_progress(
                             plan_step_before.as_deref(),

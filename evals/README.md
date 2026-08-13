@@ -22,6 +22,22 @@ Every profile result carries a claim level: `official`, `public_reproduction`,
 `smoke`, or `evidence_only`. A continuous named reward is retained separately
 from binary pass classification.
 
+## Hygiene profile
+
+`hi bench swe` scores hidden tests only. Merge-quality regressions (extra files,
+dependency-manifest edits, whole-file rewrites) are invisible there. The
+`hygiene` profile is a separate smoke corpus beside SWE:
+
+```text
+hi eval import --manifest evals/manifest.toml --profile hygiene --dry-run
+hi eval import --manifest evals/manifest.toml --profile hygiene
+hi eval run --manifest evals/manifest.toml --profile hygiene
+```
+
+Tasks live under `bench/tasks/hygiene-*`. Each oracle fails extra files
+(`allowed_changes`), unexpected dependency-manifest edits, or a file that grew
+past a byte cap. Do not fold this into SWE grading.
+
 ## Docker/Harbor profiles
 
 Use `backend = "docker"` (or `"harbor"`) for a task package whose

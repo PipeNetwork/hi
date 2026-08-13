@@ -40,6 +40,12 @@ const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 /// long generations). Non-stream metadata/tool calls use
 /// [`agent_http_client_quick`] instead.
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 360;
+/// xAI grok-4.6 reasoning can sit silent before the first token; their SDK
+/// examples use a 3600s timeout. Used only by [`agent_http_client_xai`].
+const DEFAULT_XAI_READ_TIMEOUT_SECS: u64 = 3_600;
+/// Idle window for the xAI Responses stream. Longer than the shared 240s
+/// default so a thinking gap is not mistaken for a dead connection.
+const DEFAULT_XAI_STREAM_IDLE_SECS: u64 = 3_600;
 /// Connect/read budget for non-streaming agent HTTP (auth, /models, MCP, search).
 const DEFAULT_QUICK_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_QUICK_READ_TIMEOUT_SECS: u64 = 60;
@@ -295,6 +301,16 @@ where
 /// cannot sit on the 360s streaming read timeout.
 pub fn agent_http_client() -> reqwest::Client {
     agent_http_client_for_socket(None)
+}
+
+/// Streaming client for the xAI Responses adapter. Read timeout defaults to
+/// 3600s (xAI's published reasoning-model budget) instead of the shared 360s.
+pub(crate) fn agent_http_client_xai() -> reqwest::Client {
+    build_agent_http_client(
+        None,
+        http_timeout_secs("HI_HTTP_CONNECT_TIMEOUT_SECS", DEFAULT_CONNECT_TIMEOUT_SECS),
+        http_timeout_secs("HI_HTTP_READ_TIMEOUT_SECS", DEFAULT_XAI_READ_TIMEOUT_SECS),
+    )
 }
 
 /// Like [`agent_http_client`] but with short connect/read timeouts for
@@ -1042,11 +1058,21 @@ where
 /// 240s — generous enough for providers with long silent thinking gaps, small
 /// enough that a dead connection is abandoned in minutes rather than forever.
 pub fn stream_idle_window() -> std::time::Duration {
+    stream_idle_window_or(240)
+}
+
+/// Idle window for the xAI Responses adapter. Defaults to 3600s so grok-4.6
+/// thinking is not cut off; `HI_STREAM_IDLE_TIMEOUT_SECS` still overrides.
+pub(crate) fn xai_stream_idle_window() -> std::time::Duration {
+    stream_idle_window_or(DEFAULT_XAI_STREAM_IDLE_SECS)
+}
+
+fn stream_idle_window_or(default_secs: u64) -> std::time::Duration {
     let secs = std::env::var("HI_STREAM_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value >= 30)
-        .unwrap_or(240);
+        .unwrap_or(default_secs);
     std::time::Duration::from_secs(secs)
 }
 

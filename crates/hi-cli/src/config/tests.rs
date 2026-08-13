@@ -418,7 +418,7 @@ fn a_bare_provider_name_resolves_without_a_profile() {
     drop(env);
     assert_eq!(settings.provider, ProviderName::Xai);
     assert_eq!(settings.base_url, "https://api.x.ai/v1");
-    assert_eq!(settings.model, "grok-4.3");
+    assert_eq!(settings.model, "grok-4.6");
 }
 
 /// Switching back with `/provider pipenetwork` after `/provider xai` must

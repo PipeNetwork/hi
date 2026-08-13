@@ -864,6 +864,9 @@ async fn run() -> Result<()> {
                     "\x1b[2m✓ goal set — {} sub-goal(s)\x1b[0m",
                     g.sub_goals.len()
                 );
+                for warning in g.actionability_warnings() {
+                    println!("\x1b[33m  {warning} (driving in-session anyway)\x1b[0m");
+                }
             }
         }
         let mut current_prompt = prompt;
@@ -964,6 +967,14 @@ async fn run() -> Result<()> {
                             agent.last_changed_files(),
                         );
                         agent.note_plan_drive_progress(made_progress);
+                    }
+                    if let Some(count) = agent.take_goal_requeue_notice()
+                        && !cli.quiet
+                    {
+                        println!(
+                            "\x1b[33m{}\x1b[0m",
+                            hi_agent::goal_drive_requeue_message(count)
+                        );
                     }
                     if let Some(next) = agent.drive_decision(Some(outcome)).prompt() {
                         let drive_limit = agent
@@ -1970,14 +1981,14 @@ mod tests {
             default_skeptic_model(ProviderName::Ollama, "qwen2.5-coder"),
             "qwen2.5-coder"
         );
-        // xAI: pin a strong Chat Completions reviewer, not the (often weaker) session model.
+        // xAI: pin grok-4.6 as the reviewer, not a weaker session model.
         assert_eq!(
             default_skeptic_model(ProviderName::Xai, "grok-4.3"),
-            "grok-4.5"
+            "grok-4.6"
         );
         assert_eq!(
             default_skeptic_model(ProviderName::Xai, "grok-code-fast-1"),
-            "grok-4.5"
+            "grok-4.6"
         );
     }
 
@@ -2183,6 +2194,7 @@ mod tests {
             progress_kind: "weak".into(),
             progress_reason: "tool returned an error".into(),
             normalized_signature: None,
+            command: None,
         };
 
         let records = report_tool_records(&[entry]);

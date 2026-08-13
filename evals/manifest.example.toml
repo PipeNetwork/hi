@@ -9,8 +9,21 @@ adapter = "legacy"
 source = "../bench/tasks"
 revision = "local-pinned-revision"
 
+[datasets.hygiene]
+adapter = "legacy"
+source = "../bench/tasks/hygiene-narrow-edit"
+revision = "local-pinned-revision"
+
 [profiles.smoke]
 datasets = ["local_tasks"]
+models = ["provider/model-id"]
+trials = 1
+backend = "host"
+claim_level = "smoke"
+treatments = ["baseline"]
+
+[profiles.hygiene]
+datasets = ["hygiene"]
 models = ["provider/model-id"]
 trials = 1
 backend = "host"

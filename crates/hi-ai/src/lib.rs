@@ -1,5 +1,5 @@
 //! `hi-ai` — provider-neutral LLM types, the [`Provider`] trait, and adapters
-//! for OpenAI-compatible and Anthropic backends.
+//! for OpenAI-compatible, Anthropic, and xAI Responses backends.
 
 /// Serializes tests that mutate `HOME`/`XDG_CONFIG_HOME`, which are
 /// process-wide. Both the models-cache tests and the credential-store tests
@@ -27,6 +27,7 @@ pub mod test_support;
 pub mod token;
 mod tool_validation;
 pub mod types;
+pub mod xai;
 pub mod xai_auth;
 
 pub use anthropic::AnthropicProvider;
@@ -76,3 +77,4 @@ pub use types::{
     estimate_content_tokens, estimate_messages_tokens, estimate_request_input_tokens,
     estimate_text_tokens, estimate_tool_schema_tokens,
 };
+pub use xai::XaiProvider;

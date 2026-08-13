@@ -814,7 +814,8 @@ mod tests {
         .await;
         let err = result.expect_err("a checkpoint from another run must not resume");
         assert!(
-            err.to_string().contains("does not match the run being resumed"),
+            err.to_string()
+                .contains("does not match the run being resumed"),
             "unexpected error: {err}"
         );
         // State is untouched: the foreign run identity was not overwritten.

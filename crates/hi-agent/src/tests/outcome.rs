@@ -1,5 +1,5 @@
 use super::common::{
-    Canned, IsolatedWorkspace, NullUi, ProviderStep, RecordingUi, ScriptedProvider, agent,
+    Canned, IsolatedWorkspace, NullUi, ProviderStep, RecUi, RecordingUi, ScriptedProvider, agent,
     bash_completion, completion, config, scripted_agent, write_completion,
 };
 use super::*;
@@ -688,6 +688,71 @@ async fn independent_review_status_is_emitted_in_turn_outcome() {
         outcome.review_same_model,
         "unconfigured skeptic_model should flag same-model review"
     );
+}
+
+#[tokio::test]
+async fn hygiene_gate_reenters_model_on_unreferenced_creates() {
+    let workspace = IsolatedWorkspace::new("outcome-hygiene-sprawl");
+    let mut cfg = independent_review_cfg(&workspace);
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.gates.max_independent_review_repairs = 1;
+    let responses = vec![
+        completion(
+            vec![
+                Content::ToolCall {
+                    id: "w0".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({
+                        "path": "src/parser.rs",
+                        "content": "fn parse() {}\n"
+                    })
+                    .to_string(),
+                },
+                Content::ToolCall {
+                    id: "w1".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({
+                        "path": "extra_a.rs",
+                        "content": "a\n"
+                    })
+                    .to_string(),
+                },
+                Content::ToolCall {
+                    id: "w2".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({
+                        "path": "extra_b.rs",
+                        "content": "b\n"
+                    })
+                    .to_string(),
+                },
+                Content::ToolCall {
+                    id: "w3".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({
+                        "path": "extra_c.rs",
+                        "content": "c\n"
+                    })
+                    .to_string(),
+                },
+            ],
+            1,
+            1,
+        ),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        bash_completion("true # hygiene repair"),
+        completion(vec![Content::Text("repaired".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    let outcome = agent.run_turn("fix src/parser.rs", &mut ui).await.unwrap();
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("diff hygiene")),
+        "hygiene should re-enter the model: {:?}",
+        ui.statuses
+    );
+    assert_eq!(outcome.status, TurnStatus::Completed);
 }
 
 #[tokio::test]

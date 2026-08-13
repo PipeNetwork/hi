@@ -291,6 +291,16 @@ mod tests {
     }
 
     #[test]
+    fn hygiene_corpus_is_a_legacy_task_package() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/tasks/hygiene-narrow-edit");
+        let plan = plan_directory("hygiene", "legacy", &root, "test@1", ClaimLevel::Smoke).unwrap();
+        assert_eq!(plan.cases.len(), 1);
+        assert_eq!(plan.cases[0].id, "hygiene-narrow-edit");
+        assert_eq!(plan.claim_level, ClaimLevel::Smoke);
+    }
+
+    #[test]
     fn route_catalog_labels_transcripts_and_gated_judges() {
         let route = route_spec("mrcr").unwrap();
         assert_eq!(route.input_mode, "transcript");

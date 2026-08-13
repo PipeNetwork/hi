@@ -20,6 +20,28 @@ hi workflow resume plan.md                 # continue the latest sealed checkpoi
 
 From the TUI: `/workflow plan <plan.md> [flags]` runs the same engine as a
 detached child (`/workflow plan status`, `/workflow plan stop`).
+`/goal --workflow <plan.md>` is the interactive alias for that command.
+
+## `/goal` and plan.md
+
+`/goal` ingests a checklist `.md` (unchecked boxes, numbered items, or at
+least two bullets) as structured sub-goals before calling the planner.
+`- [x]` rows start `Done` so a rerun does not redo them.
+
+- Interactive `/goal implement plan.md` drives in-session (skip stalled
+  steps; one second pass if anything completed).
+- `/goal unattended on` (or `/goal --unattended <objective>`) elevates
+  Goal-drive turns to Always (auto-approve mutations) for that goal’s
+  life, then restores the previous permission mode. Esc still pauses.
+- `/goal --workflow plan.md` detaches `hi workflow run` instead of
+  installing an in-session goal. `--unattended` is irrelevant there
+  (the child is already headless Always). Prefer this when the repo is
+  git-backed and a verify command exists; otherwise `/goal` drives
+  in-session.
+- Plain one-shot `hi --goal "implement plan.md"` with a solid checklist
+  also hands off to `hi workflow run`.
+- Fleet `--session-file` / `--goal` children already have a worktree:
+  they ingest and drive in-process. `--workflow` is refused.
 
 ## Plan format
 
@@ -34,7 +56,9 @@ Objectives are unchecked checkboxes first, else numbered items, else bullets;
 
 Objectives should be concrete and test-gated — each becomes a standalone
 delegate prompt. Prose documents (PRDs) parse badly; always `--dry-run` first.
-Cap: 512 objectives per plan.
+`hi workflow run` **fails closed** on meta or vague process-only rows
+("investigate the parser", "Final workspace validation"). Interactive `/goal`
+warns and still drives those rows. Cap: 512 objectives per plan.
 
 ## Execution model
 

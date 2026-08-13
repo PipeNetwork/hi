@@ -15,9 +15,10 @@ use crate::{MAX_TOOL_PROTOCOL_RETRIES, ToolCallEntry, Ui};
 use super::helpers::{build_turn_telemetry, effective_model_route};
 use super::progress::ProgressTracker;
 use super::retry::{
-    MAX_PROVIDER_ROUTE_RETRIES, ReviewRepairState, TurnRetryState, delay_label,
-    output_cap_retry_tokens, provider_error_is_backoff_retryable, provider_overload_retry_delay,
-    transient_route_retry_delay,
+    MAX_CAPACITY_RETRIES, MAX_PROVIDER_ROUTE_RETRIES, ReviewRepairState, TurnRetryState,
+    capacity_retry_delay, delay_label, output_cap_retry_tokens,
+    provider_error_is_backoff_retryable, provider_error_is_capacity_retryable,
+    provider_overload_retry_delay, transient_route_retry_delay,
 };
 
 #[allow(
@@ -140,6 +141,32 @@ impl crate::Agent {
                 Ok(ProviderStreamResult::Continue)
             }
             Err(err)
+                if retry_state.capacity_retries < MAX_CAPACITY_RETRIES
+                    && provider_error_is_capacity_retryable(&err) =>
+            {
+                ui.assistant_end();
+                self.add_error_usage(&err);
+                self.emit_usage(ui);
+                retry_state.capacity_retries += 1;
+                retry_state.record_recovery_attempt();
+                let retry = retry_state.capacity_retries;
+                let delay = capacity_retry_delay(retry, &err);
+                let reason =
+                    if provider_error_kind(&err) == Some(ProviderErrorKind::CapacityUnavailable) {
+                        "capacity limited"
+                    } else {
+                        "provider overloaded"
+                    };
+                ui.nudge(&format!(
+                    "{reason}; retrying {} ({retry}/{MAX_CAPACITY_RETRIES})",
+                    delay_label(delay)
+                ));
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(ProviderStreamResult::Continue)
+            }
+            Err(err)
                 if retry_state.provider_route_retries < MAX_PROVIDER_ROUTE_RETRIES
                     && provider_error_is_backoff_retryable(&err) =>
             {
@@ -166,7 +193,8 @@ impl crate::Agent {
             }
             Err(err)
                 if retry_state.provider_route_retries < MAX_PROVIDER_ROUTE_RETRIES
-                    && hi_ai::provider_route_error_is_retryable(&err) =>
+                    && hi_ai::provider_route_error_is_retryable(&err)
+                    && !provider_error_is_capacity_retryable(&err) =>
             {
                 ui.assistant_end();
                 self.add_error_usage(&err);

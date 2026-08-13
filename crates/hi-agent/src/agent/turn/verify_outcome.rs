@@ -211,6 +211,45 @@ impl crate::Agent {
                 } else {
                     diff.lines().count()
                 };
+                if *state.independent_review_repairs
+                    < self.config.gates.max_independent_review_repairs
+                    && let Some(contract) = self.task.last_task_contract.as_ref()
+                {
+                    let prompt = self.task.last_task_prompt.as_deref().unwrap_or("");
+                    let findings = crate::hygiene::assess(contract, &current_changes, prompt);
+                    if !findings.is_empty() {
+                        *state.independent_review_repairs =
+                            state.independent_review_repairs.saturating_add(1);
+                        *state.independent_review_status = ReviewStatus::Objected;
+                        self.report.verify = VerifyEvidence::none();
+                        verifier.allow_review_revalidation();
+                        let remaining = self
+                            .config
+                            .gates
+                            .max_independent_review_repairs
+                            .saturating_sub(*state.independent_review_repairs);
+                        let bullets = findings
+                            .iter()
+                            .map(|finding| format!("- {}", finding.reason))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        self.messages.push_nudge(
+                            NudgeKind::Review,
+                            format!(
+                                "Diff hygiene found merge-quality defects. Repair them now, then \
+                                 re-run deterministic validation.\n\n{bullets}"
+                            ),
+                        );
+                        ui.nudge(&format!(
+                            "diff hygiene objected; allowing repair cycle {}/{} ({} remaining)",
+                            *state.independent_review_repairs,
+                            self.config.gates.max_independent_review_repairs,
+                            remaining
+                        ));
+                        *state.force_tools_next = true;
+                        return Ok(VerifyOutcomeControl::ReenterModel);
+                    }
+                }
                 let (review_required, large_diff_review) = self
                     .task
                     .last_task_contract
@@ -252,10 +291,16 @@ impl crate::Agent {
                         .as_ref()
                         .and_then(|contract| serde_json::to_string_pretty(contract).ok())
                         .unwrap_or_else(|| "(task contract unavailable)".into());
+                    let acceptance = self
+                        .task
+                        .last_task_contract
+                        .as_ref()
+                        .and_then(|c| c.acceptance_section())
+                        .unwrap_or_else(|| "(none named)".into());
                     let instructions = self.task.task_context.as_deref().unwrap_or("(none)");
                     let stages = verifier.stages_summary().unwrap_or_else(|| "(none)".into());
                     let context = format!(
-                        "Task contract:\n{contract}\n\nScoped instructions and relevant repository context:\n{instructions}\n\nChanged files ({file_count}):\n{files}\n\nDiff size: {diff_lines} lines\nDeterministic verification: PASSED\nStages: {stages}\nVerified workspace revision: {verified_digest}\n\nComplete bounded turn diff:\n{diff}",
+                        "Task contract:\n{contract}\n\nAcceptance criteria:\n{acceptance}\n\nScoped instructions and relevant repository context:\n{instructions}\n\nChanged files ({file_count}):\n{files}\n\nDiff size: {diff_lines} lines\nDeterministic verification: PASSED\nStages: {stages}\nVerified workspace revision: {verified_digest}\n\nComplete bounded turn diff:\n{diff}",
                         file_count = current_files.len(),
                         files = current_files.join("\n"),
                     );

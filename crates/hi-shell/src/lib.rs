@@ -7,6 +7,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use hi_ai::{
     AnthropicProvider, McpDiscoveryProvider, OpenAiProvider, PipeMcpClient, Provider, TokenSource,
+    XaiProvider,
 };
 use hi_provider_config::{ProviderName, ResolvedProviderConfig};
 
@@ -37,14 +38,19 @@ pub fn build_provider(config: &ResolvedProviderConfig) -> Result<Arc<dyn Provide
         ProviderName::Xai if config.api_key.is_empty() => {
             let source = hi_ai::xai_auth::XaiTokenSource::from_store()
                 .ok_or_else(|| anyhow!("set HI_API_KEY or XAI_API_KEY, or sign in with hi"))?;
-            Arc::new(OpenAiProvider::with_token_source(
+            Arc::new(XaiProvider::with_token_source(
                 config.base_url.clone(),
                 Arc::new(source) as Arc<dyn TokenSource>,
             ))
         }
-        ProviderName::Openai | ProviderName::Xai | ProviderName::Ollama => Arc::new(
-            OpenAiProvider::new(config.base_url.clone(), config.api_key.clone()),
-        ),
+        ProviderName::Xai => Arc::new(XaiProvider::new(
+            config.base_url.clone(),
+            config.api_key.clone(),
+        )),
+        ProviderName::Openai | ProviderName::Ollama => Arc::new(OpenAiProvider::new(
+            config.base_url.clone(),
+            config.api_key.clone(),
+        )),
     };
     Ok(provider)
 }

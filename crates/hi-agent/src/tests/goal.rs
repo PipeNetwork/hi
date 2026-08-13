@@ -609,6 +609,91 @@ async fn skeptic_gate_approval_advances_and_actually_calls_the_skeptic() {
 }
 
 #[tokio::test]
+async fn skeptic_gate_objects_without_a_model_call_when_tests_are_required_and_missing() {
+    let workspace = IsolatedWorkspace::new("goal-skeptic-wants-tests");
+    let mut cfg = workspace.config();
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("check", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
+    let tmp = workspace.path("changed.rs");
+    let p = tmp.to_string_lossy().to_string();
+    let steps = vec![
+        ProviderStep::Completion(write_content_completion(
+            &p,
+            "a substantial implementation body, comfortably past the trivial-diff exemption",
+        )),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+    ];
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new(
+        "ship the parser",
+        vec!["add unit tests for the parser".into(), "step two".into()],
+    );
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(
+        goal.active_index(),
+        Some(0),
+        "missing tests must block advance"
+    );
+    assert_eq!(goal.skeptic_objections, 1);
+    assert!(
+        goal.sub_goals[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("no tests")),
+        "deterministic objection recorded: {:?}",
+        goal.sub_goals[0].notes
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "must not call the skeptic model"
+    );
+}
+
+#[tokio::test]
+async fn skeptic_gate_calls_the_model_when_test_files_land() {
+    let workspace = IsolatedWorkspace::new("goal-skeptic-wants-tests-present");
+    let mut cfg = workspace.config();
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("check", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
+    std::fs::create_dir_all(workspace.path("tests")).unwrap();
+    let tmp = workspace.path("tests/parser.rs");
+    let p = tmp.to_string_lossy().to_string();
+    let steps = vec![
+        ProviderStep::Completion(write_content_completion(
+            &p,
+            "a substantial test body, comfortably past the trivial-diff exemption",
+        )),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ProviderStep::Completion(completion(vec![Content::Text("APPROVE".into())], 1, 1)),
+    ];
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new(
+        "ship the parser",
+        vec!["add unit tests for the parser".into(), "step two".into()],
+    );
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    agent.run_turn("go", &mut NullUi).await.unwrap();
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(goal.sub_goals[0].status, GoalStatus::Done);
+    assert_eq!(goal.skeptic_objections, 0);
+    assert_eq!(requests.lock().unwrap().len(), 3, "turn + skeptic");
+}
+
+#[tokio::test]
 async fn skeptic_gate_off_makes_no_extra_call() {
     // A skeptic model is configured, but `/goal team` is off (set explicitly —
     // new goals default to team on): the gate must not fire — no extra provider

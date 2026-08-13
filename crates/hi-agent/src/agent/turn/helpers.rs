@@ -170,6 +170,18 @@ pub(super) fn tool_entry(
     output: &hi_tools::ToolOutcome,
     progress: &ToolProgressLabel,
 ) -> ToolCallEntry {
+    tool_entry_with_args(tool, path, duration_ms, output, progress, "")
+}
+
+pub(super) fn tool_entry_with_args(
+    tool: String,
+    path: String,
+    duration_ms: u64,
+    output: &hi_tools::ToolOutcome,
+    progress: &ToolProgressLabel,
+    arguments: &str,
+) -> ToolCallEntry {
+    let command = bash_command_preview(&tool, arguments);
     ToolCallEntry {
         tool,
         path,
@@ -185,7 +197,22 @@ pub(super) fn tool_entry(
         progress_kind: progress.kind.as_str().to_string(),
         progress_reason: progress.reason.clone(),
         normalized_signature: progress.signature.clone(),
+        command,
     }
+}
+
+fn bash_command_preview(tool: &str, arguments: &str) -> Option<String> {
+    if tool != "bash" {
+        return None;
+    }
+    crate::steering::bash_command(arguments).map(|command| {
+        let trimmed = command.trim();
+        if trimmed.chars().count() > 240 {
+            format!("{}…", trimmed.chars().take(239).collect::<String>())
+        } else {
+            trimmed.to_string()
+        }
+    })
 }
 
 pub(super) fn synthetic_tool_outcome(

@@ -47,6 +47,7 @@ async fn prepare(args: &[String]) -> Result<()> {
         .or_else(|| manifest.profiles.keys().next().cloned())
         .context("manifest has no profile; pass --profile <name>")?;
     let profile = manifest.profile(&profile_name)?;
+    let dry_run = args.iter().any(|arg| arg == "--dry-run");
     let (workspace_root, state_root) = resolve_runtime_roots()?;
     let state_root = flag_path(args, "--state").unwrap_or_else(|| state_root.join("evals"));
     let store_root = flag_path(args, "--store").unwrap_or_else(|| state_root.join("imports"));
@@ -79,10 +80,22 @@ async fn prepare(args: &[String]) -> Result<()> {
         let plan = plan_directory(
             dataset_name.clone(),
             source.adapter.clone(),
-            source_path,
+            source_path.clone(),
             source.revision.clone(),
             profile.claim_level,
         )?;
+        if dry_run {
+            println!(
+                "{dataset_name}: {} case(s) from {} (claim_level {:?})",
+                plan.cases.len(),
+                source_path.display(),
+                profile.claim_level
+            );
+            for case in &plan.cases {
+                println!("  - {}", case.id);
+            }
+            continue;
+        }
         let imported = store.import(&plan)?;
         if let Some(backend) = &docker_backend {
             for task in &imported.tasks {
@@ -107,6 +120,10 @@ async fn prepare(args: &[String]) -> Result<()> {
             }
         }
         dataset_digests.insert(dataset_name.clone(), imported.digest);
+    }
+    if dry_run {
+        println!("dry-run: profile {profile_name} planned, nothing imported");
+        return Ok(());
     }
     let manifest_digest = manifest.digest()?;
     let identity = build_identity(
@@ -1449,7 +1466,7 @@ fn collect_json(root: &Path, output: &mut Vec<serde_json::Value>) -> Result<()> 
 fn print_help() {
     println!(
         "hi eval — profile-driven evaluation\n\n\
-         hi eval import|prepare [--manifest PATH] [--profile NAME] [--store PATH]\n\
+         hi eval import|prepare [--manifest PATH] [--profile NAME] [--store PATH] [--dry-run]\n\
          hi eval run --profile NAME [--manifest PATH] [--state PATH] [--store PATH] [--fresh]\n\
          hi eval status|report|stop|cleanup --profile NAME [--state PATH]\n\n\
          Sources are imported into immutable content-addressed packages.\n\

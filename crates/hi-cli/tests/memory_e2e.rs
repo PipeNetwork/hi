@@ -282,10 +282,9 @@ fn memory_distills_at_quit_and_reloads_next_session() {
 /// A streamed completion that emits a single `write` tool call (then stops), so
 /// the agent has a planned mutating action to act on.
 fn sse_write_tool_call(path: &str, content: &str) -> String {
-    let arguments = serde_json::to_string(
-        &serde_json::json!({ "path": path, "content": content }).to_string(),
-    )
-    .unwrap();
+    let arguments =
+        serde_json::to_string(&serde_json::json!({ "path": path, "content": content }).to_string())
+            .unwrap();
     format!(
         "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"function\":{{\"name\":\"write\",\"arguments\":{arguments}}}}}]}}}}]}}\n\n\
          data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":5}}}}\n\n\

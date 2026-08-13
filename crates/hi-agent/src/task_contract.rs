@@ -61,6 +61,23 @@ impl TaskContract {
         self.intent = TaskIntent::Mutation;
     }
 
+    /// Named acceptance criteria extracted from the prompt, as a volatile-context
+    /// section. `None` when the prompt had no must/should/done-when sentences.
+    pub fn acceptance_section(&self) -> Option<String> {
+        if self.acceptance_text.is_empty() {
+            return None;
+        }
+        let mut out = String::from(
+            "# Acceptance criteria\nThe user named these as done-when. Meet each one before claiming complete:\n",
+        );
+        for line in &self.acceptance_text {
+            out.push_str("- ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        Some(out)
+    }
+
     /// Independent completion review (Phase L includes large-diff skeptic).
     ///
     /// Under [`CompletionReviewPolicy::Risk`], fires for
@@ -478,6 +495,23 @@ pub(crate) fn prompt_wants_tests(text: &str) -> bool {
             .any(|v| lower.contains(v)))
 }
 
+/// Whether a changed path looks like a test file (not production source).
+pub(crate) fn path_looks_like_test(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_ascii_lowercase();
+    let name = p.rsplit('/').next().unwrap_or(&p);
+    p.contains("/tests/")
+        || p.contains("/test/")
+        || p.starts_with("tests/")
+        || p.starts_with("test/")
+        || p.contains("/testing/")
+        || name.contains("_test.")
+        || name.starts_with("test_")
+        || name.contains(".spec.")
+        || name.contains(".test.")
+        || name.ends_with("_test.rs")
+        || name.ends_with("_spec.rb")
+}
+
 fn prompt_risk(prompt: &str) -> RiskLevel {
     let lower = prompt.to_ascii_lowercase();
     if [
@@ -619,6 +653,34 @@ mod tests {
         assert!(cargo.wants_tests, "cargo test prompt");
         let plain = TaskContract::derive("rename the helper function", VerificationMode::Auto);
         assert!(!plain.wants_tests, "rename without tests");
+    }
+
+    #[test]
+    fn acceptance_text_is_surfaced_as_a_section() {
+        let contract = TaskContract::derive(
+            "Add a --seed flag. Done when cargo test -p trainer passes. The CLI must accept an integer seed.",
+            VerificationMode::Auto,
+        );
+        assert!(
+            !contract.acceptance_text.is_empty(),
+            "extracts must/done-when sentences: {:?}",
+            contract.acceptance_text
+        );
+        let section = contract.acceptance_section().expect("section");
+        assert!(section.contains("# Acceptance criteria"));
+        assert!(section.contains("must accept") || section.contains("Done when"));
+        let empty = TaskContract::derive("rename the helper", VerificationMode::Auto);
+        assert!(empty.acceptance_section().is_none());
+    }
+
+    #[test]
+    fn path_looks_like_test_covers_common_layouts() {
+        assert!(path_looks_like_test("crates/hi-agent/src/tests/goal.rs"));
+        assert!(path_looks_like_test("tests/parser.rs"));
+        assert!(path_looks_like_test("src/foo_test.rs"));
+        assert!(path_looks_like_test("app.spec.ts"));
+        assert!(!path_looks_like_test("src/parser.rs"));
+        assert!(!path_looks_like_test("crates/hi-agent/src/goal.rs"));
     }
 
     #[test]

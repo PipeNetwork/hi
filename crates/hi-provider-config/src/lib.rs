@@ -46,7 +46,7 @@ impl ProviderName {
         match self {
             Self::Pipenetwork => Some("ipop/coder-balanced"),
             Self::Anthropic => Some("claude-opus-4-8"),
-            Self::Xai => Some("grok-4.3"),
+            Self::Xai => Some("grok-4.6"),
             _ => None,
         }
     }

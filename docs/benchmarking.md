@@ -43,6 +43,19 @@ Evidence lands under `<state-root>/bench/`: `scorecard.jsonl` (verdict +
 attempts per instance) and `runs/<instance>/` (prompt, transcript, agent
 diff, grade logs). Failure transcripts are the tuning loop's raw material.
 
+## Hygiene eval (merge quality, not SWE)
+
+`hi bench swe` does not see extra files, surprise dependency edits, or
+whole-file rewrites. Use the separate `hi eval` profile:
+
+```bash
+hi eval import --manifest evals/manifest.toml --profile hygiene --dry-run
+hi eval run --manifest evals/manifest.toml --profile hygiene
+```
+
+Corpus: `bench/tasks/hygiene-*`. Claim level `smoke`, host backend. Oracles
+fail sprawl / manifest edits / file-growth; they do not change SWE grading.
+
 ## Harness-effect diagnostics
 
 The ordinary report remains `schema_version: 2`; new fields are additive so

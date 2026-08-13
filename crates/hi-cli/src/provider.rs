@@ -3,7 +3,7 @@
 use hi_ai::{
     AnthropicProvider, Backend, ConcurrencyLimitedProvider, DEFAULT_PROVIDER_REQUEST_CONCURRENCY,
     FallbackProvider, McpDiscoveryProvider, MoaProvider, OpenAiProvider, PipeMcpClient, Provider,
-    ProviderConcurrencyConfig,
+    ProviderConcurrencyConfig, XaiProvider,
 };
 use hi_routing::{
     Capability, CapabilitySet, HarnessDescriptor, ModelCandidate, RouteCandidate, RouteDecision,
@@ -22,10 +22,10 @@ pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
 /// `HI_SKEPTIC_MODEL` nor the profile configures one.
 ///
 /// - **Pipenetwork** → GLM-5.2 (second opinion, distinct from the coder route).
-/// - **xAI** → latest Chat Completions Grok the client supports (`grok-4.5`),
-///   not the session model. Weak/session coders on xAI were a common source of
-///   empty or unparseable verdicts → `review unavailable`; a fixed strong
-///   reviewer is better than disabling the gate. Override with `HI_SKEPTIC_MODEL`.
+/// - **xAI** → grok-4.6 (Responses API), not the session model. Weak/session
+///   coders on xAI were a common source of empty or unparseable verdicts →
+///   `review unavailable`; a fixed strong reviewer is better than disabling
+///   the gate. Override with `HI_SKEPTIC_MODEL`.
 /// - **Elsewhere** → session model (same-model still catches concrete defects).
 ///
 /// Review calls force temperature 0; verdict parsing tolerates preambles before
@@ -33,9 +33,7 @@ pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
 pub(crate) fn default_skeptic_model(provider: ProviderName, session_model: &str) -> String {
     match provider {
         ProviderName::Pipenetwork => "pipe/glm-5.2".to_string(),
-        // Chat Completions wire format (this client). Newer than the session
-        // default `grok-4.3`; OpenAI adapter strips params 4.5 rejects.
-        ProviderName::Xai => "grok-4.5".to_string(),
+        ProviderName::Xai => "grok-4.6".to_string(),
         _ => session_model.to_string(),
     }
 }
@@ -74,16 +72,20 @@ pub(crate) fn build_provider(settings: &Settings) -> Box<dyn Provider> {
     let api_key = settings.api_key.clone();
     if settings.provider.is_anthropic() {
         Box::new(AnthropicProvider::new(base_url, api_key))
+    } else if settings.provider == ProviderName::Xai {
+        if let Some(source) = xai_oauth_token_source(settings.provider) {
+            // Signed in with a grok.com subscription: the access token expires
+            // in hours, so hand the provider a source that can re-mint it
+            // rather than a fixed string that would strand a long session.
+            Box::new(XaiProvider::with_token_source(base_url, source))
+        } else {
+            Box::new(XaiProvider::new(base_url, api_key))
+        }
     } else {
         let inner: Box<dyn Provider> = if let Some(socket) = &settings.api_unix_socket {
             Box::new(OpenAiProvider::new_unix(base_url, api_key.clone(), socket))
         } else if settings.provider == ProviderName::Pipenetwork {
             Box::new(OpenAiProvider::new_pipenetwork(base_url, api_key.clone()))
-        } else if let Some(source) = xai_oauth_token_source(settings.provider) {
-            // Signed in with a grok.com subscription: the access token expires
-            // in hours, so hand the provider a source that can re-mint it
-            // rather than a fixed string that would strand a long session.
-            Box::new(OpenAiProvider::with_token_source(base_url, source))
         } else {
             Box::new(OpenAiProvider::new(base_url, api_key.clone()))
         };

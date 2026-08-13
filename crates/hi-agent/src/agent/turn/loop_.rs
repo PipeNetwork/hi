@@ -1748,6 +1748,9 @@ impl crate::Agent {
                     changed_files: outcome.changed_files.len(),
                     model: outcome.effective_route.model.clone(),
                     hint_active: self.task.active_hint_shape.clone(),
+                    failure_shape: crate::learning::tool_failure_shape(
+                        &self.report.last_turn_telemetry.tool_timeline,
+                    ),
                 },
             );
         }
@@ -1757,6 +1760,7 @@ impl crate::Agent {
             self.suggest_next_prompt(turn_start, ui).await;
         }
         self.workspace.clear_active_baselines();
+        let _ = self.maybe_requeue_goal_second_pass();
         Ok(outcome)
     }
 }

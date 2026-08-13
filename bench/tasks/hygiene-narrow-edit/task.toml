@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "hygiene-narrow-edit"
+prompt = "solution.py defines add(a, b) and should return a + b. It currently subtracts. Fix only the body of add. Edit only solution.py. Do not add files, rewrite the whole file, or change dependencies."
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import os, solution as s; assert s.add(2, 3) == 5 and s.add(0, 0) == 0; assert os.path.getsize('solution.py') <= 400"'''

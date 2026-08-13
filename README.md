@@ -36,7 +36,7 @@ hi --provider ollama -m qwen2.5-coder "..."
 # Native Anthropic
 HI_API_KEY=sk-ant-... hi --provider anthropic -m claude-sonnet-4-20250514 "..."
 
-# xAI (Grok); defaults to grok-4.3
+# xAI (Grok); defaults to grok-4.6
 XAI_API_KEY=xai-... hi --provider xai "add a --json flag to the CLI"
 ```
 
@@ -52,7 +52,7 @@ cat data.json | hi -q "extract every email address" | sort -u   # -q: text only,
 
 ## Models & providers
 
-One OpenAI-compatible client covers **OpenRouter, pipenetwork.ai, xAI (Grok), Ollama, llama.cpp, LM Studio, and vLLM** — they differ only by `--base-url` and `--api-key`. A native **Anthropic** adapter (`--provider anthropic`) adds extended thinking and tool-use blocks.
+One OpenAI-compatible client covers **OpenRouter, pipenetwork.ai, Ollama, llama.cpp, LM Studio, and vLLM** — they differ only by `--base-url` and `--api-key`. A native **Anthropic** adapter (`--provider anthropic`) adds extended thinking and tool-use blocks. A native **xAI** adapter (`--provider xai`) uses the Responses API for Grok tool calling and encrypted reasoning.
 
 Settings resolve in this order: **CLI flags → profile → environment → defaults.**
 

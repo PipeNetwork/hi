@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
-use hi_agent::{DelegateRunner, parse_objectives, plan_has_checked_objectives};
+use hi_agent::{
+    DelegateRunner, actionability_issues, parse_objectives, plan_has_checked_objectives,
+};
 use hi_agent_runtime::{
     GateAuthority, StageDriver, StageModel, StageOutcome, TerminalOutcome, WorkflowExecutor,
     latest_checkpoint,
@@ -36,6 +38,30 @@ const MAX_OBJECTIVES: usize = hi_agent::MAX_PLAN_OBJECTIVES;
 /// Default concurrent objective delegates per wave; the cross-process
 /// resource governor additionally caps live children machine-wide.
 const DEFAULT_WAVE_CONCURRENCY: u16 = 4;
+
+/// Detach `hi workflow run <plan>` so the REPL/TUI stays interactive.
+pub(crate) fn spawn_detached_workflow_run(exe: &Path, plan: &str) -> Result<(u32, PathBuf)> {
+    let log = std::env::temp_dir().join(format!(
+        "hi-workflow-plan-{}-{}.log",
+        std::process::id(),
+        plan.replace(['/', '.'], "_")
+    ));
+    let log_file = std::fs::File::create(&log)
+        .with_context(|| format!("cannot create workflow log {}", log.display()))?;
+    let stderr_file = log_file
+        .try_clone()
+        .context("cannot clone workflow log handle")?;
+    let child = std::process::Command::new(exe)
+        .args(["workflow", "run", plan])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(stderr_file))
+        .spawn()
+        .context("failed to start workflow child")?;
+    let pid = child.id();
+    drop(child);
+    Ok((pid, log))
+}
 
 pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
     let mut action = None;
@@ -722,19 +748,38 @@ async fn run(
         "no objectives found in {} — use unchecked `- [ ]` checkboxes, numbered items, or bullets",
         plan_path.display()
     );
+    let rejected = actionability_issues(objectives.iter().map(String::as_str));
     let graph = plan_graph(objectives.len(), parallel)?;
     if dry_run {
         println!(
-            "{}: {} objective(s), {} stages, wave concurrency {}",
+            "{}: {} objective(s), {} rejected, {} stages, wave concurrency {}",
             plan_name,
             objectives.len(),
+            rejected.len(),
             graph.stages.len(),
             graph.limits.effective_concurrency()
         );
         for (index, objective) in objectives.iter().enumerate() {
-            println!("  {:>4}. {objective}", index + 1);
+            let mark = rejected
+                .iter()
+                .find(|(text, _)| text == objective)
+                .map(|(_, reason)| format!("  REJECT {reason}"))
+                .unwrap_or_default();
+            println!("  {:>4}. {objective}{mark}", index + 1);
         }
         return Ok(());
+    }
+    if !rejected.is_empty() {
+        let listing = rejected
+            .iter()
+            .map(|(text, reason)| format!("  - {text} ({reason})"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(
+            "refusing to run {}: {} untestable/meta objective(s). Rewrite them as concrete deliverables, or use interactive /goal to drive a fuzzy list.\n{listing}",
+            plan_path.display(),
+            rejected.len()
+        );
     }
 
     let (workspace_root, state_root) = crate::review_target::resolve_runtime_roots()?;
@@ -1334,6 +1379,21 @@ mod tests {
         let bullets = "* add tests\n* fix docs\n";
         assert_eq!(parse_objectives(bullets), vec!["add tests", "fix docs"]);
         assert!(parse_objectives("# just prose\n").is_empty());
+    }
+
+    #[test]
+    fn actionability_issues_flag_meta_objectives() {
+        let issues = actionability_issues(
+            [
+                "add a --seed flag",
+                "investigate the parser",
+                "Final workspace validation",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().any(|(t, _)| t.contains("investigate")));
+        assert!(issues.iter().any(|(t, _)| t.contains("validation")));
     }
 
     #[test]

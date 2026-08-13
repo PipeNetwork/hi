@@ -181,6 +181,7 @@ impl crate::Agent {
             goal_drive_stall: 0,
             interactive_session: false,
             drive_restore_permission: None,
+            goal_requeue_notice: None,
             ask_user_calls: 0,
             ask_user_drive_streak: 0,
             turn_drive_kind: crate::DriveKind::User,
@@ -558,12 +559,19 @@ impl crate::Agent {
 
     pub fn note_goal_drive_progress(&mut self, made_progress: bool) -> crate::GoalDriveProgress {
         if made_progress {
-            if self.goal_drive_stall == 0 {
-                return crate::GoalDriveProgress::Unchanged;
+            let reset = self.goal_drive_stall != 0;
+            if reset {
+                self.goal_drive_stall = 0;
+                self.persist_goal_drive();
             }
-            self.goal_drive_stall = 0;
-            self.persist_goal_drive();
-            return crate::GoalDriveProgress::Reset;
+            if let Some(count) = self.maybe_requeue_goal_second_pass() {
+                return crate::GoalDriveProgress::Requeued { count };
+            }
+            return if reset {
+                crate::GoalDriveProgress::Reset
+            } else {
+                crate::GoalDriveProgress::Unchanged
+            };
         }
         let next = crate::next_plan_drive_stall(true, false, self.goal_drive_stall);
         if next < crate::GOAL_DRIVE_STALL_LIMIT {
@@ -579,43 +587,94 @@ impl crate::Agent {
             self.persist_goal_drive();
             return crate::GoalDriveProgress::Parked;
         };
+        if goal.is_thrashing() {
+            self.goal_drive_stall = next;
+            self.persist_goal_drive();
+            return crate::GoalDriveProgress::Parked;
+        }
         let has_successor = goal.active_index().is_some_and(|index| {
             goal.sub_goals
                 .iter()
                 .skip(index + 1)
                 .any(|step| step.status == crate::GoalStatus::Pending)
         });
-        if goal.is_thrashing() || !has_successor {
-            self.goal_drive_stall = next;
-            self.persist_goal_drive();
-            return crate::GoalDriveProgress::Parked;
-        }
         let failed = goal
             .active_sub_goal()
             .map(|step| step.description.clone())
             .unwrap_or_default();
-        let _ = self.update_structured_goal(|goal| {
-            goal.skip_active(format!(
-                "skipped after {} drive turns with no progress",
-                crate::GOAL_DRIVE_STALL_LIMIT
-            ));
-        });
-        let after = self.goals.structured.as_ref();
-        let next_title = after
-            .and_then(|goal| goal.active_sub_goal())
-            .map(|step| step.description.clone());
-        let park = after.is_none_or(|goal| goal.is_thrashing() || goal.active_sub_goal().is_none());
-        if park {
-            self.goal_drive_stall = next;
+        if has_successor {
+            let _ = self.update_structured_goal(|goal| {
+                goal.skip_stalled_active(format!(
+                    "skipped after {} drive turns with no progress",
+                    crate::GOAL_DRIVE_STALL_LIMIT
+                ));
+            });
+            let after = self.goals.structured.as_ref();
+            let next_title = after
+                .and_then(|goal| goal.active_sub_goal())
+                .map(|step| step.description.clone());
+            if after.is_some_and(|goal| goal.is_thrashing()) {
+                self.goal_drive_stall = next;
+                self.persist_goal_drive();
+                return crate::GoalDriveProgress::Parked;
+            }
+            if after.is_none_or(|goal| goal.active_sub_goal().is_none()) {
+                if let Some(count) = self.maybe_requeue_goal_second_pass() {
+                    self.goal_drive_stall = 0;
+                    self.persist_goal_drive();
+                    return crate::GoalDriveProgress::Requeued { count };
+                }
+                self.goal_drive_stall = next;
+                self.persist_goal_drive();
+                return crate::GoalDriveProgress::Parked;
+            }
+            self.goal_drive_stall = 0;
             self.persist_goal_drive();
-            return crate::GoalDriveProgress::Parked;
+            return crate::GoalDriveProgress::Skipped {
+                failed,
+                next: next_title,
+            };
         }
-        self.goal_drive_stall = 0;
+        // Last remaining step: only skip-and-requeue when something already
+        // completed (a second pass is possible). Otherwise park as today so a
+        // single stuck step still GoalParked with the cursor intact.
+        if self
+            .goals
+            .structured
+            .as_ref()
+            .is_some_and(|goal| goal.completed_count() > 0)
+        {
+            let _ = self.update_structured_goal(|goal| {
+                goal.skip_stalled_active(format!(
+                    "skipped after {} drive turns with no progress",
+                    crate::GOAL_DRIVE_STALL_LIMIT
+                ));
+            });
+            if let Some(count) = self.maybe_requeue_goal_second_pass() {
+                self.goal_drive_stall = 0;
+                self.persist_goal_drive();
+                return crate::GoalDriveProgress::Requeued { count };
+            }
+        }
+        self.goal_drive_stall = next;
         self.persist_goal_drive();
-        crate::GoalDriveProgress::Skipped {
-            failed,
-            next: next_title,
+        crate::GoalDriveProgress::Parked
+    }
+
+    pub(crate) fn maybe_requeue_goal_second_pass(&mut self) -> Option<usize> {
+        let mut count = 0;
+        let _ = self.update_structured_goal(|goal| {
+            count = goal.maybe_requeue_stall_skips();
+        });
+        if count == 0 {
+            return None;
         }
+        self.goal_requeue_notice = Some(count);
+        Some(count)
+    }
+
+    pub fn take_goal_requeue_notice(&mut self) -> Option<usize> {
+        self.goal_requeue_notice.take()
     }
 
     pub fn reset_goal_drive_stall(&mut self) {
@@ -685,9 +744,25 @@ impl crate::Agent {
                 if parked || paused {
                     self.reset_goal_drive_stall();
                 }
-                self.maybe_demote_always_for_drive();
+                self.apply_goal_drive_permissions();
             }
         }
+    }
+
+    fn apply_goal_drive_permissions(&mut self) {
+        let unattended = self
+            .goals
+            .structured
+            .as_ref()
+            .is_some_and(|goal| goal.unattended);
+        if self.interactive_session && unattended {
+            if self.permission_mode != crate::PermissionMode::Always {
+                self.drive_restore_permission = Some(self.permission_mode);
+                self.set_permission_mode(crate::PermissionMode::Always);
+            }
+            return;
+        }
+        self.maybe_demote_always_for_drive();
     }
 
     fn maybe_demote_always_for_drive(&mut self) {
@@ -1610,12 +1685,13 @@ impl crate::Agent {
 
     /// The per-turn volatile context: task-ranked memory, the task context
     /// index / repo orientation, the session goal, long-horizon goal state,
-    /// and the decision log. Attached to each turn's user message (late in
-    /// the transcript) rather than the system message — rebuilding message[0]
-    /// with this content every round invalidated the entire prefix for
-    /// implicit and explicit prompt caches alike (observed: <4% cache reads
-    /// on an edit-heavy session). Mid-turn staleness is fine: each source
-    /// only changes through the model's own actions (its edits, its
+    /// the decision log, a matching stack skill, and named acceptance
+    /// criteria. Attached to each turn's user message (late in the transcript)
+    /// rather than the system message — rebuilding message[0] with this
+    /// content every round invalidated the entire prefix for implicit and
+    /// explicit prompt caches alike (observed: <4% cache reads on an
+    /// edit-heavy session). Mid-turn staleness is fine: each source only
+    /// changes through the model's own actions (its edits, its
     /// `update_plan`/`record_decision` calls), which it already sees.
     pub(crate) fn volatile_context_block(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
@@ -1653,6 +1729,17 @@ impl crate::Agent {
             if !t.is_empty() {
                 parts.push(t.to_string());
             }
+        }
+        if let Some(section) = crate::skills::active_stack_skill_section(self.runtime.root()) {
+            parts.push(section);
+        }
+        if let Some(section) = self
+            .task
+            .last_task_contract
+            .as_ref()
+            .and_then(|c| c.acceptance_section())
+        {
+            parts.push(section);
         }
         if !self.config.subagents.is_subagent {
             parts.push(
@@ -1855,6 +1942,12 @@ impl crate::Agent {
     /// Fallible form of [`Self::set_goal_team`] for command frontends.
     pub fn try_set_goal_team(&mut self, on: bool) -> Result<bool> {
         self.update_structured_goal(|goal| goal.team = on)
+    }
+
+    /// Elevate Goal-drive turns to Always (YOLO) for this goal, restoring the
+    /// previous permission mode at each turn end.
+    pub fn try_set_goal_unattended(&mut self, on: bool) -> Result<bool> {
+        self.update_structured_goal(|goal| goal.unattended = on)
     }
 
     /// Set (or clear, with `None`) a ceiling on how many sub-goals the goal's plan

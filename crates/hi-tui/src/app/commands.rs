@@ -786,6 +786,11 @@ impl crate::App {
                     self.handle_goal_team(agent, team);
                 }
             }
+            s if command::parse_goal_unattended(s).is_some() => {
+                if let Some(unattended) = command::parse_goal_unattended(s) {
+                    self.handle_goal_unattended(agent, unattended);
+                }
+            }
             s if command::parse_goal_edit(s).is_some() => {
                 if let Some(edit) = command::parse_goal_edit(s) {
                     self.handle_goal_edit(agent, edit);
@@ -903,8 +908,12 @@ impl crate::App {
             }
             // A single sub-goal equal to the objective (no decomposition).
             goal => {
-                let (review, parsed_text) = command::parse_goal_objective_flags(goal);
-                if review && parsed_text.is_empty() {
+                let flags = command::parse_goal_objective_flags(goal);
+                if flags.workflow {
+                    self.handle_goal_workflow(agent, &flags.text);
+                    return;
+                }
+                if flags.review && flags.text.is_empty() {
                     self.push(Line::styled(
                         "usage: /goal --review <objective>".to_string(),
                         Style::default().fg(crate::theme::theme().warning),
@@ -912,33 +921,25 @@ impl crate::App {
                     self.follow();
                     return;
                 }
-                let text = parsed_text;
-                let text = if text.is_empty() {
+                if flags.unattended && flags.text.is_empty() {
+                    self.push(Line::styled(
+                        "usage: /goal --unattended <objective>".to_string(),
+                        Style::default().fg(crate::theme::theme().warning),
+                    ));
+                    self.follow();
+                    return;
+                }
+                let text = if flags.text.is_empty() {
                     goal.to_string()
                 } else {
-                    text
+                    flags.text
                 };
-                let mut error = if let Some(goal) = agent.try_ingest_goal(&text) {
+                let error = if let Some(goal) = agent.try_ingest_goal(&text) {
                     Self::apply_installed_goal(agent, &text, goal)
                 } else {
                     Self::apply_goal(agent, &text, vec![text.clone()])
                 };
-                if error.is_none()
-                    && review
-                    && let Err(err) =
-                        agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review)
-                {
-                    error = Some(format!("goal review mode failed: {err:#}"));
-                }
-                self.refresh_goal(agent);
-                let review_ready = review && agent.structured_goal().is_some() && error.is_none();
-                self.report_goal_result(agent, &text, error);
-                if review_ready {
-                    self.push(Line::styled(
-                        "review mode — /goal accept to start driving".to_string(),
-                        dim(),
-                    ));
-                }
+                self.finish_goal_install(agent, &text, flags.review, flags.unattended, error);
                 if let Some(g) = agent.structured_goal() {
                     for line in g.status_report().lines().take(24) {
                         self.push(Line::styled(line.to_string(), dim()));
@@ -1202,6 +1203,88 @@ impl crate::App {
         self.follow();
     }
 
+    /// `/goal unattended on|off`: elevate Goal-drive turns to Always.
+    fn handle_goal_unattended(&mut self, agent: &mut Agent, arg: command::GoalUnattendedArg) {
+        use command::GoalUnattendedArg;
+        let warning = Style::default().fg(crate::theme::theme().warning);
+        let (msg, style, extra) = match arg {
+            GoalUnattendedArg::Show => match agent.structured_goal() {
+                Some(g) if g.unattended => (
+                    "goal unattended: on — Goal drive turns run as Always".to_string(),
+                    dim(),
+                    None,
+                ),
+                Some(_) => (
+                    "goal unattended: off — enable with /goal unattended on".to_string(),
+                    dim(),
+                    None,
+                ),
+                None => (
+                    "no active goal — set one with /goal <text> first".to_string(),
+                    dim(),
+                    None,
+                ),
+            },
+            GoalUnattendedArg::On => match agent.try_set_goal_unattended(true) {
+                Ok(true) => (
+                    "✓ goal unattended on".to_string(),
+                    Style::default().fg(crate::theme::theme().accent_success),
+                    Some(hi_agent::UNATTENDED_DRIVE_WARNING.to_string()),
+                ),
+                Ok(false) => (
+                    "no active goal — set one with /goal <text> first".to_string(),
+                    dim(),
+                    None,
+                ),
+                Err(err) => (format!("goal unattended failed: {err:#}"), warning, None),
+            },
+            GoalUnattendedArg::Off => match agent.try_set_goal_unattended(false) {
+                Ok(true) => (
+                    "✓ goal unattended off — Goal drive uses the session permission mode"
+                        .to_string(),
+                    Style::default().fg(crate::theme::theme().accent_success),
+                    None,
+                ),
+                Ok(false) => ("no active goal".to_string(), dim(), None),
+                Err(err) => (format!("goal unattended failed: {err:#}"), warning, None),
+            },
+            GoalUnattendedArg::Invalid(value) => (
+                format!("goal unattended: '{value}' — use /goal unattended on|off"),
+                warning,
+                None,
+            ),
+        };
+        self.refresh_goal(agent);
+        self.push(Line::styled(msg, style));
+        if let Some(extra) = extra {
+            self.push(Line::styled(extra, warning));
+        }
+        self.follow();
+    }
+
+    fn handle_goal_workflow(&mut self, agent: &Agent, objective: &str) {
+        let warning = Style::default().fg(crate::theme::theme().warning);
+        match hi_agent::goal_workflow_plan_path(false, agent.workspace_root(), objective) {
+            Ok(path) => match std::env::current_exe() {
+                Ok(exe) => {
+                    let plan = agent.workspace_root().join(&path);
+                    crate::workflow_tui::handle_plan_workflow(self, &plan.to_string_lossy(), &exe);
+                }
+                Err(err) => {
+                    self.push(Line::styled(
+                        format!("cannot resolve hi executable: {err:#}"),
+                        warning,
+                    ));
+                    self.follow();
+                }
+            },
+            Err(err) => {
+                self.push(Line::styled(err, warning));
+                self.follow();
+            }
+        }
+    }
+
     /// TUI-first durable execution control. Profiles/config choose the
     /// startup default; the TUI lets a user promote the current saved session
     /// immediately before a long task.
@@ -1265,28 +1348,14 @@ impl crate::App {
         objective: &str,
         goal: hi_agent::Goal,
     ) {
-        let (review, text) = command::parse_goal_objective_flags(objective);
-        let objective = if text.is_empty() {
+        let flags = command::parse_goal_objective_flags(objective);
+        let objective = if flags.text.is_empty() {
             objective
         } else {
-            text.as_str()
+            flags.text.as_str()
         };
-        let mut error = Self::apply_installed_goal(agent, objective, goal);
-        if error.is_none()
-            && review
-            && let Err(err) = agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review)
-        {
-            error = Some(format!("goal review mode failed: {err:#}"));
-        }
-        self.refresh_goal(agent);
-        let review_ready = review && agent.structured_goal().is_some() && error.is_none();
-        self.report_goal_result(agent, objective, error);
-        if review_ready {
-            self.push(Line::styled(
-                "review mode — /goal accept to start driving".to_string(),
-                dim(),
-            ));
-        }
+        let error = Self::apply_installed_goal(agent, objective, goal);
+        self.finish_goal_install(agent, objective, flags.review, flags.unattended, error);
         self.echo_installed_goal(agent);
         self.follow();
     }
@@ -1299,20 +1368,51 @@ impl crate::App {
         objective: &str,
         sub_goals: Vec<String>,
     ) {
-        let (review, text) = command::parse_goal_objective_flags(objective);
-        let objective = if text.is_empty() {
+        let flags = command::parse_goal_objective_flags(objective);
+        let objective = if flags.text.is_empty() {
             objective
         } else {
-            text.as_str()
+            flags.text.as_str()
         };
-        let mut error = Self::apply_goal(agent, objective, sub_goals);
+        let error = Self::apply_goal(agent, objective, sub_goals);
+        self.finish_goal_install(agent, objective, flags.review, flags.unattended, error);
+        self.echo_installed_goal(agent);
+        self.follow();
+    }
+
+    fn finish_goal_install(
+        &mut self,
+        agent: &mut Agent,
+        objective: &str,
+        review: bool,
+        unattended: bool,
+        mut error: Option<String>,
+    ) {
         if error.is_none()
             && review
             && let Err(err) = agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review)
         {
             error = Some(format!("goal review mode failed: {err:#}"));
         }
+        if error.is_none() && unattended {
+            match agent.try_set_goal_unattended(true) {
+                Ok(true) => self.push(Line::styled(
+                    hi_agent::UNATTENDED_DRIVE_WARNING.to_string(),
+                    Style::default().fg(crate::theme::theme().warning),
+                )),
+                Ok(false) => {}
+                Err(err) => error = Some(format!("goal unattended failed: {err:#}")),
+            }
+        }
         self.refresh_goal(agent);
+        if let Some(g) = agent.structured_goal() {
+            for warning in g.actionability_warnings() {
+                self.push(Line::styled(
+                    format!("{warning} (driving in-session anyway)"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+            }
+        }
         let review_ready = review && agent.structured_goal().is_some() && error.is_none();
         self.report_goal_result(agent, objective, error);
         if review_ready {
@@ -1321,8 +1421,6 @@ impl crate::App {
                 dim(),
             ));
         }
-        self.echo_installed_goal(agent);
-        self.follow();
     }
 
     /// Set a structured `Goal` from a decomposed sub-goal list; fall back to a

@@ -80,6 +80,61 @@ pub fn is_solid_checklist(markdown: &str) -> bool {
     parse_bullets(&lines).len() >= 2
 }
 
+/// Whether an objective is a concrete deliverable (not a meta/vague process line).
+pub fn objective_is_actionable(text: &str) -> Result<(), &'static str> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("empty objective");
+    }
+    if crate::agent::plan_goal::is_meta_milestone(trimmed) {
+        return Err("meta milestone (read/review/validate-only) — not a deliverable");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    const VAGUE: [&str; 6] = [
+        "investigate",
+        "consider",
+        "think about",
+        "look into",
+        "explore whether",
+        "research",
+    ];
+    let vague = VAGUE
+        .iter()
+        .any(|prefix| lower == *prefix || lower.starts_with(&format!("{prefix} ")));
+    if !vague {
+        return Ok(());
+    }
+    let has_artifact = lower.contains('/')
+        || lower.contains(".rs")
+        || lower.contains(".py")
+        || lower.contains(".ts")
+        || lower.contains(".js")
+        || lower.contains("crate")
+        || lower.contains("implement")
+        || lower.contains("add ")
+        || lower.contains("fix ")
+        || lower.contains("write ");
+    if has_artifact {
+        Ok(())
+    } else {
+        Err("vague process-only objective with no concrete deliverable")
+    }
+}
+
+/// Actionability failures for a list of objective descriptions.
+pub fn actionability_issues<'a>(
+    descriptions: impl IntoIterator<Item = &'a str>,
+) -> Vec<(String, &'static str)> {
+    descriptions
+        .into_iter()
+        .filter_map(|text| {
+            objective_is_actionable(text)
+                .err()
+                .map(|reason| (text.to_string(), reason))
+        })
+        .collect()
+}
+
 /// Load referenced workspace `.md` files and return the first solid checklist.
 pub fn ingest_plan_document(root: &Path, objective: &str) -> Option<IngestedPlan> {
     let input = planner_input(root, objective);
@@ -111,6 +166,24 @@ pub fn one_shot_workflow_plan_path(
     ingest_plan_document(root, prompt)
         .or_else(|| goal.and_then(|objective| ingest_plan_document(root, objective)))
         .map(|plan| plan.path)
+}
+
+/// Path to hand to `hi workflow run` for `/goal --workflow`. Fleet children
+/// already have a worktree and must not nest the runner.
+pub fn goal_workflow_plan_path(
+    is_fleet_child: bool,
+    root: &Path,
+    objective: &str,
+) -> Result<String, String> {
+    if is_fleet_child {
+        return Err(
+            "fleet --goal already has a worktree; omit --workflow and drive in-process".into(),
+        );
+    }
+    ingest_plan_document(root, objective).map(|plan| plan.path).ok_or_else(|| {
+        "--workflow needs a checklist .md (unchecked boxes, numbered items, or at least two bullets)"
+            .into()
+    })
 }
 
 impl crate::Agent {
@@ -212,6 +285,15 @@ impl Goal {
         }
         goal.rederive_status();
         goal
+    }
+
+    /// Warnings for weak/meta checklist rows. Interactive `/goal` still drives
+    /// them; `hi workflow run` fails closed instead.
+    pub fn actionability_warnings(&self) -> Vec<String> {
+        actionability_issues(self.sub_goals.iter().map(|step| step.description.as_str()))
+            .into_iter()
+            .map(|(text, reason)| format!("weak objective {text:?}: {reason}"))
+            .collect()
     }
 }
 
@@ -339,6 +421,49 @@ mod tests {
                 .as_deref(),
             Some("plan.md")
         );
+        assert_eq!(
+            goal_workflow_plan_path(false, &root, "implement plan.md").as_deref(),
+            Ok("plan.md")
+        );
+        assert_eq!(
+            goal_workflow_plan_path(true, &root, "implement plan.md").unwrap_err(),
+            "fleet --goal already has a worktree; omit --workflow and drive in-process"
+        );
+        assert!(
+            goal_workflow_plan_path(false, &root, "fix the off-by-one in count()")
+                .unwrap_err()
+                .contains("--workflow needs a checklist")
+        );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn objective_is_actionable_rejects_meta_and_vague() {
+        assert!(
+            objective_is_actionable("add a --seed flag to the trainer, with a unit test").is_ok()
+        );
+        assert!(objective_is_actionable("wire the CLI").is_ok());
+        assert!(objective_is_actionable("Final workspace validation").is_err());
+        assert!(objective_is_actionable("investigate the parser").is_err());
+        assert!(objective_is_actionable("consider the approach").is_err());
+        assert!(
+            objective_is_actionable("investigate src/parser.rs and fix the off-by-one").is_ok()
+        );
+        let warnings = Goal::from_plan_items(
+            "ship it",
+            vec![
+                PlanItem {
+                    description: "add the flag".into(),
+                    done: false,
+                },
+                PlanItem {
+                    description: "investigate the parser".into(),
+                    done: false,
+                },
+            ],
+        )
+        .actionability_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("investigate the parser"));
     }
 }

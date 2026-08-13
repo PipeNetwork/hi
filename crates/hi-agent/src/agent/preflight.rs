@@ -303,6 +303,7 @@ impl crate::Agent {
                     result.call.name,
                     &result.call.arguments,
                 ),
+                command: None,
             });
             if result.call.name == "grep" {
                 let remaining_extra_reads =
@@ -399,6 +400,7 @@ impl crate::Agent {
                     result.call.name,
                     &result.call.arguments,
                 ),
+                command: None,
             });
             let compacted_output =
                 compact_preflight_tool_output(result.call.name, &result.output.content);
@@ -489,6 +491,7 @@ impl crate::Agent {
             progress_kind: progress_kind.to_string(),
             progress_reason: progress_reason.to_string(),
             normalized_signature: None,
+            command: crate::steering::bash_command(&arguments),
         });
         emit_tool_output(ui, "implementation-preflight", "bash", &output);
         self.messages.push_assistant_with_results(

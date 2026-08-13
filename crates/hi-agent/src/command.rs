@@ -400,7 +400,7 @@ pub fn goal_arg_is_objective(arg: &str) -> bool {
     // but a flag by itself is a usage error, not an objective literally named
     // `--review`.
     if a.starts_with("--") {
-        return !parse_goal_objective_flags(a).1.is_empty();
+        return !parse_goal_objective_flags(a).text.is_empty();
     }
     let head = a.split_whitespace().next().unwrap_or(a);
     !matches!(
@@ -419,25 +419,38 @@ pub fn goal_arg_is_objective(arg: &str) -> bool {
             | "budget"
             | "team"
             | "edit"
+            | "unattended"
     ) && !a.starts_with("limit ")
         && !a.starts_with("budget ")
         && !a.starts_with("team ")
         && !a.starts_with("edit ")
+        && !a.starts_with("unattended ")
 }
 
-/// Strip `/goal` objective flags. Returns `(review_first, objective_text)`.
-pub fn parse_goal_objective_flags(arg: &str) -> (bool, String) {
-    let mut review = false;
+/// Flags stripped from a `/goal` objective before planning or ingest.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GoalObjectiveFlags {
+    pub review: bool,
+    pub unattended: bool,
+    pub workflow: bool,
+    pub text: String,
+}
+
+/// Strip `/goal` objective flags. Returns review/unattended/workflow plus the
+/// remaining objective text.
+pub fn parse_goal_objective_flags(arg: &str) -> GoalObjectiveFlags {
+    let mut flags = GoalObjectiveFlags::default();
     let mut rest = Vec::new();
     for tok in arg.split_whitespace() {
         match tok {
-            "--review" | "-r" | "--review-first" => review = true,
+            "--review" | "-r" | "--review-first" => flags.review = true,
+            "--unattended" => flags.unattended = true,
+            "--workflow" => flags.workflow = true,
             other => rest.push(other),
         }
     }
-    // Also allow trailing/leading bare `review` only as a flag when alone with objective words —
-    // keep it simple: only `--review`.
-    (review, rest.join(" "))
+    flags.text = rest.join(" ");
+    flags
 }
 
 /// Parsed `/goal edit …` forms.
@@ -943,6 +956,31 @@ pub fn parse_goal_team(arg: &str) -> Option<GoalTeamArg> {
         "on" | "yes" | "true" => GoalTeamArg::On,
         "off" | "no" | "false" => GoalTeamArg::Off,
         other => GoalTeamArg::Invalid(other.to_string()),
+    })
+}
+
+/// Parsed `/goal unattended …` (elevate Goal-drive turns to Always).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalUnattendedArg {
+    On,
+    Off,
+    Show,
+    Invalid(String),
+}
+
+/// Parse `/goal unattended …`. Returns `None` when `arg` is not that subcommand.
+pub fn parse_goal_unattended(arg: &str) -> Option<GoalUnattendedArg> {
+    let a = arg.trim();
+    let rest = if a == "unattended" {
+        ""
+    } else {
+        a.strip_prefix("unattended ")?.trim()
+    };
+    Some(match rest {
+        "" => GoalUnattendedArg::Show,
+        "on" | "yes" | "true" => GoalUnattendedArg::On,
+        "off" | "no" | "false" => GoalUnattendedArg::Off,
+        other => GoalUnattendedArg::Invalid(other.to_string()),
     })
 }
 
@@ -1652,8 +1690,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "goal",
-        args: "[text|--review|status|pause|resume|accept|edit|limit|budget|team|export|clear]",
-        help: "long-horizon goal: plan, drive, pause reasons, status, edit, export",
+        args: "[text|--review|--unattended|--workflow|status|pause|resume|accept|edit|limit|budget|team|unattended|export|clear]",
+        help: "long-horizon goal: plan, drive, pause reasons, status, edit, export. Checklist .md with git+verify → `hi workflow run`; otherwise in-session drive.",
         arg_values: &[
             ("status", "rich status: drive state, checklist, events"),
             (
@@ -1668,6 +1706,18 @@ pub const COMMANDS: &[CommandSpec] = &[
             (
                 "--review",
                 "with an objective: pause for review before auto-drive",
+            ),
+            (
+                "--unattended",
+                "with an objective: Goal drive turns run as Always (YOLO), then restore",
+            ),
+            (
+                "unattended",
+                "toggle: /goal unattended on|off — Always on Goal drive turns",
+            ),
+            (
+                "--workflow",
+                "with a checklist .md: detach hi workflow run (fails closed on meta/vague rows)",
             ),
             (
                 "edit",
@@ -2315,10 +2365,11 @@ pub fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, Command, GoalBudgetArg, GoalEditArg, GoalLimitArg, GoalTeamArg, LoopArg,
-        TurnsArg, expand_prompt_macro, goal_arg_is_objective, help_text, matching, parse,
-        parse_goal_budget, parse_goal_edit, parse_goal_limit, parse_goal_objective_flags,
-        parse_goal_team, parse_loop_arg, parse_turns_arg,
+        COMMANDS, Command, GoalBudgetArg, GoalEditArg, GoalLimitArg, GoalObjectiveFlags,
+        GoalTeamArg, GoalUnattendedArg, LoopArg, TurnsArg, expand_prompt_macro,
+        goal_arg_is_objective, help_text, matching, parse, parse_goal_budget, parse_goal_edit,
+        parse_goal_limit, parse_goal_objective_flags, parse_goal_team, parse_goal_unattended,
+        parse_loop_arg, parse_turns_arg,
     };
 
     #[test]
@@ -2918,6 +2969,8 @@ mod tests {
             "limit 20",
             "team",
             "team on",
+            "unattended",
+            "unattended on",
         ] {
             assert!(
                 !goal_arg_is_objective(control),
@@ -2926,7 +2979,11 @@ mod tests {
         }
         assert_eq!(
             parse_goal_objective_flags("--review ship it"),
-            (true, "ship it".into())
+            GoalObjectiveFlags {
+                review: true,
+                text: "ship it".into(),
+                ..GoalObjectiveFlags::default()
+            }
         );
         assert_eq!(
             parse_goal_edit("edit step 2 do the thing"),
@@ -3257,6 +3314,34 @@ mod tests {
         // Not a team subcommand → None (handled elsewhere, e.g. as an objective).
         assert_eq!(parse_goal_team("teamwork refactor"), None);
         assert_eq!(parse_goal_team("port to Rust"), None);
+    }
+
+    #[test]
+    fn goal_unattended_and_workflow_flags() {
+        assert_eq!(
+            parse_goal_unattended("unattended on"),
+            Some(GoalUnattendedArg::On)
+        );
+        assert_eq!(
+            parse_goal_unattended("unattended off"),
+            Some(GoalUnattendedArg::Off)
+        );
+        assert_eq!(
+            parse_goal_unattended("unattended"),
+            Some(GoalUnattendedArg::Show)
+        );
+        assert_eq!(parse_goal_unattended("ship it"), None);
+        assert_eq!(
+            parse_goal_objective_flags("--unattended --workflow implement plan.md"),
+            GoalObjectiveFlags {
+                unattended: true,
+                workflow: true,
+                text: "implement plan.md".into(),
+                ..GoalObjectiveFlags::default()
+            }
+        );
+        assert!(goal_arg_is_objective("--workflow implement plan.md"));
+        assert!(!goal_arg_is_objective("--workflow"));
     }
 
     #[test]

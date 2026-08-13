@@ -41,7 +41,9 @@ use crate::apply_plan_to_goal;
 use crate::heuristics::plan_has_pending_steps;
 use crate::steering::implementation_tool_call_mutates;
 
-use super::super::helpers::{synthetic_tool_outcome, tool_entry, tool_satisfies_validation};
+use super::super::helpers::{
+    synthetic_tool_outcome, tool_entry, tool_entry_with_args, tool_satisfies_validation,
+};
 use super::super::phase::TurnPhase;
 use super::super::progress::{
     ProgressKind, ProgressTracker, ToolProgressLabel, classify_tool_progress, signature_seen,
@@ -704,12 +706,13 @@ impl crate::Agent {
                 );
                 progress_tracker.record_tool(&progress_label);
                 tool_progress_labels.push(progress_label.clone());
-                tool_timeline.push(tool_entry(
+                tool_timeline.push(tool_entry_with_args(
                     name.clone(),
                     path,
                     duration_ms,
                     &output,
                     &progress_label,
+                    arguments,
                 ));
                 emit_tool_output(&mut *ui, id, name, &output);
                 results[i] = Some((id.clone(), output.content));
@@ -1600,12 +1603,13 @@ impl crate::Agent {
                 );
                 progress_tracker.record_tool(&progress_label);
                 tool_progress_labels.push(progress_label.clone());
-                tool_timeline.push(tool_entry(
+                tool_timeline.push(tool_entry_with_args(
                     name.clone(),
                     path,
                     batch_duration_ms,
                     &output,
                     &progress_label,
+                    &calls[i].2,
                 ));
                 emit_tool_output(&mut *ui, &calls[i].0, name, &output);
                 results[i] = Some((calls[i].0.clone(), output.content));

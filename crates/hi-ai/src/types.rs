@@ -392,8 +392,9 @@ impl Message {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Content {
     Text(String),
-    /// Model reasoning. `signature` is Anthropic's cryptographic attestation,
-    /// which must be echoed back verbatim when continuing after a tool call.
+    /// Model reasoning. `signature` is a provider attestation that must be
+    /// echoed back when continuing after a tool call: Anthropic's thinking
+    /// signature, or xAI Responses encrypted reasoning content.
     Thinking {
         text: String,
         signature: Option<String>,
@@ -461,10 +462,11 @@ pub struct ChatRequest {
     /// When set, asks the provider to emit reasoning with this token budget
     /// (Anthropic extended thinking). Ignored by providers that don't support it.
     pub thinking_budget: Option<u32>,
-    /// Abstract reasoning level for OpenAI-compatible endpoints that accept a
-    /// `reasoning_effort` parameter (see [`ReasoningEffort`]). `None` omits the
-    /// field, leaving the endpoint default. Ignored by the Anthropic adapter,
-    /// which uses `thinking_budget` instead.
+    /// Abstract reasoning level for endpoints that accept a reasoning-effort
+    /// parameter (see [`ReasoningEffort`]). `None` omits the field, leaving the
+    /// endpoint default. The OpenAI adapter sends `reasoning_effort`; the xAI
+    /// Responses adapter sends `reasoning.effort`. Ignored by the Anthropic
+    /// adapter, which uses `thinking_budget` instead.
     pub reasoning_effort: Option<ReasoningEffort>,
     pub profile: RequestProfile,
 }

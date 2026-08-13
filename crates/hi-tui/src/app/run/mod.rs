@@ -2863,6 +2863,35 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     app.follow();
                     continue;
                 }
+                // `/goal --workflow <plan.md>`: detach the existing plan runner.
+                // Do not also install an in-session structured goal.
+                Command::Goal(arg)
+                    if hi_agent::command::parse_goal_objective_flags(&arg).workflow =>
+                {
+                    let flags = hi_agent::command::parse_goal_objective_flags(&arg);
+                    match hi_agent::goal_workflow_plan_path(
+                        false,
+                        agent.workspace_root(),
+                        &flags.text,
+                    ) {
+                        Ok(path) => {
+                            let plan = agent.workspace_root().join(&path);
+                            crate::workflow_tui::handle_plan_workflow(
+                                &mut app,
+                                &plan.to_string_lossy(),
+                                &fleet_launcher.exe,
+                            );
+                        }
+                        Err(err) => {
+                            app.push(Line::styled(
+                                err,
+                                Style::default().fg(crate::theme::theme().warning),
+                            ));
+                            app.follow();
+                        }
+                    }
+                    continue;
+                }
                 // `/goal <objective>`: decompose with the planner behind a spinner
                 // (Esc cancels), then install the structured goal. Control
                 // subcommands (clear/pause/resume/limit) and the no-planner case
@@ -2874,18 +2903,19 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     // particular, `/goal --review <objective>` should pause
                     // the installed plan for review; the planner must receive
                     // only the objective text, not the CLI flag itself.
-                    let (review, parsed_objective) =
-                        hi_agent::command::parse_goal_objective_flags(&arg);
-                    let objective = if parsed_objective.is_empty() {
+                    let flags = hi_agent::command::parse_goal_objective_flags(&arg);
+                    let objective = if flags.text.is_empty() {
                         arg.trim().to_string()
                     } else {
-                        parsed_objective
+                        flags.text
                     };
-                    let goal_argument = if review {
-                        format!("--review {objective}")
-                    } else {
-                        objective.clone()
-                    };
+                    let mut goal_argument = objective.clone();
+                    if flags.unattended {
+                        goal_argument = format!("--unattended {goal_argument}");
+                    }
+                    if flags.review {
+                        goal_argument = format!("--review {goal_argument}");
+                    }
                     if let Some(goal) = agent.try_ingest_goal(&objective) {
                         app.set_ingested_goal(agent, &goal_argument, goal);
                         agent.reset_goal_drive_stall();
@@ -3236,6 +3266,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     }
                     _ => {}
                 }
+            }
+            if let Some(count) = agent.take_goal_requeue_notice() {
+                app.push(Line::styled(
+                    hi_agent::goal_drive_requeue_message(count),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
             }
             if plan_drive_turn {
                 let made_progress = hi_agent::plan_drive_made_progress(

@@ -84,6 +84,9 @@ pub(super) struct ProgressTracker {
     pub(super) awaiting_background: bool,
     /// Extra recoveries after a stall budget was spent (`max_keep_working`).
     pub(super) keep_working_rounds: u32,
+    /// Signature of the stall that last consumed keep-working. A following
+    /// round with the same signature is not another recovery.
+    pub(super) keep_working_blocked_signature: Option<String>,
     pub(super) events: Vec<ProgressEvent>,
 }
 
@@ -133,6 +136,13 @@ impl ProgressTracker {
         }
         self.keep_working_rounds = self.keep_working_rounds.saturating_add(1);
         true
+    }
+
+    pub(super) fn last_event_signature(&self) -> Option<String> {
+        self.events
+            .iter()
+            .rev()
+            .find_map(|event| event.signature.clone())
     }
 
     pub(super) fn record_no_progress_nudge(
