@@ -257,6 +257,10 @@ pub(crate) fn config() -> AgentConfig {
             finalize: false,
             // Off so canned turns don't need an extra completion for ghost text.
             suggest_next_prompt: false,
+            // Off so token-budget and message-shape tests aren't perturbed by the
+            // rust-workspace stack pack body (this repo has a Cargo.toml). Tests
+            // that assert the injection opt in.
+            inject_stack_skill: false,
             ..crate::AgentMemory::default()
         },
         subagents: crate::AgentSubagents {

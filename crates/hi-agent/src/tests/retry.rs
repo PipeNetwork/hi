@@ -461,6 +461,10 @@ async fn context_preflight_reduces_output_budget_to_available_headroom() {
     cfg.routing.tool_mode = ToolMode::ChatOnly;
     cfg.routing.max_tokens = 8192;
     cfg.routing.requested_max_tokens = 8192;
+    // Suppress the volatile context block (the ask_user line for non-subagents)
+    // so the request estimate matches the test's pre-block prompt_estimate
+    // exactly. This isolates the max_tokens reduction logic.
+    cfg.subagents.is_subagent = true;
     let (mut agent, _requests, max_tokens) = scripted_agent_recording_max_tokens(
         vec![ProviderStep::Completion(completion(
             vec![Content::Text("ok".into())],

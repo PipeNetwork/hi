@@ -59,7 +59,13 @@ impl crate::Agent {
         ui: &mut dyn Ui,
     ) -> bool {
         let signature = progress.last_event_signature();
-        if progress.keep_working_blocked_signature.is_some()
+        // Only block a second keep-working when the model actually re-ran a
+        // tool with the stalled signature since the last recovery. Two
+        // consecutive text-only recap stalls share a stale tool signature
+        // (no tool ran between them), but the model did not re-issue the
+        // stalled action — so the second recovery must still fire.
+        if progress.saw_tool_since_keep_working
+            && progress.keep_working_blocked_signature.is_some()
             && progress.keep_working_blocked_signature == signature
             && signature.is_some()
         {
@@ -69,6 +75,7 @@ impl crate::Agent {
             return false;
         }
         progress.keep_working_blocked_signature = signature.clone();
+        progress.saw_tool_since_keep_working = false;
         *stalled_unfinished = false;
         *stalled_repeating = false;
         *force_tools_next = true;

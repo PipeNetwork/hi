@@ -1730,7 +1730,9 @@ impl crate::Agent {
                 parts.push(t.to_string());
             }
         }
-        if let Some(section) = crate::skills::active_stack_skill_section(self.runtime.root()) {
+        if self.config.memory.inject_stack_skill
+            && let Some(section) = crate::skills::active_stack_skill_section(self.runtime.root())
+        {
             parts.push(section);
         }
         if let Some(section) = self

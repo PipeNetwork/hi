@@ -4095,7 +4095,10 @@ async fn system_message_stays_byte_stable_and_context_block_is_singular() {
 fn matching_stack_skill_lands_in_volatile_context_not_system_prompt() {
     let workspace = IsolatedWorkspace::new("stack-skill-volatile");
     std::fs::write(workspace.path("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
-    let agent = agent(vec![], workspace.config());
+    let mut cfg = workspace.config();
+    // The base test config disables injection; this test asserts it, so opt in.
+    cfg.memory.inject_stack_skill = true;
+    let agent = agent(vec![], cfg);
     let block = agent.volatile_context_block().unwrap_or_default();
     assert!(
         block.contains("# Active stack skill"),

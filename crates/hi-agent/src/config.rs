@@ -654,6 +654,11 @@ pub struct AgentMemory {
     pub context_exclusions: Vec<String>,
     /// Whether the agent may curate/learn skills during the session.
     pub curate_skills: bool,
+    /// Whether the matching stack pack (rust-workspace / pytest-package /
+    /// ts-monorepo) is auto-injected into the per-turn volatile context block.
+    /// On by default in production; the test harness disables it so canned-
+    /// provider tests measure stable token budgets and message shapes.
+    pub inject_stack_skill: bool,
     /// After a successful turn, predict a Claude-style "suggested next prompt"
     /// for the interactive input bar (ghost text). Side call; off for
     /// subagents / plan mode / goal auto-drive regardless of this flag.
@@ -677,6 +682,7 @@ impl Default for AgentMemory {
             disabled_tools: Vec::new(),
             context_exclusions: Vec::new(),
             curate_skills: false,
+            inject_stack_skill: true,
             // On by default for interactive coding; disable via profile / env /
             // `/config suggest off`.
             suggest_next_prompt: true,

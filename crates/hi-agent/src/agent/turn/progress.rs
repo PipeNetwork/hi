@@ -87,6 +87,12 @@ pub(super) struct ProgressTracker {
     /// Signature of the stall that last consumed keep-working. A following
     /// round with the same signature is not another recovery.
     pub(super) keep_working_blocked_signature: Option<String>,
+    /// Whether any tool ran since the last keep-working recovery. The
+    /// blocked-signature guard only applies when this is true: a tool that
+    /// re-issues the stalled action is a real repeat, but two consecutive
+    /// text-only recap stalls share a stale tool signature without the model
+    /// re-issuing anything.
+    pub(super) saw_tool_since_keep_working: bool,
     pub(super) events: Vec<ProgressEvent>,
 }
 
@@ -150,6 +156,14 @@ impl ProgressTracker {
         reason: impl Into<String>,
         signature: Option<String>,
     ) -> bool {
+        // A signature here means the model issued a tool call this round (e.g.
+        // a repeat caught by the repeat guard before execution). The
+        // keep-working blocked-signature guard must treat that as a tool ran,
+        // so a re-issued stalled action is still blocked even though the
+        // repeat guard skipped `record_tool`.
+        if signature.is_some() {
+            self.saw_tool_since_keep_working = true;
+        }
         self.no_progress_nudges = self.no_progress_nudges.saturating_add(1);
         self.record(ProgressKind::None, reason, signature);
         self.no_progress_nudges >= NO_PROGRESS_FINAL_ANSWER_NUDGE_THRESHOLD
@@ -157,6 +171,13 @@ impl ProgressTracker {
     }
 
     pub(super) fn record_tool(&mut self, label: &ToolProgressLabel) {
+        // A tool ran this round, so the next keep-working guard can compare
+        // against this round's signature (the model may be re-issuing the
+        // stalled action). Without this flag, two consecutive text-only recap
+        // stalls would both compare against the last *tool* signature (which
+        // never changed between them) and the second recovery would be
+        // wrongly blocked.
+        self.saw_tool_since_keep_working = true;
         self.push_event(label.kind, label.reason.clone(), label.signature.clone());
     }
 
