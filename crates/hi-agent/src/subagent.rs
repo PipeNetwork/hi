@@ -7,7 +7,16 @@
 //! worktree + subprocess + verify + apply-back dance. If none is attached, the
 //! `delegate` tool reports itself unavailable.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
+
+/// Live activity from a running `delegate` child (worktree setup, verification,
+/// or parsed child JSONL). `Send + Sync` so the CLI can call it from the
+/// blocking runner / file-tailer thread.
+pub trait DelegateProgress: Send + Sync {
+    fn progress(&self, activity: &str, line: Option<&str>);
+}
 
 /// A per-role model route override (team roles): which model — and optionally
 /// which OpenAI-compatible endpoint — a subagent runs on, independent of the
@@ -94,5 +103,20 @@ pub trait DelegateRunner: Send + Sync {
     ) -> DelegateOutcome {
         let _ = route;
         self.run_cancellable(task, verify, cancellation).await
+    }
+
+    /// Route-aware delegate execution with a live progress sink. Existing
+    /// runners keep today's behavior through the default (progress is ignored).
+    /// The CLI runner tails the child's `--events-jsonl` file into `progress`.
+    async fn run_routed_with_progress(
+        &self,
+        task: &str,
+        verify: Option<&str>,
+        route: &SubagentRoute,
+        cancellation: crate::TurnCancellation,
+        progress: Option<Arc<dyn DelegateProgress>>,
+    ) -> DelegateOutcome {
+        let _ = progress;
+        self.run_routed(task, verify, route, cancellation).await
     }
 }

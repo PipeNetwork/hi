@@ -13,6 +13,7 @@ mod commands;
 mod complete;
 mod config;
 mod delegate;
+mod delegate_events;
 mod diff_lab;
 mod doctor;
 mod eval;
@@ -885,6 +886,7 @@ async fn run() -> Result<()> {
                 } else {
                     Box::new(PlainUi::new())
                 };
+                let primary = delegate_events::wrap_event_ui(primary, cli.events_jsonl.as_deref());
                 let mut multi = sync::MultiplexUi {
                     primary,
                     remote: rui.clone(),
@@ -898,16 +900,19 @@ async fn run() -> Result<()> {
                 let mut observed = ObservedUi::new(&mut multi, tools);
                 run_one_shot_cancellable(agent.run_turn(&current_prompt, &mut observed)).await
             } else {
-                let mut plain = PlainUi::new();
-                let mut quiet = ui::QuietUi;
-                let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
+                let inner: Box<dyn hi_agent::Ui> = if cli.quiet {
+                    Box::new(ui::QuietUi)
+                } else {
+                    Box::new(PlainUi::new())
+                };
+                let mut view = delegate_events::wrap_event_ui(inner, cli.events_jsonl.as_deref());
                 let tools = rsi.observer.as_ref().map(|observer| {
                     ToolObserver::new(
                         observer.clone() as std::sync::Arc<dyn ObservationSink>,
                         observer.full_capture(),
                     )
                 });
-                let mut observed = ObservedUi::new(view, tools);
+                let mut observed = ObservedUi::new(&mut *view, tools);
                 run_one_shot_cancellable(agent.run_turn(&current_prompt, &mut observed)).await
             };
             result = if let Some(result) = turn_result {
@@ -1731,9 +1736,9 @@ async fn run() -> Result<()> {
     }
 
     // Plain REPL startup (including TUI fallback): print normal-screen context
-    // here, not before TUI launch. The TUI renders its own splash/resume summary
-    // inside the alternate screen; printing them before entering TUI leaves a
-    // stale banner in scrollback and makes a normal exit look like a crash.
+    // here, not before TUI launch. The TUI keeps a quiet empty canvas (and a
+    // one-line resume summary when continuing); printing a banner first leaves
+    // stale text in scrollback and makes a normal exit look like a crash.
     if let Some(summary) = &resume_summary {
         println!("\x1b[2m{summary}\x1b[0m");
     }

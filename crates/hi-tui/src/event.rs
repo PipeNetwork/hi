@@ -8,7 +8,7 @@ use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 use hi_agent::{
     AskUserFuture, AskUserResult, ConfirmationFuture, ConfirmationRequest, ConfirmationResult,
-    PlanStep, Ui,
+    PlanStep, SubagentSink, Ui,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -103,6 +103,24 @@ pub enum UiEvent {
     SuggestedPrompt {
         text: String,
     },
+    SubagentSpawned {
+        id: String,
+        subagent_kind: String,
+        description: String,
+        background: bool,
+    },
+    SubagentProgress {
+        id: String,
+        activity: String,
+        #[serde(default)]
+        line: Option<String>,
+    },
+    SubagentFinished {
+        id: String,
+        status: String,
+        elapsed_ms: u64,
+        summary: String,
+    },
     /// Revisioned workflow lifecycle state. Receivers must ignore stale
     /// revisions, including updates for runs already tombstoned by a terminal
     /// snapshot.
@@ -122,6 +140,36 @@ pub(crate) struct ChannelUi {
     pub confirmations: mpsc::UnboundedSender<ConfirmationControl>,
     pub event_sink: Option<Arc<dyn hi_events::EventSink>>,
     pub approval_store: Option<Arc<dyn hi_policy::ApprovalStore>>,
+}
+
+struct ChannelSubagentSink {
+    tx: mpsc::UnboundedSender<UiEvent>,
+}
+
+impl SubagentSink for ChannelSubagentSink {
+    fn spawned(&self, id: &str, kind: &str, description: &str, background: bool) {
+        let _ = self.tx.send(UiEvent::SubagentSpawned {
+            id: id.to_string(),
+            subagent_kind: kind.to_string(),
+            description: description.to_string(),
+            background,
+        });
+    }
+    fn progress(&self, id: &str, activity: &str, line: Option<&str>) {
+        let _ = self.tx.send(UiEvent::SubagentProgress {
+            id: id.to_string(),
+            activity: activity.to_string(),
+            line: line.map(str::to_string),
+        });
+    }
+    fn finished(&self, id: &str, status: &str, elapsed_ms: u64, summary: &str) {
+        let _ = self.tx.send(UiEvent::SubagentFinished {
+            id: id.to_string(),
+            status: status.to_string(),
+            elapsed_ms,
+            summary: summary.to_string(),
+        });
+    }
 }
 
 /// Local-only control message. Confirmation responses are deliberately not
@@ -637,6 +685,11 @@ impl Ui for ChannelUi {
         self.send(UiEvent::SuggestedPrompt {
             text: text.to_string(),
         });
+    }
+    fn subagent_sink(&self) -> Option<Arc<dyn SubagentSink>> {
+        Some(Arc::new(ChannelSubagentSink {
+            tx: self.tx.clone(),
+        }))
     }
 }
 

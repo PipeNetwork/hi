@@ -1,6 +1,7 @@
 //! Drive an agent future while keeping the TUI live (redraw, scroll, cancel, interject).
 
 use std::io;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -95,6 +96,9 @@ pub(crate) async fn drive<T>(
     // so the agent can settle tool_results cooperatively instead of only
     // dropping the turn future.
     turn_cancel: Option<hi_agent::TurnCancellation>,
+    // Cloneable task registry so `/tasks` can kill a background subagent
+    // without borrowing the agent the turn future already holds.
+    bg_tasks: Arc<hi_tools::BackgroundTaskRegistry>,
 ) -> Result<DriveCompletion<T>> {
     tokio::pin!(fut);
     let mut cancelled = false;
@@ -406,7 +410,35 @@ pub(crate) async fn drive<T>(
                                     continue;
                                 }
                                 Some(ChordPipeline::PaletteAccept(cmd)) => {
-                                    let _ = app.enqueue_prompt(cmd);
+                                    let open_tasks = matches!(
+                                        command::parse(&cmd),
+                                        Some(Command::Tasks(_))
+                                    ) || matches!(
+                                        command::parse(&cmd),
+                                        Some(Command::Queue(arg)) if arg.trim() == "tasks"
+                                    );
+                                    if open_tasks {
+                                        crate::subagent_overlay::open_tasks(
+                                            app,
+                                            &[],
+                                            &bg_tasks.list_now(),
+                                        );
+                                    } else {
+                                        let _ = app.enqueue_prompt(cmd);
+                                    }
+                                    continue;
+                                }
+                                Some(ChordPipeline::KillTask(id)) => {
+                                    let message = match bg_tasks.kill(&id).await {
+                                        Some(outcome) => {
+                                            crate::subagent_overlay::mark_cancelled(app, &id);
+                                            format!("Task {} cancelled.", outcome.id)
+                                        }
+                                        None => format!(
+                                            "kill_task error: no task with id \"{id}\""
+                                        ),
+                                    };
+                                    app.push(Line::styled(message, dim()));
                                     continue;
                                 }
                                 None => {}
@@ -414,6 +446,20 @@ pub(crate) async fn drive<T>(
                             if let Some(submitted) = app.edit_key(&key) {
                                 match command::parse(&submitted) {
                                     Some(Command::Copy(arg)) => app.copy(&arg),
+                                    Some(Command::Tasks(_)) => {
+                                        crate::subagent_overlay::open_tasks(
+                                            app,
+                                            &[],
+                                            &bg_tasks.list_now(),
+                                        );
+                                    }
+                                    Some(Command::Queue(arg)) if arg.trim() == "tasks" => {
+                                        crate::subagent_overlay::open_tasks(
+                                            app,
+                                            &[],
+                                            &bg_tasks.list_now(),
+                                        );
+                                    }
                                     Some(Command::Btw(question)) => {
                                         // Immediate side-channel answer: own model
                                         // call(s) via BtwDispatcher — do NOT wait

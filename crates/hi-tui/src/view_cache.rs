@@ -25,6 +25,8 @@ pub(crate) struct TranscriptViewCache {
     /// cache identity because the marker text changes while the boolean
     /// "marker is present" state remains true.
     pub trimmed: u64,
+    /// Max live subagent elapsed seconds; busts the cache so row timers tick.
+    pub subagent_tick: u64,
 
     pub lines: Vec<ratatui::text::Line<'static>>,
     /// `prefix[i]` = wrapped rows above flattened line `i`; `prefix[len]` = total.
@@ -53,6 +55,7 @@ pub(crate) struct ViewCacheKey {
     pub(crate) nav_selected: Option<usize>,
     pub(crate) pending_fp: u64,
     pub(crate) trimmed: u64,
+    pub(crate) subagent_tick: u64,
 }
 
 impl TranscriptViewCache {
@@ -67,6 +70,7 @@ impl TranscriptViewCache {
             nav_selected: self.nav_selected,
             pending_fp: self.pending_fp,
             trimmed: self.trimmed,
+            subagent_tick: self.subagent_tick,
         }
     }
 
@@ -85,6 +89,7 @@ impl TranscriptViewCache {
         nav_selected: Option<usize>,
         pending_fp: u64,
         trimmed: u64,
+        subagent_tick: u64,
     ) -> bool {
         self.generation == generation
             && self.theme_revision == theme_revision
@@ -95,6 +100,7 @@ impl TranscriptViewCache {
             && self.nav_selected == nav_selected
             && self.pending_fp == pending_fp
             && self.trimmed == trimmed
+            && self.subagent_tick == subagent_tick
             && !self.prefix.is_empty()
     }
 
@@ -209,6 +215,7 @@ mod tests {
             nav_selected: None,
             pending_fp: 0,
             trimmed: 0,
+            subagent_tick: 0,
             lines: vec![ratatui::text::Line::raw("line")],
             prefix: vec![0, 1],
             ..Default::default()
@@ -222,6 +229,7 @@ mod tests {
             crate::Density::Comfortable,
             None,
             0,
+            0,
             0
         ));
         assert!(!cache.matches(
@@ -232,6 +240,7 @@ mod tests {
             false,
             crate::Density::Comfortable,
             None,
+            0,
             0,
             0
         ));

@@ -1,13 +1,14 @@
 //! Full-screen terminal UI for `hi`.
 //!
-//! A ratatui application on the alternate screen: a bordered, scrollable
-//! conversation transcript with a title/status bar, and an input box with a
-//! "working" spinner. The agent runs behind an mpsc channel ([`ChannelUi`]) so
+//! A ratatui application on the alternate screen in grok-build's session
+//! chrome: a flat status bar, unboxed scrollback, a quiet rounded prompt, and
+//! a shortcuts row. The agent runs behind an mpsc channel ([`ChannelUi`]) so
 //! the event loop can keep redrawing — spinner, streaming output, scrolling —
 //! while a turn is in flight, and can cancel it with Ctrl-C.
 
 mod action;
 mod activity;
+mod activity_feed;
 mod app;
 #[doc(hidden)]
 pub mod benchmark;
@@ -27,6 +28,7 @@ mod profiling;
 mod race;
 pub use app::run;
 pub use daemon::run_loops_daemon;
+mod chrome;
 mod completion;
 pub mod event;
 mod input;
@@ -36,6 +38,7 @@ mod model_picker;
 mod provider_form;
 mod provider_picker;
 mod render;
+mod subagent_overlay;
 mod sync_tui;
 mod theme;
 mod tutorial;
@@ -52,7 +55,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use hi_agent::{Agent, AgentStateSnapshot};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 #[cfg(test)]
@@ -467,7 +470,8 @@ pub struct RunOptions {
 use completion::CompletionState;
 use input::InputLine;
 use model_picker::ModelPicker;
-use render::{dim, line_text};
+pub(crate) use render::dim;
+use render::line_text;
 
 pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// How many model rows the `/model` picker shows at once.
@@ -478,10 +482,10 @@ pub(crate) const PICKER_ROWS: usize = 12;
 pub(crate) const FORM_LABEL_WIDTH: usize = 9;
 
 /// A synchronous, plain (uncolored) `git diff` of the working tree, for the
-/// `Ctrl-D` diff panel. The TUI applies its own highlighting via `diff_lines`,
-/// so we want the raw diff without ANSI codes. Returns empty when not a git
-/// repo or there are no changes. Synchronous because the key handler isn't
-/// async and `git diff` is fast/user-initiated.
+/// full-screen review overlay (Ctrl-G / Ctrl-D). The TUI applies its own
+/// highlighting via `diff_lines`, so we want the raw diff without ANSI codes.
+/// Returns empty when not a git repo or there are no changes. Synchronous
+/// because the key handler isn't async and `git diff` is fast/user-initiated.
 pub(crate) fn working_tree_diff_sync(root: &std::path::Path) -> String {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -596,62 +600,6 @@ fn watchdog_stuck_timeout_from_value(value: Option<&str>) -> Duration {
     Duration::from_secs(seconds)
 }
 
-/// The "PipeNetwork.AI" wordmark rendered as figlet-style 5-row block letters.
-/// All orange, ~2x the height of a normal line — the splash centerpiece.
-/// Generated from `figlet -f small`, then hand-trimmed of trailing whitespace.
-const BANNER: [&str; 5] = [
-    " ___ _           _  _     _                  _       _   ___ ",
-    "| _ (_)_ __  ___| \\| |___| |___ __ _____ _ _| |__   /_\\ |_ _|",
-    "|  _/ | '_ \\/ -_) .` / -_)  _\\ V  V / _ \\ '_| / /_ / _ \\ | | ",
-    "|_| |_| .__/\\___|_|\\_\\___|\\__|\\_/\\_/\\___/_| |_\\_(_)_/ \\_\\___|",
-    "      |_|                                                    ",
-];
-
-/// Build the PipeNetwork.AI landing banner as styled lines, pushed as the
-/// first transcript entries on startup. The full "PipeNetwork.AI" wordmark is
-/// rendered ~2x size as a 5-row block-letter banner (all orange), followed by
-/// the dim model line (model, context window, provider, reasoning level) and
-/// the working directory. A blank line of breathing room follows before the
-/// usage hint. Sits at the top of the transcript and scrolls up naturally as
-/// you work.
-pub(crate) fn splash_lines(
-    provider: &str,
-    model: &str,
-    context_window: Option<u32>,
-    reasoning_effort: Option<hi_ai::ReasoningEffort>,
-) -> Vec<Line<'static>> {
-    let orange = Style::default().fg(Color::Rgb(255, 140, 0));
-    let bold_orange = orange.add_modifier(Modifier::BOLD);
-    let dim = dim();
-
-    let ctx = context_window
-        .map(|w| format!(" ({}K context)", w / 1000))
-        .unwrap_or_default();
-    let cwd = std::env::current_dir()
-        .map(|d| d.display().to_string())
-        .unwrap_or_else(|_| "?".into());
-
-    // The 5-row block-letter banner, all orange + bold.
-    let mut lines: Vec<Line<'static>> = BANNER
-        .iter()
-        .map(|row| Line::from(vec![Span::styled((*row).to_string(), bold_orange)]))
-        .collect();
-
-    // Dim model line + working directory below the banner.
-    lines.push(Line::from(vec![Span::styled(
-        format!(
-            "{model}{ctx} · {provider} · reasoning {}",
-            reasoning_effort.map(|e| e.as_str()).unwrap_or("off")
-        ),
-        dim,
-    )]));
-    lines.push(Line::from(vec![Span::styled(cwd, dim)]));
-
-    // A blank line for breathing room before the usage hint.
-    lines.push(Line::raw(""));
-    lines
-}
-
 /// Apply a freshly fetched `/models` result: update the served-metadata map,
 /// re-apply the current model (so its window/price refresh), and persist the
 /// result to the on-disk cache for next startup. A failure or empty list sets a
@@ -717,6 +665,9 @@ pub(crate) enum TranscriptEntry {
     Workflow {
         snapshot: hi_workflow::WorkflowRunSnapshot,
     },
+    /// Typed activity row (Read / Edit / Run / verb group). Collapsed by
+    /// default; Edit/Run expand into hunks or stdout.
+    Activity(crate::activity_feed::ActivityBlock),
     /// A tool's (non-explore) output as a foldable block: the full body is
     /// retained, but only a preview shows by default when it's long, with the
     /// remainder revealed by `Ctrl-O` (or per the global `show_tool_output`).
@@ -732,41 +683,11 @@ pub(crate) enum TranscriptEntry {
     },
 }
 
-/// How many lines of a long tool-output block show before it folds to a preview.
-pub(crate) const TOOL_OUTPUT_PREVIEW_LINES: usize = 16;
-
-/// A run of consecutive same-tool exploration results (read/list/grep) being
-/// collapsed into one transcript line, so a burst of reads renders as
-/// `⏺ read 6 files · 743 lines` instead of six separate lines.
-#[derive(Clone, Debug)]
-pub(crate) struct ExploreRun {
-    /// The tool name (`read`/`list`/`grep`).
-    pub tool: String,
-    /// How many results have been folded into this run.
-    pub count: u32,
-    /// Total lines across all folded results.
-    pub lines: u32,
-    /// Whether every result so far was empty (`(no output)`).
-    pub all_empty: bool,
-    /// Absolute transcript position (`trimmed` + local index) of this run's
-    /// summary line. Merging is only valid while that line is still the *last*
-    /// transcript entry — otherwise the in-place update would overwrite
-    /// whatever landed after it (e.g. committed assistant prose).
-    pub line_pos: u64,
-}
-
-/// A run of consecutive idle `bash_output` polls (process still running, no new
-/// output) collapsed into one updating transcript line, so tight polling does
-/// not look like a hung loop of identical status dumps.
-#[derive(Clone, Debug)]
-pub(crate) struct BgIdlePollRun {
-    /// Background handle id (`bg_1`).
-    pub id: String,
-    /// How many idle polls have been folded into this run.
-    pub count: u32,
-    /// Absolute transcript position of this run's summary line.
-    pub line_pos: u64,
-}
+/// How many lines of a long generic tool-output block show before it folds.
+/// Activity rows (Read/Edit/Run) are one line regardless; this budget only
+/// applies to leftover `ToolOutput` dumps. Comfortable density uses 0 so the
+/// transcript stays a verb list, matching grok-build.
+pub(crate) const TOOL_OUTPUT_PREVIEW_LINES: usize = 0;
 
 impl TranscriptEntry {
     /// Flatten this entry into display lines under the current fold settings.
@@ -794,6 +715,7 @@ impl TranscriptEntry {
             )],
             TranscriptEntry::ChangedFiles { line, .. } => vec![line.clone()],
             TranscriptEntry::Workflow { snapshot } => workflow_snapshot_lines(snapshot),
+            TranscriptEntry::Activity(block) => block.flatten(show_tool, density),
             TranscriptEntry::Reasoning { text, elapsed } => {
                 let secs = elapsed.as_secs();
                 let label = if secs >= 60 {
@@ -886,9 +808,28 @@ impl TranscriptEntry {
             TranscriptEntry::UserPrompt(line) => line_text(line),
             TranscriptEntry::Reasoning { text, .. } => text.clone(),
             TranscriptEntry::Workflow { snapshot } => workflow_snapshot_text(snapshot),
+            TranscriptEntry::Activity(block) => block.text(),
             TranscriptEntry::ToolOutput { body, .. } => {
                 body.iter().map(line_text).collect::<Vec<_>>().join("\n")
             }
+        }
+    }
+
+    /// Foldable blocks that block-nav / click-to-expand step over.
+    pub(crate) fn is_foldable(&self) -> bool {
+        match self {
+            Self::ToolOutput { .. } => true,
+            Self::Activity(block) => block.is_foldable() || block.subagent_id().is_some(),
+            _ => false,
+        }
+    }
+
+    /// Per-block expand flag, when this entry is foldable.
+    pub(crate) fn expanded_mut(&mut self) -> Option<&mut bool> {
+        match self {
+            Self::ToolOutput { expanded, .. } => Some(expanded),
+            Self::Activity(block) if block.is_foldable() => Some(&mut block.expanded),
+            _ => None,
         }
     }
 }
@@ -1012,10 +953,10 @@ pub(crate) struct App {
     /// the agent.
     pub(crate) execution: hi_agent::ExecutionMode,
     /// The current reasoning effort level (`None` = off / endpoint default),
-    /// mirrored from the agent for the title bar and splash.
+    /// mirrored from the agent for the title bar.
     pub(crate) reasoning_effort: Option<hi_ai::ReasoningEffort>,
     /// Explicit workspace root copied from the agent runtime for synchronous
-    /// frontend-only operations such as the Ctrl-D diff panel.
+    /// frontend-only operations such as the full-screen diff review overlay.
     pub(crate) workspace_root: std::path::PathBuf,
     /// A shared interrupt handle for the running turn. When the user presses
     /// Esc during a tool call, this is set so the agent skips the current tool
@@ -1176,18 +1117,6 @@ pub(crate) struct App {
     /// while the model — not a tool — is the active party.
     pub(crate) current_tool: Option<String>,
     pub(crate) current_tool_started: Option<Instant>,
-    /// For read/list/grep we defer the `⏺` header until the result lands, so the
-    /// file name and line count collapse into one transcript line instead of two.
-    pub(crate) pending_explore_label: Option<String>,
-    /// A run of consecutive same-tool explore results being collapsed into one
-    /// transcript line. `None` when the last transcript line isn't an explore
-    /// result (or a new run hasn't started). Reset by any non-explore event.
-    pub(crate) explore_run: Option<ExploreRun>,
-    /// Deferred `bash_output` label until the result lands, so idle polls can
-    /// collapse into one updating line instead of header+status spam.
-    pub(crate) pending_bg_poll_label: Option<String>,
-    /// Consecutive idle `bash_output` polls collapsed into one transcript line.
-    pub(crate) bg_idle_poll_run: Option<BgIdlePollRun>,
     /// Lines typed while a turn was running, to run once it finishes (FIFO).
     pub(crate) queue: VecDeque<String>,
     /// Plain-text lines offered to the in-flight turn as mid-turn steering
@@ -1283,6 +1212,10 @@ pub(crate) struct App {
     pub(crate) selected_workflow_run: Option<String>,
     /// Modal multi-run workflow browser opened by `/workflow` with no args.
     pub(crate) workflow_overlay: Option<crate::workflow_tui::WorkflowOverlay>,
+    /// Live child explore/delegate/task rows, keyed by subagent id.
+    pub(crate) subagents: HashMap<String, crate::subagent_overlay::SubagentInfo>,
+    pub(crate) inspect_subagent: Option<crate::subagent_overlay::InspectOverlay>,
+    pub(crate) tasks_overlay: Option<crate::subagent_overlay::TasksOverlay>,
     /// Interactive differential runner overlay. Large run data lives in
     /// `hi-diff` artifacts; this field only retains the bounded UI snapshot.
     pub(crate) diff_lab: Option<crate::diff_lab::DiffLabOverlay>,
@@ -1351,11 +1284,7 @@ pub(crate) struct App {
     /// [`UiEvent::SuggestedPrompt`] after a turn, or from a cheap git heuristic
     /// at session start. Cleared when the user types, accepts, or starts a turn.
     pub(crate) suggested_prompt: Option<String>,
-    /// Whether the `Ctrl-D` diff panel is open (a full working-tree diff pinned
-    /// above the input, rendered with the same highlighting as tool-output diffs).
-    pub(crate) show_diff: bool,
-    /// Cached working-tree diff text for the open diff panel, refreshed when the
-    /// panel is toggled on so it reflects the current tree, not a stale snapshot.
+    /// Cached working-tree diff text for the full-screen review overlay.
     pub(crate) diff_text: Option<String>,
     /// Scroll position (line index) within the full-screen diff review overlay.
     pub(crate) review_scroll: usize,
@@ -1572,7 +1501,7 @@ pub(crate) const MAX_EVENT_LOG: usize = 20_000;
 pub(crate) enum Density {
     /// Headers only for tool output; explore runs stay collapsed.
     Compact,
-    /// Default: tool-output preview fold, explore-run collapse.
+    /// Default: one-line activity rows (Read / Edit / Run); expand on Ctrl-O.
     #[default]
     Comfortable,
     /// Force-expand tool output (same as Ctrl-O on).

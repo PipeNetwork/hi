@@ -231,16 +231,12 @@ impl crate::App {
             KeyCode::Char('f') if alt => self.input.word_right(),
             KeyCode::Char('w') if ctrl => self.input.delete_word_back(),
             KeyCode::Char('k') if ctrl => self.input.kill_to_end(),
-            // Toggle the working-tree diff panel. Refreshed when opened so it
-            // reflects the current tree, not a stale snapshot. Fetched
-            // synchronously (a `git diff` is fast and user-initiated) since the
-            // key handler isn't async.
+            // Full-screen diff review (Ctrl-D aliases Ctrl-G).
             KeyCode::Char('d') if ctrl => {
-                self.show_diff = !self.show_diff;
-                if self.show_diff {
-                    self.diff_text = Some(working_tree_diff_sync(&self.workspace_root));
+                if self.mode.is_review() {
+                    self.mode.to_insert();
                 } else {
-                    self.diff_text = None;
+                    self.open_review(None);
                 }
             }
             // Full-screen diff review overlay (Ctrl-G): a scrollable,
@@ -342,10 +338,7 @@ impl crate::App {
     /// Number of tool-output blocks in the transcript (the foldable blocks that
     /// block-nav steps over).
     pub(crate) fn tool_block_count(&self) -> usize {
-        self.transcript
-            .iter()
-            .filter(|e| matches!(e, crate::TranscriptEntry::ToolOutput { .. }))
-            .count()
+        self.transcript.iter().filter(|e| e.is_foldable()).count()
     }
 
     /// The block cursor clamped to the current block count (blocks can be
@@ -360,18 +353,29 @@ impl crate::App {
         self.toggle_block_ord(self.selected_block_ord());
     }
 
-    /// Flip the expand state of the `target`-th tool-output block.
+    /// Flip the expand state of the `target`-th foldable block.
     pub(crate) fn toggle_block_ord(&mut self, target: usize) {
+        let mut inspect_id = None;
         let mut ord = 0;
         for entry in self.transcript.iter_mut() {
-            if let crate::TranscriptEntry::ToolOutput { expanded, .. } = entry {
-                if ord == target {
+            if !entry.is_foldable() {
+                continue;
+            }
+            if ord == target {
+                if let crate::TranscriptEntry::Activity(block) = entry
+                    && let Some(id) = block.subagent_id()
+                {
+                    inspect_id = Some(id.to_string());
+                } else if let Some(expanded) = entry.expanded_mut() {
                     *expanded = !*expanded;
                     self.bump_transcript();
-                    return;
                 }
-                ord += 1;
+                break;
             }
+            ord += 1;
+        }
+        if let Some(id) = inspect_id {
+            crate::subagent_overlay::open_inspect(self, &id);
         }
     }
 
@@ -405,6 +409,7 @@ impl crate::App {
                 | crate::TranscriptEntry::Assistant(_)
                 | crate::TranscriptEntry::ChangedFiles { .. }
                 | crate::TranscriptEntry::Workflow { .. }
+                | crate::TranscriptEntry::Activity(_)
                 | crate::TranscriptEntry::ToolOutput { .. } => {
                     body.push_str(&entry.text());
                     body.push('\n');
@@ -1573,9 +1578,7 @@ impl crate::App {
         self.follow();
     }
 
-    /// Handle `/theme`: set a named mode (`dark`/`light`/`ansi`/`auto`), or
-    /// cycle to the next when the arg is empty. Applies immediately (the whole
-    /// TUI re-reads the theme each frame) and echoes the new mode.
+    /// Handle `/theme`: set a named grok-build palette, or cycle when empty.
     fn handle_theme(&mut self, arg: &str) {
         let arg = arg.trim();
         let mode = if arg.is_empty() {
@@ -1585,7 +1588,9 @@ impl crate::App {
             mode
         } else {
             self.push(Line::styled(
-                format!("unknown theme '{arg}' — try dark, light, ansi, or auto"),
+                format!(
+                    "unknown theme '{arg}' — try groknight, grokday, tokyonight, oscura, rosepine, ansi, or auto"
+                ),
                 Style::default().fg(crate::theme::theme().warning),
             ));
             self.follow();
@@ -1748,6 +1753,20 @@ impl crate::App {
             Command::Turns(arg) => {
                 self.handle_turns(agent, hi_agent::command::parse_turns_arg(&arg));
             }
+            Command::Tasks(_) => {
+                crate::subagent_overlay::open_tasks(
+                    self,
+                    &agent.background_process_ids(),
+                    &agent.background_task_ids(),
+                );
+            }
+            Command::Queue(arg) if arg.trim() == "tasks" => {
+                crate::subagent_overlay::open_tasks(
+                    self,
+                    &agent.background_process_ids(),
+                    &agent.background_task_ids(),
+                );
+            }
             Command::Plan(_)
             | Command::ViewPlan
             | Command::Fork(_)
@@ -1756,7 +1775,6 @@ impl crate::App {
             | Command::AlwaysApprove(_)
             | Command::Auto(_)
             | Command::Queue(_)
-            | Command::Tasks(_)
             | Command::Plugins(_)
             | Command::Remember(_)
             | Command::ImportClaude(_)

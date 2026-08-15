@@ -1,49 +1,49 @@
 --- 120x24 ---
-╭ hi · openai · gpt-4o · reasoning off ─────────comfortable · out:fold ╮╭ btw · working ───────────────────────────────╮
-│┃ ⏺ thought for 3s  (Ctrl-T to expand)                                ││❓  why?                                       │
-│┃ tool result line 1                                                  ││                                              │
-│┃ tool result line 2                                                  ││                                              │
-│┃ tool result line 3                                                  ││                                              │
-│┃ tool result line 4                                                  ││                                              │
-│┃ tool result line 5                                                  ││                                              │
-│┃ tool result line 6                                                  ││                                              │
-│┃ tool result line 7                                                  ││                                              │
-│┃ tool result line 8                                                  ││                                              │
-│┃ tool result line 9                                                  ││                                              │
-│┃ tool result line 10                                                 ││                                              │
-│┃ tool result line 11                                                 ││                                              │
-│┃ tool result line 12                                                 ││                                              │
-│┃ tool result line 13                                                 ││                                              │
-│┃ tool result line 14                                                 ││                                              │
-│┃ tool result line 15                                                 ││                                              │
-│┃ tool result line 16                                                 ││                                              │
-│┃ … +1 more lines · Ctrl-O to expand                                  ││                                              │
-╰──────────────────────────────────────────────────────────────────────╯│                                              │
-╭──────────────────────────────────────────────────────────────────────╮│                                              │
-│⠋ Working… 0s   Ctrl-C to interrupt                                   ││                                              │
-│❯ next step                                                           ││                                              │
-╰──────────────────────────────────────────────────────────────────────╯╰──────────────────────────────────────────────╯
+
+  /workspace                                                                    reasoning off │ comfortable · out:fold
+
+  ┃ review the responsive layout                                        ╭ btw · working ─────────────────────────────╮
+  ┃ The layout is stable.                                               │❓  why?                                     │
+  ┃ ⏺ thought for 3s  (Ctrl-T to expand)                                │                                            │
+  ┃ … +17 more lines · Ctrl-O to expand                                 │                                            │
+                                                                        │                                            │
+                                                                        │                                            │
+                                                                        │                                            │
+                                                                        │                                            │
+                                                                        │                                            │
+                                                                        │                                            │
+                                                                        │                                            │
+                                                                        │                                            │
+                                                                        │                                            │
+                                                                        │                                            │
+  ⠋ Working… 0s   Ctrl-C to interrupt                                   │                                            │
+  ╭────────────────────────────────────────────────────────────────────╮│                                            │
+  │❯ next step                                                         ││                                            │
+  ╰──────────────────────────────────────────────────────────── gpt-4o ╯╰────────────────────────────────────────────╯
+
+  ctrl+c:interrupt  │  enter:queue  │  ?:help
+
 --- 64x14 ---
-╭ hi · openai · gpt-4o ────────────────────────────────────────╮
-│┃ tool result line 10                                         │
-│┃ tool result line 11                                         │
-│┃ tool result line 12                                         │
-│┃ tool result line 13                                         │
-│┃ tool result line 14                                         │
-│┃ tool result line 15                                         │
-│┃ tool result line 16                                         │
-│┃ … +1 more lines · Ctrl-O to expand                          │
-╰──────────────────────────────────────────────────────────────╯
-╭──────────────────────────────────────────────────────────────╮
-│⠋ Working… 0s   Ctrl-C to interrupt                           │
-│❯ next step                                                   │
-╰──────────────────────────────────────────────────────────────╯
+  /workspace
+  ┃ review the responsive layout
+  ┃ The layout is stable.
+  ┃ ⏺ thought for 3s  (Ctrl-T to expand)
+  ┃ … +17 more lines · Ctrl-O to expand
+
+
+
+
+  ⠋ Working… 0s   Ctrl-C to interrupt
+  ╭──────────────────────────────────────────────────────────╮
+  │❯ next step                                               │
+  ╰────────────────────────────────────────────────── gpt-4o ╯
+  ctrl+c:interrupt  │  enter:queue  │  ?:help
 --- 24x8 ---
-╭ hi · gpt-4o ─────────╮
-│┃ … +1 more lines ·   │
-│Ctrl-O to expand      │
-╰──────────────────────╯
-╭──────────────────────╮
-│⠋ Working… 0s   Ctrl-C│
-│❯ next step           │
-╰──────────────────────╯
+  ┃ ⏺ thought for 3s
+  (Ctrl-T to expand)
+  ┃ … +17 more lines ·
+  Ctrl-O to expand
+  ⠋ Working… 0s   Ctrl
+  ╭──────────────────╮
+  │❯ next step       │
+  ╰────────── gpt-4o ╯

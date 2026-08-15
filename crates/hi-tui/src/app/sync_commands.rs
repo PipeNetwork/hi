@@ -953,13 +953,13 @@ impl crate::App {
     ///
     /// Sync is best-effort decoration on a local-first app: a portal failure
     /// must never surface as an error or affect the coding workflow. An
-    /// explicit `/sessions host` command gets a calm availability note
-    /// (`announce_failure`); the automatic startup enable stays fully silent
-    /// and the session simply runs unhosted.
+    /// explicit `/sessions host` command gets a calm note (`announce`); the
+    /// automatic startup enable stays fully silent so the empty-session
+    /// wordmark is not buried under host-mode chatter.
     pub(crate) fn apply_host_toggle_result(
         &mut self,
         result: anyhow::Result<Option<crate::SessionHostEnable>>,
-        announce_failure: bool,
+        announce: bool,
     ) {
         match result {
             Ok(enabled) => {
@@ -968,16 +968,18 @@ impl crate::App {
                     self.remote_input_rx = Some(rx);
                     self.remote_input_poller = Some(abort);
                     self.hosting_remote_input = true;
-                    self.push(Line::styled(
-                        "✓ host on — remote attach clients can send prompts into this session",
-                        Style::default().fg(crate::theme::theme().accent_success),
-                    ));
-                    self.push(Line::styled(
-                        "  other machines: /sessions attach <id>  (or hi --attach <id>)",
-                        dim(),
-                    ));
-                    self.follow();
-                } else {
+                    if announce {
+                        self.push(Line::styled(
+                            "✓ host on — remote attach clients can send prompts into this session",
+                            Style::default().fg(crate::theme::theme().accent_success),
+                        ));
+                        self.push(Line::styled(
+                            "  other machines: /sessions attach <id>  (or hi --attach <id>)",
+                            dim(),
+                        ));
+                        self.follow();
+                    }
+                } else if announce {
                     self.push(Line::styled(
                         "host off — no longer accepting remote prompts",
                         dim(),
@@ -985,7 +987,7 @@ impl crate::App {
                     self.follow();
                 }
             }
-            Err(_) if announce_failure => {
+            Err(_) if announce => {
                 self.push(Line::styled(
                     "host mode unavailable right now — the sync portal is unreachable; this session keeps working locally",
                     dim(),

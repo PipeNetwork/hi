@@ -7,12 +7,13 @@
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use hi_agent::{DelegateOutcome, DelegateRunner};
+use hi_agent::{DelegateOutcome, DelegateProgress, DelegateRunner};
 use hi_tools::ToolStatus;
 
 use crate::candidate_gate::{
@@ -20,6 +21,7 @@ use crate::candidate_gate::{
     staged_candidate_diff,
 };
 use crate::candidate_merge::apply_candidate_and_reverify;
+use crate::delegate_events;
 use crate::resource_governor::{self, ResourceClass};
 
 const DELEGATE_TIMEOUT_SECS: u64 = 600;
@@ -181,11 +183,25 @@ impl DelegateRunner for CliDelegateRunner {
         if cancellation.is_cancelled() {
             return outcome(ToolStatus::Cancelled, "delegate cancelled before setup");
         }
-        self.run_with_route(task, verify, route).await
+        self.run_with_route(task, verify, route, None).await
+    }
+
+    async fn run_routed_with_progress(
+        &self,
+        task: &str,
+        verify: Option<&str>,
+        route: &hi_agent::SubagentRoute,
+        cancellation: hi_agent::TurnCancellation,
+        progress: Option<Arc<dyn DelegateProgress>>,
+    ) -> DelegateOutcome {
+        if cancellation.is_cancelled() {
+            return outcome(ToolStatus::Cancelled, "delegate cancelled before setup");
+        }
+        self.run_with_route(task, verify, route, progress).await
     }
 
     async fn run(&self, task: &str, verify: Option<&str>) -> DelegateOutcome {
-        self.run_with_route(task, verify, &hi_agent::SubagentRoute::default())
+        self.run_with_route(task, verify, &hi_agent::SubagentRoute::default(), None)
             .await
     }
 }
@@ -221,6 +237,7 @@ impl CliDelegateRunner {
         task: &str,
         verify: Option<&str>,
         route: &hi_agent::SubagentRoute,
+        progress: Option<Arc<dyn DelegateProgress>>,
     ) -> DelegateOutcome {
         let Some(verify_cmd) = verify
             .map(str::to_string)
@@ -302,6 +319,7 @@ impl CliDelegateRunner {
                 &workspace_relative,
                 &workspace_root,
                 &state_root,
+                progress,
             )
         })
         .await
@@ -331,8 +349,10 @@ fn run_blocking(
     workspace_relative: &Path,
     workspace_root: &Path,
     state_root: &Path,
+    progress: Option<Arc<dyn DelegateProgress>>,
 ) -> DelegateOutcome {
     let queue_started = Instant::now();
+    report_progress(progress.as_deref(), "waiting for capacity");
     let _lease = match acquire_delegate_lease(
         state_root,
         Duration::from_secs(delegate_queue_timeout_secs()),
@@ -362,6 +382,7 @@ fn run_blocking(
     };
     let setup_queue_ms = setup_queue_started.elapsed().as_millis();
     let setup_started = Instant::now();
+    report_progress(progress.as_deref(), "creating worktree");
     let worktree_root = hi_tools::worktree::worktree_path("delegate", idx);
     if let Err(error) = hi_tools::worktree::add_worktree(repo_root, &worktree_root, checkpoint) {
         return outcome(
@@ -379,8 +400,16 @@ fn run_blocking(
     }
 
     let artifact_dir = delegate_artifacts_dir(state_root, idx);
+    if let Err(error) = std::fs::create_dir_all(&artifact_dir) {
+        hi_tools::worktree::cleanup(repo_root, &[worktree_root]);
+        return outcome(
+            ToolStatus::Failed,
+            &format!("delegate failed to create artifact directory: {error}"),
+        );
+    }
     let report_path = artifact_dir.join("report.json");
     let log_path = artifact_dir.join("child.log");
+    let events_path = artifact_dir.join("events.jsonl");
 
     let prompt = child_prompt(task, verify_cmd);
     let mut arguments = vec![
@@ -403,6 +432,14 @@ fn run_blocking(
         OsString::from("--report"),
         report_path.as_os_str().to_os_string(),
     ];
+    let mut event_tailer = None;
+    if let Some(progress) = progress.clone()
+        && std::fs::write(&events_path, []).is_ok()
+    {
+        arguments.push("--events-jsonl".into());
+        arguments.push(events_path.as_os_str().into());
+        event_tailer = delegate_events::start_event_tailer(events_path.clone(), progress);
+    }
     if let Some(max_steps) = max_steps {
         arguments.push("--max-steps".into());
         arguments.push(max_steps.to_string().into());
@@ -428,6 +465,7 @@ fn run_blocking(
     };
     let model_queue_ms = model_queue_started.elapsed().as_millis();
     let child_started = Instant::now();
+    report_progress(progress.as_deref(), "running");
     let execution = crate::child_process::run(
         &worktree,
         exe,
@@ -449,7 +487,11 @@ fn run_blocking(
     );
     let child_runtime_ms = child_started.elapsed().as_millis();
     drop(process_lease);
+    if let Some(tailer) = event_tailer {
+        tailer.finish();
+    }
     let decision_started = Instant::now();
+    report_progress(progress.as_deref(), "verifying");
     let mut result = match execution {
         Ok(execution) if execution.status == ToolStatus::Succeeded => decide(
             &worktree,
@@ -522,6 +564,12 @@ fn record_verified_merge(state_root: &Path, task: &str, changed_files: &[String]
         lines.drain(..lines.len() - JOURNAL_CAP_LINES / 2);
     }
     let _ = std::fs::write(&path, lines.join("\n") + "\n");
+}
+
+fn report_progress(progress: Option<&dyn DelegateProgress>, activity: &str) {
+    if let Some(progress) = progress {
+        progress.progress(activity, None);
+    }
 }
 
 fn delegate_artifacts_dir(state_root: &Path, idx: u32) -> PathBuf {

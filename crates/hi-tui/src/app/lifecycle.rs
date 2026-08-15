@@ -88,6 +88,9 @@ impl crate::App {
             last_code_block: None,
             table_buf: Vec::new(),
             input: InputLine::default(),
+            voice: Default::default(),
+            voice_model: Default::default(),
+            voice_config: Default::default(),
             following: true,
             scroll: 0,
             view_max_scroll: 0,
@@ -115,13 +118,6 @@ impl crate::App {
             finished_at: None,
             current_tool: None,
             current_tool_started: None,
-            pending_explore_label: None,
-            explore_run: None,
-            voice: Default::default(),
-            voice_model: Default::default(),
-            voice_config: Default::default(),
-            pending_bg_poll_label: None,
-            bg_idle_poll_run: None,
             queue: VecDeque::new(),
             mid_turn_offered: VecDeque::new(),
             queue_selected: None,
@@ -155,6 +151,9 @@ impl crate::App {
             workflow_runs: HashMap::new(),
             selected_workflow_run: None,
             workflow_overlay: None,
+            subagents: HashMap::new(),
+            inspect_subagent: None,
+            tasks_overlay: None,
             diff_lab: None,
             race: None,
             plan_workflow_child: None,
@@ -178,7 +177,6 @@ impl crate::App {
             last_changed_files: Vec::new(),
             session_changed_files: Vec::new(),
             suggested_prompt: None,
-            show_diff: false,
             diff_text: None,
             review_scroll: 0,
             auto_approve_session: false,
@@ -287,10 +285,9 @@ impl crate::App {
         self.started = working.then(Instant::now);
         self.current_tool = None;
         self.current_tool_started = None;
-        self.pending_explore_label = None;
-        self.explore_run = None;
-        self.pending_bg_poll_label = None;
-        self.bg_idle_poll_run = None;
+        if !working {
+            self.freeze_verb_group();
+        }
         if working {
             self.checkpoint_warning = None;
             self.last_turn_event = None;

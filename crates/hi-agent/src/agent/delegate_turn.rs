@@ -10,6 +10,33 @@ use serde_json::Value;
 
 use crate::Ui;
 
+fn emit_delegate_finished(
+    ui: &mut dyn Ui,
+    n: u32,
+    output: &hi_tools::ToolOutcome,
+    reconciliation_failed: bool,
+    elapsed_ms: u64,
+) {
+    let summary = if output.status == hi_tools::ToolStatus::Succeeded {
+        format!(
+            "applied — {} file(s) changed",
+            output.effects.file_changes.len()
+        )
+    } else if reconciliation_failed {
+        "failed — workspace state unknown".to_string()
+    } else if output.effects.mutation_applied {
+        "failed — workspace changes remain".to_string()
+    } else {
+        "rolled back".to_string()
+    };
+    ui.subagent_finished(
+        &format!("delegate-{n}"),
+        crate::subagent_finish_status(output.status),
+        elapsed_ms,
+        &summary,
+    );
+}
+
 fn delegate_tool_outcome(
     content: impl Into<String>,
     status: hi_tools::ToolStatus,
@@ -82,6 +109,9 @@ pub(crate) struct DelegateJob {
     /// detect overlap between parallel delegates — only disjoint file sets
     /// are safe to run in parallel.
     pub(crate) file_set: std::collections::BTreeSet<String>,
+    /// Live progress into the parent [`crate::SubagentSink`]. `None` when the
+    /// frontend has no sink (CLI notes / RecUi tests).
+    pub(crate) progress: Option<std::sync::Arc<dyn crate::DelegateProgress>>,
 }
 
 /// The result of running a delegate job — the runner outcome plus the slot
@@ -272,6 +302,7 @@ impl crate::Agent {
                 route,
                 cancellation: crate::TurnCancellation::new(),
                 file_set,
+                progress: None,
             },
             ledger_revision,
         ))
@@ -373,21 +404,25 @@ impl crate::Agent {
             .and_then(|v| v.get("verify").and_then(Value::as_str))
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty());
-        let summary: String = task.chars().take(72).collect();
-        let ellipsis = if task.chars().count() > 72 { "…" } else { "" };
-        ui.subagent_note(&format!("↳ delegate subagent {n}: {summary}{ellipsis}"));
+        let summary = crate::clip_subagent_description(&task);
+        let id = format!("delegate-{n}");
+        ui.subagent_spawned(&id, "delegate", &summary, false);
+        ui.subagent_progress(&id, "running");
+        let started = std::time::Instant::now();
 
         let ledger_revision = self.runtime.ledger().revision();
         // Route-aware even on the direct tool path: `/team delegate|editor`
         // assignments must apply here exactly as they do to background tasks
         // (plain `run` silently dropped the team route).
         let route = self.route_for_kind(delegate_kind(parsed.as_ref()));
+        let progress = crate::subagent_progress::bound_sink_progress(ui, &id);
         let outcome = runner
-            .run_routed(
+            .run_routed_with_progress(
                 &task,
                 verify.as_deref(),
                 &route,
                 crate::TurnCancellation::new(),
+                progress,
             )
             .await;
         let expected_paths = outcome
@@ -442,22 +477,13 @@ impl crate::Agent {
             }
         }
 
-        if output.status == hi_tools::ToolStatus::Succeeded {
-            ui.subagent_note(&format!(
-                "↳ delegate subagent {n} applied — {} file(s) changed",
-                output.effects.file_changes.len()
-            ));
-        } else if reconciliation_failed {
-            ui.subagent_note(&format!(
-                "↳ delegate subagent {n} failed — workspace state unknown"
-            ));
-        } else if output.effects.mutation_applied {
-            ui.subagent_note(&format!(
-                "↳ delegate subagent {n} failed — workspace changes remain"
-            ));
-        } else {
-            ui.subagent_note(&format!("↳ delegate subagent {n} rolled back"));
-        }
+        emit_delegate_finished(
+            ui,
+            n,
+            &output,
+            reconciliation_failed,
+            started.elapsed().as_millis() as u64,
+        );
         // The runner may have applied a diff to the working tree; refresh the
         // parent's snapshot AND clear the read cache so change detection, verify,
         // and any later `read` see the merged content — the merge writes files via
@@ -478,6 +504,7 @@ impl crate::Agent {
         result: DelegateJobResult,
         ledger_revision: u64,
         ui: &mut dyn Ui,
+        elapsed_ms: u64,
     ) -> hi_tools::ToolOutcome {
         let DelegateJobResult { slot: n, outcome } = result;
         let expected_paths = outcome
@@ -528,22 +555,7 @@ impl crate::Agent {
             }
         }
 
-        if output.status == hi_tools::ToolStatus::Succeeded {
-            ui.subagent_note(&format!(
-                "↳ delegate subagent {n} applied — {} file(s) changed",
-                output.effects.file_changes.len()
-            ));
-        } else if reconciliation_failed {
-            ui.subagent_note(&format!(
-                "↳ delegate subagent {n} failed — workspace state unknown"
-            ));
-        } else if output.effects.mutation_applied {
-            ui.subagent_note(&format!(
-                "↳ delegate subagent {n} failed — workspace changes remain"
-            ));
-        } else {
-            ui.subagent_note(&format!("↳ delegate subagent {n} rolled back"));
-        }
+        emit_delegate_finished(ui, n, &output, reconciliation_failed, elapsed_ms);
         self.invalidate_snapshot();
         self.runtime.clear_read_cache();
         output
@@ -570,9 +582,10 @@ pub(crate) async fn run_delegate_job(job: DelegateJob) -> DelegateJobResult {
         route,
         cancellation,
         file_set: _,
+        progress,
     } = job;
     let outcome = runner
-        .run_routed(&task, verify.as_deref(), &route, cancellation)
+        .run_routed_with_progress(&task, verify.as_deref(), &route, cancellation, progress)
         .await;
     DelegateJobResult { slot, outcome }
 }
@@ -697,6 +710,7 @@ mod tests {
                 route: crate::SubagentRoute::default(),
                 cancellation: crate::TurnCancellation::new(),
                 file_set: std::collections::BTreeSet::from([format!("src/module-{slot}.rs")]),
+                progress: None,
             })));
         }
         tokio::time::timeout(std::time::Duration::from_secs(1), async {

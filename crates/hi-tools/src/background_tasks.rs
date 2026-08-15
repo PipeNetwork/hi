@@ -650,6 +650,13 @@ impl BackgroundTaskRegistry {
         Some(outcome)
     }
 
+    pub fn list_now(&self) -> Vec<String> {
+        match self.tasks.try_lock() {
+            Ok(tasks) => tasks.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub async fn list(&self) -> Vec<String> {
         let tasks = self.tasks.lock().await;
         tasks.keys().cloned().collect()

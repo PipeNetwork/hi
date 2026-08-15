@@ -97,22 +97,14 @@ impl App {
             Action::ToggleDebug => {
                 self.show_debug = !self.show_debug;
             }
-            Action::ToggleDiff => {
-                self.show_diff = !self.show_diff;
-                if self.show_diff {
-                    self.diff_text = Some(crate::working_tree_diff_sync(&self.workspace_root));
-                } else {
-                    self.diff_text = None;
-                }
-            }
-            Action::ToggleBtw => self.toggle_btw_pane(),
-            Action::ToggleReview => {
+            Action::ToggleDiff | Action::ToggleReview => {
                 if self.mode.is_review() {
                     self.mode.to_insert();
                 } else {
                     self.open_review(None);
                 }
             }
+            Action::ToggleBtw => self.toggle_btw_pane(),
             Action::ToggleReasoning => {
                 self.show_reasoning = !self.show_reasoning;
                 self.bump_transcript();
@@ -377,7 +369,7 @@ mod tests {
         // dispatch_key returns Fallthrough before resolve; globals don't fire.
         let r = app.dispatch_key(&key(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(matches!(r, DispatchResult::Fallthrough));
-        assert!(!app.show_diff);
+        assert!(!app.mode.is_review());
     }
 
     #[test]

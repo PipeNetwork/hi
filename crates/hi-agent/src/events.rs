@@ -646,6 +646,20 @@ impl Ui for EventUi {
     fn subagent_note(&mut self, text: &str) {
         self.inner.subagent_note(text);
     }
+    fn subagent_sink(&self) -> Option<std::sync::Arc<dyn crate::SubagentSink>> {
+        self.inner.subagent_sink()
+    }
+    fn subagent_spawned(&mut self, id: &str, kind: &str, description: &str, background: bool) {
+        self.inner
+            .subagent_spawned(id, kind, description, background);
+    }
+    fn subagent_progress(&mut self, id: &str, activity: &str) {
+        self.inner.subagent_progress(id, activity);
+    }
+    fn subagent_finished(&mut self, id: &str, status: &str, elapsed_ms: u64, summary: &str) {
+        self.inner
+            .subagent_finished(id, status, elapsed_ms, summary);
+    }
     fn plan(&mut self, steps: &[hi_tools::PlanStep]) {
         self.emit(AgentEventKind::PlanChanged {
             steps: steps.to_vec(),

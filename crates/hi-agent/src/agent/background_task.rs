@@ -16,8 +16,8 @@
 //! Unlike the synchronous `explore`/`delegate` tools (which block the parent
 //! turn until the subagent completes), background tasks let the parent continue
 //! working while subagents run in parallel. The trade-off: the parent must
-//! explicitly poll for results, and background subagents don't get live UI
-//! streaming (their output is collected and returned on poll).
+//! explicitly poll for results. Live activity still fans out through
+//! [`crate::SubagentSink`] when a frontend provides one.
 //!
 //! Depth is capped at 1: the child is built with `explore_subagents = false`
 //! and `is_subagent = true`, so it never sees the `task`/`explore`/`delegate`
@@ -30,7 +30,6 @@ use serde_json::Value;
 
 use crate::AgentConfig;
 use crate::Ui;
-use crate::ui::NullUi;
 
 /// Canonical background task kinds (grok-build naming).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,9 +208,9 @@ impl crate::Agent {
             );
         }
 
-        // UI callout — short harness-style label: "↳ explore: Review crate boundaries".
-        let summary: String = description.chars().take(72).collect();
-        ui.subagent_note(&format!("↳ {subagent_type}: {summary}"));
+        let summary = crate::clip_subagent_description(&description);
+        let sink = ui.subagent_sink();
+        let (id_tx, id_rx) = tokio::sync::oneshot::channel::<String>();
 
         // Build the future factory and spawn the task. Each role runs on its
         // configured route (team roles): explore/delegate children may use a
@@ -231,25 +230,50 @@ impl crate::Agent {
         // does NOT need to be `Send` — it runs on a worker thread's `LocalSet`.
         let prompt_for_factory = prompt.clone();
         let verify_for_factory = verify.clone();
-        let factory: Box<dyn FnOnce() -> hi_tools::BgFuture + Send + 'static> = if is_read_only {
+        let factory: Box<dyn FnOnce() -> hi_tools::BgFuture + Send + 'static> =
             Box::new(move || {
-                Box::pin(run_bg_readonly(
-                    provider,
-                    child_config,
-                    kind,
-                    prompt_for_factory,
-                ))
-            })
-        } else {
-            Box::new(move || {
-                Box::pin(run_bg_general_purpose(
-                    provider,
-                    child_config,
-                    prompt_for_factory,
-                    verify_for_factory,
-                ))
-            })
-        };
+                Box::pin(async move {
+                    let started = std::time::Instant::now();
+                    let id = id_rx.await.unwrap_or_default();
+                    let mut child_ui = crate::subagent_progress::SubagentProgressUi {
+                        id: id.clone(),
+                        sink: sink.clone(),
+                    };
+                    if let Some(s) = &sink {
+                        s.progress(&id, "running", None);
+                    }
+                    let result = if is_read_only {
+                        run_bg_readonly(
+                            provider,
+                            child_config,
+                            kind,
+                            prompt_for_factory,
+                            &mut child_ui,
+                        )
+                        .await
+                    } else {
+                        run_bg_general_purpose(
+                            provider,
+                            child_config,
+                            prompt_for_factory,
+                            verify_for_factory,
+                            &mut child_ui,
+                        )
+                        .await
+                    };
+                    if let Some(s) = &sink {
+                        let status = match result.state {
+                            hi_tools::BackgroundTaskState::Completed => "completed",
+                            hi_tools::BackgroundTaskState::Cancelled => "cancelled",
+                            hi_tools::BackgroundTaskState::Running => "running",
+                            hi_tools::BackgroundTaskState::Failed => "failed",
+                        };
+                        let summary: String = result.output.chars().take(120).collect();
+                        s.finished(&id, status, started.elapsed().as_millis() as u64, &summary);
+                    }
+                    result
+                })
+            });
 
         let task_id = match self
             .bg_tasks
@@ -269,6 +293,8 @@ impl crate::Agent {
                 );
             }
         };
+        let _ = id_tx.send(task_id.clone());
+        ui.subagent_spawned(&task_id, &subagent_type, &summary, true);
 
         // The full text is model-facing protocol (how to poll); the UI only
         // needs the short kind+description — the subagent note already announced it.
@@ -378,6 +404,12 @@ impl crate::Agent {
 
         let content = format_task_results(&results);
         bg_tool_outcome(content, hi_tools::ToolStatus::Succeeded)
+    }
+
+    /// Cancel a background `task` subagent from a frontend overlay.
+    pub async fn kill_background_task(&self, task_id: &str) -> String {
+        let args = serde_json::json!({ "task_id": task_id }).to_string();
+        self.handle_kill_task(&args).await.content
     }
 
     /// Handle the `kill_task` tool — cancel a background task.
@@ -586,6 +618,7 @@ async fn run_bg_readonly(
     config: AgentConfig,
     kind: BgTaskKind,
     prompt: String,
+    ui: &mut dyn Ui,
 ) -> hi_tools::BackgroundTaskOutcome {
     let kind_label = kind.as_str();
     let child_prompt = readonly_child_prompt(kind, &prompt);
@@ -606,9 +639,7 @@ async fn run_bg_readonly(
     };
 
     let mut child = child;
-    // Use a no-op UI for background subagents — their output is collected, not streamed.
-    let mut ui = NullUi;
-    let result = child.run_turn(&child_prompt, &mut ui).await;
+    let result = child.run_turn(&child_prompt, ui).await;
 
     let (state, output) = match result {
         Ok(turn) => match turn.status {
@@ -665,6 +696,7 @@ async fn run_bg_general_purpose(
     config: AgentConfig,
     prompt: String,
     verify: Option<String>,
+    ui: &mut dyn Ui,
 ) -> hi_tools::BackgroundTaskOutcome {
     let kind_label = BgTaskKind::GeneralPurpose.as_str();
     let child = match crate::Agent::new(provider, config) {
@@ -683,8 +715,7 @@ async fn run_bg_general_purpose(
     };
 
     let mut child = child;
-    let mut ui = NullUi;
-    let result = child.run_turn(&prompt, &mut ui).await;
+    let result = child.run_turn(&prompt, ui).await;
 
     let (state, output) = match result {
         Ok(turn) => match turn.status {

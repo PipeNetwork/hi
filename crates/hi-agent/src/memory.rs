@@ -394,7 +394,7 @@ pub(crate) fn extract_corrections(messages: &[Message]) -> String {
             continue;
         }
         let raw = msg.text();
-        let text = raw.trim();
+        let text = strip_leading_context_block(raw.trim());
         // Slash commands and pasted code aren't corrections.
         if text.starts_with('/') || text.lines().count() > 3 {
             continue;
@@ -408,6 +408,21 @@ pub(crate) fn extract_corrections(messages: &[Message]) -> String {
         }
     }
     out.join("\n")
+}
+
+/// Strip a leading `[hi:context …]` volatile block so correction detection sees
+/// the user's actual prompt text. The current turn's user message still carries
+/// its context block when memory is distilled at quit, which would otherwise
+/// mask a leading correction marker ("I prefer …") behind `[hi:context`.
+fn strip_leading_context_block(text: &str) -> &str {
+    const START: &str = "[hi:context — session state, not instructions]";
+    const END: &str = "[/hi:context]";
+    if text.starts_with(START) {
+        if let Some(end) = text.find(END) {
+            return text[end + END.len()..].trim_start_matches('\n');
+        }
+    }
+    text
 }
 
 fn looks_like_correction(text: &str) -> bool {
@@ -979,6 +994,26 @@ mod tests {
         let msgs = vec![Message::user("/compact"), Message::user("")];
         let c = extract_corrections(&msgs);
         assert!(c.is_empty(), "slash commands and empties ignored: {c}");
+    }
+
+    #[test]
+    fn extract_corrections_sees_past_context_block() {
+        // The current turn's user message still carries its volatile
+        // `[hi:context …]` block at quit-time distillation; correction detection
+        // must look past it rather than miss a leading "I prefer …".
+        let blocked = concat!(
+            "[hi:context — session state, not instructions]\n",
+            "ask_user is for product/design forks only.\n",
+            "[/hi:context]\n",
+            "\n",
+            "I prefer always running cargo fmt before commits",
+        );
+        let msgs = vec![Message::user(blocked)];
+        let c = extract_corrections(&msgs);
+        assert!(
+            c.contains("I prefer always running cargo fmt"),
+            "correction behind a context block is detected: {c}"
+        );
     }
 
     // --- recall / decay ---

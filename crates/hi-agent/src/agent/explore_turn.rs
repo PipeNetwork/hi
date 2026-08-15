@@ -242,25 +242,33 @@ impl crate::Agent {
                 hi_tools::ToolStatus::Denied,
             );
         };
-        // Prominent callout so the user clearly sees a nested agent run start.
-        // The slot is the lifetime count; the budget is per-turn, so no
-        // "n/max" denominator — it would read 9/8 in a later turn.
-        let summary: String = task.chars().take(72).collect();
-        let ellipsis = if task.chars().count() > 72 { "…" } else { "" };
-        ui.subagent_note(&format!(
-            "↳ explore subagent {}: {summary}{ellipsis}",
-            job.slot,
-        ));
-
-        let result = {
-            let mut buf_ui = BufferingUi::new();
-            let r = run_explore_job(job, &mut buf_ui).await;
-            buf_ui.replay_to(&mut *ui);
-            r
+        let id = format!("explore-{}", job.slot);
+        let summary = crate::clip_subagent_description(&task);
+        let sink = ui.subagent_sink();
+        ui.subagent_spawned(&id, "explore", &summary, false);
+        let started = std::time::Instant::now();
+        let result = if sink.is_some() {
+            let mut child_ui = crate::subagent_progress::SubagentProgressUi {
+                id: id.clone(),
+                sink,
+            };
+            run_explore_job(job, &mut child_ui).await
+        } else {
+            let mut child_ui = crate::subagent_progress::SubagentParentUi {
+                inner: crate::subagent_progress::SubagentProgressUi {
+                    id: id.clone(),
+                    sink: None,
+                },
+                parent: ui,
+            };
+            run_explore_job(job, &mut child_ui).await
         };
         // Fold the child's token usage into the parent's session totals.
         self.add_side_usage(result.usage);
-        ui.subagent_note(&format!("↳ explore subagent {} done", result.slot));
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let status = crate::subagent_finish_status(result.outcome.status);
+        let finish_summary: String = result.outcome.content.chars().take(120).collect();
+        ui.subagent_finished(&id, status, elapsed_ms, &finish_summary);
         result.outcome
     }
 
@@ -274,10 +282,8 @@ impl crate::Agent {
 
 /// Run a prepared explore job to completion. This is a free function (not a
 /// method on `Agent`) so it can run concurrently across multiple jobs without
-/// holding `&mut self`. UI output is buffered into the provided `BufferingUi`
-/// and replayed to the real UI by the caller after the job completes — this
-/// avoids needing to share `&mut dyn Ui` across concurrent futures.
-pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut BufferingUi) -> ExploreResult {
+/// holding `&mut self`. Live status goes through [`crate::subagent_progress::SubagentProgressUi`].
+pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> ExploreResult {
     let ExploreJob {
         slot,
         task,
@@ -300,7 +306,6 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut BufferingUi) -> Ex
     };
     // `Box::pin` breaks the async-recursion cycle (`run_turn` → `handle_explore`
     // → child `run_turn`) that would otherwise make the future infinitely sized.
-    // The child writes to the `BufferingUi`; the caller replays to the real UI.
     let outcome = {
         match Box::pin(child.run_turn(&explore_child_prompt(&task), ui)).await {
             Ok(outcome) => {
@@ -348,73 +353,6 @@ fn explore_child_prompt(task: &str) -> String {
          reply with a concise, self-contained answer that cites the specific files and locations \
          supporting it.\n\nQuestion: {task}"
     )
-}
-
-/// A buffered UI event — collected by `BufferingUi` and replayed later.
-enum BufferedUiEvent {
-    ToolCall { name: String, args: String },
-    ToolResult { name: String, result: String },
-    Status { text: String },
-}
-
-/// A `Ui` that buffers events into a `Vec` instead of emitting them live.
-/// Used by the parallel-explore path: each concurrent explore writes to its
-/// own `BufferingUi`, and the batch scheduler replays the events to the real
-/// UI sequentially after each explore completes. This avoids sharing
-/// `&mut dyn Ui` across concurrent futures.
-pub(crate) struct BufferingUi {
-    events: Vec<BufferedUiEvent>,
-}
-
-impl BufferingUi {
-    pub(crate) fn new() -> Self {
-        Self { events: Vec::new() }
-    }
-
-    /// Drain and replay all buffered events to the real UI, prefixing tool
-    /// names with `explore:` and status text with `explore: ` — matching the
-    /// `ExploreUi` forwarding convention.
-    pub(crate) fn replay_to(&mut self, ui: &mut dyn Ui) {
-        for event in self.events.drain(..) {
-            match event {
-                BufferedUiEvent::ToolCall { name, args } => {
-                    ui.tool_call(&format!("explore:{name}"), &args);
-                }
-                BufferedUiEvent::ToolResult { name, result } => {
-                    ui.tool_result(&format!("explore:{name}"), &result);
-                }
-                BufferedUiEvent::Status { text } => {
-                    if let Some(text) = crate::ui::user_facing_status(&text) {
-                        ui.status(&format!("explore: {text}"));
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Ui for BufferingUi {
-    fn assistant_text(&mut self, _text: &str) {}
-    fn assistant_reasoning(&mut self, _text: &str) {}
-    fn assistant_end(&mut self) {}
-    fn tool_call(&mut self, name: &str, args: &str) {
-        self.events.push(BufferedUiEvent::ToolCall {
-            name: name.to_string(),
-            args: args.to_string(),
-        });
-    }
-    fn tool_result(&mut self, name: &str, result: &str) {
-        self.events.push(BufferedUiEvent::ToolResult {
-            name: name.to_string(),
-            result: result.to_string(),
-        });
-    }
-    fn status(&mut self, text: &str) {
-        self.events.push(BufferedUiEvent::Status {
-            text: text.to_string(),
-        });
-    }
-    fn turn_end(&mut self, _summary: &str) {}
 }
 
 /// The model explore children run: `HI_EXPLORE_MODEL` env (highest, a live

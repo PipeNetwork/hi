@@ -295,7 +295,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::ReviewTools,
         keys: "Ctrl-D",
-        help: "toggle the working-tree diff panel",
+        help: "full-screen diff review (same as Ctrl-G)",
         in_help: true,
         action: Some(Action::ToggleDiff),
         matches: &[KeyMatch::ctrl(KeyCode::Char('d'))],
@@ -421,7 +421,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::Sessions,
         keys: "/theme",
-        help: "cycle dark / light / ansi / auto",
+        help: "cycle groknight / grokday / tokyonight / oscura / rosepine / ansi / auto",
         in_help: true,
         action: None,
         matches: &[],

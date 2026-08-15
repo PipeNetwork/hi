@@ -161,7 +161,7 @@ impl crate::Agent {
             report: crate::domain::TurnReportState::new(last_effective_route),
             workspace: crate::domain::WorkspaceTurnState::default(),
             subagents: crate::domain::SubagentSessionState::default(),
-            bg_tasks: hi_tools::BackgroundTaskRegistry::new(),
+            bg_tasks: Arc::new(hi_tools::BackgroundTaskRegistry::new()),
             interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             turn_cancellation: None,
             repair_effort_escalated: false,
@@ -1312,6 +1312,17 @@ impl crate::Agent {
     /// Snapshot this agent runtime's background handles for cancellable turns.
     pub fn background_process_ids(&self) -> Vec<String> {
         self.runtime.background().ids()
+    }
+
+    /// Registry ids for in-process background subagent tasks (`task` tool).
+    pub fn background_task_ids(&self) -> Vec<String> {
+        self.bg_tasks.list_now()
+    }
+
+    /// Cloneable handle to the background-task registry. Frontends use this to
+    /// cancel a `task` while a turn future still borrows the agent.
+    pub fn background_task_registry(&self) -> Arc<hi_tools::BackgroundTaskRegistry> {
+        Arc::clone(&self.bg_tasks)
     }
 
     /// A read-only snapshot of this session's background jobs `(id, command,

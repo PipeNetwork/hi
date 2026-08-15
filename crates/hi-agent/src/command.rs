@@ -211,8 +211,9 @@ pub enum Command {
     /// accept input from remote clients via ipop. Arg: empty (use current
     /// session) or a session id to resume.
     Daemon(String),
-    /// Switch the TUI color theme (TUI only). Arg: `dark`, `light`, `ansi`,
-    /// `auto` (follow OS), or empty to cycle to the next.
+    /// Switch the TUI color theme (TUI only). Default is `groknight`. Arg:
+    /// `groknight`/`dark`, `grokday`/`light`, `tokyonight`, `oscura`,
+    /// `rosepine`, `ansi`, `auto` (follow OS), or empty to cycle to the next.
     Theme(String),
     /// Transcript density (TUI only). Arg: `compact`, `comfortable`, `verbose`,
     /// or empty to cycle.
@@ -1924,11 +1925,19 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "theme",
-        args: "[dark|light|ansi|auto]",
+        args: "[groknight|grokday|tokyonight|oscura|rosepine|ansi|auto]",
         help: "TUI theme (alias of /config ui theme)",
         arg_values: &[
-            ("dark", "designed dark palette (truecolor)"),
-            ("light", "designed light palette (truecolor)"),
+            (
+                "groknight",
+                "default — grok-build dark: near-black gray, magenta accents",
+            ),
+            ("grokday", "grok-build light counterpart"),
+            ("tokyonight", "blue-tinted Storm palette"),
+            ("oscura", "deep purple-tinted midnight"),
+            ("rosepine", "rose pine moon"),
+            ("dark", "alias of groknight"),
+            ("light", "alias of grokday"),
             ("ansi", "terminal-native 16-color palette"),
             ("auto", "follow the OS light/dark appearance"),
         ],
@@ -2349,7 +2358,7 @@ pub fn help_text() -> String {
     out.push_str("aliases: /m /st /cp /redo /revert /new /changes /usage /debug /cfg /set /h /?");
     out.push_str("\n\nkeybindings (TUI):\n");
     out.push_str("  Ctrl-T             toggle reasoning (thinking) collapse\n");
-    out.push_str("  Ctrl-D             toggle the working-tree diff panel\n");
+    out.push_str("  Ctrl-D             full-screen diff review (same as Ctrl-G)\n");
     out.push_str("  Ctrl-?             toggle the agent observability panel\n");
     out.push_str("  Ctrl-C             interrupt the running turn; double-press idle to quit\n");
     out.push_str("  Ctrl-R             fuzzy-search input history\n");
@@ -2441,8 +2450,8 @@ mod tests {
     fn help_text_matches_non_quitting_idle_keybindings() {
         let help = help_text();
         assert!(
-            help.contains("Ctrl-D             toggle the working-tree diff panel"),
-            "Ctrl-D should be documented as diff toggle:\n{help}"
+            help.contains("Ctrl-D             full-screen diff review (same as Ctrl-G)"),
+            "Ctrl-D should be documented as full-screen review:\n{help}"
         );
         assert!(
             help.contains("double-press idle to quit"),

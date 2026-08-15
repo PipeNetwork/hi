@@ -56,6 +56,8 @@ impl OverlayDomain {
             || app.palette.is_some()
             || app.tutorial.is_some()
             || app.workflow_overlay.is_some()
+            || app.inspect_subagent.is_some()
+            || app.tasks_overlay.is_some()
             || app.diff_lab.is_some()
     }
 

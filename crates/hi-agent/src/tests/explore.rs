@@ -238,7 +238,7 @@ async fn explore_mutation_wording_keeps_reads_read_only_and_succeeds() {
     let reads = ui
         .tool_results
         .iter()
-        .filter(|(name, _)| name == "explore:read")
+        .filter(|(name, _)| name == "read")
         .collect::<Vec<_>>();
     assert_eq!(reads.len(), 14, "all read-only investigation must run");
     assert!(
@@ -334,7 +334,7 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
     let read_results = ui
         .tool_results
         .iter()
-        .filter(|(name, _)| name == "explore:read")
+        .filter(|(name, _)| name == "read")
         .collect::<Vec<_>>();
     assert_eq!(
         read_results.len(),

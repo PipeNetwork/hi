@@ -36,7 +36,7 @@ use crate::model_picker::ModelPicker;
 use crate::provider_form;
 use crate::provider_picker;
 use crate::render::dim;
-use crate::{App, TICK, TurnState, apply_metadata, splash_lines};
+use crate::{App, TICK, TurnState, apply_metadata};
 /// Run the full-screen TUI until the user quits. `history_path`, if given, is
 /// the file used to persist input history across sessions (shared with the
 /// plain REPL). `profiles` is the list of configured profiles (for `/provider`
@@ -216,7 +216,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     // Seed the context-fill gauge with the model's window so it reads 0% before
     // the first turn (it refreshes from real usage after each round).
     app.context_window = None;
-    // Mirror the agent's reasoning effort so the title bar and splash show the
+    // Mirror the agent's reasoning effort so the title bar shows the
     // live level (it can be set before the TUI starts, e.g. via config).
     app.reasoning_effort = agent.reasoning_effort();
     // Load the on-disk /models cache so model metadata (window/price)
@@ -241,35 +241,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
             .collect();
     }
     {
-        // The Pipenetwork.ai landing banner as the first transcript lines —
-        // it sits at the top of the transcript and scrolls up naturally as the
-        // session grows, like Claude's landing. Pushed before the usage hint.
-        for line in splash_lines(&provider, &model, app.context_window, app.reasoning_effort) {
-            app.push(line);
-        }
-        // A one-line usage hint as the next transcript line. The provider and
-        // model already appear in the border title (top of the box), so we don't
-        // repeat them here — that would render as a duplicate header line.
-        let ctx = app
-            .context_window
-            .map(|w| format!(" · {w} token window"))
-            .unwrap_or_default();
-        // When resuming, show what we're walking back into before the hint.
+        // Fresh sessions stay empty so the canvas can show the wordmark.
+        // Chrome already has cwd, model, and shortcuts. Resume still gets a
+        // one-line summary of what you're walking back into.
         if let Some(summary) = &resume_summary {
             app.push(Line::styled(summary.clone(), dim()));
         }
-        app.push(Line::styled(
-            format!(
-                "Enter to send · Alt-Enter for a newline · Tab accepts a suggested next prompt · Ctrl-C interrupts/double exits · Ctrl-T shows reasoning · Ctrl-O expands tool output · Ctrl-D toggles diff · /theme to restyle · /help for all commands{ctx}.",
-            ),
-            dim(),
-        ));
-        let execution_hint = if app.execution.is_durable() {
-            "durable execution on · checkpoints prompts and completed tool batches · /durable off"
-        } else {
-            "ephemeral execution · /durable on to checkpoint this saved session"
-        };
-        app.push(Line::styled(execution_hint.to_string(), dim()));
     }
     // Session-start ghost text from git dirty files (cheap; no model call).
     // Post-turn suggestions replace this via UiEvent::SuggestedPrompt.
@@ -339,19 +316,6 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 fleet_launcher.clone(),
                 fleet_launcher.loops_file.clone(),
                 event_sink.clone(),
-            ));
-        }
-    }
-    // "While you were away": if loops noticed changes since you last looked,
-    // nudge you toward /digest (which shows and then clears the marker).
-    if let Some(lf) = &fleet_launcher.loops_file {
-        let entries = crate::activity::load(&crate::activity::activity_path(lf));
-        let seen = crate::activity::load_seen(&crate::activity::seen_path(lf));
-        let fresh = entries.iter().filter(|e| e.at_ms > seen).count();
-        if fresh > 0 {
-            app.push(Line::styled(
-                format!("⟳ {fresh} loop change(s) since you last looked — /digest to review"),
-                Style::default().fg(crate::theme::theme().accent_system),
             ));
         }
     }
@@ -1060,6 +1024,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 }
                                 continue 'input;
                             }
+                            Some(ChordPipeline::KillTask(id)) => {
+                                let message = agent.kill_background_task(&id).await;
+                                if message.contains("cancelled") {
+                                    crate::subagent_overlay::mark_cancelled(&mut app, &id);
+                                }
+                                app.push(Line::styled(message, dim()));
+                                continue 'input;
+                            }
                             None => {}
                         }
 
@@ -1116,9 +1088,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 app.clear_suggested_prompt();
                                 if app.show_help {
                                     app.show_help = false;
-                                } else if app.show_diff {
-                                    app.show_diff = false;
-                                    app.diff_text = None;
+                                } else if app.mode.is_review() {
+                                    app.mode.to_insert();
                                 } else if app.input.is_empty() && !app.working {
                                     if app.mode.is_normal() {
                                         app.mode.to_insert();
@@ -1219,6 +1190,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         approval_store: approval_store.clone(),
                     };
                     {
+                        let bg_tasks = agent.background_task_registry();
                         let fut = agent.compact_with(kind, &mut sink);
                         drive(
                             &mut terminal,
@@ -1233,6 +1205,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             None,
                             tx,
                             None,
+                            bg_tasks,
                         )
                         .await?;
                     }
@@ -2358,6 +2331,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 let interject = agent.interjection_inbox();
                                 let btw = agent.btw_dispatcher();
                                 let driven = {
+                                    let bg_tasks = agent.background_task_registry();
                                     let fut = agent.run_turn_cancellable(
                                         &run_line,
                                         &mut sink,
@@ -2376,6 +2350,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                         Some(btw),
                                         tx,
                                         Some(turn_cancel),
+                                        bg_tasks,
                                     )
                                     .await?
                                 };
@@ -3063,6 +3038,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         let interject = agent.interjection_inbox();
         let btw = agent.btw_dispatcher();
         let driven = {
+            let bg_tasks = agent.background_task_registry();
             let fut = agent.run_turn_cancellable(&run_line, &mut sink, turn_cancel.clone());
             drive(
                 &mut terminal,
@@ -3077,6 +3053,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 Some(btw),
                 tx,
                 Some(turn_cancel),
+                bg_tasks,
             )
             .await?
         };
@@ -3326,6 +3303,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
             approval_store: approval_store.clone(),
         };
         {
+            let bg_tasks = agent.background_task_registry();
             let fut = async {
                 agent.update_memory(&mut sink).await;
                 Ok::<(), anyhow::Error>(())
@@ -3343,6 +3321,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 None,
                 tx,
                 None,
+                bg_tasks,
             )
             .await;
         }

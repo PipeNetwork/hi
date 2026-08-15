@@ -474,6 +474,9 @@ impl Ui for ObservedUi<'_> {
     fn subagent_note(&mut self, text: &str) {
         self.inner.subagent_note(text);
     }
+    fn subagent_sink(&self) -> Option<Arc<dyn hi_agent::SubagentSink>> {
+        self.inner.subagent_sink()
+    }
     fn plan(&mut self, steps: &[hi_agent::PlanStep]) {
         self.inner.plan(steps);
     }

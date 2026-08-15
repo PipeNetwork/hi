@@ -1,19 +1,15 @@
 //! The TUI color theme: a named slot vocabulary so every rendered color maps to
 //! a *role* (user, tool, error, running, …) rather than a hardcoded ANSI name.
 //!
-//! Modeled on grok-build's theme system. Two built-in palettes:
-//! - `dark` — a GrokNight-style truecolor palette (neutral dark base, magenta
-//!   assistant accent) shown on terminals that support 24-bit color.
-//! - `ansi` — named ANSI colors that respect the user's own terminal theme;
-//!   this reproduces hi's historical look and is the fallback on terminals
-//!   without truecolor.
+//! Palettes match grok-build's pager:
+//! - `groknight` (`dark`) — default: near-black gray base, Tokyo Night accents.
+//! - `grokday` (`light`) — grok-build's light counterpart.
+//! - `tokyonight` — blue-tinted Storm (hi's previous default).
+//! - `oscura-midnight` / `rosepine-moon` — the other grok-build truecolor looks.
+//! - `ansi` — named ANSI colors that respect the user's terminal theme.
 //!
-//! Selection: `HI_THEME` (`dark` | `light` | `ansi` | `auto`, default `auto`).
-//! `auto` picks `dark` on a truecolor terminal, `ansi` otherwise — so the
-//! designed palette shows where it renders faithfully and never regresses a
-//! basic terminal. A single global [`theme()`] accessor is read on every
-//! render; [`set_mode`] switches at runtime (the `/theme` command), and
-//! [`poll_auto_appearance`] follows the OS light/dark setting when mode = auto.
+//! Selection: `HI_THEME` (canonical names above, plus `auto`; default
+//! `groknight`). `auto` picks `groknight`/`grokday` from the OS appearance.
 
 use std::sync::{OnceLock, RwLock};
 
@@ -46,14 +42,19 @@ pub(crate) struct ChromeStyles {
     pub(crate) selected: Style,
 }
 
+const fn rgb(r: u8, g: u8, b: u8) -> Color {
+    Color::Rgb(r, g, b)
+}
+
 /// Every color role the TUI draws. One field per semantic slot; renderers ask
 /// for a role, never a raw `Color`, so the whole look restyles from one place.
-///
-/// The full palette is defined up front; call sites migrate onto it in phases
-/// (transcript first, then chrome), so some slots have no reader yet.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
+    /// Full-screen fill. `Reset` on ansi so the terminal background shows through.
+    pub bg_base: Color,
+    pub bg_highlight: Color,
+
     // Accents — the left gutter bar and headers take their color from the block
     // role, so a glance at the bar tells you what a block is.
     pub accent_user: Color,
@@ -68,6 +69,8 @@ pub struct Theme {
     pub accent_plan: Color,
     pub accent_goal: Color,
     pub accent_verify: Color,
+    /// Model name inlined in the prompt's bottom divider.
+    pub accent_model: Color,
 
     // Text.
     pub text_primary: Color,
@@ -100,6 +103,10 @@ pub struct Theme {
     pub diff_hunk: Color,
     pub diff_context: Color,
     pub diff_gutter: Color,
+    /// Insert-line background band (truecolor; `Reset` on ansi).
+    pub diff_add_bg: Color,
+    /// Delete-line background band (truecolor; `Reset` on ansi).
+    pub diff_del_bg: Color,
 
     // Chrome.
     pub selection: Color,
@@ -150,10 +157,14 @@ impl Theme {
     /// bottom hints after this, but border shape and semantic color stay shared.
     pub(crate) fn panel_block(self, title: impl Into<String>, tone: UiTone) -> Block<'static> {
         let chrome = self.chrome(tone);
-        Block::bordered()
+        let mut block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(chrome.border)
-            .title(Line::styled(title.into(), chrome.title))
+            .title(Line::styled(title.into(), chrome.title));
+        if self.paints_backgrounds() {
+            block = block.style(Style::default().bg(self.bg_base).fg(self.text_primary));
+        }
+        block
     }
 
     pub(crate) fn input_border(self, active: bool) -> Style {
@@ -164,108 +175,277 @@ impl Theme {
         })
     }
 
-    /// GrokNight-style truecolor dark palette. Neutral gray base, magenta
-    /// assistant/thinking accent, blue system, standard green/red/yellow.
+    /// GrokNight — grok-build's default: neutral #141414 base, Tokyo Night accents.
+    pub const fn groknight() -> Self {
+        Self {
+            bg_base: rgb(20, 20, 20),
+            bg_highlight: rgb(36, 36, 36),
+            accent_user: rgb(0xc8, 0xc8, 0xc8),
+            accent_assistant: rgb(0xbb, 0x9a, 0xf7),
+            accent_thinking: rgb(0xbb, 0x9a, 0xf7),
+            accent_tool: rgb(0x78, 0x78, 0x78),
+            accent_system: rgb(0x7a, 0xa2, 0xf7),
+            accent_error: rgb(0xf7, 0x76, 0x8e),
+            accent_success: rgb(0x9e, 0xce, 0x6a),
+            accent_running: rgb(0xbb, 0x9a, 0xf7),
+            accent_skill: rgb(0x7a, 0xa2, 0xf7),
+            accent_plan: rgb(0xff, 0xdb, 0x8d),
+            accent_goal: rgb(0xbb, 0x9a, 0xf7),
+            accent_verify: rgb(0xbb, 0x9a, 0xf7),
+            accent_model: rgb(0x1a, 0xbc, 0x9c),
+            text_primary: rgb(0xe1, 0xe1, 0xe1),
+            text_secondary: rgb(0xc8, 0xc8, 0xc8),
+            gray_dim: rgb(0x58, 0x58, 0x58),
+            gray: rgb(0x6c, 0x6c, 0x6c),
+            gray_bright: rgb(0x78, 0x78, 0x78),
+            warning: rgb(0xe0, 0xaf, 0x68),
+            path: rgb(0xff, 0x9e, 0x64),
+            command: rgb(0xe0, 0xaf, 0x68),
+            code: rgb(0x3a, 0x95, 0xab),
+            link: rgb(0x7a, 0xa6, 0xda),
+            status: rgb(0x6c, 0x6c, 0x6c),
+            syn_keyword: rgb(0xbb, 0x9a, 0xf7),
+            syn_type: rgb(0x2a, 0xc3, 0xde),
+            syn_function: rgb(0x7a, 0xa2, 0xf7),
+            syn_string: rgb(0x9e, 0xce, 0x6a),
+            syn_number: rgb(0xff, 0x9e, 0x64),
+            syn_comment: rgb(0x6c, 0x6c, 0x6c),
+            diff_add: rgb(0x9e, 0xce, 0x6a),
+            diff_del: rgb(0xf7, 0x76, 0x8e),
+            diff_hunk: rgb(0x7d, 0xcf, 0xff),
+            diff_context: rgb(0x78, 0x78, 0x78),
+            diff_gutter: rgb(0x58, 0x58, 0x58),
+            diff_add_bg: rgb(6, 56, 6),
+            diff_del_bg: rgb(66, 14, 20),
+            selection: rgb(0x7d, 0xcf, 0xff),
+            selection_bg: rgb(0x36, 0x36, 0x36),
+            prompt_border: rgb(0x32, 0x32, 0x37),
+            prompt_border_active: rgb(0x50, 0x50, 0x58),
+            band_user: rgb(0x24, 0x24, 0x24),
+            panel: rgb(0x1c, 0x1c, 0x1c),
+        }
+    }
+
+    /// Alias used by `/theme dark` and historical call sites.
     pub const fn dark() -> Self {
+        Self::groknight()
+    }
+
+    /// GrokDay — grok-build's light counterpart: neutral gray, deepened accents.
+    pub const fn grokday() -> Self {
         Self {
-            accent_user: Color::Rgb(0xc8, 0xc8, 0xc8),
-            accent_assistant: Color::Rgb(0xbb, 0x9a, 0xf7),
-            accent_thinking: Color::Rgb(0x9d, 0x7c, 0xd8),
-            accent_tool: Color::Rgb(0x78, 0x78, 0x78),
-            accent_system: Color::Rgb(0x7a, 0xa2, 0xf7),
-            accent_error: Color::Rgb(0xf7, 0x76, 0x8e),
-            accent_success: Color::Rgb(0x9e, 0xce, 0x6a),
-            accent_running: Color::Rgb(0xbb, 0x9a, 0xf7),
-            accent_skill: Color::Rgb(0x7a, 0xa2, 0xf7),
-            accent_plan: Color::Rgb(0x7d, 0xcf, 0xff),
-            accent_goal: Color::Rgb(0xbb, 0x9a, 0xf7),
-            accent_verify: Color::Rgb(0x7d, 0xcf, 0xff),
-            text_primary: Color::Rgb(0xc0, 0xca, 0xf5),
-            text_secondary: Color::Rgb(0x9a, 0xa5, 0xce),
-            gray_dim: Color::Rgb(0x56, 0x5f, 0x89),
-            gray: Color::Rgb(0x78, 0x7c, 0x99),
-            gray_bright: Color::Rgb(0xa9, 0xb1, 0xd6),
-            warning: Color::Rgb(0xe0, 0xaf, 0x68),
-            path: Color::Rgb(0xff, 0x9e, 0x64),
-            command: Color::Rgb(0x7d, 0xcf, 0xff),
-            code: Color::Rgb(0x7d, 0xcf, 0xff),
-            link: Color::Rgb(0x7a, 0xa2, 0xf7),
-            status: Color::Rgb(0x9a, 0xa5, 0xce),
-            syn_keyword: Color::Rgb(0xbb, 0x9a, 0xf7),
-            syn_type: Color::Rgb(0x2a, 0xc3, 0xde),
-            syn_function: Color::Rgb(0x7a, 0xa2, 0xf7),
-            syn_string: Color::Rgb(0x9e, 0xce, 0x6a),
-            syn_number: Color::Rgb(0xff, 0x9e, 0x64),
-            syn_comment: Color::Rgb(0x56, 0x5f, 0x89),
-            diff_add: Color::Rgb(0x9e, 0xce, 0x6a),
-            diff_del: Color::Rgb(0xf7, 0x76, 0x8e),
-            diff_hunk: Color::Rgb(0x7d, 0xcf, 0xff),
-            diff_context: Color::Rgb(0x78, 0x7c, 0x99),
-            diff_gutter: Color::Rgb(0x56, 0x5f, 0x89),
-            selection: Color::Rgb(0x7d, 0xcf, 0xff),
-            selection_bg: Color::Rgb(0x2d, 0x3f, 0x76),
-            prompt_border: Color::Rgb(0x56, 0x5f, 0x89),
-            prompt_border_active: Color::Rgb(0x7d, 0xcf, 0xff),
-            band_user: Color::Rgb(0x1f, 0x23, 0x35),
-            panel: Color::Rgb(0x1a, 0x1b, 0x26),
+            bg_base: rgb(238, 238, 238),
+            bg_highlight: rgb(222, 222, 222),
+            accent_user: rgb(0x44, 0x44, 0x44),
+            accent_assistant: rgb(0x7d, 0x4b, 0xc6),
+            accent_thinking: rgb(0x7d, 0x4b, 0xc6),
+            accent_tool: rgb(0x62, 0x62, 0x62),
+            accent_system: rgb(0x2f, 0x64, 0xd2),
+            accent_error: rgb(0xcd, 0x30, 0x48),
+            accent_success: rgb(0x37, 0x8e, 0x23),
+            accent_running: rgb(0x7d, 0x4b, 0xc6),
+            accent_skill: rgb(0x2f, 0x64, 0xd2),
+            accent_plan: rgb(0xa8, 0x78, 0x0a),
+            accent_goal: rgb(0x7d, 0x4b, 0xc6),
+            accent_verify: rgb(0x78, 0x50, 0xa0),
+            accent_model: rgb(0x0a, 0x8e, 0x70),
+            text_primary: rgb(0x26, 0x26, 0x26),
+            text_secondary: rgb(0x44, 0x44, 0x44),
+            gray_dim: rgb(0xa5, 0xa5, 0xa5),
+            gray: rgb(0x76, 0x76, 0x76),
+            gray_bright: rgb(0x62, 0x62, 0x62),
+            warning: rgb(0xa2, 0x76, 0x12),
+            path: rgb(0xc3, 0x69, 0x1e),
+            command: rgb(0xa2, 0x76, 0x12),
+            code: rgb(0x0f, 0x87, 0xa2),
+            link: rgb(0x2f, 0x64, 0xd2),
+            status: rgb(0x76, 0x76, 0x76),
+            syn_keyword: rgb(0x7d, 0x4b, 0xc6),
+            syn_type: rgb(0x0f, 0x87, 0xa2),
+            syn_function: rgb(0x2f, 0x64, 0xd2),
+            syn_string: rgb(0x37, 0x8e, 0x23),
+            syn_number: rgb(0xc3, 0x69, 0x1e),
+            syn_comment: rgb(0x76, 0x76, 0x76),
+            diff_add: rgb(0x37, 0x8e, 0x23),
+            diff_del: rgb(0xcd, 0x30, 0x48),
+            diff_hunk: rgb(0x00, 0x82, 0xaa),
+            diff_context: rgb(0x62, 0x62, 0x62),
+            diff_gutter: rgb(0xa5, 0xa5, 0xa5),
+            diff_add_bg: rgb(218, 242, 220),
+            diff_del_bg: rgb(245, 218, 222),
+            selection: rgb(0x00, 0x82, 0xaa),
+            selection_bg: rgb(0xc6, 0xc6, 0xc6),
+            prompt_border: rgb(0xc8, 0xc8, 0xcd),
+            prompt_border_active: rgb(0xa5, 0xa5, 0xaf),
+            band_user: rgb(0xde, 0xde, 0xde),
+            panel: rgb(0xe4, 0xe4, 0xe4),
         }
     }
 
-    /// A light truecolor palette for bright terminal backgrounds.
+    /// Alias used by `/theme light` and historical call sites.
     pub const fn light() -> Self {
+        Self::grokday()
+    }
+
+    /// Tokyo Night Storm — hi's previous default, kept as a named option.
+    pub const fn tokyonight() -> Self {
         Self {
-            accent_user: Color::Rgb(0x34, 0x3b, 0x58),
-            accent_assistant: Color::Rgb(0x7a, 0x4c, 0xc9),
-            accent_thinking: Color::Rgb(0x8a, 0x5c, 0xd9),
-            accent_tool: Color::Rgb(0x8c, 0x8c, 0x8c),
-            accent_system: Color::Rgb(0x2e, 0x5c, 0xc9),
-            accent_error: Color::Rgb(0xc0, 0x36, 0x4e),
-            accent_success: Color::Rgb(0x38, 0x7a, 0x2c),
-            accent_running: Color::Rgb(0x7a, 0x4c, 0xc9),
-            accent_skill: Color::Rgb(0x2e, 0x5c, 0xc9),
-            accent_plan: Color::Rgb(0x16, 0x7a, 0xa6),
-            accent_goal: Color::Rgb(0x7a, 0x4c, 0xc9),
-            accent_verify: Color::Rgb(0x16, 0x7a, 0xa6),
-            text_primary: Color::Rgb(0x2a, 0x2e, 0x3a),
-            text_secondary: Color::Rgb(0x50, 0x56, 0x6a),
-            gray_dim: Color::Rgb(0x9a, 0xa0, 0xb0),
-            gray: Color::Rgb(0x70, 0x76, 0x88),
-            gray_bright: Color::Rgb(0x40, 0x46, 0x58),
-            warning: Color::Rgb(0xa6, 0x6a, 0x00),
-            path: Color::Rgb(0xc0, 0x54, 0x1a),
-            command: Color::Rgb(0x16, 0x6a, 0xa6),
-            code: Color::Rgb(0x16, 0x6a, 0xa6),
-            link: Color::Rgb(0x2e, 0x5c, 0xc9),
-            status: Color::Rgb(0x50, 0x56, 0x6a),
-            syn_keyword: Color::Rgb(0x7a, 0x4c, 0xc9),
-            syn_type: Color::Rgb(0x0f, 0x6b, 0x8a),
-            syn_function: Color::Rgb(0x2e, 0x5c, 0xc9),
-            syn_string: Color::Rgb(0x38, 0x7a, 0x2c),
-            syn_number: Color::Rgb(0xc0, 0x54, 0x1a),
-            syn_comment: Color::Rgb(0x8a, 0x90, 0xa0),
-            diff_add: Color::Rgb(0x38, 0x7a, 0x2c),
-            diff_del: Color::Rgb(0xc0, 0x36, 0x4e),
-            diff_hunk: Color::Rgb(0x16, 0x6a, 0xa6),
-            diff_context: Color::Rgb(0x70, 0x76, 0x88),
-            diff_gutter: Color::Rgb(0x9a, 0xa0, 0xb0),
-            selection: Color::Rgb(0x16, 0x6a, 0xa6),
-            selection_bg: Color::Rgb(0xc6, 0xdd, 0xf7),
-            prompt_border: Color::Rgb(0x9a, 0xa0, 0xb0),
-            prompt_border_active: Color::Rgb(0x16, 0x6a, 0xa6),
-            band_user: Color::Rgb(0xec, 0xee, 0xf5),
-            panel: Color::Rgb(0xf0, 0xf2, 0xf8),
+            bg_base: rgb(0x24, 0x28, 0x3b),
+            bg_highlight: rgb(0x29, 0x2e, 0x42),
+            accent_user: rgb(0xc8, 0xc8, 0xc8),
+            accent_assistant: rgb(0xbb, 0x9a, 0xf7),
+            accent_thinking: rgb(0x9d, 0x7c, 0xd8),
+            accent_tool: rgb(0x78, 0x78, 0x78),
+            accent_system: rgb(0x7a, 0xa2, 0xf7),
+            accent_error: rgb(0xf7, 0x76, 0x8e),
+            accent_success: rgb(0x9e, 0xce, 0x6a),
+            accent_running: rgb(0xbb, 0x9a, 0xf7),
+            accent_skill: rgb(0x7a, 0xa2, 0xf7),
+            accent_plan: rgb(0x7d, 0xcf, 0xff),
+            accent_goal: rgb(0xbb, 0x9a, 0xf7),
+            accent_verify: rgb(0x7d, 0xcf, 0xff),
+            accent_model: rgb(0x1a, 0xbc, 0x9c),
+            text_primary: rgb(0xc0, 0xca, 0xf5),
+            text_secondary: rgb(0x9a, 0xa5, 0xce),
+            gray_dim: rgb(0x56, 0x5f, 0x89),
+            gray: rgb(0x78, 0x7c, 0x99),
+            gray_bright: rgb(0xa9, 0xb1, 0xd6),
+            warning: rgb(0xe0, 0xaf, 0x68),
+            path: rgb(0xff, 0x9e, 0x64),
+            command: rgb(0x7d, 0xcf, 0xff),
+            code: rgb(0x7d, 0xcf, 0xff),
+            link: rgb(0x7a, 0xa2, 0xf7),
+            status: rgb(0x9a, 0xa5, 0xce),
+            syn_keyword: rgb(0xbb, 0x9a, 0xf7),
+            syn_type: rgb(0x2a, 0xc3, 0xde),
+            syn_function: rgb(0x7a, 0xa2, 0xf7),
+            syn_string: rgb(0x9e, 0xce, 0x6a),
+            syn_number: rgb(0xff, 0x9e, 0x64),
+            syn_comment: rgb(0x56, 0x5f, 0x89),
+            diff_add: rgb(0x9e, 0xce, 0x6a),
+            diff_del: rgb(0xf7, 0x76, 0x8e),
+            diff_hunk: rgb(0x7d, 0xcf, 0xff),
+            diff_context: rgb(0x78, 0x7c, 0x99),
+            diff_gutter: rgb(0x56, 0x5f, 0x89),
+            diff_add_bg: rgb(15, 65, 20),
+            diff_del_bg: rgb(85, 15, 20),
+            selection: rgb(0x7d, 0xcf, 0xff),
+            selection_bg: rgb(0x28, 0x34, 0x57),
+            prompt_border: rgb(0x3c, 0x4b, 0x78),
+            prompt_border_active: rgb(0x4b, 0x5c, 0x8c),
+            band_user: rgb(0x1f, 0x23, 0x35),
+            panel: rgb(0x1a, 0x1b, 0x26),
         }
     }
 
-    /// Named-ANSI palette: reproduces hi's historical look and respects the
-    /// user's own terminal colors. Backgrounds are `Reset` so nothing paints a
-    /// band a terminal theme won't match. This is the non-truecolor fallback.
-    /// Blue foregrounds use the bright variant (`LightBlue`): the standard
-    /// dark ANSI blue is unreadable on the black backgrounds this palette
-    /// targets. Error/deletion reds use `LightRed` for the same reason —
-    /// dark red is the next-lowest-luminance slot after blue.
+    /// Oscura Midnight — grok-build's deep purple-tinted dark palette.
+    pub const fn oscura() -> Self {
+        Self {
+            bg_base: rgb(3, 3, 4),
+            bg_highlight: rgb(15, 18, 22),
+            accent_user: rgb(0xc4, 0xa7, 0xe7),
+            accent_assistant: rgb(0x9b, 0x7e, 0xce),
+            accent_thinking: rgb(0x81, 0x86, 0x8f),
+            accent_tool: rgb(0x5e, 0x64, 0x6c),
+            accent_system: rgb(0x7d, 0xcf, 0xdf),
+            accent_error: rgb(0xdc, 0x5a, 0x64),
+            accent_success: rgb(0x50, 0xb4, 0x8c),
+            accent_running: rgb(0x6e, 0x5a, 0x9a),
+            accent_skill: rgb(0x9b, 0x7e, 0xce),
+            accent_plan: rgb(0xeb, 0xd9, 0x6e),
+            accent_goal: rgb(0x9b, 0x7e, 0xce),
+            accent_verify: rgb(0x9b, 0x7e, 0xce),
+            accent_model: rgb(0x7d, 0xcf, 0xdf),
+            text_primary: rgb(0xe4, 0xe4, 0xe4),
+            text_secondary: rgb(0xbe, 0xbe, 0xbe),
+            gray_dim: rgb(0x5e, 0x64, 0x6c),
+            gray: rgb(0x81, 0x86, 0x8f),
+            gray_bright: rgb(0xbe, 0xbe, 0xbe),
+            warning: rgb(0xeb, 0xd9, 0x6e),
+            path: rgb(0xf1, 0xbd, 0x00),
+            command: rgb(0xeb, 0xd9, 0x6e),
+            code: rgb(0x7d, 0xcf, 0xdf),
+            link: rgb(0x7d, 0xcf, 0xdf),
+            status: rgb(0x81, 0x86, 0x8f),
+            syn_keyword: rgb(0xc4, 0xa7, 0xe7),
+            syn_type: rgb(0x7d, 0xcf, 0xdf),
+            syn_function: rgb(0x9b, 0x7e, 0xce),
+            syn_string: rgb(0x50, 0xb4, 0x8c),
+            syn_number: rgb(0xf1, 0xbd, 0x00),
+            syn_comment: rgb(0x5e, 0x64, 0x6c),
+            diff_add: rgb(0x50, 0xb4, 0x8c),
+            diff_del: rgb(0xdc, 0x5a, 0x64),
+            diff_hunk: rgb(0x7d, 0xcf, 0xdf),
+            diff_context: rgb(0x81, 0x86, 0x8f),
+            diff_gutter: rgb(0x5e, 0x64, 0x6c),
+            diff_add_bg: rgb(10, 35, 30),
+            diff_del_bg: rgb(45, 15, 25),
+            selection: rgb(0xc4, 0xa7, 0xe7),
+            selection_bg: rgb(0x24, 0x20, 0x34),
+            prompt_border: rgb(0x24, 0x20, 0x34),
+            prompt_border_active: rgb(0x34, 0x30, 0x48),
+            band_user: rgb(0x12, 0x10, 0x1c),
+            panel: rgb(0x04, 0x05, 0x07),
+        }
+    }
+
+    /// Rose Pine Moon — grok-build's warmer purple dark palette.
+    pub const fn rosepine() -> Self {
+        Self {
+            bg_base: rgb(35, 33, 54),
+            bg_highlight: rgb(57, 53, 82),
+            accent_user: rgb(0xe0, 0xde, 0xf4),
+            accent_assistant: rgb(0xc4, 0xa7, 0xe7),
+            accent_thinking: rgb(0x6e, 0x6a, 0x86),
+            accent_tool: rgb(0x90, 0x8c, 0xaa),
+            accent_system: rgb(0x3e, 0x8f, 0xb0),
+            accent_error: rgb(0xeb, 0x6f, 0x92),
+            accent_success: rgb(0x9c, 0xcf, 0xd8),
+            accent_running: rgb(0x6e, 0x6a, 0x86),
+            accent_skill: rgb(0x90, 0x8c, 0xaa),
+            accent_plan: rgb(0xf6, 0xc1, 0x77),
+            accent_goal: rgb(0xc4, 0xa7, 0xe7),
+            accent_verify: rgb(0x3e, 0x8f, 0xb0),
+            accent_model: rgb(0x3e, 0x8f, 0xb0),
+            text_primary: rgb(0xe0, 0xde, 0xf4),
+            text_secondary: rgb(0x90, 0x8c, 0xaa),
+            gray_dim: rgb(0x44, 0x41, 0x5a),
+            gray: rgb(0x6e, 0x6a, 0x86),
+            gray_bright: rgb(0x90, 0x8c, 0xaa),
+            warning: rgb(0xf6, 0xc1, 0x77),
+            path: rgb(0xea, 0x9a, 0x97),
+            command: rgb(0xf6, 0xc1, 0x77),
+            code: rgb(0x9c, 0xcf, 0xd8),
+            link: rgb(0x3e, 0x8f, 0xb0),
+            status: rgb(0x6e, 0x6a, 0x86),
+            syn_keyword: rgb(0xc4, 0xa7, 0xe7),
+            syn_type: rgb(0x9c, 0xcf, 0xd8),
+            syn_function: rgb(0x3e, 0x8f, 0xb0),
+            syn_string: rgb(0x9c, 0xcf, 0xd8),
+            syn_number: rgb(0xf6, 0xc1, 0x77),
+            syn_comment: rgb(0x6e, 0x6a, 0x86),
+            diff_add: rgb(0x9c, 0xcf, 0xd8),
+            diff_del: rgb(0xeb, 0x6f, 0x92),
+            diff_hunk: rgb(0x3e, 0x8f, 0xb0),
+            diff_context: rgb(0x90, 0x8c, 0xaa),
+            diff_gutter: rgb(0x44, 0x41, 0x5a),
+            diff_add_bg: rgb(25, 45, 55),
+            diff_del_bg: rgb(55, 30, 40),
+            selection: rgb(0xc4, 0xa7, 0xe7),
+            selection_bg: rgb(0x44, 0x41, 0x5a),
+            prompt_border: rgb(0x44, 0x41, 0x5a),
+            prompt_border_active: rgb(0x56, 0x52, 0x6e),
+            band_user: rgb(0x2a, 0x27, 0x3f),
+            panel: rgb(0x2a, 0x27, 0x3f),
+        }
+    }
+
+    /// Named-ANSI palette: respects the user's own terminal colors. Backgrounds
+    /// are `Reset` so nothing paints a band a terminal theme won't match.
     pub const fn ansi() -> Self {
         Self {
+            bg_base: Color::Reset,
+            bg_highlight: Color::Reset,
             accent_user: Color::LightBlue,
             accent_assistant: Color::Magenta,
             accent_thinking: Color::DarkGray,
@@ -278,6 +458,7 @@ impl Theme {
             accent_plan: Color::Cyan,
             accent_goal: Color::Magenta,
             accent_verify: Color::Cyan,
+            accent_model: Color::Cyan,
             text_primary: Color::Reset,
             text_secondary: Color::Gray,
             gray_dim: Color::DarkGray,
@@ -300,10 +481,12 @@ impl Theme {
             diff_hunk: Color::Cyan,
             diff_context: Color::DarkGray,
             diff_gutter: Color::DarkGray,
+            diff_add_bg: Color::Reset,
+            diff_del_bg: Color::Reset,
             selection: Color::Cyan,
             selection_bg: Color::Blue,
             prompt_border: Color::DarkGray,
-            prompt_border_active: Color::Cyan,
+            prompt_border_active: Color::Gray,
             band_user: Color::Reset,
             panel: Color::Reset,
         }
@@ -312,9 +495,8 @@ impl Theme {
     /// Whether this theme paints real backgrounds (truecolor) or leaves them at
     /// the terminal default (ansi). Renderers use this to skip band/panel fills
     /// that would look wrong against an unknown terminal background.
-    #[allow(dead_code)]
     pub fn paints_backgrounds(&self) -> bool {
-        !matches!(self.band_user, Color::Reset)
+        !matches!(self.bg_base, Color::Reset)
     }
 }
 
@@ -322,8 +504,13 @@ impl Theme {
 /// `auto` can re-resolve when the OS appearance changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ThemeMode {
+    /// GrokNight (canonical grok-build dark). `/theme dark` is an alias.
     Dark,
+    /// GrokDay (canonical grok-build light). `/theme light` is an alias.
     Light,
+    TokyoNight,
+    Oscura,
+    RosePine,
     /// Named ANSI colors that respect the user's own terminal theme.
     Ansi,
     /// Follow the OS light/dark appearance (falls back to a truecolor-aware
@@ -335,8 +522,11 @@ impl ThemeMode {
     /// Parse a `/theme <name>` / `HI_THEME` value. `None` for an unknown value.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "dark" => Some(Self::Dark),
-            "light" => Some(Self::Light),
+            "dark" | "groknight" | "grok-night" => Some(Self::Dark),
+            "light" | "grokday" | "grok-day" | "day" => Some(Self::Light),
+            "tokyonight" | "tokyo-night" | "tokyo" => Some(Self::TokyoNight),
+            "oscura" | "oscura-midnight" => Some(Self::Oscura),
+            "rosepine" | "rose-pine" | "rosepine-moon" | "rose-pine-moon" => Some(Self::RosePine),
             "ansi" | "none" => Some(Self::Ansi),
             "auto" | "system" => Some(Self::Auto),
             _ => None,
@@ -346,8 +536,11 @@ impl ThemeMode {
     /// A short label for the status line / picker.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Dark => "dark",
-            Self::Light => "light",
+            Self::Dark => "groknight",
+            Self::Light => "grokday",
+            Self::TokyoNight => "tokyonight",
+            Self::Oscura => "oscura-midnight",
+            Self::RosePine => "rosepine-moon",
             Self::Ansi => "ansi",
             Self::Auto => "auto",
         }
@@ -357,7 +550,10 @@ impl ThemeMode {
     pub fn next(self) -> Self {
         match self {
             Self::Dark => Self::Light,
-            Self::Light => Self::Ansi,
+            Self::Light => Self::TokyoNight,
+            Self::TokyoNight => Self::Oscura,
+            Self::Oscura => Self::RosePine,
+            Self::RosePine => Self::Ansi,
             Self::Ansi => Self::Auto,
             Self::Auto => Self::Dark,
         }
@@ -369,13 +565,14 @@ impl ThemeMode {
         match self {
             Self::Dark => Theme::dark(),
             Self::Light => Theme::light(),
+            Self::TokyoNight => Theme::tokyonight(),
+            Self::Oscura => Theme::oscura(),
+            Self::RosePine => Theme::rosepine(),
             Self::Ansi => Theme::ansi(),
             Self::Auto => match os_appearance() {
-                Some(OsAppearance::Dark) => Theme::dark(),
-                Some(OsAppearance::Light) => Theme::light(),
-                // OS can't be queried: the designed palette on a truecolor
-                // terminal, the terminal-respecting ANSI look otherwise.
-                None if terminal_supports_truecolor() => Theme::dark(),
+                Some(OsAppearance::Dark) => Theme::groknight(),
+                Some(OsAppearance::Light) => Theme::grokday(),
+                None if terminal_supports_truecolor() => Theme::groknight(),
                 None => Theme::ansi(),
             },
         }
@@ -416,12 +613,14 @@ fn os_appearance() -> Option<OsAppearance> {
     None
 }
 
-/// Resolve the initial mode from `HI_THEME` (default `auto`).
+/// Resolve a `HI_THEME` value. Missing or unknown values are GrokNight.
+fn mode_from_env(raw: Option<&str>) -> ThemeMode {
+    raw.and_then(ThemeMode::parse).unwrap_or(ThemeMode::Dark)
+}
+
+/// Resolve the initial mode from `HI_THEME` (default `groknight`).
 fn initial_mode() -> ThemeMode {
-    std::env::var("HI_THEME")
-        .ok()
-        .and_then(|v| ThemeMode::parse(&v))
-        .unwrap_or(ThemeMode::Auto)
+    mode_from_env(std::env::var("HI_THEME").ok().as_deref())
 }
 
 /// Best-effort truecolor detection. `COLORTERM=truecolor|24bit` is the standard
@@ -509,8 +708,7 @@ pub fn poll_auto_appearance() -> bool {
         return false;
     }
     let resolved = ThemeMode::Auto.resolve();
-    // Compare a cheap discriminator (band_user is distinct per palette).
-    if resolved.band_user != state.theme.band_user {
+    if resolved.bg_base != state.theme.bg_base {
         state.theme = resolved;
         state.revision = state.revision.wrapping_add(1);
         true
@@ -529,12 +727,24 @@ mod tests {
         assert!(!t.paints_backgrounds());
         assert_eq!(t.band_user, Color::Reset);
         assert_eq!(t.panel, Color::Reset);
+        assert_eq!(t.bg_base, Color::Reset);
     }
 
     #[test]
     fn truecolor_themes_paint_backgrounds() {
         assert!(Theme::dark().paints_backgrounds());
         assert!(Theme::light().paints_backgrounds());
+        assert!(Theme::tokyonight().paints_backgrounds());
+        assert!(Theme::oscura().paints_backgrounds());
+        assert!(Theme::rosepine().paints_backgrounds());
+    }
+
+    #[test]
+    fn groknight_is_neutral_gray_not_tokyo_blue() {
+        let t = Theme::groknight();
+        assert_eq!(t.bg_base, Color::Rgb(20, 20, 20));
+        assert_eq!(t.text_primary, Color::Rgb(0xe1, 0xe1, 0xe1));
+        assert_ne!(t.bg_base, Theme::tokyonight().bg_base);
     }
 
     #[test]
@@ -550,33 +760,45 @@ mod tests {
     #[test]
     fn mode_parse_and_cycle() {
         assert_eq!(ThemeMode::parse("dark"), Some(ThemeMode::Dark));
+        assert_eq!(ThemeMode::parse("groknight"), Some(ThemeMode::Dark));
         assert_eq!(ThemeMode::parse("LIGHT"), Some(ThemeMode::Light));
+        assert_eq!(ThemeMode::parse("grokday"), Some(ThemeMode::Light));
+        assert_eq!(ThemeMode::parse("tokyonight"), Some(ThemeMode::TokyoNight));
+        assert_eq!(ThemeMode::parse("oscura"), Some(ThemeMode::Oscura));
+        assert_eq!(ThemeMode::parse("rosepine-moon"), Some(ThemeMode::RosePine));
         assert_eq!(ThemeMode::parse("system"), Some(ThemeMode::Auto));
         assert_eq!(ThemeMode::parse("none"), Some(ThemeMode::Ansi));
         assert_eq!(ThemeMode::parse("nope"), None);
-        // Cycle visits every mode and returns to the start.
         let mut m = ThemeMode::Dark;
         let mut seen = std::collections::HashSet::new();
-        for _ in 0..4 {
+        for _ in 0..7 {
             seen.insert(m);
             m = m.next();
         }
-        assert_eq!(m, ThemeMode::Dark, "cycle is a 4-loop");
-        assert_eq!(seen.len(), 4, "cycle visits all modes");
+        assert_eq!(m, ThemeMode::Dark, "cycle is a 7-loop");
+        assert_eq!(seen.len(), 7, "cycle visits all modes");
     }
 
     #[test]
     fn each_mode_resolves_to_the_expected_palette() {
-        assert_eq!(ThemeMode::Dark.resolve().band_user, Theme::dark().band_user);
         assert_eq!(
-            ThemeMode::Light.resolve().band_user,
-            Theme::light().band_user
+            ThemeMode::Dark.resolve().bg_base,
+            Theme::groknight().bg_base
+        );
+        assert_eq!(ThemeMode::Light.resolve().bg_base, Theme::grokday().bg_base);
+        assert_eq!(
+            ThemeMode::TokyoNight.resolve().bg_base,
+            Theme::tokyonight().bg_base
         );
         assert!(!ThemeMode::Ansi.resolve().paints_backgrounds());
     }
 
-    // Note: the runtime `set_mode`/`theme` global is deliberately not unit-
-    // tested here — mutating the process-wide theme would race color-asserting
-    // render tests running in parallel. The pure constructors and mode logic
-    // above cover the palette; the global is exercised by the app at startup.
+    #[test]
+    fn missing_hi_theme_defaults_to_groknight() {
+        assert_eq!(mode_from_env(None), ThemeMode::Dark);
+        assert_eq!(mode_from_env(Some("")), ThemeMode::Dark);
+        assert_eq!(mode_from_env(Some("nope")), ThemeMode::Dark);
+        assert_eq!(mode_from_env(Some("auto")), ThemeMode::Auto);
+        assert_eq!(mode_from_env(Some("grokday")), ThemeMode::Light);
+    }
 }

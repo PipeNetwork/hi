@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// A mutation that requires an explicit user decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,6 +104,70 @@ pub enum AskUserResult {
 }
 
 pub type AskUserFuture<'a> = Pin<Box<dyn Future<Output = AskUserResult> + Send + 'a>>;
+
+/// Cloneable live-status sink for child explore/delegate/task jobs.
+///
+/// Parallel explore and background `task` workers cannot share `&mut dyn Ui`.
+/// Frontends that want a live row return this from [`Ui::subagent_sink`].
+pub trait SubagentSink: Send + Sync {
+    fn spawned(&self, id: &str, kind: &str, description: &str, background: bool);
+    fn progress(&self, id: &str, activity: &str, line: Option<&str>);
+    fn finished(&self, id: &str, status: &str, elapsed_ms: u64, summary: &str);
+}
+
+/// Map a child tool call to a short activity label (`Reading lib.rs`).
+pub fn subagent_activity_label(name: &str, arguments: &str) -> String {
+    let name = name.rsplit(':').next().unwrap_or(name);
+    let label = tool_label(name, arguments);
+    let detail = label.split_once(' ').map(|(_, rest)| rest).unwrap_or("");
+    match name {
+        "read" => with_detail("Reading", detail),
+        "grep" | "web_search" => with_detail("Searching", detail),
+        "list" => with_detail("Listing", detail),
+        "web_fetch" => with_detail("Fetching", detail),
+        "bash" => with_detail("Run", detail),
+        "write" | "edit" | "multi_edit" | "apply_patch" => with_detail("Edit", detail),
+        _ if detail.is_empty() => title_case_word(name),
+        _ => format!("{} {detail}", title_case_word(name)),
+    }
+}
+
+fn with_detail(verb: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        verb.to_string()
+    } else {
+        format!("{verb} {detail}")
+    }
+}
+
+fn title_case_word(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => name.to_string(),
+    }
+}
+
+/// Compact finish token for [`Ui::subagent_finished`].
+pub fn subagent_finish_status(status: hi_tools::ToolStatus) -> &'static str {
+    match status {
+        hi_tools::ToolStatus::Succeeded => "completed",
+        hi_tools::ToolStatus::Cancelled => "cancelled",
+        hi_tools::ToolStatus::Denied => "denied",
+        hi_tools::ToolStatus::Failed | hi_tools::ToolStatus::TimedOut => "failed",
+    }
+}
+
+/// Clip a child task/description for the spawned callout and feed row.
+pub fn clip_subagent_description(text: &str) -> String {
+    let count = text.chars().count();
+    let clipped: String = text.chars().take(72).collect();
+    if count > 72 {
+        format!("{clipped}…")
+    } else {
+        clipped
+    }
+}
 
 /// Best-effort redaction for diagnostic text. It deliberately does not claim
 /// perfect secret detection.
@@ -486,6 +551,39 @@ pub trait Ui: Send {
     fn subagent_note(&mut self, text: &str) {
         self.status(text);
     }
+    /// Live child-agent updates for frontends that can render a typed row.
+    /// `None` (the default) keeps [`subagent_spawned`](Ui::subagent_spawned)
+    /// / [`subagent_finished`](Ui::subagent_finished) on the note fallback.
+    /// Return a cloneable sink so parallel explore jobs and background `task`
+    /// workers can emit progress without sharing `&mut dyn Ui`.
+    fn subagent_sink(&self) -> Option<Arc<dyn SubagentSink>> {
+        None
+    }
+    /// A child explore/delegate/task has started. Defaults to a
+    /// [`subagent_note`](Ui::subagent_note) so CLI/tests keep today's callout.
+    fn subagent_spawned(&mut self, id: &str, kind: &str, description: &str, background: bool) {
+        if let Some(sink) = self.subagent_sink() {
+            sink.spawned(id, kind, description, background);
+            return;
+        }
+        let _ = (id, background);
+        self.subagent_note(&format!("↳ {kind} subagent: {description}"));
+    }
+    /// Live activity label for a running child (`Thinking`, `Reading lib.rs`).
+    fn subagent_progress(&mut self, id: &str, activity: &str) {
+        if let Some(sink) = self.subagent_sink() {
+            sink.progress(id, activity, None);
+        }
+    }
+    /// A child has finished. Defaults to a [`subagent_note`](Ui::subagent_note).
+    fn subagent_finished(&mut self, id: &str, status: &str, elapsed_ms: u64, summary: &str) {
+        if let Some(sink) = self.subagent_sink() {
+            sink.finished(id, status, elapsed_ms, summary);
+            return;
+        }
+        let _ = (id, elapsed_ms, summary);
+        self.subagent_note(&format!("↳ subagent {status}"));
+    }
     /// The task plan was created or updated (via the `update_plan` tool). The
     /// full step list is passed each time; a frontend shows it as a live,
     /// in-place checklist rather than a scrolling transcript echo. Defaults to
@@ -645,6 +743,18 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
     }
     fn nudge(&mut self, text: &str) {
         (**self).nudge(text);
+    }
+    fn subagent_sink(&self) -> Option<Arc<dyn SubagentSink>> {
+        (**self).subagent_sink()
+    }
+    fn subagent_spawned(&mut self, id: &str, kind: &str, description: &str, background: bool) {
+        (**self).subagent_spawned(id, kind, description, background);
+    }
+    fn subagent_progress(&mut self, id: &str, activity: &str) {
+        (**self).subagent_progress(id, activity);
+    }
+    fn subagent_finished(&mut self, id: &str, status: &str, elapsed_ms: u64, summary: &str) {
+        (**self).subagent_finished(id, status, elapsed_ms, summary);
     }
 }
 
@@ -863,7 +973,8 @@ pub fn clip(s: &str, max: usize) -> String {
 mod tests {
     use super::{
         ConfirmationRequest, classify_error, error_counts_as_model_issue, redact_debug_text,
-        tool_label, user_facing_status, user_visible_tool_result, write_private_debug_log,
+        subagent_activity_label, tool_label, user_facing_status, user_visible_tool_result,
+        write_private_debug_log,
     };
     use hi_ai::{ProviderError, ProviderErrorKind};
 
@@ -1227,5 +1338,19 @@ mod tests {
             0o600
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn subagent_activity_label_maps_read_and_bash() {
+        assert_eq!(
+            subagent_activity_label("read", r#"{"path":"lib.rs"}"#),
+            "Reading lib.rs"
+        );
+        assert_eq!(
+            subagent_activity_label("explore:read", r#"{"path":"lib.rs"}"#),
+            "Reading lib.rs"
+        );
+        let bash = subagent_activity_label("bash", r#"{"command":"cargo test"}"#);
+        assert!(bash.starts_with("Run "), "got {bash}");
     }
 }

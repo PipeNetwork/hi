@@ -30,6 +30,7 @@ pub mod skills;
 mod snapshot;
 mod steering;
 mod subagent;
+mod subagent_progress;
 mod task_contract;
 mod transcript;
 pub mod ui;
@@ -121,11 +122,15 @@ pub use skills::{
     build_learn_prompt, build_skill_use_prompt, learned_skills_context, list_skills, read_skill,
     skill_roots,
 };
-pub use subagent::{DelegateOutcome, DelegateRunner, SubagentRoute};
+pub use subagent::{DelegateOutcome, DelegateProgress, DelegateRunner, SubagentRoute};
+pub use subagent_progress::{
+    DelegateChildEvent, dispatch_delegate_child_event, parse_delegate_child_event,
+};
 pub use task_contract::{RiskLevel, TaskContract, TaskIntent};
 pub use ui::{
-    AskUserFuture, AskUserResult, ConfirmationFuture, ConfirmationRequest, ConfirmationResult, Ui,
-    classify_error, tool_label,
+    AskUserFuture, AskUserResult, ConfirmationFuture, ConfirmationRequest, ConfirmationResult,
+    SubagentSink, Ui, classify_error, clip_subagent_description, subagent_activity_label,
+    subagent_finish_status, tool_label,
 };
 pub use verify::VerificationExecution;
 pub use workspace_runtime::WorkspaceRuntime;
@@ -858,7 +863,9 @@ pub struct Agent {
     /// Session-scoped registry of background subagent tasks (spawned via the
     /// `task` tool with `run_in_background`). The agent polls results via
     /// `get_task_output`, waits via `wait_tasks`, and cancels via `kill_task`.
-    pub(crate) bg_tasks: hi_tools::BackgroundTaskRegistry,
+    /// `Arc` so a TUI overlay can cancel a task while a turn future holds
+    /// `&mut Agent`.
+    pub(crate) bg_tasks: Arc<hi_tools::BackgroundTaskRegistry>,
     /// A shared interrupt flag. When set, the current tool's result is replaced
     /// with "interrupted by user" and the flag is cleared.
     pub(crate) interrupt: Arc<std::sync::atomic::AtomicBool>,

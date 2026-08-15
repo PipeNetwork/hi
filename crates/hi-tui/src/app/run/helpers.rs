@@ -199,6 +199,8 @@ pub(super) enum ChordPipeline {
     OpenPalette,
     /// Palette accepted a command; idle loop submits/edits, drive loop queues.
     PaletteAccept(String),
+    /// `/tasks` overlay asked to cancel a background subagent.
+    KillTask(String),
 }
 
 pub(super) fn run_chord_pipeline(app: &mut App, key: &KeyEvent) -> Option<ChordPipeline> {
@@ -210,6 +212,34 @@ pub(super) fn run_chord_pipeline(app: &mut App, key: &KeyEvent) -> Option<ChordP
             app.tutorial = None;
         }
         return Some(ChordPipeline::Continue);
+    }
+    if app.inspect_subagent.is_some() {
+        return Some(
+            match crate::subagent_overlay::handle_inspect_key(app, key) {
+                crate::subagent_overlay::OverlayOutcome::Close => {
+                    app.inspect_subagent = None;
+                    ChordPipeline::Continue
+                }
+                crate::subagent_overlay::OverlayOutcome::Continue
+                | crate::subagent_overlay::OverlayOutcome::Inspect(_)
+                | crate::subagent_overlay::OverlayOutcome::Kill(_) => ChordPipeline::Continue,
+            },
+        );
+    }
+    if app.tasks_overlay.is_some() {
+        return Some(match crate::subagent_overlay::handle_tasks_key(app, key) {
+            crate::subagent_overlay::OverlayOutcome::Continue => ChordPipeline::Continue,
+            crate::subagent_overlay::OverlayOutcome::Close => {
+                app.tasks_overlay = None;
+                ChordPipeline::Continue
+            }
+            crate::subagent_overlay::OverlayOutcome::Inspect(id) => {
+                app.tasks_overlay = None;
+                crate::subagent_overlay::open_inspect(app, &id);
+                ChordPipeline::Continue
+            }
+            crate::subagent_overlay::OverlayOutcome::Kill(id) => ChordPipeline::KillTask(id),
+        });
     }
     if app.workflow_overlay.is_some() {
         return Some(match crate::workflow_tui::handle_overlay_key(app, key) {

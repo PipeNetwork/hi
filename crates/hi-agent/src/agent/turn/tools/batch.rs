@@ -33,8 +33,8 @@ use crate::agent::delegate_turn::{
     DelegateJob, delegate_turn_limit, file_sets_disjoint, parallel_delegate_limit, run_delegate_job,
 };
 use crate::agent::explore_turn::{
-    BufferingUi, ExploreJob, MAX_EXPLORE_SUBAGENTS_PER_TURN, MAX_PARALLEL_EXPLORES,
-    explore_tool_outcome, run_explore_job,
+    ExploreJob, MAX_EXPLORE_SUBAGENTS_PER_TURN, MAX_PARALLEL_EXPLORES, explore_tool_outcome,
+    run_explore_job,
 };
 
 use crate::apply_plan_to_goal;
@@ -733,9 +733,9 @@ impl crate::Agent {
             // multiple ready explores can run concurrently. Prepare all jobs
             // (budget check, config extraction) sequentially, run the child
             // turns in parallel via `FuturesUnordered`, then process results
-            // sequentially. Each explore buffers its UI output and replays it
-            // to the real UI after completion, so `&mut dyn Ui` is never
-            // shared across concurrent futures.
+            // sequentially. Each child writes live status through a
+            // SubagentSink so `&mut dyn Ui` is never shared across concurrent
+            // futures, and child tool calls stay off the parent transcript.
             let explore_indices: Vec<usize> = ready
                 .iter()
                 .copied()
@@ -748,16 +748,9 @@ impl crate::Agent {
                 for &i in &explore_indices {
                     let (id, _, arguments) = &calls[i];
                     if let Some(job) = self.prepare_explore(arguments) {
-                        let summary: String = job.task.chars().take(72).collect();
-                        let ellipsis = if job.task.chars().count() > 72 {
-                            "…"
-                        } else {
-                            ""
-                        };
-                        ui.subagent_note(&format!(
-                            "↳ explore subagent {}: {summary}{ellipsis}",
-                            job.slot,
-                        ));
+                        let summary = crate::clip_subagent_description(&job.task);
+                        let id_ui = format!("explore-{}", job.slot);
+                        ui.subagent_spawned(&id_ui, "explore", &summary, false);
                         ui.tool_call_id(id, "explore", arguments);
                         prepared.push((i, job));
                     } else {
@@ -803,23 +796,36 @@ impl crate::Agent {
                 // soon as it finishes. UI progress no longer waits for the
                 // slowest child, while transcript insertion remains ordered at
                 // the end of the parent batch.
+                // Run prepared explores concurrently. Each child writes live
+                // status through a SubagentSink; child tool calls stay off the
+                // parent transcript.
+                let sink = ui.subagent_sink();
                 let max_concurrent = MAX_PARALLEL_EXPLORES.min(prepared.len());
                 let mut explore_futures =
                     futures_util::stream::iter(prepared.into_iter().map(|(i, job)| {
-                        let mut buf_ui = BufferingUi::new();
+                        let sink = sink.clone();
+                        let id_ui = format!("explore-{}", job.slot);
                         async move {
                             let started = std::time::Instant::now();
-                            let result = run_explore_job(job, &mut buf_ui).await;
-                            (i, buf_ui, result, started.elapsed().as_millis() as u64)
+                            let mut child_ui =
+                                crate::subagent_progress::SubagentProgressUi { id: id_ui, sink };
+                            let result = run_explore_job(job, &mut child_ui).await;
+                            (i, result, started.elapsed().as_millis() as u64)
                         }
                     }))
                     .buffer_unordered(max_concurrent);
-                while let Some((i, mut buf_ui, result, duration_ms)) = explore_futures.next().await
-                {
+                while let Some((i, result, duration_ms)) = explore_futures.next().await {
                     let (id, _, arguments) = &calls[i];
-                    buf_ui.replay_to(&mut *ui);
+                    let slot = result.slot;
                     let output = self.finish_explore(result);
-                    ui.subagent_note("↳ explore subagent done");
+                    let status = crate::subagent_finish_status(output.status);
+                    let finish_summary: String = output.content.chars().take(120).collect();
+                    ui.subagent_finished(
+                        &format!("explore-{slot}"),
+                        status,
+                        duration_ms,
+                        &finish_summary,
+                    );
                     let error = output.status != hi_tools::ToolStatus::Succeeded;
                     let semantic_output = if error && !output.content.starts_with("Error:") {
                         std::borrow::Cow::Owned(format!("Error: {}", output.content))
@@ -896,17 +902,13 @@ impl crate::Agent {
                 let mut delegate_prep_failed: Vec<usize> = Vec::new();
                 for &i in &delegate_indices {
                     let (id, _, arguments) = &calls[i];
-                    if let Some((job, ledger_rev)) = self.prepare_delegate(arguments) {
-                        let summary: String = job.task.chars().take(72).collect();
-                        let ellipsis = if job.task.chars().count() > 72 {
-                            "…"
-                        } else {
-                            ""
-                        };
-                        ui.subagent_note(&format!(
-                            "↳ delegate subagent {}: {summary}{ellipsis}",
-                            job.slot,
-                        ));
+                    if let Some((mut job, ledger_rev)) = self.prepare_delegate(arguments) {
+                        let summary = crate::clip_subagent_description(&job.task);
+                        let delegate_id = format!("delegate-{}", job.slot);
+                        ui.subagent_spawned(&delegate_id, "delegate", &summary, false);
+                        ui.subagent_progress(&delegate_id, "running");
+                        job.progress =
+                            crate::subagent_progress::bound_sink_progress(ui, &delegate_id);
                         ui.tool_call_id(id, "delegate", arguments);
                         prepared_delegates.push((i, job, ledger_rev));
                     } else {
@@ -1025,7 +1027,9 @@ impl crate::Agent {
                         delegate_results.next().await
                     {
                         let (id, _, arguments) = &calls[i];
-                        let output = self.finish_delegate(result, ledger_rev, &mut *ui).await;
+                        let output = self
+                            .finish_delegate(result, ledger_rev, &mut *ui, duration_ms)
+                            .await;
                         let error = output.status != hi_tools::ToolStatus::Succeeded;
                         let semantic_output = if error && !output.content.starts_with("Error:") {
                             std::borrow::Cow::Owned(format!("Error: {}", output.content))

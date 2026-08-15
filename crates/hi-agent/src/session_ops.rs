@@ -252,6 +252,7 @@ pub fn handle_session_command(
                 .collect();
             format_tasks_report(
                 &agent.background_process_ids(),
+                &agent.background_task_ids(),
                 agent.checkpoint_count(),
                 agent.plan_mode(),
                 agent.permission_mode(),
@@ -1278,6 +1279,7 @@ pub fn parse_remember_args(arg: &str) -> (bool, String) {
 /// their own prompt-queue lines before/after.
 pub fn format_tasks_report(
     background_pids: &[String],
+    bg_task_ids: &[String],
     checkpoint_count: usize,
     plan_mode: bool,
     permission: PermissionMode,
@@ -1299,6 +1301,11 @@ pub fn format_tasks_report(
             "  background processes: {}\n",
             background_pids.join(", ")
         ));
+    }
+    if bg_task_ids.is_empty() {
+        out.push_str("  background tasks: none\n");
+    } else {
+        out.push_str(&format!("  background tasks: {}\n", bg_task_ids.join(", ")));
     }
     out.push_str(&format!("  checkpoints: {checkpoint_count}\n"));
     out.push_str(&format!(
@@ -1366,6 +1373,21 @@ mod tests {
             parse_remember_args("--global prefer pnpm"),
             (true, "prefer pnpm".into())
         );
+    }
+
+    #[test]
+    fn tasks_report_names_background_task_ids() {
+        let report = format_tasks_report(
+            &["pid-9".into()],
+            &["task_1".into(), "task_2".into()],
+            0,
+            false,
+            PermissionMode::Ask,
+            &[],
+        );
+        assert!(report.contains("task_1"));
+        assert!(report.contains("task_2"));
+        assert!(report.contains("background tasks:"));
     }
 
     #[test]

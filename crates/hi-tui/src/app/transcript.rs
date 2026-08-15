@@ -8,51 +8,21 @@ use std::time::{Duration, Instant};
 fn strip_display_gutter(line: &str) -> &str {
     line.strip_prefix("┃ ")
         .or_else(|| line.strip_prefix("▏ "))
+        .or_else(|| line.strip_prefix("• "))
         .unwrap_or(line)
 }
 
-use ansi_to_tui::IntoText;
 use hi_agent::ui::tool_label;
 use hi_agent::{ReviewStatus, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::style::Style;
+use ratatui::text::Line;
 
+use crate::activity_feed::{self, ActivityBlock, ActivityKind, ExploreVerb, label_detail};
 use crate::event::UiEvent;
-use crate::render::{accent_line, diff_lines, dim, gutter, looks_like_diff, markdown_line};
-use crate::theme::{UiTone, theme};
+use crate::render::{accent_line, dim, markdown_line};
+use crate::theme::theme;
 use crate::util::fmt_rate_limits;
-use crate::{
-    BgIdlePollRun, ExploreRun, MAX_EVENT_LOG, MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind,
-    TurnState,
-};
-
-/// Build a tool-call header line: `┃ ◆ verb rest` — the accent gutter and `◆`
-/// bullet in the tool color, the leading verb bold, the rest in secondary text.
-/// This is the block signature that marks agent machinery at a glance.
-fn tool_header(label: &str) -> Line<'static> {
-    let t = theme();
-    let (verb, rest) = match label.split_once(' ') {
-        Some((v, r)) => (v, r),
-        None => (label, ""),
-    };
-    let mut spans = vec![
-        gutter(t.tone_color(UiTone::Tool)),
-        Span::styled("◆ ", Style::default().fg(t.tone_color(UiTone::Tool))),
-        Span::styled(
-            verb.to_string(),
-            Style::default()
-                .fg(t.text_secondary)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if !rest.is_empty() {
-        spans.push(Span::styled(
-            format!(" {rest}"),
-            Style::default().fg(t.text_secondary),
-        ));
-    }
-    Line::from(spans)
-}
+use crate::{MAX_EVENT_LOG, MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind, TurnState};
 
 impl crate::App {
     pub(crate) fn push(&mut self, line: Line<'static>) {
@@ -120,7 +90,7 @@ impl crate::App {
     /// workspace reconciliation. It must therefore never decide whether a turn
     /// succeeded. This is the sole success-state transition for a normal turn.
     pub(crate) fn note_turn_outcome(&mut self, outcome: &TurnOutcome) {
-        self.last_stop_reason = Some(outcome.stop_reason.clone());
+        self.last_stop_reason = Some(outcome.stop_reason);
         let detail = outcome_detail(outcome);
         match outcome_state(outcome) {
             OutcomeState::Done => {
@@ -862,10 +832,14 @@ impl crate::App {
                 // The next assistant message is a fresh stream — a following `/btw`
                 // answer re-emits its own `↳ btw:` prefix.
                 self.btw_answer_started = false;
+                self.freeze_verb_group();
             }
             UiEvent::ToolStarted { name, arguments } => {
                 let label = tool_label(&name, &arguments);
                 self.event_log.push(format!("tool_started {label}"));
+                if activity_feed::is_parent_subagent_tool(&name) {
+                    return;
+                }
                 // Mark this tool as the active party so the working line can
                 // name it with its own timer until the result lands. No
                 // transcript line — the header is emitted with the result.
@@ -879,41 +853,38 @@ impl crate::App {
                 self.event_log.push(format!("tool_call {label}"));
                 self.last_turn_event = Some(TurnEventKind::ToolCall);
                 self.turn_tool_calls = self.turn_tool_calls.saturating_add(1);
-                if matches!(name.as_str(), "write" | "edit") {
+                if activity_feed::is_parent_subagent_tool(&name) {
+                    self.flush_reasoning();
+                    self.flush_pending();
+                    return;
+                }
+                if activity_feed::is_edit_tool(&name) {
                     self.last_turn_had_file_edits = true;
                 }
                 self.flush_reasoning();
                 self.flush_pending();
-                // Exploration tools (read/list/grep) defer their header until the
-                // result lands, so the file name and line count share one line
-                // instead of printing a header followed by a bare "N lines".
-                // Idle bash_output polls defer the same way so consecutive
-                // "still running" checks collapse into one updating line.
-                if matches!(name.as_str(), "read" | "list" | "grep") {
-                    self.pending_explore_label = Some(label);
-                    self.pending_bg_poll_label = None;
-                    self.bg_idle_poll_run = None;
-                } else if name == "bash_output" {
-                    self.explore_run = None;
-                    self.pending_bg_poll_label = Some(label);
+                self.current_tool = Some(label.clone());
+                self.current_tool_started = Some(Instant::now());
+                if let Some(verb) = ExploreVerb::from_tool(&name) {
+                    self.note_explore_call(verb, label_detail(&label));
                 } else {
-                    // A non-explore / non-bg-poll tool breaks any active run.
-                    self.explore_run = None;
-                    self.pending_bg_poll_label = None;
-                    self.bg_idle_poll_run = None;
-                    self.push(tool_header(&label));
+                    self.freeze_verb_group();
                 }
             }
             UiEvent::ToolResult { name, result } => {
                 self.event_log
                     .push(format!("tool_result {} chars", result.len()));
                 self.last_turn_event = Some(TurnEventKind::ToolResult);
-                // The tool finished — back to the model being the active party.
-                self.current_tool = None;
+                if activity_feed::is_parent_subagent_tool(&name) {
+                    self.current_tool = None;
+                    self.current_tool_started = None;
+                    return;
+                }
+                let label = self.current_tool.take().unwrap_or_else(|| name.clone());
                 self.current_tool_started = None;
                 self.tool_stream_tail.clear();
                 self.flush_pending();
-                self.push_result(&name, &result);
+                self.push_result(&name, &result, &label);
             }
             UiEvent::ToolStream { line, .. } => {
                 // Accumulate streamed lines for the live working-area display.
@@ -924,31 +895,32 @@ impl crate::App {
                 }
             }
             UiEvent::Status { text } => {
-                // `/btw` side chrome belongs in the right pane only — never echo
-                // tool crumbs / "answering N side question(s)" into the main log.
+                // Status is not a tool. Humanize it, drop skeptic/btw chatter,
+                // leftover ↳ subagent notes (typed Subagent rows own that),
+                // and paint the rest as an unguttered dim line so it cannot be
+                // mistaken for a Read/Edit/Run row.
                 let Some(text) = hi_agent::ui::user_facing_status(&text) else {
-                    // Keep wire/compatibility diagnostics out of both the
-                    // transcript and the user-facing event log.
                     return;
                 };
+                if is_legacy_subagent_status(&text) {
+                    self.event_log
+                        .push(format!("status(suppressed subagent) {text}"));
+                    return;
+                }
                 if text.contains("❓ btw")
                     || text.contains("side question")
                     || text.starts_with("btw ·")
                 {
                     self.event_log
                         .push(format!("status(suppressed btw) {text}"));
+                } else if text.to_ascii_lowercase().contains("skeptic") {
+                    self.event_log.push(format!("status {text}"));
+                    self.last_turn_event = Some(TurnEventKind::Status);
                 } else {
                     self.event_log.push(format!("status {text}"));
                     self.last_turn_event = Some(TurnEventKind::Status);
                     self.flush_pending();
-                    // The status stream is informational — a muted gutter + muted
-                    // text so it reads as agent chatter, not as the user's own words
-                    // (which historically shared this color).
-                    self.push(accent_line(
-                        theme().gray_dim,
-                        text,
-                        Style::default().fg(theme().status),
-                    ));
+                    self.push(Line::styled(text, Style::default().fg(theme().status)));
                 }
             }
             UiEvent::CheckpointWarning { text } => {
@@ -991,16 +963,10 @@ impl crate::App {
                 self.event_log.push(format!("turn_end {summary}"));
                 self.last_turn_event = Some(TurnEventKind::TurnEnd);
                 self.flush_pending();
-                // This callback is a usage summary, not a completion result.
-                // The typed `TurnOutcome` returned after final workspace
-                // reconciliation decides Done/Warning/Failed/Cancelled.
-                self.push(accent_line(
-                    theme().gray_dim,
-                    format!("usage · {summary}"),
-                    dim(),
-                ));
-                // No follow(): respect a reader who scrolled up — the "↓ N new"
-                // hint tells them the summary landed below.
+                self.freeze_verb_group();
+                // Usage summary is not a tool. Keep it as a quiet footer line
+                // without the activity gutter so it can't be mistaken for work.
+                self.push(Line::styled(format!("usage · {summary}"), dim()));
             }
             UiEvent::TurnError {
                 error_kind,
@@ -1096,191 +1062,335 @@ impl crate::App {
                     overlay.snapshot = snapshot;
                 }
             }
+            UiEvent::SubagentSpawned {
+                id,
+                subagent_kind,
+                description,
+                background,
+            } => {
+                self.apply_subagent_spawned(id, subagent_kind, description, background);
+            }
+            UiEvent::SubagentProgress { id, activity, line } => {
+                self.apply_subagent_progress(id, activity, line);
+            }
+            UiEvent::SubagentFinished {
+                id,
+                status,
+                elapsed_ms,
+                summary,
+            } => {
+                self.apply_subagent_finished(id, status, elapsed_ms, summary);
+            }
         }
     }
 
-    /// Render a tool result, clipped to a handful of lines and indented.
-    /// Preserves any ANSI colors (e.g. edit/write diffs); for *plain* unified
-    /// diff output from a shell command (`git diff`, `diff -u`) — which CLIs
-    /// emit without color when piped — adds diff coloring so it's readable.
-    ///
-    /// Read-only exploration tools (`read`/`list`/`grep`) already named the
-    /// file or pattern in their `tool_call` header line — dumping their full
-    /// output into the transcript is noise during a codebase review. Show a
-    /// compact line count instead, so the transcript reads as a list of files
-    /// consulted rather than a wall of their contents. Idle `bash_output`
-    /// polls collapse the same way so tight polling does not look hung.
-    pub(crate) fn push_result(&mut self, name: &str, result: &str) {
+    fn apply_subagent_spawned(
+        &mut self,
+        id: String,
+        kind: String,
+        description: String,
+        background: bool,
+    ) {
+        self.event_log.push(format!("subagent_spawned {kind} {id}"));
+        let started_at = Instant::now();
+        self.subagents.insert(
+            id.clone(),
+            crate::subagent_overlay::SubagentInfo {
+                id: id.clone(),
+                kind: kind.clone(),
+                description: description.clone(),
+                background,
+                activity: if background {
+                    String::new()
+                } else {
+                    "running".into()
+                },
+                started_at,
+                finished: None,
+                summary: String::new(),
+                lines: Vec::new(),
+            },
+        );
+        self.freeze_verb_group();
+        self.flush_pending();
+        self.push_activity(ActivityKind::Subagent {
+            id,
+            kind,
+            description,
+            background,
+            activity: if background {
+                String::new()
+            } else {
+                "running".into()
+            },
+            status: None,
+            started_at,
+            elapsed_ms: 0,
+        });
+    }
+
+    fn apply_subagent_progress(&mut self, id: String, activity: String, line: Option<String>) {
+        if let Some(info) = self.subagents.get_mut(&id) {
+            if !activity.is_empty() {
+                info.activity = activity.clone();
+            }
+            if let Some(line) = line {
+                let line = line.trim();
+                if !line.is_empty() && info.lines.len() < 200 {
+                    info.lines.push(line.to_string());
+                }
+            }
+        }
+        if activity.is_empty() {
+            return;
+        }
+        let background = self.subagents.get(&id).is_some_and(|info| info.background);
+        if background {
+            return;
+        }
+        if let Some(block) = self.subagent_block_mut(&id)
+            && let ActivityKind::Subagent {
+                activity: current,
+                status,
+                ..
+            } = &mut block.kind
+            && status.is_none()
+        {
+            *current = activity;
+            self.bump_transcript();
+        }
+    }
+
+    fn apply_subagent_finished(
+        &mut self,
+        id: String,
+        status: String,
+        elapsed_ms: u64,
+        summary: String,
+    ) {
+        self.event_log
+            .push(format!("subagent_finished {id} {status}"));
+        let background = self.subagents.get(&id).is_some_and(|info| info.background);
+        let (kind, description, started_at) = self
+            .subagents
+            .get(&id)
+            .map(|info| (info.kind.clone(), info.description.clone(), info.started_at))
+            .unwrap_or_else(|| ("task".into(), id.clone(), Instant::now()));
+        if let Some(info) = self.subagents.get_mut(&id) {
+            info.finished = Some((status.clone(), elapsed_ms));
+            info.summary = summary.clone();
+            if !summary.is_empty() && info.lines.len() < 200 {
+                info.lines.push(summary.clone());
+            }
+        }
+        if background {
+            self.freeze_verb_group();
+            self.flush_pending();
+            self.push_activity(ActivityKind::Subagent {
+                id,
+                kind,
+                description,
+                background: true,
+                activity: String::new(),
+                status: Some(status),
+                started_at,
+                elapsed_ms,
+            });
+            return;
+        }
+        if let Some(block) = self.subagent_block_mut(&id)
+            && let ActivityKind::Subagent {
+                status: row_status,
+                elapsed_ms: row_elapsed,
+                activity,
+                ..
+            } = &mut block.kind
+        {
+            *row_status = Some(status);
+            *row_elapsed = elapsed_ms;
+            *activity = String::new();
+            self.bump_transcript();
+        }
+    }
+
+    fn subagent_block_mut(&mut self, id: &str) -> Option<&mut ActivityBlock> {
+        self.transcript
+            .iter_mut()
+            .rev()
+            .find_map(|entry| match entry {
+                TranscriptEntry::Activity(block) if block.subagent_id() == Some(id) => Some(block),
+                _ => None,
+            })
+    }
+
+    /// Render a tool result as a typed activity row.
+    pub(crate) fn push_result(&mut self, name: &str, result: &str, label: &str) {
+        if activity_feed::is_parent_subagent_tool(name) {
+            return;
+        }
         let display_result = hi_agent::ui::user_visible_tool_result(result);
+        if let Some(verb) = ExploreVerb::from_tool(name) {
+            self.note_explore_result(verb, label_detail(label), &display_result);
+            return;
+        }
         if name == "bash_output" {
-            let label = self
-                .pending_bg_poll_label
-                .take()
-                .unwrap_or_else(|| name.to_string());
-            // A missing handle is a model-recovery condition. The raw tool
-            // result contains instructions addressed to the model ("Do not
-            // call this again"), which are confusing and noisy in the user's
-            // transcript. Keep a compact, human-readable activity marker.
+            let id = label
+                .strip_prefix("bash_output ")
+                .unwrap_or(label)
+                .to_string();
             if is_missing_background_process_result(result) {
-                let id = label.strip_prefix("bash_output ").unwrap_or(label.as_str());
-                self.explore_run = None;
-                self.bg_idle_poll_run = None;
-                self.push(tool_header(&format!("background process {id} unavailable")));
+                self.freeze_verb_group();
+                self.push_activity(ActivityKind::Other {
+                    verb: "background".into(),
+                    detail: format!("process {id} unavailable"),
+                    body: String::new(),
+                });
                 return;
             }
             if bash_output_is_idle(result) {
-                let id = label
-                    // label is already "bash_output sh_1" or just "sh_1"
-                    .strip_prefix("bash_output ")
-                    .unwrap_or(label.as_str())
-                    .to_string();
-                let last_pos = (self.trimmed + self.transcript.len() as u64).checked_sub(1);
-                let merge = self
-                    .bg_idle_poll_run
-                    .as_ref()
-                    .is_some_and(|r| r.id == id && Some(r.line_pos) == last_pos);
-                if merge {
-                    let run = self.bg_idle_poll_run.as_mut().unwrap();
-                    run.count += 1;
-                    let line = tool_header(&render_bg_idle_poll(&id, run.count));
-                    self.replace_last_line(line);
-                    return;
-                }
-                self.explore_run = None;
-                self.bg_idle_poll_run = Some(BgIdlePollRun {
-                    id: id.clone(),
-                    count: 1,
-                    line_pos: self.trimmed + self.transcript.len() as u64,
-                });
-                self.push(tool_header(&render_bg_idle_poll(&id, 1)));
+                self.note_idle_bash_poll(&id);
                 return;
             }
-            // Fresh output or a terminal status: end any idle run and show
-            // the normal header + body.
-            self.bg_idle_poll_run = None;
-            self.explore_run = None;
-            self.push(tool_header(&label));
-        } else if matches!(name, "read" | "list" | "grep") {
-            let n = display_result.lines().count() as u32;
-            // Collapse the header and the line count into one transcript line:
-            // `⏺ read path/to/file · 113 lines`. Falls back to the bare header
-            // if we never saw the ToolCall (e.g. replay from a transcript).
-            let label = self.pending_explore_label.take();
-            let header = match &label {
-                Some(l) => l.clone(),
-                None => name.to_string(),
-            };
-            // Merge consecutive same-tool explore results into one line, so a
-            // burst of reads renders as `⏺ read 6 files · 743 lines` instead of
-            // six separate lines. A run continues only while the tool name is
-            // the same AND the run's summary line is still the last transcript
-            // entry — events that commit lines without resetting the run
-            // (assistant text, status) would otherwise get overwritten by the
-            // in-place update below.
-            let last_pos = (self.trimmed + self.transcript.len() as u64).checked_sub(1);
-            let merge = self
-                .explore_run
-                .as_ref()
-                .is_some_and(|r| r.tool == name && Some(r.line_pos) == last_pos);
-            if merge {
-                let run = self.explore_run.as_mut().unwrap();
-                run.count += 1;
-                run.lines += n;
-                if n > 0 {
-                    run.all_empty = false;
-                }
-                let line = tool_header(&self.render_explore_run(&header));
-                self.replace_last_line(line);
-                return;
-            }
-            // Start a new run; its summary line is about to be pushed at the
-            // current end of the transcript.
-            self.bg_idle_poll_run = None;
-            self.explore_run = Some(ExploreRun {
-                tool: name.to_string(),
-                count: 1,
-                lines: n,
-                all_empty: n == 0,
-                line_pos: self.trimmed + self.transcript.len() as u64,
-            });
-            let line = tool_header(&self.render_explore_run(&header));
-            self.push(line);
-            return;
-        } else {
-            // A non-explore / non-deferred result breaks any active run.
-            self.explore_run = None;
-            self.bg_idle_poll_run = None;
-            let _ = self.pending_bg_poll_label.take();
         }
-        if display_result.trim().is_empty() {
-            self.push(accent_line(theme().gray_dim, "(no output)", dim()));
-            return;
-        }
-        // Keep the *entire* output — it becomes a foldable ToolOutput block that
-        // shows a preview by default and expands on Ctrl-O. (The old path hard-
-        // truncated at 16 lines and discarded the rest.)
-        let lines: Vec<Line<'static>> =
-            if !display_result.contains('\u{1b}') && looks_like_diff(&display_result) {
-                diff_lines(&display_result)
-            } else {
-                // ANSI (already-colored) or non-diff text: parse escapes as before.
+        self.freeze_verb_group();
+        if activity_feed::is_edit_tool(name) {
+            let path = label_detail(label).unwrap_or_else(|| name.to_string());
+            let (additions, deletions) = activity_feed::parse_diff_stats(&display_result);
+            let diff = if display_result.contains('\u{1b}')
+                || crate::render::looks_like_diff(&display_result)
+                || additions > 0
+                || deletions > 0
+            {
                 display_result
-                    .into_text()
-                    .unwrap_or_else(|_| Text::from(result.to_string()))
-                    .lines
+            } else {
+                String::new()
             };
-        self.transcript.push(TranscriptEntry::ToolOutput {
-            // Keep the semantic gutter display-only. Copy/export must return
-            // the provider's actual output rather than renderer decoration.
-            body: lines,
-            expanded: false,
+            self.push_activity(ActivityKind::Edit {
+                path,
+                additions,
+                deletions,
+                diff,
+            });
+            return;
+        }
+        if activity_feed::is_run_tool(name) {
+            let command = label_detail(label)
+                .or_else(|| label_detail(&format!("{name} {label}")))
+                .unwrap_or_else(|| label.to_string());
+            let command = command
+                .strip_prefix("bash ")
+                .unwrap_or(command.as_str())
+                .to_string();
+            self.push_activity(ActivityKind::Run {
+                command,
+                body: display_result,
+                idle: false,
+                poll_count: 0,
+            });
+            return;
+        }
+        let (verb, detail) = match label.split_once(' ') {
+            Some((v, rest)) => (v.to_string(), rest.to_string()),
+            None => (name.to_string(), String::new()),
+        };
+        self.push_activity(ActivityKind::Other {
+            verb,
+            detail,
+            body: display_result,
         });
+    }
+
+    fn push_activity(&mut self, kind: ActivityKind) {
+        self.flush_table();
+        self.transcript
+            .push(TranscriptEntry::Activity(ActivityBlock {
+                kind,
+                expanded: false,
+            }));
         self.bump_transcript();
         self.cap_transcript();
     }
 
-    /// Render the current explore run as a single transcript label (no bullet —
-    /// the caller wraps it with [`tool_header`]). A run of one shows the per-call
-    /// label and line count (`read src/a.rs · 113 lines`); a run of many collapses
-    /// to a summary (`read 6 files · 743 lines`).
-    fn render_explore_run(&self, header: &str) -> String {
-        let run = match &self.explore_run {
-            Some(r) => r,
-            None => return header.to_string(),
-        };
-        if run.count <= 1 {
-            if run.all_empty {
-                format!("{header} · (no output)")
-            } else {
-                let s = if run.lines == 1 { "" } else { "s" };
-                format!("{header} · {} line{}", run.lines, s)
-            }
-        } else {
-            // Multi-call summary: drop the per-file label, show counts.
-            let noun = match run.tool.as_str() {
-                "read" => "files",
-                _ => "calls",
-            };
-            if run.all_empty {
-                format!("{} {} {} · (no output)", run.tool, run.count, noun)
-            } else {
-                let s = if run.lines == 1 { "" } else { "s" };
-                format!(
-                    "{} {} {} · {} line{}",
-                    run.tool, run.count, noun, run.lines, s
-                )
-            }
+    pub(crate) fn freeze_verb_group(&mut self) {
+        if let Some(TranscriptEntry::Activity(block)) = self.transcript.last_mut()
+            && let Some(group) = block.as_verb_group_mut()
+            && group.open
+        {
+            group.live = false;
+            group.open = false;
+            self.bump_transcript();
         }
     }
 
-    /// Replace the last transcript line in place (used to update a merged
-    /// explore-run line as more results fold in). No-op if the transcript is
-    /// empty or the last entry isn't a plain line.
-    fn replace_last_line(&mut self, line: Line<'static>) {
-        if let Some(TranscriptEntry::Line(slot)) = self.transcript.last_mut() {
-            *slot = line;
+    fn note_explore_call(&mut self, verb: ExploreVerb, detail: Option<String>) {
+        if let Some(TranscriptEntry::Activity(block)) = self.transcript.last_mut()
+            && let Some(group) = block.as_verb_group_mut()
+            && group.open
+        {
+            group.add(verb, detail);
             self.bump_transcript();
+            return;
         }
+        self.flush_table();
+        self.transcript
+            .push(TranscriptEntry::Activity(ActivityBlock::verb_group(
+                verb, detail,
+            )));
+        self.bump_transcript();
+        self.cap_transcript();
+    }
+
+    fn note_explore_result(&mut self, verb: ExploreVerb, detail: Option<String>, result: &str) {
+        let n = if result.trim().is_empty() {
+            0
+        } else {
+            result.lines().count() as u32
+        };
+        if let Some(TranscriptEntry::Activity(block)) = self.transcript.last_mut()
+            && let Some(group) = block.as_verb_group_mut()
+            && group.open
+        {
+            group.lines = group.lines.saturating_add(n);
+            if n > 0 {
+                group.all_empty = false;
+            } else if group.total() == 1 {
+                group.all_empty = true;
+            }
+            group.live = false;
+            self.bump_transcript();
+            return;
+        }
+        // Replay/result without a preceding ToolCall: start a finished row.
+        let mut block = ActivityBlock::verb_group(verb, detail);
+        if let Some(group) = block.as_verb_group_mut() {
+            group.lines = n;
+            group.all_empty = n == 0;
+            group.live = false;
+            group.open = false;
+        }
+        self.flush_table();
+        self.transcript.push(TranscriptEntry::Activity(block));
+        self.bump_transcript();
+        self.cap_transcript();
+    }
+
+    fn note_idle_bash_poll(&mut self, id: &str) {
+        self.freeze_verb_group();
+        if let Some(TranscriptEntry::Activity(block)) = self.transcript.last_mut()
+            && let Some((command, idle, poll_count)) = block.as_run_mut()
+            && *idle
+            && command == id
+        {
+            *poll_count = poll_count.saturating_add(1);
+            self.bump_transcript();
+            return;
+        }
+        self.push_activity(ActivityKind::Run {
+            command: id.to_string(),
+            body: String::new(),
+            idle: true,
+            poll_count: 1,
+        });
     }
 }
 
@@ -1295,15 +1405,6 @@ fn is_missing_background_process_result(result: &str) -> bool {
     result
         .trim_start()
         .starts_with("Error: no background process")
-}
-
-fn render_bg_idle_poll(id: &str, count: u32) -> String {
-    // `id` is already the human label from tool_label (e.g. `sh_1`).
-    if count <= 1 {
-        format!("{id} · still running")
-    } else {
-        format!("{id} · still running · polled {count}×")
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1456,4 +1557,15 @@ fn btw_tool_detail(name: &str, arguments: &str) -> String {
         "web_search" | "web_fetch" => pick(&["query", "url"]),
         _ => pick(&["path", "command", "query", "task"]),
     }
+}
+
+fn is_legacy_subagent_status(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with('↳')
+        && (text.contains("subagent")
+            || text.starts_with("↳ explore:")
+            || text.starts_with("↳ delegate:")
+            || text.starts_with("↳ task:")
+            || text.starts_with("↳ plan:")
+            || text.starts_with("↳ general-purpose:"))
 }

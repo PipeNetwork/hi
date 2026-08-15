@@ -7,6 +7,7 @@
 //! if the network is down, the local session continues uninterrupted and the
 //! failed records are queued for the next flush.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1289,6 +1290,49 @@ pub struct MultiplexUi {
     pub remote: std::sync::Arc<RemoteUi>,
 }
 
+struct MultiplexSubagentSink {
+    primary: Option<Arc<dyn hi_agent::SubagentSink>>,
+    remote: Arc<RemoteUi>,
+}
+
+impl hi_agent::SubagentSink for MultiplexSubagentSink {
+    fn spawned(&self, id: &str, kind: &str, description: &str, background: bool) {
+        if let Some(primary) = &self.primary {
+            primary.spawned(id, kind, description, background);
+        }
+        self.remote
+            .push_event(hi_tui::event::UiEvent::SubagentSpawned {
+                id: id.to_string(),
+                subagent_kind: kind.to_string(),
+                description: description.to_string(),
+                background,
+            });
+    }
+    fn progress(&self, id: &str, activity: &str, line: Option<&str>) {
+        if let Some(primary) = &self.primary {
+            primary.progress(id, activity, line);
+        }
+        self.remote
+            .push_event(hi_tui::event::UiEvent::SubagentProgress {
+                id: id.to_string(),
+                activity: activity.to_string(),
+                line: line.map(str::to_string),
+            });
+    }
+    fn finished(&self, id: &str, status: &str, elapsed_ms: u64, summary: &str) {
+        if let Some(primary) = &self.primary {
+            primary.finished(id, status, elapsed_ms, summary);
+        }
+        self.remote
+            .push_event(hi_tui::event::UiEvent::SubagentFinished {
+                id: id.to_string(),
+                status: status.to_string(),
+                elapsed_ms,
+                summary: summary.to_string(),
+            });
+    }
+}
+
 impl hi_agent::Ui for MultiplexUi {
     fn assistant_text(&mut self, text: &str) {
         self.primary.assistant_text(text);
@@ -1367,6 +1411,43 @@ impl hi_agent::Ui for MultiplexUi {
         self.remote.push_event(hi_tui::event::UiEvent::Status {
             text: text.to_string(),
         });
+    }
+    fn subagent_sink(&self) -> Option<Arc<dyn hi_agent::SubagentSink>> {
+        Some(Arc::new(MultiplexSubagentSink {
+            primary: self.primary.subagent_sink(),
+            remote: self.remote.clone(),
+        }))
+    }
+    fn subagent_spawned(&mut self, id: &str, kind: &str, description: &str, background: bool) {
+        self.primary
+            .subagent_spawned(id, kind, description, background);
+        self.remote
+            .push_event(hi_tui::event::UiEvent::SubagentSpawned {
+                id: id.to_string(),
+                subagent_kind: kind.to_string(),
+                description: description.to_string(),
+                background,
+            });
+    }
+    fn subagent_progress(&mut self, id: &str, activity: &str) {
+        self.primary.subagent_progress(id, activity);
+        self.remote
+            .push_event(hi_tui::event::UiEvent::SubagentProgress {
+                id: id.to_string(),
+                activity: activity.to_string(),
+                line: None,
+            });
+    }
+    fn subagent_finished(&mut self, id: &str, status: &str, elapsed_ms: u64, summary: &str) {
+        self.primary
+            .subagent_finished(id, status, elapsed_ms, summary);
+        self.remote
+            .push_event(hi_tui::event::UiEvent::SubagentFinished {
+                id: id.to_string(),
+                status: status.to_string(),
+                elapsed_ms,
+                summary: summary.to_string(),
+            });
     }
     fn plan(&mut self, steps: &[hi_agent::PlanStep]) {
         self.primary.plan(steps);
@@ -2264,6 +2345,25 @@ fn render_live_event(event: &hi_tui::event::UiEvent) {
                 snapshot.cases_total,
                 snapshot.mismatches
             );
+        }
+        UiEvent::SubagentSpawned {
+            subagent_kind,
+            description,
+            background,
+            ..
+        } => {
+            let bg = if *background { " background" } else { "" };
+            eprintln!("\x1b[36m  ↳ {subagent_kind}{bg} subagent: {description}\x1b[0m");
+        }
+        UiEvent::SubagentProgress { activity, .. } => {
+            if !activity.is_empty() {
+                eprintln!("\x1b[2m  ↳ {activity}\x1b[0m");
+            }
+        }
+        UiEvent::SubagentFinished {
+            status, summary, ..
+        } => {
+            eprintln!("\x1b[2m  ↳ subagent {status}: {summary}\x1b[0m");
         }
     }
 }

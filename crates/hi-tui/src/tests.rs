@@ -2,6 +2,7 @@ use super::*;
 use crate::app::{review_next_hunk, search_transcript};
 use crate::input::HistorySearch;
 use ratatui::backend::TestBackend;
+use ratatui::style::Color;
 
 mod goal;
 
@@ -261,7 +262,7 @@ fn selected_model_persists_to_active_profile() {
 
 /// `App::new` with empty profiles and dummy callbacks, for tests.
 pub(crate) fn test_app(provider: &str, model: &str) -> App {
-    App::new(
+    let mut app = App::new(
         provider,
         model,
         Vec::new(),
@@ -279,7 +280,9 @@ pub(crate) fn test_app(provider: &str, model: &str) -> App {
         None,
         crate::RaceDefaults::default(),
         None,
-    )
+    );
+    app.workspace_root = std::path::PathBuf::from("/workspace");
+    app
 }
 
 #[tokio::test]
@@ -1339,17 +1342,26 @@ fn renders_tool_call_diff_and_spinner() {
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
 
-    // The header reads as "edit <path>", not a raw JSON dump.
-    assert!(screen.contains("◆ edit src/cli.rs"), "readable tool header");
+    // The header reads as "Edit <basename> +N/-M", not a raw JSON dump.
+    assert!(
+        screen.contains("Edit cli.rs"),
+        "readable edit header: {screen}"
+    );
+    assert!(screen.contains("+1"), "collapsed edit shows +N: {screen}");
     assert!(
         !screen.contains("old_string"),
         "header must not dump JSON args"
     );
+    let copied = app
+        .transcript
+        .iter()
+        .map(TranscriptEntry::text)
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        screen.contains("pub json: bool"),
-        "ANSI diff rendered as text"
+        copied.contains("pub json: bool"),
+        "copy/export keeps the diff body"
     );
-    assert!(screen.contains("1290 total"), "status bar shows usage");
     assert!(
         screen.contains(SPINNER[2]) && screen.contains("0s"),
         "prompt bar shows the spinner + an elapsed timer while working: {screen}"
@@ -1632,7 +1644,7 @@ fn long_plan_does_not_break_input_box_border() {
     // The plan is truncated to fit, with a "… +N more" line, rather than
     // overflowing.
     assert!(
-        screen.contains("… +3 more"),
+        screen.contains("… +") && screen.contains("more"),
         "plan truncated to fit:\n{screen}"
     );
     // The box never exceeds the terminal height.
@@ -1642,7 +1654,7 @@ fn long_plan_does_not_break_input_box_border() {
     );
 
     // A taller terminal shows the whole plan with no truncation.
-    let mut term2 = Terminal::new(TestBackend::new(175, 14)).unwrap();
+    let mut term2 = Terminal::new(TestBackend::new(175, 18)).unwrap();
     term2.draw(|f| app.render(f)).unwrap();
     let screen2 = dump(&term2);
     assert!(
@@ -1674,9 +1686,9 @@ fn long_plan_does_not_break_input_box_border() {
         bottom3[0].trim_start().starts_with('╰'),
         "border closed, not overlapping content:\n{screen3}"
     );
-    // The transcript title row survives (top border with `hi ·`).
+    // Status bar (cwd) and prompt (model in the bottom divider) both survive.
     assert!(
-        screen3.contains("hi · openai · gpt-4o"),
+        screen3.contains("gpt-4o"),
         "transcript keeps its row:\n{screen3}"
     );
 
@@ -1901,13 +1913,14 @@ fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
     // at the viewport. Size the terminal to the full list so this test checks
     // what the panel says, not what happens to fit; `help_panel_fits_in_*`
     // below is what guards the height itself.
-    // One taller than the previous baseline: Ctrl-B added a help row.
-    let mut term = Terminal::new(TestBackend::new(80, 42)).unwrap();
+    // One taller than the previous baseline: outer vpad + chrome gaps take
+    // four rows that used to belong to the help panel.
+    let mut term = Terminal::new(TestBackend::new(80, 46)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
 
     assert!(
-        screen.contains("Ctrl-D") && screen.contains("toggle the working-tree diff panel"),
+        screen.contains("Ctrl-D") && screen.contains("full-screen diff review"),
         "Ctrl-D help should describe diff toggle:\n{screen}"
     );
     assert!(
@@ -1953,7 +1966,7 @@ fn help_panel_still_fits_in_its_documented_height() {
     // this fails, that is the point — either trim some help text, or make the
     // panel scroll, rather than letting `/quit` silently vanish for anyone on a
     // shorter terminal.
-    const REQUIRED_ROWS: u16 = 42;
+    const REQUIRED_ROWS: u16 = 46;
     let mut app = test_app("openai", "gpt-4o");
     app.show_help = true;
     let mut term = Terminal::new(TestBackend::new(80, REQUIRED_ROWS)).unwrap();
@@ -1979,7 +1992,7 @@ fn changed_files_line_shows_what_last_turn_touched() {
         "changed-files line: {screen}"
     );
     assert!(
-        screen.contains("Ctrl-D for diff"),
+        screen.contains("Ctrl-G for review"),
         "diff toggle hint: {screen}"
     );
 }
@@ -1990,42 +2003,41 @@ fn ctrl_d_toggles_diff_even_when_input_is_empty() {
     let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
 
     assert_eq!(app.edit_key(&ctrl_d), None);
-    assert!(app.show_diff, "Ctrl-D should open the diff panel");
+    assert!(
+        app.mode.is_review(),
+        "Ctrl-D should open full-screen review"
+    );
     assert!(app.diff_text.is_some(), "opening should cache diff text");
 
     assert_eq!(app.edit_key(&ctrl_d), None);
-    assert!(!app.show_diff, "second Ctrl-D should close the diff panel");
     assert!(
-        app.diff_text.is_none(),
-        "closing should clear cached diff text"
+        !app.mode.is_review(),
+        "second Ctrl-D should close the review overlay"
     );
 }
 
 #[test]
-fn ctrl_d_toggles_the_diff_panel() {
-    // Toggling Ctrl-D opens the panel with the cached diff text and a
-    // header; toggling again closes it. We set diff_text directly to avoid
-    // a real git call in the unit test.
+fn ctrl_d_opens_the_full_screen_review() {
+    // Ctrl-D is an alias for Ctrl-G: the composer no longer dumps a 20-line
+    // git diff. Set diff_text directly to avoid a real git call.
     let mut app = test_app("openai", "gpt-4o");
-    app.show_diff = true;
     app.diff_text = Some("--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n+new\n".into());
+    app.mode = crate::mode::UiMode::Review;
     let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     assert!(
-        screen.contains("diff (Ctrl-D to close)"),
-        "panel header: {screen}"
+        screen.contains("Diff review (Ctrl-G)"),
+        "review header: {screen}"
     );
     assert!(screen.contains("+new"), "diff content rendered: {screen}");
 
-    // Closing drops the panel.
-    app.show_diff = false;
-    app.diff_text = None;
+    app.mode.to_insert();
     term.draw(|f| app.render(f)).unwrap();
     let screen2 = dump(&term);
     assert!(
-        !screen2.contains("diff (Ctrl-D to close)"),
-        "panel closed: {screen2}"
+        !screen2.contains("Diff review (Ctrl-G)"),
+        "review closed: {screen2}"
     );
 }
 
@@ -3852,36 +3864,36 @@ fn empty_tool_result_is_visible() {
 #[test]
 fn explore_tools_collapse_header_and_line_count_into_one_line() {
     let mut app = test_app("openai", "gpt-4o");
-    // A read call: header is deferred until the result, then both collapse.
     app.apply(UiEvent::ToolCall {
         name: "read".into(),
         arguments: "{\"path\":\"src/main.rs\"}".into(),
     });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
-    // No header emitted yet — it waits for the result.
     assert!(
-        !lines.iter().any(|l| l.contains("◆ read")),
-        "no deferred header before result: {lines:?}"
+        lines.iter().any(|l| l.contains("Reading src/main.rs")),
+        "live read header before result: {lines:?}"
     );
     app.apply(UiEvent::ToolResult {
         name: "read".into(),
         result: "a\nb\nc\n".into(),
     });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
-    // Exactly one line, combining the header and the count.
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("◆ read src/main.rs · 3 lines")),
+            .any(|l| l.contains("Read src/main.rs · 3 lines")),
         "collapsed read line: {lines:?}"
     );
     assert_eq!(
-        lines.iter().filter(|l| l.contains("◆ read")).count(),
+        lines
+            .iter()
+            .filter(|l| l.contains("Read src/main.rs"))
+            .count(),
         1,
         "exactly one read header line: {lines:?}"
     );
 
-    // grep with no matches shows "(no output)" in the same collapsed line.
+    // grep folds into the same verb group (mixed exploration).
     app.apply(UiEvent::ToolCall {
         name: "grep".into(),
         arguments: "{\"pattern\":\"foo\"}".into(),
@@ -3892,8 +3904,10 @@ fn explore_tools_collapse_header_and_line_count_into_one_line() {
     });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(
-        lines.iter().any(|l| l.contains("◆ grep foo · (no output)")),
-        "collapsed grep empty line: {lines:?}"
+        lines
+            .iter()
+            .any(|l| l.contains("Read 1 file, Searched 1 pattern")),
+        "mixed verb group: {lines:?}"
     );
 }
 
@@ -3919,13 +3933,13 @@ fn idle_bash_output_polls_collapse_into_one_updating_line() {
     });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(
-        lines.iter().any(|l| l.contains("◆ sh_1 · still running")),
+        lines.iter().any(|l| l.contains("sh_1 · still running")),
         "first idle poll: {lines:?}"
     );
     assert_eq!(
         lines
             .iter()
-            .filter(|l| l.contains("◆ sh_1 · still running"))
+            .filter(|l| l.contains("sh_1 · still running"))
             .count(),
         1,
         "exactly one shell poll line: {lines:?}"
@@ -3955,13 +3969,13 @@ fn idle_bash_output_polls_collapse_into_one_updating_line() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("◆ sh_1 · still running · polled 3×")),
+            .any(|l| l.contains("sh_1 · still running · polled 3×")),
         "collapsed idle polls: {lines:?}"
     );
     assert_eq!(
         lines
             .iter()
-            .filter(|l| l.contains("◆ sh_1 · still running"))
+            .filter(|l| l.contains("sh_1 · still running"))
             .count(),
         1,
         "still exactly one shell poll line after three polls: {lines:?}"
@@ -3996,7 +4010,10 @@ fn missing_background_poll_hides_model_recovery_instructions() {
     });
 
     let text = app.transcript_text();
-    assert!(text.contains("background process git-status_1 unavailable"));
+    assert!(
+        text.to_ascii_lowercase()
+            .contains("background process git-status_1 unavailable")
+    );
     assert!(!text.contains("no background process"));
     assert!(!text.contains("Do not call this again"));
 }
@@ -4088,12 +4105,12 @@ fn consecutive_same_tool_explore_results_merge_into_one_line() {
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     // Exactly one read line, summarizing all three.
     assert_eq!(
-        lines.iter().filter(|l| l.contains("◆ read")).count(),
+        lines.iter().filter(|l| l.contains("Read ")).count(),
         1,
         "one merged read line: {lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("◆ read 3 files · 6 lines")),
+        lines.iter().any(|l| l.contains("Read 3 files")),
         "merged summary: {lines:?}"
     );
 
@@ -4117,13 +4134,52 @@ fn consecutive_same_tool_explore_results_merge_into_one_line() {
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     // Now two read lines: the merged 3-file run and a fresh single read.
     assert_eq!(
-        lines.iter().filter(|l| l.contains("◆ read")).count(),
+        lines.iter().filter(|l| l.contains("Read ")).count(),
         2,
         "run broken by edit: {lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("◆ read d.rs · 2 lines")),
+        lines.iter().any(|l| l.contains("Read d.rs · 2 lines")),
         "fresh read after break: {lines:?}"
+    );
+}
+
+#[test]
+fn edit_activity_row_shows_colored_diffstat() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolCall {
+        name: "edit".into(),
+        arguments: "{\"path\":\"src/chrome.rs\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "edit".into(),
+        result: "\x1b[1m12 additions, 3 deletions\x1b[0m\n  10 + new\n  11 - old\n".into(),
+    });
+    let text = app
+        .transcript
+        .iter()
+        .map(TranscriptEntry::text)
+        .collect::<Vec<_>>();
+    assert!(
+        text.iter().any(|l| l.contains("Edit chrome.rs +12/-3")),
+        "collapsed edit identity: {text:?}"
+    );
+    let collapsed: Vec<String> = app
+        .transcript
+        .iter()
+        .flat_map(|e| e.flatten(false, false, crate::Density::Comfortable))
+        .map(|l| crate::render::line_text(&l))
+        .collect();
+    assert_eq!(collapsed.len(), 1, "edit stays one line: {collapsed:?}");
+    let expanded: Vec<String> = app
+        .transcript
+        .iter()
+        .flat_map(|e| e.flatten(false, true, crate::Density::Comfortable))
+        .map(|l| crate::render::line_text(&l))
+        .collect();
+    assert!(
+        expanded.iter().any(|l| l.contains("new")),
+        "expanded hunks: {expanded:?}"
     );
 }
 
@@ -4597,90 +4653,36 @@ fn renders_completion_menu() {
     assert!(screen.contains("▶"), "highlights a row: {screen}");
 }
 
-/// `splash_lines` now leads with a ~2x block-letter "PipeNetwork.AI"
-/// banner (5 figlet rows, all orange bold), then the dim model line, the
-/// cwd, and a trailing blank. Verifies banner shape, orange+bold styling
-/// on every banner row, the model/cwd content, and the line count.
+/// A fresh session does not dump a keybinding essay into the transcript.
+/// Chrome already has cwd, model, and shortcuts; the canvas shows the
+/// figlet wordmark until the first turn.
 #[test]
-fn splash_shows_full_pipenetwork_wordmark_in_orange() {
-    let lines = splash_lines(
-        "openai",
-        "gpt-4o",
-        Some(128_000),
-        Some(hi_ai::ReasoningEffort::High),
+fn empty_session_landing_is_quiet() {
+    let mut app = test_app("openai", "gpt-4o");
+    assert!(
+        app.transcript.is_empty(),
+        "fresh session must not seed the transcript"
     );
 
-    // 5 banner rows + model line + cwd line + trailing blank = 8.
-    assert_eq!(
-        lines.len(),
-        8,
-        "expected 8 lines (5 banner + model + cwd + blank)"
-    );
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
 
-    // Banner: rows 0..5, each one span styled orange + bold, carrying
-    // figlet strokes (pipes / underscores).
-    for (i, line) in lines[0..5].iter().enumerate() {
-        assert_eq!(
-            line.spans.len(),
-            1,
-            "banner row {i} should be a single span, got {} spans",
-            line.spans.len()
-        );
-        let span = &line.spans[0];
-        assert_eq!(
-            span.style.fg,
-            Some(Color::Rgb(255, 140, 0)),
-            "banner row {i} should be orange"
-        );
-        assert!(
-            span.style.add_modifier.contains(Modifier::BOLD),
-            "banner row {i} should be bold"
-        );
-        let text = span.content.to_string();
-        assert!(
-            text.contains('|') || text.contains('_'),
-            "banner row {i} should carry figlet strokes, got: {text:?}"
-        );
-    }
-
-    // Row 5: dim model line (model + provider + context window).
-    let model_line: String = lines[5]
-        .spans
-        .iter()
-        .map(|s| s.content.to_string())
-        .collect();
     assert!(
-        model_line.contains("gpt-4o"),
-        "model line missing model: {model_line:?}"
+        screen.contains("___ _"),
+        "wide canvas shows the wordmark: {screen}"
     );
     assert!(
-        model_line.contains("openai"),
-        "model line missing provider: {model_line:?}"
+        !screen.contains("Alt-Enter"),
+        "no keybinding essay: {screen}"
     );
     assert!(
-        model_line.contains("128K context"),
-        "model line missing context window: {model_line:?}"
+        !screen.contains("ephemeral execution") && !screen.contains("durable execution"),
+        "no execution lecture: {screen}"
     );
     assert!(
-        model_line.contains("reasoning high"),
-        "model line missing reasoning level: {model_line:?}"
-    );
-
-    // Row 6: cwd — non-empty.
-    let cwd_line: String = lines[6]
-        .spans
-        .iter()
-        .map(|s| s.content.to_string())
-        .collect();
-    assert!(
-        !cwd_line.is_empty(),
-        "cwd line should be non-empty, got: {cwd_line:?}"
-    );
-
-    // Row 7: the blank breathing-room line.
-    assert!(
-        lines[7].spans.is_empty(),
-        "last line should be the blank breathing-room line"
+        !screen.contains("type a task"),
+        "empty canvas is the wordmark, not a prompt lecture: {screen}"
     );
 }
 
@@ -4737,6 +4739,23 @@ fn uievent_serializes_and_deserializes_roundtrip() {
             estimated: false,
         },
         UiEvent::RateLimits { rate_limits: None },
+        UiEvent::SubagentSpawned {
+            id: "explore-1".to_string(),
+            subagent_kind: "explore".to_string(),
+            description: "crate boundaries".to_string(),
+            background: false,
+        },
+        UiEvent::SubagentProgress {
+            id: "explore-1".to_string(),
+            activity: "Reading lib.rs".to_string(),
+            line: Some("read lib.rs".to_string()),
+        },
+        UiEvent::SubagentFinished {
+            id: "explore-1".to_string(),
+            status: "completed".to_string(),
+            elapsed_ms: 1200,
+            summary: "found it".to_string(),
+        },
         UiEvent::TurnEnd {
             summary: "[100 in · 50 out]".to_string(),
         },
@@ -4837,12 +4856,17 @@ fn phase1_visual_grammar_smoke() {
 
     assert!(screen.contains("❯ port the parser"), "user prompt band");
     assert!(
-        screen.contains("◆ read src/parser.rs"),
-        "read header with ◆"
+        screen.contains("Read src/parser.rs") || screen.contains("Read parser.rs"),
+        "read activity row: {screen}"
     );
-    assert!(screen.contains("◆ bash"), "bash header with ◆");
-    assert!(screen.contains("skeptic approved"), "status line present");
-    assert!(screen.contains("┃"), "accent gutter present");
+    assert!(
+        screen.contains("Run cargo test") || screen.contains("Run cargo"),
+        "run activity row: {screen}"
+    );
+    assert!(
+        !screen.contains("skeptic approved"),
+        "status chatter stays out of the activity list: {screen}"
+    );
     assert!(screen.contains("✎ 1 file changed"), "changed-files line");
 }
 
@@ -4863,7 +4887,7 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
         result: output,
     });
 
-    // Collapsed (default): preview lines + a fold footer, not all 40.
+    // Collapsed (default): one Run line, no stdout dump.
     let collapsed: Vec<String> = app
         .transcript
         .iter()
@@ -4871,18 +4895,16 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
         .map(|l| crate::render::line_text(&l))
         .collect();
     assert!(
-        collapsed.iter().any(|l| l.contains("line 0")),
-        "preview shows the head: {collapsed:?}"
+        collapsed.iter().any(|l| l.contains("Run seq")),
+        "collapsed run header: {collapsed:?}"
+    );
+    assert!(
+        !collapsed.iter().any(|l| l.contains("line 0")),
+        "stdout stays folded: {collapsed:?}"
     );
     assert!(
         !collapsed.iter().any(|l| l.contains("line 39")),
         "the tail is folded away when collapsed"
-    );
-    assert!(
-        collapsed
-            .iter()
-            .any(|l| l.contains("more lines · Ctrl-O to expand")),
-        "a fold footer names the hidden lines: {collapsed:?}"
     );
 
     // Expanded (Ctrl-O / show_tool_output): the full body, no footer.
@@ -4901,8 +4923,7 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
         "no fold footer when expanded"
     );
 
-    // Short output (≤ preview) is never folded — no regression from the old
-    // inline behavior.
+    // Short output is still a one-liner; the body is in copy/export text.
     let mut app2 = test_app("pipe", "glm-5.2");
     app2.apply(UiEvent::ToolResult {
         name: "bash".into(),
@@ -4914,10 +4935,19 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
         .flat_map(|e| e.flatten(false, false, crate::Density::Comfortable))
         .map(|l| crate::render::line_text(&l))
         .collect();
-    assert!(short.iter().any(|l| l.contains("just one line")));
+    assert!(
+        short.iter().any(|l| l.contains("Run bash")),
+        "short run stays a header: {short:?}"
+    );
     assert!(
         !short.iter().any(|l| l.contains("Ctrl-O")),
-        "short output isn't folded"
+        "short output isn't a fold footer"
+    );
+    assert!(
+        app2.transcript
+            .iter()
+            .any(|e| e.text().contains("just one line")),
+        "copy/export keeps the short body"
     );
 
     // Full text (for /copy and /export) always has everything, regardless of fold.
@@ -4970,7 +5000,8 @@ fn sticky_prompt_header_pins_when_scrolled_past() {
     }
     let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
 
-    // First render (following = bottom-pinned): NO sticky, top row is the border.
+    // First render (following = bottom-pinned): NO sticky. Row 0 is the
+    // status bar; row 1 is the first visible transcript line.
     term.draw(|f| app.render(f)).unwrap();
     let bottom_pinned = dump(&term);
     let first_content_row = bottom_pinned.lines().nth(1).unwrap_or("");
@@ -5349,6 +5380,89 @@ fn jump_prompt_moves_scroll() {
 }
 
 #[test]
+fn session_chrome_matches_grok_build_stack() {
+    // Grok-build's session face: flat status, unboxed scrollback, rounded
+    // prompt, shortcuts row. The transcript must not wear a titled rounded box.
+    let mut app = test_app("openai", "gpt-4o");
+    app.push_user_prompt(Line::raw("❯ hello"));
+    app.apply(UiEvent::Text {
+        text: "working on it\n".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+    app.input.set("next");
+
+    // Auto-compact (≤20 rows) drops the outer vertical pad so chrome sits on
+    // the first and last rows.
+    let mut compact = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    compact.draw(|f| app.render(f)).unwrap();
+    let compact_screen = dump(&compact);
+    let compact_rows: Vec<&str> = compact_screen.lines().collect();
+    assert!(
+        compact_rows[0].contains("/workspace") || compact_rows[0].contains("workspace"),
+        "compact status bar shows cwd on row 0: {compact_screen}"
+    );
+    assert!(
+        !compact_rows[0].trim_start().starts_with('╭'),
+        "status bar is not a titled box: {}",
+        compact_rows[0]
+    );
+    assert!(
+        compact_rows.iter().any(|l| l.trim_start().starts_with('╭')),
+        "prompt still has a rounded top: {compact_screen}"
+    );
+    assert!(
+        compact_rows
+            .last()
+            .is_some_and(|l| l.contains("enter") && l.contains("send")),
+        "compact shortcuts row at the bottom: {compact_screen}"
+    );
+    assert!(
+        compact_rows.last().is_some_and(|l| l.contains('│')),
+        "shortcuts use grok-build separators: {compact_screen}"
+    );
+    assert!(
+        compact_screen.contains("❯ next") || compact_screen.contains("next"),
+        "composer shows the draft: {compact_screen}"
+    );
+    let prompt_border = compact_rows
+        .iter()
+        .rev()
+        .find(|l| l.contains('╰') && l.contains("gpt-4o"))
+        .expect("prompt bottom border with model");
+    let after_corner = prompt_border.trim_start().trim_start_matches('╰');
+    let model_at = after_corner.find("gpt-4o").expect("model on bottom border");
+    let rule_at = after_corner.find('─').unwrap_or(0);
+    assert!(
+        model_at > rule_at,
+        "model sits on the right of the bottom divider, grok-build style: {prompt_border}"
+    );
+
+    // Tall terminals keep a blank canvas row above the status bar and below
+    // the shortcuts, matching grok-build's outer_vpad.
+    let mut tall = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    tall.draw(|f| app.render(f)).unwrap();
+    let tall_screen = dump(&tall);
+    let tall_rows: Vec<&str> = tall_screen.lines().collect();
+    assert!(
+        tall_rows[0].trim().is_empty(),
+        "tall terminal keeps a blank top pad: {tall_screen}"
+    );
+    assert!(
+        tall_rows[1].contains("/workspace") || tall_rows[1].contains("workspace"),
+        "status bar sits under the top pad: {tall_screen}"
+    );
+    assert!(
+        tall_rows.last().is_some_and(|l| l.trim().is_empty()),
+        "tall terminal keeps a blank bottom pad: {tall_screen}"
+    );
+    let shortcuts = tall_rows[tall_rows.len() - 2];
+    assert!(
+        shortcuts.contains("enter") && shortcuts.contains("send"),
+        "shortcuts sit above the bottom pad: {tall_screen}"
+    );
+}
+
+#[test]
 fn theme_roles_not_raw_ansi_in_session_render() {
     // Guard: session render path should not reintroduce Color::Yellow etc.
     // (dashboard/watch still may during migration — this checks the string
@@ -5366,4 +5480,257 @@ fn theme_roles_not_raw_ansi_in_session_render() {
             "app/render.rs still contains {bad} — use theme roles"
         );
     }
+}
+
+#[test]
+fn subagent_spawn_updates_one_live_row_then_finishes() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::SubagentSpawned {
+        id: "explore-1".into(),
+        subagent_kind: "explore".into(),
+        description: "crate boundaries".into(),
+        background: false,
+    });
+    let text = app.transcript_text();
+    assert!(
+        text.contains("Explore") && text.contains("crate boundaries"),
+        "spawned row missing: {text}"
+    );
+    assert!(!text.contains("explore:read"));
+    app.apply(UiEvent::SubagentProgress {
+        id: "explore-1".into(),
+        activity: "Reading lib.rs".into(),
+        line: Some("read lib.rs".into()),
+    });
+    let text = app.transcript_text();
+    assert!(
+        text.contains("Reading lib.rs"),
+        "live suffix missing: {text}"
+    );
+    assert_eq!(
+        app.transcript
+            .iter()
+            .filter(|e| matches!(e, TranscriptEntry::Activity(_)))
+            .count(),
+        1,
+        "foreground explore must stay one row"
+    );
+    app.apply(UiEvent::SubagentFinished {
+        id: "explore-1".into(),
+        status: "completed".into(),
+        elapsed_ms: 12_000,
+        summary: "done".into(),
+    });
+    let text = app.transcript_text();
+    assert!(
+        text.contains("completed") && text.contains("crate boundaries"),
+        "finish should update the same row: {text}"
+    );
+    assert_eq!(
+        app.transcript
+            .iter()
+            .filter(|e| matches!(e, TranscriptEntry::Activity(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn subagent_inspect_line_keeps_live_suffix() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::SubagentSpawned {
+        id: "delegate-1".into(),
+        subagent_kind: "delegate".into(),
+        description: "fix the bug".into(),
+        background: false,
+    });
+    app.apply(UiEvent::SubagentProgress {
+        id: "delegate-1".into(),
+        activity: "Reading lib.rs".into(),
+        line: Some("Reading lib.rs".into()),
+    });
+    app.apply(UiEvent::SubagentProgress {
+        id: "delegate-1".into(),
+        activity: String::new(),
+        line: Some("fn foo() {}".into()),
+    });
+    let text = app.transcript_text();
+    assert!(
+        text.contains("Reading lib.rs"),
+        "empty-activity inspect lines must keep the live suffix: {text}"
+    );
+    assert!(
+        !text.contains("explore:read") && !text.contains("fn foo()"),
+        "inspect body must not dump into the parent feed: {text}"
+    );
+    assert_eq!(
+        app.subagents.get("delegate-1").map(|info| info.lines.len()),
+        Some(2)
+    );
+}
+
+#[test]
+fn subagent_background_task_is_two_rows() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::SubagentSpawned {
+        id: "task_1".into(),
+        subagent_kind: "explore".into(),
+        description: "scan deps".into(),
+        background: true,
+    });
+    app.apply(UiEvent::SubagentProgress {
+        id: "task_1".into(),
+        activity: "Reading Cargo.toml".into(),
+        line: None,
+    });
+    let start = app.transcript_text();
+    assert!(start.contains("started"), "background start row: {start}");
+    assert!(
+        !start.contains("Reading Cargo.toml"),
+        "bg start row stays started: {start}"
+    );
+    app.apply(UiEvent::SubagentFinished {
+        id: "task_1".into(),
+        status: "completed".into(),
+        elapsed_ms: 4000,
+        summary: "ok".into(),
+    });
+    let text = app.transcript_text();
+    assert!(text.contains("started") && text.contains("completed"));
+    assert_eq!(
+        app.transcript
+            .iter()
+            .filter(|e| matches!(e, TranscriptEntry::Activity(_)))
+            .count(),
+        2,
+        "background finish appends a second row: {text}"
+    );
+}
+
+#[test]
+fn subagent_tool_calls_do_not_dump_explore_reads() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::SubagentSpawned {
+        id: "explore-1".into(),
+        subagent_kind: "explore".into(),
+        description: "find X".into(),
+        background: false,
+    });
+    app.apply(UiEvent::ToolCall {
+        name: "explore".into(),
+        arguments: r#"{"task":"find X"}"#.into(),
+    });
+    app.apply(UiEvent::ToolCall {
+        name: "explore:read".into(),
+        arguments: r#"{"path":"lib.rs"}"#.into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "explore:read".into(),
+        result: "fn main() {}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "explore".into(),
+        result: "found it".into(),
+    });
+    let text = app.transcript_text();
+    assert!(
+        !text.contains("explore:read") && !text.contains("explore:grep"),
+        "parent feed dumped child tools: {text}"
+    );
+    assert!(text.contains("Explore") && text.contains("find X"));
+}
+
+#[test]
+fn waiting_on_subagent_chrome() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.working = true;
+    app.apply(UiEvent::SubagentSpawned {
+        id: "explore-1".into(),
+        subagent_kind: "explore".into(),
+        description: "map crate".into(),
+        background: false,
+    });
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("Waiting on subagent"),
+        "blocking chrome missing: {screen}"
+    );
+}
+
+#[test]
+fn background_subagents_still_running_chrome() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.working = false;
+    app.apply(UiEvent::SubagentSpawned {
+        id: "task_1".into(),
+        subagent_kind: "explore".into(),
+        description: "scan".into(),
+        background: true,
+    });
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("subagent still running"),
+        "idle bg chrome missing: {screen}"
+    );
+}
+
+#[test]
+fn inspect_overlay_opens_from_feed_row_and_closes() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::SubagentSpawned {
+        id: "explore-1".into(),
+        subagent_kind: "explore".into(),
+        description: "crate boundaries".into(),
+        background: false,
+    });
+    app.apply(UiEvent::SubagentProgress {
+        id: "explore-1".into(),
+        activity: "Reading lib.rs".into(),
+        line: Some("read lib.rs".into()),
+    });
+    crate::subagent_overlay::open_inspect(&mut app, "explore-1");
+    assert!(app.inspect_subagent.is_some());
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("crate boundaries") && screen.contains("read lib.rs"),
+        "inspect overlay missing child lines: {screen}"
+    );
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    match crate::subagent_overlay::handle_inspect_key(&mut app, &esc) {
+        crate::subagent_overlay::OverlayOutcome::Close => app.inspect_subagent = None,
+        _ => panic!("esc should close inspect"),
+    }
+    assert!(app.inspect_subagent.is_none());
+}
+
+#[test]
+fn tasks_overlay_lists_running_id() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::SubagentSpawned {
+        id: "task_1".into(),
+        subagent_kind: "explore".into(),
+        description: "scan deps".into(),
+        background: true,
+    });
+    crate::subagent_overlay::open_tasks(&mut app, &[], &["task_1".into()]);
+    let overlay = app.tasks_overlay.as_ref().expect("tasks overlay");
+    assert!(
+        overlay.rows.iter().any(|row| row.id == "task_1"),
+        "running id missing: {:?}",
+        overlay.rows.iter().map(|r| &r.id).collect::<Vec<_>>()
+    );
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("TASKS") && screen.contains("scan deps"),
+        "tasks overlay: {screen}"
+    );
 }

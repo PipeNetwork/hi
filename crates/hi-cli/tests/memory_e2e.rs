@@ -137,8 +137,12 @@ fn one_shot_report_creates_parent_directories() {
 #[test]
 fn review_repair_report_contains_stall_telemetry() {
     let weak_review = "The repository looks healthy and organized.";
+    // Surplus responses: the weak review triggers 4 quality-repair nudges
+    // plus keep-working recoveries (14 model calls total), all served by this
+    // one fake server. Extra responses sit unused but prevent a dead-connection
+    // error that would mask the real incomplete-review exit code.
     let Some(server) = FakeOpenAiServer::new(
-        (0..6)
+        (0..20)
             .map(|_| Response::sse(sse_with_usage(weak_review)))
             .collect(),
     ) else {
@@ -231,7 +235,10 @@ fn review_repair_report_contains_stall_telemetry() {
 fn memory_distills_at_quit_and_reloads_next_session() {
     // Round 1: an explicit user preference remains eligible for memory even
     // without a verifier-backed mutation, followed by quit-time distillation.
-    // Two canned responses suffice (the turn response + the distillation).
+    // The turn consumes two model calls (the prose reply plus a
+    // verification-obligation nudge from the bookkeeping state writes); the
+    // distillation needs its own response, so stock two usage-bearing turn
+    // responses then the cargo-fmt distillation text.
     let Some(server1) = FakeOpenAiServer::new(vec![
         Response::sse(sse_with_usage("Done — fixed it.")),
         Response::sse(sse_with_usage("Done — fixed it.")),

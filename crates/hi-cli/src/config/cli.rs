@@ -121,6 +121,11 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub subagent: bool,
 
+    /// Append live `Ui` events as JSONL so a parent `delegate` runner can tail
+    /// them into a typed subagent row. Not intended for direct use.
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub events_jsonl: Option<std::path::PathBuf>,
+
     /// Exact session file to create or resume (used internally by the
     /// `/dashboard` fleet: the parent owns the path, so a child running in a
     /// worktree appends to the parent project's session rather than creating

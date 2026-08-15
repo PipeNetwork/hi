@@ -20,6 +20,7 @@ pub(crate) fn copy_line_text(line: &Line) -> String {
     let text = line_text(line);
     text.strip_prefix("┃ ")
         .or_else(|| text.strip_prefix("▏ "))
+        .or_else(|| text.strip_prefix("• "))
         .unwrap_or(&text)
         .to_string()
 }
@@ -186,34 +187,72 @@ pub(crate) fn looks_like_diff(s: &str) -> bool {
     minus && plus
 }
 
+/// Role of one painted diff row (insert/delete get background bands).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DiffBand {
+    Add,
+    Del,
+    Context,
+    Meta,
+}
+
+/// One diff row: optional line-number gutter, role color, and insert/delete
+/// background bands on truecolor themes (grok-build's glanceable hunk look).
+pub(crate) fn banded_diff_line(
+    band: DiffBand,
+    gutter: impl Into<String>,
+    content: impl Into<String>,
+) -> Line<'static> {
+    let th = theme();
+    let (fg, bg, extra) = match band {
+        DiffBand::Add => (th.diff_add, Some(th.diff_add_bg), Modifier::empty()),
+        DiffBand::Del => (th.diff_del, Some(th.diff_del_bg), Modifier::empty()),
+        DiffBand::Context => (th.diff_context, None, Modifier::empty()),
+        DiffBand::Meta => (th.diff_hunk, None, Modifier::BOLD),
+    };
+    let bg = bg.filter(|_| th.paints_backgrounds());
+    let mut style = Style::default().fg(fg).add_modifier(extra);
+    let mut gutter_style = dim();
+    if let Some(bg) = bg {
+        style = style.bg(bg);
+        gutter_style = gutter_style.bg(bg);
+    }
+    let mut line = Line::from(vec![
+        Span::styled(gutter.into(), gutter_style),
+        Span::styled(content.into(), style),
+    ]);
+    if let Some(bg) = bg {
+        line.style = line.style.bg(bg);
+    }
+    line
+}
+
 /// Render a unified diff with coloring and a new-file line-number gutter:
 /// additions green, removals red, hunk headers cyan, file headers bold, context
-/// muted. The line number (tracked from each `@@` header) is shown for context
-/// and added lines; removed lines and headers get a blank gutter.
+/// muted. Insert/delete rows get a background band on truecolor themes. The
+/// line number (tracked from each `@@` header) is shown for context and added
+/// lines; removed lines and headers get a blank gutter.
 pub(crate) fn diff_lines(body: &str) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mut new_line: Option<u32> = None;
     for line in body.lines() {
-        let (style, gutter, advance) = if line.starts_with("+++") || line.starts_with("---") {
-            (Style::default().add_modifier(Modifier::BOLD), None, false)
+        let (band, gutter, advance) = if line.starts_with("+++") || line.starts_with("---") {
+            (DiffBand::Meta, None, false)
         } else if line.starts_with("@@") {
             new_line = parse_hunk_new_start(line);
-            (Style::default().fg(theme().diff_hunk), None, false)
+            (DiffBand::Meta, None, false)
         } else if line.starts_with('+') {
-            (Style::default().fg(theme().diff_add), new_line, true)
+            (DiffBand::Add, new_line, true)
         } else if line.starts_with('-') {
-            (Style::default().fg(theme().diff_del), None, false)
+            (DiffBand::Del, None, false)
         } else {
-            (dim(), new_line, true)
+            (DiffBand::Context, new_line, true)
         };
         let num = match gutter {
             Some(n) => format!("{n:>4} "),
             None => "     ".to_string(),
         };
-        out.push(Line::from(vec![
-            Span::styled(num, dim()),
-            Span::styled(line.to_string(), style),
-        ]));
+        out.push(banded_diff_line(band, num, line.to_string()));
         if advance && let Some(n) = new_line.as_mut() {
             *n += 1;
         }
