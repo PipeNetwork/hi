@@ -1415,10 +1415,6 @@ pub(crate) struct App {
     /// Model rounds seen this turn (incremented on each `UiEvent::AssistantEnd`),
     /// so the activity line can show "round 3 · 5 tool calls" for multi-step turns.
     pub(crate) turn_rounds: u32,
-    /// A tail of recent streamed tool output lines (e.g. bash stdout), shown
-    /// live in the working area while a tool runs. Cleared when the tool
-    /// finishes and its final result is pushed to the transcript.
-    pub(crate) tool_stream_tail: Vec<String>,
     pub(crate) waiting_for: Option<Duration>,
     pub(crate) last_turn_state: TurnState,
     pub(crate) last_error: Option<String>,

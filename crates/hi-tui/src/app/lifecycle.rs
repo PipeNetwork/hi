@@ -209,7 +209,6 @@ impl crate::App {
             last_turn_phase: None,
             turn_tool_calls: 0,
             turn_rounds: 0,
-            tool_stream_tail: Vec::new(),
             run_streamed_this_call: false,
             waiting_for: None,
             last_turn_state: TurnState::Idle,

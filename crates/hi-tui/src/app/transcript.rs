@@ -950,8 +950,6 @@ impl crate::App {
                 // ToolCall for shell tools, otherwise with the result).
                 self.current_tool = Some(label);
                 self.current_tool_started = Some(Instant::now());
-                // Clear any previous stream tail when a new tool starts.
-                self.tool_stream_tail.clear();
                 self.run_streamed_this_call = false;
             }
             UiEvent::ToolCall { name, arguments } => {
@@ -992,19 +990,23 @@ impl crate::App {
                 }
                 let label = self.current_tool.take().unwrap_or_else(|| name.clone());
                 self.current_tool_started = None;
-                self.tool_stream_tail.clear();
                 self.flush_pending();
                 self.push_result(&name, &result, &label);
             }
-            UiEvent::ToolStream { line, .. } => {
+            UiEvent::ToolStream { name, line } => {
                 if self.append_live_run_output(&line) {
                     self.run_streamed_this_call = true;
-                    self.tool_stream_tail.clear();
                 } else {
-                    self.tool_stream_tail.push(line.to_string());
-                    if self.tool_stream_tail.len() > 4 {
-                        self.tool_stream_tail.remove(0);
-                    }
+                    // No idle Run row yet: fold the streamed line into a Run
+                    // row body so live_run_tail_lines is the single source of
+                    // truth for running-command output (previously a separate
+                    // stream_area block buffering tool_stream_tail).
+                    let command = self
+                        .current_tool
+                        .as_deref()
+                        .map(|l| activity_feed::run_command(&name, l))
+                        .unwrap_or(name);
+                    self.append_run_output_for(&command, &line);
                 }
             }
             UiEvent::Status { text } => {

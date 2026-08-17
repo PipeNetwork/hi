@@ -9,9 +9,9 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use crate::chrome::{self, ShortcutHint};
 use crate::layout::{UiLayout, display_width, truncate_display};
 use crate::model_picker::{display_capabilities, display_price, display_window};
-use crate::render::{diff_lines, dim, lerp_color, markdown_line, wave_color, wrapped_line_height};
+use crate::render::{diff_lines, dim, lerp_color, markdown_line, wrapped_line_height};
 use crate::theme::UiTone;
-use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
+use crate::util::{fmt_count, fmt_elapsed, fmt_rate_limits};
 use crate::{FORM_LABEL_WIDTH, PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
 /// Clip ghost suffix to `max_width` cells without trimming leading spaces
@@ -947,14 +947,10 @@ impl crate::App {
         } else {
             0
         };
-        // Live streamed tool output tail (e.g. bash stdout), shown while a tool runs.
-        let stream_h = if self.working && !self.tool_stream_tail.is_empty() && !overlay_composer {
-            self.tool_stream_tail.len()
-        } else {
-            0
-        };
         // `/btw` overlay sits above the prompt (grok-build). Hide it while a
         // modal composer (picker/confirm) owns that slot so those stay usable.
+        // (Live running-command output no longer reserves its own row here —
+        // it renders inside the Run row via live_run_tail_lines.)
         let btw_state = if overlay_composer {
             None
         } else {
@@ -963,7 +959,7 @@ impl crate::App {
         let desired_btw = crate::btw::btw_panel_height(btw_state.as_ref(), composer_w);
         let overlay_budget = inner
             .height
-            .saturating_sub(chrome_rows + stream_h as u16 + metrics.min_transcript_rows + 3);
+            .saturating_sub(chrome_rows + metrics.min_transcript_rows + 3);
         let btw_h = crate::btw::clamp_overlay_height(desired_btw, overlay_budget);
         let btw_gap = crate::btw::gap_before_overlay(btw_h, overlay_budget > btw_h);
         // Height of the input box excluding the plan checklist and the 2 border
@@ -985,7 +981,7 @@ impl crate::App {
         let cap = inner
             .height
             .saturating_sub(
-                metrics.min_transcript_rows + chrome_rows + stream_h as u16 + btw_h + btw_gap,
+                metrics.min_transcript_rows + chrome_rows + btw_h + btw_gap,
             )
             .max(1) as usize;
         let show_lists = !overlay_composer;
@@ -1044,7 +1040,6 @@ impl crate::App {
             .height
             .saturating_sub(
                 chrome_rows
-                    + stream_h as u16
                     + metrics.min_transcript_rows
                     + btw_h
                     + btw_gap
@@ -1111,7 +1106,6 @@ impl crate::App {
             Constraint::Min(1),
             Constraint::Length(gap_h),
             Constraint::Length(turn_h),
-            Constraint::Length(stream_h as u16),
             Constraint::Length(btw_gap),
             Constraint::Length(btw_h),
             Constraint::Length(plan_pane_h as u16),
@@ -1122,11 +1116,10 @@ impl crate::App {
         let live_area = rows[0];
         let transcript_area = rows[1];
         let turn_area = rows[3];
-        let stream_area = rows[4];
-        let btw_area = rows[6];
-        let plan_area = rows[7];
-        let queue_area = rows[8];
-        let composer_area = rows[9];
+        let btw_area = rows[5];
+        let plan_area = rows[6];
+        let queue_area = rows[7];
+        let composer_area = rows[8];
 
         let prompt_count = self
             .transcript
@@ -1521,20 +1514,6 @@ impl crate::App {
         } else {
             self.turn_status_rect = ratatui::layout::Rect::default();
         }
-        if stream_h > 0 {
-            let running = th.accent_running;
-            let tail_rows = self.tool_stream_tail.len();
-            let mut slines: Vec<Line<'static>> = Vec::with_capacity(tail_rows);
-            for (i, line) in self.tool_stream_tail.iter().enumerate() {
-                let bar = wave_color(th.gray_dim, running, self.spinner, i, tail_rows);
-                slines.push(Line::from(vec![
-                    Span::styled("  │ ", Style::default().fg(bar)),
-                    Span::styled(clip_reason(line), Style::default().fg(th.gray_dim)),
-                ]));
-            }
-            frame.render_widget(Paragraph::new(slines), stream_area);
-        }
-
         if btw_h > 0 {
             if let Some(state) = &btw_state {
                 self.last_btw_area = btw_area;
@@ -2371,7 +2350,6 @@ impl crate::App {
                     + debug_h
                     + help_h
                     + palette_h
-                    + stream_h
                     + usize::from(self.startup_notice.is_some())
                     + usize::from(self.checkpoint_warning.is_some())
                     + usize::from(self.quit_notice.is_some())

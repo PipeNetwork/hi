@@ -76,31 +76,8 @@ pub(crate) fn accent_line(
 // Both are driven by the per-redraw `spinner` tick, so they animate at the
 // event loop's cadence with no extra timers.
 
-/// Ticks for the wave crest to sweep once from the top row to the bottom and
-/// wrap back to the top. At the ~120ms tick cadence this is a ~1.7s sweep.
-const WAVE_PERIOD: usize = 14;
-/// The crest's half-width in rows — how many rows around the crest still glow.
-const WAVE_SPREAD: f32 = 2.5;
 /// Ticks for one dim→bright→dim breath of the waiting pulse (~1.4s).
 const PULSE_PERIOD: usize = 12;
-
-/// Brightness weight in `0.0..=1.0` for `row` of a `rows`-tall active region at
-/// animation `phase`, forming a crest that travels down and wraps. The falloff
-/// is squared so the crest reads as a soft band rather than a hard line.
-pub(crate) fn wave_weight(phase: usize, row: usize, rows: usize) -> f32 {
-    if rows == 0 {
-        return 0.0;
-    }
-    let period = WAVE_PERIOD.max(1);
-    let rows_f = rows as f32;
-    // Crest head sweeps 0..rows as phase advances through one period.
-    let head = (phase % period) as f32 / period as f32 * rows_f;
-    let raw = (row as f32 - head).abs();
-    // Circular distance so the crest re-enters at the top as it leaves the bottom.
-    let dist = raw.min(rows_f - raw);
-    let w = 1.0 - dist / WAVE_SPREAD;
-    if w <= 0.0 { 0.0 } else { w * w }
-}
 
 /// Brightness weight in `0.0..=1.0` for the waiting pulse: a smooth
 /// dim→bright→dim breath (`sin²`) that repeats every [`PULSE_PERIOD`] ticks.
@@ -133,18 +110,6 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t)
         .round()
         .clamp(0.0, 255.0) as u8
-}
-
-/// The accent color for `row` of a `rows`-tall live-activity region at
-/// `phase` — [`base`] with a [`crest`]-colored wave rippling through it.
-pub(crate) fn wave_color(
-    base: Color,
-    crest: Color,
-    phase: usize,
-    row: usize,
-    rows: usize,
-) -> Color {
-    lerp_color(base, crest, wave_weight(phase, row, rows))
 }
 
 /// The waiting-pulse color at `phase`: [`base`] breathing toward [`crest`] and
@@ -1601,33 +1566,6 @@ mod tests {
             h >= 60_000,
             "tall transcript reports a large height, got {h}"
         );
-    }
-
-    #[test]
-    fn wave_weight_is_bounded_and_crest_travels_down() {
-        let rows = 8;
-        // Bounded to [0, 1] for every row and a spread of phases.
-        for phase in 0..40 {
-            for row in 0..rows {
-                let w = wave_weight(phase, row, rows);
-                assert!((0.0..=1.0).contains(&w), "w={w} phase={phase} row={row}");
-            }
-        }
-        // The brightest row advances (crest moves down) as phase increases across
-        // the first half of a period.
-        let brightest = |phase: usize| -> usize {
-            (0..rows)
-                .max_by(|&a, &b| {
-                    wave_weight(phase, a, rows)
-                        .partial_cmp(&wave_weight(phase, b, rows))
-                        .unwrap()
-                })
-                .unwrap()
-        };
-        assert!(brightest(0) <= brightest(3), "crest should move downward");
-        assert!(brightest(3) < brightest(6), "crest keeps descending");
-        // An empty region is a no-op (no divide-by-zero, no crest).
-        assert_eq!(wave_weight(5, 0, 0), 0.0);
     }
 
     #[test]
