@@ -1101,8 +1101,15 @@ fn round_adds_evidence_detects_re_reads_and_re_searches() {
         "re-read of an inspected path adds no evidence"
     );
     assert!(
-        evidence.round_adds_evidence(&[call("read", r#"{"path":"src/lib.rs","offset":241}"#)]),
-        "a new read page from an inspected path adds evidence"
+        !evidence.round_adds_evidence(&[call("read", r#"{"path":"src/lib.rs","offset":241}"#)]),
+        "a new read page from an inspected path adds no evidence"
+    );
+    assert!(
+        !evidence.round_adds_evidence(&[call(
+            "read",
+            r#"{"path":"/workspace/src/lib.rs","offset":480}"#
+        )]),
+        "an absolute path to an inspected relative file adds no evidence"
     );
     // Re-running the same grep adds no new evidence.
     assert!(
@@ -1116,7 +1123,10 @@ fn round_adds_evidence_detects_re_reads_and_re_searches() {
         )]),
         "grep with new context adds evidence"
     );
-    // Reading a new file adds evidence.
+    assert!(
+        evidence.round_adds_evidence(&[call("read", r#"{"path":"/workspace/other/lib.rs"}"#)]),
+        "a different directory is still new evidence"
+    );
     assert!(
         evidence.round_adds_evidence(&[call("read", r#"{"path":"src/main.rs"}"#)]),
         "read of a new path adds evidence"
@@ -1155,6 +1165,21 @@ fn round_adds_evidence_detects_re_reads_and_re_searches() {
     assert!(
         evidence.round_adds_evidence(&[call("read", r#"{"path":42}"#)]),
         "un-signable read calls should execute and surface their tool error"
+    );
+}
+
+#[test]
+fn extra_read_pages_of_inspected_file_are_not_new_evidence() {
+    let mut evidence = EvidenceTracker::default();
+    evidence.record_success("read", r#"{"path":"lib.rs"}"#, "fn x() {}\n");
+    let call = |args: &str| (String::new(), "read".to_string(), args.to_string());
+    assert!(
+        !evidence.round_adds_evidence(&[call(r#"{"path":"lib.rs","offset":40}"#)]),
+        "paging the same bare filename adds no evidence"
+    );
+    assert!(
+        evidence.round_adds_evidence(&[call(r#"{"path":"/workspace/src/lib.rs"}"#)]),
+        "a nested lib.rs is not the same file as a bare lib.rs"
     );
 }
 

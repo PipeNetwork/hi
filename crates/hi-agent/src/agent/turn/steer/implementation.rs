@@ -151,6 +151,11 @@ impl crate::Agent {
         ) {
             MutationRecoveryControl::None => {}
             MutationRecoveryControl::Continue => return RoundControl::Continue,
+            MutationRecoveryControl::Break => {
+                *stalled_unfinished = true;
+                ui.status(&self.incomplete_turn_status("implementation_discovery_exhausted"));
+                return RoundControl::BreakInner(false);
+            }
         }
         // Waiting-round detection keys on the process *lifecycle*, not output
         // novelty: a live progress bar makes every poll deliver fresh bytes,

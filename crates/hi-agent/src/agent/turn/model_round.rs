@@ -945,8 +945,10 @@ impl crate::Agent {
         // Fires only on the *second* consecutive no-new-evidence round
         // (`prev_added_no_evidence`): a single re-inspection right after
         // new evidence is allowed through (e.g. re-reading a file once a
-        // broader search has surfaced something to re-examine, or paging
-        // further into a file). Once the turn has made a successful
+        // broader search has surfaced something to re-examine). Extra pages
+        // of a file already read this turn are themselves no-new-evidence,
+        // so a paging walk trips this guard on the second consecutive page
+        // instead of running until max_steps. Once the turn has made a successful
         // mutation, this guard is advisory only: after the nudge budget
         // is spent, execute the inspection rather than hard-stalling a
         // long implementation harness in the middle of a later plan step.

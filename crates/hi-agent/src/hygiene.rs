@@ -144,17 +144,31 @@ fn is_dependency_manifest(path: &str) -> bool {
     )
 }
 
+/// Bytes written or removed this turn. `None` when the baseline is unknown
+/// (a Modify without `before_len`) — those are not flagged, because an
+/// already-large file with a small patch is not a rewrite.
+fn rewrite_delta(change: &FileChange) -> Option<u64> {
+    match change.kind {
+        FileChangeKind::Create => change.after_len,
+        FileChangeKind::Modify => {
+            let after = change.after_len?;
+            Some(after.abs_diff(change.before_len?))
+        }
+        FileChangeKind::Delete => None,
+    }
+}
+
 fn oversized_file(changes: &[FileChange]) -> Option<HygieneFinding> {
-    let large = changes.iter().find(|change| {
-        matches!(change.kind, FileChangeKind::Create | FileChangeKind::Modify)
-            && change.after_len.is_some_and(|len| len > LARGE_FILE_BYTES)
-    })?;
-    Some(HygieneFinding {
-        reason: format!(
-            "{} is {} bytes after this turn — prefer edit/patch over rewriting large files",
-            large.path,
-            large.after_len.unwrap_or(0)
-        ),
+    changes.iter().find_map(|change| {
+        let delta = rewrite_delta(change).filter(|&delta| delta > LARGE_FILE_BYTES)?;
+        Some(HygieneFinding {
+            reason: format!(
+                "{} changed by {} bytes this turn (file is {} bytes) — prefer edit/patch over rewriting large files",
+                change.path,
+                delta,
+                change.after_len.unwrap_or(0)
+            ),
+        })
     })
 }
 
@@ -164,12 +178,21 @@ mod tests {
     use crate::VerificationMode;
 
     fn change(path: &str, kind: FileChangeKind, after_len: Option<u64>) -> FileChange {
+        change_with_before(path, kind, None, after_len)
+    }
+
+    fn change_with_before(
+        path: &str,
+        kind: FileChangeKind,
+        before_len: Option<u64>,
+        after_len: Option<u64>,
+    ) -> FileChange {
         FileChange {
             path: path.into(),
             kind,
             before_digest: None,
             after_digest: None,
-            before_len: None,
+            before_len,
             after_len,
             before_mode: None,
             after_mode: None,
@@ -235,6 +258,58 @@ mod tests {
         let findings = assess(&contract, &changes, "add a helper");
         assert!(
             findings.iter().any(|f| f.reason.contains("bytes")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn small_patch_on_already_large_file_is_not_flagged() {
+        let contract =
+            TaskContract::derive("fold stream_area into the Run row", VerificationMode::Auto);
+        let changes = vec![change_with_before(
+            "crates/hi-tui/src/app/render.rs",
+            FileChangeKind::Modify,
+            Some(113_013),
+            Some(113_050),
+        )];
+        let findings = assess(&contract, &changes, "fold stream_area into the Run row");
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.reason.contains("rewriting large files")),
+            "small delta on a large file must not look like a rewrite: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn modify_without_before_len_is_not_flagged() {
+        let contract = TaskContract::derive("edit render.rs", VerificationMode::Auto);
+        let changes = vec![change(
+            "crates/hi-tui/src/app/render.rs",
+            FileChangeKind::Modify,
+            Some(LARGE_FILE_BYTES + 1),
+        )];
+        let findings = assess(&contract, &changes, "edit render.rs");
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.reason.contains("rewriting large files")),
+            "unknown baseline must not flag an already-large file: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn large_growth_on_modify_is_flagged() {
+        let contract = TaskContract::derive("rewrite the renderer", VerificationMode::Auto);
+        let changes = vec![change_with_before(
+            "src/render.rs",
+            FileChangeKind::Modify,
+            Some(1_024),
+            Some(LARGE_FILE_BYTES + 2_048),
+        )];
+        let findings = assess(&contract, &changes, "rewrite the renderer");
+        assert!(
+            findings.iter().any(|f| f.reason.contains("changed by")),
             "{findings:?}"
         );
     }

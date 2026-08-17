@@ -271,6 +271,62 @@ async fn request_too_large_drops_prior_context_and_retries_latest_prompt() {
 }
 
 #[tokio::test]
+async fn request_too_large_keeps_last_assistant_recap() {
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::RequestTooLarge,
+            ProviderStep::Completion(completion(vec![Content::Text("ok".into())], 12, 3)),
+        ],
+        config(),
+    );
+    let huge_old_output = "old tool output ".repeat(20_000);
+    agent.messages_mut().push(Message::user("previous task"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text(
+            "Gap #1: fold the standalone stream_area into the Run row.".into(),
+        )]));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::ToolCall {
+            id: "read-1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"LICENSE"}"#.into(),
+        }]));
+    agent
+        .messages_mut()
+        .push(Message::tool_result("read-1", huge_old_output.clone()));
+
+    agent
+        .run_turn(
+            "what is the current bug status?",
+            &mut RecordingUi::default(),
+        )
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let retry = requests[1]
+        .iter()
+        .map(|m| m.text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        retry.contains("Gap #1: fold the standalone stream_area into the Run row."),
+        "retry must keep the last assistant recap: {retry}"
+    );
+    assert!(
+        retry.contains("Last assistant recap before context was dropped"),
+        "recap must be labeled as recovered state: {retry}"
+    );
+    assert!(
+        !retry.contains(&huge_old_output),
+        "retry must still omit oversized tool output"
+    );
+}
+
+#[tokio::test]
 async fn request_too_large_context_drop_records_durable_boundary() {
     let records = Arc::new(Mutex::new(Vec::new()));
     let (mut agent, _requests) = scripted_agent(

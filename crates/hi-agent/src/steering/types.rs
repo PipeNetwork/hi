@@ -243,13 +243,29 @@ impl EvidenceTracker {
     /// already performed earlier — i.e. re-running the round can only reproduce
     /// prior output. Used by the cycle guard to detect multi-step read/search
     /// cycles (A→B→C→A→B→C) that evade the exact-match repeat guard.
+    ///
+    /// Extra pages of a file already read this turn (`read` with a new
+    /// offset/limit on an `inspected_paths` entry) do **not** count as new
+    /// evidence. Paging used to, and models walked 100KB sources for hours
+    /// without tripping the stall detector.
     pub(crate) fn round_adds_evidence(&self, calls: &[(String, String, String)]) -> bool {
         if calls.is_empty() {
             return true;
         }
         for (_, name, args) in calls {
             match name.as_str() {
-                "read" | "list" | "grep" | "glob" | "bash_output" | "bash_kill" | "bash" => {
+                "read" => {
+                    if let Some(path) = hi_tools::target_path(name, args)
+                        && self.path_already_inspected(&path)
+                    {
+                        continue;
+                    }
+                    match inspection_signature(name, args) {
+                        Some(sig) if self.seen_signatures.iter().any(|s| s == &sig) => {}
+                        _ => return true,
+                    }
+                }
+                "list" | "grep" | "glob" | "bash_output" | "bash_kill" | "bash" => {
                     match inspection_signature(name, args) {
                         Some(sig) if self.seen_signatures.iter().any(|s| s == &sig) => {}
                         // A new signature, or arguments we cannot signature safely,
@@ -264,6 +280,12 @@ impl EvidenceTracker {
             }
         }
         false
+    }
+
+    fn path_already_inspected(&self, path: &str) -> bool {
+        self.inspected_paths
+            .iter()
+            .any(|seen| paths_refer_to_same_file(seen, path))
     }
 
     fn record_inspection_signature(&mut self, name: &str, arguments: &str) {
@@ -400,6 +422,25 @@ impl PreflightCall {
     }
 }
 
+/// Whether two tool paths name the same file, including absolute vs workspace-
+/// relative forms (`crates/foo.rs` vs `/Users/me/proj/crates/foo.rs`).
+/// Bare filenames (`lib.rs`) only match exactly, so they cannot collide with
+/// every `**/lib.rs` in the tree.
+fn paths_refer_to_same_file(a: &str, b: &str) -> bool {
+    let a = a.replace('\\', "/").trim_end_matches('/').to_string();
+    let b = b.replace('\\', "/").trim_end_matches('/').to_string();
+    if a == b {
+        return true;
+    }
+    if a.len() > b.len() && b.contains('/') {
+        a.ends_with(&format!("/{b}"))
+    } else if b.len() > a.len() && a.contains('/') {
+        b.ends_with(&format!("/{a}"))
+    } else {
+        false
+    }
+}
+
 /// A stable signature for a read-only inspection call, used to detect rounds
 /// that re-inspect already-seen evidence. Returns `None` for mutating or
 /// unclassified tools (those always count as potentially new evidence). The
@@ -407,6 +448,10 @@ impl PreflightCall {
 /// arguments change the evidence returned by the tool. A malformed read-only
 /// call returns `None`; callers treat that as potentially new evidence so the
 /// normal tool execution path can report the argument error.
+///
+/// [`EvidenceTracker::round_adds_evidence`] does **not** treat a new read
+/// page of an already-inspected path as new evidence; the offset stays in
+/// the signature for other callers (folding identical pages, telemetry).
 pub(crate) fn inspection_signature(name: &str, arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
     match name {

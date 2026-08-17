@@ -25,7 +25,9 @@ async fn productive_discovery_continues_to_plan_instead_of_stalling() {
     let mut responses = Vec::new();
     let mut file = 0;
     // Exact batch cardinalities from the live failure: fourteen productive
-    // rounds and thirty-three calls. The advisory bound must not terminate it.
+    // rounds and thirty-three calls. After the two advisory nudges the
+    // next round is force-edit (tools required), then the scripted plan
+    // still lands instead of the turn stalling.
     for batch_size in [2, 3, 3, 3, 3, 3, 4, 2, 1, 1, 2, 2, 2, 2] {
         let mut calls = Vec::new();
         for _ in 0..batch_size {
@@ -124,7 +126,14 @@ async fn productive_discovery_continues_to_plan_instead_of_stalling() {
             .filter(|status| status.contains("requesting an implementation step"))
             .count(),
         2,
-        "discovery nudges are bounded and advisory: {:?}",
+        "discovery nudges are bounded: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("requiring an edit now")),
+        "exhausted discovery must demand an edit: {:?}",
         ui.statuses
     );
     assert!(
@@ -140,7 +149,7 @@ async fn productive_discovery_continues_to_plan_instead_of_stalling() {
     assert!(continued_tools.contains("read"));
     assert!(continued_tools.contains("update_plan"));
     assert!(continued_tools.contains("write"));
-    assert_eq!(modes.lock().unwrap()[14], ToolMode::Auto);
+    assert_eq!(modes.lock().unwrap()[14], ToolMode::Required);
     assert!(
         tool_names.lock().unwrap()[15]
             .iter()

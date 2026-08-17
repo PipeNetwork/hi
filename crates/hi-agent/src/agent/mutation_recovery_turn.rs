@@ -11,6 +11,8 @@ use crate::{Agent, Ui};
 pub(crate) enum MutationRecoveryControl {
     None,
     Continue,
+    /// Discovery budget spent without a mutation. Stop the inner tool loop.
+    Break,
 }
 
 impl Agent {
@@ -78,6 +80,24 @@ impl Agent {
                     ),
                 );
                 MutationRecoveryControl::Continue
+            }
+            DiscoveryRecovery::ForceEdit => {
+                evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
+                *force_tools_next = true;
+                ui.nudge("mutation request exhausted the discovery budget; requiring an edit now");
+                self.messages.push_nudge(
+                    NudgeKind::Continue,
+                    format!(
+                        "{IMPLEMENTATION_NO_CHANGES_NUDGE}\n\nThis is the last discovery round. Edit the workspace now with write/edit/multi_edit/apply_patch. Further inspection will end the turn without a mutation."
+                    ),
+                );
+                MutationRecoveryControl::Continue
+            }
+            DiscoveryRecovery::Stop => {
+                ui.nudge(
+                    "mutation request kept inspecting after the discovery budget; stopping the turn",
+                );
+                MutationRecoveryControl::Break
             }
         }
     }

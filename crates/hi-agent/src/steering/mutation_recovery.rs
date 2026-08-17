@@ -10,7 +10,16 @@ pub(crate) enum DiscoveryRecovery {
     None,
     ExistingPlan,
     PlanNudge,
-    Nudge { attempt: u32, maximum: u32 },
+    Nudge {
+        attempt: u32,
+        maximum: u32,
+    },
+    /// Discovery nudges are spent and there is still no mutation. Require an
+    /// edit on the next model round.
+    ForceEdit,
+    /// The force-edit round (or the post-plan extra read) still did not
+    /// mutate. Stop the turn instead of inspecting indefinitely.
+    Stop,
 }
 
 #[derive(Debug, Default)]
@@ -18,6 +27,7 @@ pub(crate) struct MutationRecovery {
     phase_nudges: u32,
     plan_grace_used: bool,
     plan_nudge_sent: bool,
+    force_edit_sent: bool,
 }
 
 impl MutationRecovery {
@@ -42,14 +52,13 @@ impl MutationRecovery {
         has_pending_plan: bool,
     ) -> DiscoveryRecovery {
         // A concrete/resumed plan gets one stronger advisory after its next
-        // non-mutating round. Productive inspection remains non-terminal; the
-        // common repeat/no-progress guards and model-call cap provide bounds.
+        // non-mutating round, then the turn stops if it still has not edited.
         if self.plan_grace_used {
             if !self.plan_nudge_sent {
                 self.plan_nudge_sent = true;
                 return DiscoveryRecovery::PlanNudge;
             }
-            return DiscoveryRecovery::None;
+            return DiscoveryRecovery::Stop;
         }
         let limit = MUTATION_DISCOVERY_ROUND_CAP.saturating_add(
             self.phase_nudges
@@ -70,7 +79,11 @@ impl MutationRecovery {
                 maximum: MAX_MUTATION_DISCOVERY_NUDGES,
             };
         }
-        DiscoveryRecovery::None
+        if !self.force_edit_sent {
+            self.force_edit_sent = true;
+            return DiscoveryRecovery::ForceEdit;
+        }
+        DiscoveryRecovery::Stop
     }
 
     fn start_plan_phase(&mut self) {
@@ -84,7 +97,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovery_budget_is_two_advisory_nudges_then_continues() {
+    fn discovery_budget_is_two_advisory_nudges_then_force_edit_then_stop() {
         let mut recovery = MutationRecovery::default();
         let mut tracker = ImplementationTracker {
             pre_mutation_rounds: 10,
@@ -111,13 +124,18 @@ mod tests {
         tracker.pre_mutation_tool_calls = 40;
         assert_eq!(
             recovery.after_discovery(&mut tracker, false),
-            DiscoveryRecovery::None
+            DiscoveryRecovery::ForceEdit
+        );
+        tracker.pre_mutation_rounds = 15;
+        assert_eq!(
+            recovery.after_discovery(&mut tracker, false),
+            DiscoveryRecovery::Stop
         );
         assert_eq!(tracker.discovery_nudges, 2);
     }
 
     #[test]
-    fn plan_at_final_threshold_gets_advisory_without_terminal_stop() {
+    fn plan_at_final_threshold_stops_after_the_advisory_read() {
         let mut recovery = MutationRecovery::default();
         let mut tracker = ImplementationTracker {
             pre_mutation_rounds: 14,
@@ -136,7 +154,7 @@ mod tests {
         tracker.pre_mutation_tool_calls += 3;
         assert_eq!(
             recovery.after_discovery(&mut tracker, true),
-            DiscoveryRecovery::None
+            DiscoveryRecovery::Stop
         );
         assert_eq!(tracker.discovery_nudges, 2);
     }

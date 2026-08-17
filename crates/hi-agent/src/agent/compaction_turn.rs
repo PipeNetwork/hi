@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use hi_ai::{
-    ChatRequest, Content, Message, ProviderError, ProviderErrorKind, RequestProfile, StreamEvent,
-    ToolMode,
+    ChatRequest, Content, Message, ProviderError, ProviderErrorKind, RequestProfile, Role,
+    StreamEvent, ToolMode,
 };
 
 use crate::Ui;
@@ -19,6 +19,86 @@ use crate::{COMPACTION_REFERENCE_PREFIX, COMPACTION_SUMMARY_END, SUMMARIZE_PROMP
 pub(crate) struct ContextPreflight {
     pub(crate) max_tokens: u32,
     pub(crate) dropped_prior_context: bool,
+}
+
+/// Cap recovered recap text so a too-large retry cannot immediately overflow
+/// again. ~8k chars is enough for a design recap without the tool-output bulk
+/// that caused the overflow.
+const DROPPED_CONTEXT_RECAP_MAX_CHARS: usize = 8_000;
+
+/// Last non-empty assistant text in `messages`, truncated to
+/// [`DROPPED_CONTEXT_RECAP_MAX_CHARS`]. Skips tool-call-only assistant
+/// turns so a mid-loop "let me read X" does not hide an earlier recap when
+/// the recap is the last text-bearing assistant message.
+pub(crate) fn last_assistant_recap(messages: &[Message]) -> Option<String> {
+    let recap = messages.iter().rev().find_map(|message| {
+        if message.role != Role::Assistant {
+            return None;
+        }
+        let text = message.text();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })?;
+    Some(truncate_recap(&recap))
+}
+
+fn truncate_recap(recap: &str) -> String {
+    if recap.chars().count() <= DROPPED_CONTEXT_RECAP_MAX_CHARS {
+        return recap.to_string();
+    }
+    let mut truncated: String = recap
+        .chars()
+        .take(DROPPED_CONTEXT_RECAP_MAX_CHARS)
+        .collect();
+    if let Some(at) = truncated.rfind('\n')
+        && at > DROPPED_CONTEXT_RECAP_MAX_CHARS / 2
+    {
+        truncated.truncate(at);
+    }
+    truncated.push_str("\n…[recap truncated]");
+    truncated
+}
+
+fn dropped_context_retry_prompt(
+    input: &str,
+    recap: Option<&str>,
+    provider_rejected: bool,
+) -> String {
+    let reason = if provider_rejected {
+        "the provider rejected the request as too large"
+    } else {
+        "the next request would exceed the model context window"
+    };
+    let mut body = format!(
+        "[Earlier conversation context was omitted because {reason}. Continue from this latest \
+         user request; ask for missing details if the omitted context is required.]\n\n{input}"
+    );
+    if let Some(recap) = recap.map(str::trim).filter(|text| !text.is_empty()) {
+        body.push_str(
+            "\n\n[Last assistant recap before context was dropped — recovered session state, \
+             not a new instruction]\n",
+        );
+        body.push_str(recap);
+    }
+    body
+}
+
+fn dropped_context_retry_status(provider_rejected: bool, kept_recap: bool) -> String {
+    let trigger = if provider_rejected {
+        "provider rejected the request as too large"
+    } else {
+        "request would exceed the model context window"
+    };
+    let recap = if kept_recap {
+        "kept last assistant recap"
+    } else {
+        "no assistant recap to keep"
+    };
+    format!("{trigger}; dropped prior conversation context, {recap}, and retrying")
 }
 
 impl crate::Agent {
@@ -50,8 +130,9 @@ impl crate::Agent {
 
     /// Provider byte/request caps can be lower than the model catalog's token
     /// window, so a request can be rejected before usage is reported and before
-    /// the normal auto-compaction trigger fires. Keep the latest user request,
-    /// drop earlier in-memory context once, and let the loop retry immediately.
+    /// the normal auto-compaction trigger fires. Keep the latest user request
+    /// and the last assistant recap, drop the tool-output bulk once, and let
+    /// the loop retry immediately.
     pub(crate) fn retry_after_request_too_large(
         &mut self,
         input: &str,
@@ -62,17 +143,13 @@ impl crate::Agent {
             return Ok(false);
         }
 
+        let recap = last_assistant_recap(self.messages.as_slice());
         self.replace_history_with_compaction(vec![self.system_message()])?;
         self.runtime.invalidate_context_after_compaction();
-        self.messages.push_user(format!(
-            "[Earlier conversation context was omitted because the provider rejected the request \
-             as too large. Continue from this latest user request; ask for missing details if the \
-             omitted context is required.]\n\n{input}"
-        ));
+        self.messages
+            .push_user(dropped_context_retry_prompt(input, recap.as_deref(), true));
         self.report.context_used = 0;
-        ui.status(
-            "provider rejected the request as too large; dropped prior conversation context and retrying",
-        );
+        ui.status(&dropped_context_retry_status(true, recap.is_some()));
         Ok(true)
     }
 
@@ -167,18 +244,14 @@ impl crate::Agent {
 
         let mut dropped_prior_context = false;
         if turn_start > 1 {
+            let recap = last_assistant_recap(self.messages.as_slice());
             self.replace_history_with_compaction(vec![self.system_message()])?;
             self.runtime.invalidate_context_after_compaction();
-            self.messages.push_user(format!(
-                "[Earlier conversation context was omitted because the next request would exceed \
-                 the model context window. Continue from this latest user request; ask for missing \
-                 details if the omitted context is required.]\n\n{input}"
-            ));
+            self.messages
+                .push_user(dropped_context_retry_prompt(input, recap.as_deref(), false));
             self.report.context_used = 0;
             dropped_prior_context = true;
-            ui.status(
-                "request would exceed the model context window; dropped prior conversation context and retrying",
-            );
+            ui.status(&dropped_context_retry_status(false, recap.is_some()));
 
             if self.request_estimated_tokens(requested_max_tokens, request_tool_schema_tokens)
                 <= u64::from(window)
@@ -513,4 +586,53 @@ fn fold_reference_summary_into_user(summary: &str, latest_user: &str) -> String 
         reference_summary_block(summary),
         latest_user
     )
+}
+
+#[cfg(test)]
+mod recap_tests {
+    use super::*;
+    use hi_ai::Content;
+
+    #[test]
+    fn last_assistant_recap_skips_tool_only_turns_and_keeps_text() {
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("review the tui"),
+            Message::assistant(vec![Content::Text(
+                "Gap #1: fold stream_area into the Run row.".into(),
+            )]),
+            Message::assistant(vec![Content::ToolCall {
+                id: "read-1".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"render.rs"}"#.into(),
+            }]),
+        ];
+        assert_eq!(
+            last_assistant_recap(&messages).as_deref(),
+            Some("Gap #1: fold stream_area into the Run row.")
+        );
+    }
+
+    #[test]
+    fn last_assistant_recap_truncates_long_text() {
+        let long = "recap line\n".repeat(2_000);
+        let messages = vec![Message::assistant(vec![Content::Text(long.clone())])];
+        let recap = last_assistant_recap(&messages).expect("recap");
+        assert!(recap.chars().count() < long.chars().count());
+        assert!(recap.contains("…[recap truncated]"));
+        assert!(recap.contains("recap line"));
+    }
+
+    #[test]
+    fn dropped_context_retry_prompt_includes_recap() {
+        let prompt = dropped_context_retry_prompt(
+            "start with gap #1",
+            Some("Fold stream_area into live_run_tail_lines."),
+            true,
+        );
+        assert!(prompt.contains("start with gap #1"));
+        assert!(prompt.contains("Last assistant recap"));
+        assert!(prompt.contains("Fold stream_area into live_run_tail_lines."));
+        assert!(prompt.contains("provider rejected the request as too large"));
+    }
 }

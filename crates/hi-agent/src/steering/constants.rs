@@ -180,7 +180,9 @@ pub(crate) const CONTEXT_EFFICIENT_TOOL_WEIGHT: u32 = 4;
 
 /// A mutation-capable turn may inspect a bounded amount of evidence before it
 /// must attempt the requested edit. This protects against models that keep
-/// reading/planning indefinitely while repeatedly promising to act.
+/// reading/planning indefinitely while repeatedly promising to act. After the
+/// two advisory nudges the turn requires an edit, then stops incomplete if
+/// inspection continues.
 pub(crate) const MUTATION_DISCOVERY_ROUND_CAP: u32 = 10;
 pub(crate) const MUTATION_DISCOVERY_ROUNDS_PER_NUDGE: u32 = 2;
 pub(crate) const MAX_MUTATION_DISCOVERY_NUDGES: u32 = 2;
