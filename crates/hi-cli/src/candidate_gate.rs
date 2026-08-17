@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
@@ -64,6 +64,47 @@ pub(crate) fn merge_eligible_path(path: &str) -> bool {
     !excluded_component && !path.ends_with(".pyc") && !path.ends_with(".pyo")
 }
 
+/// Distinct from a generic verifier failure so merge rollback vs cancel stay
+/// correct, and so a cancelled run is never cached as a passing gate.
+#[derive(Debug)]
+pub(crate) struct VerifierCancelled;
+
+impl std::fmt::Display for VerifierCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("verifier cancelled")
+    }
+}
+
+impl std::error::Error for VerifierCancelled {}
+
+/// Cancelled after the destination was mutated; the caller rolled it back.
+#[derive(Debug)]
+pub(crate) struct DestinationVerifyCancelled;
+
+impl std::fmt::Display for DestinationVerifyCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("destination verifier cancelled")
+    }
+}
+
+impl std::error::Error for DestinationVerifyCancelled {}
+
+pub(crate) fn is_verifier_cancelled(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<VerifierCancelled>().is_some())
+}
+
+pub(crate) fn is_destination_verify_cancelled(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<DestinationVerifyCancelled>().is_some())
+}
+
+fn cancel_requested(cancellation: Option<&hi_agent::TurnCancellation>) -> bool {
+    cancellation.is_some_and(hi_agent::TurnCancellation::is_cancelled)
+}
+
 static VERIFY_SINGLE_FLIGHT: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
 struct VerifyFlight {
@@ -110,6 +151,14 @@ fn create_verify_lock(path: &Path, owner: &str) -> std::io::Result<File> {
 }
 
 fn acquire_verify_flight(key: &str, cache_path: &Path) -> Result<Option<VerifyFlight>> {
+    acquire_verify_flight_while(key, cache_path, &|| false)
+}
+
+fn acquire_verify_flight_while(
+    key: &str,
+    cache_path: &Path,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<VerifyFlight>> {
     let flights = VERIFY_SINGLE_FLIGHT.get_or_init(|| Mutex::new(BTreeSet::new()));
     let lock_path = cache_path.with_extension("lock");
     let owner = format!("{}-{key}", std::process::id());
@@ -118,6 +167,9 @@ fn acquire_verify_flight(key: &str, cache_path: &Path) -> Result<Option<VerifyFl
             .with_context(|| format!("creating verification cache {}", parent.display()))?;
     }
     loop {
+        if stop() {
+            return Err(VerifierCancelled.into());
+        }
         if cache_path.is_file() {
             return Ok(None);
         }
@@ -505,6 +557,7 @@ pub(crate) fn independently_verify_candidate_cached(
     base: &str,
     verify: &str,
     cache_root: &Path,
+    cancellation: Option<hi_agent::TurnCancellation>,
 ) -> Result<CandidateDiff> {
     ensure!(!verify.trim().is_empty(), "candidate verifier is empty");
     let before = staged_candidate_diff(worktree, base)?;
@@ -531,12 +584,22 @@ pub(crate) fn independently_verify_candidate_cached(
     {
         return Ok(before);
     }
-    let _flight = acquire_verify_flight(&key_hex, &cache_path)?;
+    let _flight = acquire_verify_flight_while(&key_hex, &cache_path, &|| {
+        cancel_requested(cancellation.as_ref())
+    })?;
     if cache_path.is_file() {
         return Ok(before);
     }
-    run_verifier_sync(worktree, verify)
-        .with_context(|| format!("configured verifier `{verify}` failed"))?;
+    if cancel_requested(cancellation.as_ref()) {
+        return Err(VerifierCancelled.into());
+    }
+    match run_verifier_sync_cancellable(worktree, verify, cancellation.clone()) {
+        Ok(()) => {}
+        Err(error) if is_verifier_cancelled(&error) => return Err(error),
+        Err(error) => {
+            return Err(error).context(format!("configured verifier `{verify}` failed"));
+        }
+    }
     let after = staged_candidate_diff(worktree, base)?;
     ensure!(
         before.patch == after.patch,
@@ -595,6 +658,17 @@ pub(crate) fn repository_root(from: &Path) -> Result<PathBuf> {
 }
 
 pub(crate) fn run_verifier_sync(root: &Path, command: &str) -> Result<()> {
+    run_verifier_sync_cancellable(root, command, None)
+}
+
+pub(crate) fn run_verifier_sync_cancellable(
+    root: &Path,
+    command: &str,
+    cancellation: Option<hi_agent::TurnCancellation>,
+) -> Result<()> {
+    if cancel_requested(cancellation.as_ref()) {
+        return Err(VerifierCancelled.into());
+    }
     let root = root.to_path_buf();
     let command = command.to_string();
     let timeout = std::env::var("HI_VERIFY_TIMEOUT_SECS")
@@ -605,9 +679,18 @@ pub(crate) fn run_verifier_sync(root: &Path, command: &str) -> Result<()> {
     hi_tools::prepare_verify_workdir(&root);
     run_async_thread(move || async move {
         let runner = hi_tools::ProcessRunner::new(&root)?;
-        let execution = runner
-            .run_shell(&command, Duration::from_secs(timeout))
-            .await?;
+        let run = runner.run_shell(&command, Duration::from_secs(timeout));
+        let execution = match cancellation {
+            Some(cancel) => {
+                tokio::select! {
+                    result = run => result?,
+                    _ = crate::child_process::wait_for_cancel(cancel) => {
+                        return Err(VerifierCancelled.into());
+                    }
+                }
+            }
+            None => run.await?,
+        };
         ensure!(
             execution.status == hi_tools::ToolStatus::Succeeded,
             "verifier status {:?} (exit {:?}): {}",
@@ -674,5 +757,43 @@ mod tests {
             None => unsafe { std::env::remove_var(name) },
         }
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn run_verifier_sync_cancellable_stops_when_cancelled() {
+        let original_sandbox = std::env::var_os("HI_SANDBOX");
+        unsafe { std::env::set_var("HI_SANDBOX", "off") };
+        let root = std::env::temp_dir().join(format!(
+            "hi-verify-cancel-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let cancel = hi_agent::TurnCancellation::new();
+        let cancel_thread = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            cancel_thread.cancel();
+        });
+        let started = Instant::now();
+        let error = run_verifier_sync_cancellable(&root, "sleep 30", Some(cancel))
+            .expect_err("cancel must stop the verifier");
+        let elapsed = started.elapsed();
+        match original_sandbox {
+            Some(value) => unsafe { std::env::set_var("HI_SANDBOX", value) },
+            None => unsafe { std::env::remove_var("HI_SANDBOX") },
+        }
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            is_verifier_cancelled(&error),
+            "cancel must be distinct from a generic verify fail: {error:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "cancel must kill the verifier instead of waiting out the command: {elapsed:?}"
+        );
     }
 }

@@ -300,7 +300,7 @@ impl crate::Agent {
                 verify,
                 runner,
                 route,
-                cancellation: crate::TurnCancellation::new(),
+                cancellation: self.turn_cancellation.clone().unwrap_or_default(),
                 file_set,
                 progress: None,
             },
@@ -416,14 +416,9 @@ impl crate::Agent {
         // (plain `run` silently dropped the team route).
         let route = self.route_for_kind(delegate_kind(parsed.as_ref()));
         let progress = crate::subagent_progress::bound_sink_progress(ui, &id);
+        let cancellation = self.turn_cancellation.clone().unwrap_or_default();
         let outcome = runner
-            .run_routed_with_progress(
-                &task,
-                verify.as_deref(),
-                &route,
-                crate::TurnCancellation::new(),
-                progress,
-            )
+            .run_routed_with_progress(&task, verify.as_deref(), &route, cancellation, progress)
             .await;
         let expected_paths = outcome
             .changed_files

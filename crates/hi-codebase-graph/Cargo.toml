@@ -6,14 +6,17 @@ description = "High-performance code graph generation using tree-sitter queries"
 
 [features]
 default = []
+cli = ["dep:clap", "dep:mimalloc"]
 
 [[bin]]
 name = "code-graph"
 path = "src/bin/code_graph.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "bench_index"
 path = "src/bin/bench_index.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "bench_file_listing"
@@ -34,8 +37,8 @@ num_cpus.workspace = true
 ignore.workspace = true
 # Git repository access
 git2.workspace = true
-# Fast allocator for multi-threaded workloads
-mimalloc.workspace = true
+# Fast allocator for multi-threaded workloads (code_graph / bench_index bins)
+mimalloc = { workspace = true, optional = true }
 # Fast hash for better HashMap performance
 ahash.workspace = true
 # Additional hash utilities for StringInterner
@@ -43,8 +46,8 @@ hashbrown.workspace = true
 nohash-hasher.workspace = true
 rustc-hash.workspace = true
 smallvec.workspace = true
-# CLI argument parsing
-clap.workspace = true
+# CLI argument parsing (code_graph bin)
+clap = { workspace = true, optional = true }
 # Async runtime (for oneshot channels, sync feature for blocking_recv)
 tokio = { workspace = true, features = ["sync"] }
 # Logging

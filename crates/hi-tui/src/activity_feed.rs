@@ -6,7 +6,7 @@
 //! of grok's pager.
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use ratatui::style::{Modifier, Style};
@@ -37,7 +37,9 @@ pub(crate) enum ActivityKind {
         /// only a terse model-facing line.
         diff: String,
     },
-    /// A shell / agent command. Collapsed is a one-liner; expanded shows stdout.
+    /// A shell / agent command. Collapsed is a one-liner (`Run {command}`);
+    /// expanded shows stdout. `idle` is a live placeholder or `bash_output`
+    /// poll — the header stays `Run {command}`, never a tool id or poll count.
     Run {
         command: String,
         body: String,
@@ -78,6 +80,13 @@ pub(crate) struct VerbGroup {
     pub live: bool,
     /// Further explore tools still fold into this group.
     pub open: bool,
+    /// CoT absorbed into this row so it does not sit above the verb list.
+    pub thinking: String,
+    pub thinking_elapsed: Duration,
+    /// Short “let me look…” lines folded under the header.
+    pub steering: Vec<String>,
+    /// Path/pattern for every call in the group (kept after the header merges).
+    pub calls: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,8 +101,8 @@ impl ExploreVerb {
     pub(crate) fn from_tool(name: &str) -> Option<Self> {
         match name {
             "read" => Some(Self::Read),
-            "grep" | "web_search" => Some(Self::Search),
-            "list" => Some(Self::List),
+            "grep" | "web_search" | "find_symbol" => Some(Self::Search),
+            "list" | "glob" | "repo_map" => Some(Self::List),
             "web_fetch" => Some(Self::Fetch),
             _ => None,
         }
@@ -138,6 +147,9 @@ impl VerbGroup {
             ExploreVerb::Search => self.searches += 1,
             ExploreVerb::List => self.lists += 1,
             ExploreVerb::Fetch => self.fetches += 1,
+        }
+        if let Some(call) = detail.clone() {
+            self.calls.push(call);
         }
         let total = self.total();
         if total == 1 {
@@ -201,9 +213,11 @@ impl VerbGroup {
 impl ActivityKind {
     fn is_foldable(&self) -> bool {
         match self {
-            Self::VerbGroup(_) => false,
+            Self::VerbGroup(g) => {
+                !g.thinking.trim().is_empty() || !g.steering.is_empty() || g.calls.len() > 1
+            }
             Self::Edit { diff, .. } => !diff.trim().is_empty(),
-            Self::Run { body, idle, .. } => !*idle && !body.trim().is_empty(),
+            Self::Run { body, .. } => !body.trim().is_empty(),
             Self::Other { body, .. } => !body.trim().is_empty(),
             Self::Subagent { .. } => false,
         }
@@ -231,14 +245,14 @@ impl ActivityBlock {
         }
     }
 
-    pub(crate) fn as_run_mut(&mut self) -> Option<(&str, &mut bool, &mut u32)> {
+    pub(crate) fn as_run_mut(&mut self) -> Option<(&str, &mut String, &mut bool, &mut u32)> {
         match &mut self.kind {
             ActivityKind::Run {
                 command,
+                body,
                 idle,
                 poll_count,
-                ..
-            } => Some((command.as_str(), idle, poll_count)),
+            } => Some((command.as_str(), body, idle, poll_count)),
             _ => None,
         }
     }
@@ -250,20 +264,75 @@ impl ActivityBlock {
         }
     }
 
-    pub(crate) fn flatten(&self, show_tool_output: bool, density: Density) -> Vec<Line<'static>> {
-        let show = density.show_tool_output(show_tool_output) || self.expanded;
+    pub(crate) fn flatten(
+        &self,
+        show_tool_output: bool,
+        show_reasoning: bool,
+        density: Density,
+    ) -> Vec<Line<'static>> {
         let header = self.header_line();
-        if !show || !self.is_foldable() {
-            return vec![header];
+        match &self.kind {
+            ActivityKind::VerbGroup(g) => {
+                let mut lines = vec![header];
+                if show_reasoning && !g.thinking.trim().is_empty() {
+                    lines.extend(verb_group_thinking_lines(g));
+                }
+                // Ctrl-O / verbose expand Edit/Run bodies, not every explore path.
+                if self.expanded {
+                    let style = Style::default().fg(theme().gray_dim);
+                    for line in &g.steering {
+                        lines.push(Line::styled(line.clone(), style));
+                    }
+                    for call in &g.calls {
+                        lines.push(Line::styled(format!("  {call}"), style));
+                    }
+                }
+                lines
+            }
+            ActivityKind::Run { body, idle, .. } => {
+                let mut lines = vec![header];
+                if body.trim().is_empty() {
+                    return lines;
+                }
+                let show_full = density.show_tool_output(show_tool_output) || self.expanded;
+                if show_full {
+                    lines.extend(output_body_lines(body));
+                } else if *idle && density != Density::Compact {
+                    lines.extend(live_run_tail_lines(body));
+                }
+                lines
+            }
+            _ => {
+                let show = density.show_tool_output(show_tool_output) || self.expanded;
+                if !show || !self.is_foldable() {
+                    vec![header]
+                } else {
+                    let mut lines = vec![header];
+                    lines.extend(self.body_lines());
+                    lines
+                }
+            }
         }
-        let mut lines = vec![header];
-        lines.extend(self.body_lines());
-        lines
     }
 
     pub(crate) fn text(&self) -> String {
         match &self.kind {
-            ActivityKind::VerbGroup(g) => g.label(),
+            ActivityKind::VerbGroup(g) => {
+                let mut s = g.label();
+                if !g.thinking.trim().is_empty() {
+                    s.push('\n');
+                    s.push_str(&g.thinking);
+                }
+                for line in &g.steering {
+                    s.push('\n');
+                    s.push_str(line);
+                }
+                for call in &g.calls {
+                    s.push('\n');
+                    s.push_str(call);
+                }
+                s
+            }
             ActivityKind::Edit {
                 path,
                 additions,
@@ -281,10 +350,10 @@ impl ActivityBlock {
                 command,
                 body,
                 idle,
-                poll_count,
+                ..
             } => {
-                let mut s = run_header_text(command, *idle, *poll_count, body);
-                if !idle && !body.trim().is_empty() {
+                let mut s = run_header_text(command, *idle, body);
+                if !body.trim().is_empty() {
                     s.push('\n');
                     s.push_str(&strip_ansi(body));
                 }
@@ -356,16 +425,26 @@ impl ActivityBlock {
                 command,
                 body,
                 idle,
-                poll_count,
-            } => Line::from(vec![
-                bullet,
-                Span::styled(
-                    run_header_text(command, *idle, *poll_count, body),
-                    Style::default()
-                        .fg(th.text_primary)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
+                ..
+            } => {
+                let mut spans = vec![
+                    bullet,
+                    Span::styled(
+                        "Run ".to_string(),
+                        Style::default()
+                            .fg(th.text_primary)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(command.clone(), Style::default().fg(th.text_primary)),
+                ];
+                if !*idle && body.trim().is_empty() {
+                    spans.push(Span::styled(
+                        " · (no output)".to_string(),
+                        Style::default().fg(th.gray_dim),
+                    ));
+                }
+                Line::from(spans)
+            }
             ActivityKind::Other { verb, detail, .. } => {
                 let mut spans = vec![
                     bullet,
@@ -405,17 +484,32 @@ impl ActivityBlock {
         match &self.kind {
             ActivityKind::VerbGroup(_) => Vec::new(),
             ActivityKind::Edit { diff, .. } => edit_body_lines(diff),
-            ActivityKind::Run { body, idle, .. } => {
-                if *idle {
-                    Vec::new()
-                } else {
-                    output_body_lines(body)
-                }
-            }
+            ActivityKind::Run { body, .. } => output_body_lines(body),
             ActivityKind::Other { body, .. } => output_body_lines(body),
             ActivityKind::Subagent { .. } => Vec::new(),
         }
     }
+}
+
+fn verb_group_thinking_lines(g: &VerbGroup) -> Vec<Line<'static>> {
+    let th = theme();
+    let secs = g.thinking_elapsed.as_secs();
+    let label = if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    };
+    let mut lines = vec![Line::styled(
+        format!("┃ ⏺ thought for {label}"),
+        Style::default().fg(th.accent_thinking),
+    )];
+    for line in g.thinking.lines() {
+        lines.push(Line::styled(
+            format!("┃   {line}"),
+            Style::default().fg(th.gray_dim),
+        ));
+    }
+    lines
 }
 
 fn edit_body_lines(diff: &str) -> Vec<Line<'static>> {
@@ -499,18 +593,31 @@ fn edit_header_text(path: &str, additions: u32, deletions: u32) -> String {
     }
 }
 
-fn run_header_text(command: &str, idle: bool, poll_count: u32, body: &str) -> String {
-    if idle {
-        if poll_count <= 1 {
-            format!("{command} · still running")
-        } else {
-            format!("{command} · still running · polled {poll_count}×")
-        }
-    } else if body.trim().is_empty() {
+fn run_header_text(command: &str, idle: bool, body: &str) -> String {
+    if !idle && body.trim().is_empty() {
         format!("Run {command} · (no output)")
     } else {
         format!("Run {command}")
     }
+}
+
+/// Last lines of a still-running command, so a long `cargo test` isn't a
+/// blank header for minutes. Finished runs stay collapsed (Ctrl-O).
+const LIVE_RUN_TAIL_LINES: usize = 12;
+
+fn live_run_tail_lines(body: &str) -> Vec<Line<'static>> {
+    let mut all = output_body_lines(body);
+    if all.len() <= LIVE_RUN_TAIL_LINES {
+        return all;
+    }
+    let hidden = all.len() - LIVE_RUN_TAIL_LINES;
+    let start = all.len() - LIVE_RUN_TAIL_LINES;
+    let mut lines = vec![Line::styled(
+        format!("  … +{hidden} lines"),
+        Style::default().fg(theme().gray_dim),
+    )];
+    lines.extend(all.drain(start..));
+    lines
 }
 
 fn other_header_text(verb: &str, detail: &str) -> String {
@@ -548,6 +655,22 @@ pub(crate) fn is_edit_tool(name: &str) -> bool {
 
 pub(crate) fn is_run_tool(name: &str) -> bool {
     matches!(name, "bash" | "bash_output" | "bash_kill")
+}
+
+/// Bash start / output poll — these get a live `Run {command}` row.
+pub(crate) fn is_shell_run_tool(name: &str) -> bool {
+    matches!(name, "bash" | "bash_output")
+}
+
+/// Command shown on a `Run` row: the salient arg, never `bash_output {id}`.
+pub(crate) fn run_command(name: &str, label: &str) -> String {
+    let command = label_detail(label)
+        .or_else(|| label_detail(&format!("{name} {label}")))
+        .unwrap_or_else(|| label.to_string());
+    command
+        .strip_prefix("bash ")
+        .unwrap_or(command.as_str())
+        .to_string()
 }
 
 pub(crate) fn is_parent_subagent_tool(name: &str) -> bool {

@@ -23,7 +23,7 @@ pub(crate) const OUTER_VPAD: u16 = 1;
 pub(crate) const AUTO_COMPACT_MAX_ROWS: u16 = 20;
 
 /// Hide the shortcuts row below this terminal height so the prompt is never
-/// starved.
+/// starved. Idle sessions with a transcript also hide it (`?` still opens help).
 pub(crate) const SHORTCUTS_MIN_HEIGHT: u16 = 10;
 
 /// Hide the top status bar below this height.
@@ -218,48 +218,221 @@ pub(crate) fn push_chip(spans: &mut Vec<Span<'static>>, theme: &Theme, chip: Spa
     spans.push(chip);
 }
 
-/// The "PipeNetwork.AI" wordmark as figlet-style 5-row block letters — the
-/// empty-session splash, matching the CLI landing banner.
+/// Idle `{pct}% ctx`; hover becomes a same-width bar so the status row does
+/// not shift.
+pub(crate) fn span_hit(area: Rect, line: &Line<'_>, pred: impl Fn(&str) -> bool) -> Rect {
+    let right_w = line.width() as u16;
+    let x0 = area.x + area.width.saturating_sub(right_w);
+    let mut x = 0u16;
+    for span in &line.spans {
+        let w = span.content.width() as u16;
+        if pred(span.content.as_ref()) {
+            return Rect {
+                x: x0 + x,
+                y: area.y,
+                width: w.max(1),
+                height: 1,
+            };
+        }
+        x = x.saturating_add(w);
+    }
+    Rect::default()
+}
+
+pub(crate) fn context_chip(pct: u64, hovered: bool) -> String {
+    let idle = format!("{pct}% ctx");
+    if !hovered {
+        return idle;
+    }
+    usage_bar(idle.chars().count().max(1), pct)
+}
+
+/// Grok-build header occupancy: `64k / 128k`. Hover is a same-width bar.
+pub(crate) fn context_usage_chip(used: u64, window: u64, hovered: bool) -> String {
+    let idle = format!(
+        "{} / {}",
+        crate::util::fmt_count(used),
+        crate::util::fmt_count(window)
+    );
+    if !hovered {
+        return idle;
+    }
+    let pct = if window == 0 {
+        0
+    } else {
+        (used.saturating_mul(100) / window).min(100)
+    };
+    usage_bar(idle.chars().count().max(1), pct)
+}
+
+fn usage_bar(width: usize, pct: u64) -> String {
+    let filled = ((pct as usize) * width / 100).min(width);
+    let mut out = String::new();
+    for i in 0..width {
+        out.push(if i < filled { '#' } else { '-' });
+    }
+    out
+}
+
+/// Right-align `label` on `line` when it fits, grok-build timestamp style.
+pub(crate) fn overlay_right(line: &mut Line<'static>, label: &str, width: u16, style: Style) {
+    use crate::layout::display_width;
+    let used: usize = line
+        .spans
+        .iter()
+        .map(|s| display_width(s.content.as_ref()))
+        .sum();
+    let lw = display_width(label);
+    if used + 1 + lw > width as usize {
+        return;
+    }
+    line.spans.push(Span::raw(
+        " ".repeat((width as usize).saturating_sub(used + lw)),
+    ));
+    line.spans.push(Span::styled(label.to_string(), style));
+}
+
+/// Status-bar label for the OS write sandbox (`HI_SANDBOX`).
+pub(crate) fn sandbox_chip() -> &'static str {
+    match hi_tools::sandbox::SandboxPolicy::from_env() {
+        Ok(hi_tools::sandbox::SandboxPolicy::Off) => "sandbox off",
+        Ok(_) if cfg!(any(target_os = "macos", target_os = "linux")) => "sandbox",
+        Ok(_) => "no sandbox",
+        Err(_) => "sandbox?",
+    }
+}
+
+/// The "hi" wordmark as figlet-style 5-row block letters — the empty-session
+/// splash, matching the CLI landing banner.
 pub(crate) const WORDMARK: [&str; 5] = [
-    " ___ _           _  _     _                  _       _   ___ ",
-    "| _ (_)_ __  ___| \\| |___| |___ __ _____ _ _| |__   /_\\ |_ _|",
-    "|  _/ | '_ \\/ -_) .` / -_)  _\\ V  V / _ \\ '_| / /_ / _ \\ | | ",
-    "|_| |_| .__/\\___|_|\\_\\___|\\__|\\_/\\_/\\___/_| |_\\_(_)_/ \\_\\___|",
-    "      |_|                                                    ",
+    " _     _ ",
+    "| |__ (_)",
+    "| '_ \\| |",
+    "| | | | |",
+    "|_| |_|_|",
 ];
 
 /// Brand orange for the wordmark, matching the CLI landing banner.
 const WORDMARK_FG: Color = Color::Rgb(255, 140, 0);
 
+/// Empty-session home: repo:branch, recent sessions, plan-mode hint.
+pub(crate) struct WelcomeHome<'a> {
+    pub location: String,
+    pub sessions: &'a [crate::LocalSessionInfo],
+}
+
+const MAX_WELCOME_SESSIONS: usize = 5;
+
+pub(crate) fn welcome_location(root: &Path, branch: Option<&str>) -> String {
+    let repo = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("hi");
+    match branch.filter(|b| !b.is_empty()) {
+        Some(branch) => format!("{repo}:{branch}"),
+        None => repo.to_string(),
+    }
+}
+
+fn welcome_session_label(session: &crate::LocalSessionInfo) -> &str {
+    let title = session.title.trim();
+    if title.is_empty() || title.starts_with("[hi:context") {
+        session.id.as_str()
+    } else {
+        title
+    }
+}
+
 /// Empty-session splash: the figlet wordmark when the canvas is wide enough,
 /// otherwise a quiet centered "hi". Display-only — never seeded into the
 /// transcript, so the first turn replaces it cleanly.
-pub(crate) fn welcome_lines(area: Rect, theme: &Theme) -> Vec<Line<'static>> {
+pub(crate) fn welcome_lines(
+    area: Rect,
+    theme: &Theme,
+    home: Option<&WelcomeHome<'_>>,
+) -> Vec<Line<'static>> {
     let banner_w = WORDMARK
         .iter()
         .map(|row| UnicodeWidthStr::width(*row) as u16)
         .max()
         .unwrap_or(0);
-    if area.width >= banner_w && area.height >= WORDMARK.len() as u16 + 1 {
+    let mut lines = Vec::new();
+    if let Some(home) = home
+        && area.height >= 3
+    {
+        lines.push(Line::styled(
+            home.location.clone(),
+            Style::default().fg(theme.gray),
+        ));
+    }
+    if area.width >= banner_w && area.height >= WORDMARK.len() as u16 + 2 {
         let style = Style::default()
             .fg(WORDMARK_FG)
             .add_modifier(Modifier::BOLD);
-        let mut lines = vec![Line::raw("")];
+        lines.push(Line::raw(""));
         lines.extend(
             WORDMARK
                 .iter()
                 .map(|row| Line::from(Span::styled((*row).to_string(), style))),
         );
+        if let Some(home) = home {
+            let remaining = area
+                .height
+                .saturating_sub(lines.len() as u16)
+                .saturating_sub(2);
+            if remaining > 2 && !home.sessions.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "recent sessions",
+                    Style::default().fg(theme.gray),
+                ));
+                let title_budget = (area.width as usize).saturating_sub(12).clamp(16, 56);
+                for session in home
+                    .sessions
+                    .iter()
+                    .take(MAX_WELCOME_SESSIONS.min(remaining.saturating_sub(2) as usize))
+                {
+                    let title = hi_agent::ui::clip(welcome_session_label(session), title_budget);
+                    lines.push(Line::from(vec![
+                        Span::styled(title, Style::default().fg(theme.text_secondary)),
+                        Span::styled(
+                            format!("  {}", session.age),
+                            Style::default().fg(theme.gray_dim),
+                        ),
+                    ]));
+                }
+            }
+            if area.height as usize > lines.len() + 1 {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "Shift-Tab plan mode · /sessions resume · /memory notes",
+                    Style::default().fg(theme.gray_dim),
+                ));
+            }
+        }
         lines
     } else {
-        vec![
-            Line::raw(""),
-            Line::from(Span::styled(
-                "hi",
-                Style::default().fg(theme.gray).add_modifier(Modifier::BOLD),
-            )),
-        ]
+        lines.push(Line::from(Span::styled(
+            "hi",
+            Style::default().fg(theme.gray).add_modifier(Modifier::BOLD),
+        )));
+        lines
     }
+}
+
+pub(crate) fn git_branch(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty() && name != "HEAD").then_some(name)
 }
 
 #[cfg(test)]
@@ -315,30 +488,140 @@ mod tests {
                 height: 12,
             },
             &theme,
+            None,
         );
         assert!(
             wide.iter()
-                .any(|l| crate::render::line_text(l).contains("___ _")),
-            "wide canvas shows the wordmark"
+                .any(|l| crate::render::line_text(l).contains("|_| |_|_|")),
+            "wide canvas shows the hi wordmark"
         );
-        let narrow = welcome_lines(
+        let tiny = welcome_lines(
             Rect {
                 x: 0,
                 y: 0,
-                width: 24,
+                width: 8,
                 height: 8,
             },
             &theme,
+            None,
         );
         assert!(
-            narrow.iter().any(|l| crate::render::line_text(l) == "hi"),
-            "narrow canvas falls back to hi"
+            tiny.iter().any(|l| crate::render::line_text(l) == "hi"),
+            "tiny canvas falls back to hi"
         );
         assert!(
-            !narrow
+            !tiny
                 .iter()
-                .any(|l| crate::render::line_text(l).contains("___ _")),
-            "narrow canvas hides the figlet"
+                .any(|l| crate::render::line_text(l).contains("|_| |_|_|")),
+            "tiny canvas hides the figlet"
+        );
+    }
+
+    #[test]
+    fn context_chip_hover_keeps_the_same_width() {
+        let idle = context_chip(50, false);
+        let hover = context_chip(50, true);
+        assert_eq!(idle, "50% ctx");
+        assert_eq!(idle.chars().count(), hover.chars().count());
+        assert_eq!(hover, "###----");
+        assert_eq!(
+            context_chip(0, true).chars().count(),
+            context_chip(0, false).chars().count()
+        );
+        assert_eq!(
+            context_chip(100, true).chars().count(),
+            context_chip(100, false).chars().count()
+        );
+        let usage = context_usage_chip(64_000, 128_000, false);
+        let usage_hover = context_usage_chip(64_000, 128_000, true);
+        assert_eq!(usage, "64k / 128k");
+        assert_eq!(usage.chars().count(), usage_hover.chars().count());
+    }
+
+    #[test]
+    fn welcome_home_shows_location_sessions_and_plan_hint() {
+        let theme = crate::theme::Theme::groknight();
+        let sessions = [crate::LocalSessionInfo {
+            id: "abc".into(),
+            title: "review layout".into(),
+            age: "2h".into(),
+            lines: 12,
+        }];
+        let home = WelcomeHome {
+            location: "hi:main".into(),
+            sessions: &sessions,
+        };
+        let lines = welcome_lines(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 20,
+            },
+            &theme,
+            Some(&home),
+        );
+        let text: Vec<String> = lines.iter().map(|l| crate::render::line_text(l)).collect();
+        assert!(text.iter().any(|l| l == "hi:main"), "{text:?}");
+        assert!(
+            text.iter().any(|l| l.contains("|_| |_|_|")),
+            "wordmark stays: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("review layout")),
+            "recent session: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("Shift-Tab plan")),
+            "plan hint: {text:?}"
+        );
+    }
+
+    #[test]
+    fn welcome_location_is_repo_and_branch() {
+        assert_eq!(
+            welcome_location(Path::new("/Users/david/hi"), Some("main")),
+            "hi:main"
+        );
+        assert_eq!(welcome_location(Path::new("/workspace"), None), "workspace");
+    }
+
+    #[test]
+    fn welcome_home_does_not_dump_context_blobs() {
+        let theme = crate::theme::Theme::groknight();
+        let dump = "[hi:context — session state, not instructions] # Memory (from past sessions; task-ranked) Prefer bullets";
+        let sessions: Vec<crate::LocalSessionInfo> = (0..12)
+            .map(|i| crate::LocalSessionInfo {
+                id: format!("sess-{i}"),
+                title: dump.into(),
+                age: "5h".into(),
+                lines: 2,
+            })
+            .collect();
+        let home = WelcomeHome {
+            location: "hi:main".into(),
+            sessions: &sessions,
+        };
+        let lines = welcome_lines(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            &theme,
+            Some(&home),
+        );
+        let text: Vec<String> = lines.iter().map(|l| crate::render::line_text(l)).collect();
+        assert!(
+            text.iter().all(|l| !l.contains("[hi:context")),
+            "context dumps must not be session titles: {text:?}"
+        );
+        let listed = text.iter().filter(|l| l.contains("sess-")).count();
+        assert!(listed <= 5, "cap recent sessions: {text:?}");
+        assert!(
+            text.iter().any(|l| l.contains("sess-0")),
+            "falls back to id: {text:?}"
         );
     }
 }

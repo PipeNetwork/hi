@@ -11,15 +11,14 @@ use crate::config::{Cli, Config, Settings};
 use crate::provider::provider_label;
 use crate::session;
 
-/// The "PipeNetwork.AI" wordmark as figlet-style 5-row block letters — the
-/// splash centerpiece, ~2x the height of a normal line. Generated from
-/// `figlet -f small`, then hand-trimmed of trailing whitespace.
+/// The "hi" wordmark as figlet-style 5-row block letters — the splash
+/// centerpiece. Generated from `figlet -f small hi`, then padded.
 const BANNER: [&str; 5] = [
-    " ___ _           _  _     _                  _       _   ___ ",
-    "| _ (_)_ __  ___| \\| |___| |___ __ _____ _ _| |__   /_\\ |_ _|",
-    "|  _/ | '_ \\/ -_) .` / -_)  _\\ V  V / _ \\ '_| / /_ / _ \\ | | ",
-    "|_| |_| .__/\\___|_|\\_\\___|\\__|\\_/\\_/\\___/_| |_\\_(_)_/ \\_\\___|",
-    "      |_|                                                    ",
+    " _     _ ",
+    "| |__ (_)",
+    "| '_ \\| |",
+    "| | | | |",
+    "|_| |_|_|",
 ];
 
 pub(crate) fn print_landing(settings: &Settings, context_window: Option<u32>) {

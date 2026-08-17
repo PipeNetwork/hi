@@ -1768,9 +1768,10 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Every env var that suppresses the wizard. Cleared for the duration of a
 /// test and restored on drop.
-const SETUP_ENV_VARS: [&str; 4] = [
+const SETUP_ENV_VARS: [&str; 5] = [
     "HI_MODEL",
     "PIPENETWORK_API_KEY",
+    "OPENROUTER_API_KEY",
     "ANTHROPIC_API_KEY",
     "XAI_API_KEY",
 ];
@@ -1894,7 +1895,12 @@ fn no_setup_when_hi_model_is_set() {
 /// run and nothing to ask about. It is reported instead — see below.
 #[test]
 fn no_setup_when_an_api_key_in_the_env_auto_selects_a_provider() {
-    for name in ["PIPENETWORK_API_KEY", "ANTHROPIC_API_KEY", "XAI_API_KEY"] {
+    for name in [
+        "PIPENETWORK_API_KEY",
+        "OPENROUTER_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "XAI_API_KEY",
+    ] {
         let env = ClearedSetupEnv::new();
         env.set(name, "test-key");
         let cli = Cli::try_parse_from(["hi"]).unwrap();
@@ -2109,4 +2115,24 @@ fn resolve_falls_back_to_machine_reasoning_effort() {
         settings.reasoning_effort,
         Some(hi_ai::ReasoningEffort::Minimal)
     );
+}
+
+#[test]
+fn top_level_help_lists_everyday_commands() {
+    let err = Cli::try_parse_from(["hi", "--help"]).expect_err("clap prints help as an error");
+    let help = err.to_string();
+    for needle in [
+        "setup",
+        "doctor",
+        "update",
+        "workflow",
+        "trace",
+        "--best-of",
+        "headless form of `/race`",
+    ] {
+        assert!(
+            help.contains(needle),
+            "hi --help should mention {needle}:\n{help}"
+        );
+    }
 }

@@ -22,6 +22,7 @@ futures-util.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 ansi-to-tui.workspace = true
 reqwest = { workspace = true }
 tracing.workspace = true
@@ -38,6 +39,7 @@ unsafe_code = "allow"
 # do not compile the heavy native audio stack.
 default = []
 voice = ["hi-voice/audio"]
+codebase-graph = ["hi-tools/codebase-graph", "hi-agent/codebase-graph"]
 eye-declare-spike = ["dep:eye-declare", "dep:ratatui-core"]
 
 [dev-dependencies]

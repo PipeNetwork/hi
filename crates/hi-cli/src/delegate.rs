@@ -17,10 +17,10 @@ use hi_agent::{DelegateOutcome, DelegateProgress, DelegateRunner};
 use hi_tools::ToolStatus;
 
 use crate::candidate_gate::{
-    independently_verify_candidate_cached, inspect_child_report, repository_root, same_paths,
-    staged_candidate_diff,
+    independently_verify_candidate_cached, inspect_child_report, is_destination_verify_cancelled,
+    is_verifier_cancelled, repository_root, same_paths, staged_candidate_diff,
 };
-use crate::candidate_merge::apply_candidate_and_reverify;
+use crate::candidate_merge::apply_candidate_and_reverify_cancellable;
 use crate::delegate_events;
 use crate::resource_governor::{self, ResourceClass};
 
@@ -43,7 +43,11 @@ impl Drop for DelegateLease {
     }
 }
 
-fn acquire_delegate_lease(state_root: &Path, timeout: Duration) -> Result<DelegateLease> {
+fn acquire_delegate_lease(
+    state_root: &Path,
+    timeout: Duration,
+    stop: &dyn Fn() -> bool,
+) -> Result<DelegateLease> {
     let limit = std::env::var("HI_GLOBAL_DELEGATE_CONCURRENCY")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -54,6 +58,9 @@ fn acquire_delegate_lease(state_root: &Path, timeout: Duration) -> Result<Delega
         .with_context(|| format!("creating delegate lease directory {}", lease_root.display()))?;
     let started = Instant::now();
     loop {
+        if stop() {
+            anyhow::bail!("cancelled waiting for a global delegate concurrency slot");
+        }
         for slot in 0..limit {
             let path = lease_root.join(format!("slot-{slot}.lease"));
             match OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -167,10 +174,14 @@ impl DelegateRunner for CliDelegateRunner {
         verify: Option<&str>,
         cancellation: hi_agent::TurnCancellation,
     ) -> DelegateOutcome {
-        if cancellation.is_cancelled() {
-            return outcome(ToolStatus::Cancelled, "delegate cancelled before setup");
-        }
-        self.run(task, verify).await
+        self.run_with_route(
+            task,
+            verify,
+            &hi_agent::SubagentRoute::default(),
+            None,
+            cancellation,
+        )
+        .await
     }
 
     async fn run_routed(
@@ -180,10 +191,8 @@ impl DelegateRunner for CliDelegateRunner {
         route: &hi_agent::SubagentRoute,
         cancellation: hi_agent::TurnCancellation,
     ) -> DelegateOutcome {
-        if cancellation.is_cancelled() {
-            return outcome(ToolStatus::Cancelled, "delegate cancelled before setup");
-        }
-        self.run_with_route(task, verify, route, None).await
+        self.run_with_route(task, verify, route, None, cancellation)
+            .await
     }
 
     async fn run_routed_with_progress(
@@ -194,15 +203,19 @@ impl DelegateRunner for CliDelegateRunner {
         cancellation: hi_agent::TurnCancellation,
         progress: Option<Arc<dyn DelegateProgress>>,
     ) -> DelegateOutcome {
-        if cancellation.is_cancelled() {
-            return outcome(ToolStatus::Cancelled, "delegate cancelled before setup");
-        }
-        self.run_with_route(task, verify, route, progress).await
+        self.run_with_route(task, verify, route, progress, cancellation)
+            .await
     }
 
     async fn run(&self, task: &str, verify: Option<&str>) -> DelegateOutcome {
-        self.run_with_route(task, verify, &hi_agent::SubagentRoute::default(), None)
-            .await
+        self.run_with_route(
+            task,
+            verify,
+            &hi_agent::SubagentRoute::default(),
+            None,
+            hi_agent::TurnCancellation::new(),
+        )
+        .await
     }
 }
 
@@ -238,7 +251,11 @@ impl CliDelegateRunner {
         verify: Option<&str>,
         route: &hi_agent::SubagentRoute,
         progress: Option<Arc<dyn DelegateProgress>>,
+        cancellation: hi_agent::TurnCancellation,
     ) -> DelegateOutcome {
+        if cancellation.is_cancelled() {
+            return outcome(ToolStatus::Cancelled, "delegate cancelled before setup");
+        }
         let Some(verify_cmd) = verify
             .map(str::to_string)
             .or_else(|| self.default_verify.clone())
@@ -301,6 +318,9 @@ impl CliDelegateRunner {
         let task = task.to_string();
         let workspace_root = self.workspace_root.clone();
         let state_root = self.state_root.clone();
+        if cancellation.is_cancelled() {
+            return outcome(ToolStatus::Cancelled, "delegate cancelled before setup");
+        }
 
         tokio::task::spawn_blocking(move || {
             run_blocking(
@@ -320,6 +340,7 @@ impl CliDelegateRunner {
                 &workspace_root,
                 &state_root,
                 progress,
+                cancellation,
             )
         })
         .await
@@ -350,15 +371,23 @@ fn run_blocking(
     workspace_root: &Path,
     state_root: &Path,
     progress: Option<Arc<dyn DelegateProgress>>,
+    cancellation: hi_agent::TurnCancellation,
 ) -> DelegateOutcome {
+    if let Some(out) = stop_if_cancelled(&cancellation, None, None) {
+        return out;
+    }
     let queue_started = Instant::now();
     report_progress(progress.as_deref(), "waiting for capacity");
     let _lease = match acquire_delegate_lease(
         state_root,
         Duration::from_secs(delegate_queue_timeout_secs()),
+        &|| cancellation.is_cancelled(),
     ) {
         Ok(lease) => lease,
         Err(error) => {
+            if let Some(out) = stop_if_cancelled(&cancellation, None, None) {
+                return out;
+            }
             return outcome(
                 ToolStatus::Failed,
                 &format!("delegate could not acquire global capacity: {error:#}"),
@@ -367,13 +396,17 @@ fn run_blocking(
     };
     let queue_wait_ms = queue_started.elapsed().as_millis();
     let setup_queue_started = Instant::now();
-    let setup_lease = match resource_governor::acquire(
+    let setup_lease = match resource_governor::acquire_while(
         state_root,
         ResourceClass::Setup,
         Duration::from_secs(delegate_queue_timeout_secs()),
+        &|| cancellation.is_cancelled(),
     ) {
         Ok(lease) => lease,
         Err(error) => {
+            if let Some(out) = stop_if_cancelled(&cancellation, None, None) {
+                return out;
+            }
             return outcome(
                 ToolStatus::Failed,
                 &format!("delegate could not acquire setup capacity: {error:#}"),
@@ -383,6 +416,9 @@ fn run_blocking(
     let setup_queue_ms = setup_queue_started.elapsed().as_millis();
     let setup_started = Instant::now();
     report_progress(progress.as_deref(), "creating worktree");
+    if let Some(out) = stop_if_cancelled(&cancellation, None, None) {
+        return out;
+    }
     let worktree_root = hi_tools::worktree::worktree_path("delegate", idx);
     if let Err(error) = hi_tools::worktree::add_worktree(repo_root, &worktree_root, checkpoint) {
         return outcome(
@@ -448,14 +484,25 @@ fn run_blocking(
 
     let worktree_setup_ms = setup_started.elapsed().as_millis();
     drop(setup_lease);
+    if let Some(out) =
+        stop_if_cancelled(&cancellation, Some(repo_root), Some(worktree_root.clone()))
+    {
+        return out;
+    }
     let model_queue_started = Instant::now();
-    let process_lease = match resource_governor::acquire(
+    let process_lease = match resource_governor::acquire_while(
         state_root,
         ResourceClass::Model,
         Duration::from_secs(delegate_queue_timeout_secs()),
+        &|| cancellation.is_cancelled(),
     ) {
         Ok(lease) => lease,
         Err(error) => {
+            if let Some(out) =
+                stop_if_cancelled(&cancellation, Some(repo_root), Some(worktree_root.clone()))
+            {
+                return out;
+            }
             hi_tools::worktree::cleanup(repo_root, &[worktree_root]);
             return outcome(
                 ToolStatus::Failed,
@@ -466,7 +513,7 @@ fn run_blocking(
     let model_queue_ms = model_queue_started.elapsed().as_millis();
     let child_started = Instant::now();
     report_progress(progress.as_deref(), "running");
-    let execution = crate::child_process::run(
+    let execution = crate::child_process::run_maybe_cancelled(
         &worktree,
         exe,
         arguments,
@@ -484,11 +531,17 @@ fn run_blocking(
         ],
         Duration::from_secs(delegate_timeout_secs()),
         &log_path,
+        Some(cancellation.clone()),
     );
     let child_runtime_ms = child_started.elapsed().as_millis();
     drop(process_lease);
     if let Some(tailer) = event_tailer {
         tailer.finish();
+    }
+    if let Some(out) =
+        stop_if_cancelled(&cancellation, Some(repo_root), Some(worktree_root.clone()))
+    {
+        return out;
     }
     let decision_started = Instant::now();
     report_progress(progress.as_deref(), "verifying");
@@ -501,7 +554,15 @@ fn run_blocking(
             &artifact_dir,
             workspace_root,
             state_root,
+            &cancellation,
         ),
+        Ok(execution) if execution.status == ToolStatus::Cancelled => {
+            hi_tools::worktree::cleanup(repo_root, &[worktree_root.clone()]);
+            outcome(
+                ToolStatus::Cancelled,
+                "delegate cancelled — child process stopped; nothing was applied.",
+            )
+        }
         Ok(execution) => {
             let status = execution.status;
             if matches!(status, ToolStatus::TimedOut | ToolStatus::Failed) {
@@ -572,6 +633,23 @@ fn report_progress(progress: Option<&dyn DelegateProgress>, activity: &str) {
     }
 }
 
+fn stop_if_cancelled(
+    cancellation: &hi_agent::TurnCancellation,
+    repo_root: Option<&Path>,
+    worktree_root: Option<PathBuf>,
+) -> Option<DelegateOutcome> {
+    if !cancellation.is_cancelled() {
+        return None;
+    }
+    if let (Some(repo), Some(worktree)) = (repo_root, worktree_root) {
+        hi_tools::worktree::cleanup(repo, &[worktree]);
+    }
+    Some(outcome(
+        ToolStatus::Cancelled,
+        "delegate cancelled; nothing was applied.",
+    ))
+}
+
 fn delegate_artifacts_dir(state_root: &Path, idx: u32) -> PathBuf {
     let pid = std::process::id();
     state_root
@@ -604,6 +682,7 @@ fn decide(
     artifact_dir: &Path,
     destination: &Path,
     state_root: &Path,
+    cancellation: &hi_agent::TurnCancellation,
 ) -> DelegateOutcome {
     let child = match inspect_child_report(report_path) {
         Ok(child) => child,
@@ -655,13 +734,27 @@ fn decide(
         );
     }
 
+    if cancellation.is_cancelled() {
+        return outcome(
+            ToolStatus::Cancelled,
+            "delegate cancelled during verification; nothing was applied.",
+        );
+    }
+
     let after_check = match independently_verify_candidate_cached(
         worktree,
         checkpoint,
         verify_cmd,
         &state_root.join("delegate-verification-cache"),
+        Some(cancellation.clone()),
     ) {
         Ok(diff) => diff,
+        Err(error) if is_verifier_cancelled(&error) => {
+            return outcome(
+                ToolStatus::Cancelled,
+                "delegate cancelled during verification; nothing was applied.",
+            );
+        }
         Err(error) => {
             return outcome(
                 ToolStatus::Failed,
@@ -678,7 +771,21 @@ fn decide(
         );
     }
 
-    match apply_candidate_and_reverify(worktree, checkpoint, destination, state_root, verify_cmd) {
+    if cancellation.is_cancelled() {
+        return outcome(
+            ToolStatus::Cancelled,
+            "delegate cancelled during verification; nothing was applied.",
+        );
+    }
+
+    match apply_candidate_and_reverify_cancellable(
+        worktree,
+        checkpoint,
+        destination,
+        state_root,
+        verify_cmd,
+        Some(cancellation.clone()),
+    ) {
         Ok(applied) => DelegateOutcome {
             status: ToolStatus::Succeeded,
             applied: true,
@@ -693,6 +800,14 @@ fn decide(
             ),
             changed_files: applied.changes,
         },
+        Err(error) if is_destination_verify_cancelled(&error) => outcome(
+            ToolStatus::Cancelled,
+            "delegate cancelled during destination verification; destination was rolled back.",
+        ),
+        Err(error) if is_verifier_cancelled(&error) => outcome(
+            ToolStatus::Cancelled,
+            "delegate cancelled during verification; nothing was applied.",
+        ),
         Err(error) => outcome(
             ToolStatus::Failed,
             &format!(

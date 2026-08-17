@@ -215,7 +215,13 @@ impl crate::App {
                     self.input.save_history(&self.workspace_root);
                     return Some(line);
                 }
-                if let Some(hint) = self.suggested_prompt.take() {
+                if let Some(hint) = self
+                    .suggested_prompt
+                    .as_ref()
+                    .filter(|_| !self.suggested_prompt_dismissed && self.input.is_empty())
+                    .cloned()
+                {
+                    self.suggested_prompt = None;
                     return Some(hint);
                 }
                 if let Some(prompt) = self.last_drive.resume_prompt() {
@@ -301,20 +307,16 @@ impl crate::App {
                 self.show_help = !self.show_help;
             }
             KeyCode::Char(c) if !ctrl => {
-                // Typing dismisses a ghost-text suggestion (Claude behavior).
-                self.clear_suggested_prompt();
+                // Shrink-on-type: keep the suggestion so a matching prefix still
+                // shows the remaining ghost; divergent text just hides it.
                 self.input.insert(c);
             }
             KeyCode::Backspace => {
-                if self.input.is_empty() {
-                    self.clear_suggested_prompt();
-                }
                 self.input.backspace();
             }
             KeyCode::Left => self.input.left(),
             KeyCode::Right => {
-                // Right on empty input accepts ghost text (Claude: Right/Tab).
-                if self.input.is_empty() && self.suggested_prompt.is_some() {
+                if self.input.cursor() == self.input.chars.len() && self.ghost_suffix().is_some() {
                     let _ = self.accept_suggested_prompt();
                 } else {
                     self.input.right();
@@ -405,9 +407,10 @@ impl crate::App {
         for entry in &self.transcript {
             match entry {
                 crate::TranscriptEntry::Line(_)
-                | crate::TranscriptEntry::UserPrompt(_)
+                | crate::TranscriptEntry::UserPrompt { .. }
                 | crate::TranscriptEntry::Assistant(_)
                 | crate::TranscriptEntry::ChangedFiles { .. }
+                | crate::TranscriptEntry::Btw { .. }
                 | crate::TranscriptEntry::Workflow { .. }
                 | crate::TranscriptEntry::Activity(_)
                 | crate::TranscriptEntry::ToolOutput { .. } => {
@@ -1493,6 +1496,7 @@ impl crate::App {
         self.plan = agent.current_plan().to_vec();
         self.plan_mode = agent.plan_mode();
         self.plan_drive_paused = agent.plan_drive_paused();
+        self.permission_mode = agent.permission_mode();
         self.last_drive = agent.drive_decision(None);
     }
 
@@ -1547,6 +1551,9 @@ impl crate::App {
         outcome: Option<&hi_agent::TurnOutcome>,
     ) {
         if !self.queue.is_empty() {
+            return;
+        }
+        if self.plan_approval.is_some() {
             return;
         }
         if let Some(prompt) = agent.drive_decision(outcome).prompt() {
@@ -1743,8 +1750,8 @@ impl crate::App {
             Command::Density(arg) => self.handle_density(&arg),
             Command::Voice(arg) => self.handle_voice(&arg),
             Command::Mouse(arg) => self.handle_mouse_command(&arg),
-            Command::Help => {
-                for line in command::help_text().lines() {
+            Command::Help(arg) => {
+                for line in command::help_text_for(&arg).lines() {
                     self.push(Line::styled(line.to_string(), dim()));
                 }
             }
@@ -1760,6 +1767,56 @@ impl crate::App {
                     &agent.background_task_ids(),
                 );
             }
+            Command::Jump(arg) => {
+                let arg = arg.trim();
+                if arg.is_empty() {
+                    self.open_jump_picker();
+                } else if let Ok(n) = arg.parse::<usize>() {
+                    if n == 0 || !self.scroll_to_user_prompt(n - 1) {
+                        self.status = format!("no user prompt {n}");
+                    }
+                } else {
+                    let queued: Vec<String> = self.queue.iter().cloned().collect();
+                    if let Some(effect) = hi_agent::handle_session_command(
+                        agent,
+                        &Command::Jump(arg.to_string()),
+                        &queued,
+                    ) {
+                        for line in effect.message.lines() {
+                            self.push(Line::styled(line.to_string(), dim()));
+                        }
+                    }
+                }
+            }
+            Command::RewindPicker => self.open_rewind_picker(agent),
+            Command::Rewind(arg) => {
+                let trimmed = arg.trim();
+                if trimmed.is_empty() || trimmed == "list" || trimmed == "ls" {
+                    self.open_rewind_picker(agent);
+                } else if let Ok(n) = trimmed.parse::<usize>() {
+                    let queued: Vec<String> = self.queue.iter().cloned().collect();
+                    if let Some(effect) = hi_agent::handle_session_command(
+                        agent,
+                        &Command::Rewind(arg.clone()),
+                        &queued,
+                    ) {
+                        let failed = effect.message.starts_with("rewind failed");
+                        for line in effect.message.lines() {
+                            self.push(Line::styled(line.to_string(), dim()));
+                        }
+                        if !failed {
+                            self.rewind_transcript_to_user_turn(n);
+                            self.rewind_picker = None;
+                        }
+                        self.refresh_goal(agent);
+                    }
+                } else {
+                    self.push(Line::styled(
+                        format!("usage: /rewind [n] — got {trimmed:?}"),
+                        dim(),
+                    ));
+                }
+            }
             Command::Queue(arg) if arg.trim() == "tasks" => {
                 crate::subagent_overlay::open_tasks(
                     self,
@@ -1767,10 +1824,28 @@ impl crate::App {
                     &agent.background_task_ids(),
                 );
             }
+            Command::ViewPlan => {
+                if self.plan_approval.is_some() {
+                    self.unpark_plan_approval();
+                } else if self.plan_has_leftover() && !self.plan_mode {
+                    self.open_plan_approval();
+                } else {
+                    let queued: Vec<String> = self.queue.iter().cloned().collect();
+                    if let Some(effect) = hi_agent::handle_session_command(agent, &command, &queued)
+                    {
+                        for line in effect.message.lines() {
+                            self.push(Line::styled(line.to_string(), dim()));
+                        }
+                    }
+                }
+            }
+            Command::Memory => {
+                self.memory_browser = Some(crate::memory_browser::MemoryBrowser::open(
+                    &self.workspace_root,
+                ));
+            }
             Command::Plan(_)
-            | Command::ViewPlan
             | Command::Fork(_)
-            | Command::Rewind(_)
             | Command::Permissions(_)
             | Command::AlwaysApprove(_)
             | Command::Auto(_)
@@ -1782,7 +1857,6 @@ impl crate::App {
             | Command::Metrics
             | Command::SynthEvals
             | Command::Find(_)
-            | Command::Jump(_)
             | Command::History(_)
             | Command::Hooks(_)
             | Command::Trust(_)
@@ -1792,7 +1866,6 @@ impl crate::App {
             | Command::Agents(_)
             | Command::Share(_)
             | Command::McpAdmin(_)
-            | Command::RewindPicker
             | Command::Cd(_)
             | Command::Rename(_)
             | Command::Resume(_) => {
@@ -1802,9 +1875,17 @@ impl crate::App {
                         self.push(Line::styled(line.to_string(), dim()));
                     }
                     self.refresh_goal(agent);
+                    if let Command::Plan(arg) = &command {
+                        match arg.trim() {
+                            "off" | "exit" | "done" => self.maybe_open_plan_approval(),
+                            "resume" | "on" | "" => self.plan_approval = None,
+                            _ => {}
+                        }
+                    }
                     if let Some(prompt) = effect.follow_up_prompt {
                         // Plan mode and /synth-evals hand back a prompt to run
                         // as the next turn. Prefer front-of-queue even at cap.
+                        self.plan_approval = None;
                         let _ = self.enqueue_prompt_front(prompt);
                         self.push(Line::styled(
                             "queued follow-up turn — it will run next".to_string(),

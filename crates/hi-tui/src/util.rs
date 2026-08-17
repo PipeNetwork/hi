@@ -35,6 +35,35 @@ pub(crate) fn fmt_elapsed(secs: u64) -> String {
     }
 }
 
+/// Grok-build "Worked for" marker: `5.0s`, `23m48s`, `1h2m`.
+pub(crate) fn fmt_worked(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 10 {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Right-aligned prompt timestamp, grok-build short form (`4:55 AM`).
+pub(crate) fn fmt_clock(at: std::time::SystemTime) -> String {
+    use chrono::Timelike;
+    let dt = chrono::DateTime::<chrono::Local>::from(at);
+    let h24 = dt.hour();
+    let m = dt.minute();
+    let (h12, ampm) = match h24 {
+        0 => (12, "AM"),
+        1..=11 => (h24, "AM"),
+        12 => (12, "PM"),
+        _ => (h24 - 12, "PM"),
+    };
+    format!("{h12}:{m:02} {ampm}")
+}
+
 pub(crate) fn fmt_rate_limits(limits: Option<hi_ai::RateLimitState>) -> Option<String> {
     let limits = limits.filter(|limits| limits.has_data())?;
     let mut parts = Vec::new();
@@ -212,6 +241,16 @@ mod tests {
         assert_eq!(fmt_elapsed(868), "14m 28s"); // the reported "868s"
         assert_eq!(fmt_elapsed(3600), "1h 00m");
         assert_eq!(fmt_elapsed(3661), "1h 01m");
+    }
+
+    #[test]
+    fn fmt_worked_matches_grok_build_compact() {
+        assert_eq!(fmt_worked(std::time::Duration::from_millis(2300)), "2.3s");
+        assert_eq!(fmt_worked(std::time::Duration::from_secs(5)), "5.0s");
+        assert_eq!(fmt_worked(std::time::Duration::from_secs(45)), "45s");
+        assert_eq!(fmt_worked(std::time::Duration::from_secs(125)), "2m5s");
+        assert_eq!(fmt_worked(std::time::Duration::from_secs(1428)), "23m48s");
+        assert_eq!(fmt_worked(std::time::Duration::from_secs(3723)), "1h2m");
     }
 
     #[test]

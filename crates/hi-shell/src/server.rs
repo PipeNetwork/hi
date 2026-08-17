@@ -734,6 +734,9 @@ impl Ui for AcpUi {
         ));
     }
     fn status(&mut self, text: &str) {
+        if hi_agent::ui::user_facing_status(text).is_none() {
+            return;
+        }
         self.text(text, true);
     }
     fn turn_end(&mut self, _summary: &str) {}

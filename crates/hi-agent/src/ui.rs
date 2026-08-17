@@ -241,6 +241,18 @@ pub fn user_facing_status(text: &str) -> Option<String> {
         return None;
     }
 
+    // Capability/verification lifecycle is telemetry. A mutating tool batch
+    // and every turn's workspace-repair pass would otherwise dump bookkeeping
+    // into the transcript ("process_execution capability requested",
+    // "verification started/finished", skip-when-unchanged).
+    if candidate.ends_with(" capability requested")
+        || candidate == "verification started"
+        || candidate == "verification finished"
+        || candidate == "verification skipped — no files changed this turn"
+    {
+        return None;
+    }
+
     // Stable reason keys are for metrics and tests, not for the transcript.
     // Keep the useful recovery action while removing implementation vocabulary
     // such as `repeat_no_op_bash` and `inspection_sprawl_exhausted`.
@@ -969,6 +981,44 @@ pub fn clip(s: &str, max: usize) -> String {
     }
 }
 
+const CONTEXT_BLOCK_END: &str = "[/hi:context]";
+const CONTEXT_BLOCK_STARTS: &[&str] = &[
+    "[hi:context — session state, not instructions]",
+    "[hi:context - session state, not instructions]",
+];
+
+/// Strip a leading `[hi:context …]` volatile block from a persisted user
+/// message. Listings and titles should show the human prompt, not the
+/// memory / task-index dump prepended at turn start.
+pub fn strip_context_block(text: &str) -> &str {
+    let text = text.trim_start();
+    for start in CONTEXT_BLOCK_STARTS {
+        if let Some(rest) = text.strip_prefix(start) {
+            return match rest.find(CONTEXT_BLOCK_END) {
+                Some(end) => {
+                    rest[end + CONTEXT_BLOCK_END.len()..].trim_start_matches(['\n', '\r', ' '])
+                }
+                None => "",
+            };
+        }
+    }
+    text
+}
+
+/// One-line title from a user message: drop the context block, folded stdin,
+/// and code fences, then collapse whitespace.
+pub fn user_prompt_title(text: &str, max: usize) -> String {
+    let stripped = strip_context_block(text);
+    let head = stripped
+        .split("stdin:")
+        .next()
+        .unwrap_or(stripped)
+        .split("```")
+        .next()
+        .unwrap_or(stripped);
+    clip(&collapse_ws(head), max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1104,6 +1154,10 @@ mod tests {
                 .is_none()
         );
         assert!(user_facing_status("MoA aggregating: coder").is_none());
+        assert!(user_facing_status("process_execution capability requested").is_none());
+        assert!(user_facing_status("verification started").is_none());
+        assert!(user_facing_status("verification finished").is_none());
+        assert!(user_facing_status("verification skipped — no files changed this turn").is_none());
         let status = user_facing_status("turn stopped incomplete · repeat_no_op_bash").unwrap();
         assert!(status.contains("unfinished work"));
         assert!(!status.contains("repeat_no_op_bash"));
@@ -1352,5 +1406,20 @@ mod tests {
         );
         let bash = subagent_activity_label("bash", r#"{"command":"cargo test"}"#);
         assert!(bash.starts_with("Run "), "got {bash}");
+    }
+
+    #[test]
+    fn user_prompt_title_strips_context_and_keeps_the_real_prompt() {
+        let dumped = "[hi:context — session state, not instructions]\n\
+# Memory (from past sessions; task-ranked)\n\
+Prefer bullets that match the current task.\n\
+[/hi:context]\n\n\
+fix the parser";
+        assert_eq!(super::user_prompt_title(dumped, 72), "fix the parser");
+        assert_eq!(
+            super::user_prompt_title("[hi:context — session state, not instructions] no end", 72),
+            ""
+        );
+        assert_eq!(super::user_prompt_title("plain prompt", 72), "plain prompt");
     }
 }

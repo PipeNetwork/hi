@@ -108,8 +108,8 @@ impl crate::App {
             minimal_screen: false,
             vim_mode: true,
             multiline_mode: true,
-            timeline_enabled: false,
-            timestamps_enabled: false,
+            timeline_enabled: true,
+            timestamps_enabled: true,
             total_when_unpinned: 0,
             working: false,
             spinner: 0,
@@ -138,8 +138,21 @@ impl crate::App {
             plan: Vec::new(),
             confirmation: None,
             confirmation_scroll: 0,
+            confirmation_selected: 0,
+            confirm_focus: crate::confirm_overlay::ConfirmFocus::Options,
+            plan_approval: None,
+            memory_browser: None,
+            confirmation_waiting: 0,
+            mouse_col: 0,
+            mouse_row: 0,
+            ctx_chip_rect: ratatui::layout::Rect::default(),
+            turn_status_rect: ratatui::layout::Rect::default(),
+            git_branch: None,
+            plan_pane_expanded: true,
             goal: None,
             plan_mode: false,
+            permission_mode: hi_agent::PermissionMode::Always,
+            session_face_dirty: false,
             plan_drive_paused: false,
             last_drive: hi_agent::DriveAction::Idle {
                 reason: hi_agent::DriveIdleReason::None,
@@ -154,6 +167,11 @@ impl crate::App {
             subagents: HashMap::new(),
             inspect_subagent: None,
             tasks_overlay: None,
+            block_viewer: None,
+            jump_picker: None,
+            rewind_picker: None,
+            timeline_hits: Vec::new(),
+            timeline_rect: ratatui::layout::Rect::default(),
             diff_lab: None,
             race: None,
             plan_workflow_child: None,
@@ -167,9 +185,10 @@ impl crate::App {
             model_ids: Vec::new(),
             trimmed: 0,
             current_assistant: String::new(),
-            btw_answer_started: false,
             show_btw: false,
             btw_scroll: 0,
+            last_btw_area: ratatui::layout::Rect::default(),
+            last_btw_close: ratatui::layout::Rect::default(),
             btw_thread: Vec::new(),
             last_assistant: String::new(),
             last_turn_event: None,
@@ -177,6 +196,7 @@ impl crate::App {
             last_changed_files: Vec::new(),
             session_changed_files: Vec::new(),
             suggested_prompt: None,
+            suggested_prompt_dismissed: false,
             diff_text: None,
             review_scroll: 0,
             auto_approve_session: false,
@@ -190,6 +210,7 @@ impl crate::App {
             turn_tool_calls: 0,
             turn_rounds: 0,
             tool_stream_tail: Vec::new(),
+            run_streamed_this_call: false,
             waiting_for: None,
             last_turn_state: TurnState::Idle,
             last_error: None,
@@ -280,11 +301,38 @@ impl crate::App {
         let was_working = self.working;
         if was_working && !working {
             self.last_turn_latency = self.started.map(|started| started.elapsed());
+            if let Some(elapsed) = self.last_turn_latency {
+                let marker = match &self.last_turn_state {
+                    TurnState::Done(_) | TurnState::Warning(_) => {
+                        Some(format!("Worked for {}", crate::util::fmt_worked(elapsed)))
+                    }
+                    TurnState::Cancelled => Some(format!(
+                        "Turn cancelled by user in {}.",
+                        crate::util::fmt_worked(elapsed)
+                    )),
+                    TurnState::Failed(_) => Some(format!(
+                        "Turn failed in {}.",
+                        crate::util::fmt_worked(elapsed)
+                    )),
+                    _ => None,
+                };
+                if let Some(marker) = marker {
+                    let blank = self
+                        .transcript
+                        .last()
+                        .is_none_or(|entry| entry.text().trim().is_empty());
+                    if !blank {
+                        self.push(ratatui::text::Line::raw(""));
+                    }
+                    self.push(ratatui::text::Line::styled(marker, crate::render::dim()));
+                }
+            }
         }
         self.working = working;
         self.started = working.then(Instant::now);
         self.current_tool = None;
         self.current_tool_started = None;
+        self.run_streamed_this_call = false;
         if !working {
             self.freeze_verb_group();
         }
@@ -296,6 +344,7 @@ impl crate::App {
             self.last_turn_state = TurnState::Running;
             // Ghost-text suggestions are for the idle composer only.
             self.suggested_prompt = None;
+            self.suggested_prompt_dismissed = false;
             // A new turn's output would shift block ordinals and line indices;
             // leave block-nav and drop any stale text selection.
             if self.mode.is_block_nav() {
@@ -315,19 +364,34 @@ impl crate::App {
     /// Drop any idle ghost-text suggestion (typing, Esc, toggle off, etc.).
     pub(crate) fn clear_suggested_prompt(&mut self) {
         self.suggested_prompt = None;
+        self.suggested_prompt_dismissed = false;
     }
 
-    /// Accept the ghost-text suggestion into the input buffer (Claude: Tab/Right).
-    /// Returns true when a suggestion was present and applied.
+    /// Hide the current suggestion until a new one loads (Esc on empty).
+    pub(crate) fn dismiss_suggested_prompt(&mut self) {
+        self.suggested_prompt_dismissed = true;
+    }
+
+    /// Remaining suffix of the suggestion when `text` is a proper prefix.
+    pub(crate) fn ghost_suffix(&self) -> Option<&str> {
+        if self.suggested_prompt_dismissed {
+            return None;
+        }
+        let suggestion = self.suggested_prompt.as_deref()?;
+        let text = self.input.text();
+        let rest = suggestion.strip_prefix(&text)?;
+        if rest.is_empty() { None } else { Some(rest) }
+    }
+
+    /// Accept the ghost-text suggestion into the input buffer (Tab/Right).
+    /// Inserts the remaining suffix when the draft is a matching prefix.
     pub(crate) fn accept_suggested_prompt(&mut self) -> bool {
-        let Some(text) = self.suggested_prompt.take() else {
+        let Some(rest) = self.ghost_suffix().map(str::to_owned) else {
             return false;
         };
-        if !self.input.is_empty() {
-            // User already typed — keep their draft, drop the stale suggestion.
-            return false;
-        }
-        self.input.set(&text);
+        self.input.insert_str(&rest);
+        self.suggested_prompt = None;
+        self.suggested_prompt_dismissed = false;
         true
     }
 
@@ -364,6 +428,9 @@ impl crate::App {
     pub(crate) fn should_auto_approve(&self, request: &hi_agent::ConfirmationRequest) -> bool {
         if matches!(request, hi_agent::ConfirmationRequest::AskUser { .. }) {
             return false;
+        }
+        if self.permission_mode == hi_agent::PermissionMode::Auto && request.safe_for_auto() {
+            return true;
         }
         if self.auto_approve_session {
             return true;

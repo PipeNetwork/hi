@@ -27,10 +27,6 @@ impl UiLayout {
         }
     }
 
-    pub(crate) const fn allows_btw(self) -> bool {
-        matches!(self, Self::Wide | Self::Standard)
-    }
-
     pub(crate) const fn show_full_title(self) -> bool {
         matches!(self, Self::Wide | Self::Standard)
     }
@@ -194,9 +190,6 @@ mod tests {
 
     #[test]
     fn narrow_layout_hides_secondary_surfaces() {
-        assert!(UiLayout::Wide.allows_btw());
-        assert!(UiLayout::Standard.allows_btw());
-        assert!(!UiLayout::Narrow.allows_btw());
         assert!(!UiLayout::Tiny.show_secondary_chrome());
     }
 

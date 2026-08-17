@@ -107,6 +107,8 @@ pub(crate) async fn drive<T>(
     let mut watchdog_stuck = false;
     let watchdog_timeout = watchdog_stuck_timeout();
     let mut pending_confirmation: Option<ConfirmationControl> = None;
+    let mut confirm_queue: std::collections::VecDeque<ConfirmationControl> =
+        std::collections::VecDeque::new();
     let mut confirmations_open = true;
     let signal_turn_cancel = |app: &mut App, cancelled_flag: &mut bool| {
         *cancelled_flag = true;
@@ -124,6 +126,24 @@ pub(crate) async fn drive<T>(
         if cancelled && turn_cancel.is_some() && value.is_none() {
             // Fall through to select! so `fut` can complete.
         }
+        if pending_confirmation.is_none() {
+            while let Some(request) = confirm_queue.pop_front() {
+                if app.should_auto_approve(&request.request) {
+                    let _ = request
+                        .response
+                        .send(hi_agent::ConfirmationResult::Approved);
+                    continue;
+                }
+                app.confirmation = Some(request.request.clone());
+                app.confirmation_scroll = 0;
+                app.confirmation_selected = 0;
+                app.confirm_focus = crate::confirm_overlay::ConfirmFocus::Options;
+                app.ask_user_draft.clear();
+                pending_confirmation = Some(request);
+                break;
+            }
+        }
+        app.confirmation_waiting = confirm_queue.len();
         terminal.draw(|f| app.render(f))?;
         tokio::select! {
             result = &mut fut => {
@@ -149,23 +169,10 @@ pub(crate) async fn drive<T>(
                 // redrawing, while preserving select-loop fairness for input.
                 drain_ui_events(app, &mut rx, 64);
             }
-            request = confirmations.recv(), if pending_confirmation.is_none() && confirmations_open => {
+            request = confirmations.recv(), if confirmations_open => {
                 match request {
                     Some(request) => {
-                        // Session-wide `a` or path-scoped `p` auto-approve.
-                        if app.should_auto_approve(&request.request) {
-                            let _ = request.response.send(hi_agent::ConfirmationResult::Approved);
-                        } else {
-                            app.confirmation = Some(request.request.clone());
-                            app.confirmation_scroll = 0;
-                            if matches!(
-                                request.request,
-                                hi_agent::ConfirmationRequest::AskUser { .. }
-                            ) {
-                                app.ask_user_draft.clear();
-                            }
-                            pending_confirmation = Some(request);
-                        }
+                        confirm_queue.push_back(request);
                     }
                     None => confirmations_open = false,
                 }
@@ -191,11 +198,14 @@ pub(crate) async fn drive<T>(
                 match maybe {
                     Some(Event::Mouse(mouse)) => app.handle_mouse(mouse),
                     Some(Event::Paste(text))
-                        if pending_confirmation.as_ref().is_some_and(|request| {
-                            matches!(
-                                request.request,
-                                hi_agent::ConfirmationRequest::AskUser { .. }
-                            )
+                        if pending_confirmation.as_ref().is_some_and(|_| {
+                            app.confirm_focus == crate::confirm_overlay::ConfirmFocus::Followup
+                                || app.confirmation.as_ref().is_some_and(|request| {
+                                    matches!(
+                                        request,
+                                        hi_agent::ConfirmationRequest::AskUser { .. }
+                                    )
+                                })
                         }) =>
                     {
                         app.ask_user_draft.push_str(&text);
@@ -207,114 +217,35 @@ pub(crate) async fn drive<T>(
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                         if let Some(request) = pending_confirmation.take() {
-                            if let hi_agent::ConfirmationRequest::AskUser { options, .. } =
-                                &request.request
-                            {
-                                let options = options.clone();
-                                match key.code {
-                                    KeyCode::Char(c)
-                                        if !ctrl && c.is_ascii_digit() && c != '0' =>
-                                    {
-                                        let picked =
-                                            options.get((c as u8 - b'1') as usize).cloned();
-                                        if let Some(option) = picked {
-                                            let _ = request.response.send(
-                                                hi_agent::ConfirmationResult::Answer(option),
-                                            );
-                                            app.confirmation = None;
-                                            app.ask_user_draft.clear();
-                                        } else {
-                                            app.ask_user_draft.push(c);
-                                            pending_confirmation = Some(request);
-                                        }
-                                    }
-                                    KeyCode::Char(c) if !ctrl => {
-                                        app.ask_user_draft.push(c);
-                                        pending_confirmation = Some(request);
-                                    }
-                                    KeyCode::Backspace => {
-                                        app.ask_user_draft.pop();
-                                        pending_confirmation = Some(request);
-                                    }
-                                    KeyCode::Enter => {
-                                        let answer = app.ask_user_draft.trim().to_string();
-                                        if answer.is_empty() {
-                                            pending_confirmation = Some(request);
-                                        } else {
-                                            let _ = request.response.send(
-                                                hi_agent::ConfirmationResult::Answer(answer),
-                                            );
-                                            app.confirmation = None;
-                                            app.ask_user_draft.clear();
-                                        }
-                                    }
-                                    KeyCode::Esc => {
-                                        let _ = request.response.send(
-                                            hi_agent::ConfirmationResult::Cancelled,
-                                        );
-                                        app.confirmation = None;
-                                        app.ask_user_draft.clear();
-                                    }
-                                    KeyCode::Char('c') if ctrl => {
-                                        let _ = request.response.send(
-                                            hi_agent::ConfirmationResult::Cancelled,
-                                        );
-                                        app.confirmation = None;
-                                        app.ask_user_draft.clear();
-                                        signal_turn_cancel(app, &mut cancelled);
-                                        if turn_cancel.is_none() {
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                    KeyCode::Up => {
-                                        app.confirmation_scroll =
-                                            app.confirmation_scroll.saturating_sub(1);
-                                        pending_confirmation = Some(request);
-                                    }
-                                    KeyCode::Down => {
-                                        app.confirmation_scroll =
-                                            app.confirmation_scroll.saturating_add(1);
-                                        pending_confirmation = Some(request);
-                                    }
-                                    KeyCode::PageUp => {
-                                        app.confirmation_scroll =
-                                            app.confirmation_scroll.saturating_sub(10);
-                                        pending_confirmation = Some(request);
-                                    }
-                                    KeyCode::PageDown => {
-                                        app.confirmation_scroll =
-                                            app.confirmation_scroll.saturating_add(10);
-                                        pending_confirmation = Some(request);
-                                    }
-                                    _ => pending_confirmation = Some(request),
+                            use crate::confirm_overlay::ConfirmDecision;
+                            match crate::confirm_overlay::handle_key(
+                                app,
+                                &key,
+                                &request.request,
+                            ) {
+                                ConfirmDecision::Redraw | ConfirmDecision::Unhandled => {
+                                    pending_confirmation = Some(request);
                                 }
-                                continue;
-                            }
-                            match key.code {
-                                KeyCode::Char('y') if !ctrl => {
-                                    let _ = request.response.send(hi_agent::ConfirmationResult::Approved);
+                                ConfirmDecision::Approve => {
+                                    let _ = request
+                                        .response
+                                        .send(hi_agent::ConfirmationResult::Approved);
                                     app.confirmation = None;
+                                    app.ask_user_draft.clear();
                                 }
-                                KeyCode::Char('n') if !ctrl => {
-                                    let _ = request.response.send(hi_agent::ConfirmationResult::Rejected);
-                                    app.confirmation = None;
-                                }
-                                // "Always allow this session": approve this
-                                // request AND auto-approve all subsequent ones
-                                // without showing the modal. Removes the y-y-y-y
-                                // fatigue during a heavy edit session.
-                                KeyCode::Char('a') if !ctrl => {
-                                    let _ = request.response.send(hi_agent::ConfirmationResult::Approved);
+                                ConfirmDecision::AlwaysSession => {
+                                    let _ = request
+                                        .response
+                                        .send(hi_agent::ConfirmationResult::Approved);
                                     app.auto_approve_session = true;
                                     app.confirmation = None;
+                                    app.ask_user_draft.clear();
                                     app.push(Line::styled(
                                         "auto-approve on for this session (approvals suppressed until quit)",
                                         Style::default().fg(crate::theme::theme().accent_success),
                                     ));
                                 }
-                                // Path-scoped auto-approve for file edits (`p`).
-                                KeyCode::Char('p') if !ctrl => {
+                                ConfirmDecision::AlwaysPath => {
                                     if let hi_agent::ConfirmationRequest::FileEdit { path, .. } =
                                         &request.request
                                     {
@@ -324,6 +255,7 @@ pub(crate) async fn drive<T>(
                                             .response
                                             .send(hi_agent::ConfirmationResult::Approved);
                                         app.confirmation = None;
+                                        app.ask_user_draft.clear();
                                         app.push(Line::styled(
                                             format!(
                                                 "auto-approve path '{prefix}/' for this session"
@@ -332,40 +264,46 @@ pub(crate) async fn drive<T>(
                                                 .fg(crate::theme::theme().accent_success),
                                         ));
                                     } else {
-                                        // Not a file edit — keep the modal open.
                                         pending_confirmation = Some(request);
                                     }
                                 }
-                                KeyCode::Esc => {
-                                    let _ = request.response.send(hi_agent::ConfirmationResult::Rejected);
+                                ConfirmDecision::Reject => {
+                                    let _ = request
+                                        .response
+                                        .send(hi_agent::ConfirmationResult::Rejected);
                                     app.confirmation = None;
+                                    app.ask_user_draft.clear();
                                 }
-                                KeyCode::Char('c') if ctrl => {
-                                    let _ = request.response.send(hi_agent::ConfirmationResult::Cancelled);
+                                ConfirmDecision::RejectFollowup(text) => {
+                                    let _ = request
+                                        .response
+                                        .send(hi_agent::ConfirmationResult::Rejected);
                                     app.confirmation = None;
-                                    signal_turn_cancel(app, &mut cancelled);
-                                    if turn_cancel.is_none() {
-                                        break;
+                                    app.ask_user_draft.clear();
+                                    if !text.trim().is_empty() {
+                                        let _ = app.enqueue_prompt_front(text);
                                     }
-                                    continue;
                                 }
-                                KeyCode::Up => {
-                                    app.confirmation_scroll = app.confirmation_scroll.saturating_sub(1);
-                                    pending_confirmation = Some(request);
+                                ConfirmDecision::Cancel => {
+                                    let _ = request
+                                        .response
+                                        .send(hi_agent::ConfirmationResult::Cancelled);
+                                    app.confirmation = None;
+                                    app.ask_user_draft.clear();
+                                    if ctrl {
+                                        signal_turn_cancel(app, &mut cancelled);
+                                        if turn_cancel.is_none() {
+                                            break;
+                                        }
+                                    }
                                 }
-                                KeyCode::Down => {
-                                    app.confirmation_scroll = app.confirmation_scroll.saturating_add(1);
-                                    pending_confirmation = Some(request);
+                                ConfirmDecision::Ask(answer) => {
+                                    let _ = request
+                                        .response
+                                        .send(hi_agent::ConfirmationResult::Answer(answer));
+                                    app.confirmation = None;
+                                    app.ask_user_draft.clear();
                                 }
-                                KeyCode::PageUp => {
-                                    app.confirmation_scroll = app.confirmation_scroll.saturating_sub(10);
-                                    pending_confirmation = Some(request);
-                                }
-                                KeyCode::PageDown => {
-                                    app.confirmation_scroll = app.confirmation_scroll.saturating_add(10);
-                                    pending_confirmation = Some(request);
-                                }
-                                _ => pending_confirmation = Some(request),
                             }
                             continue;
                         }
@@ -375,6 +313,9 @@ pub(crate) async fn drive<T>(
                                 if turn_cancel.is_none() {
                                     break;
                                 }
+                                continue;
+                            }
+                            KeyCode::Esc if app.dismiss_btw_overlay() => {
                                 continue;
                             }
                             // Esc clears a half-typed queued command, or — when the
@@ -439,6 +380,25 @@ pub(crate) async fn drive<T>(
                                         ),
                                     };
                                     app.push(Line::styled(message, dim()));
+                                    continue;
+                                }
+                                Some(ChordPipeline::CycleSessionMode) => {
+                                    app.cycle_session_face();
+                                    continue;
+                                }
+                                Some(ChordPipeline::PlanApprove) => {
+                                    app.apply_plan_approve_local();
+                                    let _ = app.enqueue_prompt_front(
+                                        hi_agent::PLAN_DRIVE_PROMPT.to_string(),
+                                    );
+                                    continue;
+                                }
+                                Some(ChordPipeline::PlanRequestChanges) => {
+                                    app.apply_plan_request_changes_local();
+                                    continue;
+                                }
+                                Some(ChordPipeline::PlanQuit) => {
+                                    app.apply_plan_quit_local();
                                     continue;
                                 }
                                 None => {}
@@ -576,11 +536,17 @@ pub(crate) async fn drive<T>(
     }
     app.waiting_for = None;
     app.confirmation = None;
+    app.confirmation_waiting = 0;
     // Never leave the agent blocked on a oneshot that the modal dropped.
     // Turn completion, input EOF, and plain Ctrl+C can exit while a confirm
     // is still outstanding — resolve it explicitly so tool code sees Cancelled
     // rather than a disconnected channel.
     if let Some(request) = pending_confirmation.take() {
+        let _ = request
+            .response
+            .send(hi_agent::ConfirmationResult::Cancelled);
+    }
+    while let Some(request) = confirm_queue.pop_front() {
         let _ = request
             .response
             .send(hi_agent::ConfirmationResult::Cancelled);

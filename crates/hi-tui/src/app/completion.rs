@@ -89,7 +89,8 @@ impl crate::App {
     /// Matching is fuzzy: a prefix that matches the start of a path *or* the
     /// start of a filename (the last segment) ranks highest, then subsequence
     /// matches. Capped so a huge repo can't flood the menu. The `insert`
-    /// replaces the `@prefix` token with `@path` followed by a space.
+    /// replaces the `@prefix` token with `@path` and no trailing space so the
+    /// user can type `:N-M` next.
     fn path_completion_items(&self, prefix: &str) -> Vec<CompletionItem> {
         const MAX: usize = 12;
         let prefix_lower = prefix.to_lowercase();
@@ -123,7 +124,7 @@ impl crate::App {
             .map(|path| CompletionItem {
                 label: path.clone(),
                 help: String::new(),
-                insert: format!("{before}@{path} "),
+                insert: format!("{before}@{path}"),
                 submit_on_enter: false,
             })
             .collect()

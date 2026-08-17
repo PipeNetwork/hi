@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod config;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 pub mod diff_adapter;
 pub mod expert_pool;
 pub mod expert_stream;

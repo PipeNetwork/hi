@@ -901,15 +901,8 @@ impl crate::Agent {
                 let mut prepared_delegates: Vec<(usize, DelegateJob, u64)> = Vec::new();
                 let mut delegate_prep_failed: Vec<usize> = Vec::new();
                 for &i in &delegate_indices {
-                    let (id, _, arguments) = &calls[i];
-                    if let Some((mut job, ledger_rev)) = self.prepare_delegate(arguments) {
-                        let summary = crate::clip_subagent_description(&job.task);
-                        let delegate_id = format!("delegate-{}", job.slot);
-                        ui.subagent_spawned(&delegate_id, "delegate", &summary, false);
-                        ui.subagent_progress(&delegate_id, "running");
-                        job.progress =
-                            crate::subagent_progress::bound_sink_progress(ui, &delegate_id);
-                        ui.tool_call_id(id, "delegate", arguments);
+                    let (_, _, arguments) = &calls[i];
+                    if let Some((job, ledger_rev)) = self.prepare_delegate(arguments) {
                         prepared_delegates.push((i, job, ledger_rev));
                     } else {
                         delegate_prep_failed.push(i);
@@ -1008,6 +1001,19 @@ impl crate::Agent {
                         *sched_serial_runs += prepared_delegates.len() as u32;
                         *sched_max_concurrent = (*sched_max_concurrent).max(1);
                         continue;
+                    }
+                    // Spawn live rows only once we know these jobs will run in
+                    // parallel. Preparing then falling back to serial used to
+                    // emit a row here and a second row from `handle_delegate`.
+                    for (i, job, _) in prepared_delegates.iter_mut() {
+                        let (id, _, arguments) = &calls[*i];
+                        let summary = crate::clip_subagent_description(&job.task);
+                        let delegate_id = format!("delegate-{}", job.slot);
+                        ui.subagent_spawned(&delegate_id, "delegate", &summary, false);
+                        ui.subagent_progress(&delegate_id, "running");
+                        job.progress =
+                            crate::subagent_progress::bound_sink_progress(ui, &delegate_id);
+                        ui.tool_call_id(id, "delegate", arguments);
                     }
                     // Run prepared delegates concurrently and process each
                     // completion immediately. The runner's destination merge is

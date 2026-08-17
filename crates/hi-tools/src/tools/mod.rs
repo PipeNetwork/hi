@@ -887,6 +887,9 @@ async fn run_streaming(
         let args: BashArgs = parse(arguments)?;
         return run_bash_tool(root, state_root, resources, args, on_line).await;
     }
+    if name == "bash_output" {
+        return run_bash_output(resources, arguments, on_line).await;
+    }
     // All other tools: delegate to the normal path (on_line unused).
     run(root, state_root, resources, name, arguments).await
 }
@@ -949,37 +952,7 @@ async fn run(
             // dispatch path and the streaming path (execute_streaming) clear it.
             run_bash_tool(root, state_root, resources, args, &mut |_| {}).await
         }
-        "bash_output" => {
-            #[derive(Deserialize)]
-            struct Args {
-                id: String,
-                /// `None` (omitted) → adaptive default wait: an empty poll of
-                /// a running process parks on the registry's watcher with
-                /// escalating patience instead of returning instantly, so
-                /// waiting never becomes an API-round-trip-per-poll loop.
-                /// `Some(0)` → explicit instant peek. `Some(n)` → park up to
-                /// `n` seconds (capped at 600).
-                wait_secs: Option<u64>,
-            }
-            let args: Args = parse(arguments)?;
-            let result = match args.wait_secs {
-                None => resources.background.poll_wait_default(&args.id).await?,
-                Some(0) => resources.background.poll(&args.id)?,
-                Some(secs) => {
-                    resources
-                        .background
-                        .poll_wait(&args.id, std::time::Duration::from_secs(secs.min(600)))
-                        .await?
-                }
-            };
-            let background = resources.background.outcome(&args.id)?;
-            if let Ok(mut cache) = resources.read_cache.lock() {
-                cache.clear();
-            }
-            let mut outcome = background_tool_outcome(condense(&result), background);
-            attach_background_effects(&mut outcome, resources.background, &args.id).await;
-            Ok(outcome)
-        }
+        "bash_output" => run_bash_output(resources, arguments, &mut |_| {}).await,
         "bash_kill" => {
             #[derive(Deserialize)]
             struct Args {
@@ -1099,6 +1072,47 @@ pub(super) async fn attach_background_effects(
             }
         }
     }
+}
+
+async fn run_bash_output(
+    resources: RuntimeResources<'_>,
+    arguments: &str,
+    on_line: &mut (dyn FnMut(&str) + Send),
+) -> Result<ToolOutcome> {
+    #[derive(Deserialize)]
+    struct Args {
+        id: String,
+        /// `None` (omitted) → adaptive default wait. `Some(0)` → instant peek.
+        /// `Some(n)` → park up to `n` seconds (capped at 600).
+        wait_secs: Option<u64>,
+    }
+    let args: Args = parse(arguments)?;
+    let result = match args.wait_secs {
+        None => {
+            resources
+                .background
+                .poll_wait_default_streaming(&args.id, on_line)
+                .await?
+        }
+        Some(0) => resources.background.poll(&args.id)?,
+        Some(secs) => {
+            resources
+                .background
+                .poll_wait_streaming(
+                    &args.id,
+                    std::time::Duration::from_secs(secs.min(600)),
+                    on_line,
+                )
+                .await?
+        }
+    };
+    let background = resources.background.outcome(&args.id)?;
+    if let Ok(mut cache) = resources.read_cache.lock() {
+        cache.clear();
+    }
+    let mut outcome = background_tool_outcome(condense(&result), background);
+    attach_background_effects(&mut outcome, resources.background, &args.id).await;
+    Ok(outcome)
 }
 
 pub(super) fn background_tool_outcome(

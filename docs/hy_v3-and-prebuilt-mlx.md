@@ -69,7 +69,7 @@ pip `mlx` package dir that contains `lib/libmlx.dylib`, `lib/mlx.metallib`,
 pip install --target /path/to/mlx-0311 "mlx==0.31.1"
 
 HI_MLX_SYSTEM_MLX_PREFIX=/path/to/mlx-0311/mlx \
-  cargo build --release -p hi-mlx
+  cargo build --release -p hi-mlx --features mlx
 ```
 
 This required coordinated changes (all vendored + `[patch.crates-io]`'d from the

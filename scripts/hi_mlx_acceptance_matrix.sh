@@ -154,8 +154,8 @@ Runs the native hi-mlx acceptance smoke matrix:
 
 Options:
   --no-download     Require model directories to already exist.
-  --skip-build      Do not run cargo build -p hi-mlx.
-  --skip-unit       Do not run cargo test -p hi-mlx before the matrix.
+  --skip-build      Do not run cargo build -p hi-mlx --features mlx.
+  --skip-unit       Do not run cargo test -p hi-mlx --features mlx before the matrix.
   --skip-tool       Skip the tool-call smoke check.
   --skip-multimodal Skip the image/audio smoke check (auto-skips text-only models).
   -h, --help        Show this help.
@@ -429,12 +429,12 @@ log "artifacts: $ARTIFACT_DIR"
 
 if ((run_build)); then
   log "building hi and hi-mlx"
-  cargo build -p hi -p hi-mlx
+  cargo build -p hi -p hi-mlx --features hi-mlx/mlx
 fi
 
 if ((run_unit)); then
   log "running native hi-mlx tests"
-  cargo test -p hi-mlx
+  cargo test -p hi-mlx --features mlx
 fi
 
 failures=0

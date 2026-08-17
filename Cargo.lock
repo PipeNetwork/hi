@@ -3191,7 +3191,6 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "futures-util",
- "serde",
  "serde_json",
  "tokio",
 ]
@@ -3510,6 +3509,7 @@ version = "0.3.1"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
+ "chrono",
  "criterion",
  "crossterm",
  "eye_declare",

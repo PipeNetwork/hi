@@ -694,6 +694,7 @@ pub(crate) async fn repl(
                         }
                         Command::Plan(_)
                         | Command::ViewPlan
+                        | Command::Memory
                         | Command::Fork(_)
                         | Command::Rewind(_)
                         | Command::Permissions(_)

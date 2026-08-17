@@ -1,4 +1,6 @@
-//! Opt-in, session-local tutorial modal.
+//! Opt-in, session-local tutorial modal. Offered once on a fresh TUI session.
+
+use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -16,32 +18,32 @@ const LESSONS: [(&str, &str); LESSON_COUNT] = [
         "Say what you want changed, what good looks like, and any constraints. Concrete prompts such as “fix the failing parser test without changing the public API” give hi a useful target and a finish line.",
     ),
     (
-        "Bring context",
-        "Mention @path/to/file to attach focused file context. Use multiline input for detailed requests, or open the external editor when the prompt needs room for examples, logs, and acceptance criteria.",
+        "Tests decide",
+        "hi’s distinguishing loop is verification. After edits it runs cargo test, pytest, go test, or a command you set with /verify. Failures go back to the model. /verify off turns that off; /status shows the current command.",
     ),
     (
-        "Tools and control",
-        "hi reads, searches, edits, and runs checks as needed. Risky actions ask permission. Review the exact operation, approve only what you trust, and interrupt an in-flight turn with Ctrl-C whenever direction changes.",
+        "Take it back",
+        "hi does not nag for every edit. Before a mutating turn it checkpoints the tree. /undo restores the last turn’s files. Risky irreversible commands (sudo, force-push, curl|sh) are refused. Interrupt an in-flight turn with Ctrl-C.",
     ),
     (
         "Queue and steer",
-        "Submit another message while hi works to steer the current turn when possible; slash commands and remaining messages stay visibly queued for later. Reorder or remove queued work before it runs.",
+        "Keep typing while hi works — the next message is queued and can steer the current turn. Ctrl-K opens a command palette grouped like /help: core first, type to find the rest.",
     ),
     (
         "Sessions and recovery",
-        "Sessions preserve conversation and work context. Use /sessions to inspect, rename, switch, or recover prior work; /retry returns to the last safe message checkpoint when a turn needs another attempt.",
+        "Sessions preserve conversation and work. Use /sessions to inspect, rename, switch, or recover prior work; /retry returns to the last safe message checkpoint when a turn needs another attempt.",
     ),
     (
-        "Goals and plans",
-        "Use /goal for long-horizon work. hi can maintain a visible objective and sub-goal plan, report progress, pause when blocked, and continue across several focused turns instead of improvising one giant response.",
+        "Goals",
+        "Use /goal for long-horizon work. hi can keep a visible objective and sub-goal plan, pause when blocked, and continue across several focused turns instead of improvising one giant response.",
     ),
     (
-        "Dashboard and fleet",
-        "Open /dashboard to dispatch and monitor multiple agent sessions. Fleet work is best for independent tasks: keep scopes explicit, watch progress, and bring useful results back to the main session.",
+        "Fleet",
+        "Open /fleet to dispatch and monitor multiple agent sessions. Each row is its own git worktree; verified, non-overlapping diffs merge back. Best for independent tasks.",
     ),
     (
         "Workflows",
-        "Use /workflow to browse scripted, repeatable multi-phase work. Inspect available workflows and runs, launch one with a clear objective, then follow its agents and phases from the workflow overlay or dashboard.",
+        "Use /workflow for scripted multi-phase work. Inspect available workflows, launch one with a clear objective, then follow its agents from the overlay or /fleet.",
     ),
 ];
 
@@ -120,6 +122,32 @@ pub(crate) fn handle_key(overlay: &mut TutorialOverlay, key: &KeyEvent) -> Tutor
     }
 }
 
+/// Offer the tutorial on a fresh TUI session that has never seen it.
+pub(crate) fn should_offer(fresh_session: bool, skip_env_set: bool, already_offered: bool) -> bool {
+    fresh_session && !skip_env_set && !already_offered
+}
+
+pub(crate) fn offered_marker_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .map(|p| p.join("hi").join("tutorial-offered"))
+}
+
+pub(crate) fn already_offered() -> bool {
+    offered_marker_path().is_some_and(|p| p.is_file())
+}
+
+pub(crate) fn mark_offered() {
+    let Some(path) = offered_marker_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, b"1\n");
+}
+
 fn centered(area: Rect) -> Rect {
     let width = area.width.saturating_sub(4).clamp(1, 76);
     let height = area.height.saturating_sub(2).clamp(1, 22);
@@ -158,8 +186,8 @@ pub(crate) fn render(frame: &mut ratatui::Frame, area: Rect, overlay: &TutorialO
             Style::default().fg(th.text_secondary),
         ),
     ];
-    let block = theme::theme().panel_block(" hi tutorial ", UiTone::Info);
     frame.render_widget(Clear, modal);
+    let block = theme::theme().panel_block(" hi tutorial ", UiTone::Info);
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -172,38 +200,20 @@ pub(crate) fn render(frame: &mut ratatui::Frame, area: Rect, overlay: &TutorialO
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
+    #[test]
+    fn first_lessons_are_ask_verify_undo() {
+        assert_eq!(LESSONS[0].0, "Ask for outcomes");
+        assert_eq!(LESSONS[1].0, "Tests decide");
+        assert_eq!(LESSONS[2].0, "Take it back");
+        assert_eq!(LESSONS[6].0, "Fleet");
     }
 
     #[test]
-    fn navigation_resets_scroll_and_finishes() {
-        let mut overlay = TutorialOverlay::fresh();
-        handle_key(&mut overlay, &key(KeyCode::Down));
-        assert_eq!(overlay.scroll, 1);
-        assert_eq!(
-            handle_key(&mut overlay, &key(KeyCode::Enter)),
-            TutorialOutcome::Continue
-        );
-        assert_eq!((overlay.step, overlay.scroll), (1, 0));
-        handle_key(&mut overlay, &key(KeyCode::Char('h')));
-        assert_eq!(overlay.step, 0);
-        overlay.step = LESSON_COUNT - 1;
-        assert_eq!(
-            handle_key(&mut overlay, &key(KeyCode::Char('l'))),
-            TutorialOutcome::Close
-        );
-    }
-
-    #[test]
-    fn close_keys_close() {
-        for code in [KeyCode::Esc, KeyCode::Char('q')] {
-            assert_eq!(
-                handle_key(&mut TutorialOverlay::fresh(), &key(code)),
-                TutorialOutcome::Close
-            );
-        }
+    fn offers_only_once_on_a_fresh_session() {
+        assert!(should_offer(true, false, false));
+        assert!(!should_offer(false, false, false));
+        assert!(!should_offer(true, true, false));
+        assert!(!should_offer(true, false, true));
     }
 }

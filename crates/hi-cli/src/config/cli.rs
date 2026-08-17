@@ -1,5 +1,22 @@
 use super::*;
 
+const CLI_COMMANDS_HELP: &str = "\
+Commands:
+  setup              Interactive provider wizard (bare `hi setup` only)
+  doctor             Diagnose config, credentials, git, and MCP
+  update             Update the hi binary
+  workflow           Run or inspect a workflow
+  trace              List, show, or verify local traces
+  resume             Continue the latest session (same as -c)
+  runtime            Manage the local model sidecar
+  hf                 Hugging Face / local-model helpers
+  diff-lab           Differential fuzzing lab
+
+`hi setup fix nginx` is a prompt, not the wizard. Power commands (eval, bench,
+metrics) stay available as argv[1] dispatchers; `hi --help` lists the ones
+people look for first.
+";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum CliTraceCapture {
     Metadata,
@@ -10,7 +27,7 @@ pub enum CliTraceCapture {
 /// (OpenRouter, pipenetwork.ai, Ollama, llama.cpp, vLLM) or the native
 /// Anthropic API.
 #[derive(Parser, Debug)]
-#[command(name = "hi", version, about)]
+#[command(name = "hi", version, about, after_help = CLI_COMMANDS_HELP)]
 pub struct Cli {
     /// Named profile from the config file.
     #[arg(short = 'p', long)]
@@ -322,8 +339,9 @@ pub struct Cli {
     #[arg(long)]
     pub benchmark_orchestration: bool,
 
-    /// Run N candidate attempts in isolated git worktrees and keep the first
-    /// that passes the resolved verification pipeline. Requires a prompt.
+    /// Run N isolated worktree attempts and keep a passing candidate.
+    /// This is the headless form of `/race`: same verify gate and ranking.
+    /// Requires a prompt.
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub best_of: u32,
 

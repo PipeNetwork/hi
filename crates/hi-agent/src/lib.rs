@@ -13,6 +13,7 @@ pub mod doctor;
 mod domain;
 pub mod events;
 mod goal;
+pub mod help;
 mod heuristics;
 mod hygiene;
 pub mod learning;
@@ -93,7 +94,7 @@ pub use heuristics::{humanize_count, looks_like_new_task};
 pub use hi_tools::{PlanStatus, PlanStep};
 pub use local_skeptic::LocalSkepticOutcome;
 pub use memory::{
-    AnnotatedBullet, global_memory_file, memory_file, memory_section_for_task,
+    AnnotatedBullet, global_memory_file, memory_file, memory_file_at, memory_section_for_task,
     rank_project_bullets, read_global_memory, read_memory, read_project_annotated,
     read_project_annotated_at, should_distill_memory,
 };

@@ -1,6 +1,7 @@
 //! Command palette (Ctrl-K): fuzzy-filter slash commands and actions.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use hi_agent::help::{CORE_COMMANDS, HelpSection, command_section};
 
 /// One row in the command palette.
 #[derive(Clone, Debug)]
@@ -11,6 +12,8 @@ pub(crate) struct PaletteItem {
     pub label: String,
     /// Short help blurb.
     pub help: String,
+    /// Disclosure group. `None` for uncategorized builtins.
+    pub section: Option<HelpSection>,
 }
 
 /// Interactive Ctrl-K palette state.
@@ -31,7 +34,6 @@ impl CommandPalette {
     pub fn refilter(&mut self) {
         let needle = self.query.to_ascii_lowercase();
         let mut items = builtin_items();
-        // Slash command specs from hi-agent.
         for spec in hi_agent::command::COMMANDS {
             items.push(PaletteItem {
                 command: if spec.args.is_empty() {
@@ -41,19 +43,28 @@ impl CommandPalette {
                 },
                 label: format!("/{}", spec.name),
                 help: spec.help.to_string(),
+                section: command_section(spec.name),
             });
         }
         // De-dupe by label (builtins may overlap).
         let mut seen = std::collections::HashSet::new();
         items.retain(|i| seen.insert(i.label.clone()));
 
-        if !needle.is_empty() {
+        if needle.is_empty() {
+            // Empty palette is the front door: core, then project, then modes.
+            items.retain(|i| {
+                matches!(
+                    i.section,
+                    Some(HelpSection::Core | HelpSection::Project | HelpSection::Modes)
+                )
+            });
+            items.sort_by(|a, b| empty_palette_rank(a).cmp(&empty_palette_rank(b)));
+        } else {
             items.retain(|i| {
                 i.label.to_ascii_lowercase().contains(&needle)
                     || i.help.to_ascii_lowercase().contains(&needle)
                     || i.command.to_ascii_lowercase().contains(&needle)
             });
-            // Prefer prefix matches.
             items.sort_by_key(|i| {
                 let l = i.label.to_ascii_lowercase();
                 (
@@ -62,8 +73,6 @@ impl CommandPalette {
                     l,
                 )
             });
-        } else {
-            items.sort_by(|a, b| a.label.cmp(&b.label));
         }
         self.items = items;
         self.selected = 0;
@@ -137,27 +146,47 @@ pub(crate) enum PaletteOutcome {
     Accept(String),
 }
 
+fn empty_palette_rank(item: &PaletteItem) -> (u8, usize, String) {
+    let section_ord = match item.section {
+        None => 0,
+        Some(HelpSection::Core) => 1,
+        Some(HelpSection::Project) => 2,
+        Some(HelpSection::Modes) => 3,
+        Some(HelpSection::Platform) => 4,
+    };
+    let core_idx = item
+        .label
+        .strip_prefix('/')
+        .and_then(|name| CORE_COMMANDS.iter().position(|n| *n == name))
+        .unwrap_or(usize::MAX);
+    (section_ord, core_idx, item.label.clone())
+}
+
 fn builtin_items() -> Vec<PaletteItem> {
     vec![
+        PaletteItem {
+            command: "/tutorial".into(),
+            label: "/tutorial".into(),
+            help: "interactive tour".into(),
+            section: Some(HelpSection::Core),
+        },
         PaletteItem {
             command: "/density".into(),
             label: "/density".into(),
             help: "cycle transcript density".into(),
+            section: None,
         },
         PaletteItem {
             command: "/theme".into(),
             label: "/theme".into(),
             help: "cycle color theme".into(),
+            section: None,
         },
         PaletteItem {
             command: "/help".into(),
             label: "/help".into(),
-            help: "list slash commands".into(),
-        },
-        PaletteItem {
-            command: "/tutorial".into(),
-            label: "/tutorial".into(),
-            help: "open the interactive hi tutorial".into(),
+            help: "core commands; /help all for the rest".into(),
+            section: Some(HelpSection::Core),
         },
     ]
 }
@@ -167,10 +196,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn open_lists_commands() {
+    fn open_lists_everyday_commands() {
         let p = CommandPalette::open();
         assert!(p.items.len() > 5);
         assert!(p.items.iter().any(|i| i.label == "/help"));
+        assert!(p.items.iter().any(|i| i.label == "/verify"));
+        assert!(p.items.iter().any(|i| i.label == "/fleet"));
+        assert!(
+            !p.items.iter().any(|i| i.label == "/rsi"),
+            "empty palette hides platform commands"
+        );
+        assert!(
+            !p.items.iter().any(|i| i.label == "/dashboard"),
+            "empty palette hides /dashboard alias"
+        );
+    }
+
+    #[test]
+    fn filter_finds_platform_commands() {
+        let mut p = CommandPalette::open();
+        p.insert('r');
+        p.insert('s');
+        p.insert('i');
+        assert!(
+            p.items.iter().any(|i| i.label == "/rsi"),
+            "search still finds platform commands: {:?}",
+            p.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
     }
 
     #[test]

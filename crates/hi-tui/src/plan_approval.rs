@@ -1,0 +1,402 @@
+//! Plan-approval card parked when leaving plan mode with leftover checklist work.
+//!
+//! Approve starts leftover drive. Request changes returns to plan mode so the
+//! user can type feedback (line comments are included). Quit turns plan mode
+//! off and pauses auto-drive. Esc parks the card so keys return to the
+//! composer; `/view-plan` or a click on the turn-status row reopens it.
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use hi_agent::Agent;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{BorderType, Paragraph, Wrap};
+
+use crate::App;
+use crate::render::dim;
+use crate::theme::{UiTone, theme};
+
+const CHOICES: [&str; 3] = [
+    "Approve — leave plan mode and start implementing",
+    "Request changes — stay in plan mode and edit the plan",
+    "Quit — turn plan mode off without driving",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanApprovalFocus {
+    Preview,
+    Choices,
+    Commenting,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlanComment {
+    pub step: usize,
+    pub text: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlanApproval {
+    pub selected: usize,
+    pub preview_sel: usize,
+    pub focus: PlanApprovalFocus,
+    pub parked: bool,
+    pub comments: Vec<PlanComment>,
+    pub comment_draft: String,
+}
+
+impl PlanApproval {
+    pub(crate) fn new() -> Self {
+        Self {
+            selected: 0,
+            preview_sel: 0,
+            focus: PlanApprovalFocus::Preview,
+            parked: false,
+            comments: Vec::new(),
+            comment_draft: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanApprovalOutcome {
+    Continue,
+    Approve,
+    RequestChanges,
+    Quit,
+}
+
+pub(crate) fn leftover_indices(app: &App) -> Vec<usize> {
+    app.plan
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            matches!(
+                step.status,
+                hi_agent::PlanStatus::Pending | hi_agent::PlanStatus::Active
+            )
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+pub(crate) fn handle_key(app: &mut App, key: &KeyEvent) -> PlanApprovalOutcome {
+    let leftover = leftover_indices(app);
+    let Some(card) = app.plan_approval.as_mut() else {
+        return PlanApprovalOutcome::Continue;
+    };
+    if card.parked {
+        return PlanApprovalOutcome::Continue;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match card.focus {
+        PlanApprovalFocus::Commenting => match key.code {
+            KeyCode::Esc => {
+                card.comment_draft.clear();
+                card.focus = PlanApprovalFocus::Preview;
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Enter => {
+                let text = card.comment_draft.trim().to_string();
+                if !text.is_empty() {
+                    let step = leftover
+                        .get(card.preview_sel)
+                        .copied()
+                        .unwrap_or(card.preview_sel);
+                    card.comments.push(PlanComment { step, text });
+                }
+                card.comment_draft.clear();
+                card.focus = PlanApprovalFocus::Preview;
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Backspace => {
+                card.comment_draft.pop();
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Char(c) if !ctrl => {
+                card.comment_draft.push(c);
+                PlanApprovalOutcome::Continue
+            }
+            _ => PlanApprovalOutcome::Continue,
+        },
+        PlanApprovalFocus::Preview => match key.code {
+            KeyCode::Up | KeyCode::Char('k') if !ctrl => {
+                card.preview_sel = card.preview_sel.saturating_sub(1);
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') if !ctrl => {
+                let last = leftover.len().saturating_sub(1);
+                card.preview_sel = (card.preview_sel + 1).min(last);
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Tab => {
+                card.focus = PlanApprovalFocus::Choices;
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Char('c') if !ctrl => {
+                card.comment_draft.clear();
+                card.focus = PlanApprovalFocus::Commenting;
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Char('1') | KeyCode::Char('a') if !ctrl => PlanApprovalOutcome::Approve,
+            KeyCode::Char('2') | KeyCode::Char('r') if !ctrl => PlanApprovalOutcome::RequestChanges,
+            KeyCode::Char('3') | KeyCode::Char('q') if !ctrl => PlanApprovalOutcome::Quit,
+            KeyCode::Esc => {
+                card.parked = true;
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Enter => {
+                card.focus = PlanApprovalFocus::Choices;
+                PlanApprovalOutcome::Continue
+            }
+            _ => PlanApprovalOutcome::Continue,
+        },
+        PlanApprovalFocus::Choices => match key.code {
+            KeyCode::Up | KeyCode::Char('k') if !ctrl => {
+                card.selected = card.selected.saturating_sub(1);
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') if !ctrl => {
+                card.selected = (card.selected + 1).min(CHOICES.len() - 1);
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::BackTab | KeyCode::Tab => {
+                card.focus = PlanApprovalFocus::Preview;
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Char('1') | KeyCode::Char('a') if !ctrl => PlanApprovalOutcome::Approve,
+            KeyCode::Char('2') | KeyCode::Char('r') if !ctrl => PlanApprovalOutcome::RequestChanges,
+            KeyCode::Char('3') | KeyCode::Char('q') if !ctrl => PlanApprovalOutcome::Quit,
+            KeyCode::Esc => {
+                card.parked = true;
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Enter => match card.selected {
+                1 => PlanApprovalOutcome::RequestChanges,
+                2 => PlanApprovalOutcome::Quit,
+                _ => PlanApprovalOutcome::Approve,
+            },
+            _ => PlanApprovalOutcome::Continue,
+        },
+    }
+}
+
+pub(crate) fn render(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let Some(card) = &app.plan_approval else {
+        return;
+    };
+    if card.parked {
+        return;
+    }
+    let th = theme();
+    let leftover_idx = leftover_indices(app);
+    let mut body = vec![
+        Line::styled(
+            "Plan mode left leftover work. Review it before driving.",
+            Style::default()
+                .fg(th.accent_plan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    if leftover_idx.is_empty() {
+        body.push(Line::styled("No checklist steps left.", dim()));
+    } else {
+        body.push(Line::styled(
+            format!("{} leftover step(s):", leftover_idx.len()),
+            Style::default().fg(th.text_secondary),
+        ));
+        for (i, &step_i) in leftover_idx.iter().enumerate().take(8) {
+            let title = app.plan.get(step_i).map(|s| s.title.as_str()).unwrap_or("");
+            let notes: Vec<_> = card.comments.iter().filter(|c| c.step == step_i).collect();
+            let selected = card.focus != PlanApprovalFocus::Choices && i == card.preview_sel;
+            let mark = if selected { "▶ " } else { "  " };
+            if selected {
+                let mut fence = None;
+                body.push(crate::render::markdown_line(
+                    &format!("{mark}▸ {title}"),
+                    &mut fence,
+                ));
+                for comment in &notes {
+                    body.extend(crate::render::markdown_body_lines(&format!(
+                        "> {}",
+                        comment.text
+                    )));
+                }
+            } else {
+                let mut line = format!("{mark}▸ {title}");
+                if !notes.is_empty() {
+                    let n = notes.len();
+                    line.push_str(&format!("  ({n} comment{})", if n == 1 { "" } else { "s" }));
+                }
+                body.push(Line::styled(line, dim()));
+            }
+        }
+        if leftover_idx.len() > 8 {
+            body.push(Line::styled(
+                format!("  … +{} more", leftover_idx.len() - 8),
+                dim(),
+            ));
+        }
+    }
+    body.push(Line::raw(""));
+    if card.focus == PlanApprovalFocus::Commenting {
+        body.push(Line::styled(
+            "Comment on this step:",
+            Style::default().fg(th.text_secondary),
+        ));
+        body.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::raw(card.comment_draft.clone()),
+            Span::styled("▏", dim()),
+        ]));
+        body.push(Line::styled(" Enter save · Esc cancel", dim()));
+    } else {
+        for (i, label) in CHOICES.iter().enumerate() {
+            if card.focus == PlanApprovalFocus::Choices && i == card.selected {
+                body.push(Line::styled(
+                    format!("▶ {label}"),
+                    Style::default()
+                        .fg(th.accent_plan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                body.push(Line::styled(format!("  {label}"), dim()));
+            }
+        }
+    }
+    let hint = match card.focus {
+        PlanApprovalFocus::Preview => {
+            " j/k steps · c comment · Tab choices · a approve · Esc park "
+        }
+        PlanApprovalFocus::Choices => {
+            " j/k · Enter · a approve · r request changes · q quit · Esc park "
+        }
+        PlanApprovalFocus::Commenting => " type a comment · Enter save · Esc back ",
+    };
+    let block = th
+        .panel_block(" Plan approval ", UiTone::Warning)
+        .border_type(BorderType::Rounded)
+        .title_bottom(Line::styled(hint, dim()));
+    frame.render_widget(
+        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+impl App {
+    pub(crate) fn plan_approval_capturing(&self) -> bool {
+        self.plan_approval.as_ref().is_some_and(|p| !p.parked)
+    }
+
+    pub(crate) fn unpark_plan_approval(&mut self) {
+        if let Some(card) = self.plan_approval.as_mut() {
+            card.parked = false;
+            card.focus = PlanApprovalFocus::Preview;
+            self.status = "Waiting on plan approval".into();
+        }
+    }
+
+    pub(crate) fn open_plan_approval(&mut self) {
+        self.plan_approval = Some(PlanApproval::new());
+        self.status = "Waiting on plan approval".into();
+    }
+
+    pub(crate) fn maybe_open_plan_approval(&mut self) {
+        if self.plan_approval.is_some() {
+            return;
+        }
+        if self.plan_mode {
+            return;
+        }
+        if !self.plan_has_leftover() {
+            return;
+        }
+        if self
+            .goal
+            .as_ref()
+            .is_some_and(hi_agent::Goal::has_drive_work)
+        {
+            return;
+        }
+        self.open_plan_approval();
+    }
+
+    fn comment_prompt(&self) -> Option<String> {
+        let card = self.plan_approval.as_ref()?;
+        if card.comments.is_empty() {
+            return None;
+        }
+        let mut out = String::from("Please revise the plan:\n");
+        for comment in &card.comments {
+            let title = self
+                .plan
+                .get(comment.step)
+                .map(|s| s.title.as_str())
+                .unwrap_or("step");
+            out.push_str(&format!("- [{title}]: {}\n", comment.text));
+        }
+        Some(out)
+    }
+
+    pub(crate) fn apply_plan_approve(&mut self, agent: &mut Agent) {
+        self.plan_approval = None;
+        self.plan_mode = false;
+        self.plan_drive_paused = false;
+        self.session_face_dirty = true;
+        self.push_session_face(agent);
+        self.status = "plan approved — driving leftover work".into();
+    }
+
+    pub(crate) fn apply_plan_request_changes(&mut self, agent: &mut Agent) {
+        let prompt = self.comment_prompt();
+        self.plan_approval = None;
+        self.plan_mode = true;
+        self.permission_mode = hi_agent::PermissionMode::Ask;
+        self.session_face_dirty = true;
+        self.push_session_face(agent);
+        if let Some(prompt) = prompt {
+            self.input.set(&prompt);
+        }
+        self.status = "back in plan mode — type changes, then Enter".into();
+    }
+
+    pub(crate) fn apply_plan_quit(&mut self, agent: &mut Agent) {
+        self.plan_approval = None;
+        self.plan_mode = false;
+        self.plan_drive_paused = true;
+        self.session_face_dirty = true;
+        self.push_session_face(agent);
+        self.status = "plan drive paused".into();
+    }
+
+    /// Mid-turn / no-agent path: flip App flags; [`App::push_session_face`]
+    /// applies them when the agent is free again.
+    pub(crate) fn apply_plan_approve_local(&mut self) {
+        self.plan_approval = None;
+        self.plan_mode = false;
+        self.plan_drive_paused = false;
+        self.session_face_dirty = true;
+        self.status = "plan approved — driving leftover work".into();
+    }
+
+    pub(crate) fn apply_plan_request_changes_local(&mut self) {
+        let prompt = self.comment_prompt();
+        self.plan_approval = None;
+        self.plan_mode = true;
+        self.permission_mode = hi_agent::PermissionMode::Ask;
+        self.session_face_dirty = true;
+        if let Some(prompt) = prompt {
+            self.input.set(&prompt);
+        }
+        self.status = "back in plan mode — type changes, then Enter".into();
+    }
+
+    pub(crate) fn apply_plan_quit_local(&mut self) {
+        self.plan_approval = None;
+        self.plan_mode = false;
+        self.plan_drive_paused = true;
+        self.session_face_dirty = true;
+        self.status = "plan drive paused".into();
+    }
+}

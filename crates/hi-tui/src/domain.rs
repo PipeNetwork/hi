@@ -50,6 +50,8 @@ impl OverlayDomain {
     #[inline]
     pub(crate) fn any_hard(app: &App) -> bool {
         app.confirmation.is_some()
+            || app.plan_approval_capturing()
+            || app.memory_browser.is_some()
             || app.picker.is_some()
             || app.provider_picker.is_some()
             || app.provider_form.is_some()
@@ -58,6 +60,9 @@ impl OverlayDomain {
             || app.workflow_overlay.is_some()
             || app.inspect_subagent.is_some()
             || app.tasks_overlay.is_some()
+            || app.block_viewer.is_some()
+            || app.jump_picker.is_some()
+            || app.rewind_picker.is_some()
             || app.diff_lab.is_some()
     }
 

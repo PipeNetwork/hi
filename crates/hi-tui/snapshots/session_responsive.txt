@@ -1,49 +1,49 @@
 --- 120x24 ---
 
-  /workspace                                                                    reasoning off │ comfortable · out:fold
+  /workspace                                                                                        sandbox off │ undo
 
-  ┃ review the responsive layout                                        ╭ btw · working ─────────────────────────────╮
-  ┃ The layout is stable.                                               │❓  why?                                     │
-  ┃ ⏺ thought for 3s  (Ctrl-T to expand)                                │                                            │
-  ┃ … +17 more lines · Ctrl-O to expand                                 │                                            │
-                                                                        │                                            │
-                                                                        │                                            │
-                                                                        │                                            │
-                                                                        │                                            │
-                                                                        │                                            │
-                                                                        │                                            │
-                                                                        │                                            │
-                                                                        │                                            │
-                                                                        │                                            │
-                                                                        │                                            │
-  ⠋ Working… 0s   Ctrl-C to interrupt                                   │                                            │
-  ╭────────────────────────────────────────────────────────────────────╮│                                            │
-  │❯ next step                                                         ││                                            │
-  ╰──────────────────────────────────────────────────────────── gpt-4o ╯╰────────────────────────────────────────────╯
-
-  ctrl+c:interrupt  │  enter:queue  │  ?:help
-
---- 64x14 ---
-  /workspace
-  ┃ review the responsive layout
-  ┃ The layout is stable.
+  ❯ review the responsive layout
+  The layout is stable.
   ┃ ⏺ thought for 3s  (Ctrl-T to expand)
   ┃ … +17 more lines · Ctrl-O to expand
 
 
 
 
-  ⠋ Working… 0s   Ctrl-C to interrupt
+
+
+  ⠋ Working… 0s                                                                                                 [stop]
+
+  ╭─ /btw why? ─────────────────────────────────────────────────────────────────────────────────────────────── [Esc] ╮
+  │ ⠋ Answering…                                                                                                     │
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │❯ next step                                                                                                       │
+  ╰───────────────────────────────────────────────────────────────────────────────────────── gpt-4o · always-approve ╯
+
+  ctrl+c:interrupt  │  Shift+Tab:mode  │  ?:help
+
+--- 64x14 ---
+  /workspace                                sandbox off │ undo
+  ❯ review the responsive layout
+  The layout is stable.
+  ┃ ⏺ thought for 3s  (Ctrl-T to expand)
+  ┃ … +17 more lines · Ctrl-O to expand
+  ⠋ Working… 0s                                         [stop]
+
+  ╭─ /btw why? ─────────────────────────────────────── [Esc] ╮
+  │ ⠋ Answering…                                             │
+  ╰──────────────────────────────────────────────────────────╯
   ╭──────────────────────────────────────────────────────────╮
   │❯ next step                                               │
-  ╰────────────────────────────────────────────────── gpt-4o ╯
-  ctrl+c:interrupt  │  enter:queue  │  ?:help
+  ╰───────────────────────────────── gpt-4o · always-approve ╯
+  ctrl+c:interrupt  │  Shift+Tab:mode  │  ?:help
 --- 24x8 ---
-  ┃ ⏺ thought for 3s
-  (Ctrl-T to expand)
-  ┃ … +17 more lines ·
   Ctrl-O to expand
-  ⠋ Working… 0s   Ctrl
+  ⠋ Working… 0s [stop]
+  ╭─ /btw wh…  [Esc] ╮
+  │ ⠋ Answering…     │
+  ╰──────────────────╯
   ╭──────────────────╮
   │❯ next step       │
   ╰────────── gpt-4o ╯

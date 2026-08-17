@@ -1,4 +1,6 @@
-# `/dashboard` — control a fleet, not an agent
+# `/fleet` — control a fleet, not an agent
+
+`/dashboard` is an alias of `/fleet`.
 
 A full-screen TUI mode for dispatching, monitoring, and steering multiple concurrent agent
 sessions from one screen. Type a prompt in the dispatch box, hit Enter, and you've launched

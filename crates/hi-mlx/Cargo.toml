@@ -27,7 +27,9 @@ mlx-sys = { package = "pmetal-mlx-sys", version = "0.2.4", optional = true, defa
 libc.workspace = true
 
 [features]
-default = ["mlx"]
+# Metal/MLX is opt-in so workspace and rust-analyzer checks of this crate do
+# not compile the vendored MLX C++ stack. `hi-local --features mlx` enables it.
+default = []
 mlx = ["dep:mlx-rs", "dep:mlx-sys"]
 
 [dev-dependencies]

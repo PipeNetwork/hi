@@ -5,7 +5,8 @@ use hi_ai::ReasoningEffort;
 /// A recognized in-session command. Frontends decide how to act on each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    Help,
+    /// `/help` (core) or `/help project|modes|platform|all`.
+    Help(String),
     /// Reset the conversation, keeping only the system prompt.
     Clear,
     /// Set the model for subsequent turns (empty = report current).
@@ -50,7 +51,7 @@ pub enum Command {
     ViewPlan,
     /// Fork a peer session; optional `--worktree` / `--no-worktree` and directive.
     Fork(String),
-    /// Rewind conversation to before a user turn. Empty lists turns; `<n>` rewinds.
+    /// Rewind conversation to before a user turn. Empty opens the picker; `<n>` rewinds.
     Rewind(String),
     /// Permission ladder: empty/status, `ask`, `auto`, `always` (yolo).
     Permissions(String),
@@ -66,6 +67,8 @@ pub enum Command {
     Plugins(String),
     /// Append a durable memory note. Optional `--global` / `global`.
     Remember(String),
+    /// Browse project/global `.hi/memory.md` files.
+    Memory,
     /// Scan Claude Code config and print migration hints.
     ImportClaude(String),
     /// Local session recap (does not enter model history).
@@ -76,7 +79,7 @@ pub enum Command {
     SynthEvals,
     /// Search conversation messages for text.
     Find(String),
-    /// Jump/list user turns (same anchors as `/rewind`).
+    /// Jump to a user turn. Empty opens the picker; `<n>` scrolls to that prompt.
     Jump(String),
     /// List recent user prompts (history).
     History(String),
@@ -251,7 +254,7 @@ pub fn parse(line: &str) -> Option<Command> {
     let name = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim().to_string();
     Some(match name {
-        "help" | "h" | "?" => Command::Help,
+        "help" | "h" | "?" => Command::Help(arg),
         "clear" | "new" => Command::Clear,
         "model" | "m" => Command::Model(arg),
         "config" | "cfg" | "set" => Command::Config(arg),
@@ -285,6 +288,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "tasks" | "task" => Command::Tasks(arg),
         "plugins" | "plugin" => Command::Plugins(arg),
         "remember" | "mem" => Command::Remember(arg),
+        "memory" => Command::Memory,
         "import-claude" | "import_claude" | "claude-import" => Command::ImportClaude(arg),
         "recap" | "summarize" | "summary" => Command::Recap,
         "metrics" => Command::Metrics,
@@ -344,6 +348,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "lsp" => Command::Lsp(arg),
         "delegate" | "delegates" => Command::Delegate(arg),
         "dashboard" | "fleet" => Command::Dashboard(arg),
+        // `fleet` is the public name; `dashboard` remains a parse alias.
         "workflow" | "workflows" => Command::Workflow(arg),
         "deep-research" | "deepresearch" => Command::Workflow(if arg.is_empty() {
             "deep-research".into()
@@ -1473,9 +1478,14 @@ impl CommandSpec {
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "help",
-        args: "",
-        help: "show this help",
-        arg_values: &[],
+        args: "[project|modes|platform|all]",
+        help: "core commands; project / modes / platform / all for the rest",
+        arg_values: &[
+            ("project", "goal, init, commit, and other project commands"),
+            ("modes", "fleet, race, watch, local, workflow"),
+            ("platform", "rsi, mcp, traces, and other power commands"),
+            ("all", "every command, grouped"),
+        ],
     },
     CommandSpec {
         name: "model",
@@ -1663,7 +1673,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "race",
         args: "<task>|status|cancel|setup|apply",
-        help: "run 2–4 configured coding candidates, verify them, and review the ranked winner",
+        help: "run 2–4 coding candidates, verify them, review the winner (headless: hi --best-of N)",
         arg_values: &[
             ("status", "show the active or most recent race"),
             ("cancel", "cancel the active race"),
@@ -1868,9 +1878,21 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
+        name: "fleet",
+        args: "[status|resume <id>]",
+        help: "dispatch, monitor, and steer multiple isolated agents (TUI)",
+        arg_values: &[
+            ("status", "list this project's resumable fleet sessions"),
+            (
+                "resume",
+                "re-adopt a fleet session as a live row (most recent if no id)",
+            ),
+        ],
+    },
+    CommandSpec {
         name: "dashboard",
         args: "[status|resume <id>]",
-        help: "control a fleet: dispatch, monitor, and steer multiple agents (TUI)",
+        help: "alias of /fleet",
         arg_values: &[
             ("status", "list this project's resumable fleet sessions"),
             (
@@ -2042,7 +2064,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "rewind",
         args: "[n]",
-        help: "list user turns, or rewind conversation before turn n",
+        help: "open the turn picker, or rewind conversation before turn n",
         arg_values: &[],
     },
     CommandSpec {
@@ -2092,6 +2114,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[("--global", "write user-level ~/.config/hi/memory.md")],
     },
     CommandSpec {
+        name: "memory",
+        args: "",
+        help: "browse project and global memory files",
+        arg_values: &[],
+    },
+    CommandSpec {
         name: "import-claude",
         args: "",
         help: "scan Claude Code config and print migration hints",
@@ -2124,7 +2152,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "jump",
         args: "[n]",
-        help: "list user turns (same anchors as /rewind)",
+        help: "open the turn picker, or /jump n to scroll to that prompt",
         arg_values: &[],
     },
     CommandSpec {
@@ -2205,7 +2233,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "rewind-picker",
         args: "",
-        help: "show a richer list of conversation rewind anchors",
+        help: "open the rewind picker (same as /rewind)",
         arg_values: &[],
     },
     CommandSpec {
@@ -2317,59 +2345,7 @@ pub fn arg_matching(name: &str, prefix: &str) -> Vec<(&'static str, &'static str
         .unwrap_or_default()
 }
 
-/// Whether a command is primarily a settings toggle whose canonical home is
-/// `/config`. Kept in help under a separate section so the action list stays
-/// scannable; bare tops remain parseable aliases forever.
-fn is_settings_alias(name: &str) -> bool {
-    matches!(
-        name,
-        "model"
-            | "provider"
-            | "login"
-            | "logout"
-            | "verify"
-            | "lsp"
-            | "delegate"
-            | "theme"
-            | "density"
-            | "mouse"
-    )
-}
-
-/// Help text, generated from [`COMMANDS`] so it always lists exactly what
-/// exists. Groups settings under `/config` and marks bare tops as aliases.
-/// Includes a keybindings section so Ctrl- shortcuts aren't secret.
-pub fn help_text() -> String {
-    let mut out = String::from("commands:\n");
-    for c in COMMANDS.iter().filter(|c| !is_settings_alias(c.name)) {
-        let left = if c.args.is_empty() {
-            format!("/{}", c.name)
-        } else {
-            format!("/{} {}", c.name, c.args)
-        };
-        out.push_str(&format!("  {left:<18} {}\n", c.help));
-    }
-    out.push_str("\nsettings (also available as bare aliases):\n");
-    out.push_str(
-        "  /config [key …]   hub for model, provider, auth, reasoning, verify, lsp, ui…\n",
-    );
-    out.push_str("  /model /provider /login /logout /verify /lsp /delegate\n");
-    out.push_str("  /theme /density /mouse   (TUI; also /config ui …)\n");
-    out.push_str("aliases: /m /st /cp /redo /revert /new /changes /usage /debug /cfg /set /h /?");
-    out.push_str("\n\nkeybindings (TUI):\n");
-    out.push_str("  Ctrl-T             toggle reasoning (thinking) collapse\n");
-    out.push_str("  Ctrl-D             full-screen diff review (same as Ctrl-G)\n");
-    out.push_str("  Ctrl-?             toggle the agent observability panel\n");
-    out.push_str("  Ctrl-C             interrupt the running turn; double-press idle to quit\n");
-    out.push_str("  Ctrl-R             fuzzy-search input history\n");
-    out.push_str("  Ctrl-A / Ctrl-E    move cursor to start / end of the line\n");
-    out.push_str("  Ctrl-U             clear the input line\n");
-    out.push_str("  Alt-Enter          insert a newline (multi-line prompt)\n");
-    out.push_str("  PageUp / PageDown  scroll the transcript\n");
-    out.push_str("  Esc                clear input or dismiss panels\n");
-    out.push_str("  /quit              quit\n");
-    out
-}
+pub use crate::help::{help_text, help_text_for};
 
 #[cfg(test)]
 mod tests {
@@ -2524,7 +2500,8 @@ mod tests {
             parse("/deepresearch"),
             Some(Command::Workflow("deep-research".into()))
         );
-        assert_eq!(parse("/help"), Some(Command::Help));
+        assert_eq!(parse("/help"), Some(Command::Help(String::new())));
+        assert_eq!(parse("/help all"), Some(Command::Help("all".into())));
         assert_eq!(parse("  /q "), Some(Command::Quit));
         assert_eq!(
             parse("/model gpt-4o"),
@@ -2641,6 +2618,7 @@ mod tests {
             parse("/remember use pnpm"),
             Some(Command::Remember("use pnpm".into()))
         );
+        assert_eq!(parse("/memory"), Some(Command::Memory));
         assert_eq!(
             parse("/import-claude"),
             Some(Command::ImportClaude(String::new()))

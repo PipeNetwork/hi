@@ -182,6 +182,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     app.sync_config = sync_config;
     app.sync_session_id = sync_session_id;
     app.session_lister = session_lister;
+    if let Some(lister) = &app.session_lister {
+        app.session_completion_cache = lister();
+    }
+    app.git_branch = crate::chrome::git_branch(&app.workspace_root);
     app.session_switcher = session_switcher;
     app.session_renamer = session_renamer;
     app.session_host = session_host;
@@ -246,6 +250,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         // one-line summary of what you're walking back into.
         if let Some(summary) = &resume_summary {
             app.push(Line::styled(summary.clone(), dim()));
+        }
+        if crate::tutorial::should_offer(
+            resume_summary.is_none(),
+            std::env::var_os("HI_SKIP_TUTORIAL").is_some(),
+            crate::tutorial::already_offered(),
+        ) {
+            app.tutorial = Some(crate::tutorial::TutorialOverlay::fresh());
+            crate::tutorial::mark_offered();
         }
     }
     // Session-start ghost text from git dirty files (cheap; no model call).
@@ -1032,6 +1044,23 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 app.push(Line::styled(message, dim()));
                                 continue 'input;
                             }
+                            Some(ChordPipeline::CycleSessionMode) => {
+                                app.cycle_session_face();
+                                app.push_session_face(agent);
+                                continue 'input;
+                            }
+                            Some(ChordPipeline::PlanApprove) => {
+                                app.apply_plan_approve(agent);
+                                break 'input hi_agent::PLAN_DRIVE_PROMPT.to_string();
+                            }
+                            Some(ChordPipeline::PlanRequestChanges) => {
+                                app.apply_plan_request_changes(agent);
+                                continue 'input;
+                            }
+                            Some(ChordPipeline::PlanQuit) => {
+                                app.apply_plan_quit(agent);
+                                continue 'input;
+                            }
                             None => {}
                         }
 
@@ -1039,8 +1068,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         // Tab / Right on empty input accepts Claude-style ghost text
                         // when the `/` completion menu is not open.
                         if app.completion.is_none()
-                            && app.input.is_empty()
-                            && app.suggested_prompt.is_some()
+                            && app.ghost_suffix().is_some()
                             && matches!(key.code, KeyCode::Tab)
                         {
                             let _ = app.accept_suggested_prompt();
@@ -1085,11 +1113,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             }
                             KeyCode::Esc => {
                                 app.quit_notice = None;
-                                app.clear_suggested_prompt();
-                                if app.show_help {
+                                if app.ghost_suffix().is_some() && app.input.is_empty() {
+                                    app.dismiss_suggested_prompt();
+                                } else if app.show_help {
                                     app.show_help = false;
                                 } else if app.mode.is_review() {
                                     app.mode.to_insert();
+                                } else if app.dismiss_btw_overlay() {
                                 } else if app.input.is_empty() && !app.working {
                                     if app.mode.is_normal() {
                                         app.mode.to_insert();
@@ -2611,7 +2641,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 None => {
                                     app.push(Line::styled(
                                         if id.is_empty() {
-                                            "no fleet sessions to resume — /dashboard to dispatch some"
+                                            "no fleet sessions to resume — /fleet to dispatch some"
                                                 .to_string()
                                         } else {
                                             format!("no fleet session '{id}' — see /fleet status")
@@ -2626,7 +2656,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             let sessions = (fleet_launcher.sessions)();
                             if sessions.is_empty() {
                                 app.push(Line::styled(
-                                    "no fleet sessions in this project yet — /dashboard to dispatch some"
+                                    "no fleet sessions in this project yet — /fleet to dispatch some"
                                         .to_string(),
                                     dim(),
                                 ));
@@ -3017,6 +3047,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         // turn, and the goal state going in — any change by turn end (advance,
         // retry note, plan growth) counts as progress; no change is a stall.
         let goal_before = agent.structured_goal().cloned();
+        let started_in_plan_mode = agent.plan_mode();
         let plan_step_before = agent.next_plan_step_title().map(str::to_owned);
         let turn_snapshot = agent.state_snapshot();
         app.last_turn_snapshot = Some(turn_snapshot.clone());
@@ -3181,6 +3212,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         app.reasoning_effort = agent.reasoning_effort();
         // The goal driver (`goal_turn_end`) may have advanced/failed a sub-goal
         // this turn — mirror the new state so the pinned block + header reflect it.
+        // Push a mid-turn Shift-Tab first so refresh doesn't clobber it.
+        app.push_session_face(agent);
         app.refresh_goal(agent);
         // Record a main /goal that just reached a terminal state to the activity
         // feed (→ /digest), so the interactive autonomous producer joins loops +
@@ -3266,6 +3299,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 }
             }
             app.refresh_goal(agent);
+            if started_in_plan_mode && agent.plan_incomplete() && !agent.plan_mode() {
+                app.maybe_open_plan_approval();
+            }
             app.maybe_queue_drive(agent, driven.value.as_ref());
         }
         app.set_working(false);

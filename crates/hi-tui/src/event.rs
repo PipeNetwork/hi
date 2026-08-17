@@ -24,16 +24,16 @@ pub enum UiEvent {
     Text {
         text: String,
     },
-    /// Assistant text answering a `/btw` side question — rendered in the BTW
-    /// side pane (and optionally as a dim main-transcript stub).
+    /// Assistant text answering a `/btw` side question — rendered in the
+    /// inline overlay above the prompt.
     BtwAnswer {
         text: String,
     },
-    /// User `/btw` question — opens/feeds the BTW pane thread.
+    /// User `/btw` question — opens the inline overlay.
     BtwQuestion {
         question: String,
     },
-    /// Read-only tool started inside a `/btw` side loop (pane timeline only).
+    /// Read-only tool started inside a `/btw` side loop (overlay only).
     BtwToolStarted {
         name: String,
         arguments: String,
@@ -337,10 +337,8 @@ pub(crate) fn canonical_to_ui_event(event: &hi_events::RunEvent) -> Option<UiEve
         | hi_events::EventKind::AttemptFailed
         | hi_events::EventKind::RunWaiting
         | hi_events::EventKind::RunResumed
-        | hi_events::EventKind::VerificationStarted
         | hi_events::EventKind::ApprovalDecided
         | hi_events::EventKind::ApprovalConsumed
-        | hi_events::EventKind::CapabilityRequested
         | hi_events::EventKind::PolicyEvaluated
         | hi_events::EventKind::RouteSelected
         | hi_events::EventKind::EffectPlanned
@@ -370,19 +368,25 @@ pub(crate) fn canonical_to_ui_event(event: &hi_events::RunEvent) -> Option<UiEve
         | hi_events::EventKind::RaceApplied
         | hi_events::EventKind::RaceCancelled
         | hi_events::EventKind::RaceWorkspaceConflict => Some(UiEvent::Status { text }),
-        hi_events::EventKind::VerificationCompleted | hi_events::EventKind::GitChanged => {
-            Some(UiEvent::Status { text })
-        }
-        hi_events::EventKind::RunCompleted => Some(UiEvent::TurnEnd { summary: text }),
+        hi_events::EventKind::GitChanged => Some(UiEvent::Status { text }),
+        // Typed `TurnOutcome` paints success/failure. Mapping this to TurnEnd
+        // printed `usage · Run finished` in the reading pane.
+        hi_events::EventKind::RunCompleted => None,
         hi_events::EventKind::RunCancelled => Some(UiEvent::Status { text }),
         hi_events::EventKind::RunFailed
         | hi_events::EventKind::WorkflowCompleted
         | hi_events::EventKind::WorkflowFailed
         | hi_events::EventKind::ToolDenied
         | hi_events::EventKind::ToolTimedOut => Some(UiEvent::Status { text }),
+        // Tool/capability/verification lifecycle is durable telemetry. Tool
+        // rows already have their own UI events; capability + verify bookends
+        // are noise in the transcript.
         hi_events::EventKind::ToolRequested
         | hi_events::EventKind::ToolStarted
-        | hi_events::EventKind::ToolCompleted => None,
+        | hi_events::EventKind::ToolCompleted
+        | hi_events::EventKind::CapabilityRequested
+        | hi_events::EventKind::VerificationStarted
+        | hi_events::EventKind::VerificationCompleted => None,
     }
 }
 
@@ -690,6 +694,58 @@ impl Ui for ChannelUi {
         Some(Arc::new(ChannelSubagentSink {
             tx: self.tx.clone(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hi_events::{
+        ActivityObject, ActivityState, ActivityVerb, EventContext, EventKind, RunEvent,
+        SemanticActivity,
+    };
+
+    fn event(kind: EventKind, title: &str) -> RunEvent {
+        RunEvent::new(
+            kind,
+            EventContext::default(),
+            SemanticActivity {
+                verb: ActivityVerb::Verify,
+                object: ActivityObject::Verification,
+                state: ActivityState::Running,
+                group_key: "test".into(),
+                title: title.into(),
+                detail: None,
+                refs: Vec::new(),
+                progress: None,
+            },
+        )
+    }
+
+    #[test]
+    fn capability_and_verification_lifecycle_is_not_a_status_line() {
+        assert!(
+            canonical_to_ui_event(&event(
+                EventKind::CapabilityRequested,
+                "process_execution capability requested"
+            ))
+            .is_none()
+        );
+        assert!(
+            canonical_to_ui_event(&event(
+                EventKind::VerificationStarted,
+                "verification started"
+            ))
+            .is_none()
+        );
+        assert!(
+            canonical_to_ui_event(&event(
+                EventKind::VerificationCompleted,
+                "verification finished"
+            ))
+            .is_none()
+        );
+        assert!(canonical_to_ui_event(&event(EventKind::RunCompleted, "Run finished")).is_none());
     }
 }
 

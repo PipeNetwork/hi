@@ -804,7 +804,10 @@ fn session_display_name_impl(path: &Path) -> Option<String> {
             && let Ok(message) = serde_json::from_str::<Message>(&line)
             && message.role == Role::User
         {
-            first_user = Some(session_title(&message.text()));
+            let title = session_title(&message.text());
+            if !title.is_empty() {
+                first_user = Some(title);
+            }
         }
         if let Ok(SessionMeta::Name { name: next }) = serde_json::from_str::<SessionMeta>(&line) {
             custom_name = (!next.trim().is_empty()).then(|| next.trim().to_string());
@@ -1149,14 +1152,7 @@ pub fn list_sessions() -> Result<()> {
 /// human instruction rather than a wall of pasted output. Deterministic — no
 /// model call, unlike minion's generated titles.
 fn session_title(first_user: &str) -> String {
-    let head = first_user
-        .split("stdin:")
-        .next()
-        .unwrap_or(first_user)
-        .split("```")
-        .next()
-        .unwrap_or(first_user);
-    head.split_whitespace().collect::<Vec<_>>().join(" ")
+    hi_agent::ui::user_prompt_title(first_user, 72)
 }
 
 fn humanize(secs: u64) -> String {
@@ -1344,6 +1340,39 @@ mod tests {
             "explain this"
         );
         assert_eq!(session_title("   "), "");
+        let dumped = "[hi:context — session state, not instructions]\n\
+# Memory (from past sessions; task-ranked)\n\
+Prefer bullets.\n\
+[/hi:context]\n\n\
+fix the parser";
+        assert_eq!(session_title(dumped), "fix the parser");
+        assert_eq!(
+            session_title("[hi:context — session state, not instructions] no closer"),
+            ""
+        );
+    }
+
+    #[test]
+    fn display_name_uses_prompt_inside_context_wrapped_user_message() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-ctx-title-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dumped = "[hi:context — session state, not instructions]\n\
+# Memory (from past sessions; task-ranked)\n\
+[/hi:context]\n\n\
+fix the parser";
+        std::fs::write(
+            &path,
+            serde_json::to_string(&Message::user(dumped)).unwrap() + "\n",
+        )
+        .unwrap();
+        assert_eq!(session_display_name(&path), "fix the parser");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

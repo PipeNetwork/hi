@@ -27,7 +27,7 @@ pub(crate) fn handle_command(
         Command::Rsi(_) => {
             eprintln!("\x1b[33mRSI recovery command requires an async frontend\x1b[0m")
         }
-        Command::Help => println!("{}", hi_agent::command::help_text()),
+        Command::Help(arg) => println!("{}", hi_agent::command::help_text_for(&arg)),
         Command::Status => {
             let t = agent.totals();
             let tel = agent.last_turn_telemetry();
@@ -111,6 +111,7 @@ pub(crate) fn handle_command(
         Command::Doctor => {}
         Command::Plan(_)
         | Command::ViewPlan
+        | Command::Memory
         | Command::Fork(_)
         | Command::Rewind(_)
         | Command::Permissions(_)
@@ -898,7 +899,7 @@ pub(crate) fn handle_command(
                 }
             }
             _ => println!(
-                "\x1b[33m/dashboard is only available in the full-screen TUI (run hi without --plain); /fleet status works here\x1b[0m"
+                "\x1b[33m/fleet is only available in the full-screen TUI (run hi without --plain); /fleet status works here\x1b[0m"
             ),
         },
         Command::Workflow(arg) => {

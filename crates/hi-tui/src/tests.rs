@@ -282,6 +282,8 @@ pub(crate) fn test_app(provider: &str, model: &str) -> App {
         None,
     );
     app.workspace_root = std::path::PathBuf::from("/workspace");
+    // Keep snapshots and chrome tests deterministic (no wall-clock AM/PM).
+    app.timestamps_enabled = false;
     app
 }
 
@@ -1253,7 +1255,7 @@ fn following_shows_last_line_with_realistic_prose_word_wrapping() {
 }
 
 #[test]
-fn working_line_names_the_inflight_tool_and_model_phase() {
+fn working_line_tracks_model_phase_not_tool_ids() {
     let mut app = test_app("openai", "gpt-4o");
     app.set_working(true);
     // Model phase: reasoning then text stream distinctly.
@@ -1271,20 +1273,38 @@ fn working_line_names_the_inflight_tool_and_model_phase() {
         "{}",
         app.activity_line()
     );
-    // A tool starts → the line names it (with its own timer)…
+    // A tool in flight keeps the quiet Working wave — command identity is
+    // a transcript `Run` row, not this chrome line.
+    app.turn_rounds = 2;
+    app.turn_tool_calls = 1;
     app.apply(UiEvent::ToolStarted {
         name: "bash".into(),
         arguments: "{\"command\":\"cargo test\"}".into(),
     });
+    let line = app.activity_line();
+    assert!(line.starts_with("Working"), "{line}");
     assert!(
-        app.activity_line().starts_with("running bash cargo test"),
-        "{}",
-        app.activity_line()
+        !line.contains("bash") && !line.contains("round") && !line.contains("call"),
+        "{line}"
     );
-    // …and clears back to the model once the result lands.
+    app.apply(UiEvent::ToolCall {
+        name: "bash_output".into(),
+        arguments: "{\"id\":\"cargo-test_2\"}".into(),
+    });
+    let line = app.activity_line();
+    assert!(line.starts_with("Working"), "{line}");
+    assert!(
+        !line.contains("bash_output") && !line.contains("cargo-test_2"),
+        "{line}"
+    );
+    let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    assert!(
+        lines.iter().any(|l| l.contains("Run cargo-test_2")),
+        "live Run row: {lines:?}"
+    );
     app.apply(UiEvent::ToolResult {
-        name: "bash".into(),
-        result: "ok".into(),
+        name: "bash_output".into(),
+        result: "[cargo-test_2: still running — no new output]".into(),
     });
     assert!(
         app.activity_line().starts_with("Working"),
@@ -1367,8 +1387,8 @@ fn renders_tool_call_diff_and_spinner() {
         "prompt bar shows the spinner + an elapsed timer while working: {screen}"
     );
     assert!(
-        screen.contains("Ctrl-C to interrupt"),
-        "prompt bar shows the interrupt hint while working"
+        screen.contains("[stop]"),
+        "prompt bar shows [stop] while working: {screen}"
     );
 }
 
@@ -1451,7 +1471,7 @@ fn usage_event_keeps_tokens_out_of_compact_working_line() {
         !screen.contains("gen↓"),
         "no duplicate output tokens: {screen}"
     );
-    assert!(screen.contains("50% ctx"), "live context fill: {screen}");
+    assert!(screen.contains("64k / 128k"), "live context fill: {screen}");
 }
 
 #[test]
@@ -1465,7 +1485,10 @@ fn completed_turn_latency_is_visible_in_idle_status() {
     let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
-    assert!(screen.contains("latency 3s"), "{screen}");
+    assert!(
+        screen.contains("Worked for") && !screen.contains("last: done"),
+        "idle latency is a Worked for marker, not a done row: {screen}"
+    );
 }
 
 #[test]
@@ -1822,12 +1845,12 @@ fn wide_input_glyphs_wrap_and_position_the_cursor_by_display_columns() {
 }
 
 #[test]
-fn empty_input_uses_grok_prompt_and_placeholder() {
+fn empty_input_uses_grok_prompt_without_placeholder() {
     let app = test_app("openai", "gpt-4o");
     let (lines, cursor_row, cursor_col) = app.input_view(80);
 
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].to_string(), "❯ Ask anything, @ to mention files");
+    assert_eq!(lines[0].to_string(), "❯ ");
     assert_eq!((cursor_row, cursor_col), (0, 2));
 }
 
@@ -1840,6 +1863,36 @@ fn empty_input_shows_suggested_prompt_as_ghost_text() {
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].to_string(), "❯ Run the unit tests");
     assert_eq!((cursor_row, cursor_col), (0, 2));
+}
+
+#[test]
+fn ghost_shrinks_when_typing_a_matching_prefix() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.suggested_prompt = Some("Run the unit tests".into());
+    app.input.set("Run the");
+    let (lines, ..) = app.input_view(80);
+    assert_eq!(lines[0].to_string(), "❯ Run the unit tests");
+    assert_eq!(app.ghost_suffix(), Some(" unit tests"));
+}
+
+#[test]
+fn ghost_accept_inserts_remaining_suffix() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.suggested_prompt = Some("open a PR".into());
+    app.input.set("open");
+    assert!(app.accept_suggested_prompt());
+    assert_eq!(app.input.text(), "open a PR");
+    assert!(app.suggested_prompt.is_none());
+}
+
+#[test]
+fn ghost_esc_on_empty_dismisses_until_next_suggestion() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.suggested_prompt = Some("Run the unit tests".into());
+    app.dismiss_suggested_prompt();
+    let (lines, ..) = app.input_view(80);
+    assert_eq!(lines[0].to_string(), "❯ ");
+    assert!(app.ghost_suffix().is_none());
 }
 
 #[test]
@@ -1915,7 +1968,7 @@ fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
     // below is what guards the height itself.
     // One taller than the previous baseline: outer vpad + chrome gaps take
     // four rows that used to belong to the help panel.
-    let mut term = Terminal::new(TestBackend::new(80, 46)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(80, 56)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
 
@@ -1966,7 +2019,7 @@ fn help_panel_still_fits_in_its_documented_height() {
     // this fails, that is the point — either trim some help text, or make the
     // panel scroll, rather than letting `/quit` silently vanish for anyone on a
     // shorter terminal.
-    const REQUIRED_ROWS: u16 = 46;
+    const REQUIRED_ROWS: u16 = 56;
     let mut app = test_app("openai", "gpt-4o");
     app.show_help = true;
     let mut term = Terminal::new(TestBackend::new(80, REQUIRED_ROWS)).unwrap();
@@ -2541,7 +2594,7 @@ fn confirmation_modal_colors_file_edit_diff() {
         diff: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n"
             .to_string(),
     });
-    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(80, 32)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     // The diff header and the path should appear; the modal title too.
@@ -3197,26 +3250,33 @@ fn responsive_session_layouts_keep_the_composer_inside_the_screen() {
 }
 
 #[test]
-fn btw_pane_restores_after_responsive_resize() {
+fn btw_overlay_stays_visible_across_resize() {
     let mut app = test_app("openai", "gpt-4o");
     app.show_btw = true;
     app.btw_thread.push(BtwEntry::Question("why?".into()));
+    app.btw_thread.push(BtwEntry::Thinking("answering…".into()));
 
-    let mut wide = Terminal::new(TestBackend::new(120, 20)).unwrap();
-    wide.draw(|frame| app.render(frame)).unwrap();
-    assert!(dump(&wide).contains("btw"));
-
-    let mut narrow = Terminal::new(TestBackend::new(64, 14)).unwrap();
-    narrow.draw(|frame| app.render(frame)).unwrap();
-    assert!(!dump(&narrow).contains("btw"));
-
-    let mut restored = Terminal::new(TestBackend::new(120, 20)).unwrap();
-    restored.draw(|frame| app.render(frame)).unwrap();
-    assert!(dump(&restored).contains("btw"));
+    for (width, height) in [(120, 20), (64, 14)] {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|frame| app.render(frame)).unwrap();
+        let screen = dump(&term);
+        assert!(
+            screen.contains("/btw why?"),
+            "overlay title at {width}x{height}: {screen}"
+        );
+        assert!(
+            screen.contains("[Esc]"),
+            "close hint at {width}x{height}: {screen}"
+        );
+        assert!(
+            screen.contains("Answering"),
+            "loading body at {width}x{height}: {screen}"
+        );
+    }
 }
 
 #[test]
-fn btw_pane_measures_prompt_against_the_main_column() {
+fn btw_overlay_measures_prompt_full_width() {
     let mut app = test_app("openai", "gpt-4o");
     app.show_btw = true;
     app.btw_thread.push(BtwEntry::Question("why?".into()));
@@ -3312,6 +3372,38 @@ fn session_render_snapshots_cover_responsive_chrome() {
 }
 
 #[test]
+fn user_prompt_timestamp_sits_on_the_right() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.timestamps_enabled = true;
+    app.push_user_prompt(Line::raw("❯ hello"));
+    if let Some(crate::TranscriptEntry::UserPrompt { at, .. }) = app.transcript.last_mut() {
+        *at = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    }
+    let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("❯ hello"), "{screen}");
+    assert!(
+        screen.contains("AM") || screen.contains("PM"),
+        "prompt timestamp missing: {screen}"
+    );
+}
+
+#[test]
+fn turn_end_writes_worked_for_into_the_transcript() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    app.started = Some(std::time::Instant::now() - Duration::from_secs(125));
+    app.last_turn_state = TurnState::Done("done".into());
+    app.set_working(false);
+    let text = app.transcript_text();
+    assert!(
+        text.contains("Worked for 2m5s"),
+        "grok-build turn marker missing: {text}"
+    );
+}
+
+#[test]
 fn session_density_snapshots_keep_fold_contract() {
     let mut app = test_app("openai", "gpt-4o");
     app.transcript.push(TranscriptEntry::ToolOutput {
@@ -3347,7 +3439,7 @@ fn transcript_roles_get_display_gutters_without_polluting_copy_text() {
     });
 
     let prompt = app.transcript[0].flatten(false, false, Density::Comfortable);
-    assert!(crate::render::line_text(&prompt[0]).starts_with("┃ ❯"));
+    assert!(crate::render::line_text(&prompt[0]).starts_with("❯"));
     assert_eq!(app.transcript[0].text(), "❯ question");
 
     let assistant = app
@@ -3356,7 +3448,7 @@ fn transcript_roles_get_display_gutters_without_polluting_copy_text() {
         .find(|entry| matches!(entry, TranscriptEntry::Assistant(_)))
         .unwrap();
     let assistant_lines = assistant.flatten(false, false, Density::Comfortable);
-    assert!(crate::render::line_text(&assistant_lines[0]).starts_with("┃ answer"));
+    assert_eq!(crate::render::line_text(&assistant_lines[0]), "answer");
     assert_eq!(assistant.text(), "answer");
 
     let reasoning = app
@@ -3365,7 +3457,7 @@ fn transcript_roles_get_display_gutters_without_polluting_copy_text() {
         .find(|entry| matches!(entry, TranscriptEntry::Reasoning { .. }))
         .unwrap();
     assert!(
-        crate::render::line_text(&reasoning.flatten(false, false, Density::Comfortable)[0])
+        crate::render::line_text(&reasoning.flatten(true, false, Density::Comfortable)[0])
             .starts_with("┃ ⏺")
     );
 
@@ -3437,16 +3529,15 @@ fn turn_end_is_neutral_until_typed_pass_arrives() {
     });
 
     assert_eq!(app.last_turn_state, TurnState::Running);
-    assert_eq!(app.transcript.len(), 1);
-    let usage = app.transcript[0].text();
-    assert!(usage.contains("usage"), "got: {usage}");
     assert!(
-        !usage.contains("✓"),
-        "usage must not imply success: {usage}"
-    );
-    assert!(
-        usage.contains("12 total"),
-        "historical usage retained: {usage}"
+        app.transcript
+            .iter()
+            .all(|e| !e.text().contains("usage") && !e.text().contains("✓")),
+        "turn_end is not a transcript receipt: {:?}",
+        app.transcript
+            .iter()
+            .map(TranscriptEntry::text)
+            .collect::<Vec<_>>()
     );
 
     app.note_turn_outcome(&turn_outcome(
@@ -3478,7 +3569,10 @@ fn usage_summary_content_cannot_override_typed_outcome() {
 
     assert!(matches!(app.last_turn_state, TurnState::Warning(_)));
     let transcript = app.transcript_text();
-    assert!(transcript.contains("steer"), "usage retained: {transcript}");
+    assert!(
+        !transcript.contains("user prompt estimate"),
+        "usage stays out of the pane: {transcript}"
+    );
     assert!(transcript.contains("⚠ incomplete · checks did not settle"));
     assert!(!transcript.contains("✓ done"));
 }
@@ -3604,6 +3698,78 @@ fn typed_cancellation_is_cancelled() {
 }
 
 #[test]
+fn not_applicable_checks_stay_out_of_the_transcript() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Completed,
+        hi_agent::VerificationStatus::NotApplicable,
+        hi_agent::ReviewStatus::NotRequired,
+        hi_agent::TurnStopReason::NoApplicableVerification,
+    ));
+    assert_eq!(
+        app.last_turn_state,
+        TurnState::Done("no applicable checks".to_string())
+    );
+    let text = app.transcript_text();
+    assert!(!text.contains("✓ done"), "non-event painted done: {text}");
+    assert!(
+        !text.contains("no applicable checks"),
+        "non-event leaked into the pane: {text}"
+    );
+}
+
+#[test]
+fn idle_done_does_not_paint_a_status_receipt() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Completed,
+        hi_agent::VerificationStatus::Passed,
+        hi_agent::ReviewStatus::Passed,
+        hi_agent::TurnStopReason::Completed,
+    ));
+    app.last_turn_latency = Some(Duration::from_secs(65));
+    app.context_used = 38_000;
+    app.context_window = Some(1_000_000);
+    let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        !screen.contains("last: done"),
+        "done status row should hide: {screen}"
+    );
+    assert!(
+        !screen.contains("usage ·"),
+        "usage receipt should stay out of the pane: {screen}"
+    );
+    assert!(screen.contains("38k / 1.0M"), "ctx chip missing: {screen}");
+    assert!(
+        !screen.contains("1m 05s"),
+        "turn duration belongs in Worked for, not the header: {screen}"
+    );
+}
+
+#[test]
+fn markdown_headings_gain_space_in_the_transcript() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Text {
+        text: "intro\n## Section\nbody".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+    let texts: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    assert_eq!(
+        texts,
+        vec![
+            "intro".to_string(),
+            String::new(),
+            "Section".to_string(),
+            String::new(),
+            "body".to_string()
+        ],
+        "heading should be preceded by a blank row: {texts:?}"
+    );
+}
+
+#[test]
 fn assistant_text_becomes_copy_target() {
     let mut app = test_app("openai", "gpt-4o");
     app.apply(UiEvent::Text {
@@ -3638,7 +3804,7 @@ fn transcript_text_serializes_lines() {
 }
 
 #[test]
-fn btw_answer_goes_to_side_pane_not_task_answer() {
+fn btw_answer_goes_to_overlay_not_task_answer() {
     let mut app = test_app("openai", "gpt-4o");
     // Main task answer streams normally…
     app.apply(UiEvent::Text {
@@ -3647,12 +3813,12 @@ fn btw_answer_goes_to_side_pane_not_task_answer() {
     app.apply(UiEvent::AssistantEnd);
     // Keystroke path: question lands in the pane immediately with a thinking marker.
     app.btw_note_question("what step?");
-    assert!(app.show_btw, "first btw activity opens the side pane");
+    assert!(app.show_btw, "first btw activity opens the overlay");
     assert!(
         app.btw_thread
             .iter()
             .any(|e| matches!(e, crate::BtwEntry::Thinking(_))),
-        "in-flight marker so the pane doesn't look frozen"
+        "in-flight marker so the overlay doesn't look frozen"
     );
     // Agent drain path (may re-send the same question — must not duplicate).
     app.apply(UiEvent::BtwQuestion {
@@ -3671,7 +3837,7 @@ fn btw_answer_goes_to_side_pane_not_task_answer() {
         .join("\n");
     assert!(
         thread.contains("what step?") && thread.contains("you're on step 2"),
-        "pane thread holds Q+A, got: {thread:?}"
+        "overlay thread holds Q+A, got: {thread:?}"
     );
     assert!(
         !app.btw_thread
@@ -3686,7 +3852,7 @@ fn btw_answer_goes_to_side_pane_not_task_answer() {
         .count();
     assert_eq!(q_count, 1, "question must not be duplicated: {thread:?}");
     let transcript = app.transcript_text();
-    // Side channel is pane-only — main work log stays clean.
+    // Side channel is overlay-only — main work log stays clean until Esc.
     assert!(
         !transcript.contains("what step?") && !transcript.contains("you're on step 2"),
         "btw must not pollute main transcript: {transcript:?}"
@@ -3696,25 +3862,72 @@ fn btw_answer_goes_to_side_pane_not_task_answer() {
 }
 
 #[test]
-fn btw_answer_inline_when_pane_closed() {
+fn btw_answer_stays_in_overlay_not_inline_transcript() {
     let mut app = test_app("openai", "gpt-4o");
-    app.show_btw = false;
-    // Force closed path: answer without opening via question first, then close.
     app.apply(UiEvent::BtwAnswer {
         text: "aside".into(),
     });
-    // open_btw_pane auto-opens; close and re-apply to hit inline fallback.
-    app.show_btw = false;
-    app.btw_answer_started = false;
-    app.apply(UiEvent::BtwAnswer {
-        text: "inline path".into(),
-    });
-    // After auto-open on apply, pane is open again — answer is in thread.
     assert!(
         app.btw_thread
             .iter()
-            .any(|e| matches!(e, crate::BtwEntry::Answer(a) if a.contains("inline path"))),
-        "answer always lands in the thread"
+            .any(|e| matches!(e, crate::BtwEntry::Answer(a) if a.contains("aside"))),
+        "answer lands in the overlay thread"
+    );
+    assert!(
+        !app.transcript_text().contains("aside"),
+        "answer is not dumped into the main transcript while the overlay is open"
+    );
+}
+
+#[test]
+fn dismissing_btw_overlay_persists_collapsed_block() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.btw_note_question("what step?");
+    app.apply(UiEvent::BtwAnswer {
+        text: "you're on step 2".into(),
+    });
+    app.apply(UiEvent::BtwEnd);
+    assert!(app.dismiss_btw_overlay());
+    assert!(!app.show_btw);
+    assert!(app.btw_thread.is_empty());
+    let text = app.transcript_text();
+    assert!(
+        text.contains("/btw what step?"),
+        "dismissed overlay persists the question: {text:?}"
+    );
+    assert!(
+        text.contains("you're on step 2"),
+        "full answer is kept for copy/expand: {text:?}"
+    );
+    let flattened = app.transcript.last().expect("btw block").flatten(
+        false,
+        false,
+        crate::Density::Comfortable,
+    );
+    assert_eq!(flattened.len(), 1, "collapsed header only: {flattened:?}");
+    assert!(crate::render::line_text(&flattened[0]).contains("/btw what step?"));
+}
+
+#[test]
+fn btw_overlay_renders_above_the_prompt() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.show_btw = true;
+    app.btw_thread.push(BtwEntry::Question("why?".into()));
+    app.btw_thread.push(BtwEntry::Thinking("answering…".into()));
+    app.input.set("next step");
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let screen = dump(&terminal);
+    let btw_at = screen.find("/btw why?").expect("overlay title");
+    let prompt_at = screen.find('❯').expect("prompt");
+    assert!(
+        btw_at < prompt_at,
+        "overlay must sit above the prompt:\n{screen}"
+    );
+    assert!(
+        !screen.contains("❓"),
+        "side-pane question glyph should be gone:\n{screen}"
     );
 }
 
@@ -3920,10 +4133,16 @@ fn idle_bash_output_polls_collapse_into_one_updating_line() {
         name: "bash_output".into(),
         arguments: "{\"id\":\"sh_1\"}".into(),
     });
-    // Header is deferred until the result — no spam before we know it's idle.
+    // Live `Run` row as soon as the poll starts — never a raw tool dump.
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(
-        !lines.iter().any(|l| l.contains("◆ bash_output")),
+        lines.iter().any(|l| l.contains("Run sh_1")),
+        "live Run row before result: {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("◆ bash_output") || l.contains("bash_output")),
         "no deferred header before result: {lines:?}"
     );
 
@@ -3933,19 +4152,18 @@ fn idle_bash_output_polls_collapse_into_one_updating_line() {
     });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(
-        lines.iter().any(|l| l.contains("sh_1 · still running")),
+        lines.iter().any(|l| l.contains("Run sh_1")),
         "first idle poll: {lines:?}"
     );
     assert_eq!(
-        lines
-            .iter()
-            .filter(|l| l.contains("sh_1 · still running"))
-            .count(),
+        lines.iter().filter(|l| l.contains("Run sh_1")).count(),
         1,
         "exactly one shell poll line: {lines:?}"
     );
     assert!(
-        !lines.iter().any(|l| l.contains("no new output")),
+        !lines
+            .iter()
+            .any(|l| l.contains("no new output") || l.contains("still running")),
         "idle status body must not dump into the transcript: {lines:?}"
     );
 
@@ -3966,19 +4184,14 @@ fn idle_bash_output_polls_collapse_into_one_updating_line() {
         result: idle.into(),
     });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("sh_1 · still running · polled 3×")),
-        "collapsed idle polls: {lines:?}"
-    );
     assert_eq!(
-        lines
-            .iter()
-            .filter(|l| l.contains("sh_1 · still running"))
-            .count(),
+        lines.iter().filter(|l| l.contains("Run sh_1")).count(),
         1,
         "still exactly one shell poll line after three polls: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("polled")),
+        "poll count stays off the Run header: {lines:?}"
     );
 
     // Fresh output ends the collapse and shows a normal header + body.
@@ -3995,6 +4208,81 @@ fn idle_bash_output_polls_collapse_into_one_updating_line() {
         lines.iter().any(|l| l.contains("== hi-ai ==")),
         "fresh output is shown: {lines:?}"
     );
+}
+
+#[test]
+fn live_run_streams_stdout_into_the_transcript() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolCall {
+        name: "bash".into(),
+        arguments: "{\"command\":\"cargo test\"}".into(),
+    });
+    app.apply(UiEvent::ToolStream {
+        name: "bash".into(),
+        line: "   Compiling hi v0.3.1".into(),
+    });
+    app.apply(UiEvent::ToolStream {
+        name: "bash".into(),
+        line: "    Finished `test` profile".into(),
+    });
+    let flat: Vec<String> = app
+        .transcript
+        .iter()
+        .flat_map(|e| e.flatten(false, false, crate::Density::Comfortable))
+        .map(|l| crate::render::line_text(&l))
+        .collect();
+    assert!(
+        flat.iter().any(|l| l.contains("Run cargo")),
+        "run header: {flat:?}"
+    );
+    assert!(
+        flat.iter().any(|l| l.contains("Compiling hi")),
+        "live stdout must be visible without Ctrl-O: {flat:?}"
+    );
+    assert!(
+        flat.iter().any(|l| l.contains("Finished `test`")),
+        "later stream lines stay on the same row: {flat:?}"
+    );
+
+    app.apply(UiEvent::ToolResult {
+        name: "bash".into(),
+        result: "cargo test still running after 30s — continued as cargo-test_2.\n\
+Use bash_output with id cargo-test_2 to read output."
+            .into(),
+    });
+    let flat: Vec<String> = app
+        .transcript
+        .iter()
+        .flat_map(|e| e.flatten(false, false, crate::Density::Comfortable))
+        .map(|l| crate::render::line_text(&l))
+        .collect();
+    assert!(
+        flat.iter().any(|l| l.contains("Compiling hi")),
+        "auto-background keeps the live tail: {flat:?}"
+    );
+    let run_headers = flat.iter().filter(|l| l.contains("Run cargo")).count();
+    assert_eq!(run_headers, 1, "one Run row after handoff: {flat:?}");
+
+    app.apply(UiEvent::ToolCall {
+        name: "bash_output".into(),
+        arguments: "{\"id\":\"cargo-test_2\"}".into(),
+    });
+    app.apply(UiEvent::ToolStream {
+        name: "bash_output".into(),
+        line: "test result: ok. 455 passed".into(),
+    });
+    let flat: Vec<String> = app
+        .transcript
+        .iter()
+        .flat_map(|e| e.flatten(false, false, crate::Density::Comfortable))
+        .map(|l| crate::render::line_text(&l))
+        .collect();
+    assert!(
+        flat.iter().any(|l| l.contains("test result: ok")),
+        "bash_output streams onto the same Run row: {flat:?}"
+    );
+    let run_headers = flat.iter().filter(|l| l.contains("Run ")).count();
+    assert_eq!(run_headers, 1, "still one Run row: {flat:?}");
 }
 
 #[test]
@@ -4141,6 +4429,280 @@ fn consecutive_same_tool_explore_results_merge_into_one_line() {
     assert!(
         lines.iter().any(|l| l.contains("Read d.rs · 2 lines")),
         "fresh read after break: {lines:?}"
+    );
+}
+
+#[test]
+fn explore_tools_group_across_assistant_narration() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolCall {
+        name: "list".into(),
+        arguments: "{\"path\":\".\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "list".into(),
+        result: "a\nb\n".into(),
+    });
+    app.apply(UiEvent::Text {
+        text: "Now let me look at the turn loop.\n".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+    app.apply(UiEvent::Reasoning {
+        text: "plan the next read".into(),
+    });
+    app.apply(UiEvent::Text {
+        text: "Let me read the CLI entry point.\n".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+    app.apply(UiEvent::ToolCall {
+        name: "read".into(),
+        arguments: "{\"path\":\"crates/hi-cli/src/main.rs\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "read".into(),
+        result: "fn main() {}\n".into(),
+    });
+    app.apply(UiEvent::ToolCall {
+        name: "repo_map".into(),
+        arguments: "{\"task\":\"overview\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "repo_map".into(),
+        result: "map\n".into(),
+    });
+    let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.contains("Read ") || l.contains("Listed ") || l.contains("Repo_map"))
+            .count(),
+        1,
+        "one explore row across narration: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Listed 2 dirs") && l.contains("Read 1 file")),
+        "mixed explore summary: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("Repo_map")),
+        "repo_map must fold into the explore row: {lines:?}"
+    );
+}
+
+#[test]
+fn collapsed_zero_second_thought_is_hidden() {
+    let entry = TranscriptEntry::Reasoning {
+        text: "instant".into(),
+        elapsed: Duration::from_secs(0),
+    };
+    assert!(
+        entry.flatten(false, false, Density::Comfortable).is_empty(),
+        "collapsed 0s thought must not take a row"
+    );
+    assert!(
+        !entry.flatten(true, false, Density::Comfortable).is_empty(),
+        "Ctrl-T still reveals 0s thought"
+    );
+}
+
+fn flatten_texts(app: &crate::App, show_reasoning: bool, show_tool: bool) -> Vec<String> {
+    app.transcript
+        .iter()
+        .flat_map(|e| e.flatten(show_reasoning, show_tool, Density::Comfortable))
+        .map(|l| crate::render::line_text(&l))
+        .collect()
+}
+
+fn apply_read(app: &mut crate::App, path: &str, body: &str) {
+    app.apply(UiEvent::ToolCall {
+        name: "read".into(),
+        arguments: format!(r#"{{"path":"{path}"}}"#),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "read".into(),
+        result: body.into(),
+    });
+}
+
+#[test]
+fn explore_burst_absorbs_thinking_and_steering() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Reasoning {
+        text: "checking files".into(),
+    });
+    app.apply(UiEvent::Text {
+        text: "Let me read a.rs\n".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+    apply_read(&mut app, "a.rs", "one\n");
+    apply_read(&mut app, "b.rs", "two\n");
+    apply_read(&mut app, "c.rs", "three\n");
+
+    let activities = app
+        .transcript
+        .iter()
+        .filter(|e| matches!(e, TranscriptEntry::Activity(_)))
+        .count();
+    assert_eq!(
+        activities,
+        1,
+        "one explore row: {:?}",
+        app.transcript_text()
+    );
+    assert!(
+        !app.transcript
+            .iter()
+            .any(|e| matches!(e, TranscriptEntry::Reasoning { .. })),
+        "reasoning must be absorbed into the explore row"
+    );
+
+    let collapsed = flatten_texts(&app, false, false);
+    assert!(
+        collapsed.iter().any(|l| l.contains("Read 3 files")),
+        "collapsed header: {collapsed:?}"
+    );
+    assert!(
+        !collapsed
+            .iter()
+            .any(|l| l.contains("thought for") || l.contains("Let me read")),
+        "thinking and steering stay folded: {collapsed:?}"
+    );
+
+    let ctrl_o = flatten_texts(&app, false, true);
+    assert!(
+        !ctrl_o
+            .iter()
+            .any(|l| l.contains("a.rs") || l.contains("b.rs")),
+        "Ctrl-O must not dump explore paths: {ctrl_o:?}"
+    );
+
+    let with_t = flatten_texts(&app, true, false);
+    assert!(
+        with_t.iter().any(|l| l.contains("thought for")),
+        "Ctrl-T shows thinking in the group: {with_t:?}"
+    );
+    assert!(
+        with_t.iter().any(|l| l.contains("checking files")),
+        "Ctrl-T shows thinking text: {with_t:?}"
+    );
+    assert!(
+        !with_t.iter().any(|l| l.contains("Let me read")),
+        "steering stays collapsed until Ctrl-B: {with_t:?}"
+    );
+}
+
+#[test]
+fn substantial_answer_is_not_stolen_into_explore_group() {
+    let mut app = test_app("openai", "gpt-4o");
+    apply_read(&mut app, "a.rs", "one\n");
+    app.apply(UiEvent::Text {
+        text: "# Findings\nThe CLI entry is in main.rs.\n".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+    apply_read(&mut app, "b.rs", "two\n");
+
+    let activities = app
+        .transcript
+        .iter()
+        .filter(|e| matches!(e, TranscriptEntry::Activity(_)))
+        .count();
+    assert_eq!(
+        activities,
+        2,
+        "answer splits explore bursts: {:?}",
+        app.transcript_text()
+    );
+    let texts: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("Findings")),
+        "heading stays as the answer: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("CLI entry")),
+        "paragraph stays as the answer: {texts:?}"
+    );
+}
+
+#[test]
+fn consecutive_edits_to_the_same_path_coalesce() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolCall {
+        name: "edit".into(),
+        arguments: r#"{"path":"src/a.rs"}"#.into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "edit".into(),
+        result: "\x1b[1m2 additions, 1 deletions\x1b[0m\n  10 + foo\n".into(),
+    });
+    app.apply(UiEvent::ToolCall {
+        name: "edit".into(),
+        arguments: r#"{"path":"src/a.rs"}"#.into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "edit".into(),
+        result: "\x1b[1m3 additions, 2 deletions\x1b[0m\n  11 + bar\n".into(),
+    });
+    app.apply(UiEvent::ToolCall {
+        name: "edit".into(),
+        arguments: r#"{"path":"src/b.rs"}"#.into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "edit".into(),
+        result: "\x1b[1m1 additions, 0 deletions\x1b[0m\n  1 + baz\n".into(),
+    });
+
+    let edits: Vec<String> = app
+        .transcript
+        .iter()
+        .filter(|e| matches!(e, TranscriptEntry::Activity(_)))
+        .map(TranscriptEntry::text)
+        .collect();
+    assert_eq!(edits.len(), 2, "same-path edits merge: {edits:?}");
+    assert!(
+        edits.iter().any(|t| t.contains("Edit a.rs +5/-3")),
+        "coalesced diffstat: {edits:?}"
+    );
+    assert!(
+        edits.iter().any(|t| t.contains("Edit b.rs +1")),
+        "different path stays a second row: {edits:?}"
+    );
+
+    let collapsed = flatten_texts(&app, false, false);
+    assert!(
+        !collapsed
+            .iter()
+            .any(|l| l.contains("+ foo") || l.contains("+ bar")),
+        "hunks stay collapsed: {collapsed:?}"
+    );
+    let expanded = flatten_texts(&app, false, true);
+    assert!(
+        expanded.iter().any(|l| l.contains("foo")) && expanded.iter().any(|l| l.contains("bar")),
+        "Ctrl-O still shows hunks: {expanded:?}"
+    );
+}
+
+#[test]
+fn markdown_heading_and_list_gain_blank_lines() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Text {
+        text: "intro\n# Title\nbody\n- item".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+    let texts = flatten_texts(&app, false, false);
+    assert_eq!(
+        texts,
+        vec![
+            "intro".to_string(),
+            String::new(),
+            "Title".to_string(),
+            String::new(),
+            "body".to_string(),
+            String::new(),
+            "• item".to_string(),
+        ],
+        "blank before/after H1 and before the list: {texts:?}"
     );
 }
 
@@ -4600,10 +5162,10 @@ fn completing_compact_name_opens_its_kind_menu() {
 fn completion_navigation_and_accept() {
     let mut app = test_app("openai", "gpt-4o");
     // No-arg command: Enter accepts and submits immediately.
-    app.input.set("/hel");
+    app.input.set("/und");
     app.sync_completion();
     let line = app.accept_completion(true);
-    assert_eq!(line.as_deref(), Some("/help"));
+    assert_eq!(line.as_deref(), Some("/undo"));
     assert!(app.completion.is_none(), "menu closes after accept");
 
     // Arg-taking command: accept leaves a trailing space, does not submit.
@@ -4669,7 +5231,7 @@ fn empty_session_landing_is_quiet() {
     let screen = dump(&term);
 
     assert!(
-        screen.contains("___ _"),
+        screen.contains("|_| |_|_|"),
         "wide canvas shows the wordmark: {screen}"
     );
     assert!(
@@ -5327,15 +5889,24 @@ fn tutorial_overlay_renders_centered_content() {
 }
 
 #[test]
-fn density_chip_renders_in_title() {
+fn header_shows_ctx_not_settings() {
     let mut app = test_app("openai", "gpt-4o");
     app.density = Density::Compact;
+    app.context_used = 38_000;
+    app.context_window = Some(1_000_000);
+    app.last_turn_latency = Some(Duration::from_secs(65));
     let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     assert!(
-        screen.contains("compact") && screen.contains("out:"),
-        "density chrome missing: {screen}"
+        screen.contains("38k / 1.0M"),
+        "context chip missing: {screen}"
+    );
+    assert!(
+        !screen.contains("compact")
+            && !screen.contains("out:fold")
+            && !screen.contains("reasoning"),
+        "settings chips should stay off the header: {screen}"
     );
 }
 
@@ -5412,13 +5983,9 @@ fn session_chrome_matches_grok_build_stack() {
     );
     assert!(
         compact_rows
-            .last()
-            .is_some_and(|l| l.contains("enter") && l.contains("send")),
-        "compact shortcuts row at the bottom: {compact_screen}"
-    );
-    assert!(
-        compact_rows.last().is_some_and(|l| l.contains('│')),
-        "shortcuts use grok-build separators: {compact_screen}"
+            .iter()
+            .any(|l| l.contains("Shift+Tab") && l.contains("mode")),
+        "idle session still shows the grok-build mode hint: {compact_screen}"
     );
     assert!(
         compact_screen.contains("❯ next") || compact_screen.contains("next"),
@@ -5455,10 +6022,18 @@ fn session_chrome_matches_grok_build_stack() {
         tall_rows.last().is_some_and(|l| l.trim().is_empty()),
         "tall terminal keeps a blank bottom pad: {tall_screen}"
     );
-    let shortcuts = tall_rows[tall_rows.len() - 2];
     assert!(
-        shortcuts.contains("enter") && shortcuts.contains("send"),
-        "shortcuts sit above the bottom pad: {tall_screen}"
+        tall_screen.contains("Shift+Tab:mode"),
+        "idle transcript keeps Shift+Tab:mode on tall terminals: {tall_screen}"
+    );
+
+    let mut fresh = test_app("openai", "gpt-4o");
+    let mut welcome = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    welcome.draw(|f| fresh.render(f)).unwrap();
+    let welcome_screen = dump(&welcome);
+    assert!(
+        welcome_screen.contains("Shift+Tab") && welcome_screen.contains("mode"),
+        "empty session shows mode cycle hint: {welcome_screen}"
     );
 }
 
@@ -5732,5 +6307,476 @@ fn tasks_overlay_lists_running_id() {
     assert!(
         screen.contains("TASKS") && screen.contains("scan deps"),
         "tasks overlay: {screen}"
+    );
+}
+
+#[test]
+fn turn_status_working_shows_stop_not_ctrl_c() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.working = true;
+    let line = crate::turn_status::build(&app, 80).expect("working strip");
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("[stop]"), "{text}");
+    assert!(!text.contains("Ctrl-C"), "{text}");
+}
+
+#[test]
+fn turn_status_confirmation_waits_on_you() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.confirmation = Some(hi_agent::ConfirmationRequest::ShellMutation {
+        command: "rm x".into(),
+        cwd: "/tmp".into(),
+    });
+    let line = crate::turn_status::build(&app, 80).expect("waiting strip");
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("Waiting on you"), "{text}");
+}
+
+#[test]
+fn ctrl_f_opens_block_viewer_with_expanded_hunks() {
+    use crate::action::Action;
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolCall {
+        name: "edit".into(),
+        arguments: "{\"path\":\"src/cli.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "edit".into(),
+        result: "--- a/src/cli.rs\n+++ b/src/cli.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n".into(),
+    });
+    app.apply_action(Action::OpenBlockViewer);
+    let viewer = app.block_viewer.as_ref().expect("block viewer");
+    let text = viewer.texts.join("\n");
+    assert!(
+        text.contains("@@") && (text.contains("+new") || text.contains("new")),
+        "expanded hunk missing: {text}"
+    );
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(matches!(
+        crate::block_viewer::handle_key(&mut app, &esc),
+        crate::block_viewer::ViewerOutcome::Close
+    ));
+}
+
+#[test]
+fn jump_picker_scrolls_and_esc_restores() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.push_user_prompt(Line::raw("first prompt"));
+    for i in 0..40 {
+        app.transcript
+            .push(TranscriptEntry::Assistant(Line::raw(format!("pad {i}"))));
+    }
+    app.push_user_prompt(Line::raw("second prompt"));
+    app.view_max_scroll = 200;
+    app.scroll = 12;
+    app.following = false;
+    let restore = app.scroll;
+    app.open_jump_picker();
+    assert!(app.jump_picker.is_some());
+    let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+    crate::session_pickers::handle_jump_key(&mut app, &key);
+    assert_ne!(app.scroll, restore, "j/k should live-scroll");
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    crate::session_pickers::handle_jump_key(&mut app, &esc);
+    assert!(app.jump_picker.is_none());
+    assert_eq!(app.scroll, restore);
+}
+
+#[test]
+fn rewind_transcript_drops_chosen_prompt_and_later_rows() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.push_user_prompt(Line::raw("keep me"));
+    app.transcript
+        .push(TranscriptEntry::Assistant(Line::raw("kept answer")));
+    app.push_user_prompt(Line::raw("drop me"));
+    app.transcript
+        .push(TranscriptEntry::Assistant(Line::raw("later answer")));
+    app.rewind_transcript_to_user_turn(2);
+    let text: String = app.transcript.iter().map(TranscriptEntry::text).collect();
+    assert!(text.contains("keep me"), "{text}");
+    assert!(text.contains("kept answer"), "{text}");
+    assert!(!text.contains("drop me"), "{text}");
+    assert!(!text.contains("later answer"), "{text}");
+}
+
+#[test]
+fn rewind_picker_confirm_emits_turn_number() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.rewind_picker = crate::session_pickers::RewindPicker::new(vec![
+        hi_agent::UserTurn {
+            n: 1,
+            message_index: 1,
+            preview: "one".into(),
+        },
+        hi_agent::UserTurn {
+            n: 2,
+            message_index: 3,
+            preview: "two".into(),
+        },
+    ]);
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(matches!(
+        crate::session_pickers::handle_rewind_key(&mut app, &enter),
+        crate::session_pickers::PickerOutcome::Continue
+    ));
+    assert!(matches!(
+        crate::session_pickers::handle_rewind_key(&mut app, &enter),
+        crate::session_pickers::PickerOutcome::Rewind(2)
+    ));
+}
+
+#[test]
+fn timeline_rail_ticks_with_two_prompts() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.timeline_enabled = true;
+    app.push_user_prompt(Line::raw("turn one"));
+    app.transcript
+        .push(TranscriptEntry::Assistant(Line::raw("answer one")));
+    app.push_user_prompt(Line::raw("turn two"));
+    app.transcript
+        .push(TranscriptEntry::Assistant(Line::raw("answer two")));
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert_eq!(app.timeline_rect.width, 2);
+    assert!(
+        !app.timeline_hits.is_empty(),
+        "expected rail hits: {screen}"
+    );
+    assert!(
+        screen.contains('·') || screen.contains('●'),
+        "rail ticks missing: {screen}"
+    );
+}
+
+#[tokio::test]
+async fn rewind_without_arg_opens_picker() {
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
+    agent.apply_loaded_session(
+        vec![
+            hi_ai::Message::system("sys"),
+            hi_ai::Message::user("first"),
+            hi_ai::Message::assistant(vec![hi_ai::Content::Text("a1".into())]),
+            hi_ai::Message::user("second"),
+            hi_ai::Message::assistant(vec![hi_ai::Content::Text("a2".into())]),
+        ],
+        hi_ai::Usage::default(),
+        Vec::new(),
+        None,
+        hi_agent::DecisionLog::default(),
+        Vec::new(),
+    );
+    let mut app = test_app("openai", "gpt-4o");
+    app.handle_command(&mut agent, hi_agent::Command::Rewind(String::new()))
+        .await;
+    let picker = app.rewind_picker.as_ref().expect("rewind picker");
+    assert_eq!(picker.turns.len(), 2);
+}
+
+#[test]
+fn composer_shows_always_approve_flag_by_default() {
+    let mut app = test_app("openai", "gpt-4o");
+    let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("always-approve"),
+        "default Always face is flagged on the prompt:\n{screen}"
+    );
+}
+
+#[test]
+fn plan_mode_paints_plan_flag_on_the_composer() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.plan_mode = true;
+    app.permission_mode = hi_agent::PermissionMode::Ask;
+    let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("plan"), "plan flag shown:\n{screen}");
+    assert!(
+        !screen.contains("always-approve"),
+        "always-approve hidden while planning:\n{screen}"
+    );
+}
+
+#[test]
+fn leaving_plan_with_leftover_opens_approval_card() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.plan_mode = true;
+    app.permission_mode = hi_agent::PermissionMode::Ask;
+    app.plan = vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }];
+    app.cycle_session_face();
+    assert_eq!(app.session_face(), crate::session_face::SessionFace::Always);
+    assert!(app.plan_approval.is_some());
+}
+
+#[test]
+fn plan_approval_card_renders_choices() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.plan = vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }];
+    app.open_plan_approval();
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("Plan approval"), "{screen}");
+    assert!(screen.contains("Approve"), "{screen}");
+    assert!(screen.contains("Request changes"), "{screen}");
+    assert!(screen.contains("wire the scheduler"), "{screen}");
+}
+
+#[test]
+fn queue_pane_shows_numbered_rows_above_the_prompt() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    app.queue.push_back("run the tests".into());
+    app.queue.push_back("then commit".into());
+    let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("#1 run the tests"), "{screen}");
+    assert!(screen.contains("#2 then commit"), "{screen}");
+}
+
+#[test]
+fn confirm_overlay_highlights_the_first_option() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.confirmation = Some(hi_agent::ConfirmationRequest::ShellMutation {
+        command: "rm generated.txt".into(),
+        cwd: "/workspace".into(),
+    });
+    let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("Approve once"), "{screen}");
+    assert!(screen.contains("Always allow this session"), "{screen}");
+    assert!(screen.contains("Reject and follow up"), "{screen}");
+}
+
+#[test]
+fn plan_approval_esc_parks_and_turn_status_unparks() {
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    let mut app = test_app("openai", "gpt-4o");
+    app.plan = vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }];
+    app.open_plan_approval();
+    assert!(app.plan_approval_capturing());
+    let outcome = crate::plan_approval::handle_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    );
+    assert_eq!(outcome, crate::plan_approval::PlanApprovalOutcome::Continue);
+    assert!(!app.plan_approval_capturing());
+    assert!(app.plan_approval.as_ref().is_some_and(|c| c.parked));
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("/view-plan"), "{screen}");
+    assert!(
+        !screen.contains("Approve — leave"),
+        "parked card leaves the composer: {screen}"
+    );
+
+    let rect = app.turn_status_rect;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        app.plan_approval_capturing(),
+        "clicking the turn-status row reopens the card"
+    );
+}
+
+#[test]
+fn plan_comments_seed_request_changes() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.plan = vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }];
+    app.open_plan_approval();
+    app.plan_approval
+        .as_mut()
+        .unwrap()
+        .comments
+        .push(crate::plan_approval::PlanComment {
+            step: 0,
+            text: "too vague".into(),
+        });
+    app.apply_plan_request_changes_local();
+    assert!(app.plan_mode);
+    assert!(
+        app.input.text().contains("too vague") && app.input.text().contains("wire the scheduler"),
+        "comments seed the composer: {}",
+        app.input.text()
+    );
+}
+
+#[test]
+fn welcome_home_paints_repo_branch_and_sessions() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.git_branch = Some("main".into());
+    app.session_completion_cache = vec![crate::LocalSessionInfo {
+        id: "s1".into(),
+        title: "review layout".into(),
+        age: "2h".into(),
+        lines: 4,
+    }];
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("workspace:main"), "{screen}");
+    assert!(screen.contains("review layout"), "{screen}");
+    assert!(screen.contains("Shift-Tab plan"), "{screen}");
+}
+
+#[test]
+fn live_task_strip_lists_running_subagents() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    app.apply(UiEvent::SubagentSpawned {
+        id: "explore-1".into(),
+        subagent_kind: "explore".into(),
+        description: "crate boundaries".into(),
+        background: false,
+    });
+    app.apply(UiEvent::SubagentSpawned {
+        id: "task-1".into(),
+        subagent_kind: "task".into(),
+        description: "run tests".into(),
+        background: true,
+    });
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("Subagents"), "{screen}");
+    assert!(screen.contains("explore crate boundaries"), "{screen}");
+    assert!(screen.contains("task run tests"), "{screen}");
+}
+
+#[test]
+fn memory_browser_lists_project_and_global() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app("openai", "gpt-4o");
+    app.memory_browser = Some(crate::memory_browser::MemoryBrowser::open(
+        &app.workspace_root,
+    ));
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("project"), "{screen}");
+    assert!(screen.contains("global"), "{screen}");
+    crate::memory_browser::handle_key(&mut app, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.memory_browser.is_none());
+}
+
+#[test]
+fn context_chip_hover_swaps_in_place() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Usage {
+        prompt: 12,
+        generated: 340,
+        ctx_used: 64_000,
+        ctx_window: Some(128_000),
+        estimated: false,
+    });
+    let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let idle = dump(&term);
+    assert!(idle.contains("64k / 128k"), "{idle}");
+    app.mouse_col = app.ctx_chip_rect.x;
+    app.mouse_row = app.ctx_chip_rect.y;
+    term.draw(|f| app.render(f)).unwrap();
+    let hover = dump(&term);
+    assert!(
+        hover.contains("#####------") || hover.contains('#'),
+        "{hover}"
+    );
+    assert!(!hover.contains("64k / 128k"), "{hover}");
+}
+
+#[test]
+fn permission_auto_approves_only_safe_edits() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.permission_mode = hi_agent::PermissionMode::Auto;
+    let safe = hi_agent::ConfirmationRequest::FileEdit {
+        path: "src/lib.rs".into(),
+        diff: "+fn ok() {}\n".into(),
+    };
+    let secret = hi_agent::ConfirmationRequest::FileEdit {
+        path: ".env".into(),
+        diff: "+TOKEN=x\n".into(),
+    };
+    let shell = hi_agent::ConfirmationRequest::ShellMutation {
+        command: "rm x".into(),
+        cwd: "/tmp".into(),
+    };
+    let ask = hi_agent::ConfirmationRequest::AskUser {
+        question: "which API?".into(),
+        options: vec!["REST".into()],
+    };
+    assert!(app.should_auto_approve(&safe));
+    assert!(!app.should_auto_approve(&secret));
+    assert!(!app.should_auto_approve(&shell));
+    assert!(!app.should_auto_approve(&ask));
+}
+
+#[test]
+fn confirm_hint_mentions_queued_permissions() {
+    let request = hi_agent::ConfirmationRequest::ShellMutation {
+        command: "rm x".into(),
+        cwd: "/tmp".into(),
+    };
+    let hint =
+        crate::confirm_overlay::hint(&request, crate::confirm_overlay::ConfirmFocus::Options, 2);
+    assert!(hint.contains("2 waiting"), "{hint}");
+}
+
+#[test]
+fn path_completion_inserts_without_trailing_space_so_ranges_work() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.path_completion_cache = vec!["src/lib.rs".into()];
+    app.completion = Some(crate::completion::CompletionState {
+        ctx: crate::completion::CompletionContext::Path {
+            prefix: String::new(),
+        },
+        selected: 0,
+    });
+    app.input.set("@lib");
+    app.sync_completion();
+    let labels: Vec<String> = app
+        .completion_items()
+        .iter()
+        .map(|i| i.label.clone())
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "src/lib.rs"),
+        "fuzzy @ menu: {labels:?}"
+    );
+    assert_eq!(app.accept_completion(false), None);
+    assert_eq!(app.input.text(), "@src/lib.rs");
+    app.input.set("@src/lib.rs:40");
+    app.sync_completion();
+    assert!(
+        app.completion.is_none(),
+        "typing :range closes the path menu"
     );
 }

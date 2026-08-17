@@ -393,8 +393,10 @@ pub(crate) fn is_env_var_reference(s: &str) -> bool {
 pub(crate) const ONBOARDING: &str = "no model configured. Get started with one of:
 
   pipenetwork.ai:   PIPENETWORK_API_KEY=...  hi --provider pipenetwork \"...\"
+  OpenRouter:       OPENROUTER_API_KEY=...   hi --provider openai -m anthropic/claude-sonnet-4 \"...\"
+  Anthropic:        ANTHROPIC_API_KEY=...    hi --provider anthropic \"...\"
   Local (Ollama):   hi --provider ollama -m qwen2.5-coder \"...\"
-  xAI (Grok):       XAI_API_KEY=...  hi --provider xai \"...\"
+  xAI (Grok):       XAI_API_KEY=...          hi --provider xai \"...\"
 
 Or run `hi` on a real terminal for the interactive setup wizard.
 Or set HI_MODEL, or add a profile in ~/.config/hi/config.toml (see README).
@@ -404,11 +406,16 @@ Tip: interactive sessions use the full-screen interface by default; pass --plain
 /// Keep the models current: a stale entry here is what a user with a key in
 /// their environment silently runs on, since auto-select writes no config and
 /// says nothing about the choice it made.
-const AUTO_SELECT: [(&str, ProviderName, &str); 3] = [
+const AUTO_SELECT: [(&str, ProviderName, &str); 4] = [
     (
         "PIPENETWORK_API_KEY",
         ProviderName::Pipenetwork,
         "ipop/coder-balanced",
+    ),
+    (
+        "OPENROUTER_API_KEY",
+        ProviderName::Openai,
+        "anthropic/claude-sonnet-4",
     ),
     (
         "ANTHROPIC_API_KEY",

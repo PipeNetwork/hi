@@ -18,18 +18,24 @@ mod dashboard_goal;
 mod diff_lab;
 mod dispatch;
 mod domain;
+mod file_mentions;
 mod keys;
 mod lock;
 mod loops;
+mod memory_browser;
 mod mode;
 mod notify;
 mod palette;
+mod plan_approval;
 mod profiling;
 mod race;
 pub use app::run;
 pub use daemon::run_loops_daemon;
+mod block_viewer;
+mod btw;
 mod chrome;
 mod completion;
+mod confirm_overlay;
 pub mod event;
 mod input;
 mod layout;
@@ -38,9 +44,13 @@ mod model_picker;
 mod provider_form;
 mod provider_picker;
 mod render;
+mod session_face;
+mod session_pickers;
 mod subagent_overlay;
 mod sync_tui;
 mod theme;
+mod timeline;
+mod turn_status;
 mod tutorial;
 mod util;
 mod view_cache;
@@ -51,7 +61,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use hi_agent::{Agent, AgentStateSnapshot};
@@ -642,8 +652,12 @@ pub(crate) enum TranscriptEntry {
     /// A user prompt echo (`❯ …`). Structurally distinct from a plain `Line` so
     /// the render pass can find prompt boundaries for sticky headers — when the
     /// transcript is scrolled past a prompt, that prompt pins to the top so the
-    /// visible output always shows which request it belongs to.
-    UserPrompt(Line<'static>),
+    /// visible output always shows which request it belongs to. `at` is the
+    /// wall-clock stamp grok-build right-aligns on the first prompt row.
+    UserPrompt {
+        line: Line<'static>,
+        at: SystemTime,
+    },
     /// A line of assistant prose. It stays separate from status/tool lines so
     /// the renderer can add the assistant gutter without changing copied text.
     Assistant(Line<'static>),
@@ -659,6 +673,14 @@ pub(crate) enum TranscriptEntry {
     ChangedFiles {
         line: Line<'static>,
         files: Vec<String>,
+    },
+    /// Persisted `/btw` aside after the overlay is dismissed. Collapsed shows
+    /// the golden `/btw <question>` header (grok-build); expand to read the
+    /// markdown answer.
+    Btw {
+        question: String,
+        answer: String,
+        expanded: bool,
     },
     /// Durable workflow lifecycle block, replaced in place as newer revisions
     /// arrive rather than appended once per update.
@@ -689,6 +711,25 @@ pub(crate) enum TranscriptEntry {
 /// transcript stays a verb list, matching grok-build.
 pub(crate) const TOOL_OUTPUT_PREVIEW_LINES: usize = 0;
 
+/// Grok-build user prompts are a quiet `❯ ` prefix, not a `┃` accent gutter.
+fn style_user_prompt(line: &Line<'static>) -> Line<'static> {
+    let th = crate::theme::theme();
+    let text = line_text(line);
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('❯') || trimmed.starts_with('>') {
+        return line.clone();
+    }
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::styled(
+        "❯ ",
+        Style::default()
+            .fg(th.tone_color(crate::theme::UiTone::User))
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.extend(line.spans.iter().cloned());
+    Line::from(spans)
+}
+
 impl TranscriptEntry {
     /// Flatten this entry into display lines under the current fold settings.
     /// A collapsed reasoning block is one dim summary line; a long tool-output
@@ -705,19 +746,38 @@ impl TranscriptEntry {
         let preview_n = density.tool_preview_lines();
         match self {
             TranscriptEntry::Line(line) => vec![line.clone()],
-            TranscriptEntry::UserPrompt(line) => vec![crate::render::with_gutter(
-                line,
-                th.tone_color(crate::theme::UiTone::User),
-            )],
-            TranscriptEntry::Assistant(line) => vec![crate::render::with_gutter(
-                line,
-                th.tone_color(crate::theme::UiTone::Assistant),
-            )],
+            TranscriptEntry::UserPrompt { line, .. } => vec![style_user_prompt(line)],
+            TranscriptEntry::Assistant(line) => vec![line.clone()],
             TranscriptEntry::ChangedFiles { line, .. } => vec![line.clone()],
+            TranscriptEntry::Btw {
+                question,
+                answer,
+                expanded,
+            } => {
+                let header = Line::from(Span::styled(
+                    format!("/btw {question}"),
+                    Style::default()
+                        .fg(th.accent_plan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                if !*expanded {
+                    vec![header]
+                } else {
+                    let mut lines = vec![header, Line::raw("")];
+                    lines.extend(crate::render::markdown_body_lines(answer));
+                    lines
+                }
+            }
             TranscriptEntry::Workflow { snapshot } => workflow_snapshot_lines(snapshot),
-            TranscriptEntry::Activity(block) => block.flatten(show_tool, density),
+            TranscriptEntry::Activity(block) => block.flatten(show_tool, show_reasoning, density),
             TranscriptEntry::Reasoning { text, elapsed } => {
                 let secs = elapsed.as_secs();
+                // Instant CoT ("thought for 0s") is noise in the collapsed
+                // feed — grok-build folds it into the tool row. Keep it for
+                // Ctrl-T so the text is still there.
+                if !show_reasoning && secs == 0 {
+                    return Vec::new();
+                }
                 let label = if secs >= 60 {
                     format!("{}m {:02}s", secs / 60, secs % 60)
                 } else {
@@ -805,7 +865,10 @@ impl TranscriptEntry {
             // User prompts are stored without a semantic gutter. Preserve
             // literal leading glyphs the user typed instead of normalizing
             // their content as renderer decoration.
-            TranscriptEntry::UserPrompt(line) => line_text(line),
+            TranscriptEntry::UserPrompt { line, .. } => line_text(line),
+            TranscriptEntry::Btw {
+                question, answer, ..
+            } => format!("/btw {question}\n{answer}"),
             TranscriptEntry::Reasoning { text, .. } => text.clone(),
             TranscriptEntry::Workflow { snapshot } => workflow_snapshot_text(snapshot),
             TranscriptEntry::Activity(block) => block.text(),
@@ -818,7 +881,7 @@ impl TranscriptEntry {
     /// Foldable blocks that block-nav / click-to-expand step over.
     pub(crate) fn is_foldable(&self) -> bool {
         match self {
-            Self::ToolOutput { .. } => true,
+            Self::ToolOutput { .. } | Self::Btw { .. } => true,
             Self::Activity(block) => block.is_foldable() || block.subagent_id().is_some(),
             _ => false,
         }
@@ -827,7 +890,7 @@ impl TranscriptEntry {
     /// Per-block expand flag, when this entry is foldable.
     pub(crate) fn expanded_mut(&mut self) -> Option<&mut bool> {
         match self {
-            Self::ToolOutput { expanded, .. } => Some(expanded),
+            Self::ToolOutput { expanded, .. } | Self::Btw { expanded, .. } => Some(expanded),
             Self::Activity(block) if block.is_foldable() => Some(&mut block.expanded),
             _ => None,
         }
@@ -900,7 +963,7 @@ fn workflow_snapshot_text(snapshot: &hi_workflow::WorkflowRunSnapshot) -> String
         .join("\n")
 }
 
-/// One line (or multi-line block) in the right-hand BTW side pane.
+/// One line (or multi-line block) in the live `/btw` overlay thread.
 #[derive(Clone, Debug)]
 pub(crate) enum BtwEntry {
     /// User side question.
@@ -914,6 +977,7 @@ pub(crate) enum BtwEntry {
 }
 
 impl BtwEntry {
+    #[cfg(test)]
     pub(crate) fn as_lines(&self) -> Vec<String> {
         match self {
             BtwEntry::Question(q) => vec![format!("❓ {q}")],
@@ -923,7 +987,7 @@ impl BtwEntry {
                 if d.is_empty() {
                     vec![format!("  · {name}")]
                 } else {
-                    // Keep crumbs short so the pane stays scannable.
+                    // Keep crumbs short so the overlay stays scannable.
                     vec![format!(
                         "  · {name} {}",
                         crate::layout::truncate_display(d, 56)
@@ -1113,10 +1177,11 @@ pub(crate) struct App {
     /// elapses (the flash weight decays to zero).
     pub(crate) finished_at: Option<Instant>,
     /// The tool currently executing (its display label) and when it started, so
-    /// the working line can name the in-flight action with its own timer. `None`
-    /// while the model — not a tool — is the active party.
+    /// Esc can interrupt just that call. `None` while the model is the active party.
     pub(crate) current_tool: Option<String>,
     pub(crate) current_tool_started: Option<Instant>,
+    /// Streamed stdout already landed on the live `Run` row for this tool call.
+    pub(crate) run_streamed_this_call: bool,
     /// Lines typed while a turn was running, to run once it finishes (FIFO).
     pub(crate) queue: VecDeque<String>,
     /// Plain-text lines offered to the in-flight turn as mid-turn steering
@@ -1186,12 +1251,34 @@ pub(crate) struct App {
     /// Local interactive mutation confirmation currently shown by the turn driver.
     pub(crate) confirmation: Option<hi_agent::ConfirmationRequest>,
     pub(crate) confirmation_scroll: usize,
+    /// Highlighted option on the permission / ask-user overlay.
+    pub(crate) confirmation_selected: usize,
+    pub(crate) confirm_focus: crate::confirm_overlay::ConfirmFocus,
+    /// Parked leftover-plan card (Approve / Request changes / Quit).
+    pub(crate) plan_approval: Option<crate::plan_approval::PlanApproval>,
+    /// `/memory` split browser over project/global markdown files.
+    pub(crate) memory_browser: Option<crate::memory_browser::MemoryBrowser>,
+    /// Confirmations waiting behind the active overlay (`N waiting`).
+    pub(crate) confirmation_waiting: usize,
+    /// Last mouse cell, for hover chrome (context bar).
+    pub(crate) mouse_col: u16,
+    pub(crate) mouse_row: u16,
+    pub(crate) ctx_chip_rect: ratatui::layout::Rect,
+    pub(crate) turn_status_rect: ratatui::layout::Rect,
+    /// Cached `git rev-parse --abbrev-ref HEAD` for the welcome home line.
+    pub(crate) git_branch: Option<String>,
+    /// When false, the plan/todo list above the composer collapses to a header.
+    pub(crate) plan_pane_expanded: bool,
     /// The active long-horizon goal, mirrored from the agent so the pinned plan
     /// block and header can show sub-goal progress. Refreshed when `/goal` sets it
     /// and after every turn (the driver may advance it). `None` when no goal is set.
     pub(crate) goal: Option<hi_agent::Goal>,
     /// Mirrored from the agent so empty Enter can respect `/plan` draft mode.
     pub(crate) plan_mode: bool,
+    /// Mirrored permission ladder (`ask` / `auto` / `always`).
+    pub(crate) permission_mode: hi_agent::PermissionMode,
+    /// Composer flags changed while the agent was borrowed (mid-turn Shift-Tab).
+    pub(crate) session_face_dirty: bool,
     /// Mirrored from the agent so chrome can show paused/parked.
     pub(crate) plan_drive_paused: bool,
     /// Cached leftover-work gate, refreshed after each turn and `/plan`/`/goal`.
@@ -1216,6 +1303,12 @@ pub(crate) struct App {
     pub(crate) subagents: HashMap<String, crate::subagent_overlay::SubagentInfo>,
     pub(crate) inspect_subagent: Option<crate::subagent_overlay::InspectOverlay>,
     pub(crate) tasks_overlay: Option<crate::subagent_overlay::TasksOverlay>,
+    pub(crate) block_viewer: Option<crate::block_viewer::BlockViewer>,
+    pub(crate) jump_picker: Option<crate::session_pickers::JumpPicker>,
+    pub(crate) rewind_picker: Option<crate::session_pickers::RewindPicker>,
+    /// Last painted timeline rail hit targets (screen row → tick).
+    pub(crate) timeline_hits: Vec<(u16, crate::timeline::TimelineHit)>,
+    pub(crate) timeline_rect: ratatui::layout::Rect,
     /// Interactive differential runner overlay. Large run data lives in
     /// `hi-diff` artifacts; this field only retains the bounded UI snapshot.
     pub(crate) diff_lab: Option<crate::diff_lab::DiffLabOverlay>,
@@ -1253,16 +1346,17 @@ pub(crate) struct App {
     /// Assistant prose currently streaming. Tool output is intentionally not
     /// included; `/copy` copies the assistant's answer, not command logs.
     pub(crate) current_assistant: String,
-    /// Whether the current `/btw` side-answer stream has emitted its `↳ btw:`
-    /// prefix yet (reset on each assistant boundary so each answer gets one).
-    /// Kept for the one-line main-transcript stub when the pane is closed.
-    pub(crate) btw_answer_started: bool,
-    /// Right-hand BTW pane open (auto-opens on first `/btw` activity; toggle Ctrl-B).
+    /// Inline `/btw` overlay is visible (auto-opens on first side activity;
+    /// Esc dismisses it).
     pub(crate) show_btw: bool,
-    /// Scroll offset within the BTW pane (lines from top of the thread).
-    pub(crate) btw_scroll: u16,
-    /// Side-channel thread: questions, tool crumbs, answers — independent of the
-    /// main task transcript so asides never pollute `/copy` or the work log.
+    /// Wrapped-row offset inside a long Done overlay (from the top).
+    pub(crate) btw_scroll: usize,
+    /// Last painted overlay rect, for mouse-wheel scroll and click-to-dismiss.
+    pub(crate) last_btw_area: ratatui::layout::Rect,
+    /// `[Esc]` hit target on the overlay's top border.
+    pub(crate) last_btw_close: ratatui::layout::Rect,
+    /// Live overlay thread: question / thinking / tools / answer. Not part of
+    /// the main transcript until the overlay is dismissed.
     pub(crate) btw_thread: Vec<BtwEntry>,
     /// Last completed assistant prose, copied by `/copy`.
     pub(crate) last_assistant: String,
@@ -1280,10 +1374,12 @@ pub(crate) struct App {
     /// see at a glance what the session has modified, even while a turn is
     /// running (when the per-turn line is hidden).
     pub(crate) session_changed_files: Vec<String>,
-    /// Claude-style ghost-text suggestion for the empty input bar. Set from
+    /// Ghost-text suggestion for the composer. Set from
     /// [`UiEvent::SuggestedPrompt`] after a turn, or from a cheap git heuristic
-    /// at session start. Cleared when the user types, accepts, or starts a turn.
+    /// at session start. Typing a matching prefix shrinks it; Esc on empty
+    /// dismisses it until the next suggestion.
     pub(crate) suggested_prompt: Option<String>,
+    pub(crate) suggested_prompt_dismissed: bool,
     /// Cached working-tree diff text for the full-screen review overlay.
     pub(crate) diff_text: Option<String>,
     /// Scroll position (line index) within the full-screen diff review overlay.

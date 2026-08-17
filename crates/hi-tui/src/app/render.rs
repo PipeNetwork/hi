@@ -9,13 +9,29 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use crate::chrome::{self, ShortcutHint};
 use crate::layout::{UiLayout, display_width, truncate_display};
 use crate::model_picker::{display_capabilities, display_price, display_window};
-use crate::render::{
-    diff_lines, dim, flash_weight, lerp_color, markdown_line, pulse_color, wave_color,
-    wrapped_line_height,
-};
+use crate::render::{diff_lines, dim, lerp_color, markdown_line, wave_color, wrapped_line_height};
 use crate::theme::UiTone;
 use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
 use crate::{FORM_LABEL_WIDTH, PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
+
+/// Clip ghost suffix to `max_width` cells without trimming leading spaces
+/// (those spaces are part of the remaining suggestion).
+fn clip_ghost(text: &str, max_width: usize) -> String {
+    if display_width(text) <= max_width {
+        return text.to_string();
+    }
+    let mut width = 0;
+    let mut out = String::new();
+    for ch in text.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max_width {
+            break;
+        }
+        width += ch_width;
+        out.push(ch);
+    }
+    out
+}
 
 /// Render a confirmation request's details as styled lines so the user can
 /// review a diff or command with real coloring instead of a wall of plain text.
@@ -168,40 +184,22 @@ fn review_repair_summary(t: &hi_agent::TurnTelemetry) -> Option<String> {
 }
 
 impl crate::App {
-    /// The live "what's happening now" lead for the working line: the in-flight
-    /// tool named with its own elapsed timer, otherwise the model phase —
-    /// `thinking…` (reasoning), `responding…` (streaming text), or `Working`
-    /// (the round's model call is in flight but nothing's streamed yet). The
-    /// `Working` lead is rendered with a rolling gray→white→gray wave animation
-    /// (see [`Self::working_spans`]); the others are plain cyan bold. Lets you
-    /// tell a slow tool from a slow model at a glance.
+    /// Quiet model-phase lead for the turn-status row: `thinking…`,
+    /// `responding…`, or `Working…` plus the turn timer. Command identity
+    /// lives on transcript `Run` rows — this line never dumps tool ids,
+    /// `bash_output`, round counts, or call counts.
     pub(crate) fn activity_line(&self) -> String {
-        // A compact progress suffix for multi-step turns: "round 3 · 5 calls".
-        // Suppressed on the first round with no tool calls (the common single-shot case).
-        let progress = if self.turn_rounds > 1 || (self.turn_rounds > 0 && self.turn_tool_calls > 0)
-        {
-            format!(
-                " · round {} · {} call{}",
-                self.turn_rounds,
-                self.turn_tool_calls,
-                if self.turn_tool_calls == 1 { "" } else { "s" }
-            )
-        } else {
-            String::new()
-        };
-        if let (Some(tool), Some(started)) = (&self.current_tool, self.current_tool_started) {
-            return format!(
-                "running {tool} · {}{progress}",
-                fmt_elapsed(started.elapsed().as_secs())
-            );
-        }
         let secs = self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-        let verb = match self.last_turn_event {
-            Some(TurnEventKind::Reasoning) => "thinking",
-            Some(TurnEventKind::Assistant) => "responding",
-            _ => "Working",
+        let verb = if self.current_tool.is_some() {
+            "Working"
+        } else {
+            match self.last_turn_event {
+                Some(TurnEventKind::Reasoning) => "thinking",
+                Some(TurnEventKind::Assistant) => "responding",
+                _ => "Working",
+            }
         };
-        format!("{verb}… {}{progress}", fmt_elapsed(secs))
+        format!("{verb}… {}", fmt_elapsed(secs))
     }
 
     /// The `Working` lead rendered as a rolling wave: every letter starts gray,
@@ -231,23 +229,6 @@ impl crate::App {
             .collect()
     }
 
-    fn blocking_subagent(&self) -> Option<(std::time::Instant, String)> {
-        self.subagents.values().find_map(|info| {
-            if !info.background && info.live() {
-                Some((info.started_at, info.id.clone()))
-            } else {
-                None
-            }
-        })
-    }
-
-    fn live_background_subagents(&self) -> usize {
-        self.subagents
-            .values()
-            .filter(|info| info.background && info.live())
-            .count()
-    }
-
     fn live_subagent_tick(&self) -> u64 {
         self.subagents
             .values()
@@ -257,119 +238,16 @@ impl crate::App {
             .unwrap_or(0)
     }
 
-    /// Grok-build paints turn activity on its own row between scrollback and
-    /// the prompt — not inside the rounded composer. Idle/done hide the row.
-    fn turn_status_line(&self) -> Option<Line<'static>> {
-        let blocking = self.blocking_subagent();
-        let bg_live = self.live_background_subagents();
-        if self.working {
-            if let Some((started_at, _)) = blocking {
-                let frame_ch = SPINNER[self.spinner % SPINNER.len()];
-                let running = crate::theme::theme().accent_running;
-                return Some(Line::from(vec![
-                    Span::styled(
-                        format!("{frame_ch} "),
-                        Style::default().fg(running).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(
-                            "Waiting on subagent… {}",
-                            crate::util::fmt_elapsed(started_at.elapsed().as_secs())
-                        ),
-                        Style::default().fg(running).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("   Ctrl-C to interrupt", dim()),
-                ]));
-            }
-            let frame_ch = SPINNER[self.spinner % SPINNER.len()];
-            let mut stats = String::new();
-            if let Some(pct) = self.context_pct() {
-                stats.push_str(&format!(" · {pct}% ctx"));
-            }
-            if let Some(limits) = fmt_rate_limits(self.rate_limits) {
-                stats.push_str(&format!(" · {limits}"));
-            }
-            let activity = self.activity_line();
-            let is_working_wave = self.current_tool.is_none()
-                && !matches!(
-                    self.last_turn_event,
-                    Some(TurnEventKind::Reasoning) | Some(TurnEventKind::Assistant)
-                );
-            let running = crate::theme::theme().accent_running;
-            let glyph_fg = if is_working_wave {
-                pulse_color(crate::theme::theme().gray_dim, running, self.spinner)
-            } else {
-                running
-            };
-            let mut lead: Vec<Span<'static>> =
-                Vec::with_capacity(if is_working_wave { 8 } else { 1 });
-            lead.push(Span::styled(
-                format!("{frame_ch} "),
-                Style::default().fg(glyph_fg).add_modifier(Modifier::BOLD),
-            ));
-            if is_working_wave {
-                lead.extend(self.working_spans());
-                if let Some(rest) = activity.strip_prefix("Working") {
-                    lead.push(Span::styled(
-                        rest.to_string(),
-                        Style::default().fg(running).add_modifier(Modifier::BOLD),
-                    ));
-                }
-            } else {
-                lead.push(Span::styled(
-                    activity,
-                    Style::default().fg(running).add_modifier(Modifier::BOLD),
-                ));
-            }
-            lead.push(Span::styled(stats, Style::default()));
-            lead.push(Span::styled("   Ctrl-C to interrupt", dim()));
-            return Some(Line::from(lead));
-        }
-        if bg_live > 0 {
-            let running = crate::theme::theme().accent_running;
-            let noun = if bg_live == 1 {
-                "subagent still running"
-            } else {
-                "subagents still running"
-            };
-            return Some(Line::from(vec![Span::styled(
-                format!("{bg_live} {noun}"),
-                Style::default().fg(running),
-            )]));
-        }
-        let latency = self
-            .last_turn_latency
-            .map(|elapsed| format!(" · latency {}", fmt_elapsed(elapsed.as_secs())))
-            .unwrap_or_default();
-        let (text, tone) = match &self.last_turn_state {
-            TurnState::Done(s) => (
-                format!("last: done ({s}){latency}"),
-                crate::theme::theme().accent_success,
-            ),
-            TurnState::Warning(s) => (
-                format!("last: warning ({s}){latency}"),
-                crate::theme::theme().warning,
-            ),
-            TurnState::Failed(s) => (
-                format!("last: failed — {}{latency} · /retry", clip_reason(s)),
-                crate::theme::theme().accent_error,
-            ),
-            TurnState::Cancelled => (
-                format!("last: cancelled{latency}"),
-                crate::theme::theme().gray_bright,
-            ),
-            _ => return None,
-        };
-        // Brief brighten after the turn settles, then hold the outcome color.
-        let flash = self
-            .finished_at
-            .map(|t| flash_weight(t.elapsed().as_millis()))
-            .filter(|&w| w > 0.0);
-        let fg = match flash {
-            Some(w) => lerp_color(tone, crate::theme::theme().gray_bright, w),
-            None => tone,
-        };
-        Some(Line::styled(text, Style::default().fg(fg)))
+    /// Turn activity sits between scrollback and the prompt. Idle and done
+    /// hide the row; latency folds into the header. Warnings and failures stay.
+    fn turn_status_line(&self, width: u16) -> Option<Line<'static>> {
+        crate::turn_status::build(self, width)
+    }
+
+    /// Keep the shortcuts row whenever the terminal is tall enough. Grok-build
+    /// always shows `Shift+Tab:mode` here; `?` still opens the cheat sheet.
+    fn show_shortcuts_row(&self) -> bool {
+        true
     }
 
     pub(crate) fn report_status(&mut self, agent: &Agent) {
@@ -576,6 +454,13 @@ impl crate::App {
                 dim(),
             ));
         }
+        let cursor_at_end = self.input.cursor() == self.input.chars.len();
+        let ghost = if cursor_at_end {
+            self.ghost_suffix().map(str::to_owned)
+        } else {
+            None
+        };
+        let last_visible = wrapped[start..].len().saturating_sub(1);
         for (i, (chunk, cursor_here)) in wrapped[start..].iter().enumerate() {
             // Match Grok's compact prompt: `❯ ` on the first row and continuation
             // rows aligned directly under the editable text.
@@ -590,20 +475,27 @@ impl crate::App {
             } else {
                 Span::raw("  ")
             };
-            let content_span = if first && chunk.is_empty() {
-                if let Some(suggestion) = self.suggested_prompt.as_deref() {
-                    // Claude-style ghost text: predicted next prompt in the empty bar.
-                    Span::styled(suggestion.to_string(), dim())
-                } else {
-                    Span::styled("Ask anything, @ to mention files", dim())
+            let suffix = if i == last_visible {
+                ghost.as_deref()
+            } else {
+                None
+            };
+            let mut spans = vec![prefix_span];
+            if first && chunk.is_empty() {
+                if let Some(suggestion) = suffix {
+                    let shown = clip_ghost(suggestion, wrap_w);
+                    spans.push(Span::styled(shown, dim()));
                 }
             } else {
-                Span::styled(
-                    chunk.clone(),
-                    Style::default().fg(crate::theme::theme().text_primary),
-                )
-            };
-            lines.push(Line::from(vec![prefix_span, content_span]));
+                spans.extend(crate::file_mentions::mention_spans(chunk));
+                if let Some(suggestion) = suffix {
+                    let remain = wrap_w.saturating_sub(display_width(chunk));
+                    if remain > 0 {
+                        spans.push(Span::styled(clip_ghost(suggestion, remain), dim()));
+                    }
+                }
+            }
+            lines.push(Line::from(spans));
             if let Some(col) = cursor_here
                 && !found_cursor
             {
@@ -631,13 +523,32 @@ impl crate::App {
         if let Some(goal) = &self.goal
             && !goal.sub_goals.is_empty()
         {
+            if !self.plan_pane_expanded {
+                return vec![Line::styled(
+                    format!(
+                        "▸ goal · {}/{}  Ctrl-L",
+                        goal.sub_goals
+                            .iter()
+                            .filter(|s| s.status == hi_agent::GoalStatus::Done)
+                            .count(),
+                        goal.sub_goals.len()
+                    ),
+                    Style::default()
+                        .fg(crate::theme::theme().accent_plan)
+                        .add_modifier(Modifier::BOLD),
+                )];
+            }
             return self.goal_lines(goal, max_steps);
         }
         if self.plan.is_empty() {
             return Vec::new();
         }
         const HARD_CAP: usize = 8;
-        let max_steps = max_steps.min(HARD_CAP);
+        let max_steps = if self.plan_pane_expanded {
+            max_steps.min(HARD_CAP)
+        } else {
+            0
+        };
         let total = self.plan.len();
         let done = self
             .plan
@@ -657,6 +568,9 @@ impl crate::App {
                     }
                 ) {
                     header.push_str(" · parked");
+                }
+                if !self.plan_pane_expanded {
+                    header.push_str("  Ctrl-L");
                 }
                 header
             },
@@ -681,9 +595,108 @@ impl crate::App {
                 Span::styled(s.title.clone(), title_style),
             ]));
         }
-        if total > max_steps {
+        if self.plan_pane_expanded && total > max_steps {
             out.push(Line::styled(
                 format!("  … +{} more", total - max_steps),
+                dim(),
+            ));
+        }
+        out
+    }
+
+    fn queue_pane_lines(&self, max: usize) -> Vec<Line<'static>> {
+        if self.queue.is_empty() || max == 0 {
+            return Vec::new();
+        }
+        let th = crate::theme::theme();
+        let mut out = Vec::new();
+        for (i, q) in self.queue.iter().enumerate().take(max) {
+            let selected = self.queue_selected == Some(i);
+            let first = q
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or(q.as_str());
+            let extra = q.lines().count().saturating_sub(1);
+            let mut text = format!("#{} {first}", i + 1);
+            if extra > 0 {
+                text.push_str(&format!(" (+{extra} lines)"));
+            }
+            let prefix = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(th.accent_running)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                dim()
+            };
+            out.push(Line::styled(format!("{prefix}{text}"), style));
+        }
+        if self.queue.len() > max {
+            out.push(Line::styled(
+                format!("  … +{} more queued", self.queue.len() - max),
+                dim(),
+            ));
+        }
+        out
+    }
+
+    fn live_task_lines(&self, max: usize) -> Vec<Line<'static>> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let th = crate::theme::theme();
+        let mut live: Vec<_> = self.subagents.values().filter(|info| info.live()).collect();
+        live.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        if live.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let item_budget = if max >= 2 {
+            out.push(Line::from(vec![
+                Span::styled("▾ ", dim()),
+                Span::styled(
+                    "Subagents",
+                    Style::default()
+                        .fg(th.gray_bright)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {}", live.len()), dim()),
+            ]));
+            max - 1
+        } else {
+            max
+        };
+        for info in live.iter().take(item_budget) {
+            let kind = if info.background {
+                "task"
+            } else {
+                info.kind.as_str()
+            };
+            let status = if info.activity.trim().is_empty() {
+                "Responding"
+            } else {
+                info.activity.as_str()
+            };
+            out.push(Line::from(vec![
+                Span::styled("  ", dim()),
+                Span::styled(
+                    format!("○ {kind} {}", crate::util::clip_reason(&info.description)),
+                    Style::default().fg(th.text_primary),
+                ),
+                Span::styled(format!(" — {status}"), dim()),
+                Span::styled(
+                    format!(
+                        "  {}",
+                        crate::util::fmt_elapsed(info.started_at.elapsed().as_secs())
+                    ),
+                    dim(),
+                ),
+            ]));
+        }
+        if live.len() > item_budget {
+            out.push(Line::styled(
+                format!("  … +{} more · /tasks", live.len() - item_budget),
                 dim(),
             ));
         }
@@ -800,84 +813,6 @@ impl crate::App {
         frame.render_widget(Paragraph::new(body).block(block), area);
     }
 
-    /// Right-hand `/btw` side-question thread. Independent scroll from the main
-    /// transcript; auto-follows the latest entry when `btw_scroll == u16::MAX`.
-    fn render_btw_pane(
-        &self,
-        frame: &mut ratatui::Frame,
-        area: ratatui::layout::Rect,
-        th: &crate::theme::Theme,
-    ) {
-        let busy = matches!(
-            self.btw_thread.last(),
-            Some(crate::BtwEntry::Thinking(_)) | Some(crate::BtwEntry::Tool { .. })
-        ) || matches!(self.btw_thread.last(), Some(crate::BtwEntry::Question(_)));
-        let mut body: Vec<Line<'static>> = Vec::new();
-        if self.btw_thread.is_empty() {
-            body.push(Line::styled(
-                "side questions appear here",
-                Style::default().fg(th.text_secondary),
-            ));
-            body.push(Line::styled("/btw <q> · Ctrl-B close", dim()));
-        } else {
-            for entry in &self.btw_thread {
-                let style = match entry {
-                    crate::BtwEntry::Question(_) => Style::default()
-                        .fg(th.accent_assistant)
-                        .add_modifier(Modifier::BOLD),
-                    crate::BtwEntry::Thinking(_) => Style::default()
-                        .fg(th.accent_running)
-                        .add_modifier(Modifier::ITALIC),
-                    crate::BtwEntry::Answer(_) => Style::default().fg(th.text_primary),
-                    crate::BtwEntry::Tool { .. } => Style::default().fg(th.text_secondary),
-                };
-                for line in entry.as_lines() {
-                    body.push(Line::styled(line, style));
-                }
-            }
-        }
-        let total = body.len();
-        let visible = area.height.saturating_sub(2) as usize;
-        let max_scroll = total.saturating_sub(visible.max(1));
-        let scroll = if self.btw_scroll == u16::MAX {
-            max_scroll
-        } else {
-            (self.btw_scroll as usize).min(max_scroll)
-        };
-        let shown: Vec<Line<'static>> =
-            body.into_iter().skip(scroll).take(visible.max(1)).collect();
-        let status = if busy { "· working " } else { "· Ctrl-B " };
-        let title = Line::from(vec![
-            Span::styled(
-                " btw ",
-                th.chrome(if busy {
-                    UiTone::Active
-                } else {
-                    UiTone::Assistant
-                })
-                .title,
-            ),
-            Span::styled(
-                status,
-                if busy {
-                    th.chrome(UiTone::Active).hint
-                } else {
-                    th.chrome(UiTone::Assistant).hint
-                },
-            ),
-        ]);
-        let border = if busy {
-            th.chrome(UiTone::Active).border
-        } else {
-            th.chrome(UiTone::Assistant).border
-        };
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(border)
-            .title(title);
-        frame.render_widget(Paragraph::new(shown).block(block), area);
-    }
-
     pub(crate) fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
         let _profile = crate::profiling::FrameTimer::begin("session", area);
@@ -899,6 +834,22 @@ impl crate::App {
             crate::subagent_overlay::render_tasks(frame, area, overlay);
             return;
         }
+        if self.block_viewer.is_some() {
+            crate::block_viewer::render(frame, area, self);
+            return;
+        }
+        if let Some(picker) = &self.jump_picker {
+            crate::session_pickers::render_jump(frame, area, picker);
+            return;
+        }
+        if let Some(picker) = &self.rewind_picker {
+            crate::session_pickers::render_rewind(frame, area, picker);
+            return;
+        }
+        if let Some(browser) = &self.memory_browser {
+            crate::memory_browser::render(frame, area, browser);
+            return;
+        }
         if let Some(overlay) = &self.diff_lab {
             overlay.render(frame, area);
             return;
@@ -916,25 +867,15 @@ impl crate::App {
         }
         // Grok-build chrome floats on the canvas: 2-column side inset, a blank
         // row above the status bar and below the shortcuts, and a one-row gap
-        // between chrome and the body. The BTW pane lives only in the body.
+        // between chrome and the body. `/btw` is an inline overlay above the
+        // prompt, not a side column.
         let (th, theme_revision) = crate::theme::snapshot();
         chrome::fill_background(frame, area, &th);
         let (hpad, top_vpad, bottom_vpad) = chrome::outer_pad(area);
         let inner = chrome::inset(area, hpad, top_vpad, bottom_vpad);
-        let btw_w = if self.show_btw && ui_layout.allows_btw() && ui_layout == UiLayout::Wide {
-            ((inner.width as u32 * 2) / 5).clamp(36, 56) as u16
-        } else if self.show_btw && ui_layout.allows_btw() {
-            (inner.width / 3).clamp(30, 40)
-        } else {
-            0
-        };
-        let main_min = if ui_layout == UiLayout::Wide { 28 } else { 24 };
-        let composer_w = if btw_w > 0 {
-            inner.width.saturating_sub(btw_w).max(main_min)
-        } else {
-            inner.width
-        };
+        let composer_w = inner.width;
         let overlay_composer = self.confirmation.is_some()
+            || self.plan_approval_capturing()
             || self.fetching.is_some()
             || self.picker.is_some()
             || self.local_directory_prompt.is_some()
@@ -946,12 +887,12 @@ impl crate::App {
                 && self.picker.is_none())
             || self.provider_picker.is_some()
             || self.provider_form.is_some();
-        let turn_line = if overlay_composer {
-            None
+        let turn_visible = if overlay_composer && self.confirmation.is_none() {
+            false
         } else {
-            self.turn_status_line()
+            crate::turn_status::build(self, inner.width).is_some()
         };
-        let turn_h = u16::from(turn_line.is_some() && inner.height >= chrome::STATUS_MIN_HEIGHT);
+        let turn_h = u16::from(turn_visible && inner.height >= chrome::STATUS_MIN_HEIGHT);
         let gap_h = u16::from(
             turn_h == 0
                 && !overlay_composer
@@ -962,15 +903,15 @@ impl crate::App {
             inner.height >= chrome::STATUS_MIN_HEIGHT && ui_layout.show_secondary_chrome(),
         );
         let shortcuts_h = u16::from(
-            inner.height >= chrome::SHORTCUTS_MIN_HEIGHT && ui_layout.show_secondary_chrome(),
+            inner.height >= chrome::SHORTCUTS_MIN_HEIGHT
+                && ui_layout.show_secondary_chrome()
+                && self.show_shortcuts_row(),
         );
         let status_gap = u16::from(status_h > 0 && top_vpad > 0);
         let shortcuts_gap = u16::from(shortcuts_h > 0 && bottom_vpad > 0);
         let chrome_rows = status_h + status_gap + shortcuts_h + shortcuts_gap + turn_h + gap_h;
-        // The prompt grows to fit multiline input and up to three queued
-        // commands. Turn activity lives on its own row, not inside the box.
-        let queued_shown = self.queue.len().min(3);
-        let queue_extra = usize::from(self.queue.len() > 3);
+        // The prompt grows to fit multiline input. Plan + queued follow-ups
+        // sit in list panes above the box, not inside it.
         let (input_lines, cursor_row, cursor_col) = self.input_view(composer_w.saturating_sub(2));
         let completion_rows = self.completion_items().len();
         // The compact changed-files summary line. The 20-line Ctrl-D dump is
@@ -1012,6 +953,19 @@ impl crate::App {
         } else {
             0
         };
+        // `/btw` overlay sits above the prompt (grok-build). Hide it while a
+        // modal composer (picker/confirm) owns that slot so those stay usable.
+        let btw_state = if overlay_composer {
+            None
+        } else {
+            self.btw_overlay()
+        };
+        let desired_btw = crate::btw::btw_panel_height(btw_state.as_ref(), composer_w);
+        let overlay_budget = inner
+            .height
+            .saturating_sub(chrome_rows + stream_h as u16 + metrics.min_transcript_rows + 3);
+        let btw_h = crate::btw::clamp_overlay_height(desired_btw, overlay_budget);
+        let btw_gap = crate::btw::gap_before_overlay(btw_h, overlay_budget > btw_h);
         // Height of the input box excluding the plan checklist and the 2 border
         // rows. Used to figure out how many plan steps fit on screen.
         let base_h = changed_h
@@ -1022,9 +976,7 @@ impl crate::App {
             + usize::from(self.checkpoint_warning.is_some())
             + usize::from(self.quit_notice.is_some())
             + completion_rows
-            + input_lines.len()
-            + queued_shown
-            + queue_extra;
+            + input_lines.len();
         // The live plan checklist, pinned just above the input (input-bar state
         // only). The step count is capped to what fits on screen so a long plan
         // can't make the box taller than the terminal — ratatui's Layout would
@@ -1032,43 +984,80 @@ impl crate::App {
         // the bottom border. Reserve one row for the transcript (Min(1) below).
         let cap = inner
             .height
-            .saturating_sub(metrics.min_transcript_rows + chrome_rows + stream_h as u16)
+            .saturating_sub(
+                metrics.min_transcript_rows + chrome_rows + stream_h as u16 + btw_h + btw_gap,
+            )
             .max(1) as usize;
-        let avail_inner = cap.saturating_sub(base_h + 2);
+        let show_lists = !overlay_composer;
+        let input_needed = (base_h + 2).max(3).min(cap);
+        let list_budget = cap.saturating_sub(input_needed);
+        let queue_block = if show_lists && list_budget > 0 {
+            self.queue_pane_lines(3.min(list_budget))
+        } else {
+            Vec::new()
+        };
+        let queue_pane_h = queue_block.len().min(list_budget);
+        let live_budget = list_budget.saturating_sub(queue_pane_h);
+        let live_block = if show_lists && live_budget > 0 {
+            self.live_task_lines(3.min(live_budget))
+        } else {
+            Vec::new()
+        };
+        let live_pane_h = live_block.len().min(live_budget);
+        let avail_inner = list_budget.saturating_sub(queue_pane_h + live_pane_h);
         // plan_h = 1 (header) + steps_shown + (1 if total > steps_shown else 0).
         // Pick the largest step count (up to total and HARD_CAP) whose plan_h
-        // fits avail_inner.
-        let max_steps = if self.plan.is_empty() {
-            0
-        } else {
-            const HARD_CAP: usize = 8;
-            let total = self.plan.len();
-            let upper = total.min(HARD_CAP);
-            // plan_h for a candidate `n` (n <= upper): 1 + n + (total > n) as usize.
-            // Try showing all `upper` first; if it doesn't fit, shrink.
-            let mut n = upper;
-            while n > 0 && 1 + n + usize::from(total > n) > avail_inner {
-                n -= 1;
-            }
-            // If even n=0 (header only, +maybe more) doesn't fit, show 1 step
-            // so the plan is still visible rather than entirely hidden.
-            if 1 + n + usize::from(total > n) > avail_inner {
-                1
+        // fits avail_inner. On tiny terminals avail_inner is 0 so the prompt
+        // box keeps a closed border.
+        let max_steps =
+            if !show_lists || avail_inner == 0 || (self.plan.is_empty() && self.goal.is_none()) {
+                0
+            } else if !self.plan_pane_expanded {
+                0
             } else {
-                n
-            }
+                const HARD_CAP: usize = 8;
+                let total = if self.goal.as_ref().is_some_and(|g| !g.sub_goals.is_empty()) {
+                    self.goal.as_ref().map(|g| g.sub_goals.len()).unwrap_or(0)
+                } else {
+                    self.plan.len()
+                };
+                let upper = total.min(HARD_CAP);
+                let mut n = upper;
+                while n > 0 && 1 + n + usize::from(total > n) > avail_inner {
+                    n -= 1;
+                }
+                if 1 + n + usize::from(total > n) > avail_inner {
+                    0
+                } else {
+                    n
+                }
+            };
+        let plan_block = if show_lists && avail_inner > 0 {
+            let mut lines = self.plan_lines(max_steps);
+            lines.truncate(avail_inner);
+            lines
+        } else {
+            Vec::new()
         };
-        let plan_block = self.plan_lines(max_steps);
-        let plan_h = plan_block.len();
+        let plan_pane_h = plan_block.len();
         let composer_max = inner
             .height
-            .saturating_sub(chrome_rows + stream_h as u16 + metrics.min_transcript_rows)
+            .saturating_sub(
+                chrome_rows
+                    + stream_h as u16
+                    + metrics.min_transcript_rows
+                    + btw_h
+                    + btw_gap
+                    + plan_pane_h as u16
+                    + live_pane_h as u16
+                    + queue_pane_h as u16,
+            )
             .max(1);
-        let input_h = if self.confirmation.is_some() {
+        let input_h = if self.confirmation.is_some() || self.plan_approval_capturing() {
             inner
                 .height
                 .saturating_sub(3 + chrome_rows)
-                .clamp(8, 24)
+                .clamp(12, 28)
                 .min(composer_max)
         } else if self.fetching.is_some() {
             3.min(composer_max)
@@ -1104,7 +1093,7 @@ impl crate::App {
             };
             (form_rows as u16).min(cap as u16)
         } else {
-            (base_h + plan_h + 2).min(cap) as u16
+            input_needed as u16
         };
         let session = Layout::vertical([
             Constraint::Length(status_h),
@@ -1117,25 +1106,45 @@ impl crate::App {
         let status_area = session[0];
         let body_area = session[2];
         let shortcuts_area = session[4];
-        let (main_area, btw_area) = if btw_w > 0 {
-            let cols = Layout::horizontal([Constraint::Min(main_min), Constraint::Length(btw_w)])
-                .split(body_area);
-            (cols[0], Some(cols[1]))
-        } else {
-            (body_area, None)
-        };
         let rows = Layout::vertical([
+            Constraint::Length(live_pane_h as u16),
             Constraint::Min(1),
             Constraint::Length(gap_h),
             Constraint::Length(turn_h),
             Constraint::Length(stream_h as u16),
+            Constraint::Length(btw_gap),
+            Constraint::Length(btw_h),
+            Constraint::Length(plan_pane_h as u16),
+            Constraint::Length(queue_pane_h as u16),
             Constraint::Length(input_h),
         ])
-        .split(main_area);
-        let transcript_area = rows[0];
-        let turn_area = rows[2];
-        let stream_area = rows[3];
-        let composer_area = rows[4];
+        .split(body_area);
+        let live_area = rows[0];
+        let transcript_area = rows[1];
+        let turn_area = rows[3];
+        let stream_area = rows[4];
+        let btw_area = rows[6];
+        let plan_area = rows[7];
+        let queue_area = rows[8];
+        let composer_area = rows[9];
+
+        let prompt_count = self
+            .transcript
+            .iter()
+            .filter(|e| matches!(e, crate::TranscriptEntry::UserPrompt { .. }))
+            .count();
+        let show_rail =
+            crate::timeline::visible(self.timeline_enabled, transcript_area, prompt_count);
+        let (rail_rect, transcript_area) = if show_rail {
+            let cols = Layout::horizontal([
+                Constraint::Length(crate::timeline::RAIL_WIDTH),
+                Constraint::Min(1),
+            ])
+            .split(transcript_area);
+            (Some(cols[0]), cols[1])
+        } else {
+            (None, transcript_area)
+        };
 
         // --- Transcript ---
         // Status bar: cwd on the left, chips on the right, grok-build's `│`
@@ -1150,9 +1159,11 @@ impl crate::App {
                     .filter(|s| s.status == hi_agent::GoalStatus::Done)
                     .count();
                 let label = if goal.paused {
-                    format!("goal {done}/{total} ⏸")
+                    format!("[Goal: {done}/{total} ⏸]")
+                } else if done == total {
+                    "[Goal: Done]".to_string()
                 } else {
-                    format!("goal {done}/{total}")
+                    format!("[Goal: {done}/{total}]")
                 };
                 chrome::push_chip(
                     &mut info_spans,
@@ -1166,6 +1177,24 @@ impl crate::App {
                 &mut info_spans,
                 &th,
                 Span::styled("durable", Style::default().fg(th.accent_success)),
+            );
+        }
+        if ui_layout.show_secondary_chrome() {
+            let sandbox = chrome::sandbox_chip();
+            let sandbox_fg = if sandbox == "sandbox off" || sandbox == "sandbox?" {
+                th.warning
+            } else {
+                th.gray_dim
+            };
+            chrome::push_chip(
+                &mut info_spans,
+                &th,
+                Span::styled(sandbox, Style::default().fg(sandbox_fg)),
+            );
+            chrome::push_chip(
+                &mut info_spans,
+                &th,
+                Span::styled("undo", Style::default().fg(th.gray_dim)),
             );
         }
         if let Some(runtime) = &self.local_runtime {
@@ -1186,42 +1215,17 @@ impl crate::App {
         if ui_layout.show_secondary_chrome()
             && let Some(pct) = self.context_pct()
         {
-            let color = if pct >= 80 {
-                th.warning
+            let color = if pct >= 80 { th.warning } else { th.gray };
+            let hovered = crate::btw::cell_in(self.ctx_chip_rect, self.mouse_col, self.mouse_row);
+            let label = if let Some(window) = self.context_window.filter(|&w| w > 0) {
+                chrome::context_usage_chip(self.context_used, u64::from(window), hovered)
             } else {
-                th.text_secondary
+                chrome::context_chip(pct, hovered)
             };
             chrome::push_chip(
                 &mut info_spans,
                 &th,
-                Span::styled(format!("{pct}% ctx"), Style::default().fg(color)),
-            );
-        }
-        if ui_layout.show_full_title() {
-            chrome::push_chip(
-                &mut info_spans,
-                &th,
-                Span::styled(
-                    format!(
-                        "reasoning {}",
-                        self.reasoning_effort.map(|e| e.as_str()).unwrap_or("off")
-                    ),
-                    Style::default().fg(th.text_secondary),
-                ),
-            );
-            let dens = self.density.label();
-            let tools = if self.density.show_tool_output(self.show_tool_output) {
-                "out:full"
-            } else {
-                "out:fold"
-            };
-            chrome::push_chip(
-                &mut info_spans,
-                &th,
-                Span::styled(
-                    format!("{dens} · {tools}"),
-                    Style::default().fg(th.gray_dim),
-                ),
+                Span::styled(label, Style::default().fg(color)),
             );
         }
         if !self.queue.is_empty() && ui_layout.show_secondary_chrome() {
@@ -1357,6 +1361,27 @@ impl crate::App {
             }
         }
 
+        if self.timestamps_enabled {
+            let stamps: Vec<String> = self
+                .transcript
+                .iter()
+                .filter_map(|entry| match entry {
+                    crate::TranscriptEntry::UserPrompt { at, .. } => {
+                        Some(crate::util::fmt_clock(*at))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (i, &abs) in self.view_cache.prompt_line_starts.iter().enumerate() {
+                if abs >= line_lo
+                    && abs < line_hi
+                    && let (Some(line), Some(stamp)) = (lines.get_mut(abs - line_lo), stamps.get(i))
+                {
+                    chrome::overlay_right(line, stamp, inner_w, dim());
+                }
+            }
+        }
+
         // Cache geometry for mouse click / drag outside render.
         self.view_inner = ratatui::layout::Rect {
             x: transcript_area.x,
@@ -1393,11 +1418,32 @@ impl crate::App {
             self.view_cache
                 .prompt_line_starts
                 .iter()
+                .enumerate()
                 .rev()
-                .find(|&&idx| {
-                    (self.view_cache.prefix.get(idx).copied().unwrap_or(0) as u16) < scroll
+                .find(|(_, idx)| {
+                    (self.view_cache.prefix.get(**idx).copied().unwrap_or(0) as u16) < scroll
                 })
-                .and_then(|&idx| self.view_cache.lines.get(idx).cloned())
+                .and_then(|(prompt_i, idx)| {
+                    let mut line = self.view_cache.lines.get(*idx).cloned()?;
+                    if self.timestamps_enabled
+                        && let Some(at) = self
+                            .transcript
+                            .iter()
+                            .filter_map(|e| match e {
+                                crate::TranscriptEntry::UserPrompt { at, .. } => Some(*at),
+                                _ => None,
+                            })
+                            .nth(prompt_i)
+                    {
+                        chrome::overlay_right(
+                            &mut line,
+                            &crate::util::fmt_clock(at),
+                            inner_w,
+                            dim(),
+                        );
+                    }
+                    Some(line)
+                })
         };
 
         let mut pad = Block::new();
@@ -1405,7 +1451,14 @@ impl crate::App {
             pad = pad.style(Style::default().bg(th.bg_base).fg(th.text_primary));
         }
         let para = if total == 0 && !self.working {
-            Paragraph::new(chrome::welcome_lines(transcript_area, &th))
+            let home = chrome::WelcomeHome {
+                location: chrome::welcome_location(
+                    &self.workspace_root,
+                    self.git_branch.as_deref(),
+                ),
+                sessions: &self.session_completion_cache,
+            };
+            Paragraph::new(chrome::welcome_lines(transcript_area, &th, Some(&home)))
                 .alignment(ratatui::layout::Alignment::Center)
                 .block(pad)
         } else {
@@ -1415,6 +1468,21 @@ impl crate::App {
                 .scroll((scroll_adj, 0))
         };
         frame.render_widget(para, transcript_area);
+
+        if let Some(rail_rect) = rail_rect {
+            let rail = crate::timeline::compute(
+                rail_rect,
+                &self.view_cache,
+                scroll,
+                transcript_area.height,
+            );
+            crate::timeline::render(frame, &rail);
+            self.timeline_hits = rail.hits;
+            self.timeline_rect = rail.rect;
+        } else {
+            self.timeline_hits.clear();
+            self.timeline_rect = ratatui::layout::Rect::default();
+        }
 
         let mut status_right = info;
         if !self.following {
@@ -1439,9 +1507,19 @@ impl crate::App {
                     }),
             ));
         }
-        chrome::render_status_bar(frame, status_area, title, status_right, &th);
-        if let Some(line) = turn_line.filter(|_| turn_h > 0) {
+        chrome::render_status_bar(frame, status_area, title, status_right.clone(), &th);
+        self.ctx_chip_rect = chrome::span_hit(status_area, &status_right, |text| {
+            text.contains(" / ")
+                || text.contains("% ctx")
+                || (text.contains('#') && text.contains('-'))
+        });
+        if turn_h > 0
+            && let Some(line) = self.turn_status_line(turn_area.width)
+        {
             chrome::render_turn_status(frame, turn_area, line, &th);
+            self.turn_status_rect = turn_area;
+        } else {
+            self.turn_status_rect = ratatui::layout::Rect::default();
         }
         if stream_h > 0 {
             let running = th.accent_running;
@@ -1457,8 +1535,25 @@ impl crate::App {
             frame.render_widget(Paragraph::new(slines), stream_area);
         }
 
-        if let Some(btw_rect) = btw_area {
-            self.render_btw_pane(frame, btw_rect, &th);
+        if btw_h > 0 {
+            if let Some(state) = &btw_state {
+                self.last_btw_area = btw_area;
+                self.last_btw_close =
+                    crate::btw::render_btw_panel(frame, state, btw_area, self.spinner, &th);
+            }
+        } else {
+            self.last_btw_area = ratatui::layout::Rect::default();
+            self.last_btw_close = ratatui::layout::Rect::default();
+        }
+
+        if plan_pane_h > 0 {
+            frame.render_widget(Paragraph::new(plan_block), plan_area);
+        }
+        if live_pane_h > 0 {
+            frame.render_widget(Paragraph::new(live_block), live_area);
+        }
+        if queue_pane_h > 0 {
+            frame.render_widget(Paragraph::new(queue_block), queue_area);
         }
 
         // Overlay the sticky prompt header on the top inner row, so scrolling
@@ -1601,11 +1696,16 @@ impl crate::App {
                 ),
             ];
             frame.render_widget(Paragraph::new(body).block(block), composer_area);
+        } else if self.plan_approval_capturing() {
+            crate::plan_approval::render(frame, composer_area, self);
         } else if let Some(request) = &self.confirmation {
             let details = request.details();
             let all = confirmation_lines(request, &details);
-            let visible = composer_area.height.saturating_sub(4) as usize;
-            let max_scroll = all.len().saturating_sub(visible);
+            let options = crate::confirm_overlay::option_lines(self, request);
+            let visible = composer_area
+                .height
+                .saturating_sub(6 + options.len() as u16) as usize;
+            let max_scroll = all.len().saturating_sub(visible.max(1));
             let scroll = self.confirmation_scroll.min(max_scroll);
             let is_ask = matches!(request, hi_agent::ConfirmationRequest::AskUser { .. });
             let mut body = vec![Line::styled(
@@ -1616,23 +1716,40 @@ impl crate::App {
                 },
                 Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
             )];
-            body.extend(all.iter().skip(scroll).take(visible).cloned());
             if is_ask {
+                // Options replace the numbered dump from confirmation_lines.
+                if let hi_agent::ConfirmationRequest::AskUser { question, .. } = request {
+                    body.push(Line::styled(
+                        question.clone(),
+                        Style::default()
+                            .fg(th.text_primary)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    body.push(Line::raw(""));
+                }
+                body.extend(options);
                 body.push(Line::raw(""));
                 body.push(Line::from(vec![
                     Span::styled("answer: ", dim()),
-                    Span::raw(if self.ask_user_draft.is_empty() {
-                        String::new()
-                    } else {
-                        self.ask_user_draft.clone()
-                    }),
+                    Span::raw(self.ask_user_draft.clone()),
                 ]));
-            }
-            let hint = if is_ask {
-                " 1-9 pick · Enter submit · Esc cancel "
             } else {
-                " y approve · a always allow · n/Esc reject · Ctrl-C cancel "
-            };
+                body.extend(all.iter().skip(scroll).take(visible.max(1)).cloned());
+                body.push(Line::raw(""));
+                body.extend(options);
+                if self.confirm_focus == crate::confirm_overlay::ConfirmFocus::Followup {
+                    body.push(Line::raw(""));
+                    body.push(Line::from(vec![
+                        Span::styled("follow-up: ", dim()),
+                        Span::raw(self.ask_user_draft.clone()),
+                    ]));
+                }
+            }
+            let hint = crate::confirm_overlay::hint(
+                request,
+                self.confirm_focus,
+                self.confirmation_waiting,
+            );
             let block = th
                 .panel_block(request.title(), UiTone::Warning)
                 .title_bottom(Line::styled(hint, dim()));
@@ -1889,29 +2006,48 @@ impl crate::App {
             // with the model right-aligned on the bottom divider (`╰── gpt-4o ╯`)
             // and turn state conveyed by the status row rather than a title badge.
             let th = crate::theme::theme();
+            let border = if self.plan_mode {
+                Style::default().fg(th.accent_plan)
+            } else {
+                th.input_border(true)
+            };
+            let flags = self.composer_flags();
+            let bg = if th.paints_backgrounds() {
+                th.bg_base
+            } else {
+                Color::Reset
+            };
+            let model = truncate_display(&self.model, 28);
+            let mut bottom: Vec<Span> = vec![Span::styled(" ", Style::default().bg(bg))];
+            bottom.push(Span::styled(
+                model.clone(),
+                Style::default().fg(th.accent_model).bg(bg),
+            ));
+            let mut used = 2 + display_width(&model);
+            for flag in &flags {
+                let extra = 3 + display_width(flag);
+                if used + extra + 2 > composer_area.width as usize {
+                    break;
+                }
+                bottom.push(Span::styled(" · ", dim().bg(bg)));
+                let color = if *flag == "plan" {
+                    th.accent_plan
+                } else {
+                    th.warning
+                };
+                bottom.push(Span::styled(*flag, Style::default().fg(color).bg(bg)));
+                used += extra;
+            }
+            bottom.push(Span::styled(" ", Style::default().bg(bg)));
             let mut input_block = Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(th.input_border(true))
-                .title_bottom(
-                    Line::from(Span::styled(
-                        format!(" {} ", truncate_display(&self.model, 28)),
-                        Style::default()
-                            .fg(th.accent_model)
-                            .bg(if th.paints_backgrounds() {
-                                th.bg_base
-                            } else {
-                                Color::Reset
-                            }),
-                    ))
-                    .right_aligned(),
-                );
+                .border_style(border)
+                .title_bottom(Line::from(bottom).right_aligned());
             if th.paints_backgrounds() {
                 input_block = input_block.style(Style::default().bg(th.bg_base));
             }
 
             let mut ilines: Vec<Line> = Vec::new();
-            // Pinned plan checklist at the very top of the input box.
-            ilines.extend(plan_block);
             // Ctrl-R reverse history search overlay: shows the query, the match
             // count, and a few recent matches above the input line.
             if let Some(search) = self.mode.history_search() {
@@ -2176,24 +2312,25 @@ impl crate::App {
             let items = self.completion_items();
             let selected = self.completion.as_ref().map(|c| c.selected).unwrap_or(0);
             let label_w = items.iter().map(|i| i.label.len()).max().unwrap_or(0);
+            let prefix = match self.completion.as_ref().map(|c| &c.ctx) {
+                Some(crate::completion::CompletionContext::Command(p)) => p.as_str(),
+                Some(crate::completion::CompletionContext::Path { prefix }) => prefix.as_str(),
+                Some(crate::completion::CompletionContext::Arg { prefix, .. }) => prefix.as_str(),
+                None => "",
+            };
             for (i, item) in items.iter().enumerate() {
                 let label = format!("{:<width$}", item.label, width = label_w);
-                if i == selected {
-                    ilines.push(Line::from(vec![
-                        Span::styled(
-                            format!("▶ {label}"),
-                            Style::default()
-                                .fg(crate::theme::theme().accent_system)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(format!("  {}", item.help), dim()),
-                    ]));
-                } else {
-                    ilines.push(Line::from(vec![
-                        Span::raw(format!("  {label}")),
-                        Span::styled(format!("  {}", item.help), dim()),
-                    ]));
+                let mark = if i == selected { "▶ " } else { "  " };
+                let mut row = vec![Span::raw(mark.to_string())];
+                row.extend(crate::completion::highlight_label(
+                    &label,
+                    prefix,
+                    i == selected,
+                ));
+                if !item.help.is_empty() {
+                    row.push(Span::styled(format!("  {}", item.help), dim()));
                 }
+                ilines.push(Line::from(row));
             }
             if self.mode.is_normal() {
                 // Vim-style normal mode: show a mode banner instead of the
@@ -2224,32 +2361,13 @@ impl crate::App {
             } else {
                 ilines.extend(input_lines);
             }
-            for (qi, q) in self.queue.iter().enumerate().take(3) {
-                let selected = self.queue_selected == Some(qi);
-                let prefix = if selected { "▶ " } else { "⏳ " };
-                let style = if selected {
-                    Style::default()
-                        .fg(crate::theme::theme().accent_running)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    dim()
-                };
-                ilines.push(Line::styled(format!("{prefix}{q}"), style));
-            }
-            if self.queue.len() > 3 {
-                ilines.push(Line::styled(
-                    format!("   … +{} more queued", self.queue.len() - 3),
-                    dim(),
-                ));
-            }
             frame.render_widget(Paragraph::new(ilines).block(input_block), composer_area);
 
             // Cursor sits within the editable input — below the optional startup
             // notice, the status line, and the completion menu. Hidden in normal
             // mode (no editable input).
             if !self.mode.is_normal() && self.palette.is_none() && self.tutorial.is_none() {
-                let above = plan_h
-                    + changed_h
+                let above = changed_h
                     + debug_h
                     + help_h
                     + palette_h
@@ -2267,52 +2385,45 @@ impl crate::App {
             }
         }
 
-        let hints: &[ShortcutHint] = if self.working {
-            &[
-                ShortcutHint {
-                    key: "ctrl+c",
-                    label: "interrupt",
-                },
-                ShortcutHint {
-                    key: "enter",
-                    label: "queue",
-                },
-                ShortcutHint {
-                    key: "?",
-                    label: "help",
-                },
-            ]
-        } else if self.confirmation.is_some() {
-            &[
-                ShortcutHint {
-                    key: "enter",
-                    label: "confirm",
-                },
-                ShortcutHint {
-                    key: "esc",
-                    label: "cancel",
-                },
-            ]
-        } else {
-            &[
-                ShortcutHint {
-                    key: "enter",
-                    label: "send",
-                },
-                ShortcutHint {
-                    key: "ctrl+c",
-                    label: "quit",
-                },
-                ShortcutHint {
-                    key: "/",
-                    label: "commands",
-                },
-                ShortcutHint {
-                    key: "?",
-                    label: "help",
-                },
-            ]
-        };
+        let hints: &[ShortcutHint] =
+            if self.confirmation.is_some() || self.plan_approval_capturing() {
+                &[
+                    ShortcutHint {
+                        key: "enter",
+                        label: "confirm",
+                    },
+                    ShortcutHint {
+                        key: "esc",
+                        label: "cancel",
+                    },
+                ]
+            } else if self.working {
+                &[
+                    ShortcutHint {
+                        key: "ctrl+c",
+                        label: "interrupt",
+                    },
+                    ShortcutHint {
+                        key: "Shift+Tab",
+                        label: "mode",
+                    },
+                    ShortcutHint {
+                        key: "?",
+                        label: "help",
+                    },
+                ]
+            } else {
+                &[
+                    ShortcutHint {
+                        key: "Shift+Tab",
+                        label: "mode",
+                    },
+                    ShortcutHint {
+                        key: "?",
+                        label: "help",
+                    },
+                ]
+            };
         chrome::render_shortcuts_bar(frame, shortcuts_area, hints, &th);
     }
 
@@ -2377,7 +2488,7 @@ impl crate::App {
         }
 
         for entry in &self.transcript {
-            if matches!(entry, crate::TranscriptEntry::UserPrompt(_)) {
+            if matches!(entry, crate::TranscriptEntry::UserPrompt { .. }) {
                 prompt_line_starts.push(lines.len());
             }
             let ord = if entry.is_foldable() {
@@ -2385,7 +2496,7 @@ impl crate::App {
                 tool_ord += 1;
                 if selected_block == Some(o) {
                     lines.push(Line::styled(
-                        "▶ block selected · Enter fold/unfold · ↑↓/jk move · Esc exit",
+                        "▶ block selected · Enter fold/unfold · Ctrl-F expand · ↑↓/jk move · Esc exit",
                         Style::default()
                             .fg(th.accent_running)
                             .add_modifier(Modifier::BOLD),
@@ -2503,7 +2614,7 @@ impl crate::App {
         let start_entry = c.committed_entries;
         let mut tool_ord = block_line_ranges.last().map(|(_, _, o)| o + 1).unwrap_or(0);
         for entry in &self.transcript[start_entry..] {
-            if matches!(entry, crate::TranscriptEntry::UserPrompt(_)) {
+            if matches!(entry, crate::TranscriptEntry::UserPrompt { .. }) {
                 prompt_line_starts.push(lines.len());
             }
             let ord = if entry.is_foldable() {

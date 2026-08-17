@@ -104,7 +104,6 @@ impl App {
                     self.open_review(None);
                 }
             }
-            Action::ToggleBtw => self.toggle_btw_pane(),
             Action::ToggleReasoning => {
                 self.show_reasoning = !self.show_reasoning;
                 self.bump_transcript();
@@ -194,6 +193,18 @@ impl App {
             }
             Action::BlockNavToggle => self.toggle_selected_block(),
             Action::BlockNavExit => self.mode.to_insert(),
+            Action::OpenBlockViewer => crate::block_viewer::open_selected(self),
+            Action::TogglePlanPane => {
+                if self.plan.is_empty()
+                    && self
+                        .goal
+                        .as_ref()
+                        .is_none_or(|goal| goal.sub_goals.is_empty())
+                {
+                    return;
+                }
+                self.plan_pane_expanded = !self.plan_pane_expanded;
+            }
         }
     }
 

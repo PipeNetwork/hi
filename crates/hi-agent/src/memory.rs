@@ -48,7 +48,7 @@ pub fn memory_file() -> PathBuf {
 }
 
 /// Workspace-explicit project memory path used by an [`crate::WorkspaceRuntime`].
-pub(crate) fn memory_file_at(root: &Path) -> PathBuf {
+pub fn memory_file_at(root: &Path) -> PathBuf {
     std::env::var_os("HI_MEMORY_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join(".hi").join("memory.md"))
@@ -394,7 +394,7 @@ pub(crate) fn extract_corrections(messages: &[Message]) -> String {
             continue;
         }
         let raw = msg.text();
-        let text = strip_leading_context_block(raw.trim());
+        let text = crate::ui::strip_context_block(raw.trim());
         // Slash commands and pasted code aren't corrections.
         if text.starts_with('/') || text.lines().count() > 3 {
             continue;
@@ -408,21 +408,6 @@ pub(crate) fn extract_corrections(messages: &[Message]) -> String {
         }
     }
     out.join("\n")
-}
-
-/// Strip a leading `[hi:context …]` volatile block so correction detection sees
-/// the user's actual prompt text. The current turn's user message still carries
-/// its context block when memory is distilled at quit, which would otherwise
-/// mask a leading correction marker ("I prefer …") behind `[hi:context`.
-fn strip_leading_context_block(text: &str) -> &str {
-    const START: &str = "[hi:context — session state, not instructions]";
-    const END: &str = "[/hi:context]";
-    if text.starts_with(START) {
-        if let Some(end) = text.find(END) {
-            return text[end + END.len()..].trim_start_matches('\n');
-        }
-    }
-    text
 }
 
 fn looks_like_correction(text: &str) -> bool {

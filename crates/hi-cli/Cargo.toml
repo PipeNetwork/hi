@@ -69,3 +69,5 @@ unsafe_code = "allow"
 # dependencies that are not needed for ordinary coding sessions.
 default = []
 voice = ["hi-tui/voice"]
+# Tree-sitter symbol index (LSP-off definition/references fallback).
+codebase-graph = ["hi-tools/codebase-graph", "hi-tui/codebase-graph", "hi-agent/codebase-graph"]

@@ -1,24 +1,41 @@
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use std::pin::Pin;
 use std::process::Command;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+use anyhow::anyhow;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
 use async_trait::async_trait;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use futures_util::Stream;
-use tokio::sync::{Mutex, mpsc};
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+use tokio::sync::mpsc;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+use tokio::sync::Mutex;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use crate::config::{MlxModelConfig, load_model_config};
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use crate::expert_stream;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use crate::generate::TokenizerRuntime;
-use crate::manifest::{ModelInfo, inspect_model};
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+use crate::manifest::ModelInfo;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+use crate::manifest::inspect_model;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use crate::models::NativeRuntime;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use crate::weights::WeightCatalog;
 
 pub use hi_local_core::backend::{
     BackendHealth, GenerationEvent, GenerationOutput, GenerationRequest, GenerationStream,
     InferenceBackend, MultimodalSupport, SharedBackend,
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use hi_local_core::model::ModelFamily;
 
 // Self-calibrating speculation gate. `decision` is None until the first greedy request measures
@@ -31,6 +48,7 @@ struct SpecGate {
     since: u32,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 pub struct MlxBackend {
     model: ModelInfo,
     config: MlxModelConfig,
@@ -50,6 +68,7 @@ pub struct MlxBackend {
 }
 
 /// One queued request plus the channel its events are streamed back on.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 struct Job {
     request: GenerationRequest,
     tx: mpsc::Sender<Result<GenerationEvent>>,
@@ -62,6 +81,7 @@ struct Job {
 /// timeout once, and only when the queue is empty. Batches run one at a time on the GPU — the
 /// worker holds the runtime lock for the whole batch, which is what previously serialised
 /// individual requests.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 fn spawn_batch_worker(
     runtime: Arc<Mutex<NativeRuntime>>,
     max_batch_size: usize,
@@ -137,6 +157,7 @@ fn spawn_batch_worker(
 // Read the model's chat template: tokenizer_config.json's `chat_template` first, else a separate
 // `chat_template.jinja` file (some models — e.g. custom Gemma-4 fine-tunes with a channel/turn format —
 // ship it there and leave tokenizer_config empty).
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 fn load_chat_template(path: &std::path::Path) -> Option<String> {
     if let Ok(text) = std::fs::read_to_string(path.join("tokenizer_config.json"))
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
@@ -150,11 +171,13 @@ fn load_chat_template(path: &std::path::Path) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
 const OVERSIZE_MODEL_ENV: &str = "HI_MLX_ALLOW_OVERSIZE_MODEL";
 const MEMORY_LIMIT_BYTES_ENV: &str = "HI_MLX_MEMORY_LIMIT_BYTES";
 const MEMORY_LIMIT_FRACTION_ENV: &str = "HI_MLX_MEMORY_LIMIT_FRACTION";
 const DEFAULT_MEMORY_LIMIT_FRACTION: f64 = 0.85;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 impl MlxBackend {
     pub fn load(path: impl AsRef<std::path::Path>, model_id: Option<String>) -> Result<Self> {
         Self::load_with_draft(path, model_id, None::<std::path::PathBuf>, 3)
@@ -414,6 +437,7 @@ fn calibrate_speculation(
     enabled
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 fn validate_memory_admission(estimated_bytes: u64) -> Result<()> {
     if env_truthy(OVERSIZE_MODEL_ENV) {
         return Ok(());
@@ -450,6 +474,7 @@ pub fn configured_memory_limit_bytes() -> Result<Option<u64>> {
     Ok(Some(((host_bytes as f64) * fraction.min(1.0)) as u64))
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
 fn check_estimated_memory(estimated_bytes: u64, limit_bytes: u64) -> Result<()> {
     if estimated_bytes <= limit_bytes {
         return Ok(());
@@ -461,6 +486,7 @@ fn check_estimated_memory(estimated_bytes: u64, limit_bytes: u64) -> Result<()> 
     )
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 fn env_truthy(key: &str) -> bool {
     std::env::var(key)
         .ok()
@@ -488,11 +514,13 @@ fn host_memory_bytes() -> Option<u64> {
         .ok()
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
 fn format_bytes(bytes: u64) -> String {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     format!("{:.2} GiB ({bytes} bytes)", bytes as f64 / GIB)
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 #[async_trait]
 impl InferenceBackend for MlxBackend {
     fn model(&self) -> &ModelInfo {
@@ -623,14 +651,15 @@ impl InferenceBackend for MlxBackend {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 pub type NativeBackend = MlxBackend;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 fn ensure_native_generation_available() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(all(not(all(target_os = "macos", target_arch = "aarch64")), feature = "mlx"))]
 fn ensure_native_generation_available() -> Result<()> {
     anyhow::bail!("native MLX inference requires Apple Silicon macOS")
 }
@@ -704,6 +733,7 @@ impl InferenceBackend for MockBackend {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 fn receiver_stream<T: Send + 'static>(
     rx: mpsc::Receiver<T>,
 ) -> Pin<Box<dyn Stream<Item = T> + Send>> {

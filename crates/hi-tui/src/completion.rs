@@ -171,12 +171,64 @@ fn path_completion_context(input: &str) -> Option<CompletionContext> {
     if after_at.starts_with('@') {
         return None;
     }
-    // A completed token (trailing whitespace) would have been split off, so
-    // `after_at` is the live prefix. An empty prefix (`@` just typed) opens
-    // the menu with everything.
+    // Typing `:N-M` on an already-chosen path closes the menu so Tab/Right
+    // can accept ghost text / stay in the composer.
+    let (path, range) = crate::file_mentions::split_path_range(after_at);
+    if range.is_some() {
+        return None;
+    }
     Some(CompletionContext::Path {
-        prefix: after_at.to_string(),
+        prefix: path.to_string(),
     })
+}
+
+/// Bold/accent the subsequence of `prefix` inside a completion label.
+pub(crate) fn highlight_label(
+    label: &str,
+    prefix: &str,
+    selected: bool,
+) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::Span;
+    let th = crate::theme::theme();
+    let base = if selected {
+        Style::default()
+            .fg(th.accent_system)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th.text_primary)
+    };
+    let hit = base.fg(th.accent_plan);
+    if prefix.is_empty() {
+        return vec![Span::styled(label.to_string(), base)];
+    }
+    let mut needle = prefix.chars().peekable();
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut buf_hit = false;
+    for ch in label.chars() {
+        let is_hit = needle
+            .peek()
+            .copied()
+            .is_some_and(|n| n.eq_ignore_ascii_case(&ch));
+        if is_hit {
+            needle.next();
+        }
+        if is_hit != buf_hit && !buf.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut buf),
+                if buf_hit { hit } else { base },
+            ));
+        }
+        if buf.is_empty() {
+            buf_hit = is_hit;
+        }
+        buf.push(ch);
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, if buf_hit { hit } else { base }));
+    }
+    spans
 }
 
 /// Resolve a completion context to the menu rows it offers.
@@ -250,7 +302,7 @@ pub(crate) fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionIte
 mod tests {
     use super::{
         CompletionContext::{Arg, Command, Path},
-        completion_context,
+        completion_context, highlight_label,
     };
 
     #[test]
@@ -376,6 +428,9 @@ mod tests {
         );
         // A completed `@path` token (trailing space) closes the menu.
         assert_eq!(completion_context("@src/main.rs "), None);
+        // Line-range suffix is not a path filter.
+        assert_eq!(completion_context("@src/main.rs:40"), None);
+        assert_eq!(completion_context("@src/main.rs:40-80"), None);
         // `@@` is not a mention (escaped/decorative).
         assert_eq!(completion_context("@@"), None);
         // A slash command is not treated as a path even if it has `@`.
@@ -388,5 +443,18 @@ mod tests {
         );
         // Plain text with no `@` is no completion.
         assert_eq!(completion_context("fix the bug"), None);
+    }
+
+    #[test]
+    fn highlight_label_marks_a_fuzzy_subsequence() {
+        let spans = highlight_label("src/main.rs", "smn", false);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "src/main.rs");
+        let hits: String = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(crate::theme::theme().accent_plan))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(hits, "smn");
     }
 }

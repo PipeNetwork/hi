@@ -4,6 +4,7 @@
 use std::io::{self, Write};
 
 use anyhow::{Context, Result, bail};
+use hi_ai::Provider;
 
 use crate::config::{
     Config, Profile, ProviderName, Settings, default_config_path, local_config_path,
@@ -18,20 +19,28 @@ const WIZARD_PROFILE: &str = "default";
 /// what was just saved without a reload.
 pub async fn run(config: &mut Config) -> Result<Settings> {
     println!("Welcome to hi — let's set up a model provider.\n");
-    println!("  1) pipenetwork.ai    hi's hosted endpoint — browser sign-in or API key");
-    println!("  2) Ollama (local)    run models on your machine — free, private, no key");
-    println!("                      needs `ollama serve` running (install: ollama.com)");
-    println!("  3) xAI (Grok)        subscription sign-in or API key from console.x.ai\n");
-    println!("  Want a cloud model? Pick 1 or 3. Local-first? Pick 2.\n");
+    println!("  1) pipenetwork.ai    hosted coding endpoint — browser sign-in or API key");
+    println!("  2) OpenRouter        OpenAI-compatible cloud (OPENROUTER_API_KEY)");
+    println!("  3) Anthropic         native Claude API (ANTHROPIC_API_KEY)");
+    println!("  4) xAI (Grok)        subscription sign-in or API key from console.x.ai");
+    println!("  5) Ollama (local)    models on this machine — free, private, no key");
+    println!("                      needs `ollama serve` running (install: ollama.com)\n");
+    println!(
+        "  Cloud? 1–4. Local-first? 5. On Apple Silicon, /local can add a bundled MLX model later.\n"
+    );
 
     let provider = loop {
-        match prompt("Provider [1-3] (default 1): ")?.trim() {
+        match prompt("Provider [1-5] (default 1): ")?.trim() {
             "" | "1" => break ProviderName::Pipenetwork,
-            "2" => break ProviderName::Ollama,
-            "3" => break ProviderName::Xai,
-            other => println!("  '{other}' isn't a choice — pick 1-3."),
+            "2" => break ProviderName::Openai,
+            "3" => break ProviderName::Anthropic,
+            "4" => break ProviderName::Xai,
+            "5" => break ProviderName::Ollama,
+            other => println!("  '{other}' isn't a choice — pick 1-5."),
         }
     };
+
+    print_sandbox_note();
 
     let model = match provider.default_model() {
         Some(model) => model.to_string(),
@@ -39,7 +48,7 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
             let hint = if matches!(provider, ProviderName::Ollama) {
                 "qwen2.5-coder"
             } else {
-                "anthropic/claude-opus-4-8"
+                "anthropic/claude-sonnet-4"
             };
             let entered = prompt(&format!("Model id (default {hint}): "))?;
             let entered = entered.trim();
@@ -54,7 +63,6 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
     let api_key = if matches!(provider, ProviderName::Ollama) {
         "ollama".to_string()
     } else if matches!(provider, ProviderName::Xai) {
-        // xAI takes either a subscription sign-in or a metered API key.
         println!("\n  1) Sign in with a grok.com subscription (SuperGrok or X Premium)");
         println!("  2) Paste an API key from console.x.ai (billed per token)\n");
         let use_subscription = loop {
@@ -66,9 +74,6 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
         };
         if use_subscription {
             hi_ai::xai_auth::login().await?;
-            // The credential lives in auth.json, not the config file. Return the
-            // access token so this session works immediately; later runs re-read
-            // (and refresh) it from the store.
             hi_ai::auth_store::load(hi_ai::xai_auth::PROVIDER_ID)
                 .map(|stored| stored.access)
                 .context("sign-in reported success but stored no credential")?
@@ -80,7 +85,6 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
             key
         }
     } else if matches!(provider, ProviderName::Pipenetwork) {
-        // Browser pairing mints a project API key; paste remains for existing keys.
         println!("\n  1) Sign in with your pipenetwork account (browser pairing)");
         println!("  2) Paste an existing API key\n");
         let use_login = loop {
@@ -105,7 +109,12 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
             key
         }
     } else {
-        let key = prompt(&format!("Paste your {} API key: ", provider.as_str()))?;
+        let label = match provider {
+            ProviderName::Anthropic => "Anthropic",
+            ProviderName::Openai => "OpenRouter",
+            other => other.as_str(),
+        };
+        let key = prompt(&format!("Paste your {label} API key: "))?;
         let key = key.trim().to_string();
         if key.is_empty() {
             bail!("no API key entered");
@@ -113,7 +122,6 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
         key
     };
 
-    // Test the connection before saving, so configuration issues surface during setup.
     print!("\x1b[2m  testing connection…\x1b[0m\r");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let test_result = test_connection(provider, &model, &api_key).await;
@@ -125,9 +133,6 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
         }
     }
 
-    // Browser/subscription login already persisted a credential in auth.json.
-    // Writing it into config.toml would duplicate a secret the user may copy
-    // into a project (and for xAI, bake in a value that expires in hours).
     let credential_is_stored = (matches!(provider, ProviderName::Xai)
         && hi_ai::auth_store::load(hi_ai::xai_auth::PROVIDER_ID).is_some())
         || (matches!(provider, ProviderName::Pipenetwork)
@@ -167,7 +172,6 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
         compat: hi_ai::CompatMode::Auto,
         deepseek_compat: hi_ai::DeepSeekCompat::Auto,
         curate_skills: false,
-        // Match production defaults: explore on; delegate risk-gated.
         explore_subagents: true,
         suggest_next_prompt: true,
         write_subagents: hi_agent::WriteSubagentPolicy::Risk,
@@ -179,16 +183,37 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
     })
 }
 
-/// Test the connection by listing models. Returns `Ok(())` for any successful
-/// model-list response, including an empty list.
+fn print_sandbox_note() {
+    let platform = if cfg!(target_os = "macos") {
+        "macOS Seatbelt confines shell writes to this project"
+    } else if cfg!(target_os = "linux") {
+        "Linux confines shell writes when pipe-wrap is available; otherwise hi warns and continues"
+    } else {
+        "this OS does not confine shell writes — treat prompts as trusted"
+    };
+    println!(
+        "\x1b[2m  Sandbox: {platform}. HI_SANDBOX=off disables it. /undo reverts the last turn.\x1b[0m\n"
+    );
+}
+
 async fn test_connection(provider: ProviderName, _model: &str, api_key: &str) -> Result<()> {
-    use hi_ai::{OpenAiProvider, Provider};
     let base_url = provider.default_base_url();
-    let p = OpenAiProvider::new(base_url.to_string(), api_key.to_string());
-    p.list_models()
-        .await
-        .map(|_| ())
-        .map_err(|err| anyhow::anyhow!("{err:#}"))
+    match provider {
+        ProviderName::Anthropic => {
+            let p = hi_ai::AnthropicProvider::new(base_url.to_string(), api_key.to_string());
+            p.list_models()
+                .await
+                .map(|_| ())
+                .map_err(|err| anyhow::anyhow!("{err:#}"))
+        }
+        _ => {
+            let p = hi_ai::OpenAiProvider::new(base_url.to_string(), api_key.to_string());
+            p.list_models()
+                .await
+                .map(|_| ())
+                .map_err(|err| anyhow::anyhow!("{err:#}"))
+        }
+    }
 }
 
 fn prompt(message: &str) -> Result<String> {
@@ -203,33 +228,16 @@ fn prompt(message: &str) -> Result<String> {
 
 /// `api_key: None` writes a profile with no key — used when the credential
 /// lives in `auth.json` instead (subscription login) or is not needed (Ollama).
-///
-/// This is a read-modify-write of the `default` profile only. It used to
-/// `fs::write` a whole hand-formatted file, which erased every other profile
-/// (and its key) in the config — the reason `needs_setup` was once narrowed to
-/// "no profiles at all", which in turn made the wizard unreachable in any
-/// directory holding a `hi.toml`. Keep this non-destructive: the trigger
-/// depends on it.
 fn save_config(
     config: &mut Config,
     provider: ProviderName,
     model: &str,
     api_key: Option<&str>,
 ) -> Result<std::path::PathBuf> {
-    // Always the global config, never a project-local `hi.toml`: that's what
-    // the save prompt promises, and a key written into a project file is one
-    // `git add` away from being published.
     let path = default_config_path().context("could not determine config directory")?;
     let profile = Profile {
         provider: Some(provider),
         model: Some(model.to_string()),
-        // Store the literal key in the config file (which `save_config_to`
-        // chmods to 0600). We used to store an env var reference
-        // (api_key_env = "HI_API_KEY") and tell the user to `export HI_API_KEY=…`
-        // in their shell profile, but if they didn't do that (or didn't restart
-        // their shell), every run failed with "env var HI_API_KEY (from profile)
-        // is not set". Storing the key directly is simpler and works immediately
-        // — the config file is already protected.
         api_key: api_key
             .filter(|_| !matches!(provider, ProviderName::Ollama))
             .map(str::to_string),
@@ -239,9 +247,6 @@ fn save_config(
     Ok(path)
 }
 
-/// The wizard writes to the global config, but a `hi.toml` in the working
-/// directory wins the merge. Say so rather than letting the next run silently
-/// use something other than what was just chosen.
 fn warn_if_shadowed_by_local_config() {
     let local = local_config_path();
     let Ok(file) = read_config_file(&local) else {

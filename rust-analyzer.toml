@@ -1,0 +1,4 @@
+# On-save check follows default-members (hi-cli) / the open package instead of
+# typechecking all 54 workspace crates, including hi-mlx's Metal stack.
+[check]
+workspace = false

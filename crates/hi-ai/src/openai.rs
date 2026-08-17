@@ -10,6 +10,7 @@
 mod deepseek;
 mod request;
 mod stream;
+mod thinking_tags;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

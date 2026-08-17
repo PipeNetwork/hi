@@ -103,6 +103,7 @@ load — hi-mlx *does* support mixed per-tensor quantization, so it's now valida
 
 ## CI
 
-`cargo test -p hi-mlx` runs on an Apple-silicon runner on every PR (`.github/workflows/ci.yml`), so every
-architecture is compiled and unit-tested on each change — not just locally. The CPU crates
-(`cargo test --workspace --exclude hi-mlx`) + `cargo fmt` gate on Linux; clippy is advisory.
+Core PR CI (`.github/workflows/ci.yml`) does not build `hi-mlx`. MLX coverage is the local
+acceptance matrix (`scripts/hi_mlx_acceptance_matrix.sh`), which runs
+`cargo test -p hi-mlx --features mlx` (the `mlx` feature is opt-in so ordinary workspace
+checks skip the vendored Metal/C++ stack). Linux gates `cargo fmt` and the CPU crates.

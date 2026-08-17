@@ -142,7 +142,22 @@ pub(crate) struct KeyBinding {
 
 /// Canonical binding table. Order within a context is the help-overlay order.
 pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
-    // --- Input (help-only: edit_key owns these) ---
+    KeyBinding {
+        context: BindContext::Input,
+        keys: "Shift-Tab",
+        help: "cycle ask / plan / always-approve",
+        in_help: true,
+        action: None,
+        matches: &[],
+    },
+    KeyBinding {
+        context: BindContext::Input,
+        keys: "Tab / Right",
+        help: "accept ghost-text suggestion",
+        in_help: true,
+        action: None,
+        matches: &[],
+    },
     KeyBinding {
         context: BindContext::Input,
         keys: "Enter",
@@ -211,7 +226,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::Input,
         keys: "@file",
-        help: "Tab-complete a workspace path mention",
+        help: "Tab-complete a path mention; append :N-M for a line range",
         in_help: true,
         action: None,
         matches: &[],
@@ -249,6 +264,14 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
         in_help: true,
         action: Some(Action::ToggleBlockNav),
         matches: &[KeyMatch::ctrl(KeyCode::Char('b'))],
+    },
+    KeyBinding {
+        context: BindContext::Navigation,
+        keys: "Ctrl-F",
+        help: "fullscreen viewer for the selected (or last) foldable block",
+        in_help: true,
+        action: Some(Action::OpenBlockViewer),
+        matches: &[KeyMatch::ctrl(KeyCode::Char('f'))],
     },
     KeyBinding {
         context: BindContext::Navigation,
@@ -302,11 +325,11 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         context: BindContext::ReviewTools,
-        keys: "Ctrl-B",
-        help: "toggle the /btw side-question pane",
+        keys: "Esc",
+        help: "dismiss the /btw overlay (saves the answer to the transcript)",
         in_help: true,
-        action: Some(Action::ToggleBtw),
-        matches: &[KeyMatch::ctrl(KeyCode::Char('b'))],
+        action: None,
+        matches: &[],
     },
     KeyBinding {
         context: BindContext::ReviewTools,
@@ -323,6 +346,14 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
         in_help: true,
         action: Some(Action::CopyLastCode),
         matches: &[KeyMatch::ctrl(KeyCode::Char('y'))],
+    },
+    KeyBinding {
+        context: BindContext::ReviewTools,
+        keys: "Ctrl-L",
+        help: "fold/expand the plan checklist above the prompt",
+        in_help: true,
+        action: Some(Action::TogglePlanPane),
+        matches: &[KeyMatch::ctrl(KeyCode::Char('l'))],
     },
     KeyBinding {
         context: BindContext::ReviewTools,
@@ -520,6 +551,14 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
             KeyMatch::ctrl(KeyCode::Char('b')),
         ],
     },
+    KeyBinding {
+        context: BindContext::BlockNav,
+        keys: "Ctrl-F",
+        help: "fullscreen viewer for the selected block",
+        in_help: true,
+        action: Some(Action::OpenBlockViewer),
+        matches: &[KeyMatch::ctrl(KeyCode::Char('f'))],
+    },
     // --- Diff review (full-screen) ---
     KeyBinding {
         context: BindContext::Review,
@@ -581,6 +620,38 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
         context: BindContext::Confirm,
         keys: "p",
         help: "always allow this path prefix this session",
+        in_help: true,
+        action: None,
+        matches: &[],
+    },
+    KeyBinding {
+        context: BindContext::Confirm,
+        keys: "j/k",
+        help: "move the highlighted option",
+        in_help: true,
+        action: None,
+        matches: &[],
+    },
+    KeyBinding {
+        context: BindContext::Confirm,
+        keys: "Enter",
+        help: "activate the highlighted option",
+        in_help: true,
+        action: None,
+        matches: &[],
+    },
+    KeyBinding {
+        context: BindContext::Confirm,
+        keys: "x",
+        help: "reject and type a follow-up",
+        in_help: true,
+        action: None,
+        matches: &[],
+    },
+    KeyBinding {
+        context: BindContext::Confirm,
+        keys: "a / r / q",
+        help: "plan approval: approve / request changes / quit",
         in_help: true,
         action: None,
         matches: &[],
@@ -800,6 +871,20 @@ mod tests {
         );
         assert_eq!(
             resolve_from_table(
+                KeySurface::Insert,
+                &key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            ),
+            Action::OpenBlockViewer
+        );
+        assert_eq!(
+            resolve_from_table(
+                KeySurface::Normal,
+                &key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            ),
+            Action::OpenBlockViewer
+        );
+        assert_eq!(
+            resolve_from_table(
                 KeySurface::Normal,
                 &key(KeyCode::Char('n'), KeyModifiers::CONTROL)
             ),
@@ -834,6 +919,13 @@ mod tests {
                 &key(KeyCode::Char('k'), KeyModifiers::NONE)
             ),
             Action::BlockNavUp
+        );
+        assert_eq!(
+            resolve_from_table(
+                KeySurface::BlockNav,
+                &key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            ),
+            Action::OpenBlockViewer
         );
     }
 

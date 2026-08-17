@@ -2411,12 +2411,12 @@ mod tests {
         );
     }
 
-    /// `write_landing` renders the ~2x block-letter "PipeNetwork.AI" banner.
+    /// `write_landing` renders the block-letter "hi" banner.
     /// We render into a `Vec<u8>`, strip ANSI escapes, and assert the banner
     /// shape (5 figlet rows), the trailing model/cwd lines, and that the raw
     /// output carries the orange SGR escape — no real file descriptors touched.
     #[test]
-    fn write_landing_shows_full_pipenetwork_wordmark() {
+    fn write_landing_shows_hi_wordmark() {
         let mut buf: Vec<u8> = Vec::new();
         write_landing(&mut buf, &test_settings(), Some(128_000)).expect("render landing");
 

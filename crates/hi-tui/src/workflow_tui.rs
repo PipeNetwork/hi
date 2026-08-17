@@ -769,9 +769,7 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
                         app.selected_workflow_run = Some(run_id.clone());
                         app.apply(crate::event::UiEvent::WorkflowUpdated { snapshot });
                         app.push(Line::styled(
-                            format!(
-                                "workflow {run_id} resumed; open /dashboard to view its agents"
-                            ),
+                            format!("workflow {run_id} resumed; open /fleet to view its agents"),
                             accent(),
                         ));
                     }
@@ -801,7 +799,7 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
             dim(),
         )),
         _ => app.push(Line::styled(
-            format!("use /workflow {arg} to run — it opens the dashboard"),
+            format!("use /workflow {arg} to run — it opens /fleet"),
             dim(),
         )),
     }

@@ -1,10 +1,18 @@
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use std::net::SocketAddr;
 use std::path::PathBuf;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+use anyhow::Context;
 use clap::{Parser, Subcommand};
-use hi_mlx::backend::{InferenceBackend, MlxBackend, platform_supported};
+use hi_mlx::backend::platform_supported;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+use hi_mlx::backend::InferenceBackend;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+use hi_mlx::backend::MlxBackend;
 use hi_mlx::manifest::{inspect_model, list_models};
 
 #[derive(Parser, Debug)]
@@ -79,6 +87,7 @@ async fn main() -> Result<()> {
     run(Cli::parse()).await
 }
 
+#[allow(unused_variables)]
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Serve {
@@ -92,24 +101,29 @@ async fn run(cli: Cli) -> Result<()> {
             if !platform_supported() {
                 bail!("MLX inference requires Apple Silicon macOS");
             }
-            let backend = Arc::new(
-                MlxBackend::load_with_draft(&model_path, model_id, draft.as_ref(), spec_k)
-                    .with_context(|| format!("loading MLX model from {}", model_path.display()))?,
-            );
-            let addr: SocketAddr = format!("{host}:{port}")
-                .parse()
-                .with_context(|| format!("invalid listen address {host}:{port}"))?;
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("binding {addr}"))?;
-            if let Some(draft) = &draft {
-                tracing::info!(
-                    "speculative decoding enabled (draft {}, k={spec_k})",
-                    draft.display()
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+            {
+                let backend = Arc::new(
+                    MlxBackend::load_with_draft(&model_path, model_id, draft.as_ref(), spec_k)
+                        .with_context(|| format!("loading MLX model from {}", model_path.display()))?,
                 );
+                let addr: SocketAddr = format!("{host}:{port}")
+                    .parse()
+                    .with_context(|| format!("invalid listen address {host}:{port}"))?;
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("binding {addr}"))?;
+                if let Some(draft) = &draft {
+                    tracing::info!(
+                        "speculative decoding enabled (draft {}, k={spec_k})",
+                        draft.display()
+                    );
+                }
+                tracing::info!("serving {} on http://{addr}/v1", backend.model().id);
+                axum::serve(listener, hi_mlx::server::app(backend)).await?;
             }
-            tracing::info!("serving {} on http://{addr}/v1", backend.model().id);
-            axum::serve(listener, hi_mlx::server::app(backend)).await?;
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+            bail!("MLX inference is not compiled in; rebuild with --features mlx");
         }
         Command::Inspect {
             model_path,
@@ -139,52 +153,57 @@ async fn run(cli: Cli) -> Result<()> {
             if !platform_supported() {
                 bail!("MLX inference requires Apple Silicon macOS");
             }
-            use hi_mlx::backend::GenerationRequest;
-            use hi_mlx::models::NativeRuntime;
-            let req = |p: &str| GenerationRequest {
-                prompt: p.to_string(),
-                max_tokens,
-                temperature: 0.0,
-                top_p: 1.0,
-                top_k: None,
-                seed: None,
-                stop_sequences: vec![],
-                media_inputs: vec![],
-                messages: Vec::new(),
-            };
-            let mut target = NativeRuntime::from_path(&target_path)
-                .with_context(|| format!("loading target {}", target_path.display()))?;
-            let mut draft = NativeRuntime::from_path(&draft_path)
-                .with_context(|| format!("loading draft {}", draft_path.display()))?;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+            {
+                use hi_mlx::backend::GenerationRequest;
+                use hi_mlx::models::NativeRuntime;
+                let req = |p: &str| GenerationRequest {
+                    prompt: p.to_string(),
+                    max_tokens,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: None,
+                    seed: None,
+                    stop_sequences: vec![],
+                    media_inputs: vec![],
+                    messages: Vec::new(),
+                };
+                let mut target = NativeRuntime::from_path(&target_path)
+                    .with_context(|| format!("loading target {}", target_path.display()))?;
+                let mut draft = NativeRuntime::from_path(&draft_path)
+                    .with_context(|| format!("loading draft {}", draft_path.display()))?;
 
-            let t0 = std::time::Instant::now();
-            let (spec_out, stats) =
-                target.speculative_generate(&mut draft, req(&prompt), k, |_| Ok(()))?;
-            let spec_dt = t0.elapsed().as_secs_f64();
-            let spec_tps = spec_out.completion_tokens as f64 / spec_dt.max(1e-6);
-            let accept_rate = stats.accepted as f64 / stats.proposed.max(1) as f64 * 100.0;
-            let avg_per_round = spec_out.completion_tokens as f64 / stats.rounds.max(1) as f64;
+                let t0 = std::time::Instant::now();
+                let (spec_out, stats) =
+                    target.speculative_generate(&mut draft, req(&prompt), k, |_| Ok(()))?;
+                let spec_dt = t0.elapsed().as_secs_f64();
+                let spec_tps = spec_out.completion_tokens as f64 / spec_dt.max(1e-6);
+                let accept_rate = stats.accepted as f64 / stats.proposed.max(1) as f64 * 100.0;
+                let avg_per_round = spec_out.completion_tokens as f64 / stats.rounds.max(1) as f64;
 
-            let t1 = std::time::Instant::now();
-            let base_out = target.generate(req(&prompt))?;
-            let base_dt = t1.elapsed().as_secs_f64();
-            let base_tps = base_out.completion_tokens as f64 / base_dt.max(1e-6);
+                let t1 = std::time::Instant::now();
+                let base_out = target.generate(req(&prompt))?;
+                let base_dt = t1.elapsed().as_secs_f64();
+                let base_tps = base_out.completion_tokens as f64 / base_dt.max(1e-6);
 
-            println!("=== speculative (k={k}) ===\n{}", spec_out.text.trim());
-            println!(
-                "\n--- speculative: {} tok, {spec_dt:.1}s => {spec_tps:.1} tok/s | \
-                 accept {accept_rate:.0}% | {avg_per_round:.2} tok/round over {} rounds ---",
-                spec_out.completion_tokens, stats.rounds
-            );
-            println!(
-                "--- target greedy: {} tok, {base_dt:.1}s => {base_tps:.1} tok/s ---",
-                base_out.completion_tokens
-            );
-            println!(
-                "=== SPEEDUP {:.2}x  |  output identical to greedy: {} ===",
-                spec_tps / base_tps.max(1e-6),
-                spec_out.text == base_out.text
-            );
+                println!("=== speculative (k={k}) ===\n{}", spec_out.text.trim());
+                println!(
+                    "\n--- speculative: {} tok, {spec_dt:.1}s => {spec_tps:.1} tok/s | \
+                     accept {accept_rate:.0}% | {avg_per_round:.2} tok/round over {} rounds ---",
+                    spec_out.completion_tokens, stats.rounds
+                );
+                println!(
+                    "--- target greedy: {} tok, {base_dt:.1}s => {base_tps:.1} tok/s ---",
+                    base_out.completion_tokens
+                );
+                println!(
+                    "=== SPEEDUP {:.2}x  |  output identical to greedy: {} ===",
+                    spec_tps / base_tps.max(1e-6),
+                    spec_out.text == base_out.text
+                );
+            }
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+            bail!("MLX inference is not compiled in; rebuild with --features mlx");
         }
         Command::Repack {
             model_path,

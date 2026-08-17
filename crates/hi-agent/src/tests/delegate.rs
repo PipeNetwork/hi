@@ -294,3 +294,112 @@ async fn applied_delegate_timeline_contains_exact_reconciled_effects() {
 
     let _ = std::fs::remove_dir_all(base);
 }
+
+struct CancellableRunner {
+    started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl crate::DelegateRunner for CancellableRunner {
+    async fn run(&self, _task: &str, _verify: Option<&str>) -> crate::DelegateOutcome {
+        panic!("cancel test must use run_routed_with_progress");
+    }
+
+    async fn run_routed_with_progress(
+        &self,
+        _task: &str,
+        _verify: Option<&str>,
+        _route: &crate::SubagentRoute,
+        cancellation: crate::TurnCancellation,
+        _progress: Option<std::sync::Arc<dyn crate::DelegateProgress>>,
+    ) -> crate::DelegateOutcome {
+        self.started
+            .store(true, std::sync::atomic::Ordering::Release);
+        while !cancellation.is_cancelled() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        crate::DelegateOutcome {
+            status: hi_tools::ToolStatus::Cancelled,
+            applied: false,
+            changed_files: Vec::new(),
+            summary: "delegate cancelled by test".into(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn handle_delegate_stops_when_turn_is_cancelled() {
+    let mut agent = agent(Vec::new(), delegate_config());
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    agent.set_delegate_runner(std::sync::Arc::new(CancellableRunner {
+        started: started.clone(),
+    }));
+    let cancel = crate::TurnCancellation::new();
+    agent.turn_cancellation = Some(cancel.clone());
+    let mut ui = RecUi::default();
+    let out = {
+        let handle = agent.handle_delegate(r#"{"task":"do the thing"}"#, &mut ui);
+        tokio::pin!(handle);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    output = &mut handle => break output,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+                        if started.load(std::sync::atomic::Ordering::Acquire) {
+                            cancel.cancel();
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("delegate should observe turn cancellation")
+    };
+    assert_eq!(out.status, hi_tools::ToolStatus::Cancelled);
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("cancelled")),
+        "expected a cancelled finish note; got {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn overlapping_parallel_delegates_do_not_double_spawn() {
+    let responses = vec![
+        completion(
+            vec![
+                Content::ToolCall {
+                    id: "delegate-1".into(),
+                    name: "delegate".into(),
+                    arguments: r#"{"task":"update src/foo.rs"}"#.into(),
+                },
+                Content::ToolCall {
+                    id: "delegate-2".into(),
+                    name: "delegate".into(),
+                    arguments: r#"{"task":"also update src/foo.rs"}"#.into(),
+                },
+            ],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text("both delegates rolled back.".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, delegate_config());
+    agent.set_delegate_runner(std::sync::Arc::new(StubRunner { applied: false }));
+    let mut ui = RecUi::default();
+    agent.run_turn("update foo", &mut ui).await.unwrap();
+    let spawned = ui
+        .statuses
+        .iter()
+        .filter(|s| s.contains("delegate subagent"))
+        .count();
+    assert_eq!(
+        spawned, 2,
+        "overlapping delegates must spawn once each (serial fallback), not a prepare row plus a serial row: {:?}",
+        ui.statuses
+    );
+}

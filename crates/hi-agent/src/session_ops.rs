@@ -267,6 +267,7 @@ pub fn handle_session_command(
                 Err(err) => format!("remember failed: {err:#}"),
             }
         }
+        Command::Memory => format_memory_dump(agent.workspace_root()),
         Command::ImportClaude(_) => import_claude_report(agent.workspace_root()),
         Command::Hooks(arg) => hooks_command(agent.workspace_root(), arg),
         Command::Trust(arg) => trust_command(agent.workspace_root(), arg),
@@ -632,6 +633,27 @@ pub fn remember_note(workspace: &Path, text: &str, global: bool) -> Result<Strin
         path.display(),
         bullet
     ))
+}
+
+fn format_memory_dump(workspace: &Path) -> String {
+    let project = memory_file_at(workspace);
+    let global = global_memory_file();
+    let read = |path: &Path| {
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        let body = crate::memory::strip_header(&raw);
+        if body.trim().is_empty() {
+            "(empty)".to_string()
+        } else {
+            body
+        }
+    };
+    format!(
+        "project ({})\n{}\n\nglobal ({})\n{}",
+        project.display(),
+        read(&project),
+        global.display(),
+        read(&global)
+    )
 }
 
 /// Best-effort Claude Code config discovery + migration hints (no silent overwrite).
@@ -1313,7 +1335,7 @@ pub fn format_tasks_report(
         if plan_mode { "on" } else { "off" },
         permission.as_str()
     ));
-    out.push_str("  tip: /loop list and /dashboard show more in the TUI\n");
+    out.push_str("  tip: /loop list and /fleet show more in the TUI\n");
     out
 }
 

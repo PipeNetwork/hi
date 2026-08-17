@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::candidate_gate::{
-    ensure_command, run_async_thread, run_verifier_sync, staged_candidate_diff,
+    DestinationVerifyCancelled, VerifierCancelled, ensure_command, is_verifier_cancelled,
+    run_async_thread, run_verifier_sync_cancellable, staged_candidate_diff,
 };
 use crate::resource_governor::{self, ResourceClass};
 
@@ -38,15 +39,48 @@ pub(crate) fn apply_candidate_and_reverify(
     state_root: &Path,
     verify: &str,
 ) -> Result<AppliedCandidate> {
+    apply_candidate_and_reverify_cancellable(worktree, base, destination, state_root, verify, None)
+}
+
+pub(crate) fn apply_candidate_and_reverify_cancellable(
+    worktree: &Path,
+    base: &str,
+    destination: &Path,
+    state_root: &Path,
+    verify: &str,
+    cancellation: Option<hi_agent::TurnCancellation>,
+) -> Result<AppliedCandidate> {
     ensure!(!verify.trim().is_empty(), "destination verifier is empty");
+    let stop = || {
+        cancellation
+            .as_ref()
+            .is_some_and(hi_agent::TurnCancellation::is_cancelled)
+    };
     let merge_queue_started = Instant::now();
-    let _merge_lease =
-        resource_governor::acquire(state_root, ResourceClass::Merge, Duration::from_secs(120))
-            .context("waiting for exclusive destination merge capacity")?;
+    let _merge_lease = match resource_governor::acquire_while(
+        state_root,
+        ResourceClass::Merge,
+        Duration::from_secs(120),
+        &stop,
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            if stop() {
+                return Err(VerifierCancelled.into());
+            }
+            return Err(error).context("waiting for exclusive destination merge capacity");
+        }
+    };
     let merge_queue_ms = merge_queue_started.elapsed().as_millis();
     let apply_started = Instant::now();
+    if stop() {
+        return Err(VerifierCancelled.into());
+    }
     let pre_apply = create_checkpoint_sync(destination, state_root)
         .context("creating the destination pre-apply checkpoint")?;
+    if stop() {
+        return Err(VerifierCancelled.into());
+    }
 
     let applied = apply_candidate_transactionally(worktree, base, destination, state_root)
         .context("transactional candidate apply failed")?;
@@ -70,12 +104,35 @@ pub(crate) fn apply_candidate_and_reverify(
     );
     let apply_ms = apply_started.elapsed().as_millis();
     let verifier_queue_started = Instant::now();
-    let _verifier_lease =
-        resource_governor::acquire(state_root, ResourceClass::Verifier, verifier_timeout)
-            .context("waiting for shared verifier capacity")?;
+    let _verifier_lease = match resource_governor::acquire_while(
+        state_root,
+        ResourceClass::Verifier,
+        verifier_timeout,
+        &stop,
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            let reason = if stop() {
+                DestinationVerifyCancelled.into()
+            } else {
+                error.context("waiting for shared verifier capacity")
+            };
+            let rollback =
+                restore_checkpoint_sealed_sync(destination, &pre_apply, &post_apply, state_root);
+            return Err(combine_rollback_error(reason, rollback));
+        }
+    };
     let verifier_queue_ms = verifier_queue_started.elapsed().as_millis();
+    if stop() {
+        let rollback =
+            restore_checkpoint_sealed_sync(destination, &pre_apply, &post_apply, state_root);
+        return Err(combine_rollback_error(
+            DestinationVerifyCancelled.into(),
+            rollback,
+        ));
+    }
     let verifier_started = Instant::now();
-    let verifier_result = run_verifier_sync(destination, verify);
+    let verifier_result = run_verifier_sync_cancellable(destination, verify, cancellation.clone());
     let verifier_ms = verifier_started.elapsed().as_millis();
     let post_verify = match create_checkpoint_sync(destination, state_root) {
         Ok(checkpoint) => checkpoint,
@@ -111,7 +168,11 @@ pub(crate) fn apply_candidate_and_reverify(
     }
 
     let reason = if let Err(error) = verifier_result {
-        error.context(format!("destination verification `{verify}` failed"))
+        if is_verifier_cancelled(&error) {
+            DestinationVerifyCancelled.into()
+        } else {
+            error.context(format!("destination verification `{verify}` failed"))
+        }
     } else {
         anyhow!("destination verifier modified relevant files (verification unstable)")
     };

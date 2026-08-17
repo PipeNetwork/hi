@@ -22,8 +22,6 @@ pub(crate) enum Action {
     ToggleHelp,
     ToggleDebug,
     ToggleDiff,
-    /// Right-hand `/btw` side-question pane.
-    ToggleBtw,
     ToggleReview,
     ToggleReasoning,
     ToggleToolOutput,
@@ -63,6 +61,10 @@ pub(crate) enum Action {
     BlockNavDown,
     BlockNavToggle,
     BlockNavExit,
+    /// Ctrl-F: fullscreen viewer for the selected (or latest) foldable block.
+    OpenBlockViewer,
+    /// Ctrl-L: fold/expand the plan checklist above the composer.
+    TogglePlanPane,
 }
 
 impl Action {

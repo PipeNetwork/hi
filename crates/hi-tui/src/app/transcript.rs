@@ -64,7 +64,11 @@ impl crate::App {
     /// Push a user-prompt echo as a structurally-distinct entry so the render
     /// pass can pin it as a sticky header when scrolled past.
     pub(crate) fn push_user_prompt(&mut self, line: Line<'static>) {
-        self.transcript.push(TranscriptEntry::UserPrompt(line));
+        self.freeze_verb_group();
+        self.transcript.push(TranscriptEntry::UserPrompt {
+            line,
+            at: std::time::SystemTime::now(),
+        });
         self.bump_transcript();
         self.cap_transcript();
     }
@@ -97,11 +101,15 @@ impl crate::App {
                 self.status = format!("done · {detail}");
                 self.last_turn_state = TurnState::Done(detail.clone());
                 self.last_error = None;
-                self.push(accent_line(
-                    theme().accent_success,
-                    format!("✓ done · {detail}"),
-                    dim(),
-                ));
+                // “No applicable checks” is a non-event. Keep the typed state
+                // for /status, but don't paint a green receipt into the pane.
+                if outcome.verification == VerificationStatus::Passed {
+                    self.push(accent_line(
+                        theme().accent_success,
+                        format!("✓ done · {detail}"),
+                        dim(),
+                    ));
+                }
             }
             OutcomeState::Warning => {
                 let label = match outcome.status {
@@ -184,49 +192,92 @@ impl crate::App {
         self.following = true;
     }
 
-    /// Open the right-hand BTW pane (idempotent). Auto-called on first side activity.
+    /// Show the inline `/btw` overlay (idempotent). Auto-called on first side activity.
     pub(crate) fn open_btw_pane(&mut self) {
         self.show_btw = true;
     }
 
-    /// Pin BTW pane scroll to the latest entry.
-    pub(crate) fn btw_follow(&mut self) {
-        // `btw_scroll` is applied as "from top"; render clamps to bottom when
-        // following — we store u16::MAX as a sentinel for "stick to end".
-        self.btw_scroll = u16::MAX;
+    /// Grok-style overlay derived from the live thread (None when dismissed).
+    pub(crate) fn btw_overlay(&self) -> Option<crate::btw::BtwOverlayState> {
+        crate::btw::overlay_from_thread(self.show_btw, &self.btw_thread, self.btw_scroll)
     }
 
-    /// Toggle the BTW side pane (Ctrl-B). Closing keeps the thread so reopening
-    /// shows history; opening with no history is a no-op-looking empty pane.
-    pub(crate) fn toggle_btw_pane(&mut self) {
-        self.show_btw = !self.show_btw;
-        if self.show_btw {
-            self.btw_follow();
+    /// Persist a finished overlay answer into the transcript as a collapsed
+    /// `/btw <question>` block. Loading/error states are not written.
+    fn persist_btw_done(&mut self) {
+        if let Some(crate::btw::BtwOverlayState::Done {
+            question, answer, ..
+        }) = self.btw_overlay()
+        {
+            self.transcript.push(TranscriptEntry::Btw {
+                question,
+                answer,
+                expanded: false,
+            });
+            self.bump_transcript();
+            self.cap_transcript();
         }
     }
 
-    /// Push a user `/btw` question into the pane immediately (before the agent
-    /// drains the inbox) so the side box isn't empty while waiting for the next
-    /// model boundary. Idempotent if the same question is already the latest.
+    /// Dismiss the overlay. A Done answer is flushed to scrollback first
+    /// (grok-build). Returns whether an overlay was showing.
+    pub(crate) fn dismiss_btw_overlay(&mut self) -> bool {
+        if !self.show_btw {
+            return false;
+        }
+        self.persist_btw_done();
+        self.show_btw = false;
+        self.btw_thread.clear();
+        self.btw_scroll = 0;
+        self.last_btw_area = ratatui::layout::Rect::default();
+        self.last_btw_close = ratatui::layout::Rect::default();
+        true
+    }
+
+    /// Scroll the Done overlay when the pointer is over it. Returns true if
+    /// the event was consumed (even when the answer already fits).
+    fn scroll_btw_overlay_at(&mut self, x: u16, y: u16, up: bool) -> bool {
+        if !crate::btw::cell_in(self.last_btw_area, x, y) {
+            return false;
+        }
+        let Some(state) = self.btw_overlay() else {
+            return true;
+        };
+        let cw = self.last_btw_area.width.saturating_sub(4);
+        let max_body = self.last_btw_area.height.saturating_sub(2) as usize;
+        let max = state.max_scroll_offset(cw, max_body.max(1));
+        if up {
+            self.btw_scroll = self.btw_scroll.saturating_sub(1);
+        } else {
+            self.btw_scroll = (self.btw_scroll + 1).min(max);
+        }
+        true
+    }
+
+    /// Push a user `/btw` question into the overlay immediately (before the
+    /// agent drains the inbox) so the panel isn't empty while waiting. A
+    /// previous Done overlay is persisted first. Idempotent if the same
+    /// question is already the latest.
     pub(crate) fn btw_note_question(&mut self, question: &str) {
         let q = question.trim();
         if q.is_empty() {
             return;
         }
-        self.open_btw_pane();
-        let already = matches!(
-            self.btw_thread.last(),
-            Some(crate::BtwEntry::Question(prev)) if prev == q
-        );
+        let already = self
+            .btw_thread
+            .iter()
+            .rev()
+            .any(|e| matches!(e, crate::BtwEntry::Question(prev) if prev == q));
         if !already {
-            // Drop a stale thinking line under a prior unanswered question.
-            if matches!(self.btw_thread.last(), Some(crate::BtwEntry::Thinking(_))) {
-                self.btw_thread.pop();
+            if matches!(self.btw_thread.last(), Some(crate::BtwEntry::Answer(_))) {
+                self.persist_btw_done();
             }
+            self.btw_thread.clear();
+            self.btw_scroll = 0;
             self.btw_thread
                 .push(crate::BtwEntry::Question(q.to_string()));
         }
-        // Always show an in-flight marker so the pane never looks frozen.
+        self.open_btw_pane();
         match self.btw_thread.last() {
             Some(crate::BtwEntry::Thinking(_)) => {}
             _ => {
@@ -234,7 +285,6 @@ impl crate::App {
                     .push(crate::BtwEntry::Thinking("answering…".into()));
             }
         }
-        self.btw_follow();
     }
 
     /// Replace the trailing thinking marker (if any) with a fresher status.
@@ -245,7 +295,6 @@ impl crate::App {
             self.btw_thread
                 .push(crate::BtwEntry::Thinking(msg.to_string()));
         }
-        self.btw_follow();
     }
 
     fn btw_clear_thinking(&mut self) {
@@ -290,28 +339,50 @@ impl crate::App {
 
     pub(crate) fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+        self.mouse_col = mouse.column;
+        self.mouse_row = mouse.row;
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                if let Some(picker) = self.picker.as_mut() {
-                    picker.up();
-                } else if self.completion.is_some() {
-                    self.completion_move(-1);
-                } else {
-                    self.scroll_up(3);
+                if !self.scroll_btw_overlay_at(mouse.column, mouse.row, true) {
+                    if let Some(picker) = self.picker.as_mut() {
+                        picker.up();
+                    } else if self.completion.is_some() {
+                        self.completion_move(-1);
+                    } else {
+                        self.scroll_up(3);
+                    }
                 }
             }
             MouseEventKind::ScrollDown => {
-                if let Some(picker) = self.picker.as_mut() {
-                    picker.down();
-                } else if self.completion.is_some() {
-                    self.completion_move(1);
-                } else {
-                    self.scroll_down(3);
+                if !self.scroll_btw_overlay_at(mouse.column, mouse.row, false) {
+                    if let Some(picker) = self.picker.as_mut() {
+                        picker.down();
+                    } else if self.completion.is_some() {
+                        self.completion_move(1);
+                    } else {
+                        self.scroll_down(3);
+                    }
                 }
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if crate::btw::cell_in(self.last_btw_close, mouse.column, mouse.row) =>
+            {
+                let _ = self.dismiss_btw_overlay();
             }
             // Left press/drag/release drive text selection; a press with no drag
             // falls through to a fold on release.
-            MouseEventKind::Down(MouseButton::Left) => self.mouse_down(mouse.column, mouse.row),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.plan_approval.as_ref().is_some_and(|c| c.parked)
+                    && crate::btw::cell_in(self.turn_status_rect, mouse.column, mouse.row)
+                {
+                    self.unpark_plan_approval();
+                    return;
+                }
+                if self.apply_timeline_click(mouse.column, mouse.row) {
+                    return;
+                }
+                self.mouse_down(mouse.column, mouse.row);
+            }
             MouseEventKind::Drag(MouseButton::Left) => self.mouse_drag(mouse.column, mouse.row),
             MouseEventKind::Up(MouseButton::Left) => self.mouse_up(mouse.column, mouse.row),
             _ => {}
@@ -327,6 +398,35 @@ impl crate::App {
             self.select_cursor = Some(point);
             self.select_dragged = false;
         }
+    }
+
+    fn timeline_contains(&self, col: u16, row: u16) -> bool {
+        let r = self.timeline_rect;
+        r.width > 0
+            && col >= r.x
+            && col < r.x.saturating_add(r.width)
+            && row >= r.y
+            && row < r.y.saturating_add(r.height)
+    }
+
+    fn apply_timeline_click(&mut self, col: u16, row: u16) -> bool {
+        if !self.timeline_contains(col, row) {
+            return false;
+        }
+        if let Some(hit) = crate::timeline::hit_at(&self.timeline_hits, row) {
+            match hit {
+                crate::timeline::TimelineHit::Tick(i) => {
+                    let _ = self.scroll_to_user_prompt(i);
+                }
+                crate::timeline::TimelineHit::Up => {
+                    self.jump_transcript_marker(crate::dispatch::TranscriptMarker::UserPrompt, -1);
+                }
+                crate::timeline::TimelineHit::Down => {
+                    self.jump_transcript_marker(crate::dispatch::TranscriptMarker::UserPrompt, 1);
+                }
+            }
+        }
+        true
     }
 
     /// Left-button drag: extend the selection to the point under the cursor,
@@ -348,6 +448,10 @@ impl crate::App {
     /// Down + Up at different cells. Apply the release point here so that
     /// path still extends the selection and auto-copies.
     fn mouse_up(&mut self, col: u16, row: u16) {
+        if self.timeline_contains(col, row) {
+            self.clear_selection();
+            return;
+        }
         if self.select_anchor.is_none() {
             self.handle_click(col, row);
             return;
@@ -610,6 +714,7 @@ impl crate::App {
         // Track fenced code blocks so Ctrl-Y can copy the most recent one. A
         // fence-open line (```lang) starts a new block buffer; interior lines
         // accumulate; the closing fence finalizes `last_code_block`.
+        let in_fence = self.code_lang.is_some();
         let trimmed = text.trim_start();
         if trimmed.starts_with("```") {
             if self.code_lang.is_none() {
@@ -628,8 +733,35 @@ impl crate::App {
                 block.push_str(&text);
             }
         }
+        if !in_fence
+            && text.trim().is_empty()
+            && last_entry_is_blank(&self.transcript)
+            && !self.transcript.is_empty()
+        {
+            return;
+        }
+        if !in_fence
+            && !trimmed.starts_with("```")
+            && crate::render::markdown_needs_leading_blank(
+                trimmed,
+                last_entry_is_blank(&self.transcript),
+                last_entry_is_list(&self.transcript),
+            )
+        {
+            self.transcript
+                .push(TranscriptEntry::Assistant(Line::raw("")));
+        }
+        let heading_level = if !in_fence && !trimmed.starts_with("```") {
+            crate::render::markdown_heading(trimmed).map(|(level, _)| level)
+        } else {
+            None
+        };
         let line = markdown_line(&text, &mut self.code_lang);
         self.transcript.push(TranscriptEntry::Assistant(line));
+        if heading_level.is_some() {
+            self.transcript
+                .push(TranscriptEntry::Assistant(Line::raw("")));
+        }
         self.bump_transcript();
     }
 
@@ -723,20 +855,7 @@ impl crate::App {
             UiEvent::BtwQuestion { question } => {
                 self.event_log
                     .push(format!("btw_question {} chars", question.len()));
-                // May already be in the thread from the mid-turn keystroke.
-                let already = self
-                    .btw_thread
-                    .iter()
-                    .rev()
-                    .any(|e| matches!(e, crate::BtwEntry::Question(prev) if prev == &question));
-                if !already {
-                    self.btw_clear_thinking();
-                    self.open_btw_pane();
-                    self.btw_thread
-                        .push(crate::BtwEntry::Question(question.clone()));
-                }
-                self.btw_set_thinking("answering…");
-                // Question lives in the BTW pane only — no main-transcript stub.
+                self.btw_note_question(&question);
             }
             UiEvent::BtwAnswer { text } => {
                 self.event_log
@@ -745,20 +864,9 @@ impl crate::App {
                 self.flush_reasoning();
                 self.open_btw_pane();
                 self.btw_clear_thinking();
-                // Append into the latest answer entry while streaming; else start one.
                 match self.btw_thread.last_mut() {
                     Some(crate::BtwEntry::Answer(buf)) => buf.push_str(&text),
                     _ => self.btw_thread.push(crate::BtwEntry::Answer(text.clone())),
-                }
-                self.btw_follow();
-                // When the pane is closed, keep the legacy dim inline stream so
-                // headless-ish / narrow terminals still see the answer.
-                if !self.show_btw {
-                    if !self.btw_answer_started {
-                        self.stream(crate::render::dim(), false, "↳ btw: ");
-                        self.btw_answer_started = true;
-                    }
-                    self.stream(crate::render::dim(), false, &text);
                 }
             }
             UiEvent::BtwToolStarted { name, arguments } => {
@@ -800,9 +908,7 @@ impl crate::App {
             }
             UiEvent::BtwEnd => {
                 self.event_log.push("btw_end".into());
-                self.btw_answer_started = false;
                 self.btw_clear_thinking();
-                self.btw_follow();
             }
             UiEvent::Reasoning { text } => {
                 self.event_log
@@ -829,10 +935,9 @@ impl crate::App {
                 // Fences don't span messages; reset so a stray ``` can't bleed
                 // code styling into the next response.
                 self.code_lang = None;
-                // The next assistant message is a fresh stream — a following `/btw`
-                // answer re-emits its own `↳ btw:` prefix.
-                self.btw_answer_started = false;
-                self.freeze_verb_group();
+                // Do not freeze explore grouping here. Grok-build keeps
+                // consecutive reads/searches in one row across model rounds
+                // ("Let me look at…") until a write/run or the turn ends.
             }
             UiEvent::ToolStarted { name, arguments } => {
                 let label = tool_label(&name, &arguments);
@@ -840,13 +945,14 @@ impl crate::App {
                 if activity_feed::is_parent_subagent_tool(&name) {
                     return;
                 }
-                // Mark this tool as the active party so the working line can
-                // name it with its own timer until the result lands. No
-                // transcript line — the header is emitted with the result.
+                // Track the in-flight tool for interrupt/watchdog, not chrome.
+                // Command identity lives on transcript `Run` rows (emitted on
+                // ToolCall for shell tools, otherwise with the result).
                 self.current_tool = Some(label);
                 self.current_tool_started = Some(Instant::now());
                 // Clear any previous stream tail when a new tool starts.
                 self.tool_stream_tail.clear();
+                self.run_streamed_this_call = false;
             }
             UiEvent::ToolCall { name, arguments } => {
                 let label = tool_label(&name, &arguments);
@@ -865,10 +971,14 @@ impl crate::App {
                 self.flush_pending();
                 self.current_tool = Some(label.clone());
                 self.current_tool_started = Some(Instant::now());
+                self.run_streamed_this_call = false;
                 if let Some(verb) = ExploreVerb::from_tool(&name) {
                     self.note_explore_call(verb, label_detail(&label));
                 } else {
                     self.freeze_verb_group();
+                    if activity_feed::is_shell_run_tool(&name) {
+                        self.ensure_run_placeholder(&activity_feed::run_command(&name, &label));
+                    }
                 }
             }
             UiEvent::ToolResult { name, result } => {
@@ -887,11 +997,14 @@ impl crate::App {
                 self.push_result(&name, &result, &label);
             }
             UiEvent::ToolStream { line, .. } => {
-                // Accumulate streamed lines for the live working-area display.
-                // Keep only the last few so the panel stays compact.
-                self.tool_stream_tail.push(line.to_string());
-                if self.tool_stream_tail.len() > 4 {
-                    self.tool_stream_tail.remove(0);
+                if self.append_live_run_output(&line) {
+                    self.run_streamed_this_call = true;
+                    self.tool_stream_tail.clear();
+                } else {
+                    self.tool_stream_tail.push(line.to_string());
+                    if self.tool_stream_tail.len() > 4 {
+                        self.tool_stream_tail.remove(0);
+                    }
                 }
             }
             UiEvent::Status { text } => {
@@ -964,9 +1077,7 @@ impl crate::App {
                 self.last_turn_event = Some(TurnEventKind::TurnEnd);
                 self.flush_pending();
                 self.freeze_verb_group();
-                // Usage summary is not a tool. Keep it as a quiet footer line
-                // without the activity gutter so it can't be mistaken for work.
-                self.push(Line::styled(format!("usage · {summary}"), dim()));
+                // Token/ctx accounting lives in the header chip, not here.
             }
             UiEvent::TurnError {
                 error_kind,
@@ -1007,6 +1118,7 @@ impl crate::App {
                     // the start of the next turn. Skip when the prompt queue is
                     // non-empty — the next turn starts immediately.
                     self.suggested_prompt = Some(trimmed.to_string());
+                    self.suggested_prompt_dismissed = false;
                 }
             }
             UiEvent::WorkflowUpdated { snapshot } => {
@@ -1240,6 +1352,7 @@ impl crate::App {
                 .to_string();
             if is_missing_background_process_result(result) {
                 self.freeze_verb_group();
+                self.pop_idle_run(&id);
                 self.push_activity(ActivityKind::Other {
                     verb: "background".into(),
                     detail: format!("process {id} unavailable"),
@@ -1251,6 +1364,8 @@ impl crate::App {
                 self.note_idle_bash_poll(&id);
                 return;
             }
+            self.apply_run_result(&id, &display_result, bash_process_live(result));
+            return;
         }
         self.freeze_verb_group();
         if activity_feed::is_edit_tool(name) {
@@ -1265,6 +1380,9 @@ impl crate::App {
             } else {
                 String::new()
             };
+            if self.try_coalesce_edit(&path, additions, deletions, &diff) {
+                return;
+            }
             self.push_activity(ActivityKind::Edit {
                 path,
                 additions,
@@ -1274,19 +1392,8 @@ impl crate::App {
             return;
         }
         if activity_feed::is_run_tool(name) {
-            let command = label_detail(label)
-                .or_else(|| label_detail(&format!("{name} {label}")))
-                .unwrap_or_else(|| label.to_string());
-            let command = command
-                .strip_prefix("bash ")
-                .unwrap_or(command.as_str())
-                .to_string();
-            self.push_activity(ActivityKind::Run {
-                command,
-                body: display_result,
-                idle: false,
-                poll_count: 0,
-            });
+            let command = activity_feed::run_command(name, label);
+            self.apply_run_result(&command, &display_result, bash_process_live(result));
             return;
         }
         let (verb, detail) = match label.split_once(' ') {
@@ -1311,33 +1418,142 @@ impl crate::App {
         self.cap_transcript();
     }
 
+    fn try_coalesce_edit(
+        &mut self,
+        path: &str,
+        additions: u32,
+        deletions: u32,
+        diff: &str,
+    ) -> bool {
+        let Some(TranscriptEntry::Activity(block)) = self.transcript.last_mut() else {
+            return false;
+        };
+        let ActivityKind::Edit {
+            path: existing,
+            additions: add,
+            deletions: del,
+            diff: existing_diff,
+        } = &mut block.kind
+        else {
+            return false;
+        };
+        if existing != path {
+            return false;
+        }
+        *add = add.saturating_add(additions);
+        *del = del.saturating_add(deletions);
+        if !diff.is_empty() {
+            if !existing_diff.is_empty() {
+                existing_diff.push('\n');
+            }
+            existing_diff.push_str(diff);
+        }
+        self.bump_transcript();
+        true
+    }
+
     pub(crate) fn freeze_verb_group(&mut self) {
-        if let Some(TranscriptEntry::Activity(block)) = self.transcript.last_mut()
-            && let Some(group) = block.as_verb_group_mut()
-            && group.open
-        {
+        if let Some(group) = self.open_verb_group_mut() {
             group.live = false;
             group.open = false;
             self.bump_transcript();
         }
     }
 
+    /// Grok-build keeps consecutive reads/searches in one row even when the
+    /// model narrates between them. Skip assistant/reasoning/status lines and
+    /// resume the still-open explore group from this turn. A substantial
+    /// assistant answer (heading, list, long prose) starts a new burst.
+    fn open_verb_group_mut(&mut self) -> Option<&mut crate::activity_feed::VerbGroup> {
+        for entry in self.transcript.iter_mut().rev() {
+            match entry {
+                TranscriptEntry::Activity(block) => {
+                    return block.as_verb_group_mut().filter(|group| group.open);
+                }
+                TranscriptEntry::Assistant(line) if is_steering_assistant_line(line) => continue,
+                TranscriptEntry::Assistant(_) => return None,
+                TranscriptEntry::Reasoning { .. } | TranscriptEntry::Line(_) => continue,
+                TranscriptEntry::UserPrompt { .. }
+                | TranscriptEntry::ChangedFiles { .. }
+                | TranscriptEntry::Btw { .. }
+                | TranscriptEntry::Workflow { .. }
+                | TranscriptEntry::ToolOutput { .. } => return None,
+            }
+        }
+        None
+    }
+
     fn note_explore_call(&mut self, verb: ExploreVerb, detail: Option<String>) {
-        if let Some(TranscriptEntry::Activity(block)) = self.transcript.last_mut()
-            && let Some(group) = block.as_verb_group_mut()
-            && group.open
-        {
+        let chrome = self.take_explore_chrome();
+        if let Some(group) = self.open_verb_group_mut() {
+            absorb_explore_chrome(group, chrome);
             group.add(verb, detail);
             self.bump_transcript();
             return;
         }
+        self.freeze_verb_group();
         self.flush_table();
-        self.transcript
-            .push(TranscriptEntry::Activity(ActivityBlock::verb_group(
-                verb, detail,
-            )));
+        let mut block = ActivityBlock::verb_group(verb, detail);
+        if let Some(group) = block.as_verb_group_mut() {
+            absorb_explore_chrome(group, chrome);
+        }
+        self.transcript.push(TranscriptEntry::Activity(block));
         self.bump_transcript();
         self.cap_transcript();
+    }
+
+    /// Steal trailing CoT and short steering lines so they live inside the
+    /// explore row instead of sitting above it.
+    fn take_explore_chrome(&mut self) -> ExploreChrome {
+        let mut steal: Vec<usize> = Vec::new();
+        for i in (0..self.transcript.len()).rev() {
+            match &self.transcript[i] {
+                TranscriptEntry::Reasoning { .. } => steal.push(i),
+                TranscriptEntry::Line(_) => continue,
+                TranscriptEntry::Assistant(line) if is_steering_assistant_line(line) => {
+                    steal.push(i);
+                }
+                TranscriptEntry::Assistant(_) => {
+                    if let Some(&reason_at) = steal
+                        .iter()
+                        .find(|&&j| matches!(self.transcript[j], TranscriptEntry::Reasoning { .. }))
+                    {
+                        steal.retain(|&j| j >= reason_at);
+                    } else {
+                        steal.clear();
+                    }
+                    break;
+                }
+                TranscriptEntry::Activity(_)
+                | TranscriptEntry::UserPrompt { .. }
+                | TranscriptEntry::ChangedFiles { .. }
+                | TranscriptEntry::Btw { .. }
+                | TranscriptEntry::Workflow { .. }
+                | TranscriptEntry::ToolOutput { .. } => break,
+            }
+        }
+        steal.sort_unstable();
+        let mut chrome = ExploreChrome::default();
+        for i in steal.into_iter().rev() {
+            match self.transcript.remove(i) {
+                TranscriptEntry::Reasoning { text, elapsed } => {
+                    if chrome.thinking.is_empty() {
+                        chrome.thinking = text;
+                    } else {
+                        chrome.thinking = format!("{text}\n{}", chrome.thinking);
+                    }
+                    chrome.thinking_elapsed = chrome.thinking_elapsed.saturating_add(elapsed);
+                }
+                TranscriptEntry::Assistant(line) => {
+                    let text = crate::render::line_text(&line);
+                    if !text.trim().is_empty() {
+                        chrome.steering.insert(0, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        chrome
     }
 
     fn note_explore_result(&mut self, verb: ExploreVerb, detail: Option<String>, result: &str) {
@@ -1346,10 +1562,7 @@ impl crate::App {
         } else {
             result.lines().count() as u32
         };
-        if let Some(TranscriptEntry::Activity(block)) = self.transcript.last_mut()
-            && let Some(group) = block.as_verb_group_mut()
-            && group.open
-        {
+        if let Some(group) = self.open_verb_group_mut() {
             group.lines = group.lines.saturating_add(n);
             if n > 0 {
                 group.all_empty = false;
@@ -1374,24 +1587,262 @@ impl crate::App {
         self.cap_transcript();
     }
 
-    fn note_idle_bash_poll(&mut self, id: &str) {
+    fn apply_run_result(&mut self, command: &str, display: &str, live: bool) {
         self.freeze_verb_group();
+        let chunk = strip_bg_status_lines(display);
+        if live {
+            if !self.run_streamed_this_call && !chunk.trim().is_empty() {
+                self.append_run_output_for(command, &chunk);
+            }
+            self.touch_idle_run(command);
+            return;
+        }
         if let Some(TranscriptEntry::Activity(block)) = self.transcript.last_mut()
-            && let Some((command, idle, poll_count)) = block.as_run_mut()
-            && *idle
-            && command == id
+            && let Some((existing, dest, idle, _)) = block.as_run_mut()
+            && (existing == command || *idle)
         {
-            *poll_count = poll_count.saturating_add(1);
+            if !self.run_streamed_this_call {
+                dest.clear();
+                dest.push_str(&chunk);
+            }
+            *idle = false;
             self.bump_transcript();
             return;
         }
         self.push_activity(ActivityKind::Run {
-            command: id.to_string(),
+            command: command.to_string(),
+            body: chunk,
+            idle: false,
+            poll_count: 0,
+        });
+    }
+
+    fn append_live_run_output(&mut self, line: &str) -> bool {
+        for entry in self.transcript.iter_mut().rev() {
+            if let TranscriptEntry::Activity(block) = entry
+                && let Some((_, body, idle, _)) = block.as_run_mut()
+                && *idle
+            {
+                append_capped_run_body(body, line);
+                self.bump_transcript();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn append_run_output_for(&mut self, command: &str, chunk: &str) {
+        for entry in self.transcript.iter_mut().rev() {
+            if let TranscriptEntry::Activity(block) = entry
+                && let Some((existing, body, idle, _)) = block.as_run_mut()
+                && (existing == command || *idle)
+            {
+                append_capped_run_body(body, chunk);
+                *idle = true;
+                self.bump_transcript();
+                return;
+            }
+        }
+        let mut body = String::new();
+        append_capped_run_body(&mut body, chunk);
+        self.push_activity(ActivityKind::Run {
+            command: command.to_string(),
+            body,
+            idle: true,
+            poll_count: 0,
+        });
+    }
+
+    fn idle_run_count_and_match(&self, command: &str) -> (usize, bool) {
+        let mut count = 0;
+        let mut matching = false;
+        for entry in &self.transcript {
+            if let TranscriptEntry::Activity(block) = entry
+                && let ActivityKind::Run {
+                    command: existing,
+                    idle: true,
+                    ..
+                } = &block.kind
+            {
+                count += 1;
+                if existing == command {
+                    matching = true;
+                }
+            }
+        }
+        (count, matching)
+    }
+
+    fn touch_idle_run(&mut self, command: &str) {
+        let (count, matching) = self.idle_run_count_and_match(command);
+        if matching || count == 1 {
+            for entry in self.transcript.iter_mut().rev() {
+                if let TranscriptEntry::Activity(block) = entry
+                    && let Some((existing, _, idle, poll_count)) = block.as_run_mut()
+                    && *idle
+                    && (existing == command || count == 1)
+                {
+                    *poll_count = poll_count.saturating_add(1);
+                    self.bump_transcript();
+                    return;
+                }
+            }
+        }
+        self.push_activity(ActivityKind::Run {
+            command: command.to_string(),
             body: String::new(),
             idle: true,
             poll_count: 1,
         });
     }
+
+    fn note_idle_bash_poll(&mut self, id: &str) {
+        self.freeze_verb_group();
+        self.touch_idle_run(id);
+    }
+
+    fn pop_idle_run(&mut self, command: &str) {
+        let drop_last = matches!(
+            self.transcript.last(),
+            Some(TranscriptEntry::Activity(block))
+                if matches!(
+                    &block.kind,
+                    ActivityKind::Run {
+                        command: existing,
+                        idle: true,
+                        ..
+                    } if existing == command
+                )
+        );
+        if drop_last {
+            self.transcript.pop();
+            self.bump_transcript();
+        }
+    }
+
+    fn ensure_run_placeholder(&mut self, command: &str) {
+        let (count, matching) = self.idle_run_count_and_match(command);
+        if matching || count == 1 {
+            return;
+        }
+        self.push_activity(ActivityKind::Run {
+            command: command.to_string(),
+            body: String::new(),
+            idle: true,
+            poll_count: 0,
+        });
+    }
+}
+
+fn last_entry_is_blank(transcript: &[TranscriptEntry]) -> bool {
+    match transcript.last() {
+        None => true,
+        Some(TranscriptEntry::Assistant(line) | TranscriptEntry::Line(line)) => {
+            crate::render::line_text(line).trim().is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn last_entry_is_list(transcript: &[TranscriptEntry]) -> bool {
+    match transcript.last() {
+        Some(TranscriptEntry::Assistant(line)) => {
+            crate::render::is_markdown_list_line(&crate::render::line_text(line))
+        }
+        _ => false,
+    }
+}
+
+const STEERING_MAX_CHARS: usize = 140;
+
+/// Short “let me look…” chrome, not a real answer (heading / list / document).
+fn is_steering_assistant_line(line: &Line<'_>) -> bool {
+    let text = crate::render::line_text(line);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.chars().count() > STEERING_MAX_CHARS {
+        return false;
+    }
+    if crate::render::line_looks_like_heading(line) {
+        return false;
+    }
+    if trimmed.starts_with('▏') || trimmed.starts_with('─') || trimmed.contains('│') {
+        return false;
+    }
+    if crate::render::is_markdown_list_line(&text) {
+        return false;
+    }
+    true
+}
+
+#[derive(Default)]
+struct ExploreChrome {
+    thinking: String,
+    thinking_elapsed: Duration,
+    steering: Vec<String>,
+}
+
+fn absorb_explore_chrome(group: &mut crate::activity_feed::VerbGroup, chrome: ExploreChrome) {
+    if !chrome.thinking.trim().is_empty() {
+        if !group.thinking.is_empty() {
+            group.thinking.push('\n');
+        }
+        group.thinking.push_str(&chrome.thinking);
+        group.thinking_elapsed = group
+            .thinking_elapsed
+            .saturating_add(chrome.thinking_elapsed);
+    }
+    group.steering.extend(chrome.steering);
+}
+
+fn bash_process_live(result: &str) -> bool {
+    result.lines().next().is_some_and(|status| {
+        status.contains("still running")
+            || status.contains("continued as")
+            || (status.starts_with("Started ") && status.contains('('))
+    })
+}
+
+fn strip_bg_status_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with('[')
+                && trimmed.ends_with(']')
+                && (trimmed.contains("still running")
+                    || trimmed.contains("exited")
+                    || trimmed.contains("stopped")
+                    || trimmed.contains(": failed")))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const LIVE_RUN_BODY_MAX: usize = 64 * 1024;
+
+fn append_capped_run_body(body: &mut String, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    if !body.is_empty() && !body.ends_with('\n') && !chunk.starts_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(chunk);
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    if body.len() <= LIVE_RUN_BODY_MAX {
+        return;
+    }
+    let overflow = body.len() - LIVE_RUN_BODY_MAX;
+    let cut = body[overflow..]
+        .find('\n')
+        .map(|i| overflow + i + 1)
+        .unwrap_or(overflow)
+        .min(body.len());
+    body.replace_range(..cut, "");
 }
 
 fn bash_output_is_idle(result: &str) -> bool {

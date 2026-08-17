@@ -77,19 +77,22 @@ fn find_partial_prefix_start(text: &str, from: usize) -> usize {
     }
 }
 
-/// A streaming filter that combines two text-cleaning passes for local models:
+/// A streaming filter that combines text-cleaning passes for local / gateway
+/// models:
 ///
 /// 1. **Special-token stripping**: removes ChatML special tokens (`<|im_start|>`,
 ///    `<|im_end|>`, …) that some local models emit as raw text.
-/// 2. **Tool-call JSON suppression**: when the model emits tool calls as text
+/// 2. **In-band thinking**: routes `<thinking>…</thinking>` / `<think>…</think>`
+///    to [`StreamEvent::Reasoning`] so the TUI collapsed-thought row owns them
+///    instead of dumping the tags as assistant prose.
+/// 3. **Tool-call JSON suppression**: when the model emits tool calls as text
 ///    content (`{"name": "bash", …}`), suppresses the raw JSON from the live
 ///    display. The post-collection `parse_text_tool_calls` promotes it to real
 ///    `ToolCall` blocks; this filter only hides it while streaming so the user
 ///    doesn't see a screen full of JSON.
 ///
-/// Text flows through both passes: raw → special-token strip → tool-call
-/// suppression → sink. Combining them into one struct avoids the borrow-conflict
-/// of chaining two `&mut dyn FnMut` filters.
+/// Combining them into one struct avoids the borrow-conflict of chaining two
+/// `&mut dyn FnMut` filters.
 struct StreamingTextFilter<'a> {
     inner: &'a mut (dyn FnMut(StreamEvent) + Send),
     dsml_enabled: bool,
@@ -130,6 +133,7 @@ struct StreamingTextFilter<'a> {
     bracket_tool_suppression_active: bool,
     dsml_pending: String,
     dsml_suppression_active: bool,
+    think: super::thinking_tags::InlineThinkingSplitter,
 }
 
 impl<'a> StreamingTextFilter<'a> {
@@ -151,6 +155,7 @@ impl<'a> StreamingTextFilter<'a> {
             bracket_tool_suppression_active: false,
             dsml_pending: String::new(),
             dsml_suppression_active: false,
+            think: super::thinking_tags::InlineThinkingSplitter::new(),
         }
     }
 
@@ -175,8 +180,24 @@ impl<'a> StreamingTextFilter<'a> {
             cleaned
         };
         if !cleaned.is_empty() {
-            self.suppress_tool_calls(&cleaned);
+            self.feed_after_thinking(&cleaned);
         }
+    }
+
+    fn feed_after_thinking(&mut self, chunk: &str) {
+        for piece in self.think.push(chunk) {
+            match piece {
+                super::thinking_tags::Piece::Text(text) => self.suppress_tool_calls(&text),
+                super::thinking_tags::Piece::Reasoning(text) => self.emit_reasoning(text),
+            }
+        }
+    }
+
+    fn emit_reasoning(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        (self.inner)(StreamEvent::Reasoning(text));
     }
 
     fn suppress_dsml(&mut self, chunk: &str) -> String {
@@ -525,7 +546,7 @@ impl<'a> StreamingTextFilter<'a> {
             } else {
                 st
             };
-            self.suppress_tool_calls(&st);
+            self.feed_after_thinking(&st);
         }
         // `dsml_pending` is either an incomplete native marker or the body of
         // an unterminated call. Drop it rather than exposing protocol markup
@@ -537,6 +558,12 @@ impl<'a> StreamingTextFilter<'a> {
         if self.leading_open_brace_pending {
             self.leading_open_brace_pending = false;
             self.emit_text("{".to_string());
+        }
+        for piece in self.think.finish() {
+            match piece {
+                super::thinking_tags::Piece::Text(text) => self.suppress_tool_calls(&text),
+                super::thinking_tags::Piece::Reasoning(text) => self.emit_reasoning(text),
+            }
         }
         // Flush tool-call buffer — might be a partial tool call that never
         // completed (e.g. truncated output). Flush as text so the user sees it.
@@ -1011,14 +1038,24 @@ where
 
     // Strip special tokens from the accumulated text so recorded history stays
     // clean. The streaming filter already removed them from the live display,
-    // but the `text` accumulator holds the raw content.
+    // but the `text` accumulator holds the raw content. In-band `<thinking>` /
+    // `<think>` wrappers become a Thinking block so they are not replayed as
+    // visible assistant text (and so the model is less likely to keep copying
+    // the tags).
+    let text = strip_text_tool_protocol_artifact(&strip_special_tokens(&text));
+    let (inline_reasoning, text) = super::thinking_tags::split_inline_thinking(&text);
+    if !inline_reasoning.is_empty() {
+        if !reasoning.is_empty() && !reasoning.ends_with('\n') {
+            reasoning.push('\n');
+        }
+        reasoning.push_str(&inline_reasoning);
+    }
     if !reasoning.is_empty() {
         completion.content.push(Content::Thinking {
             text: reasoning,
             signature: None,
         });
     }
-    let text = strip_text_tool_protocol_artifact(&strip_special_tokens(&text));
     let mut text_tool_calls = false;
     if dsml_enabled && tool_calls.is_empty() {
         if let Some(dsml_content) = super::deepseek::parse_dsml_tool_calls(&text, &dsml_id_prefix) {
@@ -1658,6 +1695,60 @@ mod tests {
         assert!(matches!(
             completion.content.get(1),
             Some(Content::Text(text)) if text == "done"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inline_thinking_tags_are_reasoning_not_visible_text() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"<thinking>\nLet me read the architecture doc.\n</thinking>\n"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"Let me look at the turn loop."},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut seen_text = String::new();
+        let mut seen_reasoning = String::new();
+        let mut sink = |event: StreamEvent| match event {
+            StreamEvent::Text(text) => seen_text.push_str(&text),
+            StreamEvent::Reasoning(text) => seen_reasoning.push_str(&text),
+            _ => {}
+        };
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        assert!(
+            !seen_text.contains("<thinking>") && !seen_text.contains("</thinking>"),
+            "streamed text leaked thinking tags: {seen_text:?}"
+        );
+        assert_eq!(seen_text.trim(), "Let me look at the turn loop.");
+        assert!(
+            seen_reasoning.contains("Let me read the architecture doc."),
+            "in-band thinking should stream as reasoning: {seen_reasoning:?}"
+        );
+        assert!(matches!(
+            completion.content.first(),
+            Some(Content::Thinking { text, .. }) if text.contains("Let me read the architecture doc.")
+        ));
+        assert!(matches!(
+            completion.content.get(1),
+            Some(Content::Text(text)) if text == "Let me look at the turn loop."
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fragmented_thinking_open_tag_does_not_leak() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"<thin"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"king>\nplan\n</think"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"ing>\nvisible"},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut seen_text = String::new();
+        let mut sink = |event: StreamEvent| {
+            if let StreamEvent::Text(text) = event {
+                seen_text.push_str(&text);
+            }
+        };
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        assert_eq!(seen_text.trim(), "visible");
+        assert!(matches!(
+            completion.content.first(),
+            Some(Content::Thinking { text, .. }) if text.contains("plan")
         ));
     }
 

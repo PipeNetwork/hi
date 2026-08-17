@@ -220,6 +220,15 @@ pub(crate) fn acquire(
     class: ResourceClass,
     timeout: Duration,
 ) -> Result<ResourceLease> {
+    acquire_while(state_root, class, timeout, &|| false)
+}
+
+pub(crate) fn acquire_while(
+    state_root: &Path,
+    class: ResourceClass,
+    timeout: Duration,
+    stop: &dyn Fn() -> bool,
+) -> Result<ResourceLease> {
     let configured = capacity_for(class).min(aggregate_capacity());
     let limit = configured
         .saturating_sub(adaptive_penalty(state_root, class))
@@ -231,6 +240,9 @@ pub(crate) fn acquire(
     let mut waiter = WaiterGuard(queue_path);
     let started = Instant::now();
     loop {
+        if stop() {
+            bail!("cancelled waiting for shared {} capacity", class.as_str());
+        }
         if !waiter_is_eligible(&lease_root, class, &waiter.0, limit)? {
             report_wait(class, started, "queued behind earlier work");
             if started.elapsed() >= timeout {

@@ -230,12 +230,14 @@ pub struct MediaFeatures {
     pub audio_token_id: u32,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 impl MediaFeatures {
     pub fn is_empty(&self) -> bool {
         self.pixel_values.is_none() && self.audio_ids.is_none()
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 pub trait CausalLm {
     fn forward(&mut self, input_ids: &[u32]) -> Result<mlx_rs::Array>;
     fn reset_cache(&mut self);

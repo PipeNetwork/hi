@@ -405,14 +405,13 @@ impl RemoteSessionSink {
         if lock_recover(&self.title).is_some() {
             return;
         }
-        let title = messages
-            .iter()
-            .find(|message| message.role == Role::User)
-            .map(|message| {
-                let text = message.text();
-                let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                hi_agent::ui::clip(&title, 120)
-            });
+        let title = messages.iter().find_map(|message| {
+            if message.role != Role::User {
+                return None;
+            }
+            let title = hi_agent::ui::user_prompt_title(&message.text(), 72);
+            (!title.is_empty()).then_some(title)
+        });
         self.set_title(title);
     }
 

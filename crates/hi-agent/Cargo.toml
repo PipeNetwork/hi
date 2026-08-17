@@ -26,6 +26,10 @@ sha2.workspace = true
 [dev-dependencies]
 async-trait = { workspace = true }
 
+[features]
+default = []
+codebase-graph = ["hi-tools/codebase-graph"]
+
 
 [lints.rust]
 # Test-only unsafe: env set_var/remove_var guards in test helpers.

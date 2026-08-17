@@ -1,11 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::candidate_gate::{inspect_child_report, parse_name_status, staged_candidate_diff};
-use crate::candidate_merge::apply_candidate_and_reverify;
+use crate::candidate_gate::{
+    independently_verify_candidate_cached, inspect_child_report, is_destination_verify_cancelled,
+    is_verifier_cancelled, parse_name_status, staged_candidate_diff,
+};
+use crate::candidate_merge::{
+    apply_candidate_and_reverify, apply_candidate_and_reverify_cancellable,
+};
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -239,6 +245,117 @@ fn verifier_mutation_is_unstable_and_rolls_back() {
     assert_eq!(
         std::fs::read_to_string(root.join("value.txt")).unwrap(),
         "before\n"
+    );
+
+    hi_tools::worktree::cleanup(&root, &[worktree]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn independently_verify_candidate_cached_cancel_skips_cache() {
+    let original_sandbox = std::env::var_os("HI_SANDBOX");
+    unsafe { std::env::set_var("HI_SANDBOX", "off") };
+    let (root, worktree) = candidate_fixture("verify-cache-cancel");
+    std::fs::write(worktree.join("value.txt"), "after\n").unwrap();
+    let cache = root.join(".hi-test-verify-cache");
+    let cancel = hi_agent::TurnCancellation::new();
+    let cancel_thread = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        cancel_thread.cancel();
+    });
+    let started = Instant::now();
+    let error =
+        independently_verify_candidate_cached(&worktree, "HEAD", "sleep 30", &cache, Some(cancel))
+            .expect_err("cancel must stop independent verify");
+    let elapsed = started.elapsed();
+    match original_sandbox {
+        Some(value) => unsafe { std::env::set_var("HI_SANDBOX", value) },
+        None => unsafe { std::env::remove_var("HI_SANDBOX") },
+    }
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "cancel must kill the verifier instead of waiting: {elapsed:?}"
+    );
+    assert!(
+        is_verifier_cancelled(&error),
+        "cancel must be distinct from a generic verify fail: {error:#}"
+    );
+    let rendered = format!("{error:#}");
+    assert!(
+        !rendered.contains("configured verifier"),
+        "cancel must not be wrapped as a verify failure: {rendered}"
+    );
+    let wrote_cache = std::fs::read_dir(&cache)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        })
+        .unwrap_or(false);
+    assert!(
+        !wrote_cache,
+        "cancelled verify must not write a cache record"
+    );
+
+    hi_tools::worktree::cleanup(&root, &[worktree]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn apply_candidate_and_reverify_cancel_rolls_back_destination() {
+    let original_sandbox = std::env::var_os("HI_SANDBOX");
+    unsafe { std::env::set_var("HI_SANDBOX", "off") };
+    let (root, worktree) = candidate_fixture("apply-verify-cancel");
+    std::fs::write(worktree.join("value.txt"), "after\n").unwrap();
+    let dest_value = root.join("value.txt");
+    let cancel = hi_agent::TurnCancellation::new();
+    let cancel_thread = cancel.clone();
+    let watch = dest_value.clone();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            if std::fs::read_to_string(&watch).ok().as_deref() == Some("after\n") {
+                std::thread::sleep(Duration::from_millis(50));
+                cancel_thread.cancel();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cancel_thread.cancel();
+    });
+    let started = Instant::now();
+    let error = apply_candidate_and_reverify_cancellable(
+        &worktree,
+        "HEAD",
+        &root,
+        &root.join(".hi-test-state"),
+        "sleep 30",
+        Some(cancel),
+    )
+    .expect_err("cancel during destination verify must reject the candidate");
+    let elapsed = started.elapsed();
+    match original_sandbox {
+        Some(value) => unsafe { std::env::set_var("HI_SANDBOX", value) },
+        None => unsafe { std::env::remove_var("HI_SANDBOX") },
+    }
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "cancel must kill destination verify instead of waiting: {elapsed:?}"
+    );
+    assert!(
+        is_destination_verify_cancelled(&error),
+        "cancel after apply must be distinct from a generic verify fail: {error:#}"
+    );
+    let rendered = format!("{error:#}");
+    assert!(
+        !rendered.contains("destination verification `sleep 30` failed"),
+        "cancel must not be wrapped as a verify failure: {rendered}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dest_value).unwrap(),
+        "before\n",
+        "destination must be rolled back after cancel during verify"
     );
 
     hi_tools::worktree::cleanup(&root, &[worktree]);

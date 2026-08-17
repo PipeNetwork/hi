@@ -167,8 +167,9 @@ pub(crate) fn flash_weight(elapsed_ms: u128) -> f32 {
     1.0 - elapsed_ms as f32 / FLASH_MS as f32
 }
 
-/// The style for code — inline spans and fenced blocks.
-fn code_style() -> Style {
+/// The style for inline code — one quiet cyan, matching grok-build. Paths in
+/// activity rows still use `theme.path`; fenced blocks use syntax colors.
+fn inline_code_style(_content: &str) -> Style {
     Style::default().fg(theme().code)
 }
 
@@ -665,12 +666,21 @@ pub(crate) fn markdown_line(text: &str, code_lang: &mut Option<String>) -> Line<
         return Line::styled("─".repeat(40), dim());
     }
 
-    // Headings: # … ###### → bold, markers stripped.
-    if let Some(rest) = heading_text(trimmed) {
-        return Line::from(inline_spans(
-            rest,
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+    // Headings: # … ###### → bold, markers stripped. H1/H2 stay primary so
+    // they scan; H3+ drop to a quieter gray. Levels share a size in a
+    // terminal, so color + a blank row (inserted by the committer) is the
+    // hierarchy.
+    if let Some((level, rest)) = markdown_heading(trimmed) {
+        let style = if level <= 2 {
+            Style::default()
+                .fg(theme().text_primary)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme().gray_bright)
+                .add_modifier(Modifier::BOLD)
+        };
+        return Line::from(inline_spans(rest, style));
     }
 
     // Blockquote.
@@ -913,13 +923,88 @@ fn is_hr(s: &str) -> bool {
     s.len() >= 3 && ['-', '*', '_'].iter().any(|&m| s.chars().all(|c| c == m))
 }
 
-/// Strip a leading `#`..`###### `, returning the heading text.
-fn heading_text(s: &str) -> Option<&str> {
+/// ATX heading `#`..`###### ` → (level, title). Markers must be followed by a
+/// space so `#include` and similar identifiers stay prose.
+pub(crate) fn markdown_heading(s: &str) -> Option<(u8, &str)> {
     let hashes = s.len() - s.trim_start_matches('#').len();
     if (1..=6).contains(&hashes) {
-        return s[hashes..].strip_prefix(' ').map(str::trim_end);
+        return s[hashes..]
+            .strip_prefix(' ')
+            .map(|rest| (hashes as u8, rest.trim_end()));
     }
     None
+}
+
+/// Whether a rendered assistant line was committed as an ATX heading.
+pub(crate) fn line_looks_like_heading(line: &Line<'_>) -> bool {
+    let th = theme();
+    line.spans.iter().any(|span| {
+        !span.content.is_empty()
+            && span.style.add_modifier.contains(Modifier::BOLD)
+            && matches!(span.style.fg, Some(fg) if fg == th.text_primary || fg == th.gray_bright)
+    })
+}
+
+/// Source or already-rendered list item (`- item`, `1. item`, or `• item`).
+pub(crate) fn is_markdown_list_line(s: &str) -> bool {
+    let t = s.trim_start();
+    task_item(t).is_some()
+        || bullet_text(t).is_some()
+        || numbered_text(t).is_some()
+        || t.starts_with("• ")
+        || t.starts_with("☑ ")
+        || t.starts_with("☐ ")
+}
+
+/// Blank row before a heading, or before a list that follows prose.
+pub(crate) fn markdown_needs_leading_blank(
+    trimmed: &str,
+    last_is_blank: bool,
+    last_is_list: bool,
+) -> bool {
+    if last_is_blank {
+        return false;
+    }
+    markdown_heading(trimmed).is_some() || (is_markdown_list_line(trimmed) && !last_is_list)
+}
+
+/// Render markdown source into styled lines, inserting a blank row before
+/// headings so section titles can be scanned in a monospaced transcript.
+pub(crate) fn markdown_body_lines(text: &str) -> Vec<Line<'static>> {
+    let mut lang = None;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let in_fence = lang.is_some();
+        let trimmed = line.trim_start();
+        if !in_fence
+            && line.trim().is_empty()
+            && lines.last().is_some_and(|l| line_text(l).trim().is_empty())
+        {
+            continue;
+        }
+        if !in_fence && !trimmed.starts_with("```") {
+            let last_blank = lines.last().is_none_or(|l| line_text(l).trim().is_empty());
+            let last_list = lines
+                .last()
+                .is_some_and(|l| is_markdown_list_line(&line_text(l)));
+            if markdown_needs_leading_blank(trimmed, last_blank, last_list) {
+                lines.push(Line::raw(""));
+            }
+        }
+        let heading_level = if !in_fence && !trimmed.starts_with("```") {
+            markdown_heading(trimmed).map(|(level, _)| level)
+        } else {
+            None
+        };
+        lines.push(markdown_line(line, &mut lang));
+        if heading_level.is_some() {
+            lines.push(Line::raw(""));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::raw(""));
+    }
+    lines
 }
 
 /// Strip a leading `- `, `* `, or `+ ` bullet marker.
@@ -956,7 +1041,8 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
             && let Some(close) = find_char(&chars, i + 1, '`')
         {
             flush_plain(&mut spans, &mut plain, base);
-            spans.push(Span::styled(slice(&chars, i + 1, close), code_style()));
+            let code = slice(&chars, i + 1, close);
+            spans.push(Span::styled(code.clone(), inline_code_style(&code)));
             i = close + 1;
             continue;
         }
@@ -1172,6 +1258,20 @@ mod tests {
             "heading markers stripped"
         );
         assert!(span_has(&h, "visited", Modifier::BOLD), "heading is bold");
+        assert!(
+            h.spans.iter().any(|s| s.content.contains("visited")
+                && s.style.fg == Some(crate::theme::theme().gray_bright)),
+            "H4 is quieter than body: {:?}",
+            h.spans
+        );
+        let h1 = markdown_line("# Title", &mut code);
+        assert!(
+            h1.spans.iter().any(|s| s.content.contains("Title")
+                && s.style.fg == Some(crate::theme::theme().text_primary)
+                && s.style.add_modifier.contains(Modifier::BOLD)),
+            "H1 stays primary: {:?}",
+            h1.spans
+        );
 
         let b = markdown_line("- Threefold repetition", &mut code);
         assert_eq!(line_text(&b), "• Threefold repetition", "bullet rewritten");
@@ -1180,6 +1280,23 @@ mod tests {
         assert_eq!(line_text(&n), "7. parse_move accepts", "numbered list kept");
 
         assert_eq!(line_text(&markdown_line("---", &mut code)), "─".repeat(40));
+    }
+
+    #[test]
+    fn markdown_body_lines_inserts_a_blank_before_headings() {
+        let lines = markdown_body_lines("intro\n## Section\nbody");
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts, vec!["intro", "", "Section", "", "body"]);
+        let already_spaced = markdown_body_lines("intro\n\n## Section");
+        let texts: Vec<String> = already_spaced.iter().map(line_text).collect();
+        assert_eq!(texts, vec!["intro", "", "Section", ""]);
+    }
+
+    #[test]
+    fn markdown_body_lines_spaces_h1_and_lists() {
+        let lines = markdown_body_lines("intro\n# Title\nbody\n- item");
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts, vec!["intro", "", "Title", "", "body", "", "• item"]);
     }
 
     #[test]
@@ -1216,7 +1333,17 @@ mod tests {
             line.spans
                 .iter()
                 .any(|s| s.content == "Vec" && s.style.fg == Some(crate::theme::theme().code)),
-            "`code` styled"
+            "`code` identifiers use the code accent: {:?}",
+            line.spans
+        );
+        let path = markdown_line("see `crates/hi-tui/src/render.rs`", &mut code);
+        assert!(
+            path.spans
+                .iter()
+                .any(|s| s.content.contains("crates/")
+                    && s.style.fg == Some(crate::theme::theme().code)),
+            "inline paths share the code accent: {:?}",
+            path.spans
         );
         // A bare underscore in an identifier must not start italics.
         let id = markdown_line("call is_empty here", &mut code);

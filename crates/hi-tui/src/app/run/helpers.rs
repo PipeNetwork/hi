@@ -14,98 +14,7 @@ use tokio::sync::mpsc;
 use crate::App;
 use crate::render::dim;
 
-/// Expand `@file` mentions in `prompt`: for each `@path` token (a path
-/// relative to `root` that exists and is a file), append the file's contents
-/// to the prompt under a labeled fenced block. This injects the file into
-/// context without a separate `read` tool call. The original `@path` tokens
-/// remain in the user-visible text. Files over 8 KiB are noted as "too large"
-/// rather than dumped, and missing files are noted as "not found". `@@` is
-/// treated as a literal `@`, not a mention.
-pub(super) fn expand_file_mentions(prompt: &str, root: &std::path::Path) -> String {
-    const MAX_FILE_BYTES: usize = 8 * 1024;
-    let mut additions: Vec<String> = Vec::new();
-    let mut chars = prompt.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '@' {
-            continue;
-        }
-        // `@@` is a literal `@`, not a mention.
-        if chars.peek() == Some(&'@') {
-            chars.next();
-            continue;
-        }
-        // Collect the path token: chars until whitespace or end.
-        let mut path = String::new();
-        while let Some(&pc) = chars.peek() {
-            if pc.is_whitespace() {
-                break;
-            }
-            path.push(pc);
-            chars.next();
-        }
-        if path.is_empty() {
-            continue;
-        }
-        let candidate = std::path::Path::new(&path);
-        let full = root.join(candidate);
-        if candidate.is_absolute()
-            || candidate
-                .components()
-                .any(|component| component == std::path::Component::ParentDir)
-        {
-            additions.push(format!(
-                "\n\n<file mention=\"{path}\">\noutside workspace\n</file>"
-            ));
-            continue;
-        }
-        if !full.is_file() {
-            additions.push(format!("\n\n<file mention=\"{path}\">\nnot found\n</file>"));
-            continue;
-        }
-        let contained = root
-            .canonicalize()
-            .ok()
-            .zip(full.canonicalize().ok())
-            .is_some_and(|(root, full)| full.starts_with(root));
-        if !contained {
-            additions.push(format!(
-                "\n\n<file mention=\"{path}\">\noutside workspace\n</file>"
-            ));
-            continue;
-        }
-        match std::fs::metadata(&full) {
-            Ok(meta) if (meta.len() as usize) > MAX_FILE_BYTES => {
-                additions.push(format!(
-                    "\n\n<file mention=\"{path}\">\ntoo large ({} bytes; limit {})\n</file>",
-                    meta.len(),
-                    MAX_FILE_BYTES
-                ));
-            }
-            Ok(_) => match std::fs::read_to_string(&full) {
-                Ok(contents) => {
-                    additions.push(format!(
-                        "\n\n<file mention=\"{path}\">\n{contents}\n</file>"
-                    ));
-                }
-                Err(err) => {
-                    additions.push(format!(
-                        "\n\n<file mention=\"{path}\">\nread error: {err}\n</file>"
-                    ));
-                }
-            },
-            Err(err) => {
-                additions.push(format!(
-                    "\n\n<file mention=\"{path}\">\nread error: {err}\n</file>"
-                ));
-            }
-        }
-    }
-    if additions.is_empty() {
-        prompt.to_string()
-    } else {
-        format!("{prompt}{}", additions.join(""))
-    }
-}
+pub(super) use crate::file_mentions::expand_file_mentions;
 
 /// Handle a key in vim-style normal mode (Esc on empty input). Modal
 /// scroll/search/copy without leaving the keyboard. `i`, `q`, or Esc returns
@@ -201,11 +110,20 @@ pub(super) enum ChordPipeline {
     PaletteAccept(String),
     /// `/tasks` overlay asked to cancel a background subagent.
     KillTask(String),
+    /// Shift-Tab: cycle ask / plan / always-approve.
+    CycleSessionMode,
+    PlanApprove,
+    PlanRequestChanges,
+    PlanQuit,
 }
 
 pub(super) fn run_chord_pipeline(app: &mut App, key: &KeyEvent) -> Option<ChordPipeline> {
     use crate::dispatch::DispatchResult;
     use crate::domain::OverlayDomain;
+
+    if crate::session_face::is_cycle_key(key) && crate::session_face::cycle_allowed(app) {
+        return Some(ChordPipeline::CycleSessionMode);
+    }
 
     if let Some(tutorial) = app.tutorial.as_mut() {
         if crate::tutorial::handle_key(tutorial, key) == crate::tutorial::TutorialOutcome::Close {
@@ -239,6 +157,46 @@ pub(super) fn run_chord_pipeline(app: &mut App, key: &KeyEvent) -> Option<ChordP
                 ChordPipeline::Continue
             }
             crate::subagent_overlay::OverlayOutcome::Kill(id) => ChordPipeline::KillTask(id),
+        });
+    }
+    if app.block_viewer.is_some() {
+        return Some(match crate::block_viewer::handle_key(app, key) {
+            crate::block_viewer::ViewerOutcome::Continue => ChordPipeline::Continue,
+            crate::block_viewer::ViewerOutcome::Close => {
+                app.block_viewer = None;
+                ChordPipeline::Continue
+            }
+        });
+    }
+    if app.jump_picker.is_some() {
+        crate::session_pickers::handle_jump_key(app, key);
+        return Some(ChordPipeline::Continue);
+    }
+    if app.rewind_picker.is_some() {
+        return Some(match crate::session_pickers::handle_rewind_key(app, key) {
+            crate::session_pickers::PickerOutcome::Continue => ChordPipeline::Continue,
+            crate::session_pickers::PickerOutcome::Close => {
+                app.rewind_picker = None;
+                ChordPipeline::Continue
+            }
+            crate::session_pickers::PickerOutcome::Rewind(n) => {
+                app.rewind_picker = None;
+                ChordPipeline::PaletteAccept(format!("/rewind {n}"))
+            }
+        });
+    }
+    if app.memory_browser.is_some() {
+        crate::memory_browser::handle_key(app, key);
+        return Some(ChordPipeline::Continue);
+    }
+    if app.plan_approval_capturing() {
+        return Some(match crate::plan_approval::handle_key(app, key) {
+            crate::plan_approval::PlanApprovalOutcome::Continue => ChordPipeline::Continue,
+            crate::plan_approval::PlanApprovalOutcome::Approve => ChordPipeline::PlanApprove,
+            crate::plan_approval::PlanApprovalOutcome::RequestChanges => {
+                ChordPipeline::PlanRequestChanges
+            }
+            crate::plan_approval::PlanApprovalOutcome::Quit => ChordPipeline::PlanQuit,
         });
     }
     if app.workflow_overlay.is_some() {

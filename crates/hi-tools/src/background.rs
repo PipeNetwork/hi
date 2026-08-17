@@ -401,12 +401,21 @@ impl BackgroundRegistry {
     /// with output already pending (or a terminal process) return immediately
     /// as before.
     pub async fn poll_wait_default(&self, id: &str) -> Result<String> {
+        self.poll_wait_default_streaming(id, &mut |_| {}).await
+    }
+
+    /// [`poll_wait_default`](Self::poll_wait_default) with a live output callback.
+    pub async fn poll_wait_default_streaming(
+        &self,
+        id: &str,
+        on_line: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<String> {
         let empty_polls = {
             let proc = lookup(self, id)?;
             let inner = proc.inner.lock().unwrap();
             inner.empty_polls
         };
-        self.poll_wait(id, default_poll_wait_budget(empty_polls))
+        self.poll_wait_streaming(id, default_poll_wait_budget(empty_polls), on_line)
             .await
     }
 
@@ -416,24 +425,59 @@ impl BackgroundRegistry {
     /// timeout it returns the normal idle status. The wait sleeps on a
     /// notification (no spinning) and holds no locks while parked.
     pub async fn poll_wait(&self, id: &str, wait: std::time::Duration) -> Result<String> {
+        self.poll_wait_streaming(id, wait, &mut |_| {}).await
+    }
+
+    /// [`poll_wait`](Self::poll_wait) that also forwards newly buffered output
+    /// through `on_line` as it arrives, so a UI can paint a live tail during a
+    /// multi-minute wait instead of staying blank until the poll returns.
+    pub async fn poll_wait_streaming(
+        &self,
+        id: &str,
+        wait: std::time::Duration,
+        on_line: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<String> {
         let proc = lookup(self, id)?;
+        let mut streamed = {
+            let inner = proc.inner.lock().unwrap();
+            inner.read_offset
+        };
         let deadline = tokio::time::Instant::now() + wait;
         loop {
-            // Register interest before checking the condition so an append or
-            // exit that lands between the check and the await still wakes us.
             let notified = proc.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
+            let (fresh, done) = {
                 let inner = proc.inner.lock().unwrap();
-                let has_new_output = inner.output.len() > inner.read_offset;
-                if has_new_output || !matches!(inner.state, BgState::Running) {
-                    break;
+                let fresh = if inner.output.len() > streamed {
+                    inner.output[streamed..].to_string()
+                } else {
+                    String::new()
+                };
+                if !fresh.is_empty() {
+                    streamed = inner.output.len();
                 }
+                let done = inner.output.len() > inner.read_offset
+                    || !matches!(inner.state, BgState::Running);
+                (fresh, done)
+            };
+            if !fresh.is_empty() {
+                emit_stream_chunk(on_line, &fresh);
+            }
+            if done {
+                break;
             }
             tokio::select! {
                 () = &mut notified => {}
                 () = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        {
+            let inner = proc.inner.lock().unwrap();
+            if inner.output.len() > streamed {
+                let fresh = inner.output[streamed..].to_string();
+                drop(inner);
+                emit_stream_chunk(on_line, &fresh);
             }
         }
         poll_from(self, id)
@@ -596,6 +640,15 @@ impl BackgroundRegistry {
 
     pub fn kill_started_after(&self, before: &[String]) -> usize {
         kill_started_after_from(self, before)
+    }
+}
+
+fn emit_stream_chunk(on_line: &mut dyn FnMut(&str), chunk: &str) {
+    for piece in chunk.split_inclusive('\n') {
+        let line = piece.trim_end_matches(['\n', '\r']);
+        if !line.is_empty() {
+            on_line(line);
+        }
     }
 }
 
@@ -1450,6 +1503,31 @@ mod tests {
             started.elapsed() < Duration::from_secs(8),
             "must wake on output, not sleep out the full wait: {:?}",
             started.elapsed()
+        );
+        registry.kill(&id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn poll_wait_streaming_emits_output_before_return() {
+        let _guard = TEST_LOCK.lock().await;
+        let registry = BackgroundRegistry::default();
+        let runner = crate::ProcessRunner::from_current_dir().unwrap();
+        let id = registry
+            .spawn(&runner, "sleep 0.3; echo streamed-line; sleep 600")
+            .unwrap();
+
+        let mut seen = String::new();
+        let out = registry
+            .poll_wait_streaming(&id, Duration::from_secs(10), &mut |line| {
+                seen.push_str(line);
+                seen.push('\n');
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            seen.contains("streamed-line"),
+            "live callback should see output before the poll returns: seen={seen:?} out={out:?}"
         );
         registry.kill(&id).unwrap();
     }
