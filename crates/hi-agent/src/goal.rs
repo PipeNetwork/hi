@@ -842,7 +842,7 @@ impl Goal {
         // the verdict went.
         sg.unjudged_turns = 0;
         sg.attempts += 1;
-        sg.notes.push(note.into());
+        push_clipped_note(sg, &note.into());
         if sg.attempts > max_retries {
             sg.status = GoalStatus::Failed;
             self.status = GoalStatus::Failed;
@@ -867,10 +867,7 @@ impl Goal {
         };
         let sg = &mut self.sub_goals[i];
         sg.unjudged_turns = sg.unjudged_turns.saturating_add(1);
-        let note = note.into();
-        if !sg.notes.contains(&note) {
-            sg.notes.push(note);
-        }
+        push_clipped_note(sg, &note.into());
         sg.unjudged_turns < MAX_UNJUDGED_TURNS
     }
 
@@ -973,10 +970,10 @@ impl Goal {
         let description = self.sub_goals[i].description.clone();
         let sg = &mut self.sub_goals[i];
         sg.status = GoalStatus::Blocked;
-        let note = format!("blocked — missing prerequisite: {prerequisite}");
-        if !sg.notes.contains(&note) {
-            sg.notes.push(note);
-        }
+        push_clipped_note(
+            sg,
+            &format!("blocked — missing prerequisite: {prerequisite}"),
+        );
         self.consecutive_skips = self.consecutive_skips.saturating_add(1);
         self.push_event(
             "block",
@@ -1030,7 +1027,7 @@ impl Goal {
     fn skip_active_inner(&mut self, note: impl Into<String>, stalled: bool) {
         if let Some(i) = self.active_index() {
             self.sub_goals[i].status = GoalStatus::Failed;
-            self.sub_goals[i].notes.push(note.into());
+            push_clipped_note(&mut self.sub_goals[i], &note.into());
             if stalled {
                 self.sub_goals[i].stall_skipped = true;
             }
@@ -1371,7 +1368,10 @@ impl Goal {
         let mut out = String::from(
             "\n\n[Long-horizon goal — work the active step, then advance only after validation]\n",
         );
-        out.push_str(&format!("Objective: {}\n", self.objective));
+        out.push_str(&format!(
+            "Objective: {}\n",
+            clip_chars(&self.objective, MAX_OBJECTIVE_CHARS)
+        ));
         // The full checklist rides in the system prompt every turn; on a long
         // goal (the planner may produce 120 milestones) re-rendering every line
         // is the dominant per-turn token cost — and it busts provider prefix
@@ -1407,7 +1407,7 @@ impl Goal {
                             out.push_str(&format!(
                                 "  ✓ {}. {}\n",
                                 i + 1,
-                                self.sub_goals[i].description
+                                clip_chars(&self.sub_goals[i].description, MAX_STEP_CHARS)
                             ));
                         } else {
                             out.push_str(&format!("  ✓ {}–{} completed\n", i + 1, end));
@@ -1441,11 +1441,15 @@ impl Goal {
                 GoalStatus::Blocked => '⛔',
                 GoalStatus::Pending => '○',
             };
-            out.push_str(&format!("  {glyph} {}. {}\n", i + 1, sg.description));
+            out.push_str(&format!(
+                "  {glyph} {}. {}\n",
+                i + 1,
+                clip_chars(&sg.description, MAX_STEP_CHARS)
+            ));
             if sg.status == GoalStatus::Active && !sg.notes.is_empty() {
                 out.push_str("     prior attempts (don't repeat these):\n");
-                for n in &sg.notes {
-                    out.push_str(&format!("       — {n}\n"));
+                for n in sg.notes.iter().take(MAX_NOTES_IN_PROMPT) {
+                    out.push_str(&format!("       — {}\n", clip_chars(n, MAX_NOTE_CHARS)));
                 }
             }
             i += 1;
@@ -1468,9 +1472,35 @@ fn normalized_description(description: &str) -> Option<String> {
 /// the model tends to resubmit the same plan several times per turn, and one
 /// claim/regression note per step is signal; five are noise.
 pub(crate) fn push_note_deduped(sub_goal: &mut SubGoal, note: &str) {
-    if !sub_goal.notes.iter().any(|n| n == note) {
-        sub_goal.notes.push(note.to_string());
+    push_clipped_note(sub_goal, note);
+}
+
+fn push_clipped_note(sub_goal: &mut SubGoal, note: &str) {
+    let note = clip_chars(note, MAX_NOTE_CHARS);
+    if note.is_empty() {
+        return;
     }
+    if !sub_goal.notes.iter().any(|n| n == &note) {
+        sub_goal.notes.push(note);
+        if sub_goal.notes.len() > MAX_NOTES_PER_STEP {
+            sub_goal.notes.remove(0);
+        }
+    }
+}
+
+const MAX_OBJECTIVE_CHARS: usize = 500;
+const MAX_STEP_CHARS: usize = 200;
+pub(crate) const MAX_NOTE_CHARS: usize = 240;
+const MAX_NOTES_PER_STEP: usize = 6;
+pub(crate) const MAX_NOTES_IN_PROMPT: usize = 4;
+
+pub(crate) fn clip_chars(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{clipped}…")
 }
 
 /// Map a tolerant status string (from the model's `update_plan`) to a `GoalStatus`.
@@ -2008,6 +2038,20 @@ mod tests {
     fn prompt_section_none_for_empty_goal() {
         let g = Goal::new("nothing", vec![]);
         assert!(g.prompt_section().is_none());
+    }
+
+    #[test]
+    fn prompt_section_clips_huge_objective_and_notes() {
+        let mut g = Goal::new("O".repeat(2_000), vec!["S".repeat(800)]);
+        g.record_failure("N".repeat(1_000), 3);
+        let section = g.prompt_section().expect("renders");
+        assert!(
+            section.chars().count() < 3_000,
+            "goal prompt must stay bounded: {}",
+            section.chars().count()
+        );
+        assert!(!section.contains(&"O".repeat(600)), "{section}");
+        assert!(!section.contains(&"N".repeat(400)), "{section}");
     }
 
     #[test]

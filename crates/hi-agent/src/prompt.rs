@@ -55,7 +55,7 @@ impl SystemPrompt {
 
     pub(crate) fn with_project_context(mut self, context: Option<&str>) -> Self {
         self.project_context = context
-            .map(|s| s.trim().to_string())
+            .map(|s| clip_chars(s.trim(), MAX_PROJECT_CONTEXT_CHARS))
             .filter(|s| !s.is_empty());
         self
     }
@@ -90,6 +90,18 @@ impl SystemPrompt {
         }
         Message::system(text)
     }
+}
+
+/// Last-line defense: project context is also clipped at load, but config
+/// can be injected from tests or other frontends.
+const MAX_PROJECT_CONTEXT_CHARS: usize = 16_000;
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{clipped}…")
 }
 
 #[cfg(test)]
@@ -128,6 +140,29 @@ mod tests {
         assert!(
             text.contains("Prefer `edit`") || text.contains("prefer `edit`"),
             "steers edit vs write/patch: {text}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_clips_a_huge_project_guide() {
+        let bomb = "TOKENBOMB ".repeat(5_000);
+        let sys = SystemPrompt::new()
+            .with_project_context(Some(&bomb))
+            .build();
+        let text = sys.text();
+        assert!(
+            text.chars().count() < bomb.chars().count(),
+            "system prompt must not absorb an unbounded HI.md: {}",
+            text.chars().count()
+        );
+        assert!(
+            text.chars().count() <= MAX_PROJECT_CONTEXT_CHARS + 4_000,
+            "clipped guide plus identity must stay bounded: {}",
+            text.chars().count()
+        );
+        assert!(
+            !text.contains(&"TOKENBOMB ".repeat(2_000)),
+            "huge guide must be clipped"
         );
     }
 }

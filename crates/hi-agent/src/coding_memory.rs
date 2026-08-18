@@ -169,8 +169,7 @@ pub(crate) fn merge_facts_into_memory(path: &Path, facts: &[Decision]) -> Result
     if facts.is_empty() {
         return Ok(0);
     }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let body = memory::strip_header(&existing);
+    let body = memory::read_layer(path);
     let mut bullets: Vec<String> = body
         .lines()
         .map(str::trim)

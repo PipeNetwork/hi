@@ -89,7 +89,7 @@ pub fn append_finding(state_root: &Path, finding: &Finding) {
 pub fn render_report(state_root: &Path) -> String {
     let mut out = String::new();
     let learning = state_root.join("learning");
-    if let Ok(raw) = std::fs::read_to_string(learning.join("findings.jsonl")) {
+    if let Some(raw) = read_ledger_capped(&learning.join("findings.jsonl")) {
         let mut by_reason: std::collections::BTreeMap<String, usize> = Default::default();
         let mut total = 0usize;
         for line in raw.lines() {
@@ -111,7 +111,7 @@ pub fn render_report(state_root: &Path) -> String {
             ));
         }
     }
-    if let Ok(raw) = std::fs::read_to_string(learning.join("interventions.jsonl")) {
+    if let Some(raw) = read_ledger_capped(&learning.join("interventions.jsonl")) {
         let mut latest: std::collections::BTreeMap<String, serde_json::Value> = Default::default();
         for line in raw.lines() {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
@@ -150,8 +150,21 @@ pub struct ContextHint {
 /// tell the model so it can adapt (e.g. prefer package-local checks when
 /// verification keeps timing out). Returns None when there is no pattern —
 /// context space is only spent on evidence.
+/// Findings are append-only. Reading the whole file every turn would turn a
+/// long-lived project ledger into a startup/token tax.
+pub(crate) const MAX_LEDGER_READ_BYTES: usize = 64 * 1024;
+
+pub(crate) fn read_ledger_capped(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; MAX_LEDGER_READ_BYTES];
+    let n = file.read(&mut buf).ok()?;
+    buf.truncate(n);
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 pub fn context_hint(state_root: &Path) -> Option<ContextHint> {
-    let raw = std::fs::read_to_string(state_root.join("learning").join("findings.jsonl")).ok()?;
+    let raw = read_ledger_capped(&state_root.join("learning").join("findings.jsonl"))?;
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
@@ -283,7 +296,7 @@ fn is_root_cargo_test(command: &str) -> bool {
 /// --validate` (fail-before / pass-after / immutable oracle).
 pub fn synth_evals_prompt(state_root: &Path) -> Option<(usize, String)> {
     let learning = state_root.join("learning");
-    let raw = std::fs::read_to_string(learning.join("findings.jsonl")).ok()?;
+    let raw = read_ledger_capped(&learning.join("findings.jsonl"))?;
     let cursor_path = learning.join("findings.cursor");
     let done: usize = std::fs::read_to_string(&cursor_path)
         .ok()
@@ -374,6 +387,64 @@ mod tests {
             leftover: None,
             plan_leftover: None,
         }
+    }
+
+    #[test]
+    fn context_hint_does_not_load_an_unbounded_findings_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-learning-huge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("learning")).unwrap();
+        let line = r#"{"ts":1,"status":"Incomplete","stop_reason":"Stalled","verification":"Passed","review":"NotRequired","changed_files":0,"model":"m","failure_shape":"repeat_inspect"}"#;
+        let mut body = String::new();
+        while body.len() < MAX_LEDGER_READ_BYTES + 8_000 {
+            body.push_str(line);
+            body.push('\n');
+        }
+        std::fs::write(dir.join("learning").join("findings.jsonl"), &body).unwrap();
+        let raw = read_ledger_capped(&dir.join("learning").join("findings.jsonl")).unwrap();
+        assert!(
+            raw.len() <= MAX_LEDGER_READ_BYTES,
+            "findings read must be capped: {}",
+            raw.len()
+        );
+        let _ = context_hint(&dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn render_report_does_not_load_an_unbounded_interventions_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-learning-interventions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("learning")).unwrap();
+        let line = r#"{"name":"cap-test","evidence_state":"shipped"}"#;
+        let mut body = String::new();
+        while body.len() < MAX_LEDGER_READ_BYTES + 8_000 {
+            body.push_str(line);
+            body.push('\n');
+        }
+        std::fs::write(dir.join("learning").join("interventions.jsonl"), &body).unwrap();
+        let report = render_report(&dir);
+        assert!(
+            report.len() < 4_096,
+            "metrics report must stay short: {}",
+            report.len()
+        );
+        assert!(report.contains("cap-test"), "{report}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -519,6 +590,10 @@ mod tests {
             progress_reason: "ok".into(),
             normalized_signature: None,
             command: Some(command.into()),
+            arg_chars: 0,
+            result_chars: 0,
+            truncated: false,
+            kind: "shell".into(),
         }
     }
 

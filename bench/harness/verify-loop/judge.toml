@@ -1,0 +1,5 @@
+[process]
+require_tools = ["edit"]
+require_verify = true
+[budget]
+max_tool_result_chars = 50000

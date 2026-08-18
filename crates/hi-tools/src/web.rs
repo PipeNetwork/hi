@@ -815,13 +815,20 @@ async fn resolve_download(
     }
 
     let files = client.list_files(&repo).await?;
+    const MAX_LISTING_FILES: usize = 80;
     let mut listing = format!(
         "Files in {}@{} (call web_download again with `filename`):\n\n",
         repo.repo_id, repo.revision
     );
-    for file in &files {
+    for file in files.iter().take(MAX_LISTING_FILES) {
         let size = file.size.map(format_size).unwrap_or_default();
         listing.push_str(&format!("  {}  {}\n", file.path, size));
+    }
+    if files.len() > MAX_LISTING_FILES {
+        listing.push_str(&format!(
+            "  … {} more files omitted — pass `filename` to download one\n",
+            files.len() - MAX_LISTING_FILES
+        ));
     }
     if files.is_empty() {
         listing = format!("No files found in {}@{}.", repo.repo_id, repo.revision);

@@ -317,6 +317,13 @@ impl Transcript {
                 }
             }
         }
+        // Keep the newest user-turn's write/edit payloads intact so the model
+        // can still quote what it just wrote. Older bulky arguments are stubbed.
+        if let Some(split) =
+            crate::compaction::recent_split(&messages, crate::compaction::DEFAULT_KEEP_RECENT)
+        {
+            crate::compaction::elide_old_tool_arguments(&mut messages, split);
+        }
         Self {
             messages: Arc::new(messages),
         }
@@ -494,6 +501,10 @@ impl Transcript {
                 Some(i) => remaining.remove(i).1,
                 None => "[tool result missing]".to_string(),
             };
+            // Same budget as session resume: explore/delegate/ask_user skip
+            // the tool-host clip, and a child answer can otherwise land
+            // verbatim in the next parent request.
+            let (output, _) = hi_tools::bound_tool_content(output);
             msgs.push(Message::tool_result(id, output));
         }
     }
@@ -1186,6 +1197,101 @@ mod tests {
             assert!(!lower.contains("insufficient evidence"), "{text}");
             assert!(!lower.contains("quality_rejected"), "{text}");
         }
+    }
+
+    #[test]
+    fn resume_stubs_old_images_and_keeps_recent() {
+        let old = Content::Image {
+            data: "A".repeat(2_000),
+            media_type: "image/png".into(),
+        };
+        let recent = Content::Image {
+            data: "B".repeat(400),
+            media_type: "image/png".into(),
+        };
+        let user_with = |text: &str, image: Content| Message {
+            role: Role::User,
+            content: vec![Content::Text(text.into()), image],
+        };
+        let t = Transcript::new(vec![
+            Message::system("sys"),
+            user_with("turn 1", old),
+            assistant_text("ok1"),
+            user("turn 2"),
+            assistant_text("ok2"),
+            user("turn 3"),
+            assistant_text("ok3"),
+            user_with("turn 4", recent.clone()),
+            assistant_text("ok4"),
+        ]);
+        let first_user = &t.as_slice()[1];
+        assert!(
+            first_user
+                .content
+                .iter()
+                .any(|c| matches!(c, Content::Text(text) if text.starts_with("[elided image"))),
+            "old image stubbed on resume: {:?}",
+            first_user.content
+        );
+        let last_user = t
+            .as_slice()
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .unwrap();
+        assert!(
+            last_user.content.iter().any(
+                |c| matches!(c, Content::Image { data, .. } if data == "B".repeat(400).as_str())
+            ),
+            "recent image stays: {:?}",
+            last_user.content
+        );
+    }
+
+    #[test]
+    fn live_write_arguments_stay_quoteable_when_recorded() {
+        let args = serde_json::json!({
+            "path": "src/main.rs",
+            "content": "fn main() {}\n".repeat(80),
+        })
+        .to_string();
+        let mut transcript = Transcript::new(vec![user("write it")]);
+        transcript.push_assistant_with_results(
+            vec![Content::ToolCall {
+                id: "w1".into(),
+                name: "write".into(),
+                arguments: args.clone(),
+            }],
+            vec![("w1".into(), "wrote src/main.rs".into())],
+        );
+        let Content::ToolCall { arguments, .. } = &transcript.as_slice()[1].content[0] else {
+            panic!("expected tool call");
+        };
+        assert_eq!(arguments, &args, "just-written content must stay quoteable");
+        transcript.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn live_tool_results_are_bounded_when_recorded() {
+        let original = "explore dump\n".repeat(2_000);
+        let mut transcript = Transcript::new(vec![user("look around")]);
+        transcript.push_assistant_with_results(
+            vec![Content::ToolCall {
+                id: "ex-1".into(),
+                name: "explore".into(),
+                arguments: r#"{"task":"map the crate"}"#.into(),
+            }],
+            vec![("ex-1".into(), original.clone())],
+        );
+        let Content::ToolResult { output, .. } = &transcript.as_slice()[2].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(
+            output.len() < original.len(),
+            "live explore result must clip"
+        );
+        assert!(output.contains("truncated"), "{output}");
+        transcript.validate_for_provider().unwrap();
     }
 
     #[test]

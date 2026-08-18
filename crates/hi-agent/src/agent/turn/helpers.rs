@@ -87,6 +87,8 @@ pub(super) fn build_turn_telemetry(
         reasoning_fallback: false,
         refusal_source: None,
         wire_audit: Vec::new(),
+        requests: Vec::new(),
+        compaction: Vec::new(),
     }
 }
 
@@ -182,6 +184,8 @@ pub(super) fn tool_entry_with_args(
     arguments: &str,
 ) -> ToolCallEntry {
     let command = bash_command_preview(&tool, arguments);
+    let kind = crate::tool_kind(&tool).to_string();
+    let truncated = !matches!(output.truncation, hi_tools::TruncationState::Complete);
     ToolCallEntry {
         tool,
         path,
@@ -198,6 +202,10 @@ pub(super) fn tool_entry_with_args(
         progress_reason: progress.reason.clone(),
         normalized_signature: progress.signature.clone(),
         command,
+        arg_chars: arguments.chars().count() as u64,
+        result_chars: output.content.chars().count() as u64,
+        truncated,
+        kind,
     }
 }
 

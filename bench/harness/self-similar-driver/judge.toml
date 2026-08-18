@@ -1,0 +1,6 @@
+[process]
+require_tools = ["write"]
+require_output_slice = true
+
+[budget]
+max_tool_result_chars = 50000

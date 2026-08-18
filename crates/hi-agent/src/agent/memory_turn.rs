@@ -9,7 +9,7 @@ use hi_ai::{ChatRequest, Content, Message, RequestProfile, Role, StreamEvent, To
 use crate::compaction;
 use crate::memory::{
     cap_memory, extract_corrections, global_memory_file, memory_file_at, memory_prompt,
-    split_layers, strip_header, unreferenced_bullets, verify_grounded, write_memory,
+    split_layers, unreferenced_bullets, verify_grounded, write_memory,
 };
 use crate::snapshot::FileFingerprint;
 use crate::transcript::repair_invalid_tool_call_arguments_in_messages;
@@ -34,11 +34,9 @@ impl crate::Agent {
     pub(crate) async fn update_memory_at(&mut self, path: std::path::PathBuf, ui: &mut dyn Ui) {
         // Read both memory layers, stripping the schema header so the distiller
         // sees only the bullets (and tolerates a missing/legacy header).
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let existing = strip_header(&existing);
+        let existing = crate::memory::read_layer(&path);
         let global_path = global_memory_file();
-        let global_existing = std::fs::read_to_string(&global_path).unwrap_or_default();
-        let global_existing = strip_header(&global_existing);
+        let global_existing = crate::memory::read_layer(&global_path);
 
         ui.status("distilling session memory…");
 

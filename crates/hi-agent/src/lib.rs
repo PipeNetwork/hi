@@ -2,6 +2,7 @@
 //! until the model stops calling tools, with a configurable runaway-step guard.
 
 mod agent;
+mod census;
 mod change_ledger;
 mod coding_memory;
 pub mod command;
@@ -80,6 +81,7 @@ pub trait RsiControl: Send + Sync {
 }
 
 pub use agent::turn::TurnPhase;
+pub use census::{CompactionEvent, RequestCensus, census_messages, tool_kind};
 pub use change_ledger::{BackgroundScan, ChangeLedger};
 pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
@@ -441,6 +443,10 @@ pub struct TurnTelemetry {
     /// bodies are kept only for the local full-trace observer; report output
     /// exposes metadata fields from these entries.
     pub wire_audit: Vec<serde_json::Value>,
+    /// Per-provider-send census (main turn only). Side-calls are omitted.
+    pub requests: Vec<crate::RequestCensus>,
+    /// Elide/compact events this turn.
+    pub compaction: Vec<crate::CompactionEvent>,
 }
 
 impl Default for TurnTelemetry {
@@ -496,6 +502,8 @@ impl Default for TurnTelemetry {
             reasoning_fallback: false,
             refusal_source: None,
             wire_audit: Vec::new(),
+            requests: Vec::new(),
+            compaction: Vec::new(),
         }
     }
 }
@@ -586,6 +594,31 @@ pub struct ToolCallEntry {
     /// Truncated bash command when `tool == "bash"`. Empty/absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Tool-argument size in Unicode chars (tape).
+    #[serde(default)]
+    pub arg_chars: u64,
+    /// Tool-result size in Unicode chars as stored on the timeline.
+    #[serde(default)]
+    pub result_chars: u64,
+    /// Whether the model-facing result was truncated.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Coarse kind: `read`, `mutate`, `shell`, `search`, or `other`.
+    #[serde(default)]
+    pub kind: String,
+}
+
+impl ToolCallEntry {
+    /// Fill tape size/kind fields from the call arguments and model-facing result.
+    pub fn with_tape(mut self, arguments: &str, result: &str) -> Self {
+        self.arg_chars = arguments.chars().count() as u64;
+        self.result_chars = result.chars().count() as u64;
+        self.truncated = !matches!(self.truncation, hi_tools::TruncationState::Complete);
+        if self.kind.is_empty() {
+            self.kind = tool_kind(&self.tool).to_string();
+        }
+        self
+    }
 }
 
 /// Auto-compact once the context window is at least this percent full.

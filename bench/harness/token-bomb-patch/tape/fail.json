@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "outcome": {},
+  "telemetry": {
+    "tool_timeline": [
+      { "tool": "apply_patch", "path": "solution.py", "result_chars": 17000000, "kind": "mutate" }
+    ],
+    "requests": [{ "input_tokens_est": 90000, "max_tool_result_chars": 17000000, "max_image_chars": 0, "elided_images": 0 }]
+  }
+}

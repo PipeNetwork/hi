@@ -13,7 +13,19 @@ const DEFAULT_READ_LIMIT: usize = 2000;
 /// Do not materialize arbitrarily large files just to return a bounded page.
 /// Model-facing output is much smaller, and callers can use `bash` for binary
 /// or genuinely large artifacts when they need byte-level access.
-const MAX_READ_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_READ_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Refuse an after-image that could never be re-read or edited in place.
+pub(crate) fn refuse_oversized_text(display_path: &str, len: usize) -> Result<()> {
+    if len as u64 > MAX_READ_FILE_BYTES {
+        bail!(
+            "refusing to write `{display_path}` ({} bytes) — files larger than {} bytes cannot be re-read or edited in place",
+            len,
+            MAX_READ_FILE_BYTES
+        );
+    }
+    Ok(())
+}
 /// A multi-file read is a convenience for a small related set, not a way to
 /// turn one tool call into an unbounded workspace dump.
 const MAX_MULTI_READ_PATHS: usize = 32;
@@ -596,6 +608,15 @@ pub(crate) fn is_binary(bytes: &[u8]) -> bool {
 /// byte in the whole file with U+FFFD on the write-back, corrupting e.g.
 /// Latin-1 files even on lines the edit never touched.
 pub(crate) async fn read_text_file(path: &str) -> Result<String> {
+    let size = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("reading metadata for {path}"))?
+        .len();
+    if size > MAX_READ_FILE_BYTES {
+        bail!(
+            "{path} is too large to edit in place ({size} bytes; limit {MAX_READ_FILE_BYTES}). Use `bash` with a bounded command such as `sed` to modify it."
+        );
+    }
     let bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("reading {path}"))?;
@@ -766,6 +787,10 @@ mod tests {
             .await
             .expect_err("large file should be rejected before loading");
         assert!(error.to_string().contains("too large"));
+        let edit_err = super::read_text_file(&path.to_string_lossy())
+            .await
+            .expect_err("edit path must reject the same oversized file");
+        assert!(edit_err.to_string().contains("too large"));
         let _ = std::fs::remove_dir_all(root);
     }
 

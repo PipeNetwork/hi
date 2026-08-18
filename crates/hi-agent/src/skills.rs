@@ -20,6 +20,14 @@ const PROJECT_SKILLS_DIR: &str = ".hi/skills";
 const MAX_SKILL_BYTES: usize = 64 * 1024;
 /// Cap for the auto-injected stack-skill body in the volatile context block.
 const MAX_ACTIVE_STACK_SKILL_CHARS: usize = 4_000;
+/// The startup skill index lives in the stable system prompt. Unbounded
+/// descriptions (or hundreds of skills) would tax every model call.
+const MAX_SKILLS_IN_INDEX: usize = 32;
+const MAX_SKILL_DESCRIPTION_CHARS: usize = 160;
+const MAX_SKILLS_CONTEXT_CHARS: usize = 2_000;
+/// `/skill` injects a full body as a user turn; keep it well under a context
+/// page even when the on-disk file is at [`MAX_SKILL_BYTES`].
+const MAX_SKILL_USE_PROMPT_CHARS: usize = 8_000;
 
 /// Embedded stack skill packs (Phase N). Order is display order in the index.
 const BUILTIN_SKILL_SOURCES: &[(&str, &str)] = &[
@@ -325,14 +333,25 @@ pub fn learned_skills_context_from(skills: &[LearnedSkill]) -> Option<String> {
          packs (`rust-workspace`, `pytest-package`, `ts-monorepo`) cover package-local \
          check/test loops — prefer them over ad-hoc full-repo suites.\n",
     );
-    for skill in skills {
-        out.push_str("- ");
-        out.push_str(&skill.name);
-        out.push_str(" [");
-        out.push_str(&skill.scope);
-        out.push_str("]: ");
-        out.push_str(&skill.description);
-        out.push('\n');
+    let listed = skills.len().min(MAX_SKILLS_IN_INDEX);
+    for skill in skills.iter().take(listed) {
+        let line = format!(
+            "- {} [{}]: {}\n",
+            skill.name,
+            skill.scope,
+            clip_chars(&skill.description, MAX_SKILL_DESCRIPTION_CHARS)
+        );
+        if out.chars().count().saturating_add(line.chars().count()) > MAX_SKILLS_CONTEXT_CHARS {
+            out.push_str("… (skill index truncated)\n");
+            break;
+        }
+        out.push_str(&line);
+    }
+    if skills.len() > listed {
+        out.push_str(&format!(
+            "… ({} more skill(s) omitted from the index — use `/skill <name>`)\n",
+            skills.len() - listed
+        ));
     }
     Some(out)
 }
@@ -365,10 +384,10 @@ pub fn build_learn_prompt(request: &str) -> String {
 /// Prompt used by `/skill <name>` to inject the full selected skill body as an
 /// explicit user turn.
 pub fn build_skill_use_prompt(name: &str, content: &str) -> String {
+    let body = clip_chars(content.trim(), MAX_SKILL_USE_PROMPT_CHARS);
     format!(
-        "Use the learned skill `{}` for the current task/context.\n\n---\n{}\n---\n\nApply this skill only where it is relevant, and continue with the user's current task.",
-        name.trim(),
-        content.trim()
+        "Use the learned skill `{}` for the current task/context.\n\n---\n{body}\n---\n\nApply this skill only where it is relevant, and continue with the user's current task.",
+        name.trim()
     )
 }
 
@@ -581,6 +600,41 @@ mod tests {
         assert!(rendered.contains("debug-flow"));
         assert!(rendered.contains("Debug the thing."));
         assert!(!rendered.contains("SECRET FULL BODY"));
+    }
+
+    #[test]
+    fn learned_context_clips_huge_descriptions_and_caps_the_index() {
+        let mut skills = Vec::new();
+        for i in 0..40 {
+            skills.push(LearnedSkill {
+                name: format!("skill-{i:02}"),
+                description: "D".repeat(2_000),
+                scope: "project".into(),
+                path: PathBuf::from(format!("/tmp/skill-{i}")),
+            });
+        }
+        let rendered = learned_skills_context_from(&skills).unwrap();
+        assert!(
+            rendered.chars().count() <= MAX_SKILLS_CONTEXT_CHARS + 80,
+            "skill index must stay bounded: {}",
+            rendered.chars().count()
+        );
+        assert!(
+            rendered.contains("truncated") || rendered.contains("omitted"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(&"D".repeat(500)), "{rendered}");
+    }
+
+    #[test]
+    fn skill_use_prompt_clips_a_huge_body() {
+        let prompt = build_skill_use_prompt("bomb", &"X".repeat(20_000));
+        assert!(
+            prompt.chars().count() < MAX_SKILL_USE_PROMPT_CHARS + 200,
+            "{}",
+            prompt.chars().count()
+        );
+        assert!(prompt.contains("bomb"));
     }
 
     #[test]

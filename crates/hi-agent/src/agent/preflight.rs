@@ -285,26 +285,33 @@ impl crate::Agent {
                 );
             }
             let (progress_kind, progress_reason) = preflight_progress(&result.output);
-            tool_timeline.push(ToolCallEntry {
-                tool: result.call.name.to_string(),
-                path: result.path,
-                duration_ms: result.duration_ms,
-                queue_delay_ms: 0,
-                completion_index: 0,
-                status: result.output.status,
-                background: result.output.background.clone(),
-                process: result.output.process.clone(),
-                effects: result.output.effects.clone(),
-                truncation: result.output.truncation.clone(),
-                error: result.error,
-                progress_kind: progress_kind.to_string(),
-                progress_reason: progress_reason.to_string(),
-                normalized_signature: inspection_signature(
-                    result.call.name,
-                    &result.call.arguments,
-                ),
-                command: None,
-            });
+            tool_timeline.push(
+                ToolCallEntry {
+                    tool: result.call.name.to_string(),
+                    path: result.path,
+                    duration_ms: result.duration_ms,
+                    queue_delay_ms: 0,
+                    completion_index: 0,
+                    status: result.output.status,
+                    background: result.output.background.clone(),
+                    process: result.output.process.clone(),
+                    effects: result.output.effects.clone(),
+                    truncation: result.output.truncation.clone(),
+                    error: result.error,
+                    progress_kind: progress_kind.to_string(),
+                    progress_reason: progress_reason.to_string(),
+                    normalized_signature: inspection_signature(
+                        result.call.name,
+                        &result.call.arguments,
+                    ),
+                    command: None,
+                    arg_chars: 0,
+                    result_chars: 0,
+                    truncated: false,
+                    kind: String::new(),
+                }
+                .with_tape(&result.call.arguments, &result.output.content),
+            );
             if result.call.name == "grep" {
                 let remaining_extra_reads =
                     inspection_cap.saturating_sub(evidence.inspection_attempt_count()) as usize;
@@ -382,26 +389,33 @@ impl crate::Agent {
                 );
             }
             let (progress_kind, progress_reason) = preflight_progress(&result.output);
-            tool_timeline.push(ToolCallEntry {
-                tool: result.call.name.to_string(),
-                path: result.path,
-                duration_ms: result.duration_ms,
-                queue_delay_ms: 0,
-                completion_index: 0,
-                status: result.output.status,
-                background: result.output.background.clone(),
-                process: result.output.process.clone(),
-                effects: result.output.effects.clone(),
-                truncation: result.output.truncation.clone(),
-                error: result.error,
-                progress_kind: progress_kind.to_string(),
-                progress_reason: progress_reason.to_string(),
-                normalized_signature: inspection_signature(
-                    result.call.name,
-                    &result.call.arguments,
-                ),
-                command: None,
-            });
+            tool_timeline.push(
+                ToolCallEntry {
+                    tool: result.call.name.to_string(),
+                    path: result.path,
+                    duration_ms: result.duration_ms,
+                    queue_delay_ms: 0,
+                    completion_index: 0,
+                    status: result.output.status,
+                    background: result.output.background.clone(),
+                    process: result.output.process.clone(),
+                    effects: result.output.effects.clone(),
+                    truncation: result.output.truncation.clone(),
+                    error: result.error,
+                    progress_kind: progress_kind.to_string(),
+                    progress_reason: progress_reason.to_string(),
+                    normalized_signature: inspection_signature(
+                        result.call.name,
+                        &result.call.arguments,
+                    ),
+                    command: None,
+                    arg_chars: 0,
+                    result_chars: 0,
+                    truncated: false,
+                    kind: String::new(),
+                }
+                .with_tape(&result.call.arguments, &result.output.content),
+            );
             let compacted_output =
                 compact_preflight_tool_output(result.call.name, &result.output.content);
             let mut display_output = result.output.clone();
@@ -476,23 +490,30 @@ impl crate::Agent {
         let error = output.status != hi_tools::ToolStatus::Succeeded;
         tracker.preferred_validation = preferred_validation_from_preflight(&output.content);
         let (progress_kind, progress_reason) = preflight_progress(&output);
-        tool_timeline.push(ToolCallEntry {
-            tool: "bash".to_string(),
-            path: String::new(),
-            duration_ms,
-            queue_delay_ms: 0,
-            completion_index: 0,
-            status: output.status,
-            background: output.background.clone(),
-            process: output.process.clone(),
-            effects: output.effects.clone(),
-            truncation: output.truncation.clone(),
-            error,
-            progress_kind: progress_kind.to_string(),
-            progress_reason: progress_reason.to_string(),
-            normalized_signature: None,
-            command: crate::steering::bash_command(&arguments),
-        });
+        tool_timeline.push(
+            ToolCallEntry {
+                tool: "bash".to_string(),
+                path: String::new(),
+                duration_ms,
+                queue_delay_ms: 0,
+                completion_index: 0,
+                status: output.status,
+                background: output.background.clone(),
+                process: output.process.clone(),
+                effects: output.effects.clone(),
+                truncation: output.truncation.clone(),
+                error,
+                progress_kind: progress_kind.to_string(),
+                progress_reason: progress_reason.to_string(),
+                normalized_signature: None,
+                command: crate::steering::bash_command(&arguments),
+                arg_chars: 0,
+                result_chars: 0,
+                truncated: false,
+                kind: String::new(),
+            }
+            .with_tape(&arguments, &output.content),
+        );
         emit_tool_output(ui, "implementation-preflight", "bash", &output);
         self.messages.push_assistant_with_results(
             vec![Content::ToolCall {

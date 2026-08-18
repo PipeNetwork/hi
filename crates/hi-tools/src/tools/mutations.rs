@@ -77,6 +77,7 @@ pub async fn prepare_mutation_in_with_state(
             refuse_large_write_overwrite(&target, &args.path)?;
             let recorded = crate::transaction::workspace_display_path(root, &target);
             let after = args.content;
+            crate::read::refuse_oversized_text(&args.path, after.len())?;
             let plan = MutationPlan::new_with_state(
                 root,
                 state_root,
@@ -106,6 +107,7 @@ pub async fn prepare_mutation_in_with_state(
             )
             .await
             .with_context(|| format!("editing {}", args.path))?;
+            crate::read::refuse_oversized_text(&args.path, after.len())?;
             let recorded = crate::transaction::workspace_display_path(root, &target);
             let plan = MutationPlan::new_with_state(
                 root,
@@ -133,8 +135,15 @@ pub async fn prepare_mutation_in_with_state(
             if args.edits.is_empty() {
                 bail!("no edits provided");
             }
+            if args.edits.len() > MAX_MULTI_EDITS {
+                bail!(
+                    "multi_edit accepts at most {MAX_MULTI_EDITS} edits per call (got {})",
+                    args.edits.len()
+                );
+            }
             let (before, after) =
                 apply_multi_edit_with_disk_retry(&target, &args.path, &args.edits).await?;
+            crate::read::refuse_oversized_text(&args.path, after.len())?;
             let recorded = crate::transaction::workspace_display_path(root, &target);
             let edit_count = args.edits.len();
             let plan = MutationPlan::new_with_state(
@@ -162,6 +171,12 @@ pub async fn prepare_mutation_in_with_state(
                 patch: String,
             }
             let args: PatchArgs = parse(arguments)?;
+            if args.patch.len() > MAX_PATCH_BYTES {
+                bail!(
+                    "apply_patch payload is too large ({} bytes; limit {MAX_PATCH_BYTES})",
+                    args.patch.len()
+                );
+            }
             let (plan, summary) =
                 plan_multi_patch_with_disk_retry(root, state_root, &args.patch).await?;
             Ok(PreparedMutation {
@@ -172,6 +187,13 @@ pub async fn prepare_mutation_in_with_state(
         _ => bail!("{name} is not a preparable file mutation"),
     }
 }
+
+/// Cap on `multi_edit` hunks in one call. Each hunk is applied sequentially to
+/// a growing buffer; an unbounded list is a CPU/memory bomb.
+const MAX_MULTI_EDITS: usize = 64;
+/// Cap on an `apply_patch` payload. Stream ingestion already stops at 4 MiB;
+/// this is a tighter, earlier refuse so we never materialize a giant plan.
+const MAX_PATCH_BYTES: usize = 1024 * 1024;
 
 fn refuse_large_write_overwrite(target: &Path, display_path: &str) -> Result<()> {
     if !target.is_file() {

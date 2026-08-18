@@ -1,0 +1,5 @@
+[process]
+require_tools = ["edit"]
+[budget]
+max_request_tokens_est = 80000
+max_tool_result_chars = 50000

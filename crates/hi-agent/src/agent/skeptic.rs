@@ -34,6 +34,11 @@ use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode
 /// [`Agent::review_diff`] are bounded side-calls that must stay cheap, while
 /// post-verify completion review can afford a fuller package.
 const SKEPTIC_DIFF_BUDGET: usize = 6_000;
+/// Bound on objective / sub-goal text copied into a side-call. The stored
+/// goal and the user's transcript message are not rewritten.
+const MAX_SKEPTIC_SIDE_CHARS: usize = 8_000;
+const MAX_SKEPTIC_FILES: usize = 16;
+const MAX_SKEPTIC_PATH_CHARS: usize = 200;
 
 /// Diff char budget for independent / large-diff **completion** review (post
 /// green WorkspaceRepair). Kept here next to the goal budget so the asymmetry
@@ -185,13 +190,7 @@ impl crate::Agent {
             diff.push_str("\n… (diff truncated)");
         }
         // Mirror the gate's context format so the reviewer sees the same shape.
-        let context = format!(
-            "Objective: {objective}\n\n\
-             Active sub-goal (the one about to be marked done): {sub_goal}\n\n\
-             verify result: (none configured)\n\
-             Files changed this turn: (see diff)\n\n\
-             Diff of this turn's changes:\n{diff}"
-        );
+        let context = review_diff_context(objective, sub_goal, &diff);
         self.skeptic_review(&context).await
     }
 
@@ -207,10 +206,24 @@ impl crate::Agent {
         let notes = if prior_notes.is_empty() {
             "(none — first review of this step)".to_string()
         } else {
-            prior_notes
+            let clipped: String = prior_notes
                 .iter()
-                .map(|n| format!("\n  — {n}"))
-                .collect::<String>()
+                .take(crate::goal::MAX_NOTES_IN_PROMPT)
+                .map(|n| {
+                    format!(
+                        "\n  — {}",
+                        crate::goal::clip_chars(n, crate::goal::MAX_NOTE_CHARS)
+                    )
+                })
+                .collect();
+            if prior_notes.len() > crate::goal::MAX_NOTES_IN_PROMPT {
+                format!(
+                    "{clipped}\n  — … {} more",
+                    prior_notes.len() - crate::goal::MAX_NOTES_IN_PROMPT
+                )
+            } else {
+                clipped
+            }
         };
         let verify = match self.report.verify {
             VerifyEvidence::Passed { .. } => "verify result: PASSED",
@@ -220,7 +233,20 @@ impl crate::Agent {
         let files = if self.workspace.last_changed_files.is_empty() {
             "(none detected)".to_string()
         } else {
-            self.workspace.last_changed_files.join(", ")
+            let mut parts: Vec<String> = self
+                .workspace
+                .last_changed_files
+                .iter()
+                .take(MAX_SKEPTIC_FILES)
+                .map(|path| crate::goal::clip_chars(path, MAX_SKEPTIC_PATH_CHARS))
+                .collect();
+            if self.workspace.last_changed_files.len() > MAX_SKEPTIC_FILES {
+                parts.push(format!(
+                    "… {} more",
+                    self.workspace.last_changed_files.len() - MAX_SKEPTIC_FILES
+                ));
+            }
+            parts.join(", ")
         };
         let stub_findings = self.turn_stub_scan().await;
         let stubs = if stub_findings.is_empty() {
@@ -245,15 +271,17 @@ impl crate::Agent {
             .and_then(|c| c.acceptance_section())
             .unwrap_or_else(|| "(none named)".into());
         format!(
-            "Objective: {objective}\n\n\
-             Active sub-goal (the one about to be marked done): {sub_goal}\n\n\
+            "Objective: {}\n\n\
+             Active sub-goal (the one about to be marked done): {}\n\n\
              Prior review notes on this step (re-review: confirm these are addressed; \
              the bar does not rise): {notes}\n\n\
              {verify}\n\
              Files changed this turn: {files}\n\
              Stub markers present in files changed this turn: {stubs}\n\n\
              Acceptance criteria:\n{acceptance}\n\n\
-             Diff of this turn's changes:\n{diff}"
+             Diff of this turn's changes:\n{diff}",
+            crate::goal::clip_chars(objective, MAX_SKEPTIC_SIDE_CHARS),
+            crate::goal::clip_chars(sub_goal, MAX_SKEPTIC_SIDE_CHARS),
         )
     }
 
@@ -572,6 +600,18 @@ fn approve_is_negated(lower: &str, approve_idx: usize) -> bool {
 ///
 /// Product policy for [`SkepticVerdict::Unavailable`] is caller-side (goal gate
 /// vs completion review); this parser never treats ambiguity as approve.
+fn review_diff_context(objective: &str, sub_goal: &str, diff: &str) -> String {
+    format!(
+        "Objective: {}\n\n\
+         Active sub-goal (the one about to be marked done): {}\n\n\
+         verify result: (none configured)\n\
+         Files changed this turn: (see diff)\n\n\
+         Diff of this turn's changes:\n{diff}",
+        crate::goal::clip_chars(objective, MAX_SKEPTIC_SIDE_CHARS),
+        crate::goal::clip_chars(sub_goal, MAX_SKEPTIC_SIDE_CHARS),
+    )
+}
+
 fn parse_verdict(text: &str) -> SkepticVerdict {
     let lines: Vec<&str> = text
         .lines()
@@ -688,6 +728,22 @@ mod tests {
             parse_verdict("hmm, not sure"),
             SkepticVerdict::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn review_diff_context_clips_huge_objective_and_sub_goal() {
+        let ctx = review_diff_context(&"O".repeat(20_000), &"S".repeat(20_000), "diff-here");
+        assert!(
+            ctx.chars().count() < 20_000,
+            "side-call context must stay bounded: {}",
+            ctx.chars().count()
+        );
+        assert!(ctx.contains("diff-here"), "{ctx}");
+        assert!(
+            !ctx.contains(&"O".repeat(MAX_SKEPTIC_SIDE_CHARS + 1)),
+            "{ctx}"
+        );
+        assert!(ctx.contains('…'), "{ctx}");
     }
 
     #[test]

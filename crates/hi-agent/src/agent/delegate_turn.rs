@@ -43,8 +43,9 @@ fn delegate_tool_outcome(
     mutation_attempted: bool,
     mutation_applied: bool,
 ) -> hi_tools::ToolOutcome {
+    let (content, truncation) = hi_tools::bound_tool_content(content.into());
     hi_tools::ToolOutcome {
-        content: content.into(),
+        content,
         display: None,
         plan: None,
         status,
@@ -55,7 +56,7 @@ fn delegate_tool_outcome(
             mutation_applied,
             file_changes: Vec::new(),
         },
-        truncation: hi_tools::TruncationState::Complete,
+        truncation,
     }
 }
 

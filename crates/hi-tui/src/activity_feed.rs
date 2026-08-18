@@ -264,6 +264,18 @@ impl ActivityBlock {
         }
     }
 
+    fn is_live(&self) -> bool {
+        match &self.kind {
+            ActivityKind::VerbGroup(g) => g.live,
+            ActivityKind::Run { idle, .. } => *idle,
+            ActivityKind::Subagent { status, .. } => !matches!(
+                status.as_deref(),
+                Some("completed" | "failed" | "denied" | "cancelled")
+            ),
+            ActivityKind::Edit { .. } | ActivityKind::Other { .. } => false,
+        }
+    }
+
     pub(crate) fn flatten(
         &self,
         show_tool_output: bool,
@@ -275,7 +287,7 @@ impl ActivityBlock {
             ActivityKind::VerbGroup(g) => {
                 let mut lines = vec![header];
                 if show_reasoning && !g.thinking.trim().is_empty() {
-                    lines.extend(verb_group_thinking_lines(g));
+                    lines.extend(thinking_block_lines(&g.thinking, g.thinking_elapsed, true));
                 }
                 // Ctrl-O / verbose expand Edit/Run bodies, not every explore path.
                 if self.expanded {
@@ -297,8 +309,12 @@ impl ActivityBlock {
                 let show_full = density.show_tool_output(show_tool_output) || self.expanded;
                 if show_full {
                     lines.extend(output_body_lines(body));
-                } else if *idle && density != Density::Compact {
+                } else if density == Density::Compact {
+                    return lines;
+                } else if *idle {
                     lines.extend(live_run_tail_lines(body));
+                } else {
+                    lines.extend(finished_run_preview_lines(body));
                 }
                 lines
             }
@@ -375,51 +391,52 @@ impl ActivityBlock {
 
     fn header_line(&self) -> Line<'static> {
         let th = theme();
-        let bullet = Span::styled("• ", Style::default().fg(th.gray_dim));
+        let live = self.is_live();
+        let muted = !live && !self.expanded;
+        let verb_fg = if muted { th.gray } else { th.text_primary };
+        let verb_style = Style::default().fg(verb_fg).add_modifier(Modifier::BOLD);
+        let diamond_fg = if live { th.accent_running } else { th.gray_dim };
+        let mut spans = vec![Span::styled("◆ ", Style::default().fg(diamond_fg))];
         match &self.kind {
-            ActivityKind::VerbGroup(g) => Line::from(vec![
-                bullet,
-                Span::styled(
-                    g.label(),
-                    Style::default()
-                        .fg(th.text_primary)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            ActivityKind::VerbGroup(g) => {
+                let label = g.label();
+                let (main, detail) = split_label_detail(&label);
+                spans.push(Span::styled(main.to_string(), verb_style));
+                if let Some(detail) = detail {
+                    spans.push(Span::styled(
+                        format!(" · {detail}"),
+                        Style::default().fg(th.gray_dim),
+                    ));
+                }
+            }
             ActivityKind::Edit {
                 path,
                 additions,
                 deletions,
                 ..
             } => {
-                let mut spans = vec![
-                    bullet,
-                    Span::styled(
-                        "Edit ".to_string(),
-                        Style::default()
-                            .fg(th.text_primary)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(display_path(path).to_string(), Style::default().fg(th.path)),
-                ];
+                spans.push(Span::styled("Edit ".to_string(), verb_style));
+                spans.push(Span::styled(
+                    display_path(path).to_string(),
+                    Style::default().fg(th.path),
+                ));
                 if *additions > 0 || *deletions > 0 {
-                    if *additions > 0 {
-                        spans.push(Span::styled(
-                            format!(" +{additions}"),
-                            Style::default().fg(th.diff_add),
-                        ));
-                    }
-                    if *additions > 0 && *deletions > 0 {
-                        spans.push(Span::styled("/", Style::default().fg(th.gray_dim)));
-                    }
-                    if *deletions > 0 {
-                        spans.push(Span::styled(
-                            format!(" -{deletions}"),
-                            Style::default().fg(th.diff_del),
-                        ));
-                    }
+                    let stat = match (*additions, *deletions) {
+                        (a, 0) => format!(" +{a}"),
+                        (0, d) => format!(" -{d}"),
+                        (a, d) => format!(" +{a}/-{d}"),
+                    };
+                    let stat_style = if muted {
+                        Style::default().fg(th.gray_dim)
+                    } else if *deletions == 0 {
+                        Style::default().fg(th.diff_add)
+                    } else if *additions == 0 {
+                        Style::default().fg(th.diff_del)
+                    } else {
+                        Style::default().fg(th.gray)
+                    };
+                    spans.push(Span::styled(stat, stat_style));
                 }
-                Line::from(spans)
             }
             ActivityKind::Run {
                 command,
@@ -427,41 +444,28 @@ impl ActivityBlock {
                 idle,
                 ..
             } => {
-                let mut spans = vec![
-                    bullet,
-                    Span::styled(
-                        "Run ".to_string(),
-                        Style::default()
-                            .fg(th.text_primary)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(command.clone(), Style::default().fg(th.text_primary)),
-                ];
+                let cmd_fg = if muted { th.gray } else { th.text_primary };
+                spans.push(Span::styled("Run ".to_string(), verb_style));
+                spans.push(Span::styled(command.clone(), Style::default().fg(cmd_fg)));
                 if !*idle && body.trim().is_empty() {
                     spans.push(Span::styled(
                         " · (no output)".to_string(),
                         Style::default().fg(th.gray_dim),
                     ));
                 }
-                Line::from(spans)
             }
             ActivityKind::Other { verb, detail, .. } => {
-                let mut spans = vec![
-                    bullet,
-                    Span::styled(
-                        title_case(verb),
-                        Style::default()
-                            .fg(th.text_primary)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ];
+                spans.push(Span::styled(title_case(verb), verb_style));
                 if !detail.is_empty() {
                     spans.push(Span::styled(
                         format!(" {detail}"),
-                        Style::default().fg(th.text_secondary),
+                        Style::default().fg(if muted {
+                            th.gray_dim
+                        } else {
+                            th.text_secondary
+                        }),
                     ));
                 }
-                Line::from(spans)
             }
             ActivityKind::Subagent { status, .. } => {
                 let color = match status.as_deref() {
@@ -469,15 +473,16 @@ impl ActivityBlock {
                     Some("failed") | Some("denied") | Some("cancelled") => th.accent_error,
                     _ => th.accent_running,
                 };
-                Line::from(vec![
-                    bullet,
-                    Span::styled(
-                        subagent_header_text(&self.kind),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                ])
+                spans.push(Span::styled(
+                    subagent_header_text(&self.kind),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
             }
         }
+        if self.is_foldable() && !self.expanded && !live {
+            spans.push(Span::styled(" ›", Style::default().fg(th.gray_dim)));
+        }
+        Line::from(spans)
     }
 
     fn body_lines(&self) -> Vec<Line<'static>> {
@@ -491,25 +496,83 @@ impl ActivityBlock {
     }
 }
 
-fn verb_group_thinking_lines(g: &VerbGroup) -> Vec<Line<'static>> {
+fn split_label_detail(label: &str) -> (&str, Option<&str>) {
+    match label.split_once(" · ") {
+        Some((main, rest)) => (main, Some(rest)),
+        None => (label, None),
+    }
+}
+
+/// Grok-build thinking block: muted header + optional preview, wrap at 120.
+pub(crate) const THINKING_WRAP_COLS: usize = 120;
+const THINKING_PREVIEW_LINES: usize = 3;
+
+pub(crate) fn thinking_block_lines(
+    text: &str,
+    elapsed: std::time::Duration,
+    expanded: bool,
+) -> Vec<Line<'static>> {
     let th = theme();
-    let secs = g.thinking_elapsed.as_secs();
-    let label = if secs >= 60 {
-        format!("{}m {:02}s", secs / 60, secs % 60)
+    let secs = elapsed.as_secs();
+    let header = if secs == 0 && !expanded {
+        "Thinking…".to_string()
     } else {
-        format!("{secs}s")
+        let label = if secs >= 60 {
+            format!("{}m {:02}s", secs / 60, secs % 60)
+        } else {
+            format!("{secs}s")
+        };
+        if expanded {
+            format!("thought for {label}")
+        } else {
+            format!("thought for {label}")
+        }
     };
     let mut lines = vec![Line::styled(
-        format!("┃ ⏺ thought for {label}"),
+        format!("  {header}"),
         Style::default().fg(th.accent_thinking),
     )];
-    for line in g.thinking.lines() {
+    if text.trim().is_empty() {
+        return lines;
+    }
+    let wrapped = wrap_text_cols(text, THINKING_WRAP_COLS);
+    let take = if expanded {
+        wrapped.len()
+    } else {
+        wrapped.len().min(THINKING_PREVIEW_LINES)
+    };
+    for line in wrapped.into_iter().take(take) {
         lines.push(Line::styled(
-            format!("┃   {line}"),
+            format!("  {line}"),
             Style::default().fg(th.gray_dim),
         ));
     }
     lines
+}
+
+fn wrap_text_cols(text: &str, max_cols: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        if raw.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut width = 0usize;
+        for ch in raw.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width + w > max_cols && !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+                width = 0;
+            }
+            current.push(ch);
+            width = width.saturating_add(w);
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    out
 }
 
 fn edit_body_lines(diff: &str) -> Vec<Line<'static>> {
@@ -602,8 +665,26 @@ fn run_header_text(command: &str, idle: bool, body: &str) -> String {
 }
 
 /// Last lines of a still-running command, so a long `cargo test` isn't a
-/// blank header for minutes. Finished runs stay collapsed (Ctrl-O).
+/// blank header for minutes.
 const LIVE_RUN_TAIL_LINES: usize = 12;
+/// Grok-build execute block: first 2 + last 3 when collapsed.
+const FINISHED_RUN_HEAD: usize = 2;
+const FINISHED_RUN_TAIL: usize = 3;
+
+fn finished_run_preview_lines(body: &str) -> Vec<Line<'static>> {
+    let all = output_body_lines(body);
+    if all.len() <= FINISHED_RUN_HEAD + FINISHED_RUN_TAIL {
+        return all;
+    }
+    let hidden = all.len() - FINISHED_RUN_HEAD - FINISHED_RUN_TAIL;
+    let mut lines = all[..FINISHED_RUN_HEAD].to_vec();
+    lines.push(Line::styled(
+        format!("  … +{hidden} lines"),
+        Style::default().fg(theme().gray_dim),
+    ));
+    lines.extend(all[all.len() - FINISHED_RUN_TAIL..].iter().cloned());
+    lines
+}
 
 fn live_run_tail_lines(body: &str) -> Vec<Line<'static>> {
     let mut all = output_body_lines(body);
@@ -881,6 +962,68 @@ mod tests {
         g.add(ExploreVerb::Search, Some("TODO".into()));
         g.live = false;
         assert_eq!(g.label(), "Read 1 file, Searched 1 pattern");
+    }
+
+    #[test]
+    fn collapsed_edit_uses_diamond_and_chevron() {
+        let block = ActivityBlock {
+            kind: ActivityKind::Edit {
+                path: "src/lib.rs".into(),
+                additions: 4,
+                deletions: 2,
+                diff: "@@\n-old\n+new\n".into(),
+            },
+            expanded: false,
+        };
+        let text = crate::render::line_text(&block.flatten(false, false, Density::Comfortable)[0]);
+        assert!(text.starts_with("◆ "), "{text}");
+        assert!(text.contains("Edit"), "{text}");
+        assert!(text.contains("›"), "{text}");
+    }
+
+    #[test]
+    fn live_run_has_no_chevron() {
+        let block = ActivityBlock {
+            kind: ActivityKind::Run {
+                command: "cargo test".into(),
+                body: "running\n".into(),
+                idle: true,
+                poll_count: 0,
+            },
+            expanded: false,
+        };
+        let text = crate::render::line_text(&block.flatten(false, false, Density::Comfortable)[0]);
+        assert!(text.starts_with("◆ "), "{text}");
+        assert!(!text.contains('›'), "{text}");
+    }
+
+    #[test]
+    fn finished_run_shows_head_and_tail() {
+        let body = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = ActivityBlock {
+            kind: ActivityKind::Run {
+                command: "echo".into(),
+                body,
+                idle: false,
+                poll_count: 0,
+            },
+            expanded: false,
+        };
+        let lines: Vec<String> = block
+            .flatten(false, false, Density::Comfortable)
+            .iter()
+            .map(crate::render::line_text)
+            .collect();
+        let joined = lines.join("\n");
+        assert!(joined.contains("line 1"), "{joined}");
+        assert!(joined.contains("line 2"), "{joined}");
+        assert!(joined.contains("… +5 lines"), "{joined}");
+        assert!(joined.contains("line 8"), "{joined}");
+        assert!(joined.contains("line 10"), "{joined}");
+        assert!(!joined.contains("line 5"), "{joined}");
     }
 
     #[test]

@@ -49,6 +49,10 @@ the first line ONLY when there is a concrete, specific defect: a real bug, a bro
 safeguard, or a requirement left unhandled. Put one concrete defect per following line. \
 When uncertain, APPROVE.";
 
+/// Bound on task/plan text copied into a trio side-call. The user's
+/// transcript message is not rewritten.
+const MAX_TRIO_SIDE_CHARS: usize = 8_000;
+
 impl crate::Agent {
     /// Run the trio planner side-call. Returns the plan text, or the prompt
     /// itself if no planner model is configured (graceful fallback). Books
@@ -66,7 +70,7 @@ impl crate::Agent {
             canonical_objective: None,
             messages: Arc::new(vec![
                 Message::system(TRIO_PLANNER_PROMPT),
-                Message::user(prompt.to_string()),
+                Message::user(crate::goal::clip_chars(prompt, MAX_TRIO_SIDE_CHARS)),
             ]),
             tools: Arc::new([]),
             max_tokens: 1024,
@@ -129,11 +133,7 @@ impl crate::Agent {
         } else {
             diff
         };
-        let context = format!(
-            "Task: {prompt}\n\n\
-             Plan:\n{plan}\n\n\
-             Diff of the executor's changes:\n{diff}"
-        );
+        let context = trio_review_context(prompt, plan, &diff);
 
         let request = ChatRequest {
             model,
@@ -217,6 +217,16 @@ fn parse_trio_verdict(text: &str) -> SkepticVerdict {
     }
 }
 
+fn trio_review_context(prompt: &str, plan: &str, diff: &str) -> String {
+    format!(
+        "Task: {}\n\n\
+         Plan:\n{}\n\n\
+         Diff of the executor's changes:\n{diff}",
+        crate::goal::clip_chars(prompt, MAX_TRIO_SIDE_CHARS),
+        crate::goal::clip_chars(plan, MAX_TRIO_SIDE_CHARS),
+    )
+}
+
 /// Extract text from a completion's content array (same as plan_goal's helper).
 fn content_text(content: &[Content]) -> String {
     content
@@ -232,6 +242,19 @@ fn content_text(content: &[Content]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_context_clips_huge_prompt_and_plan() {
+        let ctx = trio_review_context(&"P".repeat(20_000), &"L".repeat(20_000), "diff-here");
+        assert!(
+            ctx.chars().count() < 20_000,
+            "trio review context must stay bounded: {}",
+            ctx.chars().count()
+        );
+        assert!(ctx.contains("diff-here"), "{ctx}");
+        assert!(!ctx.contains(&"P".repeat(MAX_TRIO_SIDE_CHARS + 1)), "{ctx}");
+        assert!(ctx.contains('…'), "{ctx}");
+    }
 
     #[test]
     fn parse_trio_verdict_approve() {

@@ -661,6 +661,10 @@ pub(crate) enum TranscriptEntry {
     /// A line of assistant prose. It stays separate from status/tool lines so
     /// the renderer can add the assistant gutter without changing copied text.
     Assistant(Line<'static>),
+    /// One grok-build assistant reply (markdown source), flattened as a block.
+    AssistantMessage {
+        text: String,
+    },
     /// Assistant reasoning/thinking, buffered until the reasoning phase ends.
     /// Shown collapsed ("thought for Ns") unless `show_reasoning` is on.
     Reasoning {
@@ -746,8 +750,21 @@ impl TranscriptEntry {
         let preview_n = density.tool_preview_lines();
         match self {
             TranscriptEntry::Line(line) => vec![line.clone()],
-            TranscriptEntry::UserPrompt { line, .. } => vec![style_user_prompt(line)],
-            TranscriptEntry::Assistant(line) => vec![line.clone()],
+            TranscriptEntry::UserPrompt { line, .. } => {
+                let mut prompt = style_user_prompt(line);
+                if th.paints_backgrounds() {
+                    prompt.style = prompt.style.bg(th.bg_highlight);
+                }
+                vec![prompt]
+            }
+            TranscriptEntry::Assistant(line) => crate::render::wrap_line_to_width(line, 120),
+            TranscriptEntry::AssistantMessage { text } => {
+                let mut lines = Vec::new();
+                for line in crate::render::markdown_body_lines(text) {
+                    lines.extend(crate::render::wrap_line_to_width(&line, 120));
+                }
+                lines
+            }
             TranscriptEntry::ChangedFiles { line, .. } => vec![line.clone()],
             TranscriptEntry::Btw {
                 question,
@@ -772,35 +789,12 @@ impl TranscriptEntry {
             TranscriptEntry::Activity(block) => block.flatten(show_tool, show_reasoning, density),
             TranscriptEntry::Reasoning { text, elapsed } => {
                 let secs = elapsed.as_secs();
-                // Instant CoT ("thought for 0s") is noise in the collapsed
-                // feed — grok-build folds it into the tool row. Keep it for
-                // Ctrl-T so the text is still there.
+                // Instant CoT is noise in the collapsed feed — grok-build
+                // folds it into the tool row. Keep it for Ctrl-T.
                 if !show_reasoning && secs == 0 {
                     return Vec::new();
                 }
-                let label = if secs >= 60 {
-                    format!("{}m {:02}s", secs / 60, secs % 60)
-                } else {
-                    format!("{secs}s")
-                };
-                if show_reasoning {
-                    let mut lines = vec![Line::styled(
-                        format!("┃ ⏺ thought for {label} (Ctrl-T to collapse)"),
-                        Style::default().fg(th.accent_thinking),
-                    )];
-                    for line in text.lines() {
-                        lines.push(Line::styled(
-                            format!("┃   {line}"),
-                            Style::default().fg(th.gray_dim),
-                        ));
-                    }
-                    lines
-                } else {
-                    vec![Line::styled(
-                        format!("┃ ⏺ thought for {label}  (Ctrl-T to expand)",),
-                        Style::default().fg(th.accent_thinking),
-                    )]
-                }
+                crate::activity_feed::thinking_block_lines(text, *elapsed, show_reasoning)
             }
             TranscriptEntry::ToolOutput { body, expanded } => {
                 // The visible body lines sit in a sunken panel (a `panel` base
@@ -862,6 +856,7 @@ impl TranscriptEntry {
             TranscriptEntry::Line(line)
             | TranscriptEntry::Assistant(line)
             | TranscriptEntry::ChangedFiles { line, .. } => crate::render::copy_line_text(line),
+            TranscriptEntry::AssistantMessage { text } => text.clone(),
             // User prompts are stored without a semantic gutter. Preserve
             // literal leading glyphs the user typed instead of normalizing
             // their content as renderer decoration.
@@ -1191,6 +1186,9 @@ pub(crate) struct App {
     /// Index into `queue` for Alt-Up/Down selection (reorder / delete). `None`
     /// when nothing is highlighted; clamped whenever the queue shrinks.
     pub(crate) queue_selected: Option<usize>,
+    /// After submit, pin the new `❯` at the top of the transcript (grok-build
+    /// `page_flip_on_send`) once, then leave scroll alone.
+    pub(crate) page_flip_on_send: bool,
     /// The last message actually sent to the model, for `/retry`.
     pub(crate) last_prompt: Option<String>,
     /// Message-history length just before the last turn started, so `/retry`

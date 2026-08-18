@@ -1,0 +1,8 @@
+[process]
+forbid_tools = ["write"]
+require_tools = ["edit"]
+mutate_after_read = true
+
+[budget]
+max_tool_result_chars = 50000
+max_write_existing_bytes = 16384

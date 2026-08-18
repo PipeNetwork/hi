@@ -181,17 +181,14 @@ impl GoalState {
         structured: Option<Goal>,
         last_plan: Vec<PlanStep>,
     ) {
-        self.free_text = free_text;
+        self.free_text = normalize_free_text_goal(free_text);
         self.structured = structured;
         self.last_plan = last_plan;
     }
 
     /// Set or clear the transient free-text goal (trim; empty → `None`).
     pub(crate) fn set_free_text(&mut self, goal: Option<String>) {
-        self.free_text = goal.and_then(|g| {
-            let g = g.trim().to_string();
-            (!g.is_empty()).then_some(g)
-        });
+        self.free_text = normalize_free_text_goal(goal);
     }
 
     /// Clone the durable structured goal (turn-start baseline for revert).
@@ -203,6 +200,25 @@ impl GoalState {
     pub(crate) fn set_structured(&mut self, goal: Option<Goal>) {
         self.structured = goal;
     }
+}
+
+const MAX_FREE_TEXT_GOAL_CHARS: usize = 500;
+
+fn normalize_free_text_goal(goal: Option<String>) -> Option<String> {
+    goal.and_then(|g| {
+        let g = g.trim();
+        if g.is_empty() {
+            return None;
+        }
+        if g.chars().count() <= MAX_FREE_TEXT_GOAL_CHARS {
+            return Some(g.to_string());
+        }
+        let clipped: String = g
+            .chars()
+            .take(MAX_FREE_TEXT_GOAL_CHARS.saturating_sub(1))
+            .collect();
+        Some(format!("{clipped}…"))
+    })
 }
 
 /// Live RSI observation state that is *not* config (`AgentRsi`).

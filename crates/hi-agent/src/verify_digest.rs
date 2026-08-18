@@ -267,7 +267,13 @@ fn source_region(root: &Path, location: &str) -> Option<String> {
     {
         return None;
     }
-    let text = std::fs::read_to_string(root.join(relative)).ok()?;
+    let file_path = root.join(relative);
+    const MAX_SOURCE_REGION_FILE_BYTES: u64 = 256 * 1024;
+    let metadata = std::fs::metadata(&file_path).ok()?;
+    if metadata.len() > MAX_SOURCE_REGION_FILE_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(file_path).ok()?;
     let lines: Vec<&str> = text.lines().collect();
     if line == 0 || line > lines.len() {
         return None;

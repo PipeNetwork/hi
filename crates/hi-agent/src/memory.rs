@@ -75,9 +75,28 @@ pub fn global_memory_file() -> PathBuf {
 
 /// Read a memory file and return its body (schema header stripped). Returns an
 /// empty string when the file is missing or unreadable.
-fn read_layer(path: &Path) -> String {
-    let raw = fs::read_to_string(path).unwrap_or_default();
+/// Backstop on a hand-edited memory file. Distillation already caps writes at
+/// [`MEMORY_MAX_CHARS`]; this keeps a 50 MB dump from being loaded every turn.
+const MAX_LAYER_READ_BYTES: usize = 16 * 1024;
+
+pub(crate) fn read_layer(path: &Path) -> String {
+    let raw = read_capped(path, MAX_LAYER_READ_BYTES);
     strip_header(&raw)
+}
+
+fn read_capped(path: &Path, max_bytes: usize) -> String {
+    use std::io::Read;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return String::new(),
+    };
+    let mut buf = vec![0u8; max_bytes];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return String::new(),
+    };
+    buf.truncate(n);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Read the project memory file (header stripped). Returns "" when absent.
@@ -825,6 +844,28 @@ pub(crate) use hi_ai::{Message, Role};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_layer_does_not_load_an_unbounded_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-memory-huge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("memory.md");
+        fs::write(&path, format!("{MEMORY_HEADER}\n{}", "x".repeat(200_000))).unwrap();
+        let body = read_layer(&path);
+        assert!(
+            body.len() <= MAX_LAYER_READ_BYTES,
+            "memory layer read must be capped: {}",
+            body.len()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn cap_memory_trims_and_backstops() {

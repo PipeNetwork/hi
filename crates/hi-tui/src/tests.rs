@@ -2465,7 +2465,7 @@ fn streamed_table_commits_aligned_after_it_ends() {
     );
     // A following non-table line flushes the table as an aligned block.
     app.stream(ratatui::style::Style::default(), true, "after\n");
-    let texts: Vec<String> = app.transcript.iter().map(|e| e.text()).collect();
+    let texts = flatten_texts(&app, false, false);
     assert_eq!(
         texts.len(),
         4,
@@ -3335,6 +3335,8 @@ fn session_render_snapshots_cover_responsive_chrome() {
     for (width, height) in [(120, 24), (64, 14), (24, 8)] {
         let mut app = test_app("openai", "gpt-4o");
         app.push_user_prompt(Line::raw("review the responsive layout"));
+        app.page_flip_on_send = false;
+        app.following = true;
         app.transcript.push(TranscriptEntry::Assistant(Line::raw(
             "The layout is stable.",
         )));
@@ -3445,20 +3447,27 @@ fn transcript_roles_get_display_gutters_without_polluting_copy_text() {
     let assistant = app
         .transcript
         .iter()
-        .find(|entry| matches!(entry, TranscriptEntry::Assistant(_)))
+        .find(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::Assistant(_) | TranscriptEntry::AssistantMessage { .. }
+            )
+        })
         .unwrap();
     let assistant_lines = assistant.flatten(false, false, Density::Comfortable);
     assert_eq!(crate::render::line_text(&assistant_lines[0]), "answer");
-    assert_eq!(assistant.text(), "answer");
+    assert_eq!(assistant.text().trim(), "answer");
 
     let reasoning = app
         .transcript
         .iter()
         .find(|entry| matches!(entry, TranscriptEntry::Reasoning { .. }))
         .unwrap();
+    let thought =
+        crate::render::line_text(&reasoning.flatten(true, false, Density::Comfortable)[0]);
     assert!(
-        crate::render::line_text(&reasoning.flatten(true, false, Density::Comfortable)[0])
-            .starts_with("┃ ⏺")
+        thought.contains("thought") || thought.contains("Thinking"),
+        "{thought}"
     );
 
     let tool = app.transcript.last().unwrap();
@@ -3755,7 +3764,12 @@ fn markdown_headings_gain_space_in_the_transcript() {
         text: "intro\n## Section\nbody".into(),
     });
     app.apply(UiEvent::AssistantEnd);
-    let texts: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    let texts: Vec<String> = app
+        .transcript
+        .iter()
+        .flat_map(|e| e.flatten(false, false, crate::Density::Comfortable))
+        .map(|line| crate::render::line_text(&line))
+        .collect();
     assert_eq!(
         texts,
         vec![
@@ -4684,6 +4698,63 @@ fn consecutive_edits_to_the_same_path_coalesce() {
 }
 
 #[test]
+fn assistant_end_collapses_streamed_reply_into_one_message() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Text {
+        text: "hello\nworld".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+    let messages: Vec<_> = app
+        .transcript
+        .iter()
+        .filter(|e| matches!(e, TranscriptEntry::AssistantMessage { .. }))
+        .collect();
+    assert_eq!(
+        messages.len(),
+        1,
+        "{:?}",
+        app.transcript
+            .iter()
+            .map(TranscriptEntry::text)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(messages[0].text(), "hello\nworld");
+}
+
+#[test]
+fn page_flip_pins_sent_prompt_when_working() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.following = true;
+    for i in 0..20 {
+        app.transcript
+            .push(TranscriptEntry::Assistant(Line::raw(format!("pad {i}"))));
+    }
+    app.working = true;
+    app.push_user_prompt(Line::raw("new task"));
+    assert!(app.page_flip_on_send);
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    for i in 0..30 {
+        app.transcript
+            .push(TranscriptEntry::Assistant(Line::raw(format!("later {i}"))));
+    }
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    assert!(
+        !app.following,
+        "page-flip stays unpinned so the reply grows under the prompt"
+    );
+    let screen = dump(&terminal);
+    assert!(
+        screen.contains("new task"),
+        "sent prompt must stay visible after page-flip:\n{screen}"
+    );
+    assert!(
+        !screen.contains("later 29"),
+        "must not jump to the tail while page-flipped:\n{screen}"
+    );
+}
+
+#[test]
 fn markdown_heading_and_list_gain_blank_lines() {
     let mut app = test_app("openai", "gpt-4o");
     app.apply(UiEvent::Text {
@@ -5449,7 +5520,7 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
         result: output,
     });
 
-    // Collapsed (default): one Run line, no stdout dump.
+    // Collapsed (default): Run header + first 2 / last 3, not the full dump.
     let collapsed: Vec<String> = app
         .transcript
         .iter()
@@ -5461,12 +5532,12 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
         "collapsed run header: {collapsed:?}"
     );
     assert!(
-        !collapsed.iter().any(|l| l.contains("line 0")),
-        "stdout stays folded: {collapsed:?}"
+        collapsed.iter().any(|l| l.contains("… +")),
+        "middle stdout is folded: {collapsed:?}"
     );
     assert!(
-        !collapsed.iter().any(|l| l.contains("line 39")),
-        "the tail is folded away when collapsed"
+        !collapsed.iter().any(|l| l.contains("line 20")),
+        "the middle is folded away when collapsed: {collapsed:?}"
     );
 
     // Expanded (Ctrl-O / show_tool_output): the full body, no footer.

@@ -445,6 +445,8 @@ pub(crate) fn write_report(
         "reasoning_signature_replayed": tel.reasoning_signature_replayed,
         "reasoning_fallback": tel.reasoning_fallback,
         "refusal_source": tel.refusal_source,
+        "requests": tel.requests,
+        "compaction": tel.compaction,
     });
     let planned_stages = agent
         .resolved_verification_stages()

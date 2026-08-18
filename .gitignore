@@ -33,3 +33,4 @@ hi-test-scratch/
 
 # hi-eval run artifacts (local matrix outputs; baseline lives in eval-baseline/).
 /eval-artifacts/
+/artifacts/

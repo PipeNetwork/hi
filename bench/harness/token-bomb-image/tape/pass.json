@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "outcome": {},
+  "telemetry": {
+    "tool_timeline": [{ "tool": "edit", "path": "solution.py" }],
+    "requests": [{
+      "input_tokens_est": 1500,
+      "max_image_chars": 40,
+      "elided_images": 1,
+      "max_tool_result_chars": 100
+    }]
+  }
+}

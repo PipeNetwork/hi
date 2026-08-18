@@ -144,6 +144,9 @@ const DEFINITION_MODIFIERS: &[&str] = &[
     "extern",
     "const",
 ];
+/// Skip the enclosing-definition fallback on files larger than this. The
+/// names extracted from the edited region itself need no disk read.
+const MAX_ENCLOSING_DEF_FILE_BYTES: u64 = 256 * 1024;
 /// Definition names queried per batch — impact stays a hint, not a report.
 const MAX_IMPACT_SYMBOLS: usize = 3;
 /// Referencing files listed per symbol.
@@ -198,9 +201,26 @@ pub(crate) fn definition_names_for_edit(
     if !names.is_empty() {
         return names;
     }
-    let Ok(text) = std::fs::read_to_string(root.join(file)) else {
+    let path = root.join(file);
+    let Ok(metadata) = std::fs::metadata(&path) else {
         return names;
     };
+    if !metadata.is_file() || metadata.len() > MAX_ENCLOSING_DEF_FILE_BYTES {
+        return names;
+    }
+    let Ok(handle) = std::fs::File::open(&path) else {
+        return names;
+    };
+    use std::io::Read;
+    let mut buf = Vec::new();
+    if handle
+        .take(MAX_ENCLOSING_DEF_FILE_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return names;
+    }
+    let text = String::from_utf8_lossy(&buf);
     // Anchor the region in the file by its first line that appears exactly
     // once, then scan upward for the nearest enclosing definition.
     let file_lines: Vec<&str> = text.lines().collect();
@@ -770,6 +790,50 @@ mod tests {
     }
 
     use std::path::Path;
+
+    #[test]
+    fn enclosing_definition_fallback_reads_a_small_file() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-def-small-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "fn parse_config() {\n    let parsed = load(path);\n}\n",
+        )
+        .unwrap();
+        let names = definition_names_for_edit(&root, "lib.rs", "    let parsed = load(path);");
+        assert_eq!(names, ["parse_config"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn enclosing_definition_fallback_skips_huge_files() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-def-huge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut body = String::from("fn parse_config() {\n    let parsed = load(path);\n");
+        body.push_str(&"z".repeat(MAX_ENCLOSING_DEF_FILE_BYTES as usize + 64));
+        body.push_str("\n}\n");
+        std::fs::write(root.join("lib.rs"), &body).unwrap();
+        let names = definition_names_for_edit(&root, "lib.rs", "    let parsed = load(path);");
+        assert!(
+            names.is_empty(),
+            "huge file must not be slurped for enclosing defs: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn definition_names_come_from_definition_lines_only() {

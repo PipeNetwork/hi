@@ -299,6 +299,18 @@ pub struct EvaluationSummary {
     pub cost_per_solved: Option<f64>,
     /// Mean total tokens across solved cells only (None if none solved).
     pub tokens_per_solved: Option<f64>,
+    /// Fraction of judged candidates whose process rules passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_pass_rate: Option<f64>,
+    /// Fraction of judged candidates whose budget rules passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_pass_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_tokens_p95: Option<u64>,
+    #[serde(default)]
+    pub write_overwrite_violations: u64,
+    #[serde(default)]
+    pub image_elision_misses: u64,
     /// Candidate failure buckets (no-edits / compile / logic / error).
     pub failure_buckets: FailureBucketCounts,
     #[serde(default)]
@@ -461,10 +473,64 @@ pub fn evaluation_summary(
             .filter(|_| solved_cell_count > 0)
             .map(|cost| cost / solved_cell_count as f64),
         tokens_per_solved,
+        process_pass_rate: judge_rate(results, "process"),
+        budget_pass_rate: judge_rate(results, "budget"),
+        max_request_tokens_p95: max_request_tokens_p95(results),
+        write_overwrite_violations: judge_violation_count(
+            results,
+            &["write_overwrite", "forbid_tools.write"],
+        ),
+        image_elision_misses: judge_violation_count(results, &["image_elision"]),
         failure_buckets,
         diagnostics,
         groups,
     }
+}
+
+fn judge_rate(results: &[RunResult], field: &str) -> Option<f64> {
+    let judged: Vec<&serde_json::Value> = results
+        .iter()
+        .flat_map(|row| &row.candidates)
+        .filter_map(|candidate| candidate.judge.as_ref())
+        .collect();
+    if judged.is_empty() {
+        return None;
+    }
+    let passes = judged
+        .iter()
+        .filter(|report| report.get(field).and_then(|v| v.as_str()) == Some("pass"))
+        .count();
+    Some(ratio(passes, judged.len()))
+}
+
+fn judge_violation_count(results: &[RunResult], needles: &[&str]) -> u64 {
+    results
+        .iter()
+        .flat_map(|row| &row.candidates)
+        .filter_map(|candidate| candidate.judge.as_ref())
+        .filter_map(|report| report.get("violations"))
+        .filter_map(|v| v.as_array())
+        .flatten()
+        .filter(|v| {
+            v.get("rule")
+                .and_then(|r| r.as_str())
+                .is_some_and(|rule| needles.iter().any(|needle| rule.contains(needle)))
+        })
+        .count() as u64
+}
+
+fn max_request_tokens_p95(results: &[RunResult]) -> Option<u64> {
+    let mut values: Vec<u64> = results
+        .iter()
+        .flat_map(|row| &row.candidates)
+        .filter_map(|candidate| candidate.max_request_tokens)
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let idx = ((values.len() as f64 - 1.0) * 0.95).ceil() as usize;
+    Some(values[idx.min(values.len() - 1)])
 }
 
 fn diagnostic_counts(results: &[RunResult]) -> DiagnosticCounts {

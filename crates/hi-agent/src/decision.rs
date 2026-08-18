@@ -31,6 +31,10 @@ pub struct Decision {
 /// decisions age out first — the recent ones are most likely to still govern
 /// the work in progress.
 const MAX_DECISIONS: usize = 12;
+const MAX_SUMMARY_CHARS: usize = 200;
+const MAX_RATIONALE_CHARS: usize = 400;
+const MAX_DECISION_FILES: usize = 8;
+const MAX_DECISION_FILE_CHARS: usize = 160;
 
 /// The durable decision log. Injected into the system prompt each turn;
 /// compaction-immune (it's not part of the summarizable history).
@@ -54,6 +58,7 @@ impl DecisionLog {
     /// earlier one is replaced (the model is re-stating/refining a decision,
     /// not adding a duplicate).
     pub fn record(&mut self, decision: Decision) {
+        let decision = clip_decision(decision);
         // Replace an existing entry with the same summary rather than
         // accumulating duplicates.
         if let Some(existing) = self
@@ -101,6 +106,25 @@ impl DecisionLog {
         }
         Some(out)
     }
+}
+
+fn clip_decision(mut decision: Decision) -> Decision {
+    decision.summary = clip_chars(&decision.summary, MAX_SUMMARY_CHARS);
+    decision.rationale = clip_chars(&decision.rationale, MAX_RATIONALE_CHARS);
+    decision.files.truncate(MAX_DECISION_FILES);
+    for file in &mut decision.files {
+        *file = clip_chars(file, MAX_DECISION_FILE_CHARS);
+    }
+    decision
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{clipped}…")
 }
 
 #[cfg(test)]
@@ -162,6 +186,34 @@ mod tests {
         assert!(
             section.contains("src/config.rs, src/main.rs"),
             "files: {section}"
+        );
+    }
+
+    #[test]
+    fn record_clips_unbounded_fields() {
+        let mut log = DecisionLog::default();
+        log.record(Decision {
+            summary: "S".repeat(500),
+            rationale: "R".repeat(2_000),
+            files: (0..20)
+                .map(|i| format!("crates/hi-agent/src/{i:03}-very-long-path.rs"))
+                .collect(),
+        });
+        let entry = &log.entries()[0];
+        assert!(entry.summary.chars().count() <= MAX_SUMMARY_CHARS);
+        assert!(entry.rationale.chars().count() <= MAX_RATIONALE_CHARS);
+        assert_eq!(entry.files.len(), MAX_DECISION_FILES);
+        assert!(
+            entry
+                .files
+                .iter()
+                .all(|f| f.chars().count() <= MAX_DECISION_FILE_CHARS)
+        );
+        let section = log.prompt_section().unwrap();
+        assert!(
+            section.chars().count() < 4_000,
+            "decision prompt section must stay small: {}",
+            section.chars().count()
         );
     }
 }

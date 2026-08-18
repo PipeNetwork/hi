@@ -787,6 +787,7 @@ impl crate::Agent {
 }
 
 fn decision_tool_outcome(content: String, status: hi_tools::ToolStatus) -> hi_tools::ToolOutcome {
+    let (content, truncation) = hi_tools::bound_tool_content(content);
     hi_tools::ToolOutcome {
         content,
         display: None,
@@ -795,6 +796,6 @@ fn decision_tool_outcome(content: String, status: hi_tools::ToolStatus) -> hi_to
         process: None,
         background: None,
         effects: hi_tools::ToolEffects::default(),
-        truncation: hi_tools::TruncationState::Complete,
+        truncation,
     }
 }

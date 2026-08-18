@@ -1,0 +1,5 @@
+[process]
+require_tools = ["edit"]
+no_root_cargo_test = true
+[budget]
+max_tool_result_chars = 50000

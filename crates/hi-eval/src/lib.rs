@@ -4,6 +4,7 @@ pub mod agent_path;
 pub mod backends;
 pub mod config;
 pub mod differential;
+pub mod judge;
 pub mod platform;
 
 pub use platform::{

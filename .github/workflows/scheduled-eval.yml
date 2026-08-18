@@ -50,3 +50,45 @@ jobs:
           path: artifacts/eval
           if-no-files-found: error
           retention-days: 90
+
+  # Separate job and summary so outcome rates cannot be averaged with
+  # process/budget. Replay stays in Core CI; this is the live tape.
+  evaluate-harness:
+    name: harness process + budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build core binaries
+        run: cargo build --release -p hi -p hi-eval
+
+      - name: Run harness suite (verify, one trial)
+        env:
+          HI_BIN: target/release/hi
+          HI_MODEL: ${{ vars.HI_EVAL_MODEL }}
+          HI_API_KEY: ${{ secrets.HI_EVAL_API_KEY }}
+          HI_BASE_URL: ${{ vars.HI_EVAL_BASE_URL }}
+          HI_STATE_DIR: ${{ runner.temp }}/hi-state
+          HI_EVAL_CONCURRENCY: "2"
+        run: >-
+          target/release/hi-eval bench/harness
+          --trials=1
+          --configs=verify
+          --artifacts=artifacts/harness
+
+      - name: Enforce harness process/budget gates
+        run: scripts/check_harness_regression.sh artifacts/harness eval-baseline/harness.json
+
+      - name: Upload harness artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-eval-${{ github.run_id }}
+          path: artifacts/harness
+          if-no-files-found: error
+          retention-days: 90

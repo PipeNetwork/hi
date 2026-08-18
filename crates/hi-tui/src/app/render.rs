@@ -1282,11 +1282,17 @@ impl crate::App {
             self.scroll = want.min(max_scroll as u32) as u16;
             self.following = false;
         }
-        let scroll = if self.following || self.scroll >= max_scroll {
-            self.following = true;
+        if self.page_flip_on_send && self.working {
+            if let Some(&idx) = self.view_cache.prompt_line_starts.last() {
+                self.scroll = self.view_cache.prefix.get(idx).copied().unwrap_or(0) as u16;
+                self.following = false;
+            }
+        }
+        let scroll = if self.following {
+            self.page_flip_on_send = false;
             max_scroll
         } else {
-            self.scroll
+            self.scroll.min(max_scroll)
         };
 
         // Virtualize: only paint the viewport ± overscan lines.
@@ -2467,6 +2473,13 @@ impl crate::App {
 
         for entry in &self.transcript {
             if matches!(entry, crate::TranscriptEntry::UserPrompt { .. }) {
+                if !lines.is_empty()
+                    && !lines
+                        .last()
+                        .is_some_and(|l| crate::render::line_text(l).trim().is_empty())
+                {
+                    lines.push(Line::raw(""));
+                }
                 prompt_line_starts.push(lines.len());
             }
             let ord = if entry.is_foldable() {
@@ -2593,6 +2606,16 @@ impl crate::App {
         let mut tool_ord = block_line_ranges.last().map(|(_, _, o)| o + 1).unwrap_or(0);
         for entry in &self.transcript[start_entry..] {
             if matches!(entry, crate::TranscriptEntry::UserPrompt { .. }) {
+                if !lines.is_empty()
+                    && !lines
+                        .last()
+                        .is_some_and(|l| crate::render::line_text(l).trim().is_empty())
+                {
+                    let h = wrapped_line_height(&Line::raw(""), inner_w) as u32;
+                    let cum = prefix.last().copied().unwrap_or(0).saturating_add(h);
+                    prefix.push(cum);
+                    lines.push(Line::raw(""));
+                }
                 prompt_line_starts.push(lines.len());
             }
             let ord = if entry.is_foldable() {

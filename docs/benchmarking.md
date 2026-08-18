@@ -56,6 +56,30 @@ hi eval run --manifest evals/manifest.toml --profile hygiene
 Corpus: `bench/tasks/hygiene-*`. Claim level `smoke`, host backend. Oracles
 fail sprawl / manifest edits / file-growth; they do not change SWE grading.
 
+## Harness judge (process + budget)
+
+`bench/harness` is a small corpus whose `judge.toml` files score the `--report`
+tape: tool shape, verify, rereads, image/result caps. Outcome oracles stay
+independent — a run can pass tests and fail process.
+
+```bash
+cargo run -p hi-eval -- judge --suite bench/harness   # no provider
+scripts/check_harness_regression.sh
+cargo run -p hi-eval -- --validate bench/harness
+```
+
+`--report` now includes `telemetry.requests[]` (per-send census) and extra
+`tool_timeline` size/kind fields. User message size is recorded and is never
+a budget fail. Live harness tasks may set `[run] steps` / `seed_image_chars`
+in `judge.toml` (or `HI_EVAL_RESUME=1`) so hi-eval resumes the same
+`--session-file`; `bench/tasks` stays single-shot.
+
+Core CI replays committed tapes (`scripts/check_harness_regression.sh`).
+The Monday scheduled workflow runs `bench/harness` as a **separate job**
+(`evaluate-harness`) and compares `artifacts/harness/summary.json` to
+`eval-baseline/harness.json`. Do not fold those rates into the SWE /
+`bench/tasks` summary.
+
 ## Harness-effect diagnostics
 
 The ordinary report remains `schema_version: 2`; new fields are additive so

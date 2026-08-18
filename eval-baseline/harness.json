@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "note": "Measured 2026-08-17 live run: grok-4.3 / xai, --configs=verify, --trials=1. Outcome 9/10 (self-similar still edits bug/solution.py). Process/budget are the harness gate; do not average with solve_rate.",
+  "captured_at": "2026-08-17",
+  "model": "xai/grok-4.3",
+  "config": "verify",
+  "trials": 1,
+  "process_pass_rate": 1.0,
+  "budget_pass_rate": 1.0,
+  "write_overwrite_violations": 0,
+  "image_elision_misses": 0,
+  "max_request_tokens_p95": 12568,
+  "solve_rate": 0.9
+}

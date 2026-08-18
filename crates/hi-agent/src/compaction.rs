@@ -18,6 +18,10 @@ pub const DEFAULT_KEEP_RECENT: usize = 3;
 const ELIDE_MIN_CHARS: usize = 200;
 /// Marker an elided output starts with, so elision is idempotent.
 const ELIDED_MARK: &str = "[elided";
+/// Payload fields on executed `write`/`edit`/`apply_patch`/`bash` calls. Below
+/// this, a short command or identifier stays; above it, the bytes are already
+/// on disk (or in the tool result) and must not be resent every round.
+const ELIDE_ARG_MIN_CHARS: usize = 400;
 
 /// How a turn's history is compacted when the context fills up.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,17 +208,86 @@ pub(crate) fn elide_tool_outputs(messages: &mut [Message], up_to: usize) -> usiz
     }
     for message in &mut messages[1..up_to] {
         for block in &mut message.content {
-            if let Content::ToolResult { call_id, output } = block
-                && output.len() > ELIDE_MIN_CHARS
-                && !output.starts_with(ELIDED_MARK)
-            {
-                let lines = output.lines().count();
-                let name = names.get(call_id).map_or("tool", String::as_str);
-                freed += output.len();
-                *output = format!("{ELIDED_MARK} {name} output — was {lines} lines]");
+            match block {
+                Content::ToolResult { call_id, output }
+                    if output.len() > ELIDE_MIN_CHARS && !output.starts_with(ELIDED_MARK) =>
+                {
+                    let lines = output.lines().count();
+                    let name = names.get(call_id).map_or("tool", String::as_str);
+                    freed += output.len();
+                    *output = format!("{ELIDED_MARK} {name} output — was {lines} lines]");
+                }
+                Content::ToolCall { arguments, .. } => {
+                    freed += elide_old_tool_arguments_in(arguments);
+                }
+                Content::Thinking { text, .. } => {
+                    freed += elide_old_thinking_in(text);
+                }
+                Content::Image { .. } => {
+                    freed += elide_old_image(block);
+                }
+                _ => {}
             }
         }
     }
+    freed
+}
+
+/// Stub bulky tool-call payloads in `messages[1..up_to]` without touching
+/// results. Used on session resume so recent writes stay quoteable.
+pub(crate) fn elide_old_tool_arguments(messages: &mut [Message], up_to: usize) -> usize {
+    let up_to = up_to.min(messages.len());
+    if up_to <= 1 {
+        return 0;
+    }
+    let mut freed = 0;
+    for message in &mut messages[1..up_to] {
+        for block in &mut message.content {
+            match block {
+                Content::ToolCall { arguments, .. } => {
+                    freed += elide_old_tool_arguments_in(arguments);
+                }
+                Content::Thinking { text, .. } => {
+                    freed += elide_old_thinking_in(text);
+                }
+                Content::Image { .. } => {
+                    freed += elide_old_image(block);
+                }
+                _ => {}
+            }
+        }
+    }
+    freed
+}
+
+const ELIDE_THINKING_MIN_CHARS: usize = 400;
+
+fn elide_old_thinking_in(text: &mut String) -> usize {
+    if text.chars().count() <= ELIDE_THINKING_MIN_CHARS || text.starts_with("[elided thinking") {
+        return 0;
+    }
+    let n = text.chars().count();
+    let freed = text.len();
+    *text = format!("[elided thinking — was {n} chars]");
+    freed
+}
+
+fn elide_old_image(block: &mut Content) -> usize {
+    let Content::Image { data, .. } = block else {
+        return 0;
+    };
+    let n = data.chars().count();
+    let freed = data.len();
+    *block = Content::Text(format!("[elided image — was {n} chars]"));
+    freed
+}
+
+fn elide_old_tool_arguments_in(arguments: &mut String) -> usize {
+    let Some(shrunk) = shrink_tool_arguments(arguments) else {
+        return 0;
+    };
+    let freed = arguments.len().saturating_sub(shrunk.len());
+    *arguments = shrunk;
     freed
 }
 
@@ -231,6 +304,20 @@ pub(crate) fn elide_tool_outputs_except_recent(
     }
 
     let names = tool_names(messages);
+    let mut recent_ids = std::collections::HashSet::new();
+    let mut kept = 0usize;
+    'outer: for message in messages.iter().rev() {
+        for block in message.content.iter().rev() {
+            if let Content::ToolResult { call_id, .. } = block {
+                recent_ids.insert(call_id.clone());
+                kept += 1;
+                if kept >= keep_recent_results {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
     let mut seen = 0usize;
     for message in messages.iter().rev() {
         for block in message.content.iter().rev() {
@@ -243,22 +330,86 @@ pub(crate) fn elide_tool_outputs_except_recent(
     let mut eligible = seen.saturating_sub(keep_recent_results);
     let mut freed = 0usize;
     for message in &mut messages[1..] {
+        let keep_thinking = message
+            .content
+            .iter()
+            .any(|c| matches!(c, Content::ToolCall { id, .. } if recent_ids.contains(id)));
         for block in &mut message.content {
-            if let Content::ToolResult { call_id, output } = block {
-                if eligible == 0 {
-                    return freed;
+            match block {
+                Content::ToolResult { call_id, output } if eligible > 0 => {
+                    eligible -= 1;
+                    if output.len() > ELIDE_MIN_CHARS && !output.starts_with(ELIDED_MARK) {
+                        let lines = output.lines().count();
+                        let name = names.get(call_id).map_or("tool", String::as_str);
+                        freed += output.len();
+                        *output = format!("{ELIDED_MARK} {name} output — was {lines} lines]");
+                    }
                 }
-                eligible -= 1;
-                if output.len() > ELIDE_MIN_CHARS && !output.starts_with(ELIDED_MARK) {
-                    let lines = output.lines().count();
-                    let name = names.get(call_id).map_or("tool", String::as_str);
-                    freed += output.len();
-                    *output = format!("{ELIDED_MARK} {name} output — was {lines} lines]");
+                Content::ToolCall { id, arguments, .. } if !recent_ids.contains(id) => {
+                    freed += elide_old_tool_arguments_in(arguments);
                 }
+                Content::Thinking { text, .. } if !keep_thinking => {
+                    freed += elide_old_thinking_in(text);
+                }
+                _ => {}
             }
         }
     }
     freed
+}
+
+/// Shrink bulky string fields on an executed tool call so the payload is not
+/// resent on every later model round. Keeps JSON valid and leaves identifiers
+/// (`path`, `id`, `name`, …) intact.
+pub(crate) fn shrink_tool_arguments(arguments: &str) -> Option<String> {
+    if arguments.len() <= ELIDE_ARG_MIN_CHARS {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let mut changed = false;
+    shrink_json_strings(&mut value, &mut changed);
+    if !changed {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+fn shrink_json_strings(value: &mut serde_json::Value, changed: &mut bool) {
+    match value {
+        serde_json::Value::String(s) => {
+            if s.chars().count() > ELIDE_ARG_MIN_CHARS && !s.starts_with("[elided") {
+                let n = s.chars().count();
+                *s = format!("[elided — {n} chars]");
+                *changed = true;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                shrink_json_strings(item, changed);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if matches!(
+                    key.as_str(),
+                    "path"
+                        | "paths"
+                        | "id"
+                        | "name"
+                        | "server"
+                        | "tool"
+                        | "status"
+                        | "title"
+                        | "glob"
+                        | "pattern"
+                ) {
+                    continue;
+                }
+                shrink_json_strings(item, changed);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +463,158 @@ mod tests {
         ));
         assert_eq!(CompactionKind::from_arg(""), None);
         assert_eq!(CompactionKind::from_arg("bogus"), None);
+    }
+
+    #[test]
+    fn shrink_tool_arguments_stubs_write_payload_and_keeps_path() {
+        let args = serde_json::json!({
+            "path": "src/lib.rs",
+            "content": "fn main() {}\n".repeat(80),
+        })
+        .to_string();
+        let shrunk = shrink_tool_arguments(&args).expect("large write should shrink");
+        let value: serde_json::Value = serde_json::from_str(&shrunk).unwrap();
+        assert_eq!(value["path"], "src/lib.rs");
+        let content = value["content"].as_str().unwrap();
+        assert!(content.starts_with("[elided"), "{content}");
+        assert!(content.contains("chars"), "{content}");
+        assert!(
+            shrunk.len() < args.len() / 4,
+            "payload must drop: {} vs {}",
+            shrunk.len(),
+            args.len()
+        );
+        assert!(shrink_tool_arguments(&shrunk).is_none(), "idempotent");
+        assert!(shrink_tool_arguments(r#"{"path":"a.rs","content":"short"}"#).is_none());
+    }
+
+    #[test]
+    fn elide_shrinks_old_write_arguments_with_results() {
+        let mut m = vec![
+            Message::system("sys"),
+            Message::user("write it"),
+            Message::assistant(vec![Content::ToolCall {
+                id: "w1".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({"path":"a.rs","content":"x".repeat(800)}).to_string(),
+            }]),
+            Message::tool_result("w1", "wrote a.rs"),
+        ];
+        let len = m.len();
+        let freed = elide_tool_outputs(&mut m, len);
+        assert!(freed > 0, "should reclaim write payload");
+        let Content::ToolCall { arguments, .. } = &m[2].content[0] else {
+            panic!("expected tool call");
+        };
+        assert!(arguments.contains("a.rs"), "{arguments}");
+        assert!(arguments.contains("[elided"), "{arguments}");
+        assert!(!arguments.contains(&"x".repeat(800)), "{arguments}");
+    }
+
+    #[test]
+    fn in_turn_elide_keeps_recent_write_arguments() {
+        let recent_args = serde_json::json!({
+            "path": "new.rs",
+            "content": "y".repeat(800),
+        })
+        .to_string();
+        let mut m = vec![Message::system("sys"), Message::user("q")];
+        m.push(Message::assistant(vec![Content::ToolCall {
+            id: "old".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"path":"old.rs","content":"x".repeat(800)}).to_string(),
+        }]));
+        m.push(Message::tool_result("old", "wrote old.rs"));
+        m.push(Message::assistant(vec![Content::ToolCall {
+            id: "new".into(),
+            name: "write".into(),
+            arguments: recent_args.clone(),
+        }]));
+        m.push(Message::tool_result("new", "wrote new.rs"));
+        let freed = elide_tool_outputs_except_recent(&mut m, 1);
+        assert!(freed > 0);
+        let Content::ToolCall { arguments: old, .. } = &m[2].content[0] else {
+            panic!("old call");
+        };
+        let Content::ToolCall { arguments: new, .. } = &m[4].content[0] else {
+            panic!("new call");
+        };
+        assert!(old.contains("[elided"), "{old}");
+        assert_eq!(new, &recent_args, "newest write must stay quoteable");
+    }
+
+    fn user_with_image(text: &str, data: String) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![
+                Content::Text(text.into()),
+                Content::Image {
+                    data,
+                    media_type: "image/png".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn elide_stubs_old_images_and_keeps_recent() {
+        let mut m = vec![
+            Message::system("sys"),
+            user_with_image("old shot", "A".repeat(2_000)),
+            Message::assistant(vec![Content::Text("ok".into())]),
+            user_with_image("new shot", "B".repeat(400)),
+            Message::assistant(vec![Content::Text("done".into())]),
+        ];
+        let split = recent_split(&m, 1).unwrap();
+        let freed = elide_tool_outputs(&mut m, split);
+        assert!(freed > 0);
+        assert!(
+            matches!(&m[1].content[1], Content::Text(text) if text.starts_with("[elided image")),
+            "old image stubbed: {:?}",
+            m[1].content[1]
+        );
+        assert!(
+            matches!(&m[3].content[1], Content::Image { data, .. } if data == &"B".repeat(400)),
+            "recent image stays"
+        );
+        assert_eq!(elide_tool_outputs(&mut m, split), 0, "idempotent");
+    }
+
+    #[test]
+    fn elide_stubs_old_thinking_and_keeps_recent() {
+        let mut m = vec![
+            Message::system("sys"),
+            Message::user("q1"),
+            Message::assistant(vec![Content::Thinking {
+                text: "T".repeat(800),
+                signature: Some("sig-old".into()),
+            }]),
+            Message::user("q2"),
+            Message::assistant(vec![
+                Content::Thinking {
+                    text: "U".repeat(800),
+                    signature: Some("sig-new".into()),
+                },
+                Content::ToolCall {
+                    id: "c-new".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            ]),
+            Message::tool_result("c-new", "ok"),
+        ];
+        let split = recent_split(&m, 1).unwrap();
+        let freed = elide_tool_outputs(&mut m, split);
+        assert!(freed > 0);
+        let Content::Thinking { text, signature } = &m[2].content[0] else {
+            panic!("old thinking");
+        };
+        assert!(text.starts_with("[elided thinking"), "{text}");
+        assert_eq!(signature.as_deref(), Some("sig-old"));
+        let Content::Thinking { text, .. } = &m[4].content[0] else {
+            panic!("new thinking");
+        };
+        assert_eq!(text, &"U".repeat(800), "recent thinking stays");
     }
 
     #[test]

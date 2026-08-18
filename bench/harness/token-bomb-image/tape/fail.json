@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "outcome": {},
+  "telemetry": {
+    "tool_timeline": [],
+    "requests": [{
+      "input_tokens_est": 4000,
+      "max_image_chars": 2000000,
+      "elided_images": 0,
+      "max_tool_result_chars": 0
+    }]
+  }
+}

@@ -1370,6 +1370,8 @@ impl crate::Agent {
         self.report.last_turn_telemetry.reasoning_fallback = model_telemetry.reasoning_fallback;
         self.report.last_turn_telemetry.refusal_source = model_telemetry.refusal_source;
         self.report.last_turn_telemetry.wire_audit = model_telemetry.wire_audit;
+        self.report.last_turn_telemetry.requests = model_telemetry.requests;
+        self.report.last_turn_telemetry.compaction = model_telemetry.compaction;
         self.report.last_turn_telemetry.phase_latencies = turn.phase_latencies.clone();
         self.report.last_turn_telemetry.checkpoint_available = turn
             .turn_checkpoint_allowed

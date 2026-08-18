@@ -110,6 +110,7 @@ impl crate::App {
             multiline_mode: true,
             timeline_enabled: true,
             timestamps_enabled: true,
+            page_flip_on_send: false,
             total_when_unpinned: 0,
             working: false,
             spinner: 0,

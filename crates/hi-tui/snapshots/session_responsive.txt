@@ -1,12 +1,12 @@
 --- 120x24 ---
 
-  /workspace                                                                                        sandbox off │ undo
+  /workspace                                                                                            sandbox │ undo
 
   ❯ review the responsive layout
   The layout is stable.
-  ┃ ⏺ thought for 3s  (Ctrl-T to expand)
+    thought for 3s
+    Check spacing and preserve the active input.
   ┃ … +17 more lines · Ctrl-O to expand
-
 
 
 
@@ -24,10 +24,10 @@
   ctrl+c:interrupt  │  Shift+Tab:mode  │  ?:help
 
 --- 64x14 ---
-  /workspace                                sandbox off │ undo
-  ❯ review the responsive layout
+  /workspace                                    sandbox │ undo
   The layout is stable.
-  ┃ ⏺ thought for 3s  (Ctrl-T to expand)
+    thought for 3s
+    Check spacing and preserve the active input.
   ┃ … +17 more lines · Ctrl-O to expand
   ⠋ Working… 0s                                         [stop]
 

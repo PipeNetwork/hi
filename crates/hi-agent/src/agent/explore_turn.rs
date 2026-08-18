@@ -17,15 +17,16 @@ pub(crate) fn explore_tool_outcome(
     content: impl Into<String>,
     status: hi_tools::ToolStatus,
 ) -> hi_tools::ToolOutcome {
+    let (content, truncation) = hi_tools::bound_tool_content(content.into());
     hi_tools::ToolOutcome {
-        content: content.into(),
+        content,
         display: None,
         plan: None,
         status,
         process: None,
         background: None,
         effects: hi_tools::ToolEffects::default(),
-        truncation: hi_tools::TruncationState::Complete,
+        truncation,
     }
 }
 
@@ -344,15 +345,26 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
     }
 }
 
+const MAX_EXPLORE_TASK_CHARS: usize = 2_000;
+
 fn explore_child_prompt(task: &str) -> String {
     // Deliberately plain phrasing: the child's read-only restriction and
     // inspection-sprawl cap come from its task contract and capability scope,
     // not legacy review-intent prompt shaping.
+    let task = clip_chars(task.trim(), MAX_EXPLORE_TASK_CHARS);
     format!(
         "Answer this question about the codebase. Read and search the relevant files as needed, then \
          reply with a concise, self-contained answer that cites the specific files and locations \
          supporting it.\n\nQuestion: {task}"
     )
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{clipped}…")
 }
 
 /// The model explore children run: `HI_EXPLORE_MODEL` env (highest, a live
@@ -392,6 +404,17 @@ pub(crate) fn routed_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explore_child_prompt_clips_a_huge_task() {
+        let prompt = explore_child_prompt(&"TASK ".repeat(2_000));
+        assert!(
+            prompt.chars().count() < MAX_EXPLORE_TASK_CHARS + 400,
+            "{}",
+            prompt.chars().count()
+        );
+        assert!(!prompt.contains(&"TASK ".repeat(500)), "{prompt}");
+    }
 
     #[test]
     fn explore_child_model_prefers_config_route_over_driver() {

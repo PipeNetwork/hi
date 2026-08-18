@@ -596,7 +596,10 @@ fn format_task_results(results: &[hi_tools::BackgroundTaskOutcome]) -> String {
     lines.join("\n")
 }
 
+const MAX_BG_CHILD_PROMPT_CHARS: usize = 2_000;
+
 fn readonly_child_prompt(kind: BgTaskKind, prompt: &str) -> String {
+    let prompt = clip_chars(prompt.trim(), MAX_BG_CHILD_PROMPT_CHARS);
     match kind {
         BgTaskKind::Plan => format!(
             "You are a read-only software architect. Explore the codebase and design an \
@@ -610,6 +613,14 @@ fn readonly_child_prompt(kind: BgTaskKind, prompt: &str) -> String {
              specific files and locations supporting it.\n\nQuestion: {prompt}"
         ),
     }
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{clipped}…")
 }
 
 /// Run a background read-only subagent (`explore` / `plan`) to completion.
@@ -807,6 +818,17 @@ mod format_tests {
             applied: false,
             changed_files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn readonly_child_prompt_clips_a_huge_task() {
+        let prompt = super::readonly_child_prompt(BgTaskKind::Explore, &"TASK ".repeat(2_000));
+        assert!(
+            prompt.chars().count() < super::MAX_BG_CHILD_PROMPT_CHARS + 400,
+            "{}",
+            prompt.chars().count()
+        );
+        assert!(!prompt.contains(&"TASK ".repeat(500)));
     }
 
     #[test]

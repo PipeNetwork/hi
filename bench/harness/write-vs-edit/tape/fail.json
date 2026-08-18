@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "outcome": { "status": "completed" },
+  "telemetry": {
+    "verify_rounds": 0,
+    "tool_timeline": [
+      { "tool": "write", "path": "solution.py", "kind": "mutate", "arg_chars": 200 }
+    ],
+    "requests": [
+      { "input_tokens_est": 900, "max_tool_result_chars": 0, "max_image_chars": 0, "elided_images": 0 }
+    ]
+  }
+}

@@ -2200,6 +2200,10 @@ mod tests {
             progress_reason: "tool returned an error".into(),
             normalized_signature: None,
             command: None,
+            arg_chars: 0,
+            result_chars: 0,
+            truncated: true,
+            kind: "shell".into(),
         };
 
         let records = report_tool_records(&[entry]);

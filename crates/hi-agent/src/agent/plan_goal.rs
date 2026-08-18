@@ -28,6 +28,9 @@ const MAX_REFERENCED_DOCUMENTS: usize = 8;
 /// planner (and the completion auditor, which reuses this) goes blind to a
 /// plan's tail sections. ~256KB ≈ 65k tokens: a big but bounded one-shot call.
 const MAX_DOCUMENT_CONTEXT_BYTES: usize = 256 * 1024;
+/// Side-call copy of the user's objective. The stored goal and transcript
+/// message stay intact; this only bounds what the planner request carries.
+const MAX_PLANNER_OBJECTIVE_CHARS: usize = 32 * 1024;
 
 const PLANNER_PROMPT: &str = "You are a planning assistant for a coding agent. Decompose the \
 user's coding objective into ordered, independently-verifiable implementation milestones — as \
@@ -224,6 +227,7 @@ pub(crate) struct PlannerInput {
 /// filename. Paths are workspace-contained and the combined payload is bounded.
 pub(crate) fn planner_input(root: &Path, objective: &str) -> PlannerInput {
     let contract = crate::TaskContract::derive(objective, crate::VerificationMode::Disabled);
+    let objective = crate::goal::clip_chars(objective, MAX_PLANNER_OBJECTIVE_CHARS);
     let mut documents = Vec::new();
     let mut remaining = MAX_DOCUMENT_CONTEXT_BYTES;
 
@@ -269,7 +273,7 @@ pub(crate) fn planner_input(root: &Path, objective: &str) -> PlannerInput {
 
     if documents.is_empty() {
         return PlannerInput {
-            text: objective.to_string(),
+            text: objective,
             docs: Vec::new(),
         };
     }
@@ -574,6 +578,25 @@ mod tests {
     #[test]
     fn empty_output_yields_nothing() {
         assert!(parse_sub_goals("   \n\n").is_empty());
+    }
+
+    #[test]
+    fn planner_clips_a_huge_objective() {
+        let root = temp_root("huge-objective");
+        let objective = "O".repeat(MAX_PLANNER_OBJECTIVE_CHARS + 200);
+        let input = planner_input(&root, &objective);
+        assert!(
+            input.text.chars().count() <= MAX_PLANNER_OBJECTIVE_CHARS,
+            "planner objective copy must be clipped: {}",
+            input.text.chars().count()
+        );
+        assert!(input.text.starts_with('O'), "{}", &input.text[..8]);
+        assert!(
+            input.text.ends_with('…'),
+            "truncation marker: {}",
+            &input.text[input.text.len().saturating_sub(8)..]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

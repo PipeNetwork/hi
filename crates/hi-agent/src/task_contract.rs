@@ -420,6 +420,9 @@ fn referenced_paths(prompt: &str) -> Vec<String> {
     paths.into_iter().collect()
 }
 
+const MAX_ACCEPTANCE_ITEMS: usize = 8;
+const MAX_ACCEPTANCE_ITEM_CHARS: usize = 200;
+
 fn acceptance_text(prompt: &str) -> Vec<String> {
     prompt
         .split(['\n', '.'])
@@ -438,8 +441,20 @@ fn acceptance_text(prompt: &str) -> Vec<String> {
             .iter()
             .any(|needle| lower.contains(needle))
         })
-        .map(str::to_string)
+        .map(|sentence| clip_acceptance(sentence))
+        .take(MAX_ACCEPTANCE_ITEMS)
         .collect()
+}
+
+fn clip_acceptance(text: &str) -> String {
+    if text.chars().count() <= MAX_ACCEPTANCE_ITEM_CHARS {
+        return text.to_string();
+    }
+    let clipped: String = text
+        .chars()
+        .take(MAX_ACCEPTANCE_ITEM_CHARS.saturating_sub(1))
+        .collect();
+    format!("{clipped}…")
 }
 
 /// Whether free text asks for tests / green CI as part of done.
@@ -671,6 +686,25 @@ mod tests {
         assert!(section.contains("must accept") || section.contains("Done when"));
         let empty = TaskContract::derive("rename the helper", VerificationMode::Auto);
         assert!(empty.acceptance_section().is_none());
+    }
+
+    #[test]
+    fn acceptance_text_caps_count_and_length() {
+        let mut prompt = String::new();
+        for i in 0..20 {
+            prompt.push_str(&format!(
+                "The CLI must {}.\n",
+                "accept this very long acceptance sentence ".repeat(10) + &i.to_string()
+            ));
+        }
+        let contract = TaskContract::derive(&prompt, VerificationMode::Auto);
+        assert_eq!(contract.acceptance_text.len(), MAX_ACCEPTANCE_ITEMS);
+        assert!(
+            contract
+                .acceptance_text
+                .iter()
+                .all(|line| line.chars().count() <= MAX_ACCEPTANCE_ITEM_CHARS)
+        );
     }
 
     #[test]

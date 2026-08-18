@@ -409,6 +409,7 @@ impl crate::App {
                 crate::TranscriptEntry::Line(_)
                 | crate::TranscriptEntry::UserPrompt { .. }
                 | crate::TranscriptEntry::Assistant(_)
+                | crate::TranscriptEntry::AssistantMessage { .. }
                 | crate::TranscriptEntry::ChangedFiles { .. }
                 | crate::TranscriptEntry::Btw { .. }
                 | crate::TranscriptEntry::Workflow { .. }
@@ -716,9 +717,15 @@ impl crate::App {
                 crate::TranscriptEntry::Line(line) | crate::TranscriptEntry::Assistant(line) => {
                     crate::render::line_text(line)
                 }
+                crate::TranscriptEntry::AssistantMessage { text } => {
+                    if let Some(block) = Self::last_fenced_block(text) {
+                        return Some(block);
+                    }
+                    continue;
+                }
                 _ => entry.text(),
             };
-            if let Some(body) = text.strip_prefix("▏ ") {
+            if let Some(body) = text.strip_prefix("▏ ").or_else(|| text.strip_prefix('▏')) {
                 // A code line (interior or fence). Keep collecting.
                 lines.push(body.to_string());
                 found = true;
@@ -748,6 +755,27 @@ impl crate::App {
         } else {
             None
         }
+    }
+
+    fn last_fenced_block(text: &str) -> Option<String> {
+        let mut last: Option<String> = None;
+        let mut current: Option<String> = None;
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                if current.is_some() {
+                    last = current.take();
+                } else {
+                    current = Some(String::new());
+                }
+            } else if let Some(buf) = current.as_mut() {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str(line);
+            }
+        }
+        last.filter(|s| !s.trim().is_empty())
     }
 
     pub(crate) fn copy(&mut self, arg: &str) {

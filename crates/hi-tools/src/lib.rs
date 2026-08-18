@@ -574,6 +574,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_edit_rejects_an_unbounded_hunk_list() {
+        let dir = std::env::temp_dir().join(format!("hi-medit-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.txt"), "keep\n").unwrap();
+        let edits = (0..80)
+            .map(|i| format!(r#"{{"old_string":"keep","new_string":"{i}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let args = format!(r#"{{"path":"x.txt","edits":[{edits}]}}"#);
+        let out = crate::execute_in(&dir, "multi_edit", &args).await;
+        assert!(
+            out.content.contains("at most") && out.content.contains("Error"),
+            "{}",
+            out.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("x.txt")).unwrap(),
+            "keep\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn failures_and_denials_are_typed_not_inferred_from_prose() {
         let malformed = execute("read", "not json").await;
         assert_eq!(malformed.status, crate::ToolStatus::Failed);
@@ -1086,6 +1109,23 @@ mod tests {
         let out = execute("update_plan", r#"{"steps":[]}"#).await;
         assert!(out.content.contains("Error"), "{}", out.content);
         assert!(out.plan.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_plan_clips_titles_and_caps_step_count() {
+        let mut steps = Vec::new();
+        for i in 0..200 {
+            steps.push(format!(
+                r#"{{"title":"{}","status":"pending"}}"#,
+                "T".repeat(400) + &i.to_string()
+            ));
+        }
+        let args = format!(r#"{{"steps":[{}]}}"#, steps.join(","));
+        let out = execute("update_plan", &args).await;
+        let plan = out.plan.expect("plan is set");
+        assert_eq!(plan.len(), 128);
+        assert!(plan.iter().all(|step| step.title.chars().count() <= 160));
+        assert!(out.content.contains("omitted"), "{}", out.content);
     }
 
     #[tokio::test]

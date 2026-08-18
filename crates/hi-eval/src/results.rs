@@ -274,6 +274,18 @@ pub struct Candidate {
     pub trajectory: Trajectory,
     /// Per-turn context-growth series (multi-turn drive only; empty otherwise).
     pub growth: Vec<TurnMetric>,
+    /// Process/budget judge over the candidate `--report` tape, when the
+    /// task directory has a `judge.toml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<serde_json::Value>,
+    /// Largest per-send `input_tokens_est` from the turn tape. Used for the
+    /// suite-level `max_request_tokens_p95` summary field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_tokens: Option<u64>,
+    /// Full `--report` tape, kept long enough to write `report.json` next to
+    /// the candidate patch. Not serialized into the trial artifact.
+    #[serde(skip)]
+    pub tape: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

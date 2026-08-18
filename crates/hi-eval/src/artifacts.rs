@@ -326,6 +326,12 @@ fn materialize_candidate_evidence(dir: &Path, result: &RunResult) -> Result<Vec<
             std::fs::create_dir_all(&candidate_dir)?;
             let patch_path = candidate_dir.join("patch.diff");
             atomic_write(&patch_path, candidate.patch.as_bytes())?;
+            if let Some(tape) = &candidate.tape {
+                atomic_write(
+                    &candidate_dir.join("report.json"),
+                    serde_json::to_vec_pretty(tape)?.as_slice(),
+                )?;
+            }
 
             let status = candidate
                 .partial_artifact
@@ -742,7 +748,9 @@ pub(crate) fn prune_candidate_runtime_artifacts(
     for reserved in [
         INJECTED_ORACLE_DIR,
         ".hi-eval-report.json",
+        ".hi-eval-report.json.evidence",
         ".hi-eval-session.jsonl",
+        ".hi-eval-final-message",
         ".hi-debug.log",
     ] {
         remove_path_if_present(&root.join(reserved))?;
@@ -769,11 +777,16 @@ pub(crate) fn prune_candidate_runtime_artifacts(
 fn is_evaluator_runtime_file(relative: &Path) -> bool {
     relative == Path::new(".hi-eval-report.json")
         || relative == Path::new(".hi-eval-session.jsonl")
+        || relative == Path::new(".hi-eval-final-message")
         || relative == Path::new(".hi-debug.log")
+        || relative.starts_with(Path::new(".hi-eval-report.json.evidence"))
 }
 
 fn is_new_runtime_artifact(path: &str, entry: Option<&SnapshotEntry>) -> bool {
     if is_loose_git_object(path) {
+        return true;
+    }
+    if is_evaluator_runtime_file(Path::new(path)) {
         return true;
     }
     let components: Vec<_> = path.split('/').collect();
@@ -796,6 +809,9 @@ fn is_new_runtime_artifact(path: &str, entry: Option<&SnapshotEntry>) -> bool {
             // Anything newly created under node_modules is tooling output;
             // allowed_changes still wins for tasks that want files there.
             "node_modules" => return true,
+            // Agent/eval workspace state written during the turn (memory,
+            // session sidecars). Not the candidate's solution.
+            ".hi" => return true,
             _ if suffix.is_empty() && component.ends_with(".pyc") => return true,
             _ => {}
         }
@@ -1504,6 +1520,10 @@ command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"
             "target/debug/libeval_cache_key.d",
             "node_modules/lodash/index.js",
             "pkg/module.pyc",
+            ".hi-eval-report.json",
+            ".hi-eval-report.json.evidence/manifest.json",
+            ".hi-eval-session.jsonl",
+            ".hi/memory.md",
         ] {
             assert!(is_new_runtime_artifact(path, None), "{path} must classify");
         }
@@ -1519,6 +1539,29 @@ command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"
                 "{path} must not classify"
             );
         }
+    }
+
+    #[test]
+    fn trace_evidence_and_agent_state_are_not_candidate_changes() {
+        let root = make_workdir().unwrap();
+        std::fs::write(root.join("solution.py"), "VALUE = 0\n").unwrap();
+        let before = directory_snapshot(&root).unwrap();
+        std::fs::write(root.join("solution.py"), "VALUE = 42\n").unwrap();
+        std::fs::create_dir_all(root.join(".hi-eval-report.json.evidence")).unwrap();
+        std::fs::write(
+            root.join(".hi-eval-report.json.evidence/manifest.json"),
+            "{}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".hi")).unwrap();
+        std::fs::write(root.join(".hi/memory.md"), "note\n").unwrap();
+        let after = directory_snapshot(&root).unwrap();
+        let changed =
+            candidate_changed_paths(&before, &after, &["solution.py".to_string()]).unwrap();
+        assert_eq!(changed, vec!["solution.py".to_string()]);
+        let forbidden = forbidden_changes(&changed, &["solution.py".to_string()]).unwrap();
+        assert!(forbidden.is_empty(), "{forbidden:?}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -399,6 +399,11 @@ mod tests {
             solve_rate: solve,
             cost_per_solved: Some(0.05),
             tokens_per_solved: Some(12_000.0),
+            process_pass_rate: None,
+            budget_pass_rate: None,
+            max_request_tokens_p95: None,
+            write_overwrite_violations: 0,
+            image_elision_misses: 0,
             failure_buckets: FailureBucketCounts {
                 no_edits: 2,
                 compile: 1,

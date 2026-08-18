@@ -5,13 +5,20 @@ use std::sync::LazyLock;
 /// window, raise it when the model has room. Read once, at first use. The
 /// default is intentionally tight for remote agent loops: ~5k chars is ~1.3k
 /// tokens, and repeated tool rounds resend this history.
-pub(crate) static MAX_OUTPUT_CHARS: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("HI_TOOL_RESULT_CHARS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 1_000)
-        .unwrap_or(5_000)
-});
+pub(crate) static MAX_OUTPUT_CHARS: LazyLock<usize> =
+    LazyLock::new(|| parse_max_output_chars(std::env::var("HI_TOOL_RESULT_CHARS").ok().as_deref()));
+
+/// Floor keeps a result useful; ceiling stops `HI_TOOL_RESULT_CHARS=999999999`
+/// from turning every tool result into a context bomb.
+const DEFAULT_MAX_OUTPUT_CHARS: usize = 5_000;
+const MIN_MAX_OUTPUT_CHARS: usize = 1_000;
+const ABSOLUTE_MAX_OUTPUT_CHARS: usize = 50_000;
+
+pub(crate) fn parse_max_output_chars(var: Option<&str>) -> usize {
+    var.and_then(|v| v.parse().ok())
+        .filter(|&n| (MIN_MAX_OUTPUT_CHARS..=ABSOLUTE_MAX_OUTPUT_CHARS).contains(&n))
+        .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS)
+}
 
 /// Clip output to the configured character budget ([`MAX_OUTPUT_CHARS`]).
 pub(crate) fn truncate(s: &str) -> String {
@@ -218,7 +225,16 @@ pub(crate) fn truncate_to(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{condense_diagnostics, condense_enabled, truncate_to};
+    use super::{condense_diagnostics, condense_enabled, parse_max_output_chars, truncate_to};
+
+    #[test]
+    fn tool_result_char_budget_rejects_unbounded_overrides() {
+        assert_eq!(parse_max_output_chars(None), 5_000);
+        assert_eq!(parse_max_output_chars(Some("8000")), 8_000);
+        assert_eq!(parse_max_output_chars(Some("999")), 5_000);
+        assert_eq!(parse_max_output_chars(Some("999999999")), 5_000);
+        assert_eq!(parse_max_output_chars(Some("not-a-number")), 5_000);
+    }
 
     #[test]
     fn condense_toggle_defaults_on_and_parses_off_values() {

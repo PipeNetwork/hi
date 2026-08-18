@@ -22,6 +22,22 @@ Every profile result carries a claim level: `official`, `public_reproduction`,
 `smoke`, or `evidence_only`. A continuous named reward is retained separately
 from binary pass classification.
 
+## Harness profile (process + budget)
+
+`bench/harness` scores *how* hi ran, not just whether the hidden oracle passed.
+Each task has a `judge.toml` sidecar. CI replays committed `tape/*.json` with
+no API key:
+
+```text
+cargo run -p hi-eval -- judge --suite bench/harness
+scripts/check_harness_regression.sh
+```
+
+Live (optional): `HI_MODEL=… cargo run -p hi-eval -- bench/harness --configs=verify --trials=1 --artifacts=artifacts/harness`.
+Set `HI_STATE_DIR` so process/budget fails append `harness_process` /
+`harness_budget` findings. See `bench/harness/README.md`. The Monday
+scheduled workflow runs this as its own job, not mixed with `bench/tasks`.
+
 ## Hygiene profile
 
 `hi bench swe` scores hidden tests only. Merge-quality regressions (extra files,

@@ -107,6 +107,7 @@ pub(crate) fn plan_multi_patch(
                     content.push_str(line.strip_prefix('+').unwrap_or(line));
                     content.push('\n');
                 }
+                crate::read::refuse_oversized_text(path, content.len())?;
                 mutations.push(PlannedFileMutation::add(path, content.into_bytes()));
                 summaries.push(format!("+ added {path}"));
             }
@@ -121,6 +122,14 @@ pub(crate) fn plan_multi_patch(
             "update" => {
                 ensure!(!body.is_empty(), "update operation for {path} has no hunks");
                 let target = resolve_workspace_target(root, Path::new(path))?;
+                let size = std::fs::metadata(&target)
+                    .with_context(|| format!("reading {path} (use *** Add File: to create)"))?
+                    .len();
+                ensure!(
+                    size <= crate::read::MAX_READ_FILE_BYTES,
+                    "{path} is too large to patch in place ({size} bytes; limit {})",
+                    crate::read::MAX_READ_FILE_BYTES
+                );
                 let bytes = std::fs::read(&target)
                     .with_context(|| format!("reading {path} (use *** Add File: to create)"))?;
                 ensure!(!crate::read::is_binary(&bytes), "{path} is a binary file");
@@ -128,6 +137,7 @@ pub(crate) fn plan_multi_patch(
                     .with_context(|| format!("{path} is not valid UTF-8"))?;
                 let after = apply_hunk_patch_text(&original, body)
                     .with_context(|| format!("patching {path}"))?;
+                crate::read::refuse_oversized_text(path, after.len())?;
                 let changes = body
                     .iter()
                     .filter(|line| line.starts_with('+') || line.starts_with('-'))
@@ -720,7 +730,10 @@ pub(crate) fn reindent(new: &str, old_indent: &str, file_indent: &str) -> String
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_edit, apply_hunk_patch, apply_multi_patch_at, diff, edit_not_found_help};
+    use super::{
+        apply_edit, apply_hunk_patch, apply_multi_patch_at, diff, edit_not_found_help,
+        plan_multi_patch,
+    };
 
     #[test]
     fn edit_not_found_points_at_similar_lines() {
@@ -954,6 +967,30 @@ mod tests {
             msg.contains("funciton_add"),
             "similarity fallback finds the typo'd line: {msg}"
         );
+    }
+
+    #[test]
+    fn apply_patch_refuses_an_oversized_add() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hi-patch-oversized-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("huge.txt");
+        let huge = "x".repeat(crate::read::MAX_READ_FILE_BYTES as usize + 8);
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n{huge}\n*** End Patch",
+            dest.display()
+        );
+        let err =
+            plan_multi_patch(&dir, &crate::checkpoint::default_state_root(), &patch).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to write"), "{msg}");
+        assert!(!dest.exists(), "oversized add must not land");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -1,0 +1,6 @@
+[process]
+require_tools = ["edit"]
+
+[budget]
+max_tool_result_chars = 50000
+max_write_existing_bytes = 16384

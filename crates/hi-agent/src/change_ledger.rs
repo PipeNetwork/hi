@@ -595,40 +595,65 @@ fn read_state(path: &Path, previous: Option<&FileState>) -> Result<Option<FileSt
     };
     let mode = file_mode(&metadata);
     let mtime_ns = mtime_as_ns(&metadata);
-    let (bytes, len) = if metadata.file_type().is_symlink() {
+    if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(path)
             .with_context(|| format!("reading symlink {}", path.display()))?;
         let bytes = target.as_os_str().as_encoded_bytes().to_vec();
-        let len = bytes.len() as u64;
-        (bytes, len)
-    } else if metadata.is_file() {
-        let len = metadata.len();
-        // Cheap fingerprint: reuse the prior digest when len/mode/mtime match so
-        // reconcile does not re-read and re-hash every unchanged source file.
-        if let Some(prev) = previous
-            && prev.len == len
-            && prev.mode == mode
-            && prev.mtime_ns == mtime_ns
-        {
-            return Ok(Some(prev.clone()));
-        }
-        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let len = bytes.len() as u64;
-        (bytes, len)
-    } else {
+        return Ok(Some(FileState {
+            digest: format!("symlink:sha256:{:x}", Sha256::digest(&bytes)),
+            len: bytes.len() as u64,
+            mode,
+            mtime_ns,
+        }));
+    }
+    if !metadata.is_file() {
         return Ok(None);
-    };
-    let prefix = if metadata.file_type().is_symlink() {
-        "symlink:sha256:"
-    } else {
-        "sha256:"
-    };
+    }
+    let len = metadata.len();
+    // Cheap fingerprint: reuse the prior digest when len/mode/mtime match so
+    // reconcile does not re-read and re-hash every unchanged source file.
+    if let Some(prev) = previous
+        && prev.len == len
+        && prev.mode == mode
+        && prev.mtime_ns == mtime_ns
+    {
+        return Ok(Some(prev.clone()));
+    }
+    if len > MAX_AUTOMATIC_FILE_BYTES {
+        return Ok(Some(FileState {
+            digest: format!("oversized:{len}"),
+            len,
+            mode,
+            mtime_ns,
+        }));
+    }
+    let (digest, hashed_len) = hash_file_streaming(path)?;
     Ok(Some(FileState {
-        digest: format!("{prefix}{:x}", Sha256::digest(bytes)),
-        len,
+        digest,
+        len: hashed_len,
         mode,
         mtime_ns,
     }))
+}
+
+fn hash_file_streaming(path: &Path) -> Result<(String, u64)> {
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut hashed_len = 0u64;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        hashed_len += n as u64;
+    }
+    Ok((format!("sha256:{:x}", hasher.finalize()), hashed_len))
 }
 
 fn mtime_as_ns(metadata: &std::fs::Metadata) -> u64 {

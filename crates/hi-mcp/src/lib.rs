@@ -35,7 +35,7 @@ use std::process::Stdio;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// Errors from the MCP client.
@@ -230,7 +230,7 @@ pub struct McpServer {
 struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
-    stdout: tokio::io::Lines<BufReader<ChildStdout>>,
+    stdout: BufReader<ChildStdout>,
     next_id: u64,
 }
 
@@ -277,7 +277,7 @@ impl StdioTransport {
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout).lines(),
+            stdout: BufReader::new(stdout),
             next_id: 1,
         })
     }
@@ -309,7 +309,7 @@ impl McpTransportTrait for StdioTransport {
             request["params"] = params;
         }
         self.write_message(&request).await?;
-        while let Some(line) = self.stdout.next_line().await? {
+        while let Some(line) = next_rpc_line(&mut self.stdout).await? {
             if line.trim().is_empty() {
                 continue;
             }
@@ -611,7 +611,10 @@ impl McpClient {
         let result = transport
             .request("resources/read", Some(serde_json::json!({"uri": uri})))
             .await?;
-        Ok(resource_text_from_value(&result))
+        Ok(clip_mcp_text(
+            &resource_text_from_value(&result),
+            MAX_MCP_RESOURCE_CHARS,
+        ))
     }
 
     /// Check liveness of all connected servers.
@@ -623,12 +626,70 @@ impl McpClient {
     }
 }
 
+/// One newline-delimited JSON-RPC frame. A hostile or buggy MCP server can
+/// emit a gigabyte line; `BufReader::lines()` would retain it all.
+const MAX_RPC_LINE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_MCP_TOOLS: usize = 128;
+const MAX_MCP_TOOL_DESCRIPTION_CHARS: usize = 2_000;
+const MAX_MCP_RESOURCE_CHARS: usize = 64 * 1024;
+
+async fn next_rpc_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<String>, McpError> {
+    let mut buf = Vec::new();
+    loop {
+        let data = reader.fill_buf().await?;
+        if data.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if let Some(pos) = data.iter().position(|&b| b == b'\n') {
+            if buf.len().saturating_add(pos) > MAX_RPC_LINE_BYTES {
+                return Err(McpError::Transport(
+                    "MCP JSON-RPC line exceeds 2 MiB".into(),
+                ));
+            }
+            buf.extend_from_slice(&data[..pos]);
+            reader.consume(pos + 1);
+            break;
+        }
+        if buf.len().saturating_add(data.len()) > MAX_RPC_LINE_BYTES {
+            return Err(McpError::Transport(
+                "MCP JSON-RPC line exceeds 2 MiB".into(),
+            ));
+        }
+        let n = data.len();
+        buf.extend_from_slice(data);
+        reader.consume(n);
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
 fn list_tools_from_result(value: serde_json::Value) -> Result<Vec<McpTool>, McpError> {
     let tools = value
         .get("tools")
         .cloned()
         .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-    Ok(serde_json::from_value(tools)?)
+    let mut tools: Vec<McpTool> = serde_json::from_value(tools)?;
+    if tools.len() > MAX_MCP_TOOLS {
+        tools.truncate(MAX_MCP_TOOLS);
+    }
+    for tool in &mut tools {
+        if tool.description.chars().count() > MAX_MCP_TOOL_DESCRIPTION_CHARS {
+            tool.description = tool
+                .description
+                .chars()
+                .take(MAX_MCP_TOOL_DESCRIPTION_CHARS.saturating_sub(1))
+                .collect::<String>()
+                + "…";
+        }
+    }
+    Ok(tools)
 }
 
 fn validate_arguments(
@@ -691,6 +752,14 @@ fn resource_text_from_value(value: &serde_json::Value) -> String {
                 .join("\n")
         })
         .unwrap_or_else(|| value.to_string())
+}
+
+fn clip_mcp_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{clipped}…")
 }
 
 impl Default for McpClient {
@@ -958,6 +1027,56 @@ mod tests {
         std::fs::write(mcp_dir.join("bad.json"), "not valid json").unwrap();
         let configs = discover_servers(tmp.path());
         assert!(configs.is_empty());
+    }
+
+    #[test]
+    fn list_tools_caps_count_and_description() {
+        let tools: Vec<serde_json::Value> = (0..200)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("t{i}"),
+                    "description": "D".repeat(5_000),
+                    "inputSchema": {"type": "object"}
+                })
+            })
+            .collect();
+        let listed = list_tools_from_result(serde_json::json!({"tools": tools})).unwrap();
+        assert_eq!(listed.len(), MAX_MCP_TOOLS);
+        assert!(
+            listed
+                .iter()
+                .all(|tool| tool.description.chars().count() <= MAX_MCP_TOOL_DESCRIPTION_CHARS)
+        );
+    }
+
+    #[test]
+    fn resource_text_is_clipped() {
+        let text = clip_mcp_text(
+            &"R".repeat(MAX_MCP_RESOURCE_CHARS + 80),
+            MAX_MCP_RESOURCE_CHARS,
+        );
+        assert!(text.chars().count() <= MAX_MCP_RESOURCE_CHARS);
+        assert!(text.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn next_rpc_line_rejects_oversize_and_reads_normal_frames() {
+        let data = b"{\"ok\":true}\n{\"next\":1}\n";
+        let mut reader = BufReader::new(&data[..]);
+        assert_eq!(
+            next_rpc_line(&mut reader).await.unwrap().as_deref(),
+            Some("{\"ok\":true}")
+        );
+        assert_eq!(
+            next_rpc_line(&mut reader).await.unwrap().as_deref(),
+            Some("{\"next\":1}")
+        );
+        assert!(next_rpc_line(&mut reader).await.unwrap().is_none());
+
+        let huge = vec![b'x'; MAX_RPC_LINE_BYTES + 8];
+        let mut reader = BufReader::new(&huge[..]);
+        let err = next_rpc_line(&mut reader).await.unwrap_err();
+        assert!(err.to_string().contains("2 MiB"), "{err}");
     }
 
     #[test]

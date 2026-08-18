@@ -61,6 +61,9 @@ jobs:
       - name: Validate benchmark task schemas and immutable oracles
         run: cargo run -p hi-eval -- bench --validate
 
+      - name: Harness judge replay (no provider)
+        run: scripts/check_harness_regression.sh
+
       - name: Evaluator hermetic/tamper-resistance tests
         run: cargo nextest run -p hi-eval
 

@@ -22,6 +22,19 @@ backend = "host"
 claim_level = "smoke"
 treatments = ["baseline"]
 
+[datasets.harness]
+adapter = "legacy"
+source = "../bench/harness"
+revision = "local-pinned-revision"
+
+[profiles.harness]
+datasets = ["harness"]
+models = ["provider/model-id"]
+trials = 1
+backend = "host"
+claim_level = "smoke"
+treatments = ["baseline"]
+
 [profiles.hygiene]
 datasets = ["hygiene"]
 models = ["provider/model-id"]

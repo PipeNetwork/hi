@@ -1760,7 +1760,7 @@ impl crate::Agent {
                     .into(),
             );
         }
-        (!parts.is_empty()).then(|| parts.join("\n\n"))
+        (!parts.is_empty()).then(|| clip_volatile_context(&parts.join("\n\n")))
     }
 
     /// Reload project + global memory, rank bullets for `task`, and cache the
@@ -2996,4 +2996,19 @@ fn normalized(value: Option<String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Combined cap for the per-turn volatile block. Individual sections are
+/// already bounded; this is the last line of defense if they stack.
+const MAX_VOLATILE_CONTEXT_CHARS: usize = 24_000;
+
+fn clip_volatile_context(text: &str) -> String {
+    if text.chars().count() <= MAX_VOLATILE_CONTEXT_CHARS {
+        return text.to_string();
+    }
+    let clipped: String = text
+        .chars()
+        .take(MAX_VOLATILE_CONTEXT_CHARS.saturating_sub(1))
+        .collect();
+    format!("{clipped}…")
 }

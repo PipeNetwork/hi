@@ -1,15 +1,46 @@
 //! Project guide and hierarchical memory context loaded into the agent.
 
-pub(crate) fn load_project_context() -> Option<String> {
+use std::io::Read;
+use std::path::Path;
+
+/// Per-file cap for `HI.md` / `AGENTS.md`. These ride in the stable system
+/// prompt on every model call, so an unbounded guide is a session-wide
+/// token bomb.
+const MAX_GUIDE_FILE_CHARS: usize = 8_000;
+/// Combined cap for both project guides (skills index is added separately
+/// and has its own budget).
+const MAX_GUIDES_TOTAL_CHARS: usize = 16_000;
+/// Do not materialize a multi-megabyte guide just to clip it.
+const MAX_GUIDE_READ_BYTES: usize = 64 * 1024;
+
+pub(crate) fn load_project_context_from(root: &Path) -> Option<String> {
     const FILES: &[&str] = &["HI.md", "AGENTS.md"];
     let mut parts = Vec::new();
+    let mut remaining = MAX_GUIDES_TOTAL_CHARS;
     for name in FILES {
-        if let Ok(text) = std::fs::read_to_string(name) {
-            let text = text.trim();
-            if !text.is_empty() {
-                parts.push(format!("# Project context (from {name})\n{text}"));
-            }
+        if remaining == 0 {
+            break;
         }
+        let Some(raw) = read_text_capped(&root.join(name), MAX_GUIDE_READ_BYTES) else {
+            continue;
+        };
+        let text = raw.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let header = format!("# Project context (from {name})\n");
+        let footer = format!("\n… ({name} truncated — keep this file concise)");
+        let cap = remaining.min(MAX_GUIDE_FILE_CHARS);
+        let body_budget = cap
+            .saturating_sub(header.chars().count())
+            .saturating_sub(footer.chars().count());
+        let (body, truncated) = clip_with_flag(text, body_budget);
+        let mut section = format!("{header}{body}");
+        if truncated {
+            section.push_str(&footer);
+        }
+        remaining = remaining.saturating_sub(section.chars().count().saturating_add(2));
+        parts.push(section);
     }
     // Memory is injected live by hi-agent (task-ranked, refreshed each turn and
     // after coding-fact writes). Do not bake a static snapshot here — that
@@ -20,6 +51,25 @@ pub(crate) fn load_project_context() -> Option<String> {
         parts.push(section);
     }
     (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+fn read_text_capped(path: &Path, max_bytes: usize) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; max_bytes];
+    let n = file.read(&mut buf).ok()?;
+    buf.truncate(n);
+    if buf.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn clip_with_flag(text: &str, max: usize) -> (String, bool) {
+    if text.chars().count() <= max {
+        return (text.to_string(), false);
+    }
+    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    (clipped, true)
 }
 
 /// Whether auto-memory is active for this session: on unless `--no-memory`, and
@@ -37,4 +87,93 @@ pub(crate) fn auto_memory_enabled(no_memory: bool, no_save: bool) -> bool {
 pub(crate) fn memory_context(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| format!("# Memory (from past sessions)\n{text}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-project-context-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_guides_yield_only_skills_or_none() {
+        let root = unique_dir("empty");
+        let loaded = load_project_context_from(&root);
+        if let Some(text) = loaded {
+            assert!(
+                !text.contains("# Project context (from"),
+                "no guide files: {text}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loads_both_guides_from_the_workspace_root() {
+        let root = unique_dir("both");
+        fs::write(root.join("HI.md"), "Use package-local tests.\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "Keep core changes deterministic.\n").unwrap();
+        let text = load_project_context_from(&root).expect("guides present");
+        assert!(text.contains("from HI.md"), "{text}");
+        assert!(text.contains("Use package-local tests."), "{text}");
+        assert!(text.contains("from AGENTS.md"), "{text}");
+        assert!(text.contains("Keep core changes deterministic."), "{text}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn huge_guide_is_clipped_before_it_enters_the_system_prompt() {
+        let root = unique_dir("huge");
+        let bomb = "TOKENBOMB ".repeat(20_000);
+        fs::write(root.join("HI.md"), &bomb).unwrap();
+        let text = load_project_context_from(&root).expect("huge guide still loads");
+        assert!(
+            text.chars().count() <= MAX_GUIDES_TOTAL_CHARS + 2_000,
+            "project context must stay bounded: {} chars",
+            text.chars().count()
+        );
+        assert!(text.contains("truncated"), "{text}");
+        assert!(
+            !text.contains(&"TOKENBOMB ".repeat(2_000)),
+            "must not dump the full guide"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn second_guide_shares_the_combined_budget() {
+        let root = unique_dir("shared");
+        fs::write(root.join("HI.md"), "H".repeat(MAX_GUIDE_FILE_CHARS + 200)).unwrap();
+        fs::write(
+            root.join("AGENTS.md"),
+            "A".repeat(MAX_GUIDE_FILE_CHARS + 200),
+        )
+        .unwrap();
+        let text = load_project_context_from(&root).expect("both guides");
+        let guide_chars = text
+            .split("# Learned Skills")
+            .next()
+            .unwrap_or(&text)
+            .chars()
+            .count();
+        assert!(
+            guide_chars <= MAX_GUIDES_TOTAL_CHARS + 8,
+            "combined guides exceeded budget: {guide_chars}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }

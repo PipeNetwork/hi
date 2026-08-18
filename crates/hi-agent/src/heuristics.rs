@@ -561,6 +561,7 @@ pub fn leftover_plan_summary(steps: &[PlanStep]) -> Option<String> {
         return None;
     }
     let title = next_plan_step_title(steps)?;
+    let title: String = title.chars().take(160).collect();
     Some(format!("{remaining}/{total} remaining — {title}"))
 }
 

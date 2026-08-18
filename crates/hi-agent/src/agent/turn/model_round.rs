@@ -580,6 +580,10 @@ impl crate::Agent {
             },
         };
 
+        self.report
+            .last_turn_telemetry
+            .requests
+            .push(crate::census_messages(self.messages.as_slice()));
         self.report.last_turn_telemetry.model_requests = self
             .report
             .last_turn_telemetry

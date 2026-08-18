@@ -242,7 +242,7 @@ impl crate::Agent {
             input.push_str(&format!(
                 "  {}. [{glyph}] {}\n",
                 i + 1,
-                sub_goal.description
+                clip_audit_text(&sub_goal.description, 200)
             ));
         }
 
@@ -277,6 +277,14 @@ impl crate::Agent {
         }
         input
     }
+}
+
+fn clip_audit_text(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{clipped}…")
 }
 
 /// Parse the auditor's reply: `COMPLETE` (markdown-tolerant, case-insensitive

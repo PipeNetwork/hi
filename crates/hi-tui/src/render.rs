@@ -21,6 +21,7 @@ pub(crate) fn copy_line_text(line: &Line) -> String {
     text.strip_prefix("┃ ")
         .or_else(|| text.strip_prefix("▏ "))
         .or_else(|| text.strip_prefix("• "))
+        .or_else(|| text.strip_prefix("◆ "))
         .unwrap_or(&text)
         .to_string()
 }
@@ -615,15 +616,27 @@ pub(crate) fn markdown_line(text: &str, code_lang: &mut Option<String>) -> Line<
         } else {
             None
         };
-        return Line::from(vec![
-            Span::styled("▏ ", dim()),
-            Span::styled(caption.to_string(), dim().add_modifier(Modifier::ITALIC)),
-        ]);
+        let mut line = if caption.is_empty() {
+            Line::from(vec![Span::styled("▏", dim())])
+        } else {
+            Line::from(vec![
+                Span::styled("▏ ", dim()),
+                Span::styled(caption.to_string(), dim().add_modifier(Modifier::ITALIC)),
+            ])
+        };
+        if theme().paints_backgrounds() {
+            line.style = line.style.bg(theme().panel);
+        }
+        return line;
     }
     if let Some(lang) = code_lang.as_deref() {
         let mut spans = vec![Span::styled("▏ ", dim())];
         spans.extend(highlight_code(text, lang));
-        return Line::from(spans);
+        let mut line = Line::from(spans);
+        if theme().paints_backgrounds() {
+            line.style = line.style.bg(theme().panel);
+        }
+        return line;
     }
 
     // Horizontal rule.
@@ -938,9 +951,22 @@ pub(crate) fn markdown_needs_leading_blank(
 pub(crate) fn markdown_body_lines(text: &str) -> Vec<Line<'static>> {
     let mut lang = None;
     let mut lines = Vec::new();
+    let mut table: Vec<String> = Vec::new();
+    let flush_table = |lines: &mut Vec<Line<'static>>, table: &mut Vec<String>| {
+        if table.is_empty() {
+            return;
+        }
+        lines.extend(render_table(table));
+        table.clear();
+    };
     for line in text.lines() {
         let in_fence = lang.is_some();
         let trimmed = line.trim_start();
+        if !in_fence && is_table_line(line) {
+            table.push(line.to_string());
+            continue;
+        }
+        flush_table(&mut lines, &mut table);
         if !in_fence
             && line.trim().is_empty()
             && lines.last().is_some_and(|l| line_text(l).trim().is_empty())
@@ -966,6 +992,7 @@ pub(crate) fn markdown_body_lines(text: &str) -> Vec<Line<'static>> {
             lines.push(Line::raw(""));
         }
     }
+    flush_table(&mut lines, &mut table);
     if lines.is_empty() {
         lines.push(Line::raw(""));
     }
@@ -1136,6 +1163,51 @@ fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
 /// Wrapped row count for a single line at `width` (the same `WordWrapper` the
 /// render path uses). `width == 0` → 1 row. Used to locate sticky-header
 /// positions without re-measuring the whole transcript.
+/// Split `line` into display-width chunks so a 200-col terminal does not
+/// stretch assistant prose. Width 0 returns the line unchanged.
+pub(crate) fn wrap_line_to_width(line: &Line<'static>, max_cols: u16) -> Vec<Line<'static>> {
+    if max_cols == 0 {
+        return vec![line.clone()];
+    }
+    let max_cols = max_cols as usize;
+    let used: usize = line
+        .spans
+        .iter()
+        .map(|s| crate::layout::display_width(s.content.as_ref()))
+        .sum();
+    if used <= max_cols {
+        return vec![line.clone()];
+    }
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut width = 0usize;
+    for span in &line.spans {
+        let style = span.style;
+        for ch in span.content.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width + w > max_cols && !current.is_empty() {
+                rows.push(Line::from(std::mem::take(&mut current)));
+                width = 0;
+            }
+            if let Some(last) = current.last_mut()
+                && last.style == style
+            {
+                last.content.to_mut().push(ch);
+            } else {
+                current.push(Span::styled(ch.to_string(), style));
+            }
+            width = width.saturating_add(w);
+        }
+    }
+    if !current.is_empty() {
+        rows.push(Line::from(current));
+    }
+    if rows.is_empty() {
+        rows.push(line.clone());
+    }
+    rows
+}
+
 pub(crate) fn wrapped_line_height(line: &Line, width: u16) -> u16 {
     if width == 0 {
         return 1;

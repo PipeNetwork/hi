@@ -164,7 +164,9 @@ pub async fn run_memory_search(
     fn default_limit() -> usize {
         5
     }
+    const MAX_MEMORY_SEARCH: usize = 20;
     let args: Args = serde_json::from_str(arguments).context("invalid tool arguments")?;
+    let limit = args.limit.clamp(1, MAX_MEMORY_SEARCH);
 
     let backend = match backend {
         Some(b) => b,
@@ -175,7 +177,7 @@ pub async fn run_memory_search(
         }
     };
 
-    let results = backend.search(&args.query, args.limit).await?;
+    let results = backend.search(&args.query, limit).await?;
 
     if results.is_empty() {
         return Ok(ToolOutcome::plain(

@@ -122,6 +122,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                     "edits": {
                         "type": "array",
                         "description": "Edits applied in sequence to the file's evolving content.",
+                        "maxItems": 64,
                         "items": {
                             "type": "object",
                             "properties": {

@@ -483,6 +483,13 @@ impl crate::Agent {
             return;
         }
 
+        self.report
+            .last_turn_telemetry
+            .compaction
+            .push(crate::CompactionEvent {
+                freed_chars: freed as u64,
+                keep_recent: self.config.memory.in_turn_keep_tool_results,
+            });
         self.runtime.invalidate_context_after_compaction();
         self.report.context_used = 0;
     }
@@ -576,8 +583,24 @@ impl crate::Agent {
     }
 }
 
+const MAX_COMPACTION_SUMMARY_CHARS: usize = 6_000;
+
+fn clip_summary(summary: &str) -> String {
+    if summary.chars().count() <= MAX_COMPACTION_SUMMARY_CHARS {
+        return summary.to_string();
+    }
+    let clipped: String = summary
+        .chars()
+        .take(MAX_COMPACTION_SUMMARY_CHARS.saturating_sub(1))
+        .collect();
+    format!("{clipped}…")
+}
+
 fn reference_summary_block(summary: &str) -> String {
-    format!("{COMPACTION_REFERENCE_PREFIX}\n\n{summary}\n\n{COMPACTION_SUMMARY_END}")
+    format!(
+        "{COMPACTION_REFERENCE_PREFIX}\n\n{}\n\n{COMPACTION_SUMMARY_END}",
+        clip_summary(summary)
+    )
 }
 
 fn fold_reference_summary_into_user(summary: &str, latest_user: &str) -> String {

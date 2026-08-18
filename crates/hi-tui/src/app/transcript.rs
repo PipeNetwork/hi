@@ -9,6 +9,7 @@ fn strip_display_gutter(line: &str) -> &str {
     line.strip_prefix("┃ ")
         .or_else(|| line.strip_prefix("▏ "))
         .or_else(|| line.strip_prefix("• "))
+        .or_else(|| line.strip_prefix("◆ "))
         .unwrap_or(line)
 }
 
@@ -65,6 +66,9 @@ impl crate::App {
     /// pass can pin it as a sticky header when scrolled past.
     pub(crate) fn push_user_prompt(&mut self, line: Line<'static>) {
         self.freeze_verb_group();
+        if self.following {
+            self.page_flip_on_send = true;
+        }
         self.transcript.push(TranscriptEntry::UserPrompt {
             line,
             at: std::time::SystemTime::now(),
@@ -190,6 +194,7 @@ impl crate::App {
     /// scrolled up stays put.
     pub(crate) fn follow(&mut self) {
         self.following = true;
+        self.page_flip_on_send = false;
     }
 
     /// Show the inline `/btw` overlay (idempotent). Auto-called on first side activity.
@@ -322,12 +327,14 @@ impl crate::App {
     /// Scroll to the top of the transcript (line 0).
     pub(crate) fn scroll_to_top(&mut self) {
         self.following = false;
+        self.page_flip_on_send = false;
         self.scroll = 0;
     }
 
     /// Scroll to the bottom of the transcript (follow the latest content).
     pub(crate) fn scroll_to_bottom(&mut self) {
         self.following = true;
+        self.page_flip_on_send = false;
     }
 
     /// Scroll to an absolute line index. Clamped to the valid scroll range.
@@ -676,11 +683,13 @@ impl crate::App {
         let next = (cur + delta).clamp(0, max);
         if next >= max {
             self.following = true;
+            self.page_flip_on_send = false;
         } else {
             if self.following {
                 self.total_when_unpinned = self.view_total;
             }
             self.following = false;
+            self.page_flip_on_send = false;
             self.scroll = next as u16;
         }
     }
@@ -740,28 +749,8 @@ impl crate::App {
         {
             return;
         }
-        if !in_fence
-            && !trimmed.starts_with("```")
-            && crate::render::markdown_needs_leading_blank(
-                trimmed,
-                last_entry_is_blank(&self.transcript),
-                last_entry_is_list(&self.transcript),
-            )
-        {
-            self.transcript
-                .push(TranscriptEntry::Assistant(Line::raw("")));
-        }
-        let heading_level = if !in_fence && !trimmed.starts_with("```") {
-            crate::render::markdown_heading(trimmed).map(|(level, _)| level)
-        } else {
-            None
-        };
-        let line = markdown_line(&text, &mut self.code_lang);
-        self.transcript.push(TranscriptEntry::Assistant(line));
-        if heading_level.is_some() {
-            self.transcript
-                .push(TranscriptEntry::Assistant(Line::raw("")));
-        }
+        let _ = markdown_line(&text, &mut self.code_lang);
+        append_assistant_line(&mut self.transcript, &text);
         self.bump_transcript();
     }
 
@@ -771,8 +760,8 @@ impl crate::App {
             return;
         }
         let rows = std::mem::take(&mut self.table_buf);
-        for line in crate::render::render_table(&rows) {
-            self.transcript.push(TranscriptEntry::Assistant(line));
+        for row in &rows {
+            append_assistant_line(&mut self.transcript, row);
         }
         self.bump_transcript();
     }
@@ -914,11 +903,20 @@ impl crate::App {
                 self.event_log
                     .push(format!("reasoning {} chars", text.len()));
                 self.last_turn_event = Some(TurnEventKind::Reasoning);
-                // Buffer reasoning instead of streaming it inline — it's
-                // committed as a single collapsible "thought for Ns" entry when
-                // the reasoning phase ends (first text or assistant_end).
                 if self.reasoning_started.is_none() {
                     self.reasoning_started = Some(Instant::now());
+                }
+                // Grok-build folds thoughts among an open explore burst into
+                // that row instead of a standalone thinking block.
+                let elapsed = self
+                    .reasoning_started
+                    .map(|started| started.elapsed())
+                    .unwrap_or_default();
+                if let Some(group) = self.open_verb_group_mut() {
+                    group.thinking.push_str(&text);
+                    group.thinking_elapsed = elapsed;
+                    self.bump_transcript();
+                    return;
                 }
                 self.reasoning_buffer.push_str(&text);
             }
@@ -1474,6 +1472,10 @@ impl crate::App {
                 }
                 TranscriptEntry::Assistant(line) if is_steering_assistant_line(line) => continue,
                 TranscriptEntry::Assistant(_) => return None,
+                TranscriptEntry::AssistantMessage { text } if is_steering_assistant_text(text) => {
+                    continue;
+                }
+                TranscriptEntry::AssistantMessage { .. } => return None,
                 TranscriptEntry::Reasoning { .. } | TranscriptEntry::Line(_) => continue,
                 TranscriptEntry::UserPrompt { .. }
                 | TranscriptEntry::ChangedFiles { .. }
@@ -1515,7 +1517,10 @@ impl crate::App {
                 TranscriptEntry::Assistant(line) if is_steering_assistant_line(line) => {
                     steal.push(i);
                 }
-                TranscriptEntry::Assistant(_) => {
+                TranscriptEntry::AssistantMessage { text } if is_steering_assistant_text(text) => {
+                    steal.push(i);
+                }
+                TranscriptEntry::Assistant(_) | TranscriptEntry::AssistantMessage { .. } => {
                     if let Some(&reason_at) = steal
                         .iter()
                         .find(|&&j| matches!(self.transcript[j], TranscriptEntry::Reasoning { .. }))
@@ -1550,6 +1555,13 @@ impl crate::App {
                     let text = crate::render::line_text(&line);
                     if !text.trim().is_empty() {
                         chrome.steering.insert(0, text);
+                    }
+                }
+                TranscriptEntry::AssistantMessage { text } => {
+                    for line in text.lines().rev() {
+                        if !line.trim().is_empty() {
+                            chrome.steering.insert(0, line.to_string());
+                        }
                     }
                 }
                 _ => {}
@@ -1736,21 +1748,43 @@ impl crate::App {
     }
 }
 
+fn append_assistant_line(transcript: &mut Vec<TranscriptEntry>, line: &str) {
+    if let Some(TranscriptEntry::AssistantMessage { text }) = transcript.last_mut() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(line);
+        return;
+    }
+    transcript.push(TranscriptEntry::AssistantMessage {
+        text: line.to_string(),
+    });
+}
+
 fn last_entry_is_blank(transcript: &[TranscriptEntry]) -> bool {
     match transcript.last() {
         None => true,
         Some(TranscriptEntry::Assistant(line) | TranscriptEntry::Line(line)) => {
             crate::render::line_text(line).trim().is_empty()
         }
+        Some(TranscriptEntry::AssistantMessage { text }) => {
+            text.lines().last().is_none_or(|l| l.trim().is_empty())
+        }
         _ => false,
     }
 }
 
+#[allow(dead_code)]
 fn last_entry_is_list(transcript: &[TranscriptEntry]) -> bool {
     match transcript.last() {
         Some(TranscriptEntry::Assistant(line)) => {
             crate::render::is_markdown_list_line(&crate::render::line_text(line))
         }
+        Some(TranscriptEntry::AssistantMessage { text }) => text
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .is_some_and(crate::render::is_markdown_list_line),
         _ => false,
     }
 }
@@ -1758,6 +1792,26 @@ fn last_entry_is_list(transcript: &[TranscriptEntry]) -> bool {
 const STEERING_MAX_CHARS: usize = 140;
 
 /// Short “let me look…” chrome, not a real answer (heading / list / document).
+fn is_steering_assistant_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.chars().count() > STEERING_MAX_CHARS {
+        return false;
+    }
+    if crate::render::markdown_heading(trimmed).is_some() {
+        return false;
+    }
+    if trimmed.starts_with('▏') || trimmed.starts_with('─') || trimmed.contains('│') {
+        return false;
+    }
+    if crate::render::is_markdown_list_line(text) {
+        return false;
+    }
+    true
+}
+
 fn is_steering_assistant_line(line: &Line<'_>) -> bool {
     let text = crate::render::line_text(line);
     let trimmed = text.trim();

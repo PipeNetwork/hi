@@ -10,7 +10,7 @@ use hi_ai::Provider;
 use crate::config::{Cli, QualitySettings, RsiRequested, Settings, permits_missing_checkpoint};
 use crate::goal_drive;
 use crate::landing::LoadedAgentSession;
-use crate::project_context::load_project_context;
+use crate::project_context::load_project_context_from;
 use crate::provider::{LiveModelMetadata, provider_label};
 
 pub(crate) struct BuiltAgent {
@@ -90,7 +90,7 @@ pub(crate) fn build_agent(
             // Env override lets you flip on skill auto-curation without editing a profile.
             curate_skills: settings.curate_skills || std::env::var_os("HI_CURATE_SKILLS").is_some(),
             suggest_next_prompt: settings.suggest_next_prompt && cli.eval_input.is_none(),
-            project_context: load_project_context(),
+            project_context: load_project_context_from(&workspace_root),
             context_exclusions: quality.context_exclusions.clone(),
             auto_compact: !cli.no_auto_compact,
             compaction: cli

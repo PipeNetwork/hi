@@ -617,8 +617,7 @@ pub fn remember_note(workspace: &Path, text: &str, global: bool) -> Result<Strin
     let existing = if global {
         read_global_memory()
     } else {
-        let raw = std::fs::read_to_string(&path).unwrap_or_default();
-        crate::memory::strip_header(&raw)
+        crate::memory::read_layer(&path)
     };
     let mut body = existing.trim().to_string();
     if !body.is_empty() {
@@ -639,8 +638,7 @@ fn format_memory_dump(workspace: &Path) -> String {
     let project = memory_file_at(workspace);
     let global = global_memory_file();
     let read = |path: &Path| {
-        let raw = std::fs::read_to_string(path).unwrap_or_default();
-        let body = crate::memory::strip_header(&raw);
+        let body = crate::memory::read_layer(path);
         if body.trim().is_empty() {
             "(empty)".to_string()
         } else {
@@ -692,24 +690,8 @@ pub fn import_claude_report(cwd: &Path) -> String {
     // MCP servers inside ~/.claude.json
     if let Some(home) = &home {
         let claude_json = home.join(".claude.json");
-        if claude_json.is_file()
-            && let Ok(raw) = std::fs::read_to_string(&claude_json)
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
-            && let Some(servers) = v.get("mcpServers").and_then(|s| s.as_object())
-        {
-            out.push_str(&format!(
-                "  mcpServers in ~/.claude.json: {}\n",
-                servers.len()
-            ));
-            for name in servers.keys().take(12) {
-                out.push_str(&format!("    - {name}\n"));
-            }
-            if servers.len() > 12 {
-                out.push_str(&format!("    … {} more\n", servers.len() - 12));
-            }
-            out.push_str(
-                            "         → copy into hi.toml [profiles.*.mcp] / provider mcp_url, or keep using Claude MCP separately\n",
-                        );
+        if claude_json.is_file() {
+            out.push_str(&inspect_claude_mcp_servers(&claude_json));
         }
     }
 
@@ -718,6 +700,30 @@ pub fn import_claude_report(cwd: &Path) -> String {
     }
     out.push_str(
         "  note: hi does not auto-overwrite hi.toml; apply the hints above, then /doctor\n",
+    );
+    out
+}
+
+fn inspect_claude_mcp_servers(path: &Path) -> String {
+    let Some(raw) = crate::learning::read_ledger_capped(path) else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return "  mcpServers in ~/.claude.json: (file too large or unreadable; listing skipped)\n"
+            .into();
+    };
+    let Some(servers) = value.get("mcpServers").and_then(|s| s.as_object()) else {
+        return String::new();
+    };
+    let mut out = format!("  mcpServers in ~/.claude.json: {}\n", servers.len());
+    for name in servers.keys().take(12) {
+        out.push_str(&format!("    - {name}\n"));
+    }
+    if servers.len() > 12 {
+        out.push_str(&format!("    … {} more\n", servers.len() - 12));
+    }
+    out.push_str(
+        "         → copy into hi.toml [profiles.*.mcp] / provider mcp_url, or keep using Claude MCP separately\n",
     );
     out
 }
@@ -1214,8 +1220,16 @@ pub fn agents_report(workspace: &Path, arg: &str) -> String {
     }
     if let Some(name) = arg.strip_prefix("show ") {
         let path = dir.join(format!("{}.md", name.trim()));
-        return std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| format!("agent show failed: {e}"));
+        return match crate::learning::read_ledger_capped(&path) {
+            Some(raw) => raw,
+            None => format!(
+                "agent show failed: {}",
+                std::fs::metadata(&path)
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unreadable".into())
+            ),
+        };
     }
     if let Some(name) = arg.strip_prefix("remove ") {
         let path = dir.join(format!("{}.md", name.trim()));
@@ -1417,6 +1431,77 @@ mod tests {
         let msgs = vec![u("hi"), a("unique-token-xyz")];
         let r = search_messages(&msgs, "unique-token");
         assert!(r.contains("unique-token-xyz"));
+    }
+
+    #[test]
+    fn agents_show_clips_a_huge_persona() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-agents-show-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".hi/agents")).unwrap();
+        std::fs::write(
+            root.join(".hi/agents/huge.md"),
+            "P".repeat(crate::learning::MAX_LEDGER_READ_BYTES + 8_000),
+        )
+        .unwrap();
+        let out = agents_report(&root, "show huge");
+        assert!(
+            out.len() <= crate::learning::MAX_LEDGER_READ_BYTES,
+            "persona dump must be prefix-capped: {}",
+            out.len()
+        );
+        assert!(out.starts_with('P'), "{out}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_mcp_inspect_lists_servers_and_skips_a_huge_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-claude-json-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small.json");
+        std::fs::write(
+            &small,
+            r#"{"mcpServers":{"sqlite":{},"github":{},"extra":{}}}"#,
+        )
+        .unwrap();
+        let listed = inspect_claude_mcp_servers(&small);
+        assert!(listed.contains("sqlite"), "{listed}");
+        assert!(listed.contains("github"), "{listed}");
+
+        let huge = dir.join("huge.json");
+        std::fs::write(
+            &huge,
+            format!(
+                "{{\"mcpServers\":{{}},\"pad\":\"{}\"}}",
+                "x".repeat(crate::learning::MAX_LEDGER_READ_BYTES + 8_000)
+            ),
+        )
+        .unwrap();
+        let skipped = inspect_claude_mcp_servers(&huge);
+        assert!(
+            skipped.len() < 4_096,
+            "huge claude.json must not be dumped: {}",
+            skipped.len()
+        );
+        assert!(
+            skipped.contains("too large") || skipped.contains("mcpServers"),
+            "{skipped}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

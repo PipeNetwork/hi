@@ -1,0 +1,5 @@
+[process]
+require_tools = ["edit"]
+[budget]
+max_same_path_rereads = 2
+max_tool_result_chars = 50000

@@ -359,6 +359,8 @@ impl MutationPlan {
 
     /// Render the exact in-memory plan without touching target files.
     pub fn preview(&self) -> String {
+        const MAX_PREVIEW_CHARS: usize = 16_384;
+        const MAX_DIFF_SOURCE_BYTES: usize = 64 * 1024;
         let mut out = String::new();
         for change in &self.changes {
             if change.as_file_change(&self.root).is_none() {
@@ -373,24 +375,44 @@ impl MutationPlan {
                     Some(RestoreNode::File { bytes: before, .. }),
                     Some(RestoreNode::File { bytes: after, .. }),
                 ) => match (std::str::from_utf8(before), std::str::from_utf8(after)) {
-                    (Ok(before), Ok(after)) => {
+                    (Ok(before), Ok(after))
+                        if before.len().saturating_add(after.len()) <= MAX_DIFF_SOURCE_BYTES =>
+                    {
                         out.push_str(&format!("--- {path}\n+++ {path}\n"));
                         out.push_str(&crate::edit::diff(before, after));
                     }
+                    (Ok(_), Ok(_)) => out.push_str(&format!(
+                        "~ {path} ({} → {} bytes; preview omitted)",
+                        before.len(),
+                        after.len()
+                    )),
                     _ => out.push_str(&format!("~ {path} (binary content changed)")),
                 },
                 (None, Some(RestoreNode::File { bytes: after, .. })) => {
                     match std::str::from_utf8(after) {
-                        Ok(after) => {
+                        Ok(after) if after.len() <= MAX_DIFF_SOURCE_BYTES => {
                             out.push_str(&format!("--- /dev/null\n+++ {path}\n"));
                             out.push_str(&crate::edit::diff("", after));
                         }
+                        Ok(after) => out.push_str(&format!(
+                            "+ {path} ({} bytes; preview omitted)",
+                            after.len()
+                        )),
                         Err(_) => out.push_str(&format!("+ {path} (binary file)")),
                     }
                 }
                 (Some(_), None) => out.push_str(&format!("- {path}")),
                 (_, Some(_)) => out.push_str(&format!("~ {path} (filesystem node changed)")),
                 (None, None) => {}
+            }
+            if out.len() > MAX_PREVIEW_CHARS {
+                let mut end = MAX_PREVIEW_CHARS.min(out.len());
+                while end > 0 && !out.is_char_boundary(end) {
+                    end -= 1;
+                }
+                out.truncate(end);
+                out.push_str("\n… (preview truncated)");
+                break;
             }
         }
         if out.is_empty() {

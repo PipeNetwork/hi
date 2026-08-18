@@ -918,11 +918,18 @@ async fn run(
             if args.steps.is_empty() {
                 bail!("update_plan needs at least one step");
             }
+            // Titles ride in leftover-plan steering and the structured goal.
+            // An unbounded list (or novel-length titles) is a session-wide
+            // token bomb even though the tool result itself is one line.
+            const MAX_PLAN_STEPS: usize = 128;
+            const MAX_PLAN_TITLE_CHARS: usize = 160;
+            let omitted = args.steps.len().saturating_sub(MAX_PLAN_STEPS);
             let steps: Vec<PlanStep> = args
                 .steps
                 .into_iter()
+                .take(MAX_PLAN_STEPS)
                 .map(|s| PlanStep {
-                    title: s.title,
+                    title: clip_plan_title(&s.title, MAX_PLAN_TITLE_CHARS),
                     status: PlanStatus::parse(&s.status),
                 })
                 .collect();
@@ -930,10 +937,11 @@ async fn run(
                 .iter()
                 .filter(|s| s.status == PlanStatus::Done)
                 .count();
-            Ok(ToolOutcome::planned(
-                format!("Plan recorded: {done}/{} done.", steps.len()),
-                steps,
-            ))
+            let mut content = format!("Plan recorded: {done}/{} done.", steps.len());
+            if omitted > 0 {
+                content.push_str(&format!(" ({omitted} extra step(s) omitted)"));
+            }
+            Ok(ToolOutcome::planned(content, steps))
         }
         "write" | "edit" | "multi_edit" | "apply_patch" => {
             let prepared =
@@ -1013,6 +1021,15 @@ async fn run(
 
 fn mutation_attempted_by_tool(name: &str) -> bool {
     is_filesystem_mutating(name) || name == "bash"
+}
+
+fn clip_plan_title(title: &str, max: usize) -> String {
+    let title = title.trim();
+    if title.chars().count() <= max {
+        return title.to_string();
+    }
+    let clipped: String = title.chars().take(max.saturating_sub(1)).collect();
+    format!("{clipped}…")
 }
 
 pub(super) fn mark_effect_inspection_failed(

@@ -58,6 +58,9 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "judge") {
+        return hi_eval::judge::run_cli(&args);
+    }
     if args.first().is_some_and(|arg| arg == "compare") {
         let left = flag_value(&args, "--left")
             .ok_or_else(|| anyhow::anyhow!("compare requires --left <artifact-dir>"))?;

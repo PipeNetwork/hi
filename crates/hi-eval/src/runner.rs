@@ -264,6 +264,16 @@ pub fn run_candidate(
         .filter(|&n| n >= 1)
         .unwrap_or(25);
     let session = work.join(".hi-eval-session.jsonl");
+    let harness_run = harness_run_config(task_dir);
+    let resume_steps = harness_resume_steps(&harness_run);
+    let persist_session = turns > 1 || !resume_steps.is_empty() || harness_run.needs_session();
+    if harness_run.needs_seed() {
+        seed_harness_session(
+            &session,
+            harness_run.seed_image_chars,
+            harness_run.seed_tool_result_chars,
+        )?;
+    }
     const GOAL_CONTINUE_PROMPT: &str = "Continue the long-horizon goal: complete the active \
 sub-goal now, then update the plan with update_plan — including any newly discovered steps.";
 
@@ -275,8 +285,8 @@ sub-goal now, then update the plan with update_plan — including any newly disc
             .arg("--trace-full")
             .arg("--temperature")
             .arg(temperature.to_string());
-        if turns > 1 {
-            // Multi-turn: persist the conversation across child runs.
+        if persist_session {
+            // Multi-turn / harness resume: persist the conversation across child runs.
             cmd.arg("--session-file").arg(&session);
         } else {
             cmd.arg("--no-save");
@@ -314,19 +324,19 @@ sub-goal now, then update the plan with update_plan — including any newly disc
 
     let started = Instant::now();
     let timeout = Duration::from_secs(task.timeouts.candidate_seconds);
-    let mut first_command = build_cmd(
-        &task.prompt,
-        true,
+    let first_max_steps = resume_steps.first().copied().or_else(|| {
         (turns > 1).then(|| {
             if goal_mode {
                 turn_steps
             } else {
                 turn_steps * turns
             }
-        }),
-    );
+        })
+    });
+    let mut first_command = build_cmd(&task.prompt, true, first_max_steps);
     let mut output =
         command_output_with_timeout(&mut first_command, timeout).context("failed to launch hi")?;
+    let mut merged_tape = read_report_value(&report_path);
     // Per-turn context-growth series (multi-turn drive only). Turn 1 first, then
     // one snapshot per session-continuing drive turn — the growth curve.
     let mut growth: Vec<TurnMetric> = Vec::new();
@@ -358,6 +368,36 @@ sub-goal now, then update the plan with update_plan — including any newly disc
             }
             last_goal = goal;
         }
+    }
+    // Harness resume: additional invocations on the same --session-file.
+    // Default single-shot tasks never take this path.
+    if resume_steps.len() > 1 && !output.timed_out {
+        for (offset, &steps) in resume_steps.iter().enumerate().skip(1) {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let mut command = build_cmd(&task.prompt, false, Some(steps));
+            output = command_output_with_timeout(&mut command, remaining)
+                .context("failed to launch hi (harness resume)")?;
+            if persist_session {
+                growth.push(read_turn_metric(&report_path, (offset + 1) as u32));
+            }
+            if let Some(next) = read_report_value(&report_path) {
+                merged_tape = Some(match merged_tape.take() {
+                    Some(prev) => merge_harness_tapes(prev, next),
+                    None => next,
+                });
+            }
+        }
+    }
+    if let Some(merged) = &merged_tape
+        && persist_session
+    {
+        let _ = std::fs::write(
+            &report_path,
+            serde_json::to_vec_pretty(merged).unwrap_or_default(),
+        );
     }
     if !output.success() {
         eprintln!(
@@ -467,6 +507,17 @@ sub-goal now, then update the plan with update_plan — including any newly disc
         growth.iter().map(|turn| turn.input_tokens).sum()
     };
 
+    // Judge before deleting the workdir: the report and any written driver.py
+    // must still be readable. Live judge is a no-op when judge.toml is absent.
+    let max_request_tokens = max_request_tokens_from_report(&report_path);
+    let judge = maybe_judge(task_dir, &report_path, &work);
+    if let Some(report) = &judge {
+        append_harness_finding(report, model_override.unwrap_or(""));
+    }
+    let tape = std::fs::read_to_string(&report_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+
     let _ = std::fs::remove_dir_all(&work);
 
     Ok(Candidate {
@@ -503,7 +554,85 @@ sub-goal now, then update the plan with update_plan — including any newly disc
         checks,
         trajectory: report.trajectory,
         growth,
+        judge,
+        max_request_tokens,
+        tape,
     })
+}
+
+fn maybe_judge(task_dir: &Path, report_path: &Path, work: &Path) -> Option<serde_json::Value> {
+    let rules_path = task_dir.join("judge.toml");
+    if !rules_path.is_file() {
+        return None;
+    }
+    let rules = hi_eval::judge::load_rules(&rules_path).ok()?;
+    let raw = std::fs::read_to_string(report_path).ok()?;
+    let mut report = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    if rules.process.require_output_slice {
+        let src = std::fs::read_to_string(work.join("driver.py")).unwrap_or_default();
+        report["harness"]["driver_bounds_output"] =
+            serde_json::Value::Bool(hi_eval::judge::driver_bounds_output(&src));
+    }
+    serde_json::to_value(hi_eval::judge::judge_report(&report, &rules)).ok()
+}
+
+fn max_request_tokens_from_report(path: &Path) -> Option<u64> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let report: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    report
+        .pointer("/telemetry/requests")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.get("input_tokens_est").and_then(|v| v.as_u64()))
+        .max()
+}
+
+fn append_harness_finding(judge: &serde_json::Value, model: &str) {
+    let process_fail = judge.get("process").and_then(|v| v.as_str()) == Some("fail");
+    let budget_fail = judge.get("budget").and_then(|v| v.as_str()) == Some("fail");
+    if !process_fail && !budget_fail {
+        return;
+    }
+    let Ok(root) = std::env::var("HI_STATE_DIR") else {
+        return;
+    };
+    if root.trim().is_empty() {
+        return;
+    }
+    let dir = std::path::PathBuf::from(root).join("learning");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let shape = if process_fail {
+        "harness_process"
+    } else {
+        "harness_budget"
+    };
+    let line = serde_json::json!({
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "status": "failed",
+        "stop_reason": "completed",
+        "verification": "failed",
+        "review": "not_required",
+        "changed_files": 0,
+        "model": model,
+        "failure_shape": shape,
+    });
+    let Ok(body) = serde_json::to_string(&line) else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("findings.jsonl"))
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{body}");
+    }
 }
 
 fn infrastructure_candidate(
@@ -555,7 +684,111 @@ fn infrastructure_candidate(
         }],
         trajectory: Trajectory::default(),
         growth: Vec::new(),
+        judge: None,
+        max_request_tokens: None,
+        tape: None,
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct HarnessRunConfig {
+    steps: Vec<u32>,
+    seed_image_chars: Option<u64>,
+    seed_tool_result_chars: Option<u64>,
+}
+
+impl HarnessRunConfig {
+    fn needs_session(&self) -> bool {
+        !self.steps.is_empty()
+            || self.seed_image_chars.is_some()
+            || self.seed_tool_result_chars.is_some()
+    }
+
+    fn needs_seed(&self) -> bool {
+        self.seed_image_chars.is_some() || self.seed_tool_result_chars.is_some()
+    }
+}
+
+fn harness_run_config(task_dir: &Path) -> HarnessRunConfig {
+    let path = task_dir.join("judge.toml");
+    let from_file = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| toml::from_str::<hi_eval::judge::JudgeRules>(&raw).ok())
+        .map(|rules| HarnessRunConfig {
+            steps: rules.run.steps,
+            seed_image_chars: rules.run.seed_image_chars,
+            seed_tool_result_chars: rules.run.seed_tool_result_chars,
+        })
+        .unwrap_or_default();
+    if !from_file.steps.is_empty() || from_file.needs_seed() {
+        return from_file;
+    }
+    let resume = std::env::var("HI_EVAL_RESUME")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    if resume {
+        HarnessRunConfig {
+            steps: vec![3, 8],
+            ..from_file
+        }
+    } else {
+        from_file
+    }
+}
+
+fn harness_resume_steps(cfg: &HarnessRunConfig) -> Vec<u32> {
+    cfg.steps.iter().copied().filter(|&n| n >= 1).collect()
+}
+
+fn seed_harness_session(
+    path: &Path,
+    image_chars: Option<u64>,
+    tool_result_chars: Option<u64>,
+) -> Result<()> {
+    use hi_ai::{Content, Message, Role};
+    const MAX_SEED_IMAGE: u64 = 2_000_000;
+    const MAX_SEED_RESULT: u64 = 200_000;
+    let mut messages = Vec::new();
+    if let Some(n) = image_chars {
+        let n = n.min(MAX_SEED_IMAGE) as usize;
+        messages.push(Message {
+            role: Role::User,
+            content: vec![
+                Content::Text("see this screenshot".into()),
+                Content::Image {
+                    data: "A".repeat(n),
+                    media_type: "image/png".into(),
+                },
+            ],
+        });
+        messages.push(Message::assistant(vec![Content::Text("ok".into())]));
+    }
+    if let Some(n) = tool_result_chars {
+        let n = n.min(MAX_SEED_RESULT) as usize;
+        messages.push(Message::user("read the blob"));
+        messages.push(Message::assistant(vec![Content::ToolCall {
+            id: "seed-read".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"blob.txt"}"#.into(),
+        }]));
+        messages.push(Message::tool_result("seed-read", "X".repeat(n)));
+        messages.push(Message::assistant(vec![Content::Text("noted".into())]));
+    }
+    // Pad past DEFAULT_KEEP_RECENT (3) so the seed is old on resume.
+    for i in 0..3 {
+        messages.push(Message::user(format!("continue {i}")));
+        messages.push(Message::assistant(vec![Content::Text("ok".into())]));
+    }
+    let mut payload = String::new();
+    for message in &messages {
+        payload.push_str(&serde_json::to_string(message)?);
+        payload.push('\n');
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, payload).with_context(|| format!("seeding session {}", path.display()))?;
+    Ok(())
 }
 
 pub(crate) fn initialize_workspace(work: &Path, task: &Task) -> Result<()> {
@@ -760,6 +993,53 @@ struct ReportInfo {
     trace: Option<serde_json::Value>,
     compat_fallbacks_used: Vec<String>,
     trajectory: Trajectory,
+}
+
+fn read_report_value(path: &Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn merge_harness_tapes(prev: serde_json::Value, next: serde_json::Value) -> serde_json::Value {
+    let prev_tel = prev
+        .get("telemetry")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let next_tel = next
+        .get("telemetry")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let concat = |key: &str| -> serde_json::Value {
+        let mut items = prev_tel
+            .get(key)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        items.extend(
+            next_tel
+                .get(key)
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+        );
+        serde_json::Value::Array(items)
+    };
+    let mut merged = next;
+    if let Some(tel) = merged.get_mut("telemetry") {
+        tel["tool_timeline"] = concat("tool_timeline");
+        tel["requests"] = concat("requests");
+        tel["compaction"] = concat("compaction");
+        let prev_rounds = prev_tel
+            .get("verify_rounds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let next_rounds = next_tel
+            .get("verify_rounds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        tel["verify_rounds"] = serde_json::json!(prev_rounds.max(next_rounds));
+    }
+    merged
 }
 
 fn read_report(path: &Path) -> ReportInfo {
@@ -1394,6 +1674,102 @@ command = "PYTHONPATH=. python3 -c 'from solution import VALUE; assert VALUE == 
             temperatures
         );
         assert!(result.candidates.iter().all(|candidate| candidate.passed));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn merge_harness_tapes_unions_timeline_and_requests() {
+        let first = serde_json::json!({
+            "telemetry": {
+                "verify_rounds": 0,
+                "tool_timeline": [{"tool": "edit", "path": "solution.py"}],
+                "requests": [{"input_tokens_est": 100}]
+            }
+        });
+        let second = serde_json::json!({
+            "telemetry": {
+                "verify_rounds": 1,
+                "tool_timeline": [{"tool": "bash", "path": ""}],
+                "requests": [{"input_tokens_est": 200}]
+            }
+        });
+        let merged = super::merge_harness_tapes(first, second);
+        let tools: Vec<&str> = merged["telemetry"]["tool_timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["tool"].as_str())
+            .collect();
+        assert_eq!(tools, ["edit", "bash"]);
+        assert_eq!(merged["telemetry"]["verify_rounds"], 1);
+        assert_eq!(merged["telemetry"]["requests"][1]["input_tokens_est"], 200);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn harness_run_steps_use_session_file_and_judge_before_cleanup() {
+        let (root, task) = candidate_test_task();
+        std::fs::write(
+            root.join("judge.toml"),
+            r#"
+[process]
+require_tools = ["edit"]
+[budget]
+max_tool_result_chars = 50000
+[run]
+steps = [3, 8]
+"#,
+        )
+        .unwrap();
+        let args_log = root.join("args.log");
+        let hi = fake_hi(
+            &root,
+            &format!(
+                r#"printf '%s\n' "$*" >> "{log}"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--report" ]; then
+    shift
+    printf '%s' '{{"schema_version":2,"outcome":{{"status":"completed"}},"telemetry":{{"tool_timeline":[{{"tool":"edit","path":"solution.py"}}],"requests":[{{"input_tokens_est":1234,"max_tool_result_chars":10}}]}}}}' > "$1"
+  fi
+  shift
+done
+printf 'VALUE = 42\n' > solution.py
+exit 0
+"#,
+                log = args_log.display()
+            ),
+        );
+        let candidate = run_candidate(
+            0,
+            &hi,
+            &root,
+            &task,
+            false,
+            0.0,
+            &[],
+            EvalProfile::Default,
+            None,
+        )
+        .unwrap();
+        let args = std::fs::read_to_string(&args_log).unwrap();
+        assert!(
+            args.contains("--session-file"),
+            "resume helper must persist a session: {args}"
+        );
+        assert!(
+            args.contains("--max-steps 3") && args.contains("--max-steps 8"),
+            "both run.steps must be invoked: {args}"
+        );
+        assert!(candidate.judge.is_some(), "judge must run before cleanup");
+        assert_eq!(candidate.max_request_tokens, Some(1234));
+        assert_eq!(
+            candidate
+                .judge
+                .as_ref()
+                .and_then(|j| j.get("process"))
+                .and_then(|v| v.as_str()),
+            Some("pass")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

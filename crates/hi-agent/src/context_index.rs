@@ -260,6 +260,12 @@ fn boost_one_hop_imports(
     let mut imported = HashSet::new();
     for seed in seeds {
         let path = root.join(&seed);
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -386,6 +392,10 @@ fn scoped_instructions(root: &Path, candidates: &[Candidate]) -> BTreeMap<String
         .into_iter()
         .filter_map(|path| {
             let relative = normalize(&path.strip_prefix(root).ok()?.to_string_lossy());
+            let metadata = std::fs::metadata(&path).ok()?;
+            if metadata.len() > MAX_FILE_BYTES {
+                return None;
+            }
             let text = std::fs::read_to_string(path).ok()?;
             (!text.trim().is_empty()).then(|| (relative, text.trim().to_string()))
         })
