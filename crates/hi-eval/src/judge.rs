@@ -127,6 +127,31 @@ fn tool_name(entry: &Value) -> &str {
     entry.get("tool").and_then(|v| v.as_str()).unwrap_or("")
 }
 
+/// Paths this call touched: the single `path` field, plus every
+/// `effects.file_changes[].path` so multi-file `apply_patch` / `multi_edit`
+/// still participate in process rules.
+fn tool_paths(entry: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(path) = entry.get("path").and_then(|v| v.as_str()) {
+        if !path.is_empty() {
+            paths.push(path.to_string());
+        }
+    }
+    if let Some(changes) = entry
+        .pointer("/effects/file_changes")
+        .and_then(|v| v.as_array())
+    {
+        for change in changes {
+            if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
+                if !path.is_empty() && !paths.iter().any(|existing| existing == path) {
+                    paths.push(path.to_string());
+                }
+            }
+        }
+    }
+    paths
+}
+
 fn judge_process(report: &Value, rules: &ProcessRules, violations: &mut Vec<JudgeViolation>) {
     let names: Vec<&str> = tools(report).map(tool_name).collect();
     for forbidden in &rules.forbid_tools {
@@ -162,18 +187,21 @@ fn judge_process(report: &Value, rules: &ProcessRules, violations: &mut Vec<Judg
         let mut read_paths = std::collections::BTreeSet::new();
         for entry in tools(report) {
             let name = tool_name(entry);
-            let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            if name == "read" && !path.is_empty() {
-                read_paths.insert(path.to_string());
+            let paths = tool_paths(entry);
+            if name == "read" {
+                for path in &paths {
+                    read_paths.insert(path.clone());
+                }
             }
-            if matches!(name, "edit" | "multi_edit" | "apply_patch")
-                && !path.is_empty()
-                && !read_paths.contains(path)
-            {
-                violations.push(JudgeViolation {
-                    rule: "process.mutate_after_read".into(),
-                    got: path.to_string(),
-                });
+            if matches!(name, "edit" | "multi_edit" | "apply_patch" | "write") {
+                for path in &paths {
+                    if !read_paths.contains(path) {
+                        violations.push(JudgeViolation {
+                            rule: "process.mutate_after_read".into(),
+                            got: path.clone(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -200,19 +228,17 @@ fn judge_process(report: &Value, rules: &ProcessRules, violations: &mut Vec<Judg
             ) {
                 continue;
             }
-            let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            if path.is_empty() {
-                continue;
-            }
-            if let Some(prefix) = rules
-                .forbid_path_prefixes
-                .iter()
-                .find(|prefix| path_under_prefix(path, prefix))
-            {
-                violations.push(JudgeViolation {
-                    rule: format!("process.forbid_path_prefixes.{prefix}"),
-                    got: path.to_string(),
-                });
+            for path in tool_paths(entry) {
+                if let Some(prefix) = rules
+                    .forbid_path_prefixes
+                    .iter()
+                    .find(|prefix| path_under_prefix(&path, prefix))
+                {
+                    violations.push(JudgeViolation {
+                        rule: format!("process.forbid_path_prefixes.{prefix}"),
+                        got: path,
+                    });
+                }
             }
         }
     }
@@ -242,11 +268,15 @@ pub fn path_under_prefix(path: &str, prefix: &str) -> bool {
 }
 
 fn is_root_cargo_test(command: &str) -> bool {
-    let t = command.trim();
-    t.starts_with("cargo test")
-        && !t.contains("-p ")
-        && !t.contains("--package")
-        && !t.contains("--manifest-path")
+    let lower = command.to_ascii_lowercase();
+    let has_cargo_test = lower.contains("cargo test") || lower.contains("cargo t ");
+    if !has_cargo_test {
+        return false;
+    }
+    !(lower.contains(" -p ")
+        || lower.contains(" --package ")
+        || lower.contains("--manifest-path")
+        || lower.contains("-p="))
 }
 
 fn judge_budget(report: &Value, rules: &BudgetRules, violations: &mut Vec<JudgeViolation>) {
@@ -310,11 +340,9 @@ fn judge_budget(report: &Value, rules: &BudgetRules, violations: &mut Vec<JudgeV
             if tool_name(entry) != "read" {
                 continue;
             }
-            let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            if path.is_empty() {
-                continue;
+            for path in tool_paths(entry) {
+                *counts.entry(path).or_default() += 1;
             }
-            *counts.entry(path.to_string()).or_default() += 1;
         }
         for (path, n) in counts {
             if n > max {
@@ -559,6 +587,27 @@ mod tests {
     }
 
     #[test]
+    fn cargo_t_at_root_fails_process() {
+        let report = json!({
+            "telemetry": {
+                "tool_timeline": [
+                    {"tool": "edit", "path": "solution.py"},
+                    {"tool": "bash", "command": "CARGO t --quiet"}
+                ]
+            }
+        });
+        let rules = JudgeRules {
+            process: ProcessRules {
+                no_root_cargo_test: true,
+                require_tools: vec!["edit".into()],
+                ..ProcessRules::default()
+            },
+            ..JudgeRules::default()
+        };
+        assert_eq!(judge_report(&report, &rules).process, JudgeVerdict::Fail);
+    }
+
+    #[test]
     fn package_local_cargo_test_is_allowed() {
         let report = json!({
             "telemetry": {
@@ -640,6 +689,19 @@ mod tests {
             }
         });
         assert!(judge_report(&via_host, &rules).ok());
+        let via_patch = json!({
+            "telemetry": {
+                "tool_timeline": [
+                    {"tool": "write", "path": "driver.py"},
+                    {
+                        "tool": "apply_patch",
+                        "path": "",
+                        "effects": {"file_changes": [{"path": "bug/solution.py"}]}
+                    }
+                ]
+            }
+        });
+        assert_eq!(judge_report(&via_patch, &rules).process, JudgeVerdict::Fail);
     }
 
     #[test]

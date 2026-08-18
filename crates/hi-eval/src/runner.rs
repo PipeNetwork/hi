@@ -282,7 +282,6 @@ sub-goal now, then update the plan with update_plan — including any newly disc
         cmd.current_dir(&work)
             .arg("--report")
             .arg(&report_path)
-            .arg("--trace-full")
             .arg("--temperature")
             .arg(temperature.to_string());
         if persist_session {
@@ -290,6 +289,10 @@ sub-goal now, then update the plan with update_plan — including any newly disc
             cmd.arg("--session-file").arg(&session);
         } else {
             cmd.arg("--no-save");
+        }
+        // Full traces are for harness tapes. Ordinary bench/tasks stay metadata-first.
+        if task_dir.join("judge.toml").is_file() {
+            cmd.arg("--trace-full");
         }
         if let Some(steps) = max_steps {
             cmd.arg("--max-steps").arg(steps.to_string());
@@ -393,11 +396,9 @@ sub-goal now, then update the plan with update_plan — including any newly disc
     }
     if let Some(merged) = &merged_tape
         && persist_session
+        && let Ok(bytes) = serde_json::to_vec_pretty(merged)
     {
-        let _ = std::fs::write(
-            &report_path,
-            serde_json::to_vec_pretty(merged).unwrap_or_default(),
-        );
+        let _ = std::fs::write(&report_path, bytes);
     }
     if !output.success() {
         eprintln!(
@@ -722,6 +723,12 @@ impl HarnessRunConfig {
     fn needs_seed(&self) -> bool {
         self.seed_image_chars.is_some() || self.seed_tool_result_chars.is_some()
     }
+
+    /// Any `[run]` content counts as explicit so HI_EVAL_RESUME cannot
+    /// override a task that only set ignore_change_prefixes.
+    fn has_explicit_run(&self) -> bool {
+        self.needs_session() || !self.ignore_change_prefixes.is_empty()
+    }
 }
 
 fn harness_run_config(task_dir: &Path) -> HarnessRunConfig {
@@ -736,7 +743,7 @@ fn harness_run_config(task_dir: &Path) -> HarnessRunConfig {
             ignore_change_prefixes: rules.run.ignore_change_prefixes,
         })
         .unwrap_or_default();
-    if !from_file.steps.is_empty() || from_file.needs_seed() {
+    if from_file.has_explicit_run() {
         return from_file;
     }
     let resume = std::env::var("HI_EVAL_RESUME")
