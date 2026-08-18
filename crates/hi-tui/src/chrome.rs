@@ -257,11 +257,11 @@ pub(crate) fn context_usage_chip(used: u64, window: u64, hovered: bool) -> Strin
     if !hovered {
         return idle;
     }
-    let pct = if window == 0 {
-        0
-    } else {
-        (used.saturating_mul(100) / window).min(100)
-    };
+    let pct = used
+        .saturating_mul(100)
+        .checked_div(window)
+        .unwrap_or(0)
+        .min(100);
     usage_bar(idle.chars().count().max(1), pct)
 }
 

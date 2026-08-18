@@ -228,7 +228,7 @@ pub(crate) fn render_btw_panel(
     };
     match state {
         BtwOverlayState::Loading { .. } => {
-            let spinner = SPINNER[(tick as usize) % SPINNER.len()];
+            let spinner = SPINNER[tick % SPINNER.len()];
             let style = Style::default().fg(theme.gray).bg(bg);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![

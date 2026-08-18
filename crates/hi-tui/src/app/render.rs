@@ -647,7 +647,7 @@ impl crate::App {
         }
         let th = crate::theme::theme();
         let mut live: Vec<_> = self.subagents.values().filter(|info| info.live()).collect();
-        live.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        live.sort_by_key(|info| std::cmp::Reverse(info.started_at));
         if live.is_empty() {
             return Vec::new();
         }
@@ -1003,29 +1003,30 @@ impl crate::App {
         // Pick the largest step count (up to total and HARD_CAP) whose plan_h
         // fits avail_inner. On tiny terminals avail_inner is 0 so the prompt
         // box keeps a closed border.
-        let max_steps =
-            if !show_lists || avail_inner == 0 || (self.plan.is_empty() && self.goal.is_none()) {
-                0
-            } else if !self.plan_pane_expanded {
+        let max_steps = if !show_lists
+            || avail_inner == 0
+            || (self.plan.is_empty() && self.goal.is_none())
+            || !self.plan_pane_expanded
+        {
+            0
+        } else {
+            const HARD_CAP: usize = 8;
+            let total = if self.goal.as_ref().is_some_and(|g| !g.sub_goals.is_empty()) {
+                self.goal.as_ref().map(|g| g.sub_goals.len()).unwrap_or(0)
+            } else {
+                self.plan.len()
+            };
+            let upper = total.min(HARD_CAP);
+            let mut n = upper;
+            while n > 0 && 1 + n + usize::from(total > n) > avail_inner {
+                n -= 1;
+            }
+            if 1 + n + usize::from(total > n) > avail_inner {
                 0
             } else {
-                const HARD_CAP: usize = 8;
-                let total = if self.goal.as_ref().is_some_and(|g| !g.sub_goals.is_empty()) {
-                    self.goal.as_ref().map(|g| g.sub_goals.len()).unwrap_or(0)
-                } else {
-                    self.plan.len()
-                };
-                let upper = total.min(HARD_CAP);
-                let mut n = upper;
-                while n > 0 && 1 + n + usize::from(total > n) > avail_inner {
-                    n -= 1;
-                }
-                if 1 + n + usize::from(total > n) > avail_inner {
-                    0
-                } else {
-                    n
-                }
-            };
+                n
+            }
+        };
         let plan_block = if show_lists && avail_inner > 0 {
             let mut lines = self.plan_lines(max_steps);
             lines.truncate(avail_inner);
@@ -1280,11 +1281,12 @@ impl crate::App {
             self.scroll = want.min(max_scroll as u32) as u16;
             self.following = false;
         }
-        if self.page_flip_on_send && self.working {
-            if let Some(&idx) = self.view_cache.prompt_line_starts.last() {
-                self.scroll = self.view_cache.prefix.get(idx).copied().unwrap_or(0) as u16;
-                self.following = false;
-            }
+        if self.page_flip_on_send
+            && self.working
+            && let Some(&idx) = self.view_cache.prompt_line_starts.last()
+        {
+            self.scroll = self.view_cache.prefix.get(idx).copied().unwrap_or(0) as u16;
+            self.following = false;
         }
         let scroll = if self.following {
             self.page_flip_on_send = false;

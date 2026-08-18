@@ -126,7 +126,7 @@ mod tests {
                     Content::Text("[elided image — was 2000000 chars]".into()),
                 ],
             },
-            Message::tool_result("r1", &"x".repeat(20_000)),
+            Message::tool_result("r1", "x".repeat(20_000)),
         ];
         let census = census_messages(&messages);
         assert!(census.elided_images >= 1, "{census:?}");

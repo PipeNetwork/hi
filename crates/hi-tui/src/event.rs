@@ -697,6 +697,21 @@ impl Ui for ChannelUi {
     }
 }
 
+/// Restores the terminal on drop (covers early returns and panics).
+pub(crate) struct Restore;
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableFocusChange,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,20 +761,5 @@ mod tests {
             .is_none()
         );
         assert!(canonical_to_ui_event(&event(EventKind::RunCompleted, "Run finished")).is_none());
-    }
-}
-
-/// Restores the terminal on drop (covers early returns and panics).
-pub(crate) struct Restore;
-impl Drop for Restore {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableMouseCapture,
-            DisableFocusChange,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
     }
 }

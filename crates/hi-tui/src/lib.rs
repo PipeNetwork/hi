@@ -660,6 +660,7 @@ pub(crate) enum TranscriptEntry {
     },
     /// A line of assistant prose. It stays separate from status/tool lines so
     /// the renderer can add the assistant gutter without changing copied text.
+    #[allow(dead_code)]
     Assistant(Line<'static>),
     /// One grok-build assistant reply (markdown source), flattened as a block.
     AssistantMessage {

@@ -58,7 +58,7 @@ impl CommandPalette {
                     Some(HelpSection::Core | HelpSection::Project | HelpSection::Modes)
                 )
             });
-            items.sort_by(|a, b| empty_palette_rank(a).cmp(&empty_palette_rank(b)));
+            items.sort_by_key(empty_palette_rank);
         } else {
             items.retain(|i| {
                 i.label.to_ascii_lowercase().contains(&needle)

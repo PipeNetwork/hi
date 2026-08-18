@@ -522,11 +522,7 @@ pub(crate) fn thinking_block_lines(
         } else {
             format!("{secs}s")
         };
-        if expanded {
-            format!("thought for {label}")
-        } else {
-            format!("thought for {label}")
-        }
+        format!("thought for {label}")
     };
     let mut lines = vec![Line::styled(
         format!("  {header}"),

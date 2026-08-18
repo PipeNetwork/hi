@@ -1383,14 +1383,11 @@ mod tests {
 
     #[test]
     fn actionability_issues_flag_meta_objectives() {
-        let issues = actionability_issues(
-            [
-                "add a --seed flag",
-                "investigate the parser",
-                "Final workspace validation",
-            ]
-            .into_iter(),
-        );
+        let issues = actionability_issues([
+            "add a --seed flag",
+            "investigate the parser",
+            "Final workspace validation",
+        ]);
         assert_eq!(issues.len(), 2);
         assert!(issues.iter().any(|(t, _)| t.contains("investigate")));
         assert!(issues.iter().any(|(t, _)| t.contains("validation")));

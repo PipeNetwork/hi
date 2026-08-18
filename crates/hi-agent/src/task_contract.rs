@@ -441,7 +441,7 @@ fn acceptance_text(prompt: &str) -> Vec<String> {
             .iter()
             .any(|needle| lower.contains(needle))
         })
-        .map(|sentence| clip_acceptance(sentence))
+        .map(clip_acceptance)
         .take(MAX_ACCEPTANCE_ITEMS)
         .collect()
 }

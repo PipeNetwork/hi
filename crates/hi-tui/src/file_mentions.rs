@@ -186,9 +186,9 @@ pub(crate) fn mention_spans(chunk: &str) -> Vec<Span<'static>> {
             spans.push(Span::styled(rest[..at].to_string(), text_style));
         }
         let after = &rest[at + 1..];
-        if after.starts_with('@') {
+        if let Some(rest_after) = after.strip_prefix('@') {
             spans.push(Span::styled("@@".to_string(), text_style));
-            rest = &after[1..];
+            rest = rest_after;
             continue;
         }
         let token_len = after

@@ -937,64 +937,61 @@ async fn run() -> Result<()> {
                 ),
                 Ok(_) => None,
             };
-            match &result {
-                Ok(outcome) => {
-                    if kind == hi_agent::DriveKind::Goal {
-                        let made_progress = match (agent.structured_goal(), goal_before.as_ref()) {
-                            (Some(after), Some(before)) => after.drive_state_changed_since(before),
-                            _ => true,
-                        };
-                        let progress = agent.note_goal_drive_progress(made_progress);
-                        if !cli.quiet {
-                            match progress {
-                                hi_agent::GoalDriveProgress::Skipped { failed, next } => {
-                                    println!(
-                                        "\x1b[33m{}\x1b[0m",
-                                        hi_agent::goal_drive_skip_message(&failed, next.as_deref())
-                                    );
-                                }
-                                hi_agent::GoalDriveProgress::Parked => {
-                                    println!(
-                                        "\x1b[33m{}\x1b[0m",
-                                        hi_agent::goal_drive_park_message(
-                                            agent.leftover_work().as_deref()
-                                        )
-                                    );
-                                }
-                                _ => {}
+            if let Ok(outcome) = &result {
+                if kind == hi_agent::DriveKind::Goal {
+                    let made_progress = match (agent.structured_goal(), goal_before.as_ref()) {
+                        (Some(after), Some(before)) => after.drive_state_changed_since(before),
+                        _ => true,
+                    };
+                    let progress = agent.note_goal_drive_progress(made_progress);
+                    if !cli.quiet {
+                        match progress {
+                            hi_agent::GoalDriveProgress::Skipped { failed, next } => {
+                                println!(
+                                    "\x1b[33m{}\x1b[0m",
+                                    hi_agent::goal_drive_skip_message(&failed, next.as_deref())
+                                );
                             }
+                            hi_agent::GoalDriveProgress::Parked => {
+                                println!(
+                                    "\x1b[33m{}\x1b[0m",
+                                    hi_agent::goal_drive_park_message(
+                                        agent.leftover_work().as_deref()
+                                    )
+                                );
+                            }
+                            _ => {}
                         }
-                    } else if kind == hi_agent::DriveKind::Plan {
-                        let made_progress = hi_agent::plan_drive_made_progress(
-                            plan_step_before.as_deref(),
-                            agent.next_plan_step_title(),
-                            &agent.last_turn_telemetry().progress_events,
-                            agent.last_changed_files(),
-                        );
-                        agent.note_plan_drive_progress(made_progress);
                     }
-                    if let Some(count) = agent.take_goal_requeue_notice()
-                        && !cli.quiet
-                    {
-                        println!(
-                            "\x1b[33m{}\x1b[0m",
-                            hi_agent::goal_drive_requeue_message(count)
-                        );
-                    }
-                    if let Some(next) = agent.drive_decision(Some(outcome)).prompt() {
-                        let drive_limit = agent
-                            .structured_goal()
-                            .map(|goal| hi_agent::auto_budget_for(goal.sub_goals.len()))
-                            .unwrap_or(hi_agent::ONE_SHOT_DRIVE_TURN_LIMIT);
-                        if drive_turns >= drive_limit {
-                            break;
-                        }
-                        drive_turns += 1;
-                        current_prompt = next.to_string();
-                        continue;
-                    }
+                } else if kind == hi_agent::DriveKind::Plan {
+                    let made_progress = hi_agent::plan_drive_made_progress(
+                        plan_step_before.as_deref(),
+                        agent.next_plan_step_title(),
+                        &agent.last_turn_telemetry().progress_events,
+                        agent.last_changed_files(),
+                    );
+                    agent.note_plan_drive_progress(made_progress);
                 }
-                _ => {}
+                if let Some(count) = agent.take_goal_requeue_notice()
+                    && !cli.quiet
+                {
+                    println!(
+                        "\x1b[33m{}\x1b[0m",
+                        hi_agent::goal_drive_requeue_message(count)
+                    );
+                }
+                if let Some(next) = agent.drive_decision(Some(outcome)).prompt() {
+                    let drive_limit = agent
+                        .structured_goal()
+                        .map(|goal| hi_agent::auto_budget_for(goal.sub_goals.len()))
+                        .unwrap_or(hi_agent::ONE_SHOT_DRIVE_TURN_LIMIT);
+                    if drive_turns >= drive_limit {
+                        break;
+                    }
+                    drive_turns += 1;
+                    current_prompt = next.to_string();
+                    continue;
+                }
             }
             break;
         }

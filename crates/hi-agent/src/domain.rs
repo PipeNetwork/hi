@@ -272,9 +272,10 @@ pub(crate) struct TaskContextState {
 /// settlement/classify logic used to hold by convention is now enforced by
 /// construction: the only way to produce `Passed` is [`VerifyEvidence::pass`],
 /// which requires the evidence.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum VerifyEvidence {
     /// No verification ran this turn (or was cleared by a cancel/fail finalizer).
+    #[default]
     None,
     /// A verification stage ran and failed.
     Failed,
@@ -339,12 +340,6 @@ impl VerifyEvidence {
     /// Reset to no verification (cancel/fail finalizers, settlement invalidation).
     pub(crate) fn clear(&mut self) {
         *self = Self::None;
-    }
-}
-
-impl Default for VerifyEvidence {
-    fn default() -> Self {
-        Self::None
     }
 }
 

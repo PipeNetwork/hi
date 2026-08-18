@@ -557,7 +557,7 @@ fn run_blocking(
             &cancellation,
         ),
         Ok(execution) if execution.status == ToolStatus::Cancelled => {
-            hi_tools::worktree::cleanup(repo_root, &[worktree_root.clone()]);
+            hi_tools::worktree::cleanup(repo_root, std::slice::from_ref(&worktree_root));
             outcome(
                 ToolStatus::Cancelled,
                 "delegate cancelled — child process stopped; nothing was applied.",
@@ -674,6 +674,7 @@ fn delegate_timeout_secs() -> u64 {
         .unwrap_or(DELEGATE_TIMEOUT_SECS)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decide(
     worktree: &Path,
     checkpoint: &str,

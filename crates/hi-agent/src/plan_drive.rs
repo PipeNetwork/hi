@@ -7,17 +7,12 @@ use crate::{
 };
 
 /// How a prompt entered the turn loop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DriveKind {
+    #[default]
     User,
     Plan,
     Goal,
-}
-
-impl Default for DriveKind {
-    fn default() -> Self {
-        Self::User
-    }
 }
 
 impl DriveKind {

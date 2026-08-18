@@ -851,8 +851,10 @@ fn save_config_tightens_preexisting_world_readable_file() {
     std::fs::write(&path, "default_profile = \"keep-me\"\n").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    let mut config = Config::default();
-    config.default_profile = Some("sonnet".into());
+    let config = Config {
+        default_profile: Some("sonnet".into()),
+        ..Config::default()
+    };
     save_config_to(&config, &path).unwrap();
 
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -878,8 +880,10 @@ fn save_config_tightens_a_planted_world_readable_temp_before_writing() {
     std::fs::write(&tmp, "stale").unwrap();
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
 
-    let mut config = Config::default();
-    config.default_profile = Some("sonnet".into());
+    let config = Config {
+        default_profile: Some("sonnet".into()),
+        ..Config::default()
+    };
     save_config_to(&config, &path).unwrap();
 
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

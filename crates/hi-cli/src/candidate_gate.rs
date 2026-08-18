@@ -6,7 +6,9 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(test)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
@@ -150,6 +152,7 @@ fn create_verify_lock(path: &Path, owner: &str) -> std::io::Result<File> {
     Ok(file)
 }
 
+#[cfg(test)]
 fn acquire_verify_flight(key: &str, cache_path: &Path) -> Result<Option<VerifyFlight>> {
     acquire_verify_flight_while(key, cache_path, &|| false)
 }
