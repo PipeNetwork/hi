@@ -410,7 +410,15 @@ sub-goal now, then update the plan with update_plan — including any newly disc
 
     // Freeze the candidate revision before running any feedback or scorer.
     let after = directory_snapshot(&work)?;
-    let changed_files = candidate_changed_paths(&before, &after, &task.allowed_changes)?;
+    let mut changed_files = candidate_changed_paths(&before, &after, &task.allowed_changes)?;
+    if !harness_run.ignore_change_prefixes.is_empty() {
+        changed_files.retain(|path| {
+            !harness_run
+                .ignore_change_prefixes
+                .iter()
+                .any(|prefix| hi_eval::judge::path_under_prefix(path, prefix))
+        });
+    }
     let runtime_artifacts =
         candidate_runtime_artifact_paths(&before, &after, &task.allowed_changes)?;
     let edited = !changed_files.is_empty();
@@ -434,6 +442,12 @@ sub-goal now, then update the plan with update_plan — including any newly disc
     let forbidden = forbidden_changes(&changed_files, &task.allowed_changes)?;
     let (patch, patch_truncated) = render_patch(&before, &after, &changed_files);
 
+    // Inner-task trees (e.g. bug/) may have been mutated by the candidate's
+    // driver via host.py. Restore the fixture copy so the oracle scores the
+    // driver, not a leftover inner patch.
+    if !harness_run.ignore_change_prefixes.is_empty() {
+        restore_ignored_inner_paths(&fixture, &work, &harness_run.ignore_change_prefixes)?;
+    }
     // The score comes only from the captured oracle in a new copy. A visible
     // feedback check, when configured, is recorded separately and cannot make
     // a candidate pass.
@@ -695,6 +709,7 @@ struct HarnessRunConfig {
     steps: Vec<u32>,
     seed_image_chars: Option<u64>,
     seed_tool_result_chars: Option<u64>,
+    ignore_change_prefixes: Vec<String>,
 }
 
 impl HarnessRunConfig {
@@ -718,6 +733,7 @@ fn harness_run_config(task_dir: &Path) -> HarnessRunConfig {
             steps: rules.run.steps,
             seed_image_chars: rules.run.seed_image_chars,
             seed_tool_result_chars: rules.run.seed_tool_result_chars,
+            ignore_change_prefixes: rules.run.ignore_change_prefixes,
         })
         .unwrap_or_default();
     if !from_file.steps.is_empty() || from_file.needs_seed() {
@@ -734,6 +750,29 @@ fn harness_run_config(task_dir: &Path) -> HarnessRunConfig {
     } else {
         from_file
     }
+}
+
+fn restore_ignored_inner_paths(fixture: &Path, work: &Path, prefixes: &[String]) -> Result<()> {
+    for prefix in prefixes {
+        let rel = prefix.trim_end_matches('/');
+        if rel.is_empty() || rel.contains("..") || Path::new(rel).is_absolute() {
+            continue;
+        }
+        let src = fixture.join(rel);
+        let dst = work.join(rel);
+        if src.is_dir() {
+            if dst.exists() {
+                std::fs::remove_dir_all(&dst)?;
+            }
+            copy_dir(&src, &dst)?;
+        } else if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
 }
 
 fn harness_resume_steps(cfg: &HarnessRunConfig) -> Vec<u32> {

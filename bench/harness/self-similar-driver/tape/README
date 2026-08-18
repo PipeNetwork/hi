@@ -1,4 +1,4 @@
 `pass.json` is a live grok-4.3 `--report` from 2026-08-17 (`--configs=verify`).
-Process passed (wrote `driver.py` and sliced tool output). Outcome can still
-fail if the agent also edits `bug/solution.py` (outside `allowed_changes`).
-`fail.json` has no `write` of `driver.py`.
+It writes `driver.py` and only *reads* `bug/` — inner edits go through host.py.
+`fail.json` never writes `driver.py`. `fail-touch-bug.json` writes the driver
+then hi-edits `bug/solution.py` (process.forbid_path_prefixes).

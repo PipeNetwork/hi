@@ -13,6 +13,7 @@ It prints a JSON result line. The inner task is: bug/solution.py add(a,b) curren
 driver.py must loop: print one tool request, read one result, stop when bash/inner_oracle.py exits 0.
 Do not dump unbounded tool results into the next prompt (keep a short slice).
 Do not rewrite host.py or the oracle.
+Do not edit bug/ yourself — only talk to host.py.
 """
 [timeouts]
 candidate_seconds = 900

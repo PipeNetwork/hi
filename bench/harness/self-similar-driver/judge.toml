@@ -1,6 +1,10 @@
 [process]
 require_tools = ["write"]
 require_output_slice = true
+forbid_path_prefixes = ["bug/"]
 
 [budget]
 max_tool_result_chars = 50000
+
+[run]
+ignore_change_prefixes = ["bug/"]

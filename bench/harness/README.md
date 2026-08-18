@@ -28,6 +28,7 @@ Optional `[run]` in `judge.toml` is live-only and does not change `bench/tasks`:
 steps = [3, 8]                 # two hi invocations, same --session-file
 seed_image_chars = 2000000     # token-bomb-image
 seed_tool_result_chars = 80000 # resume-elide
+ignore_change_prefixes = ["bug/"]  # inner-task tree; restored before oracle
 ```
 
 `HI_EVAL_RESUME=1` is the env fallback (`steps = [3, 8]`) when a task has no `[run]` block.

@@ -27,6 +27,9 @@ pub struct RunRules {
     pub seed_image_chars: Option<u64>,
     /// Seed an old tool result of this many chars so resume bounding is visible.
     pub seed_tool_result_chars: Option<u64>,
+    /// Workspace-relative prefixes restored from fixture/ before the oracle
+    /// and dropped from `allowed_changes` (inner-task side effects, e.g. `bug/`).
+    pub ignore_change_prefixes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -39,6 +42,9 @@ pub struct ProcessRules {
     pub no_root_cargo_test: bool,
     /// `driver.py` must slice/cap tool output (self-similar-driver).
     pub require_output_slice: bool,
+    /// Mutate tools (`edit`/`write`/`apply_patch`/…) must not target these
+    /// prefixes. Reads and inner-host edits are allowed.
+    pub forbid_path_prefixes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -185,6 +191,31 @@ fn judge_process(report: &Value, rules: &ProcessRules, violations: &mut Vec<Judg
             }
         }
     }
+    if !rules.forbid_path_prefixes.is_empty() {
+        for entry in tools(report) {
+            let name = tool_name(entry);
+            if !matches!(
+                name,
+                "write" | "edit" | "multi_edit" | "apply_patch" | "delete" | "move"
+            ) {
+                continue;
+            }
+            let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if path.is_empty() {
+                continue;
+            }
+            if let Some(prefix) = rules
+                .forbid_path_prefixes
+                .iter()
+                .find(|prefix| path_under_prefix(path, prefix))
+            {
+                violations.push(JudgeViolation {
+                    rule: format!("process.forbid_path_prefixes.{prefix}"),
+                    got: path.to_string(),
+                });
+            }
+        }
+    }
     if rules.require_output_slice {
         let bounded = report
             .pointer("/harness/driver_bounds_output")
@@ -203,6 +234,11 @@ fn judge_process(report: &Value, rules: &ProcessRules, violations: &mut Vec<Judg
 /// slice tool results instead of concatenating them unbounded.
 pub fn driver_bounds_output(src: &str) -> bool {
     src.contains("[:") || src.contains("[-") || src.contains("slice(")
+}
+
+pub fn path_under_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
 fn is_root_cargo_test(command: &str) -> bool {
@@ -564,6 +600,46 @@ mod tests {
         };
         let judged = judge_report(&report, &rules);
         assert_eq!(judged.budget, JudgeVerdict::Fail);
+    }
+
+    #[test]
+    fn mutate_under_forbidden_prefix_fails_process() {
+        let rules = JudgeRules {
+            process: ProcessRules {
+                require_tools: vec!["write".into()],
+                forbid_path_prefixes: vec!["bug/".into()],
+                ..ProcessRules::default()
+            },
+            ..JudgeRules::default()
+        };
+        let cheat = json!({
+            "telemetry": {
+                "tool_timeline": [
+                    {"tool": "write", "path": "driver.py"},
+                    {"tool": "edit", "path": "bug/solution.py"}
+                ]
+            }
+        });
+        let judged = judge_report(&cheat, &rules);
+        assert_eq!(judged.process, JudgeVerdict::Fail);
+        assert!(
+            judged
+                .violations
+                .iter()
+                .any(|v| v.rule.contains("forbid_path_prefixes")),
+            "{:?}",
+            judged.violations
+        );
+        let via_host = json!({
+            "telemetry": {
+                "tool_timeline": [
+                    {"tool": "write", "path": "driver.py"},
+                    {"tool": "read", "path": "bug/solution.py"},
+                    {"tool": "bash", "command": "python3 host.py"}
+                ]
+            }
+        });
+        assert!(judge_report(&via_host, &rules).ok());
     }
 
     #[test]
