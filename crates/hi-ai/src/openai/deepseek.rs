@@ -84,7 +84,7 @@ impl ProviderCapabilities {
 
     pub(crate) fn model_for_request(&self, model: &str) -> String {
         if self.deepseek && self.official && is_deepseek_model(model) {
-            "deepseek-v4-flash".to_string()
+            official_deepseek_model(model)
         } else {
             model.to_string()
         }
@@ -205,6 +205,18 @@ pub(crate) fn strict_cache_key(base_url: &str, model: &str) -> String {
 pub(crate) fn is_deepseek_model(model: &str) -> bool {
     let normalized = model.to_ascii_lowercase().replace(['_', ' '], "-");
     normalized.contains("deepseek") && (normalized.contains("v4") || normalized.contains("flash"))
+}
+
+/// Official Chat Completions only accepts `deepseek-v4-flash` and
+/// `deepseek-v4-pro`. Dated snapshot aliases (Flash-0731, Pro-0813, …) have
+/// to be collapsed to those slugs; Pro must not be rewritten to Flash.
+fn official_deepseek_model(model: &str) -> String {
+    let normalized = model.to_ascii_lowercase().replace(['_', ' '], "-");
+    if normalized.contains("pro") {
+        "deepseek-v4-pro".to_string()
+    } else {
+        "deepseek-v4-flash".to_string()
+    }
 }
 
 pub(crate) fn is_official_endpoint(base_url: &str) -> bool {
@@ -636,7 +648,21 @@ mod tests {
     fn detects_aliases_and_local_routes() {
         assert!(is_deepseek_model("DeepSeek-V4-Flash-0731"));
         assert!(is_deepseek_model("deepseek/deepseek-v4-flash"));
+        assert!(is_deepseek_model("deepseek-v4-pro"));
         assert!(!is_deepseek_model("gpt-5"));
+        let official_pro = ProviderCapabilities::detect(
+            "https://api.deepseek.com",
+            "DeepSeek-V4-Pro-0813",
+            crate::types::DeepSeekCompat::Auto,
+        );
+        assert_eq!(
+            official_pro.model_for_request("DeepSeek-V4-Pro-0813"),
+            "deepseek-v4-pro"
+        );
+        assert_eq!(
+            official_pro.model_for_request("deepseek-v4-flash"),
+            "deepseek-v4-flash"
+        );
 
         let official = ProviderCapabilities::detect(
             "https://api.deepseek.com",

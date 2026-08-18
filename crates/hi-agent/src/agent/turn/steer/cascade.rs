@@ -341,8 +341,12 @@ fn evaluate_cascade_mode(
                     mode,
                     status: problem.status().to_string(),
                     nudge_body: CONCRETE_REVIEW_NUDGE.to_string(),
+                    // Keep the read-only catalog. Preflight + a thinking
+                    // model (DeepSeek V4 especially) often answers from the
+                    // seed evidence without calling tools; a chat-only
+                    // follow-up then cannot cite or re-read those files.
                     force_tools: false,
-                    force_text: true,
+                    force_text: false,
                 })
             } else if evidence.saw_read && !assistant_text.trim().is_empty() {
                 // Format-weak answer after inspection: accept rather than stall.
