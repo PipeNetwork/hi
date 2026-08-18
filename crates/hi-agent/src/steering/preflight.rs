@@ -43,7 +43,11 @@ pub(crate) fn read_only_preflight_initial_calls_for_prompt(
         intent,
         ReviewIntent::Review | ReviewIntent::Status | ReviewIntent::Roadmap | ReviewIntent::Gaps
     ) && !prompt_explicitly_forbids_tool(prompt, "diff")
+        && !crate::steering::is_bare_codebase_review(prompt)
     {
+        // A bare "review codebase" plus an unbounded working-tree diff dumps
+        // whatever the user has dirty into Flash's first request and crowds
+        // out orientation files. Keep git diff for status/named reviews.
         calls.push(PreflightCall::new("diff", serde_json::json!({})));
     }
     push_preflight_read_if_exists_in(&mut calls, root, "Cargo.toml", 100);
@@ -372,8 +376,35 @@ mod tests {
             paths_from_grep_output_in(&root, grep),
             vec!["crates/demo/src/lib.rs"]
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-        let _ = std::fs::remove_dir_all(root);
+    #[test]
+    fn bare_codebase_review_preflight_skips_unbounded_diff() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-preflight-bare-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        let calls = read_only_preflight_initial_calls_for_prompt(
+            &root,
+            ReviewIntent::Review,
+            "review codebase",
+        );
+        assert!(
+            calls.iter().all(|call| call.name != "diff"),
+            "bare review preflight should not dump the working tree: {calls:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

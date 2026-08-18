@@ -26,8 +26,8 @@ pub use crate::catalog::{
     ToolMetadata, ask_user_tool_spec, delegate_tool_spec, explore_tool_spec,
     get_task_output_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
     is_read_only, kill_task_tool_spec, memory_get_tool_spec, memory_search_tool_spec,
-    search_tool_tool_spec, skill_tool_spec, target_path, task_tool_spec, tool_metadata,
-    use_tool_tool_spec, wait_tasks_tool_spec,
+    search_tool_tool_spec, skill_tool_spec, target_path, target_paths, task_tool_spec,
+    tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
 };
 
 use mutations::run_prepared_mutation;
@@ -846,8 +846,15 @@ fn redact_tool_output(outcome: &mut ToolOutcome) {
     // file/process result, and a newly added handler must not send an
     // arbitrarily large payload into the next model request. Preserve metadata
     // from handlers that already bounded their content.
+    let ceiling = if crate::read::read_output_invites_paging(&outcome.content)
+        || looks_like_numbered_read(&outcome.content)
+    {
+        crate::read::read_output_budget()
+    } else {
+        *crate::condense::MAX_OUTPUT_CHARS
+    };
     if matches!(outcome.truncation, crate::TruncationState::Complete)
-        && outcome.content.chars().count() > *crate::condense::MAX_OUTPUT_CHARS
+        && outcome.content.chars().count() > ceiling
     {
         let (content, truncation) = crate::bound_tool_content(std::mem::take(&mut outcome.content));
         outcome.content = content;
@@ -856,6 +863,13 @@ fn redact_tool_output(outcome: &mut ToolOutcome) {
     if let Some(display) = outcome.display.as_mut() {
         *display = hi_secrets::redact_secrets(display).into_owned();
     }
+}
+
+fn looks_like_numbered_read(content: &str) -> bool {
+    content.lines().next().is_some_and(|line| {
+        line.split_once('\t')
+            .is_some_and(|(number, _)| number.trim().parse::<u32>().is_ok())
+    })
 }
 
 const MAX_LSP_SYNC_BYTES: u64 = 16 * 1024 * 1024;

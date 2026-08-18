@@ -1,13 +1,13 @@
 use super::common::*;
 use super::*;
 use crate::steering::{
-    CONTEXT_EFFICIENT_TOOL_WEIGHT, GAPS_INSPECTION_CAP, MAX_SOFT_CAP_EXTENSIONS,
-    REVIEW_INSPECTION_CAP, ROADMAP_INSPECTION_CAP, ReviewRepairMode, SECURITY_INSPECTION_CAP,
-    SOFT_CAP_EXTENSION_GRANT, STATUS_INSPECTION_CAP, active_read_only_inspection_cap,
-    default_read_only_inspection_cap, explicit_read_only_inspection_cap, inspection_cap_multiplier,
-    inspection_cap_project_ceiling, is_context_efficient_tool,
-    read_only_preflight_initial_calls_in, read_only_turn_prompt, repair_nudge_with_required_next,
-    scaled_inspection_cap, workspace_source_file_count,
+    CONTEXT_EFFICIENT_TOOL_WEIGHT, GAPS_INSPECTION_CAP, MAX_PAGED_READS_PER_PATH,
+    MAX_SOFT_CAP_EXTENSIONS, REVIEW_INSPECTION_CAP, ROADMAP_INSPECTION_CAP, ReviewRepairMode,
+    SECURITY_INSPECTION_CAP, SOFT_CAP_EXTENSION_GRANT, STATUS_INSPECTION_CAP,
+    active_read_only_inspection_cap, default_read_only_inspection_cap,
+    explicit_read_only_inspection_cap, inspection_cap_multiplier, inspection_cap_project_ceiling,
+    is_context_efficient_tool, read_only_preflight_initial_calls_in, read_only_turn_prompt,
+    repair_nudge_with_required_next, scaled_inspection_cap, workspace_source_file_count,
 };
 
 #[test]
@@ -1180,6 +1180,65 @@ fn extra_read_pages_of_inspected_file_are_not_new_evidence() {
     assert!(
         evidence.round_adds_evidence(&[call(r#"{"path":"/workspace/src/lib.rs"}"#)]),
         "a nested lib.rs is not the same file as a bare lib.rs"
+    );
+}
+
+#[test]
+fn extra_read_pages_of_truncated_file_are_new_evidence() {
+    let mut evidence = EvidenceTracker::default();
+    evidence.record_success(
+        "read",
+        r#"{"path":"src/lib.rs"}"#,
+        "   1\tfn start() {}\n… showing lines 1-113 of 800 — read more with offset 114",
+    );
+    let call = |args: &str| (String::new(), "read".to_string(), args.to_string());
+    assert!(
+        evidence.round_adds_evidence(&[call(r#"{"path":"src/lib.rs","offset":114}"#)]),
+        "the next page of a truncated file is new evidence"
+    );
+    assert!(
+        !evidence.round_adds_evidence(&[call(r#"{"path":"src/lib.rs"}"#)]),
+        "repeating the first page is still not new evidence"
+    );
+
+    evidence.record_success(
+        "read",
+        r#"{"path":"src/lib.rs","offset":114}"#,
+        " 114\tfn mid() {}\n… showing lines 114-232 of 800 — read more with offset 233",
+    );
+    assert!(
+        evidence.round_adds_evidence(&[call(r#"{"path":"src/lib.rs","offset":233,"limit":40}"#)]),
+        "a later page of a still-truncated file remains new evidence"
+    );
+
+    evidence.record_success(
+        "read",
+        r#"{"path":"src/lib.rs","offset":233,"limit":40}"#,
+        " 233\tfn end() {}\n",
+    );
+    assert!(
+        !evidence.round_adds_evidence(&[call(r#"{"path":"src/lib.rs","offset":300}"#)]),
+        "paging after a complete read adds no evidence"
+    );
+}
+
+#[test]
+fn truncated_file_page_budget_eventually_stops_counting() {
+    let mut evidence = EvidenceTracker::default();
+    let mut offset = 1u32;
+    for _ in 0..MAX_PAGED_READS_PER_PATH {
+        let args = format!(r#"{{"path":"big.rs","offset":{offset}}}"#);
+        evidence.record_success(
+            "read",
+            &args,
+            "line\n… showing lines 1-2 of 9999 — read more with offset 3",
+        );
+        offset += 100;
+    }
+    let next = format!(r#"{{"path":"big.rs","offset":{offset}}}"#);
+    assert!(
+        !evidence.round_adds_evidence(&[(String::new(), "read".to_string(), next)]),
+        "the per-path page budget must still bound a truncated-file walk"
     );
 }
 

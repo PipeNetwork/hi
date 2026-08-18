@@ -10,6 +10,32 @@ use crate::paths::{ReadCache, cache_key, is_vcs_metadata_dir};
 use crate::{ProcessRunner, ToolOutcome, ToolStatus};
 
 const DEFAULT_READ_LIMIT: usize = 2000;
+
+/// Dedicated `read` budget. The shared tool-result cap (~5k) is right for
+/// grep/bash noise but turns a documented 2,000-line default page into ~113
+/// lines of Rust and forces DeepSeek to page a typical source file 6–8 times.
+/// 64k is enough for an ~800-line file with line-number gutters.
+const DEFAULT_READ_OUTPUT_CHARS: usize = 64_000;
+const MIN_READ_OUTPUT_CHARS: usize = 1_000;
+const MAX_READ_OUTPUT_CHARS: usize = 200_000;
+
+pub(crate) fn read_output_budget() -> usize {
+    std::env::var("HI_READ_RESULT_CHARS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&n| (MIN_READ_OUTPUT_CHARS..=MAX_READ_OUTPUT_CHARS).contains(&n))
+        .unwrap_or(DEFAULT_READ_OUTPUT_CHARS)
+}
+
+/// True when a `read` result told the model to request another page.
+///
+/// The footer is the public paging contract (`read more with offset N`).
+/// Callers use this to tell a complete file from a budget- or limit-clipped
+/// one — `ToolOutcome::truncation` used to stay `Complete` because the
+/// renderer already stays under the budget.
+pub fn read_output_invites_paging(output: &str) -> bool {
+    output.contains("read more with offset")
+}
 /// Do not materialize arbitrarily large files just to return a bounded page.
 /// Model-facing output is much smaller, and callers can use `bash` for binary
 /// or genuinely large artifacts when they need byte-level access.
@@ -74,8 +100,9 @@ pub(crate) async fn run_read(
             .collect::<Vec<_>>()
             .await;
         let mut out = String::new();
-        let mut remaining_budget = *crate::condense::MAX_OUTPUT_CHARS;
+        let mut remaining_budget = read_output_budget();
         let mut remaining_files = reads.len();
+        let mut source_bytes = 0u64;
         for (path, body) in reads {
             let body = body?;
             let header = format!("──── {path} ────\n");
@@ -86,13 +113,14 @@ pub(crate) async fn run_read(
                 .unwrap_or(0);
             let formatted =
                 format_read_with_budget(&body, args.offset, args.limit, Some(body_budget));
+            source_bytes = source_bytes.saturating_add(body.len() as u64);
             let used = header.chars().count() + formatted.chars().count() + 1;
             out.push_str(&formatted);
             out.push('\n');
             remaining_budget = remaining_budget.saturating_sub(used);
             remaining_files = remaining_files.saturating_sub(1);
         }
-        return Ok(ToolOutcome::plain(out));
+        return Ok(crate::ToolOutcome::plain_read(out, source_bytes));
     }
     // Single-file mode.
     let path = args
@@ -101,11 +129,10 @@ pub(crate) async fn run_read(
         .ok_or_else(|| anyhow::anyhow!("`read` requires `path` or `paths`"))?;
     let target = resolve(root, path)?;
     let content = read_one(cache, &target).await?;
-    Ok(ToolOutcome::plain(format_read_for_output(
-        &content,
-        args.offset,
-        args.limit,
-    )))
+    Ok(crate::ToolOutcome::plain_read(
+        format_read_for_output(&content, args.offset, args.limit),
+        content.len() as u64,
+    ))
 }
 
 /// Read one file as UTF-8 text, using the per-turn cache and bailing clearly
@@ -505,12 +532,7 @@ pub(crate) fn format_read(content: &str, offset: Option<usize>, limit: Option<us
 /// Select the largest complete line range that fits and report the exact
 /// range that was returned.
 fn format_read_for_output(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
-    format_read_with_budget(
-        content,
-        offset,
-        limit,
-        Some(*crate::condense::MAX_OUTPUT_CHARS),
-    )
+    format_read_with_budget(content, offset, limit, Some(read_output_budget()))
 }
 
 fn format_read_with_budget(
@@ -825,6 +847,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paged_read_reports_truncated_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-read-trunc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let body = (1..=2_000)
+            .map(|n| format!("source line {n} with enough text to blow the char budget"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.join("big.rs"), &body).unwrap();
+        let cache = std::sync::Mutex::new(crate::paths::ReadCache::new());
+        let output = run_read(&root, &cache, r#"{"path":"big.rs"}"#)
+            .await
+            .unwrap();
+        assert!(
+            crate::read_output_invites_paging(&output.content),
+            "expected a paging footer: {}",
+            output.content
+        );
+        match output.truncation {
+            crate::TruncationState::Truncated {
+                original_bytes,
+                retained_bytes,
+            } => {
+                assert!(
+                    original_bytes > retained_bytes,
+                    "original {original_bytes} should exceed retained {retained_bytes}"
+                );
+            }
+            crate::TruncationState::Complete => {
+                panic!("budget-clipped read was reported complete")
+            }
+        }
+        let small = run_read(&root, &cache, r#"{"path":"big.rs","limit":5}"#)
+            .await
+            .unwrap();
+        assert!(
+            matches!(small.truncation, crate::TruncationState::Truncated { .. }),
+            "an explicit short page of a longer file is truncated: {:?}",
+            small.truncation
+        );
+        std::fs::write(root.join("tiny.rs"), "fn ready() {}\n").unwrap();
+        let whole = run_read(&root, &cache, r#"{"path":"tiny.rs"}"#)
+            .await
+            .unwrap();
+        assert_eq!(whole.truncation, crate::TruncationState::Complete);
+        let typical = (1..=800)
+            .map(|n| format!("    pub fn item_{n}() {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.join("typical.rs"), typical).unwrap();
+        let typical = run_read(&root, &cache, r#"{"path":"typical.rs"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            typical.truncation,
+            crate::TruncationState::Complete,
+            "an 800-line source file must fit in one default read"
+        );
+        assert!(
+            !crate::read_output_invites_paging(&typical.content),
+            "typical source should not ask the model to page: {}",
+            typical.content
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn multi_read_shares_budget_and_preserves_each_file_footer() {
         let root = std::env::temp_dir().join(format!(
             "hi-read-multi-budget-{}-{}",
@@ -835,12 +930,12 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let first = (1..=600)
-            .map(|n| format!("first line {n}"))
+        let first = (1..=1_500)
+            .map(|n| format!("first line {n} padded so two files exceed the read budget"))
             .collect::<Vec<_>>()
             .join("\n");
-        let second = (1..=600)
-            .map(|n| format!("second line {n}"))
+        let second = (1..=1_500)
+            .map(|n| format!("second line {n} padded so two files exceed the read budget"))
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(root.join("first.txt"), first).unwrap();
@@ -852,14 +947,15 @@ mod tests {
             .unwrap();
 
         assert!(
-            output.content.chars().count() <= *crate::condense::MAX_OUTPUT_CHARS,
-            "multi-read exceeded the shared budget: {} chars",
+            output.content.chars().count() <= super::read_output_budget(),
+            "multi-read exceeded the read budget: {} chars",
             output.content.chars().count()
         );
-        assert!(matches!(
-            output.truncation,
-            crate::TruncationState::Complete
-        ));
+        assert!(
+            matches!(output.truncation, crate::TruncationState::Truncated { .. }),
+            "budget-clipped multi-read must report truncated, got {:?}",
+            output.truncation
+        );
         assert!(output.content.contains("──── first.txt ────"));
         assert!(output.content.contains("──── second.txt ────"));
         assert_eq!(

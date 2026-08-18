@@ -1851,7 +1851,10 @@ impl crate::App {
                 composer_area.y + 1,
             ));
         } else if let Some(p) = &self.provider_picker {
-            let block = th.panel_block(" provider ", UiTone::Info);
+            let block = th.panel_block(" provider ", UiTone::Info).title_top(
+                Line::from(format!(" {}/{} ", p.selected + 1, p.matches.len().max(1)))
+                    .right_aligned(),
+            );
             let mut plines: Vec<Line> = vec![Line::from(vec![
                 Span::styled("filter: ", dim()),
                 Span::raw(p.filter.clone()),

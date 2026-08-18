@@ -946,11 +946,16 @@ pub(crate) fn to_openai_messages_with_capabilities(
                 let mut msg = json!({ "role": "assistant" });
                 if capabilities.requires_assistant_content {
                     msg["content"] = json!(text);
-                    if capabilities.requires_reasoning_content
-                        && !tool_calls.is_empty()
-                        && !thinking.is_empty()
-                    {
-                        msg["reasoning_content"] = json!(thinking);
+                    if capabilities.requires_reasoning_content && !tool_calls.is_empty() {
+                        // Official DeepSeek 400s a `tools` request if a prior
+                        // assistant tool turn has no reasoning_content. Preflight
+                        // and other synthetic calls have no model CoT, so send a
+                        // short stub rather than omit the field.
+                        msg["reasoning_content"] = json!(if thinking.is_empty() {
+                            "Inspected the requested files."
+                        } else {
+                            thinking.as_str()
+                        });
                     }
                     if !tool_calls.is_empty() {
                         msg["tool_calls"] = json!(tool_calls);
@@ -1602,6 +1607,23 @@ mod tests {
         assert_eq!(messages[0]["content"], "");
         assert_eq!(messages[0]["reasoning_content"], "inspect the file");
         assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+
+        let preflight = to_openai_messages_with_capabilities(
+            &[Message {
+                role: Role::Assistant,
+                content: vec![Content::ToolCall {
+                    id: "hi_preflight_0".into(),
+                    name: "read".into(),
+                    arguments: "{\"path\":\"Cargo.toml\"}".into(),
+                }],
+            }],
+            &caps,
+        );
+        assert_eq!(
+            preflight[0]["reasoning_content"],
+            "Inspected the requested files."
+        );
+        assert_eq!(preflight[0]["tool_calls"][0]["id"], "hi_preflight_0");
 
         let final_message = to_openai_messages_with_capabilities(
             &[Message {

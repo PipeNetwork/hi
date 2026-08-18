@@ -126,6 +126,14 @@ pub(super) fn advertised_tools_with_background(
         let suppress_new_subagents = task_text.is_some_and(|task| {
             broad_read_only_review(task, mutating) && !explicit_subagent_request(task)
         });
+        if suppress_new_subagents {
+            specs.retain(|spec| {
+                !matches!(
+                    spec.name.as_str(),
+                    "update_plan" | "record_decision" | "block_step"
+                )
+            });
+        }
         // Explore: default-on for repo-relevant work; never for pure greetings.
         if !suppress_new_subagents
             && config.subagents.explore_subagents
@@ -1187,6 +1195,10 @@ mod tests {
         );
         assert!(
             review_names.contains(&"repo_map"),
+            "review tools: {review_names:?}"
+        );
+        assert!(
+            !review_names.contains(&"update_plan"),
             "review tools: {review_names:?}"
         );
         assert!(

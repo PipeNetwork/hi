@@ -51,8 +51,8 @@ pub(crate) struct CompletionItem {
 pub(crate) const MODEL_CMD: &str = "model";
 /// Cap on inline `/model` id completions, so a large catalog can't flood the menu.
 pub(crate) const MODEL_COMPLETION_MAX: usize = 8;
-/// The command whose argument values are profile names (live state from the
-/// config, plus the `add`/`edit`/`remove` subcommands).
+/// The command whose argument values are profile names, hosted provider
+/// presets, and the `add`/`edit`/`remove` subcommands.
 pub(crate) const PROVIDER_CMD: &str = "provider";
 pub(crate) const SESSIONS_CMD: &str = "sessions";
 pub(crate) const SESSIONS_SWITCH_CTX: &str = "sessions switch";
@@ -146,8 +146,8 @@ pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
                 });
             }
             if spec.name == PROVIDER_CMD {
-                // Profile names + subcommands are dynamic — resolved at render
-                // time from the live profile list.
+                // Profile names, hosted presets, and subcommands are dynamic —
+                // resolved at render time from the live profile list + PRESETS.
                 return Some(CompletionContext::Arg {
                     cmd: spec.name,
                     prefix,

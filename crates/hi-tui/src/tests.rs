@@ -5658,6 +5658,73 @@ fn sticky_prompt_header_pins_when_scrolled_past() {
     );
 }
 
+/// `/provider pipe` must complete the hosted preset. Completing only profile
+/// names made pipenetwork unreachable after `/login pipenetwork` when no
+/// profile was named that way.
+#[test]
+fn provider_completion_offers_the_pipenetwork_preset() {
+    let app = test_app("xai", "grok-4.3");
+    let labels = |prefix: &str| -> Vec<String> {
+        app.provider_completion_items(prefix)
+            .into_iter()
+            .map(|item| item.label)
+            .collect()
+    };
+
+    let all = labels("");
+    assert!(
+        all.contains(&"pipenetwork".into()),
+        "empty /provider prefix must list the hosted preset: {all:?}"
+    );
+    assert!(
+        all.contains(&"xai".into()),
+        "other presets stay listed: {all:?}"
+    );
+
+    let pipe = labels("pipe");
+    assert_eq!(
+        pipe,
+        vec!["pipenetwork".to_string()],
+        "/provider pipe must select pipenetwork, not close the menu: {pipe:?}"
+    );
+    let item = app
+        .provider_completion_items("pipe")
+        .into_iter()
+        .next()
+        .expect("pipenetwork completion");
+    assert_eq!(item.insert, "/provider pipenetwork");
+    assert!(item.submit_on_enter);
+}
+
+/// A profile named after a provider still shadows the preset in completion,
+/// matching picker resolution (profiles win on a name clash).
+#[test]
+fn provider_completion_does_not_duplicate_a_profile_named_pipenetwork() {
+    let mut app = test_app("xai", "grok-4.3");
+    app.profiles = vec![crate::ProfileInfo {
+        name: "pipenetwork".into(),
+        provider: "pipenetwork".into(),
+        model: Some("ipop/coder-balanced".into()),
+        base_url: None,
+        managed_local_repo: None,
+        managed_local_path: None,
+    }];
+    let pipe: Vec<String> = app
+        .provider_completion_items("pipe")
+        .into_iter()
+        .map(|item| format!("{}|{}", item.label, item.help))
+        .collect();
+    assert_eq!(
+        pipe.len(),
+        1,
+        "one pipenetwork row, not preset+profile: {pipe:?}"
+    );
+    assert!(
+        pipe[0].contains("ipop/coder-balanced"),
+        "the configured profile must win: {pipe:?}"
+    );
+}
+
 /// `/provider xai` switches to a provider preset without creating a profile,
 /// so the active name need not name one. Selecting a model then had nothing to
 /// persist into and surfaced "couldn't save model to active profile: no profile

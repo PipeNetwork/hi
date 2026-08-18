@@ -93,11 +93,23 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     // Last-session model beats the profile's stored model so mid-session
     // `/model` picks (also written into the profile when possible) win on
     // restart even if a concurrent edit raced the profile file.
+    //
+    // A CLI `--provider` that isn't this profile's provider must not inherit
+    // the profile's model: grok-4.3 would otherwise ride onto pipenetwork and
+    // ignore `HI_MODEL` / the provider default.
+    let profile_model = profile.and_then(|p| p.model.clone()).filter(|_| {
+        match (cli.provider, profile.and_then(|p| p.provider)) {
+            (Some(cli_provider), profile_provider) => {
+                cli_provider == profile_provider.unwrap_or(ProviderName::Openai)
+            }
+            _ => true,
+        }
+    });
     let mut model = cli
         .model
         .clone()
         .or_else(|| last.as_ref().and_then(|s| s.model.clone()))
-        .or_else(|| profile.and_then(|p| p.model.clone()))
+        .or_else(|| profile_model)
         .or_else(|| std::env::var("HI_MODEL").ok())
         .or_else(|| provider.default_model().map(String::from));
 
@@ -126,7 +138,7 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         .or_else(|| std::env::var("HI_MCP_URL").ok())
         .or_else(|| provider.default_mcp_url().map(String::from));
 
-    let api_key = resolve_api_key(cli, profile, provider)?;
+    let api_key = resolve_api_key_with_endpoint(cli, profile, provider, &base_url)?;
 
     let profile_max_tokens = profile.and_then(|p| p.max_tokens);
     let max_tokens = configured_max_tokens(provider, cli.max_tokens, profile_max_tokens);
@@ -145,12 +157,12 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         .unwrap_or_default();
 
     let thinking_budget = cli.thinking.or(profile.and_then(|p| p.thinking_budget));
-    // CLI → profile → machine-wide last `/config reasoning`.
-    let reasoning_effort = cli
-        .reasoning_effort
-        .map(ReasoningEffort::from)
-        .or_else(|| profile.and_then(|p| p.reasoning_effort))
-        .or(config.reasoning_effort);
+    let reasoning_effort = resolve_reasoning_effort(
+        cli.reasoning_effort.map(ReasoningEffort::from),
+        profile,
+        provider,
+        config.reasoning_effort,
+    );
     let tool_mode = cli
         .tool_mode
         .map(ToolMode::from)
@@ -353,10 +365,12 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
             .and_then(|p| p.output_token_parameter)
             .unwrap_or_default(),
         thinking_budget: profile.and_then(|p| p.thinking_budget),
-        // Profile override, else machine-wide last `/config reasoning`.
-        reasoning_effort: profile
-            .and_then(|p| p.reasoning_effort)
-            .or(config.reasoning_effort),
+        reasoning_effort: resolve_reasoning_effort(
+            None,
+            profile,
+            provider,
+            config.reasoning_effort,
+        ),
         tool_mode: profile.and_then(|p| p.tool_mode).unwrap_or_default(),
         compat: profile.and_then(|p| p.compat).unwrap_or_default(),
         deepseek_compat: profile.and_then(|p| p.deepseek_compat).unwrap_or_default(),
@@ -375,6 +389,36 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         api_unix_socket: None,
         runtime: profile.and_then(|p| p.runtime.clone()),
     })
+}
+
+/// Reasoning effort for this route.
+///
+/// CLI always wins. A profile's `reasoning_effort` applies only when that
+/// profile's provider is the active one — an xAI default profile's `xhigh`
+/// must not follow `--provider pipenetwork` onto DeepSeek wrap-up.
+/// Machine-wide `/config reasoning` still applies, except `xhigh`, which is
+/// an xAI-only wire value and is dropped on every other provider.
+pub(crate) fn resolve_reasoning_effort(
+    cli: Option<ReasoningEffort>,
+    profile: Option<&Profile>,
+    provider: ProviderName,
+    machine: Option<ReasoningEffort>,
+) -> Option<ReasoningEffort> {
+    if let Some(effort) = cli {
+        return Some(effort);
+    }
+    if let Some(profile) = profile {
+        let profile_provider = profile.provider.unwrap_or(ProviderName::Openai);
+        if profile_provider == provider
+            && let Some(effort) = profile.reasoning_effort
+        {
+            return Some(effort);
+        }
+    }
+    match machine {
+        Some(ReasoningEffort::Xhigh) if provider != ProviderName::Xai => None,
+        other => other,
+    }
 }
 
 /// Profile to borrow credentials from when resolving a bare provider preset.

@@ -133,8 +133,10 @@ fn tool_name(entry: &Value) -> &str {
 fn tool_paths(entry: &Value) -> Vec<String> {
     let mut paths = Vec::new();
     if let Some(path) = entry.get("path").and_then(|v| v.as_str()) {
-        if !path.is_empty() {
-            paths.push(path.to_string());
+        for part in path.split('\n') {
+            if !part.is_empty() && !paths.iter().any(|existing| existing == part) {
+                paths.push(part.to_string());
+            }
         }
     }
     if let Some(changes) = entry
@@ -269,14 +271,57 @@ pub fn path_under_prefix(path: &str, prefix: &str) -> bool {
 
 fn is_root_cargo_test(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
-    let has_cargo_test = lower.contains("cargo test") || lower.contains("cargo t ");
-    if !has_cargo_test {
+    if !cargo_test_invocation(&lower) {
         return false;
     }
-    !(lower.contains(" -p ")
+    if cargo_test_is_package_scoped(&lower) {
+        return false;
+    }
+    // `cd pkg && cargo test` is the intended non-root form for this rule.
+    !directory_changed_before_cargo_test(&lower)
+}
+
+fn cargo_test_invocation(lower: &str) -> bool {
+    cargo_subcommand_tokens(lower).any(|sub| sub == "test" || sub == "t")
+}
+
+fn cargo_test_is_package_scoped(lower: &str) -> bool {
+    lower.contains(" -p ")
         || lower.contains(" --package ")
         || lower.contains("--manifest-path")
-        || lower.contains("-p="))
+        || lower.contains("-p=")
+        || lower.contains("--package=")
+}
+
+fn directory_changed_before_cargo_test(lower: &str) -> bool {
+    let Some(idx) = cargo_test_start(lower) else {
+        return false;
+    };
+    let prefix = &lower[..idx];
+    prefix.contains("cd ") || prefix.contains("cd\t") || prefix.contains("pushd ")
+}
+
+fn cargo_test_start(lower: &str) -> Option<usize> {
+    lower.find("cargo")
+}
+
+fn cargo_subcommand_tokens(lower: &str) -> impl Iterator<Item = &str> {
+    let mut tokens = tokenize_shell(lower).into_iter();
+    std::iter::from_fn(move || {
+        while let Some(token) = tokens.next() {
+            if token == "cargo" {
+                return tokens.next();
+            }
+        }
+        None
+    })
+}
+
+fn tokenize_shell(input: &str) -> Vec<&str> {
+    input
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '`'))
+        .filter(|token| !token.is_empty())
+        .collect()
 }
 
 fn judge_budget(report: &Value, rules: &BudgetRules, violations: &mut Vec<JudgeViolation>) {
@@ -621,6 +666,62 @@ mod tests {
             process: ProcessRules {
                 no_root_cargo_test: true,
                 require_tools: vec!["edit".into()],
+                ..ProcessRules::default()
+            },
+            ..JudgeRules::default()
+        };
+        assert!(judge_report(&report, &rules).ok());
+    }
+
+    #[test]
+    fn cargo_test_after_cd_or_package_eq_is_allowed() {
+        let rules = JudgeRules {
+            process: ProcessRules {
+                no_root_cargo_test: true,
+                require_tools: vec!["edit".into()],
+                ..ProcessRules::default()
+            },
+            ..JudgeRules::default()
+        };
+        for command in [
+            "cd pkg && cargo test --quiet",
+            "(cd pkg && cargo test)",
+            "cargo test --package=pkg --quiet",
+        ] {
+            let report = json!({
+                "telemetry": {
+                    "tool_timeline": [
+                        {"tool": "edit", "path": "solution.py"},
+                        {"tool": "bash", "command": command}
+                    ]
+                }
+            });
+            assert!(judge_report(&report, &rules).ok(), "should allow {command}");
+        }
+        let bare_t = json!({
+            "telemetry": {
+                "tool_timeline": [
+                    {"tool": "edit", "path": "solution.py"},
+                    {"tool": "bash", "command": "cargo t"}
+                ]
+            }
+        });
+        assert_eq!(judge_report(&bare_t, &rules).process, JudgeVerdict::Fail);
+    }
+
+    #[test]
+    fn mutate_after_read_accepts_batched_read_paths() {
+        let report = json!({
+            "telemetry": {
+                "tool_timeline": [
+                    {"tool": "read", "path": "a.rs\nb.rs"},
+                    {"tool": "edit", "path": "b.rs"}
+                ]
+            }
+        });
+        let rules = JudgeRules {
+            process: ProcessRules {
+                mutate_after_read: true,
                 ..ProcessRules::default()
             },
             ..JudgeRules::default()

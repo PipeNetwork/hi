@@ -2,10 +2,11 @@ use super::{
     Cli, Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS, LocalRuntimeProfile,
     PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, RsiRequested, RsiSection,
     auto_selected_env, configured_max_tokens, curate_skills_default, detect_verify_pipeline,
-    explore_subagents_default, max_tokens_is_explicit, needs_setup, permits_missing_checkpoint,
-    planner_model_default, read_config_file, resolve, resolve_active_profile,
-    resolve_named_profile, resolve_quality, resolve_rsi, save_config_to, set_rsi_config,
-    suggest_next_prompt_default, upsert_profile_project_local, write_subagents_default,
+    explore_subagents_default, is_official_deepseek_url, max_tokens_is_explicit, needs_setup,
+    permits_missing_checkpoint, planner_model_default, read_config_file, resolve,
+    resolve_active_profile, resolve_named_profile, resolve_quality, resolve_reasoning_effort,
+    resolve_rsi, save_config_to, set_rsi_config, suggest_next_prompt_default,
+    upsert_profile_project_local, write_subagents_default,
 };
 use clap::Parser;
 use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode};
@@ -516,6 +517,16 @@ fn an_unknown_name_names_both_profiles_and_providers() {
 #[test]
 fn xai_prefers_provider_specific_api_key_env() {
     assert_eq!(ProviderName::Xai.key_envs(), &["XAI_API_KEY", "HI_API_KEY"]);
+}
+
+#[test]
+fn official_deepseek_url_is_detected() {
+    assert!(is_official_deepseek_url("https://api.deepseek.com"));
+    assert!(is_official_deepseek_url("https://api.deepseek.com/v1"));
+    assert!(!is_official_deepseek_url(
+        "https://api.deepseek.com.example/v1"
+    ));
+    assert!(!is_official_deepseek_url("http://127.0.0.1:8081/v1"));
 }
 
 #[test]
@@ -2118,6 +2129,171 @@ fn resolve_falls_back_to_machine_reasoning_effort() {
     assert_eq!(
         settings.reasoning_effort,
         Some(hi_ai::ReasoningEffort::Minimal)
+    );
+}
+
+#[test]
+fn xai_profile_xhigh_does_not_follow_a_provider_override() {
+    let mut config = Config {
+        default_profile: Some("default".into()),
+        ..Default::default()
+    };
+    config.profiles.insert(
+        "default".into(),
+        Profile {
+            provider: Some(ProviderName::Xai),
+            model: Some("grok-4.3".into()),
+            reasoning_effort: Some(hi_ai::ReasoningEffort::Xhigh),
+            api_key: Some("xai-key".into()),
+            ..Default::default()
+        },
+    );
+    let env = ClearedSetupEnv::new();
+    env.set("PIPENETWORK_API_KEY", "pipe-key");
+    let cli = Cli::try_parse_from([
+        "hi",
+        "--provider",
+        "pipenetwork",
+        "--model",
+        "pipe/deepseek-v4-flash",
+    ])
+    .unwrap();
+    let settings = resolve(&cli, &config).unwrap();
+    drop(env);
+    assert_eq!(settings.provider, ProviderName::Pipenetwork);
+    assert_eq!(
+        settings.reasoning_effort, None,
+        "xAI xhigh must not ride --provider pipenetwork onto DeepSeek"
+    );
+}
+
+#[test]
+fn provider_override_does_not_inherit_mismatched_profile_model() {
+    let mut config = Config {
+        default_profile: Some("default".into()),
+        ..Default::default()
+    };
+    config.profiles.insert(
+        "default".into(),
+        Profile {
+            provider: Some(ProviderName::Xai),
+            model: Some("grok-4.3".into()),
+            api_key: Some("xai-key".into()),
+            ..Default::default()
+        },
+    );
+    let env = ClearedSetupEnv::new();
+    env.set("PIPENETWORK_API_KEY", "pipe-key");
+    env.set("HI_MODEL", "pipe/deepseek-v4-flash");
+    let cli = Cli::try_parse_from(["hi", "--provider", "pipenetwork"]).unwrap();
+    let settings = resolve(&cli, &config).unwrap();
+    drop(env);
+    assert_eq!(settings.provider, ProviderName::Pipenetwork);
+    assert_eq!(
+        settings.model, "pipe/deepseek-v4-flash",
+        "HI_MODEL must win when --provider does not match the default profile"
+    );
+}
+
+#[test]
+fn provider_override_falls_back_to_provider_default_model() {
+    let mut config = Config {
+        default_profile: Some("default".into()),
+        ..Default::default()
+    };
+    config.profiles.insert(
+        "default".into(),
+        Profile {
+            provider: Some(ProviderName::Xai),
+            model: Some("grok-4.3".into()),
+            api_key: Some("xai-key".into()),
+            ..Default::default()
+        },
+    );
+    let env = ClearedSetupEnv::new();
+    env.set("PIPENETWORK_API_KEY", "pipe-key");
+    let cli = Cli::try_parse_from(["hi", "--provider", "pipenetwork"]).unwrap();
+    let settings = resolve(&cli, &config).unwrap();
+    drop(env);
+    assert_eq!(settings.model, "ipop/coder-balanced");
+}
+
+#[test]
+fn cli_reasoning_effort_still_applies_on_a_provider_override() {
+    let mut config = Config {
+        default_profile: Some("default".into()),
+        ..Default::default()
+    };
+    config.profiles.insert(
+        "default".into(),
+        Profile {
+            provider: Some(ProviderName::Xai),
+            reasoning_effort: Some(hi_ai::ReasoningEffort::Xhigh),
+            api_key: Some("xai-key".into()),
+            ..Default::default()
+        },
+    );
+    let env = ClearedSetupEnv::new();
+    env.set("PIPENETWORK_API_KEY", "pipe-key");
+    let cli = Cli::try_parse_from([
+        "hi",
+        "--provider",
+        "pipenetwork",
+        "--model",
+        "pipe/deepseek-v4-flash",
+        "--reasoning-effort",
+        "high",
+    ])
+    .unwrap();
+    let settings = resolve(&cli, &config).unwrap();
+    drop(env);
+    assert_eq!(
+        settings.reasoning_effort,
+        Some(hi_ai::ReasoningEffort::High)
+    );
+}
+
+#[test]
+fn machine_wide_xhigh_is_xai_only() {
+    assert_eq!(
+        resolve_reasoning_effort(
+            None,
+            None,
+            ProviderName::Pipenetwork,
+            Some(hi_ai::ReasoningEffort::Xhigh)
+        ),
+        None
+    );
+    assert_eq!(
+        resolve_reasoning_effort(
+            None,
+            None,
+            ProviderName::Xai,
+            Some(hi_ai::ReasoningEffort::Xhigh)
+        ),
+        Some(hi_ai::ReasoningEffort::Xhigh)
+    );
+    assert_eq!(
+        resolve_reasoning_effort(
+            None,
+            None,
+            ProviderName::Pipenetwork,
+            Some(hi_ai::ReasoningEffort::High)
+        ),
+        Some(hi_ai::ReasoningEffort::High)
+    );
+}
+
+#[test]
+fn pipenetwork_profile_keeps_its_own_reasoning_effort() {
+    let profile = Profile {
+        provider: Some(ProviderName::Pipenetwork),
+        reasoning_effort: Some(hi_ai::ReasoningEffort::High),
+        ..Default::default()
+    };
+    assert_eq!(
+        resolve_reasoning_effort(None, Some(&profile), ProviderName::Pipenetwork, None),
+        Some(hi_ai::ReasoningEffort::High)
     );
 }
 

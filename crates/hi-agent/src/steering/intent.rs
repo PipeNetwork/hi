@@ -751,13 +751,13 @@ pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String
             "Inspect manifests, owning modules, tests, and TODO/FIXME or missing-coverage search results before naming gaps."
         }
         ReviewIntent::Review => {
-            "Treat this as a bounded static review: make one orientation pass, inspect the highest-risk relevant files or targeted search results, then give concrete findings. Do not repeatedly relist the workspace, narrate planning, or spawn subagents unless the user explicitly asks for parallel investigations."
+            "Treat this as a bounded static review: make one orientation pass, inspect the highest-risk relevant files or targeted search results, then give concrete findings. Cite inspected paths by name. Do not repeatedly relist the workspace, narrate planning, or spawn subagents unless the user explicitly asks for parallel investigations."
         }
     };
     let bounded_guidance = if bounded_exact_review {
         " This is a bounded exact-file review: start with one batched `read` call using the `paths` array for all named files when there is more than one. Prefer one read pass per named file and a targeted `grep` only when it tests a concrete candidate. Do not keep paging through a large file for completeness. After the first useful pass, stop inspecting and answer from the evidence unless one targeted read is required to verify a specific finding. Do not reread the same content; make a best-effort finding from the first useful pass and state the inspection limit instead."
     } else {
-        ""
+        " If deterministic preflight already read files, cite those paths; do not re-read them unless you need a later slice. Prefer one targeted grep or read for a gap, then answer."
     };
     format!(
         "{input}\n\nRead-only review guard: use only the currently advertised read-only inspection tools; never invent tool names or handles remembered from earlier turns. Do not write, edit, apply patches, or change files. Respect explicit user exclusions: never invoke a tool or inspect an artifact the user explicitly forbids, even if this review recipe mentions it. Do not narrate tool availability, stale handles, polling recovery, or internal steering to the user; inspect with the available tools and give the review directly. Use read-only inspection before the final answer. Active inspection cap: at most {cap} file reads/searches for this turn; listings and diffs may provide context but do not raise the cap. Context-efficient tools (explore, repo_map, find_symbol) cost less against the cap — prefer them to cover more ground. Once the cap is reached, answer from gathered evidence instead of inspecting more. {recipe}{bounded_guidance} If only a directory listing is available, keep inspecting before making file-specific findings."

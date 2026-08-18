@@ -84,6 +84,7 @@ pub(super) struct ModelRoundState<'a> {
     pub tool_schema_tokens: &'a mut u64,
     pub ended_at_cap: &'a mut bool,
     pub cap_wrap_up_requested: &'a mut bool,
+    pub review_wrap_up_requested: &'a mut bool,
     pub prev_call_sig: &'a mut Option<Vec<(String, String)>>,
     pub deepseek_strict_fallback_active: &'a mut bool,
     pub retry_state: &'a mut TurnRetryState,
@@ -237,6 +238,7 @@ impl crate::Agent {
         let mut tool_schema_tokens = *state.tool_schema_tokens;
         let ended_at_cap = *state.ended_at_cap;
         let mut cap_wrap_up_requested = *state.cap_wrap_up_requested;
+        let mut review_wrap_up_requested = *state.review_wrap_up_requested;
         let mut prev_call_sig = std::mem::take(state.prev_call_sig);
         let deepseek_strict_fallback_active = *state.deepseek_strict_fallback_active;
         let mut retry_state = std::mem::take(state.retry_state);
@@ -303,7 +305,9 @@ impl crate::Agent {
             && evidence.has_discovery()
             && !request_cap_wrap_up
             && !force_text_answer_next
+            && !review_wrap_up_requested
         {
+            review_wrap_up_requested = true;
             force_text_answer_next = true;
             force_tools_next = false;
             let current_max_tokens = request_max_tokens_override
@@ -574,8 +578,11 @@ impl crate::Agent {
                 } else {
                     None
                 },
-                deepseek_thinking: bounded_exact_review
-                    .then_some(!(request_text_answer || request_cap_wrap_up)),
+                // Inspection: thinking off so Flash calls tools instead of
+                // writing a CoT essay from preflight. Wrap-up: thinking on.
+                deepseek_thinking: read_only_intent
+                    .is_some()
+                    .then_some(request_text_answer || request_cap_wrap_up),
                 output_token_parameter: self.config.routing.output_token_parameter,
             },
         };
@@ -950,9 +957,8 @@ impl crate::Agent {
         // (`prev_added_no_evidence`): a single re-inspection right after
         // new evidence is allowed through (e.g. re-reading a file once a
         // broader search has surfaced something to re-examine). Extra pages
-        // of a file already read this turn are themselves no-new-evidence,
-        // so a paging walk trips this guard on the second consecutive page
-        // instead of running until max_steps. Once the turn has made a successful
+        // of a complete file are no-new-evidence; a later page of a still-
+        // truncated file counts (capped per path). Once the turn has made a successful
         // mutation, this guard is advisory only: after the nudge budget
         // is spent, execute the inspection rather than hard-stalling a
         // long implementation harness in the middle of a later plan step.
@@ -1696,6 +1702,7 @@ If the task is already complete, stop and give your final recap."
         *state.tool_schema_tokens = tool_schema_tokens;
         *state.ended_at_cap = ended_at_cap;
         *state.cap_wrap_up_requested = cap_wrap_up_requested;
+        *state.review_wrap_up_requested = review_wrap_up_requested;
         *state.prev_call_sig = prev_call_sig;
         *state.retry_state = retry_state;
         *state.request_max_tokens_override = request_max_tokens_override;

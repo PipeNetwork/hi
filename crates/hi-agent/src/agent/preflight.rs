@@ -19,6 +19,7 @@ use crate::transcript::NudgeKind;
 use crate::{ToolCallEntry, Ui};
 
 const PREFLIGHT_INTERRUPTED_NUDGE: &str = "The user skipped the preflight inspection, not the overall task. Continue the original task now with an appropriate tool. Do not stop merely to acknowledge the interruption, and do not retry the same preflight command.";
+const PREFLIGHT_CITATION_NUDGE: &str = "The files above are already in this transcript. Cite them by path in your findings. Call a tool only for a file that is not already shown.";
 
 fn cancelled_preflight_outcome() -> hi_tools::ToolOutcome {
     hi_tools::ToolOutcome {
@@ -433,6 +434,8 @@ impl crate::Agent {
 
         if !content.is_empty() {
             self.messages.push_assistant_with_results(content, results);
+            self.messages
+                .push_nudge(NudgeKind::Continue, PREFLIGHT_CITATION_NUDGE);
         }
         if summary.interrupted {
             self.messages

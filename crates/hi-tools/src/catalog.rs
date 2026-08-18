@@ -1164,6 +1164,31 @@ pub fn target_path(name: &str, arguments: &str) -> Option<String> {
     }
 }
 
+/// Every concrete path this call targeted. Used by the eval tape: a batched
+/// `read` of several files must still count as a read of each one.
+pub fn target_paths(name: &str, arguments: &str) -> Vec<String> {
+    if let Some(one) = target_path(name, arguments) {
+        return vec![one];
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return Vec::new();
+    };
+    if name == "read" {
+        return value
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .filter(|path| !path.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1382,6 +1407,10 @@ mod tests {
         assert_eq!(
             target_path("read", r#"{"paths":["src/a.rs","src/b.rs"]}"#),
             None
+        );
+        assert_eq!(
+            target_paths("read", r#"{"paths":["src/a.rs","src/b.rs"]}"#),
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
         );
         // apply_patch: a single file directive's path is extracted.
         let patch =

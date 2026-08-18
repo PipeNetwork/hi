@@ -301,6 +301,9 @@ sub-goal now, then update the plan with update_plan — including any newly disc
             cmd.arg(arg);
         }
         if let Some(model) = model_override {
+            // `--model` beats a user default-profile model. `HI_MODEL` alone
+            // loses to `~/.config/hi` (e.g. grok-4.3 riding onto pipenetwork).
+            cmd.arg("--model").arg(model);
             cmd.env("HI_MODEL", model);
         }
         if final_message_mode {
@@ -370,6 +373,7 @@ sub-goal now, then update the plan with update_plan — including any newly disc
                 stall = 0;
             }
             last_goal = goal;
+            absorb_report(&mut merged_tape, &report_path);
         }
     }
     // Harness resume: additional invocations on the same --session-file.
@@ -386,12 +390,7 @@ sub-goal now, then update the plan with update_plan — including any newly disc
             if persist_session {
                 growth.push(read_turn_metric(&report_path, (offset + 1) as u32));
             }
-            if let Some(next) = read_report_value(&report_path) {
-                merged_tape = Some(match merged_tape.take() {
-                    Some(prev) => merge_harness_tapes(prev, next),
-                    None => next,
-                });
-            }
+            absorb_report(&mut merged_tape, &report_path);
         }
     }
     if let Some(merged) = &merged_tape
@@ -1044,6 +1043,18 @@ struct ReportInfo {
 fn read_report_value(path: &Path) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// Fold the latest `--report` into the union tape. Goal-drive and resume
+/// both overwrite the file each invocation; without this the persist rewrite
+/// would keep only the first turn and the judge would miss later tools.
+fn absorb_report(merged: &mut Option<serde_json::Value>, path: &Path) {
+    if let Some(next) = read_report_value(path) {
+        *merged = Some(match merged.take() {
+            Some(prev) => merge_harness_tapes(prev, next),
+            None => next,
+        });
+    }
 }
 
 fn merge_harness_tapes(prev: serde_json::Value, next: serde_json::Value) -> serde_json::Value {
@@ -1752,6 +1763,33 @@ command = "PYTHONPATH=. python3 -c 'from solution import VALUE; assert VALUE == 
     }
 
     #[test]
+    fn absorb_report_unions_successive_overwrites() {
+        let path = std::env::temp_dir().join(format!("hi-eval-absorb-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{"telemetry":{"tool_timeline":[{"tool":"edit","path":"a.rs"}],"requests":[]}}"#,
+        )
+        .unwrap();
+        let mut merged = None;
+        super::absorb_report(&mut merged, &path);
+        std::fs::write(
+            &path,
+            r#"{"telemetry":{"tool_timeline":[{"tool":"bash","path":""}],"requests":[]}}"#,
+        )
+        .unwrap();
+        super::absorb_report(&mut merged, &path);
+        let merged = merged.unwrap();
+        let tools: Vec<&str> = merged["telemetry"]["tool_timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["tool"].as_str())
+            .collect();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(tools, ["edit", "bash"]);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn harness_run_steps_use_session_file_and_judge_before_cleanup() {
         let (root, task) = candidate_test_task();
@@ -1817,5 +1855,62 @@ exit 0
             Some("pass")
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn model_override_is_passed_as_cli_model() {
+        let (root, task) = candidate_test_task();
+        let args_log = root.join("args.log");
+        let hi = fake_hi(
+            &root,
+            &format!(
+                r#"printf '%s\n' "$*" >> "{log}"
+printf 'VALUE = 42\n' > solution.py
+exit 0
+"#,
+                log = args_log.display()
+            ),
+        );
+        let _ = run_candidate(
+            0,
+            &hi,
+            &root,
+            &task,
+            false,
+            0.0,
+            &[],
+            EvalProfile::Pipenetwork,
+            Some("pipe/deepseek-v4-flash"),
+        )
+        .unwrap();
+        let args = std::fs::read_to_string(&args_log).unwrap();
+        assert!(
+            args.contains("--model pipe/deepseek-v4-flash"),
+            "eval must pass --model so a user default profile cannot win: {args}"
+        );
+        assert!(
+            args.contains("--provider pipenetwork"),
+            "pipenetwork profile args must still be present: {args}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_ignored_inner_paths_recreates_a_deleted_prefix() {
+        let fixture = crate::artifacts::make_workdir().unwrap();
+        let work = crate::artifacts::make_workdir().unwrap();
+        std::fs::create_dir_all(fixture.join("bug")).unwrap();
+        std::fs::write(fixture.join("bug/solution.py"), "VALUE = 0\n").unwrap();
+        std::fs::create_dir_all(work.join("bug")).unwrap();
+        std::fs::write(work.join("bug/solution.py"), "mutated\n").unwrap();
+        std::fs::remove_dir_all(work.join("bug")).unwrap();
+        super::restore_ignored_inner_paths(&fixture, &work, &["bug/".into()]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(work.join("bug/solution.py")).unwrap(),
+            "VALUE = 0\n"
+        );
+        let _ = std::fs::remove_dir_all(fixture);
+        let _ = std::fs::remove_dir_all(work);
     }
 }

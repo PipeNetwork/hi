@@ -278,14 +278,52 @@ pub fn tool_failure_shape(timeline: &[crate::ToolCallEntry]) -> Option<String> {
 
 fn is_root_cargo_test(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
-    let has_cargo_test = lower.contains("cargo test") || lower.contains("cargo t ");
-    if !has_cargo_test {
+    if !cargo_test_invocation(&lower) {
         return false;
     }
-    !(lower.contains(" -p ")
+    if cargo_test_is_package_scoped(&lower) {
+        return false;
+    }
+    !directory_changed_before_cargo_test(&lower)
+}
+
+fn cargo_test_invocation(lower: &str) -> bool {
+    cargo_subcommand_tokens(lower).any(|sub| sub == "test" || sub == "t")
+}
+
+fn cargo_test_is_package_scoped(lower: &str) -> bool {
+    lower.contains(" -p ")
         || lower.contains(" --package ")
         || lower.contains("--manifest-path")
-        || lower.contains("-p="))
+        || lower.contains("-p=")
+        || lower.contains("--package=")
+}
+
+fn directory_changed_before_cargo_test(lower: &str) -> bool {
+    let Some(idx) = lower.find("cargo") else {
+        return false;
+    };
+    let prefix = &lower[..idx];
+    prefix.contains("cd ") || prefix.contains("cd\t") || prefix.contains("pushd ")
+}
+
+fn cargo_subcommand_tokens(lower: &str) -> impl Iterator<Item = &str> {
+    let mut tokens = tokenize_shell(lower).into_iter();
+    std::iter::from_fn(move || {
+        while let Some(token) = tokens.next() {
+            if token == "cargo" {
+                return tokens.next();
+            }
+        }
+        None
+    })
+}
+
+fn tokenize_shell(input: &str) -> Vec<&str> {
+    input
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '`'))
+        .filter(|token| !token.is_empty())
+        .collect()
 }
 
 /// Assemble the `/synth-evals` follow-up turn: unprocessed findings past the
@@ -607,6 +645,11 @@ mod tests {
         assert!(
             tool_failure_shape(&[bash_entry("cargo test --manifest-path crates/x/Cargo.toml")])
                 .is_none()
+        );
+        assert!(tool_failure_shape(&[bash_entry("cd pkg && cargo test")]).is_none());
+        assert_eq!(
+            tool_failure_shape(&[bash_entry("cargo t")]).as_deref(),
+            Some("root_cargo_test")
         );
     }
 

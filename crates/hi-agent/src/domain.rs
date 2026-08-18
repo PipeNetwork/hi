@@ -662,6 +662,10 @@ pub(crate) struct TurnControlFlags {
     /// Whether this turn already granted the one tool-free wrap-up round after
     /// reaching the step cap. Sticky: the next cap hit ends the turn for real.
     pub cap_wrap_up_requested: bool,
+    /// Whether this turn already forced the one text-only wrap-up after a
+    /// bounded/bare review inspection pass. Sticky so citation-repair can
+    /// keep read tools on later rounds instead of being pinned ChatOnly.
+    pub review_wrap_up_requested: bool,
     pub obligation_nudge_fired: bool,
 }
 

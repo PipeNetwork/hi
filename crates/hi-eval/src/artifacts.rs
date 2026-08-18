@@ -1026,7 +1026,10 @@ pub fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     if !source_metadata.is_dir() || source_metadata.file_type().is_symlink() {
         bail!("copy source is not a real directory: {}", src.display());
     }
-    ensure_real_directory(dst)?;
+    // Create `dst` when missing so restore-after-delete (self-similar
+    // `bug/`) does not crash the evaluator. An already-created workdir
+    // (make_workdir) stays as-is.
+    ensure_destination_directory(dst)?;
     copy_dir_contents(src, src, dst)
 }
 
@@ -1351,6 +1354,29 @@ command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"
         for path in [source, destination, unsafe_source, unsafe_destination] {
             let _ = std::fs::remove_dir_all(path);
         }
+    }
+
+    #[test]
+    fn copy_dir_creates_a_missing_destination() {
+        let source = make_workdir().unwrap();
+        std::fs::create_dir(source.join("bug")).unwrap();
+        std::fs::write(source.join("bug/solution.py"), "VALUE = 0\n").unwrap();
+        let destination = std::env::temp_dir().join(format!(
+            "hi-eval-copy-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&destination);
+        copy_dir(&source.join("bug"), &destination).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(destination.join("solution.py")).unwrap(),
+            "VALUE = 0\n"
+        );
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(destination);
     }
 
     #[test]

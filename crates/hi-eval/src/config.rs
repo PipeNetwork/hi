@@ -347,9 +347,11 @@ impl EvalProfile {
         if matches!(self, Self::Pipenetwork | Self::PipenetworkMcp)
             && std::env::var("PIPENETWORK_API_KEY").is_err()
             && std::env::var("HI_API_KEY").is_err()
+            && hi_ai::auth_store::load("pipenetwork")
+                .is_none_or(|token| token.access.trim().is_empty())
         {
             bail!(
-                "--profile={} requires PIPENETWORK_API_KEY or HI_API_KEY",
+                "--profile={} requires PIPENETWORK_API_KEY, HI_API_KEY, or `/login pipenetwork`",
                 self.label()
             );
         }

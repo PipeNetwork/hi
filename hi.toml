@@ -87,6 +87,17 @@ base_url = "http://127.0.0.1:8081/v1"
 max_tokens = 4096
 tool_mode = "auto"
 
+# Official DeepSeek-V4-Flash (api.deepseek.com). Key from DEEPSEEK_API_KEY.
+#   hi -p deepseek-flash "review codebase"
+[profiles.deepseek-flash]
+provider = "openai"
+model = "deepseek-v4-flash"
+base_url = "https://api.deepseek.com"
+deepseek_compat = "on"
+api_key_env = "DEEPSEEK_API_KEY"
+max_tokens = 8192
+tool_mode = "auto"
+
 # GLM-5.2 REAP50 (394B MoE, 128 experts/layer) with expert streaming: dense
 # trunk resident (~10 GB quantized), routed experts streamed through the VRAM
 # pool with the bounded-RAM disk tier underneath — built for limited-RAM boxes

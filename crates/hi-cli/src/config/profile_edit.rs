@@ -465,6 +465,39 @@ pub(crate) fn resolve_api_key(
     resolve_api_key_for(profile, provider)
 }
 
+/// Official DeepSeek Chat Completions. Used so `DEEPSEEK_API_KEY` wins when
+/// `--base-url https://api.deepseek.com` is set on the generic OpenAI provider.
+pub(crate) fn is_official_deepseek_url(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "api.deepseek.com")
+}
+
+pub(crate) fn resolve_api_key_with_endpoint(
+    cli: &Cli,
+    profile: Option<&Profile>,
+    provider: ProviderName,
+    base_url: &str,
+) -> Result<String> {
+    if is_official_deepseek_url(base_url)
+        && let Ok(key) = std::env::var("DEEPSEEK_API_KEY")
+        && !key.is_empty()
+    {
+        return Ok(key);
+    }
+    resolve_api_key(cli, profile, provider).or_else(|err| {
+        if is_official_deepseek_url(base_url) {
+            bail!(
+                "no DeepSeek API key: pass --api-key or set DEEPSEEK_API_KEY\n\
+                 ({err})"
+            )
+        } else {
+            Err(err)
+        }
+    })
+}
+
 /// API key for a profile/provider, independent of CLI flags (used for fallback
 /// profiles, whose keys come from their own profile or the environment).
 pub(crate) fn resolve_api_key_for(

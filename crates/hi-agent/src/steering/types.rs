@@ -161,6 +161,16 @@ pub(crate) struct EvidenceTracker {
     /// as potentially new, but a tightly recognized no-op/control bash command
     /// gets a signature so stop/quit/done loops are bounded.
     pub(crate) seen_signatures: Vec<String>,
+    /// Paths whose latest successful `read` invited another page via the
+    /// `read more with offset` footer. A later page of such a path is new
+    /// evidence until the read completes or [`MAX_PAGED_READS_PER_PATH`] hits.
+    pub(crate) truncated_read_paths: Vec<String>,
+    /// Paths that have already been returned in full this turn. A later
+    /// limited slice must not re-open paging — live Flash followed a complete
+    /// default read with `offset:70` and we treated that as a truncated file.
+    pub(crate) completed_read_paths: Vec<String>,
+    /// Successful `read` count per inspected path this turn.
+    pub(crate) read_pages: Vec<(String, u32)>,
 }
 
 impl EvidenceTracker {
@@ -220,12 +230,15 @@ impl EvidenceTracker {
                 self.file_reads = self.file_reads.saturating_add(1);
                 if let Some(path) = hi_tools::target_path(name, arguments)
                     && !path.is_empty()
-                    && !self
+                {
+                    if !self
                         .inspected_paths
                         .iter()
                         .any(|existing| existing == &path)
-                {
-                    self.inspected_paths.push(path);
+                    {
+                        self.inspected_paths.push(path.clone());
+                    }
+                    self.record_read_page(&path, output);
                 }
             }
         }
@@ -244,10 +257,11 @@ impl EvidenceTracker {
     /// prior output. Used by the cycle guard to detect multi-step read/search
     /// cycles (A→B→C→A→B→C) that evade the exact-match repeat guard.
     ///
-    /// Extra pages of a file already read this turn (`read` with a new
-    /// offset/limit on an `inspected_paths` entry) do **not** count as new
-    /// evidence. Paging used to, and models walked 100KB sources for hours
-    /// without tripping the stall detector.
+    /// Extra pages of a **complete** file already read this turn do **not**
+    /// count as new evidence — that walk used to burn hours on 100KB sources.
+    /// A later page of a still-truncated file does count (capped per path),
+    /// because the default tool-result budget often returns ~100 lines and
+    /// the footer tells the model to `read more with offset N`.
     pub(crate) fn round_adds_evidence(&self, calls: &[(String, String, String)]) -> bool {
         if calls.is_empty() {
             return true;
@@ -255,9 +269,21 @@ impl EvidenceTracker {
         for (_, name, args) in calls {
             match name.as_str() {
                 "read" => {
+                    if let Some(sig) = inspection_signature(name, args)
+                        && self.seen_signatures.iter().any(|s| s == &sig)
+                    {
+                        continue;
+                    }
                     if let Some(path) = hi_tools::target_path(name, args)
                         && self.path_already_inspected(&path)
                     {
+                        if !self.path_read_is_complete(&path)
+                            && self.path_read_is_truncated(&path)
+                            && self.read_page_count(&path)
+                                < super::constants::MAX_PAGED_READS_PER_PATH
+                        {
+                            return true;
+                        }
                         continue;
                     }
                     match inspection_signature(name, args) {
@@ -286,6 +312,63 @@ impl EvidenceTracker {
         self.inspected_paths
             .iter()
             .any(|seen| paths_refer_to_same_file(seen, path))
+    }
+
+    fn path_read_is_truncated(&self, path: &str) -> bool {
+        self.truncated_read_paths
+            .iter()
+            .any(|seen| paths_refer_to_same_file(seen, path))
+    }
+
+    fn path_read_is_complete(&self, path: &str) -> bool {
+        self.completed_read_paths
+            .iter()
+            .any(|seen| paths_refer_to_same_file(seen, path))
+    }
+
+    /// True when every call is a `read` of a file already returned in full.
+    /// Those rounds should skip immediately rather than waiting for a second
+    /// consecutive no-new-evidence hit.
+    pub(crate) fn rereads_only_completed_files(
+        &self,
+        calls: &[(String, String, String)],
+    ) -> bool {
+        !calls.is_empty()
+            && calls.iter().all(|(_, name, args)| {
+                name == "read"
+                    && hi_tools::target_path(name, args)
+                        .is_some_and(|path| self.path_read_is_complete(&path))
+            })
+    }
+
+    fn read_page_count(&self, path: &str) -> u32 {
+        self.read_pages
+            .iter()
+            .find(|(seen, _)| paths_refer_to_same_file(seen, path))
+            .map(|(_, count)| *count)
+            .unwrap_or(0)
+    }
+
+    fn record_read_page(&mut self, path: &str, output: &str) {
+        match self
+            .read_pages
+            .iter_mut()
+            .find(|(seen, _)| paths_refer_to_same_file(seen, path))
+        {
+            Some((_, count)) => *count = count.saturating_add(1),
+            None => self.read_pages.push((path.to_string(), 1)),
+        }
+        if hi_tools::read_output_invites_paging(output) {
+            if !self.path_read_is_complete(path) && !self.path_read_is_truncated(path) {
+                self.truncated_read_paths.push(path.to_string());
+            }
+        } else {
+            self.truncated_read_paths
+                .retain(|seen| !paths_refer_to_same_file(seen, path));
+            if !self.path_read_is_complete(path) {
+                self.completed_read_paths.push(path.to_string());
+            }
+        }
     }
 
     fn record_inspection_signature(&mut self, name: &str, arguments: &str) {
@@ -449,9 +532,9 @@ fn paths_refer_to_same_file(a: &str, b: &str) -> bool {
 /// call returns `None`; callers treat that as potentially new evidence so the
 /// normal tool execution path can report the argument error.
 ///
-/// [`EvidenceTracker::round_adds_evidence`] does **not** treat a new read
-/// page of an already-inspected path as new evidence; the offset stays in
-/// the signature for other callers (folding identical pages, telemetry).
+/// [`EvidenceTracker::round_adds_evidence`] treats a new page of a still-
+/// truncated file as new evidence (capped per path). The offset stays in
+/// the signature so identical pages still fold.
 pub(crate) fn inspection_signature(name: &str, arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
     match name {

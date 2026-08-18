@@ -146,8 +146,12 @@ impl crate::App {
             .collect()
     }
 
-    /// Profile names + `add`/`edit`/`remove` subcommands matching `prefix`, as
-    /// `/provider <name>` rows — inline type-ahead for `/provider`.
+    /// Profile names, hosted provider presets, and `add`/`edit`/`remove`
+    /// subcommands matching `prefix`, as `/provider <name>` rows.
+    ///
+    /// Presets belong here for the same reason they belong in the picker:
+    /// `/provider pipenetwork` is valid with no profile (right after
+    /// `/login pipenetwork`). Completing only profile names hid that path.
     pub(crate) fn provider_completion_items(&self, prefix: &str) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
         // Subcommands first.
@@ -163,6 +167,21 @@ impl crate::App {
                     }
                     .to_string(),
                     insert: format!("/{PROVIDER_CMD} {sub}"),
+                    submit_on_enter: true,
+                });
+            }
+        }
+        // Hosted presets next so `/provider pipe` can select pipenetwork
+        // even when no profile is named that way.
+        for (name, detail) in crate::provider_picker::PRESETS {
+            if self.profiles.iter().any(|profile| profile.name == *name) {
+                continue;
+            }
+            if name.starts_with(prefix) {
+                items.push(CompletionItem {
+                    label: (*name).to_string(),
+                    help: (*detail).to_string(),
+                    insert: format!("/{PROVIDER_CMD} {name}"),
                     submit_on_enter: true,
                 });
             }

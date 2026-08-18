@@ -186,6 +186,10 @@ pub(super) fn tool_entry_with_args(
     let command = bash_command_preview(&tool, arguments);
     let kind = crate::tool_kind(&tool).to_string();
     let truncated = !matches!(output.truncation, hi_tools::TruncationState::Complete);
+    let path = {
+        let all = hi_tools::target_paths(&tool, arguments);
+        if all.len() > 1 { all.join("\n") } else { path }
+    };
     ToolCallEntry {
         tool,
         path,

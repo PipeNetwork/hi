@@ -77,8 +77,8 @@ pub mod protocol {
         memory_search_tool_spec, prepare_mutation_in_with_state, prepare_verify_workdir,
         run_check_in, run_check_in_with_timeout, run_fast_check_in, run_memory_get,
         run_memory_search, run_search_tool, run_skill, run_use_tool, search_tool_tool_spec,
-        skill_tool_spec, target_path, task_tool_spec, tool_metadata, use_tool_tool_spec,
-        wait_tasks_tool_spec, working_tree_diff_in, working_tree_diff_plain_in,
+        skill_tool_spec, target_path, target_paths, task_tool_spec, tool_metadata,
+        use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in, working_tree_diff_plain_in,
     };
     pub use crate::transaction::{
         MutationPlan, PlannedFileMutation, recover_workspace_transactions,
@@ -191,6 +191,7 @@ pub use paths::ReadCache;
 pub use process::{
     AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild, preserve_detached_descendants,
 };
+pub use read::read_output_invites_paging;
 pub use repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
 #[cfg(test)]
 pub(crate) use tools::preview_edit_in;
@@ -205,8 +206,8 @@ pub use tools::{
     prepare_mutation_in_with_state, prepare_verify_workdir, run_check_in,
     run_check_in_with_timeout, run_fast_check_in, run_memory_get, run_memory_search,
     run_search_tool, run_skill, run_use_tool, search_tool_tool_spec, skill_tool_spec, target_path,
-    task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in,
-    working_tree_diff_plain_in,
+    target_paths, task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
+    working_tree_diff_in, working_tree_diff_plain_in,
 };
 #[cfg(test)]
 pub(crate) use tools::{execute, execute_in};
@@ -379,6 +380,21 @@ impl ToolOutcome {
             effects: ToolEffects::default(),
             truncation: TruncationState::Complete,
         }
+    }
+
+    /// A `read` page. Budget-clipped and line-limited pages stay under
+    /// [`condense::MAX_OUTPUT_CHARS`], so [`bound_tool_content`] would call
+    /// them complete; the paging footer is the real truncation signal.
+    pub(crate) fn plain_read(content: String, source_bytes: u64) -> Self {
+        let retained_bytes = content.len() as u64;
+        let mut outcome = Self::plain(content);
+        if crate::read::read_output_invites_paging(&outcome.content) {
+            outcome.truncation = TruncationState::Truncated {
+                original_bytes: source_bytes.max(retained_bytes.saturating_add(1)),
+                retained_bytes,
+            };
+        }
+        outcome
     }
 
     /// Plain model/UI content clipped to the shared per-tool context budget,

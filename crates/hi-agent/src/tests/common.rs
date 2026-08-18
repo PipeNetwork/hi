@@ -9,7 +9,10 @@ use std::sync::Mutex;
 /// A provider that returns canned completions in order.
 pub(crate) struct Canned(pub(crate) Mutex<Vec<Completion>>);
 
-fn pop_canned_completion(responses: &Mutex<Vec<Completion>>, provider: &str) -> Result<Completion> {
+pub(crate) fn pop_canned_completion(
+    responses: &Mutex<Vec<Completion>>,
+    provider: &str,
+) -> Result<Completion> {
     let mut responses = responses.lock().unwrap();
     if responses.is_empty() {
         anyhow::bail!(

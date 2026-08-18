@@ -1,10 +1,14 @@
 //! Interactive `/provider` picker: a filterable, arrow-navigable list of the
 //! things you can switch to — configured profiles first, then the built-in
-//! provider presets.
+//! provider presets, then local models.
 //!
 //! Presets are listed alongside profiles because a provider is usable without
 //! one (`/provider xai` right after `/login xai`), and a list that only showed
-//! profiles left no way to discover or reach them.
+//! profiles left no way to discover or reach them. Hosted presets stay above
+//! the (often long) local-model catalog so `/provider` can still select
+//! `pipenetwork` after `/login pipenetwork`.
+
+use crate::PICKER_ROWS;
 
 /// One selectable row: a configured profile, a managed local model, or a
 /// built-in provider preset.
@@ -33,7 +37,10 @@ pub(crate) enum ProviderChoice {
 /// `provider_form::PROVIDER_CHOICES` — that list is what you can *create a
 /// profile for*, this one is what you can *switch to right now*, so it also
 /// includes providers with no interactive setup form.
-const PRESETS: &[(&str, &str)] = &[
+///
+/// Shared with `/provider` slash-completion so typing `/provider pipe` can
+/// select the hosted preset instead of only matching profile names.
+pub(crate) const PRESETS: &[(&str, &str)] = &[
     (
         "xai",
         "xAI (Grok) — subscription via /login xai, or XAI_API_KEY",
@@ -142,16 +149,6 @@ impl ProviderPicker {
                 managed_local_profile: false,
             })
             .collect();
-        for (name, detail, model) in local_models {
-            all.push(ProviderEntry {
-                name,
-                detail,
-                is_preset: false,
-                is_local: true,
-                managed_local_profile: false,
-                action: ProviderChoice::LocalModel(model),
-            });
-        }
         // A preset whose name is already a profile would switch to the profile
         // anyway (profiles shadow presets in resolution), so listing it twice
         // would be a lie about what selecting it does.
@@ -171,6 +168,18 @@ impl ProviderPicker {
                 managed_local_profile: false,
             });
         }
+        // Local catalog rows come last so a long MLX list cannot push hosted
+        // presets like `pipenetwork` off the first page.
+        for (name, detail, model) in local_models {
+            all.push(ProviderEntry {
+                name,
+                detail,
+                is_preset: false,
+                is_local: true,
+                managed_local_profile: false,
+                action: ProviderChoice::LocalModel(model),
+            });
+        }
         let selected = all.iter().position(|e| e.name == current).unwrap_or(0);
         let matches = (0..all.len()).collect();
         Self {
@@ -186,17 +195,10 @@ impl ProviderPicker {
     /// completes. Profile and preset rows keep their order; an active filter
     /// is reapplied so the picker can update while it is open.
     pub fn replace_local_models(&mut self, local_models: Vec<(String, String, String)>) {
-        let highlighted = self.current_choice().and_then(|choice| match choice {
-            ProviderChoice::LocalModel(model) => Some(model),
-            ProviderChoice::Named(_) => None,
-        });
+        let highlighted = self.current_choice();
         self.all
             .retain(|entry| !entry.is_local || entry.managed_local_profile);
-        let insert_at = self
-            .all
-            .iter()
-            .position(|entry| entry.is_preset)
-            .unwrap_or(self.all.len());
+        // Catalog rows stay after profiles and hosted presets.
         let rows = local_models
             .into_iter()
             .map(|(name, detail, model)| ProviderEntry {
@@ -207,13 +209,13 @@ impl ProviderPicker {
                 managed_local_profile: false,
                 action: ProviderChoice::LocalModel(model),
             });
-        self.all.splice(insert_at..insert_at, rows);
+        self.all.extend(rows);
         self.refilter();
         if let Some(highlighted) = highlighted
             && let Some(row) = self.matches.iter().position(|index| {
-                self.all.get(*index).is_some_and(|entry| {
-                    entry.action == ProviderChoice::LocalModel(highlighted.clone())
-                })
+                self.all
+                    .get(*index)
+                    .is_some_and(|entry| entry.action == highlighted)
             })
         {
             self.selected = row;
@@ -289,9 +291,16 @@ impl ProviderPicker {
     }
 
     /// Rows to render: (name, detail, is_preset, is_local, is_active,
-    /// is_highlighted).
+    /// is_highlighted). The window scrolls so the highlighted row stays
+    /// on-screen — same contract as the `/model` picker.
     pub fn visible(&self) -> Vec<(&str, &str, bool, bool, bool, bool)> {
-        self.matches
+        let offset = if self.selected >= PICKER_ROWS {
+            self.selected + 1 - PICKER_ROWS
+        } else {
+            0
+        };
+        let end = (offset + PICKER_ROWS).min(self.matches.len());
+        self.matches[offset..end]
             .iter()
             .enumerate()
             .filter_map(|(row, index)| {
@@ -302,7 +311,7 @@ impl ProviderPicker {
                     entry.is_preset,
                     entry.is_local,
                     entry.name == self.current,
-                    row == self.selected,
+                    offset + row == self.selected,
                 ))
             })
             .collect()
@@ -674,5 +683,84 @@ mod tests {
         assert!(!picker.all.iter().any(|entry| entry.name == "local"));
         assert!(picker.all.iter().any(|entry| entry.name == "work"));
         assert!(picker.all.iter().any(|entry| entry.name == "openai"));
+    }
+
+    #[test]
+    fn hosted_presets_stay_above_the_local_catalog() {
+        let picker = ProviderPicker::new_with_local(
+            profiles(),
+            vec![(
+                "DeepSeek Coder V2 Lite".into(),
+                "MLX 4bit · download on select".into(),
+                "deepseek-coder-v2-lite".into(),
+            )],
+            "local",
+        );
+        let names: Vec<&str> = picker.all.iter().map(|e| e.name.as_str()).collect();
+        let pipe = names
+            .iter()
+            .position(|name| *name == "pipenetwork")
+            .expect("pipenetwork preset");
+        let local = names
+            .iter()
+            .position(|name| *name == "DeepSeek Coder V2 Lite")
+            .expect("local catalog row");
+        assert!(
+            pipe < local,
+            "hosted pipenetwork must stay selectable above the local catalog: {names:?}"
+        );
+    }
+
+    #[test]
+    fn visible_window_scrolls_so_pipenetwork_can_be_selected() {
+        let locals = (0..(PICKER_ROWS + 4))
+            .map(|i| {
+                (
+                    format!("local-model-{i}"),
+                    "MLX 4bit · download on select".into(),
+                    format!("repo/model-{i}"),
+                )
+            })
+            .collect();
+        let mut picker = ProviderPicker::new_with_local(profiles(), locals, "local");
+        let pipe_match = picker
+            .matches
+            .iter()
+            .position(|index| picker.all[*index].name == "pipenetwork")
+            .expect("pipenetwork in matches");
+        picker.selected = pipe_match;
+        let visible: Vec<&str> = picker
+            .visible()
+            .into_iter()
+            .map(|(name, ..)| name)
+            .collect();
+        assert!(
+            visible.contains(&"pipenetwork"),
+            "highlighting pipenetwork must scroll it into the visible window: {visible:?}"
+        );
+        assert_eq!(
+            picker.current_choice(),
+            Some(ProviderChoice::Named("pipenetwork".into()))
+        );
+    }
+
+    #[test]
+    fn catalog_refresh_keeps_a_named_preset_highlight() {
+        let mut picker = ProviderPicker::new_with_local(profiles(), Vec::new(), "local");
+        let pipe_match = picker
+            .matches
+            .iter()
+            .position(|index| picker.all[*index].name == "pipenetwork")
+            .expect("pipenetwork in matches");
+        picker.selected = pipe_match;
+        picker.replace_local_models(vec![(
+            "VISTA 9B".into(),
+            "Pipe Network · VISTA MLX · ready".into(),
+            "pipenetwork/VISTA-9B-MLX-4bit".into(),
+        )]);
+        assert_eq!(
+            picker.current_choice(),
+            Some(ProviderChoice::Named("pipenetwork".into()))
+        );
     }
 }

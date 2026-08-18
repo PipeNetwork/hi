@@ -116,6 +116,15 @@ pub(crate) const SECURITY_INSPECTION_CAP: u32 = 40;
 /// sprawl nudge before the turn stops incomplete.
 pub(crate) const MAX_INSPECTION_SPRAWL_NUDGES: u32 = 2;
 
+/// Successful `read` calls allowed against one still-truncated file before
+/// further pages stop counting as new evidence.
+///
+/// The default 2,000-line page is clipped to the ~5k-char tool-result budget
+/// (~100 lines of Rust). Models that follow the `read more with offset N`
+/// footer need several pages to finish a typical source file. Exact same-page
+/// re-reads and paging after a complete read still add nothing.
+pub(crate) const MAX_PAGED_READS_PER_PATH: u32 = 8;
+
 // ── Inspection cap scaling system ──────────────────────────────────────────
 //
 // The base caps above are task-blind and project-blind. The effective cap is:
