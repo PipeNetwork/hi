@@ -980,9 +980,7 @@ impl crate::App {
         // the bottom border. Reserve one row for the transcript (Min(1) below).
         let cap = inner
             .height
-            .saturating_sub(
-                metrics.min_transcript_rows + chrome_rows + btw_h + btw_gap,
-            )
+            .saturating_sub(metrics.min_transcript_rows + chrome_rows + btw_h + btw_gap)
             .max(1) as usize;
         let show_lists = !overlay_composer;
         let input_needed = (base_h + 2).max(3).min(cap);

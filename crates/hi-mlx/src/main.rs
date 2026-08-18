@@ -4,15 +4,15 @@ use std::path::PathBuf;
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use anyhow::Context;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use hi_mlx::backend::platform_supported;
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use hi_mlx::backend::InferenceBackend;
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use hi_mlx::backend::MlxBackend;
+use hi_mlx::backend::platform_supported;
 use hi_mlx::manifest::{inspect_model, list_models};
 
 #[derive(Parser, Debug)]
@@ -105,7 +105,9 @@ async fn run(cli: Cli) -> Result<()> {
             {
                 let backend = Arc::new(
                     MlxBackend::load_with_draft(&model_path, model_id, draft.as_ref(), spec_k)
-                        .with_context(|| format!("loading MLX model from {}", model_path.display()))?,
+                        .with_context(|| {
+                            format!("loading MLX model from {}", model_path.display())
+                        })?,
                 );
                 let addr: SocketAddr = format!("{host}:{port}")
                     .parse()

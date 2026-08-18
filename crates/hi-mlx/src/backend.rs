@@ -4,17 +4,20 @@ use std::process::Command;
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use anyhow::anyhow;
-#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+use anyhow::{Context, Result, bail};
+#[cfg(any(
+    test,
+    all(target_os = "macos", target_arch = "aarch64", feature = "mlx")
+))]
 use async_trait::async_trait;
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use futures_util::Stream;
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
-use tokio::sync::mpsc;
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use tokio::sync::Mutex;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+use tokio::sync::mpsc;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use crate::config::{MlxModelConfig, load_model_config};
@@ -22,7 +25,10 @@ use crate::config::{MlxModelConfig, load_model_config};
 use crate::expert_stream;
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use crate::generate::TokenizerRuntime;
-#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+#[cfg(any(
+    test,
+    all(target_os = "macos", target_arch = "aarch64", feature = "mlx")
+))]
 use crate::manifest::ModelInfo;
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use crate::manifest::inspect_model;
@@ -171,7 +177,10 @@ fn load_chat_template(path: &std::path::Path) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+#[cfg(any(
+    test,
+    all(target_os = "macos", target_arch = "aarch64", feature = "mlx")
+))]
 const OVERSIZE_MODEL_ENV: &str = "HI_MLX_ALLOW_OVERSIZE_MODEL";
 const MEMORY_LIMIT_BYTES_ENV: &str = "HI_MLX_MEMORY_LIMIT_BYTES";
 const MEMORY_LIMIT_FRACTION_ENV: &str = "HI_MLX_MEMORY_LIMIT_FRACTION";
@@ -474,7 +483,10 @@ pub fn configured_memory_limit_bytes() -> Result<Option<u64>> {
     Ok(Some(((host_bytes as f64) * fraction.min(1.0)) as u64))
 }
 
-#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+#[cfg(any(
+    test,
+    all(target_os = "macos", target_arch = "aarch64", feature = "mlx")
+))]
 fn check_estimated_memory(estimated_bytes: u64, limit_bytes: u64) -> Result<()> {
     if estimated_bytes <= limit_bytes {
         return Ok(());
@@ -514,7 +526,10 @@ fn host_memory_bytes() -> Option<u64> {
         .ok()
 }
 
-#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+#[cfg(any(
+    test,
+    all(target_os = "macos", target_arch = "aarch64", feature = "mlx")
+))]
 fn format_bytes(bytes: u64) -> String {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     format!("{:.2} GiB ({bytes} bytes)", bytes as f64 / GIB)
@@ -659,7 +674,10 @@ fn ensure_native_generation_available() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(not(all(target_os = "macos", target_arch = "aarch64")), feature = "mlx"))]
+#[cfg(all(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    feature = "mlx"
+))]
 fn ensure_native_generation_available() -> Result<()> {
     anyhow::bail!("native MLX inference requires Apple Silicon macOS")
 }
