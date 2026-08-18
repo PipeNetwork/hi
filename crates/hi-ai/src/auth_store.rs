@@ -219,8 +219,9 @@ mod tests {
     #[test]
     fn saves_and_loads_a_credential() {
         with_temp_home(|| {
-            save("xai", &token("access-1")).unwrap();
-            assert_eq!(load("xai"), Some(token("access-1")));
+            let stored = token("access-1");
+            save("xai", &stored).unwrap();
+            assert_eq!(load("xai"), Some(stored));
             assert_eq!(load("other"), None, "unrelated providers stay absent");
         });
     }
