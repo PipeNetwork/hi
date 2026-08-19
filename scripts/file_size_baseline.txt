@@ -38,7 +38,7 @@
 1095 crates/hi-ai/src/huggingface.rs
 1459 crates/hi-ai/src/openai.rs
 1028 crates/hi-ai/src/openai/deepseek.rs
-1894 crates/hi-ai/src/openai/request.rs
+2001 crates/hi-ai/src/openai/request.rs
 2522 crates/hi-ai/src/openai/stream.rs
 1000 crates/hi-ai/src/types.rs
 1123 crates/hi-cli/src/bench.rs

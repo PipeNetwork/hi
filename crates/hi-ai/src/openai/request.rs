@@ -819,7 +819,7 @@ pub(crate) fn build_body_with_capabilities(
                         "parameters": if attempt.strict_tools {
                             super::deepseek::normalize_strict_schema(&t.parameters)
                         } else {
-                            t.parameters.clone()
+                            compat_tool_parameters(&t.parameters)
                         },
                     }
                 })
@@ -865,6 +865,44 @@ pub(crate) fn build_body_with_capabilities(
         body["reasoning_effort"] = json!(capabilities.reasoning_wire_value(effort));
     }
     body
+}
+
+/// OpenAI-compatible hosts often reject a sibling `oneOf`/`anyOf` of
+/// `{ "required": ["field"] }` fragments (hi's `read` tool). PipeNetwork's
+/// Kimi K2.6 / K2.7-code-fast routes answer 400 `external model route
+/// rejected the request`. Drop those combinators and keep the object
+/// properties; exclusivity stays in local tool validation.
+fn compat_tool_parameters(schema: &Value) -> Value {
+    let Some(root) = schema.as_object() else {
+        return schema.clone();
+    };
+    let key = if root.contains_key("oneOf") {
+        "oneOf"
+    } else if root.contains_key("anyOf") {
+        "anyOf"
+    } else {
+        return schema.clone();
+    };
+    let Some(branches) = root.get(key).and_then(Value::as_array) else {
+        return schema.clone();
+    };
+    if !root.contains_key("properties") {
+        return schema.clone();
+    }
+    let required_only_fragments = !branches.is_empty()
+        && branches.iter().all(|branch| {
+            branch.as_object().is_some_and(|obj| {
+                obj.contains_key("required") && obj.keys().all(|k| k == "required")
+            })
+        });
+    if !required_only_fragments {
+        return schema.clone();
+    }
+    let mut out = schema.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove(key);
+    }
+    out
 }
 
 /// Flatten neutral messages into OpenAI's wire shape. The generic path keeps
@@ -1476,6 +1514,75 @@ mod tests {
             near(&hot["frequency_penalty"], 0.4),
             "frequency_penalty: {}",
             hot["frequency_penalty"]
+        );
+    }
+
+    #[test]
+    fn openai_compat_drops_sibling_oneof_required_fragments() {
+        let req = crate::types::ChatRequest {
+            model: "pipe/kimi-k2.6".into(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: false,
+            canonical_objective: None,
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![ToolSpec {
+                name: "read".into(),
+                description: "Read a file".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "paths": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "oneOf": [
+                        { "required": ["path"] },
+                        { "required": ["paths"] }
+                    ],
+                    "additionalProperties": false
+                }),
+            }]
+            .into(),
+            max_tokens: 16,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: Default::default(),
+        };
+        let body = build_body(&req, request_attempts(&req)[0], None);
+        let parameters = &body["tools"][0]["function"]["parameters"];
+        assert!(parameters.get("oneOf").is_none());
+        assert_eq!(parameters["type"], "object");
+        assert!(parameters["properties"].get("path").is_some());
+        assert!(parameters["properties"].get("paths").is_some());
+        assert_eq!(parameters["additionalProperties"], false);
+
+        // Property-level unions are not the sibling-required shape and stay.
+        let mut union_req = req.clone();
+        union_req.tools = vec![ToolSpec {
+            name: "get_task_output".into(),
+            description: "poll".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_ids": {
+                        "oneOf": [
+                            { "type": "string" },
+                            { "type": "array", "items": { "type": "string" } }
+                        ]
+                    }
+                },
+                "required": ["task_ids"]
+            }),
+        }]
+        .into();
+        let union_body = build_body(&union_req, request_attempts(&union_req)[0], None);
+        assert!(
+            union_body["tools"][0]["function"]["parameters"]["properties"]["task_ids"]
+                .get("oneOf")
+                .is_some()
         );
     }
 

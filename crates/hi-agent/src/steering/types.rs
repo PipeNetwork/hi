@@ -329,10 +329,7 @@ impl EvidenceTracker {
     /// True when every call is a `read` of a file already returned in full.
     /// Those rounds should skip immediately rather than waiting for a second
     /// consecutive no-new-evidence hit.
-    pub(crate) fn rereads_only_completed_files(
-        &self,
-        calls: &[(String, String, String)],
-    ) -> bool {
+    pub(crate) fn rereads_only_completed_files(&self, calls: &[(String, String, String)]) -> bool {
         !calls.is_empty()
             && calls.iter().all(|(_, name, args)| {
                 name == "read"
