@@ -5,7 +5,7 @@
 801 crates/hi-agent/src/agent/goal_turn.rs
 3014 crates/hi-agent/src/agent/lifecycle.rs
 861 crates/hi-agent/src/agent/skeptic.rs
-1294 crates/hi-agent/src/agent/tool_selection.rs
+1326 crates/hi-agent/src/agent/tool_selection.rs
 1159 crates/hi-agent/src/agent/turn/btw.rs
 938 crates/hi-agent/src/agent/turn/fast_feedback.rs
 808 crates/hi-agent/src/agent/turn/finalize.rs
@@ -23,13 +23,13 @@
 1555 crates/hi-agent/src/session_ops.rs
 816 crates/hi-agent/src/skills.rs
 963 crates/hi-agent/src/steering/implementation.rs
-1146 crates/hi-agent/src/steering/intent.rs
+1230 crates/hi-agent/src/steering/intent.rs
 957 crates/hi-agent/src/task_contract.rs
 2006 crates/hi-agent/src/tests/goal.rs
 1317 crates/hi-agent/src/tests/outcome.rs
 1590 crates/hi-agent/src/tests/plan.rs
 1529 crates/hi-agent/src/tests/retry.rs
-3471 crates/hi-agent/src/tests/steering.rs
+3474 crates/hi-agent/src/tests/steering.rs
 4656 crates/hi-agent/src/tests/turn.rs
 2093 crates/hi-agent/src/transcript.rs
 1425 crates/hi-agent/src/ui.rs
@@ -38,7 +38,7 @@
 1095 crates/hi-ai/src/huggingface.rs
 1459 crates/hi-ai/src/openai.rs
 1028 crates/hi-ai/src/openai/deepseek.rs
-2001 crates/hi-ai/src/openai/request.rs
+2015 crates/hi-ai/src/openai/request.rs
 2522 crates/hi-ai/src/openai/stream.rs
 1000 crates/hi-ai/src/types.rs
 1123 crates/hi-cli/src/bench.rs

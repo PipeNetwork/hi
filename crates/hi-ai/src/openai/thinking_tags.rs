@@ -181,7 +181,13 @@ fn find_tag(s: &str, long: &str, short: &str) -> Scan {
 
 fn hold_prefix(s: &str, needle: &str) -> usize {
     let max = needle.len().saturating_sub(1);
-    let start = s.len().saturating_sub(max);
+    let mut start = s.len().saturating_sub(max);
+    // Byte-length lookback can land inside a multibyte char (an em-dash at
+    // the tail of a streamed chunk is the live case). Slice only at a
+    // boundary so the splitter cannot panic on ordinary UTF-8 prose.
+    while start > 0 && !s.is_char_boundary(start) {
+        start -= 1;
+    }
     for (offset, _) in s[start..].char_indices() {
         let idx = start + offset;
         let suffix = &s[idx..];
@@ -266,5 +272,16 @@ mod tests {
         let (r, t) = split_inline_thinking("use i < n as the bound");
         assert!(r.is_empty());
         assert_eq!(t, "use i < n as the bound");
+    }
+
+    #[test]
+    fn multibyte_suffix_does_not_panic_when_holding_a_tag_prefix() {
+        // Live: muse-spark streamed a chunk whose last 9 bytes started inside
+        // '—' (bytes 7..10). `hold_prefix` used to slice at that byte.
+        let chunk = format!("abcdefg—{}", "x".repeat(8));
+        assert_eq!(chunk.len(), 18);
+        let (r, t) = split_all(&[&chunk, " more"]);
+        assert!(r.is_empty(), "prose must not become reasoning: {r:?}");
+        assert_eq!(t, format!("{chunk} more"));
     }
 }

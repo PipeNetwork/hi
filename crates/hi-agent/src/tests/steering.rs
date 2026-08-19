@@ -23,6 +23,9 @@ fn scoped_no_edit_carveouts_never_flip_implementation_to_read_only() {
         "Fix the parser without changing the documentation.",
         "Apply the fix; never edit the changelog.",
         "Fix it. Avoid updating any docs.",
+        "Write driver.py for the included host.py. Do not rewrite host.py or the oracle. Do not edit bug/ yourself — only talk to host.py.",
+        "Fix the bug. Do not edit src/lib.rs.",
+        "Implement the feature. Don't rewrite host.py.",
     ] {
         assert_eq!(
             classify_read_only_intent(carveout),

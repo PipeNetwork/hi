@@ -697,6 +697,7 @@ pub(crate) fn is_model_unavailable_text(text: &str) -> bool {
             "model_unavailable",
             "model temporarily unavailable",
             "requested model is unavailable",
+            "not currently serviceable",
             "model not available",
             "model not enabled",
             "model not supported",
@@ -1036,7 +1037,7 @@ mod tests {
     use super::{
         build_body, build_body_with_capabilities, classify_http_error, classify_message_fallback,
         is_deepseek_strict_schema_text, is_deepseek_strict_schema_unsupported,
-        is_quality_rejected_text, is_unsupported_frequency_penalty_text,
+        is_model_unavailable_text, is_quality_rejected_text, is_unsupported_frequency_penalty_text,
         is_unsupported_output_token_text, next_deepseek_reasoning_attempt, next_degraded_attempt,
         parse_api_error, request_attempts, request_attempts_for, to_openai_messages,
         to_openai_messages_with_capabilities,
@@ -1268,6 +1269,19 @@ mod tests {
         assert_eq!(
             build_body(&request, explicit[0], None)["max_completion_tokens"],
             16
+        );
+    }
+
+    #[test]
+    fn serviceable_model_text_is_model_unavailable() {
+        assert!(is_model_unavailable_text(
+            "requested model is not currently serviceable"
+        ));
+        assert_eq!(
+            classify_message_fallback(
+                "API error 503 Service Unavailable: requested model is not currently serviceable"
+            ),
+            ProviderErrorKind::ModelUnavailable
         );
     }
 

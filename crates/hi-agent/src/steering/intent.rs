@@ -226,7 +226,10 @@ pub(crate) fn security_search_families(search_text: &str) -> SecuritySearchFamil
 }
 
 pub(crate) fn classify_read_only_intent(input: &str) -> Option<ReviewIntent> {
-    let normalized = normalize_intent_text(input);
+    // Path-scoped "do not edit bug/" / "do not rewrite host.py" must be
+    // stripped before normalize, which turns `/` and `.` into spaces and
+    // would otherwise leave a bare "do not edit" no-mutation request.
+    let normalized = normalize_intent_text(&without_path_scoped_no_edit_clauses(input));
     if normalized.trim().is_empty() {
         return None;
     }
@@ -277,6 +280,85 @@ pub(crate) fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+/// Drop negated edit clauses whose object is a file or directory path
+/// (`host.py`, `bug/`, `src/lib.rs`). `normalize_intent_text` turns `.` and
+/// `/` into spaces, so this has to run on the original prompt; otherwise
+/// "Do not edit bug/ yourself" collapses to a global "do not edit".
+fn without_path_scoped_no_edit_clauses(input: &str) -> String {
+    const EDIT_VERBS: &[&str] = &[
+        "change",
+        "edit",
+        "modify",
+        "touch",
+        "alter",
+        "update",
+        "rewrite",
+        "changing",
+        "editing",
+        "modifying",
+        "touching",
+        "altering",
+        "updating",
+        "rewriting",
+    ];
+    let lower = input.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    let mut keep = vec![true; tokens.len()];
+    let mut i = 0;
+    while i < tokens.len() {
+        let head_len = match tokens[i] {
+            "do" | "don" if matches!(tokens.get(i + 1).copied(), Some("not") | Some("t")) => 2,
+            "don't" | "dont" | "never" | "without" | "avoid" => 1,
+            _ => 0,
+        };
+        if head_len == 0 {
+            i += 1;
+            continue;
+        }
+        let verb_index = i + head_len;
+        if !tokens
+            .get(verb_index)
+            .is_some_and(|verb| EDIT_VERBS.contains(verb))
+        {
+            i += 1;
+            continue;
+        }
+        let mut matched = false;
+        for j in verb_index + 1..=(verb_index + 4).min(tokens.len().saturating_sub(1)) {
+            if is_path_scoped_object(tokens[j]) {
+                for slot in keep.iter_mut().take(j + 1).skip(i) {
+                    *slot = false;
+                }
+                i = j + 1;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            i += 1;
+        }
+    }
+    tokens
+        .iter()
+        .zip(&keep)
+        .filter_map(|(token, keep)| keep.then_some(*token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_path_scoped_object(token: &str) -> bool {
+    let trimmed = token.trim_matches(|c: char| {
+        matches!(
+            c,
+            ',' | ';' | ':' | '"' | '\'' | '(' | ')' | '!' | '?' | '—' | '–'
+        )
+    });
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.contains('/') || is_file_reference(trimmed.trim_end_matches('.'))
+}
+
 fn without_scoped_no_edit_constraints(normalized: &str) -> String {
     // Token-structural, not an enumerated phrase list: a negation head
     // ("do not" / "don t" / "never" / "without" / "avoid") followed by an
@@ -286,6 +368,8 @@ fn without_scoped_no_edit_constraints(normalized: &str) -> String {
     // clause is removed before the no-mutation phrases are looked for.
     // Negated edits with global or absent objects ("do not modify anything",
     // bare "do not edit") are kept: those are genuine no-mutation requests.
+    // File/directory objects are handled earlier by
+    // [`without_path_scoped_no_edit_clauses`].
     const EDIT_VERBS: &[&str] = &[
         "change",
         "edit",

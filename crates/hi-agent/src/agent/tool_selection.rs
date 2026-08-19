@@ -531,6 +531,22 @@ fn targeted_mutation_needs_write(task: &str) -> bool {
     ]
     .iter()
     .any(|marker| lower.contains(marker))
+        || write_named_file_request(&lower)
+}
+
+/// "Write driver.py" / "write src/foo.rs" names a new file without using the
+/// longer "write a file" phrasing the marker list above expects.
+fn write_named_file_request(lower: &str) -> bool {
+    let words: Vec<&str> = lower
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '.' | '/' | '_' | '-'))
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.windows(2).any(|pair| {
+        matches!(pair[0], "write" | "writing")
+            && (is_file_reference(pair[1]) || pair[1].contains('/'))
+    })
 }
 
 /// Do not advertise a process tool when the user explicitly forbids shell
@@ -1074,6 +1090,22 @@ mod tests {
             BackgroundToolAvailability::default(),
         );
         assert!(names(&create).contains(&"write"));
+
+        let write_named = advertised_tools_with_background(
+            &config,
+            Some((
+                "Write driver.py for the included host.py tool host.\n\
+                 Do not rewrite host.py or the oracle.\n\
+                 Do not edit bug/ yourself — only talk to host.py.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert!(
+            names(&write_named).contains(&"write"),
+            "write <filename> must advertise write: {:?}",
+            names(&write_named)
+        );
 
         let planned = advertised_tools_with_background(
             &config,
