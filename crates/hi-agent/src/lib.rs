@@ -621,6 +621,9 @@ impl ToolCallEntry {
     }
 }
 
+/// Occupancy stand-in when `/models` did not report a context window.
+/// Used only to decide when to stub old tool output — never to drop history.
+pub const FALLBACK_CONTEXT_WINDOW: u32 = 128_000;
 /// Auto-compact once the context window is at least this percent full.
 pub const AUTO_COMPACT_PERCENT: u64 = 80;
 /// After triggering, compact until the local estimate is at or below this

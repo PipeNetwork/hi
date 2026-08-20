@@ -458,6 +458,50 @@ async fn context_preflight_still_drops_when_real_window_exceeded() {
 }
 
 #[test]
+fn in_turn_elide_runs_without_a_catalog_window() {
+    // Mutation turns used to no-op elision when `/models` omitted a window.
+    // Occupancy must still stub old bulky tool results against the fallback
+    // window so a long loop does not resend every payload.
+    let mut cfg = config();
+    cfg.routing.context_window = None;
+    cfg.memory.auto_compact = true;
+    cfg.memory.in_turn_keep_tool_results = 1;
+    cfg.memory.in_turn_elide_percent = 1;
+    let mut agent = agent(vec![], cfg);
+    for index in 0..4 {
+        let id = format!("c{index}");
+        agent
+            .messages_mut()
+            .push(Message::assistant(vec![Content::ToolCall {
+                id: id.clone(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }]));
+        agent
+            .messages_mut()
+            .push(Message::tool_result(&id, "x".repeat(8_000)));
+    }
+    agent.elide_in_turn_context_if_needed(&mut NullUi, None);
+    let outputs: Vec<&str> = agent
+        .messages()
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::ToolResult { output, .. } => Some(output.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        outputs.iter().any(|output| output.starts_with("[elided")),
+        "old tool results must be stubbed without a catalog window: {outputs:?}"
+    );
+    assert!(
+        outputs.last().is_some_and(|output| output.len() == 8_000),
+        "newest tool result stays verbatim: {outputs:?}"
+    );
+}
+
+#[test]
 fn persist_after_transcript_shrink_does_not_panic() {
     // Regression: strip_trailing_nudges/strip_finalize_pair pop messages without
     // moving the `persisted` cursor, so after a mid-turn persist the cursor can

@@ -59,6 +59,11 @@ pub(crate) const NO_EVIDENCE_REVIEW_NUDGE: &str = "This read-only review has no 
 Do not finalize. Use read-only inspection tools first, then answer from the inspected evidence. \
 If inspection is impossible, explain which inspection failed and what remains unknown.";
 pub(crate) const READ_ONLY_SAFE_CONTEXT_WINDOW: u32 = 12_000;
+/// In-turn elision cap for mutation/coding loops. Without this, a 200k catalog
+/// window delays stubbing old tool results until occupancy is huge, so a long
+/// edit loop resends every payload. Recent results stay verbatim via
+/// [`crate::IN_TURN_KEEP_TOOL_RESULTS`].
+pub(crate) const MUTATION_SAFE_CONTEXT_WINDOW: u32 = 32_000;
 pub(crate) const READ_ONLY_PREFLIGHT_GREP_MAX_LINES: usize = 32;
 pub(crate) const READ_ONLY_PREFLIGHT_DIFF_MAX_LINES: usize = 160;
 pub(crate) const SECURITY_PREFLIGHT_EXTRA_READ_LIMIT: u32 = 90;

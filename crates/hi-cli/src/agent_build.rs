@@ -88,7 +88,13 @@ pub(crate) fn build_agent(
             tool_set: quality.tool_set,
             disabled_tools: crate::tool_trim::disabled_tools(&state_root),
             // Env override lets you flip on skill auto-curation without editing a profile.
-            curate_skills: settings.curate_skills || std::env::var_os("HI_CURATE_SKILLS").is_some(),
+            // Eval skips it the same way it skips finalize: the extra completion is
+            // billed and does not belong in a measured coding cell.
+            curate_skills: session_curate_skills(
+                settings.curate_skills,
+                std::env::var_os("HI_CURATE_SKILLS").is_some(),
+                cli.eval_input.is_some(),
+            ),
             suggest_next_prompt: settings.suggest_next_prompt && cli.eval_input.is_none(),
             project_context: load_project_context_from(&workspace_root),
             context_exclusions: quality.context_exclusions.clone(),
@@ -185,4 +191,27 @@ pub(crate) fn build_agent(
 /// Read an optional team-role route env var (empty = unset).
 fn env_route(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
+}
+
+/// Skill auto-curation is a follow-up completion after a green mutating turn.
+/// Eval cells skip it so the measured model is not billed for a curator call.
+pub(crate) fn session_curate_skills(
+    settings_on: bool,
+    env_override: bool,
+    eval_mode: bool,
+) -> bool {
+    !eval_mode && (settings_on || env_override)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_curate_skills;
+
+    #[test]
+    fn eval_disables_skill_curation() {
+        assert!(session_curate_skills(true, false, false));
+        assert!(session_curate_skills(false, true, false));
+        assert!(!session_curate_skills(true, true, true));
+        assert!(!session_curate_skills(false, false, false));
+    }
 }

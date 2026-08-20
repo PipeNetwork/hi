@@ -12,13 +12,13 @@ use crate::heuristics::{
 };
 use crate::steering::{
     BOOKKEEPING_REPOST_NUDGE, EvidenceTracker, IMPLEMENTATION_NO_CHANGES_NUDGE,
-    ImplementationIntent, ImplementationTracker, PLAN_REPOST_NUDGE, READ_AFTER_SEARCH_NUDGE,
-    READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent,
-    SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT,
-    ToolLoopGuardrail, bash_call_waits, bash_no_progress_signature, implementation_text_tool_nudge,
-    inspected_paths_for_prompt, inspection_sprawl_exhausted, inspection_sprawl_nudge,
-    is_bare_codebase_review, is_bounded_file_review, should_nudge_inspection_sprawl,
-    should_nudge_read_after_repeated_search,
+    ImplementationIntent, ImplementationTracker, MUTATION_SAFE_CONTEXT_WINDOW, PLAN_REPOST_NUDGE,
+    READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE,
+    ReviewIntent, SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_PLAN_REPOST_RESULT,
+    SKIPPED_REPEATED_CALL_RESULT, ToolLoopGuardrail, bash_call_waits, bash_no_progress_signature,
+    implementation_text_tool_nudge, inspected_paths_for_prompt, inspection_sprawl_exhausted,
+    inspection_sprawl_nudge, is_bare_codebase_review, is_bounded_file_review,
+    should_nudge_inspection_sprawl, should_nudge_read_after_repeated_search,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::WorkspaceRepairVerifier;
@@ -394,9 +394,11 @@ impl crate::Agent {
             ui.nudge(&line);
         }
 
-        let context_safety_window = read_only_intent
-            .is_some()
-            .then_some(READ_ONLY_SAFE_CONTEXT_WINDOW);
+        let context_safety_window = if read_only_intent.is_some() {
+            Some(READ_ONLY_SAFE_CONTEXT_WINDOW)
+        } else {
+            Some(MUTATION_SAFE_CONTEXT_WINDOW)
+        };
         self.elide_in_turn_context_if_needed(ui, context_safety_window);
 
         self.refresh_active_task_context(

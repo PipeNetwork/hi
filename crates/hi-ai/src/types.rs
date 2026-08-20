@@ -760,13 +760,24 @@ impl Completion {
 /// byte-based heuristic rather than a model tokenizer; provider-reported
 /// counts always win when available.
 const BYTES_PER_TOKEN: usize = 4;
+/// JSON schemas and tool-call arguments are denser than prose. Using the
+/// prose 4-byte ratio undercounts occupancy and delays compaction.
+const BYTES_PER_JSON_TOKEN: usize = 3;
 
 /// Estimate tokens from UTF-8 byte length for usage/context fallback paths.
 pub fn estimate_text_tokens(text: &str) -> u64 {
+    estimate_bytes(text, BYTES_PER_TOKEN)
+}
+
+fn estimate_json_tokens(text: &str) -> u64 {
+    estimate_bytes(text, BYTES_PER_JSON_TOKEN)
+}
+
+fn estimate_bytes(text: &str, bytes_per_token: usize) -> u64 {
     if text.is_empty() {
         0
     } else {
-        text.len().div_ceil(BYTES_PER_TOKEN) as u64
+        text.len().div_ceil(bytes_per_token) as u64
     }
 }
 
@@ -789,7 +800,7 @@ pub fn estimate_content_tokens(content: &Content) -> u64 {
             arguments,
         } => estimate_text_tokens(id)
             .saturating_add(estimate_text_tokens(name))
-            .saturating_add(estimate_text_tokens(arguments)),
+            .saturating_add(estimate_json_tokens(arguments)),
         Content::ToolResult { call_id, output } => {
             estimate_text_tokens(call_id).saturating_add(estimate_text_tokens(output))
         }
@@ -818,7 +829,7 @@ fn estimate_generated_content_tokens(content: &Content) -> u64 {
         Content::Thinking { text, .. } => estimate_text_tokens(text),
         Content::ToolCall {
             name, arguments, ..
-        } => estimate_text_tokens(name).saturating_add(estimate_text_tokens(arguments)),
+        } => estimate_text_tokens(name).saturating_add(estimate_json_tokens(arguments)),
         Content::ToolResult { output, .. } => estimate_text_tokens(output),
         Content::Image { data, .. } => estimate_text_tokens(data),
     }
@@ -840,7 +851,7 @@ pub fn estimate_tool_schema_tokens(tools: &[ToolSpec]) -> u64 {
     tools.iter().fold(0, |total, tool| {
         let tool_tokens = estimate_text_tokens(&tool.name)
             .saturating_add(estimate_text_tokens(&tool.description))
-            .saturating_add(estimate_text_tokens(&tool.parameters.to_string()));
+            .saturating_add(estimate_json_tokens(&tool.parameters.to_string()));
         total.saturating_add(tool_tokens)
     })
 }
@@ -974,7 +985,7 @@ mod tests {
             .fold(0, u64::saturating_add);
         let expected_tools = estimate_text_tokens("read")
             + estimate_text_tokens("read a file")
-            + estimate_text_tokens(&tools[0].parameters.to_string());
+            + super::estimate_json_tokens(&tools[0].parameters.to_string());
         assert_eq!(
             estimate_request_input_tokens(&messages, &tools),
             expected_messages.saturating_add(expected_tools)
@@ -988,6 +999,11 @@ mod tests {
     #[test]
     fn estimate_arithmetic_saturates_and_empty_text_is_zero() {
         assert_eq!(estimate_text_tokens(""), 0);
+        assert!(
+            super::estimate_json_tokens(r#"{"type":"object"}"#)
+                > estimate_text_tokens(r#"{"type":"object"}"#),
+            "JSON occupancy must be denser than the prose 4-byte heuristic"
+        );
         let usage = Usage {
             input_tokens: u64::MAX,
             cache_read_tokens: u64::MAX,

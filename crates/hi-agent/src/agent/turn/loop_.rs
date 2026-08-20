@@ -34,8 +34,9 @@ use crate::steering::{
 use crate::transcript::NudgeKind;
 use crate::verify::{Snapshot, WorkspaceRepairVerifier};
 use crate::{
-    AUTO_KEEP_RECENT, ReviewStatus, TaskContract, TaskIntent, ToolCallEntry, TurnOutcome,
-    TurnStatus, TurnStopReason, TurnTelemetry, Ui, VerificationMode, VerificationStatus,
+    AUTO_KEEP_RECENT, FALLBACK_CONTEXT_WINDOW, ReviewStatus, TaskContract, TaskIntent,
+    ToolCallEntry, TurnOutcome, TurnStatus, TurnStopReason, TurnTelemetry, Ui, VerificationMode,
+    VerificationStatus,
 };
 
 use super::helpers::{
@@ -383,6 +384,7 @@ impl crate::Agent {
         let goal_context = self.goal_continuation_context(&expanded_input);
         let goal_drive_turn = goal_context.is_some();
         let plan_context = self.plan_continuation_context(&expanded_input);
+        let plan_drive_turn = plan_context.is_some();
         // Charge the turn budget up front: a turn that errors out still spent
         // the time, so counting only successful turns would let a failing goal
         // run past its ceiling indefinitely.
@@ -423,8 +425,18 @@ impl crate::Agent {
         // and implementation work, where it provides useful orientation.
         let bounded_file_review =
             is_bounded_file_review(&context_task, task_contract.intent == TaskIntent::Mutation);
-        let repository_context_enabled =
-            !bounded_file_review && task_needs_repository_context(&context_task, &task_contract);
+        let targeted_named_mutation = super::super::tool_selection::targeted_named_file_mutation(
+            &context_task,
+            task_contract.intent == TaskIntent::Mutation,
+        );
+        // Goal/plan continuations name a doc (plan.md) but still need the
+        // repository map. Ordinary "write driver.py" prompts already named
+        // the files and should not pay for a 6k-char index.
+        let skip_index_for_named_edit =
+            targeted_named_mutation && !goal_drive_turn && !plan_drive_turn;
+        let repository_context_enabled = !bounded_file_review
+            && !skip_index_for_named_edit
+            && task_needs_repository_context(&context_task, &task_contract);
         let ranked_context_paths = self
             .workspace
             .last_changed_files
@@ -605,35 +617,44 @@ impl crate::Agent {
         // heavy, the configured summarizing strategy. Best-effort — a failed
         // model call just leaves the (already elided) history as-is.
         //
-        // The outer trigger uses the provider-reported `context_used` (the last
-        // request's occupancy — the most accurate signal, and only meaningful
-        // once a real request has happened, so a fresh session isn't
-        // over-eagerly compacted). Tier 2 below gates on a local token estimate
-        // instead, because `context_used` is stale by then.
-        if self.config.memory.auto_compact
-            && let Some(window) = self.config.routing.context_window
-            && window > 0
-            && self.report.context_used * 100
-                >= u64::from(window) * self.config.memory.auto_compact_percent
-        {
-            ui.status(&format!(
-                "context ~{}% full — compacting to free room",
-                self.report.context_used * 100 / u64::from(window)
-            ));
-            // Tier 1: deterministic, no model call. Only old turns are eligible.
-            if let Some(split) =
-                compaction::recent_split(self.messages.as_slice(), AUTO_KEEP_RECENT)
-                && compaction::elide_tool_outputs(self.messages.mutate_slice(), split) > 0
+        // The occupancy trigger uses provider-reported `context_used` (the last
+        // request's occupancy). That signal is only meaningful after a real
+        // request, so a fresh session is not compacted from a local estimate.
+        // When `/models` omitted a window, still stub old tool output against
+        // [`FALLBACK_CONTEXT_WINDOW`]; summarizing stays gated on the real
+        // catalog window.
+        if self.config.memory.auto_compact && self.report.context_used > 0 {
+            let real_window = self
+                .config
+                .routing
+                .context_window
+                .filter(|window| *window > 0);
+            let occupancy_window = real_window.unwrap_or(FALLBACK_CONTEXT_WINDOW);
+            if occupancy_window > 0
+                && self.report.context_used * 100
+                    >= u64::from(occupancy_window) * self.config.memory.auto_compact_percent
             {
-                self.runtime.invalidate_context_after_compaction();
+                ui.status(&format!(
+                    "context ~{}% full — compacting to free room",
+                    self.report.context_used * 100 / u64::from(occupancy_window)
+                ));
+                // Tier 1: deterministic, no model call. Only old turns are eligible.
+                if let Some(split) =
+                    compaction::recent_split(self.messages.as_slice(), AUTO_KEEP_RECENT)
+                    && compaction::elide_tool_outputs(self.messages.mutate_slice(), split) > 0
+                {
+                    self.runtime.invalidate_context_after_compaction();
+                }
+                // Tier 2: only if still heavy and we know the real window.
+                if let Some(window) = real_window {
+                    let target =
+                        u64::from(window) * self.config.memory.compact_target_percent / 100;
+                    if compaction::estimate_tokens(self.messages.as_slice()) > target {
+                        let _ = self.compact(ui).await;
+                    }
+                }
+                self.report.context_used = 0;
             }
-            // Tier 2: only if still heavy. `context_used` reflects the
-            // pre-elision request and is now stale, so gate on a local estimate.
-            let target = u64::from(window) * self.config.memory.compact_target_percent / 100;
-            if compaction::estimate_tokens(self.messages.as_slice()) > target {
-                let _ = self.compact(ui).await;
-            }
-            self.report.context_used = 0;
         }
 
         self.messages.strip_trailing_nudges();

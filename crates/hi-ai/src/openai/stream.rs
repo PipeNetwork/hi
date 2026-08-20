@@ -1367,7 +1367,7 @@ mod tests {
     use crate::provider::ProviderErrorKind;
     use crate::types::{
         ChatRequest, Completion, Content, Message, RequestProfile, StreamEvent, ToolCallChannel,
-        ToolSpec, estimate_request_input_tokens,
+        ToolSpec, estimate_completion_output_tokens, estimate_request_input_tokens,
     };
 
     /// A stream of SSE `data` strings that never ends (no `[DONE]`, socket stays
@@ -1984,16 +1984,10 @@ mod tests {
         assert_eq!(calls[0].arguments, r#"{"command":"echo hi"}"#);
         assert_eq!(calls[1].name, "read");
         assert_eq!(calls[1].arguments, r#"{"path":"a.md"}"#);
-        let net_tokens = [
-            "bash",
-            r#"{"command":"echo hi"}"#,
-            "read",
-            r#"{"path":"a.md"}"#,
-        ]
-        .into_iter()
-        .map(crate::types::estimate_text_tokens)
-        .sum::<u64>();
-        assert_eq!(completion.usage.output_tokens, net_tokens);
+        assert_eq!(
+            completion.usage.output_tokens,
+            estimate_completion_output_tokens(&completion.content)
+        );
     }
 
     #[tokio::test(start_paused = true)]

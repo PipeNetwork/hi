@@ -744,6 +744,51 @@ async fn comprehension_question_gets_repository_context() {
 }
 
 #[tokio::test]
+async fn targeted_named_mutation_skips_repository_context_index() {
+    // Named ≤4-file edits already list the files. Injecting the ranked
+    // repository index duplicates them and inflates every request.
+    let workspace = IsolatedWorkspace::new("named-mutation-no-index");
+    std::fs::write(
+        workspace.path("driver.py"),
+        "def add(a, b):\n    return a - b\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.path("host.py"), "print('host')\n").unwrap();
+    let answer = || {
+        ProviderStep::Completion(completion(
+            vec![Content::Text("Wrote driver.py.".into())],
+            1,
+            1,
+        ))
+    };
+    let (mut agent, requests) = scripted_agent(
+        vec![answer(), answer(), answer(), answer(), answer()],
+        workspace.config(),
+    );
+    let mut ui = RecUi::default();
+    let _ = agent
+        .run_turn(
+            "Write driver.py for the included host.py tool host.\n\
+             Do not rewrite host.py or the oracle.\n\
+             Do not edit bug/ yourself — only talk to host.py.",
+            &mut ui,
+        )
+        .await;
+
+    let requests = requests.lock().unwrap();
+    let request_text = requests[0]
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !request_text.contains("# Task context index"),
+        "named-file mutations must skip the repository index; first request was: {}",
+        &request_text[..request_text.len().min(1500)]
+    );
+}
+
+#[tokio::test]
 async fn repeated_decision_repost_gets_bookkeeping_nudge() {
     // The bookkeeping-repost handling covers the whole coordination family:
     // when only update_plan was withheld, the plan-fixated model slid to

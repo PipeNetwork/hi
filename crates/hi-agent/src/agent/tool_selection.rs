@@ -177,6 +177,8 @@ pub(super) fn advertised_tools_with_background(
         task_text.is_some_and(|task| targeted_single_file_mutation_task(task, mutating));
     let targeted_multi_mutation =
         task_text.is_some_and(|task| targeted_multi_file_mutation_task(task, mutating));
+    // `targeted_named_file_mutation` is the union of the two predicates above;
+    // keep the split so one-file work can still advertise `multi_edit`.
     if targeted_mutation || targeted_multi_mutation {
         // A named small-scope edit needs evidence, an edit primitive, and a
         // way to run focused validation. It does not need repository census,
@@ -421,10 +423,8 @@ fn targeted_mutation_file_count(task: &str, mutating: bool) -> Option<usize> {
         "extract into",
     ]
     .iter()
-    .any(|marker| lower.contains(marker))
-        || lower
-            .split(|character: char| !character.is_ascii_alphanumeric())
-            .any(|word| word == "port");
+    .any(|marker| contains_unnegated(&lower, marker))
+        || contains_unnegated_word(&lower, "port");
     let broad = [
         "across the repository",
         "across the codebase",
@@ -437,7 +437,7 @@ fn targeted_mutation_file_count(task: &str, mutating: bool) -> Option<usize> {
         "multifile",
     ]
     .iter()
-    .any(|marker| lower.contains(marker));
+    .any(|marker| contains_unnegated(&lower, marker));
     let file_mentions = lower
         .split(|character: char| {
             !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/'))
@@ -445,6 +445,12 @@ fn targeted_mutation_file_count(task: &str, mutating: bool) -> Option<usize> {
         .filter(|token| is_file_reference(token))
         .collect::<BTreeSet<_>>();
     (explicit && !isolation && !broad).then_some(file_mentions.len())
+}
+
+/// Whether a prompt is an explicit mutation of at most four named files.
+/// Used to skip the repository index: the prompt already named the files.
+pub(super) fn targeted_named_file_mutation(task: &str, mutating: bool) -> bool {
+    matches!(targeted_mutation_file_count(task, mutating), Some(1..=4))
 }
 
 /// Whether a prompt is an explicit, single-file mutation.
@@ -457,6 +463,68 @@ fn targeted_single_file_mutation_task(task: &str, mutating: bool) -> bool {
 /// search, or delegate when that is actually useful.
 fn targeted_multi_file_mutation_task(task: &str, mutating: bool) -> bool {
     matches!(targeted_mutation_file_count(task, mutating), Some(2..=4))
+}
+
+/// True when `needle` occurs without a negation immediately before it.
+/// "Do not rewrite host.py" must not count as isolation-shaped `rewrite`.
+fn contains_unnegated(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while from < haystack.len() {
+        let Some(rel) = haystack[from..].find(needle) else {
+            return false;
+        };
+        let start = from + rel;
+        if !negated_at(haystack, start) {
+            return true;
+        }
+        from = start + needle.len();
+    }
+    false
+}
+
+fn contains_unnegated_word(haystack: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while from < haystack.len() {
+        let Some(rel) = haystack[from..].find(word) else {
+            return false;
+        };
+        let start = from + rel;
+        let end = start + word.len();
+        let before_ok = start == 0 || !haystack.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == haystack.len()
+            || haystack
+                .as_bytes()
+                .get(end)
+                .is_some_and(|byte| !byte.is_ascii_alphanumeric());
+        if before_ok && after_ok && !negated_at(haystack, start) {
+            return true;
+        }
+        from = end.max(from + 1);
+    }
+    false
+}
+
+fn negated_at(haystack: &str, start: usize) -> bool {
+    let before = haystack[..start].trim_end();
+    let Some(token) = before.split_whitespace().next_back() else {
+        return false;
+    };
+    let token = token.trim_matches(|character: char| {
+        matches!(
+            character,
+            ',' | ';' | ':' | '"' | '\'' | '(' | ')' | '!' | '?' | '.' | '—' | '–'
+        )
+    });
+    matches!(
+        token,
+        "not" | "never" | "without" | "avoid" | "don't" | "dont" | "no" | "can't" | "cannot"
+    )
 }
 
 /// Search is an optional branch for a known-file edit. Keep its schema out of
@@ -586,7 +654,7 @@ pub(super) fn delegate_risk_relevant(task: &str) -> bool {
         "independent of",
     ]
     .iter()
-    .any(|m| lower.contains(m))
+    .any(|marker| contains_unnegated(&lower, marker))
     {
         return true;
     }
@@ -608,9 +676,7 @@ pub(super) fn delegate_risk_relevant(task: &str) -> bool {
         return true;
     }
     // Multi-module / multi-package verbs.
-    let has_port_word = lower
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|word| word == "port");
+    let has_port_word = contains_unnegated_word(&lower, "port");
     if [
         "multi-file",
         "multifile",
@@ -621,13 +687,12 @@ pub(super) fn delegate_risk_relevant(task: &str) -> bool {
         "entire package",
         "refactor",
         "migrate",
-        " port ",
         "rewrite",
         "split into",
         "extract into",
     ]
     .iter()
-    .any(|m| lower.contains(m))
+    .any(|marker| contains_unnegated(&lower, marker))
         || has_port_word
     {
         return true;
@@ -954,6 +1019,29 @@ mod tests {
         assert!(!delegate_risk_relevant(
             "Update greeting.txt and report what changed."
         ));
+        assert!(
+            !delegate_risk_relevant("Do not rewrite the parser"),
+            "negated isolation verbs must not open the broad catalog"
+        );
+        assert!(delegate_risk_relevant("rewrite the parser"));
+    }
+
+    #[test]
+    fn negated_rewrite_stays_a_targeted_named_mutation() {
+        let prompt = "Write driver.py for the included host.py tool host.\n\
+             Do not rewrite host.py or the oracle.\n\
+             Do not edit bug/ yourself — only talk to host.py.";
+        assert!(
+            targeted_named_file_mutation(prompt, true),
+            "path-scoped 'do not rewrite' must keep the lean named-file catalog"
+        );
+        assert!(
+            !targeted_named_file_mutation("rewrite src/a.rs and src/b.rs in parallel", true),
+            "an actual rewrite request must keep the broad catalog"
+        );
+        assert!(contains_unnegated("please rewrite host.py", "rewrite"));
+        assert!(!contains_unnegated("do not rewrite host.py", "rewrite"));
+        assert!(!contains_unnegated("don't migrate auth", "migrate"));
     }
 
     #[test]
@@ -1101,10 +1189,18 @@ mod tests {
             )),
             BackgroundToolAvailability::default(),
         );
+        let write_named_names = names(&write_named);
         assert!(
-            names(&write_named).contains(&"write"),
-            "write <filename> must advertise write: {:?}",
-            names(&write_named)
+            write_named_names.contains(&"write"),
+            "write <filename> must advertise write: {write_named_names:?}"
+        );
+        assert!(
+            !write_named_names.contains(&"explore"),
+            "'do not rewrite' must not open the isolation catalog: {write_named_names:?}"
+        );
+        assert!(
+            !write_named_names.contains(&"delegate"),
+            "'do not rewrite' must not open the isolation catalog: {write_named_names:?}"
         );
 
         let planned = advertised_tools_with_background(

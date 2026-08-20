@@ -300,6 +300,24 @@ impl crate::Agent {
         }
     }
 
+    /// Window used to decide when old tool output is worth stubbing. Falls back
+    /// to [`crate::FALLBACK_CONTEXT_WINDOW`] when `/models` omitted a window so
+    /// a long mutation loop still elides. Never used as the hard drop bound.
+    fn occupancy_context_window(&self, safety_window: Option<u32>) -> u32 {
+        match (
+            self.config
+                .routing
+                .context_window
+                .filter(|window| *window > 0),
+            safety_window.filter(|window| *window > 0),
+        ) {
+            (Some(configured), Some(safety)) => configured.min(safety),
+            (Some(configured), None) => configured,
+            (None, Some(safety)) => safety,
+            (None, None) => crate::FALLBACK_CONTEXT_WINDOW,
+        }
+    }
+
     fn request_estimated_tokens(&self, max_tokens: u32, request_tool_schema_tokens: u64) -> u64 {
         compaction::estimate_tokens(self.messages.as_slice())
             .saturating_add(request_tool_schema_tokens)
@@ -458,19 +476,13 @@ impl crate::Agent {
         if !self.config.memory.auto_compact {
             return;
         }
-        let window = match (self.config.routing.context_window, safety_window) {
-            (Some(configured), Some(safety)) => configured.min(safety),
-            (Some(configured), None) => configured,
-            (None, Some(safety)) => safety,
-            (None, None) => {
-                return;
-            }
-        };
+        let window = self.occupancy_context_window(safety_window);
         if window == 0 {
             return;
-        };
+        }
 
-        let used = compaction::estimate_tokens(self.messages.as_slice());
+        let used = compaction::estimate_tokens(self.messages.as_slice())
+            .saturating_add(hi_ai::estimate_tool_schema_tokens(&self.tools));
         if used * 100 < u64::from(window) * self.config.memory.in_turn_elide_percent {
             return;
         }
