@@ -24,6 +24,7 @@ mod goal_report;
 mod landing;
 mod learning_ledger;
 mod local_runtime;
+mod mcp_host;
 mod orchestration;
 mod orchestration_benchmark;
 mod orchestration_metrics;
@@ -586,6 +587,9 @@ async fn run() -> Result<()> {
     };
 
     startup_trace!("agent built");
+    if let Some(mcp) = mcp_host::connect_workspace_mcp(&workspace_root).await {
+        agent.attach_mcp(mcp);
+    }
     if let Some(runtime) = &startup_local_runtime {
         agent.register_driver_local_server(
             runtime.base_url.clone(),

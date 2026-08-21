@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["answer.txt"]
+name = "inspect-before-ask"
+prompt = """How does quality_marker_fn work? Inspect the local source yourself. Write one sentence that includes the helper's docstring token to answer.txt. Do not ask the user and do not use the web."""
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "p=open('answer.txt').read(); assert 'QUALITY_ZX9_DOCSTRING' in p"'''

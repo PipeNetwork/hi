@@ -722,6 +722,12 @@ impl crate::Agent {
         arguments: &str,
         ui: &mut dyn crate::Ui,
     ) -> hi_tools::ToolOutcome {
+        if !self.config.memory.offer_ask_user {
+            return decision_tool_outcome(
+                "Error: ask_user is unavailable in eval/noninteractive runs — do not ask; inspect the workspace and continue".to_string(),
+                hi_tools::ToolStatus::Failed,
+            );
+        }
         #[derive(serde::Deserialize)]
         struct AskArgs {
             question: String,

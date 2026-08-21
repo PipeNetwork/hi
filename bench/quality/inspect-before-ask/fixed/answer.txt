@@ -1,0 +1,1 @@
+QUALITY_ZX9_DOCSTRING: marker helper returns the fixture token.

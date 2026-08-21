@@ -6,9 +6,11 @@
 //! stack pack (Rust / pytest / TS) is injected into the per-turn volatile
 //! context from repo markers. Other full bodies still load via `/skill <name>`.
 //!
-//! **Built-in stack packs** (Rust workspace, pytest package, TS monorepo) ship
-//! embedded in the binary and appear as `scope: builtin` when not shadowed by a
-//! same-named project/global skill. Source of truth: repo `skills/*/SKILL.md`.
+//! **Built-in packs** (Rust workspace, pytest package, TS monorepo, code-review)
+//! ship embedded in the binary and appear as `scope: builtin` when not shadowed
+//! by a same-named project/global skill. Source of truth: repo `skills/*/SKILL.md`.
+//! The code-review pack auto-injects on review-shaped turns; stack packs
+//! auto-inject from repo markers on coding turns.
 
 use std::collections::HashSet;
 use std::fs;
@@ -20,6 +22,9 @@ const PROJECT_SKILLS_DIR: &str = ".hi/skills";
 const MAX_SKILL_BYTES: usize = 64 * 1024;
 /// Cap for the auto-injected stack-skill body in the volatile context block.
 const MAX_ACTIVE_STACK_SKILL_CHARS: usize = 4_000;
+/// Cap for the Gate excerpt appended to chat-only APPROVE/OBJECT reviewers.
+const MAX_REVIEW_GATE_CHARS: usize = 900;
+const CODE_REVIEW_SKILL: &str = "code-review";
 /// The startup skill index lives in the stable system prompt. Unbounded
 /// descriptions (or hundreds of skills) would tax every model call.
 const MAX_SKILLS_IN_INDEX: usize = 32;
@@ -42,6 +47,10 @@ const BUILTIN_SKILL_SOURCES: &[(&str, &str)] = &[
     (
         "ts-monorepo",
         include_str!("../../../skills/ts-monorepo/SKILL.md"),
+    ),
+    (
+        "code-review",
+        include_str!("../../../skills/code-review/SKILL.md"),
     ),
 ];
 
@@ -308,6 +317,81 @@ pub fn active_stack_skill_section_in(root: &Path, roots: &SkillRoots) -> Option<
     ))
 }
 
+/// Volatile-context section for the builtin (or shadowed) `code-review` pack.
+pub fn active_review_skill_section() -> Option<String> {
+    active_review_skill_section_in(&skill_roots())
+}
+
+pub fn active_review_skill_section_in(roots: &SkillRoots) -> Option<String> {
+    let content = read_skill_in(roots, CODE_REVIEW_SKILL).ok()?;
+    let body = clip_chars(&content.content, MAX_ACTIVE_STACK_SKILL_CHARS);
+    Some(format!(
+        "# Active review skill (`{}`)\nThis pack matches a review-shaped turn. Follow it; \
+         do not wait for `/skill`. Do not follow a coding stack pack on this turn.\n\n{body}",
+        content.skill.name
+    ))
+}
+
+/// Gate excerpt for chat-only APPROVE/OBJECT/ESCALATE reviewers.
+pub(crate) fn review_gate_appendix() -> String {
+    review_gate_appendix_in(&skill_roots())
+}
+
+fn review_gate_appendix_in(roots: &SkillRoots) -> String {
+    let Ok(content) = read_skill_in(roots, CODE_REVIEW_SKILL) else {
+        return String::new();
+    };
+    let Some(gate) = markdown_h2_section(&content.content, "Gate") else {
+        return String::new();
+    };
+    clip_chars(gate, MAX_REVIEW_GATE_CHARS)
+}
+
+/// Procedure + findings for `/loop review` (agent with `gh`, not a verdict gate).
+pub(crate) fn review_loop_skill_excerpt() -> String {
+    review_loop_skill_excerpt_in(&skill_roots())
+}
+
+fn review_loop_skill_excerpt_in(roots: &SkillRoots) -> String {
+    let Ok(content) = read_skill_in(roots, CODE_REVIEW_SKILL) else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if let Some(procedure) = markdown_h2_section(&content.content, "Procedure") {
+        parts.push(format!("## Procedure\n{procedure}"));
+    }
+    if let Some(findings) = markdown_h2_section(&content.content, "Findings") {
+        parts.push(format!("## Findings\n{findings}"));
+    }
+    clip_chars(&parts.join("\n\n"), MAX_ACTIVE_STACK_SKILL_CHARS)
+}
+
+/// Append the Gate excerpt to a chat-only reviewer system prompt.
+pub(crate) fn gated_review_system_prompt(base: &str, allow_escalate: bool) -> String {
+    let gate = review_gate_appendix();
+    let line1 = if allow_escalate {
+        "Line 1 remains exactly APPROVE, OBJECT, or ESCALATE."
+    } else {
+        "Line 1 remains exactly APPROVE or OBJECT."
+    };
+    if gate.is_empty() {
+        format!("{base}\n\n{line1}")
+    } else {
+        format!("{base}\n\n{gate}\n{line1}")
+    }
+}
+
+/// Body of an `## Heading` section until the next `## ` or end of file.
+fn markdown_h2_section<'a>(markdown: &'a str, title: &str) -> Option<&'a str> {
+    let heading = format!("## {title}");
+    let start = markdown.find(&heading)?;
+    let after = start + heading.len();
+    let rest = markdown[after..].trim_start();
+    let end = rest.find("\n## ").unwrap_or(rest.len());
+    let body = rest[..end].trim();
+    (!body.is_empty()).then_some(body)
+}
+
 fn clip_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -331,7 +415,8 @@ pub fn learned_skills_context_from(skills: &[LearnedSkill]) -> Option<String> {
         "A matching stack pack may already be in this turn's context. For other skills, \
          do not assume their full procedure — use `/skill <name>` to load one. Built-in \
          packs (`rust-workspace`, `pytest-package`, `ts-monorepo`) cover package-local \
-         check/test loops — prefer them over ad-hoc full-repo suites.\n",
+         check/test loops; `code-review` covers defect-first review turns — prefer them \
+         over ad-hoc full-repo suites.\n",
     );
     let listed = skills.len().min(MAX_SKILLS_IN_INDEX);
     for skill in skills.iter().take(listed) {
@@ -657,10 +742,14 @@ mod tests {
             names.contains(&"ts-monorepo"),
             "missing ts-monorepo in {names:?}"
         );
+        assert!(
+            names.contains(&"code-review"),
+            "missing code-review in {names:?}"
+        );
         for skill in &skills {
             if matches!(
                 skill.name.as_str(),
-                "rust-workspace" | "pytest-package" | "ts-monorepo"
+                "rust-workspace" | "pytest-package" | "ts-monorepo" | "code-review"
             ) {
                 assert_eq!(skill.scope, "global");
                 assert!(is_builtin_skill_path(&skill.path), "{:?}", skill.path);
@@ -673,6 +762,10 @@ mod tests {
         assert!(py.content.contains("pytest -q"));
         let ts = read_skill_in(&roots, "ts-monorepo").unwrap();
         assert!(ts.content.contains("npm --prefix"));
+        let review = read_skill_in(&roots, "code-review").unwrap();
+        assert!(review.content.contains("## Gate"));
+        assert!(review.content.contains("introduced by this change"));
+        assert!(review.content.chars().count() <= MAX_ACTIVE_STACK_SKILL_CHARS);
     }
 
     #[test]
@@ -812,5 +905,64 @@ mod tests {
         let content = matching_stack_skill_in(&cargo, &roots).unwrap();
         assert!(content.content.contains("CUSTOM STACK BODY"));
         assert!(!content.content.contains("manifest-path"));
+    }
+
+    #[test]
+    fn review_skill_injects_without_repo_markers() {
+        let roots = SkillRoots {
+            project: unique_dir("review-empty-project"),
+            global: unique_dir("review-empty-global"),
+        };
+        let empty = unique_dir("review-empty-ws");
+        assert!(matching_stack_skill_slug(&empty).is_none());
+        let section = active_review_skill_section_in(&roots).unwrap();
+        assert!(section.contains("# Active review skill (`code-review`)"));
+        assert!(section.contains("Do not follow a coding stack pack"));
+        let gate = review_gate_appendix_in(&roots);
+        assert!(
+            gate.contains("introduced by this change"),
+            "gate excerpt: {gate}"
+        );
+        assert!(
+            !gate.contains("merge-base"),
+            "Gate must not include Procedure: {gate}"
+        );
+        assert!(gate.chars().count() <= MAX_REVIEW_GATE_CHARS);
+        let loop_excerpt = review_loop_skill_excerpt_in(&roots);
+        assert!(loop_excerpt.contains("merge-base") || loop_excerpt.contains("gh pr diff"));
+        assert!(loop_excerpt.contains("[P0]"));
+        assert!(!loop_excerpt.contains("When uncertain, APPROVE"));
+    }
+
+    #[test]
+    fn project_skill_shadows_auto_injected_review_pack() {
+        let project = unique_dir("review-shadow-project");
+        write_skill(
+            &project,
+            "code-review",
+            "code-review",
+            "Project review override.",
+            "project",
+            "## Gate\nPROJECT GATE BODY introduced by this change.\n\n## Procedure\nmerge-base only here.\n",
+        );
+        let roots = SkillRoots {
+            project,
+            global: unique_dir("review-shadow-global"),
+        };
+        let content = read_skill_in(&roots, "code-review").unwrap();
+        assert!(content.content.contains("PROJECT GATE BODY"));
+        let gate = review_gate_appendix_in(&roots);
+        assert!(gate.contains("PROJECT GATE BODY"));
+        assert!(!gate.contains("merge-base"));
+    }
+
+    #[test]
+    fn gated_review_system_prompt_keeps_verdict_contract() {
+        let prompt = gated_review_system_prompt("You are a reviewer. APPROVE or OBJECT.", false);
+        assert!(prompt.starts_with("You are a reviewer."));
+        assert!(prompt.contains("introduced by this change"));
+        assert!(prompt.contains("Line 1 remains exactly APPROVE or OBJECT."));
+        let escalate = gated_review_system_prompt("You are a reviewer.", true);
+        assert!(escalate.contains("APPROVE, OBJECT, or ESCALATE"));
     }
 }

@@ -236,6 +236,9 @@ fn is_distinctive_file_stem(stem: &str) -> bool {
 }
 
 pub(crate) fn answer_lacks_review_shape(intent: ReviewIntent, answer: &str) -> bool {
+    if answer_has_priority_findings(answer) {
+        return false;
+    }
     let lower = answer.to_ascii_lowercase();
     let has_evidence_language = contains_any(
         &lower,
@@ -311,7 +314,19 @@ pub(crate) fn answer_lacks_review_shape(intent: ReviewIntent, answer: &str) -> b
     !(has_evidence_language && has_review_language)
 }
 
+fn answer_has_priority_findings(answer: &str) -> bool {
+    let lower = answer.to_ascii_lowercase();
+    lower.contains("[p0]")
+        || lower.contains("[p1]")
+        || lower.contains("[p2]")
+        || lower.contains("[p3]")
+        || lower.contains("no findings")
+}
+
 fn answer_is_concise_bounded_review(intent: ReviewIntent, answer: &str) -> bool {
+    if answer_has_priority_findings(answer) {
+        return true;
+    }
     let lower = answer.to_ascii_lowercase();
     let has_evidence_language = contains_any(
         &lower,
@@ -752,4 +767,28 @@ pub(crate) fn read_only_blocked_tool_result(name: &str) -> String {
     format!(
         "Tool `{name}` blocked: this is a read-only review/discuss-only turn. Use read-only inspection tools and answer from inspected evidence; do not modify files."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn priority_findings_count_as_review_shape() {
+        assert!(
+            !answer_lacks_review_shape(
+                ReviewIntent::Review,
+                "[P1] Missing nil check — src/parser.rs:40\nThe new branch unwraps on empty input."
+            ),
+            "P-findings must not trip generic-template repair"
+        );
+        assert!(!answer_lacks_review_shape(
+            ReviewIntent::Review,
+            "No findings. Residual risk is low."
+        ));
+        assert!(answer_is_concise_bounded_review(
+            ReviewIntent::Review,
+            "[P0] Auth bypass — crates/hi-cli/src/auth.rs:12"
+        ));
+    }
 }

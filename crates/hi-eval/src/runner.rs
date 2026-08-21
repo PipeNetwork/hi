@@ -245,6 +245,10 @@ pub fn run_candidate(
     let fixture = task_dir.join("fixture");
     copy_dir(&fixture, &work)?;
     initialize_workspace(&work, task)?;
+    let harness_run = harness_run_config(task_dir);
+    if harness_run.init_git {
+        seed_eval_git(&work, &harness_run)?;
+    }
     let before = directory_snapshot(&work)?;
     let report_path = work.join(".hi-eval-report.json");
 
@@ -264,7 +268,6 @@ pub fn run_candidate(
         .filter(|&n| n >= 1)
         .unwrap_or(25);
     let session = work.join(".hi-eval-session.jsonl");
-    let harness_run = harness_run_config(task_dir);
     let resume_steps = harness_resume_steps(&harness_run);
     let persist_session = turns > 1 || !resume_steps.is_empty() || harness_run.needs_session();
     if harness_run.needs_seed() {
@@ -710,6 +713,10 @@ struct HarnessRunConfig {
     seed_image_chars: Option<u64>,
     seed_tool_result_chars: Option<u64>,
     ignore_change_prefixes: Vec<String>,
+    init_git: bool,
+    git_branch: String,
+    git_origin: String,
+    git_commit_message: String,
 }
 
 impl HarnessRunConfig {
@@ -726,7 +733,7 @@ impl HarnessRunConfig {
     /// Any `[run]` content counts as explicit so HI_EVAL_RESUME cannot
     /// override a task that only set ignore_change_prefixes.
     fn has_explicit_run(&self) -> bool {
-        self.needs_session() || !self.ignore_change_prefixes.is_empty()
+        self.needs_session() || !self.ignore_change_prefixes.is_empty() || self.init_git
     }
 }
 
@@ -740,6 +747,10 @@ fn harness_run_config(task_dir: &Path) -> HarnessRunConfig {
             seed_image_chars: rules.run.seed_image_chars,
             seed_tool_result_chars: rules.run.seed_tool_result_chars,
             ignore_change_prefixes: rules.run.ignore_change_prefixes,
+            init_git: rules.run.init_git,
+            git_branch: rules.run.git_branch,
+            git_origin: rules.run.git_origin,
+            git_commit_message: rules.run.git_commit_message,
         })
         .unwrap_or_default();
     if from_file.has_explicit_run() {
@@ -881,6 +892,54 @@ pub(crate) fn initialize_workspace(work: &Path, task: &Task) -> Result<()> {
                 .expect("validated dirty contents"),
         )?;
     }
+    Ok(())
+}
+
+fn seed_eval_git(work: &Path, cfg: &HarnessRunConfig) -> Result<()> {
+    let branch = cfg.git_branch.trim();
+    let branch = if branch.is_empty() { "main" } else { branch };
+    let message = cfg.git_commit_message.trim();
+    let message = if message.is_empty() {
+        "seed: quality fixture"
+    } else {
+        message
+    };
+    let origin = cfg.git_origin.trim();
+    if origin.is_empty() {
+        anyhow::bail!("[run] init_git requires git_origin");
+    }
+
+    let git = |args: &[&str]| -> Result<()> {
+        let mut command = Command::new("git");
+        command
+            .current_dir(work)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .args(args);
+        let output = command_output_with_timeout(&mut command, Duration::from_secs(30))?;
+        if !output.success() {
+            anyhow::bail!(
+                "seeding eval git workspace ({args:?}): {}",
+                output_summary(&output)
+            );
+        }
+        Ok(())
+    };
+
+    git(&["init", "-q", "-b", branch])?;
+    git(&["add", "-A"])?;
+    git(&[
+        "-c",
+        "user.name=hi-eval",
+        "-c",
+        "user.email=hi-eval@example.invalid",
+        "commit",
+        "-qm",
+        message,
+    ])?;
+    git(&["remote", "add", "origin", origin])?;
     Ok(())
 }
 
@@ -1911,6 +1970,43 @@ exit 0
             "VALUE = 0\n"
         );
         let _ = std::fs::remove_dir_all(fixture);
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn seed_eval_git_commits_fixture_and_sets_origin() {
+        let work = crate::artifacts::make_workdir().unwrap();
+        std::fs::write(work.join("README"), "quality\n").unwrap();
+        super::seed_eval_git(
+            &work,
+            &super::HarnessRunConfig {
+                init_git: true,
+                git_branch: "main".into(),
+                git_origin: "https://github.com/example-org/quality-fixture.git".into(),
+                git_commit_message: "seed: quality-zx9-fixture".into(),
+                ..super::HarnessRunConfig::default()
+            },
+        )
+        .unwrap();
+        let origin = std::process::Command::new("git")
+            .args(["config", "--get", "remote.origin.url"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        assert!(origin.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&origin.stdout).trim(),
+            "https://github.com/example-org/quality-fixture.git"
+        );
+        let subject = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&subject.stdout).trim(),
+            "seed: quality-zx9-fixture"
+        );
         let _ = std::fs::remove_dir_all(work);
     }
 }

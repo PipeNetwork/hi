@@ -29,6 +29,7 @@ pub struct TimedOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
+    pub timeout_process_snapshot: Option<String>,
 }
 
 impl TimedOutput {
@@ -60,6 +61,7 @@ pub fn command_output_with_timeout(
     let stdout_reader = std::thread::spawn(move || read_process_output(stdout));
     let stderr_reader = std::thread::spawn(move || read_process_output(stderr));
     let mut timed_out = false;
+    let mut timeout_process_snapshot = None;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -67,8 +69,11 @@ pub fn command_output_with_timeout(
         if started.elapsed() >= timeout {
             timed_out = true;
             #[cfg(unix)]
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            {
+                timeout_process_snapshot = Some(process_group_snapshot(child.id()));
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
             }
             let _ = child.kill();
             break child.wait()?;
@@ -90,7 +95,40 @@ pub fn command_output_with_timeout(
         stdout,
         stderr,
         timed_out,
+        timeout_process_snapshot,
     })
+}
+
+#[cfg(unix)]
+fn process_group_snapshot(pgid: u32) -> String {
+    const MAX_CHARS: usize = 4_000;
+    let output = Command::new("ps")
+        .args(["-axo", "pid,ppid,pgid,stat,etime,command"])
+        .output();
+    let Ok(output) = output else {
+        return format!("(ps failed for pgid {pgid})");
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let pgid_s = pgid.to_string();
+    let mut kept = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if i == 0 {
+            kept.push(line.to_string());
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let Some(_) = cols.next() else { continue };
+        let Some(_) = cols.next() else { continue };
+        if cols.next() == Some(pgid_s.as_str()) {
+            kept.push(line.to_string());
+        }
+    }
+    let mut joined = kept.join("\n");
+    if joined.chars().count() > MAX_CHARS {
+        joined = joined.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+        joined.push('…');
+    }
+    joined
 }
 
 fn read_process_output(mut reader: impl io::Read) -> Vec<u8> {
@@ -1688,6 +1726,11 @@ command = "test -f file.txt"
         let output = command_output_with_timeout(&mut command, Duration::from_millis(25)).unwrap();
         assert!(output.timed_out);
         assert!(!output.success());
+        let snapshot = output.timeout_process_snapshot.unwrap_or_default();
+        assert!(
+            snapshot.contains("sleep") || snapshot.contains("PID"),
+            "timeout should snapshot the process group before SIGKILL, got: {snapshot}"
+        );
     }
 
     #[test]

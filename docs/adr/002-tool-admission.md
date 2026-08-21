@@ -76,7 +76,7 @@ not tools.
 | `edit` / `apply_patch` | **Admit** — reliability + confirmable mutations |
 | `bash` | **Admit** + protect — human-protocol escape hatch |
 | `repo_map` / `find_symbol` | **Admit** only while structure/speed beats `list`/`grep`; keep dynamic |
-| `use_tool` / `search_tool` (MCP) | **Admit** inject-only — external systems, never floor |
+| `use_tool` / `search_tool` (MCP) | **Admit** inject-only — external systems, never floor. Wired when `.hi/mcp/*.json` connects; two gateway schemas, not per-tool dump |
 | `browser_click` for coding-core | **Reject** — new protocol surface; not the coding job |
 | `delegate` / `explore` / `task` | **Admit** inject — isolation/verify are not one shell command |
 

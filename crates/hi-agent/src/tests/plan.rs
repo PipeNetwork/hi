@@ -1085,6 +1085,31 @@ async fn new_task_without_update_plan_keeps_stale_pin() {
 }
 
 #[tokio::test]
+async fn ask_user_fails_closed_when_not_offered() {
+    let mut cfg = config();
+    cfg.memory.offer_ask_user = false;
+    let mut agent = agent(Vec::new(), cfg);
+    let mut ui = RecUi::default();
+    let out = agent
+        .handle_ask_user(
+            r#"{"question":"REST or gRPC for the public API?"}"#,
+            &mut ui,
+        )
+        .await;
+    assert_eq!(out.status, hi_tools::ToolStatus::Failed);
+    assert!(
+        out.content.contains("unavailable"),
+        "eval/report must fail-close ask_user: {}",
+        out.content
+    );
+    assert!(
+        ui.ask_user_questions.is_empty(),
+        "no overlay in eval: {:?}",
+        ui.ask_user_questions
+    );
+}
+
+#[tokio::test]
 async fn ask_user_rejects_continue_and_caps_at_one() {
     let mut agent = agent(Vec::new(), config());
     let mut ui = RecUi::default();

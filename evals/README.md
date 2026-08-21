@@ -37,6 +37,8 @@ Live (optional): `HI_MODEL=… cargo run -p hi-eval -- bench/harness --configs=v
 Set `HI_STATE_DIR` so process/budget fails append `harness_process` /
 `harness_budget` findings. See `bench/harness/README.md`. The Monday
 scheduled workflow runs this as its own job, not mixed with `bench/tasks`.
+`bench/quality` is a third job (`evaluate-quality`) vs
+`eval-baseline/quality.json` — first-tool routing, `--configs=baseline`.
 
 ## Hygiene profile
 

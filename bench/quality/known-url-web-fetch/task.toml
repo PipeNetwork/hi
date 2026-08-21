@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["answer.txt"]
+name = "known-url-web-fetch"
+prompt = """Fetch https://example.com/ at that exact URL. Do not search the web and do not ask the user. Write the page's main heading to answer.txt as the only line."""
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "p=open('answer.txt').read().lower(); assert 'example domain' in p"'''

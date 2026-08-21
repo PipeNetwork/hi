@@ -8,6 +8,9 @@ cd "$ROOT"
 
 echo "hi-eval judge --suite bench/harness"
 cargo run -q -p hi-eval -- judge --suite bench/harness
+echo "hi-eval judge --suite bench/quality"
+cargo run -q -p hi-eval -- judge --suite bench/quality
+# Live quality rates: scripts/check_quality_regression.sh artifacts/quality
 
 SUMMARY=${1:-}
 BASELINE=${2:-eval-baseline/harness.json}

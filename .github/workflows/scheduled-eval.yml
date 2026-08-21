@@ -92,3 +92,45 @@ jobs:
           path: artifacts/harness
           if-no-files-found: error
           retention-days: 90
+
+  # First-tool routing. Separate summary so quality process_pass_rate cannot
+  # be averaged with harness process/budget or SWE solve_rate.
+  evaluate-quality:
+    name: quality first-tool routing
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build core binaries
+        run: cargo build --release -p hi -p hi-eval
+
+      - name: Run quality suite (baseline, one trial)
+        env:
+          HI_BIN: target/release/hi
+          HI_MODEL: ${{ vars.HI_EVAL_MODEL }}
+          HI_API_KEY: ${{ secrets.HI_EVAL_API_KEY }}
+          HI_BASE_URL: ${{ vars.HI_EVAL_BASE_URL }}
+          HI_STATE_DIR: ${{ runner.temp }}/hi-state
+          HI_EVAL_CONCURRENCY: "2"
+        run: >-
+          target/release/hi-eval bench/quality
+          --trials=1
+          --configs=baseline
+          --artifacts=artifacts/quality
+
+      - name: Enforce quality process/budget gates
+        run: scripts/check_quality_regression.sh artifacts/quality eval-baseline/quality.json
+
+      - name: Upload quality artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-eval-${{ github.run_id }}
+          path: artifacts/quality
+          if-no-files-found: error
+          retention-days: 90

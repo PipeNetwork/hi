@@ -142,7 +142,10 @@ impl crate::Agent {
             user_turn: false,
             canonical_objective: None,
             messages: Arc::new(vec![
-                Message::system(TRIO_REVIEW_PROMPT),
+                Message::system(crate::skills::gated_review_system_prompt(
+                    TRIO_REVIEW_PROMPT,
+                    false,
+                )),
                 Message::user(context),
             ]),
             tools: Arc::new([]),
@@ -263,6 +266,14 @@ mod tests {
             SkepticVerdict::Approve
         );
         assert_eq!(parse_trio_verdict("**APPROVE**"), SkepticVerdict::Approve);
+    }
+
+    #[test]
+    fn trio_review_system_prompt_includes_gate() {
+        let prompt = crate::skills::gated_review_system_prompt(TRIO_REVIEW_PROMPT, false);
+        assert!(prompt.contains("Bias strongly toward APPROVE"));
+        assert!(prompt.contains("introduced by this change"));
+        assert!(prompt.contains("Line 1 remains exactly APPROVE or OBJECT."));
     }
 
     #[test]

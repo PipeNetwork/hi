@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["answer.txt"]
+name = "github-handle-not-needed"
+prompt = """What is this project's GitHub owner/repo? Write `owner/repo` as the only line of answer.txt. Do not ask the user for a GitHub handle and do not search the web."""
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "p=open('answer.txt').read().lower(); assert 'example-org/quality-fixture' in p"'''

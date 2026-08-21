@@ -135,16 +135,16 @@ fn verify_ran_test_stage(executions: &[crate::VerificationExecution]) -> bool {
 impl crate::Agent {
     pub(crate) async fn independent_review(&mut self, context: &str) -> SkepticVerdict {
         let model = self.effective_skeptic_model().to_string();
-        self.review_with_prompt(context, INDEPENDENT_REVIEW_PROMPT, model)
-            .await
+        let system = crate::skills::gated_review_system_prompt(INDEPENDENT_REVIEW_PROMPT, false);
+        self.review_with_prompt(context, &system, model).await
     }
 
     /// Phase L large-diff skeptic — same transport/fail-open as independent
     /// review, with a prompt tuned for multi-file holes after green verify.
     pub(crate) async fn large_diff_review(&mut self, context: &str) -> SkepticVerdict {
         let model = self.effective_skeptic_model().to_string();
-        self.review_with_prompt(context, LARGE_DIFF_REVIEW_PROMPT, model)
-            .await
+        let system = crate::skills::gated_review_system_prompt(LARGE_DIFF_REVIEW_PROMPT, false);
+        self.review_with_prompt(context, &system, model).await
     }
     /// Run the skeptic gate against `sub_goal` (the sub-goal that was active at
     /// turn start — the current one may already be marked done via update_plan).
@@ -324,8 +324,8 @@ impl crate::Agent {
     /// `ReviewStatus::Unavailable`).
     async fn skeptic_review(&mut self, context: &str) -> SkepticVerdict {
         let model = self.effective_skeptic_model().to_string();
-        self.review_with_prompt(context, SKEPTIC_PROMPT, model)
-            .await
+        let system = crate::skills::gated_review_system_prompt(SKEPTIC_PROMPT, true);
+        self.review_with_prompt(context, &system, model).await
     }
 
     async fn review_with_prompt(
@@ -710,6 +710,18 @@ mod tests {
             LARGE_DIFF_REVIEW_PROMPT.contains("LARGE"),
             "should mark large-diff context"
         );
+        let gated = crate::skills::gated_review_system_prompt(LARGE_DIFF_REVIEW_PROMPT, false);
+        assert!(
+            gated.contains("introduced by this change"),
+            "completion review must include the code-review Gate: {gated}"
+        );
+        assert!(
+            gated.contains("Line 1 remains exactly APPROVE or OBJECT."),
+            "{gated}"
+        );
+        let skeptic = crate::skills::gated_review_system_prompt(SKEPTIC_PROMPT, true);
+        assert!(skeptic.contains("APPROVE, OBJECT, or ESCALATE"));
+        assert!(skeptic.contains("introduced by this change"));
     }
 
     #[test]

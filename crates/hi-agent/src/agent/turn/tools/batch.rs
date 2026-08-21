@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 use futures_util::StreamExt;
 use hi_tools::protocol::{
-    execute_in_runtime_shared, execute_prepared_in_runtime, execute_streaming_in_runtime,
+    execute_in_runtime_shared_with, execute_prepared_in_runtime, execute_streaming_in_runtime,
     prepare_mutation_in_with_state,
 };
 
@@ -1478,6 +1478,7 @@ impl crate::Agent {
                     let background = self.runtime.background();
                     let read_cache = self.runtime.read_cache();
                     let repo_map = self.runtime.repo_map_arc();
+                    let mcp = self.mcp.clone();
                     let calls = &calls;
                     async move {
                         let output = if let Some(failure) = failure {
@@ -1485,13 +1486,14 @@ impl crate::Agent {
                         } else if let Some(prepared) = prepared {
                             execute_prepared_in_runtime(lsp, read_cache, prepared).await
                         } else {
-                            execute_in_runtime_shared(
+                            execute_in_runtime_shared_with(
                                 root,
                                 state_root,
                                 lsp,
                                 background,
                                 read_cache,
                                 &repo_map,
+                                mcp.as_deref(),
                                 &calls[i].1,
                                 &calls[i].2,
                             )

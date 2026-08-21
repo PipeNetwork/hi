@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -30,6 +31,16 @@ pub struct RunRules {
     /// Workspace-relative prefixes restored from fixture/ before the oracle
     /// and dropped from `allowed_changes` (inner-task side effects, e.g. `bug/`).
     pub ignore_change_prefixes: Vec<String>,
+    /// Live-only: `git init` the workdir, commit the fixture, and set origin.
+    /// Replay ignores this. Lets quality rows inject repo identity without
+    /// committing a nested `.git`.
+    pub init_git: bool,
+    /// Branch created by `init_git` (default `main` when empty).
+    pub git_branch: String,
+    /// `remote.origin.url` set by `init_git`. Required when `init_git` is set.
+    pub git_origin: String,
+    /// Initial commit subject for `init_git` (default `seed: quality fixture`).
+    pub git_commit_message: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -45,6 +56,13 @@ pub struct ProcessRules {
     /// Mutate tools (`edit`/`write`/`apply_patch`/…) must not target these
     /// prefixes. Reads and inner-host edits are allowed.
     pub forbid_path_prefixes: Vec<String>,
+    /// First `telemetry.tool_timeline` entry's tool name must be one of these
+    /// (any-of). Empty skips the rule. Empty timeline fails with `got = "none"`.
+    pub require_first_tools: Vec<String>,
+    /// If set, the first timeline entry must be `bash` whose `command` matches.
+    /// Empty skips the rule. Compiled at [`load_rules`]; prefix-oriented
+    /// because bash `command` is truncated at 240 chars in the tape.
+    pub require_first_command_regex: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -88,7 +106,20 @@ impl JudgeReport {
 pub fn load_rules(path: &Path) -> Result<JudgeRules> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading judge rules {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    let rules: JudgeRules =
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    compile_first_command_regex(&rules.process.require_first_command_regex)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(rules)
+}
+
+fn compile_first_command_regex(pattern: &str) -> Result<Option<Regex>> {
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+    Regex::new(pattern)
+        .with_context(|| format!("invalid process.require_first_command_regex {pattern:?}"))
+        .map(Some)
 }
 
 pub fn judge_report(report: &Value, rules: &JudgeRules) -> JudgeReport {
@@ -254,6 +285,47 @@ fn judge_process(report: &Value, rules: &ProcessRules, violations: &mut Vec<Judg
                 rule: "process.require_output_slice".into(),
                 got: "driver.py does not slice tool output".into(),
             });
+        }
+    }
+    if !rules.require_first_tools.is_empty() {
+        let first = tools(report).next();
+        let name = first.map(tool_name).unwrap_or("none");
+        if !rules
+            .require_first_tools
+            .iter()
+            .any(|allowed| allowed == name)
+        {
+            violations.push(JudgeViolation {
+                rule: "process.require_first_tools".into(),
+                got: name.to_string(),
+            });
+        }
+    }
+    if !rules.require_first_command_regex.is_empty() {
+        match compile_first_command_regex(&rules.require_first_command_regex) {
+            Ok(Some(re)) => {
+                let first = tools(report).next();
+                let name = first.map(tool_name).unwrap_or("none");
+                let command = first
+                    .and_then(|entry| entry.get("command"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if name != "bash" || !re.is_match(command) {
+                    violations.push(JudgeViolation {
+                        rule: "process.require_first_command_regex".into(),
+                        got: if name == "bash" {
+                            command.to_string()
+                        } else {
+                            name.to_string()
+                        },
+                    });
+                }
+            }
+            Ok(None) => {}
+            Err(err) => violations.push(JudgeViolation {
+                rule: "process.require_first_command_regex".into(),
+                got: err.to_string(),
+            }),
         }
     }
 }
@@ -841,5 +913,167 @@ seed_image_chars = 2000000
         .unwrap();
         assert_eq!(rules.run.steps, vec![3, 8]);
         assert_eq!(rules.run.seed_image_chars, Some(2_000_000));
+    }
+
+    fn first_tool_rules() -> JudgeRules {
+        JudgeRules {
+            process: ProcessRules {
+                require_first_tools: vec![
+                    "read".into(),
+                    "grep".into(),
+                    "glob".into(),
+                    "find_symbol".into(),
+                    "repo_map".into(),
+                ],
+                forbid_tools: vec!["web_search".into(), "ask_user".into()],
+                ..ProcessRules::default()
+            },
+            ..JudgeRules::default()
+        }
+    }
+
+    #[test]
+    fn require_first_tools_accepts_grep() {
+        let report = json!({
+            "telemetry": {
+                "tool_timeline": [
+                    {"tool": "grep", "path": "src/marker.py"},
+                    {"tool": "write", "path": "answer.txt"}
+                ]
+            }
+        });
+        assert!(judge_report(&report, &first_tool_rules()).ok());
+    }
+
+    #[test]
+    fn require_first_tools_rejects_wrong_first_tool() {
+        let report = json!({
+            "telemetry": {
+                "tool_timeline": [
+                    {"tool": "web_search"},
+                    {"tool": "grep", "path": "src/marker.py"}
+                ]
+            }
+        });
+        let judged = judge_report(&report, &first_tool_rules());
+        assert_eq!(judged.process, JudgeVerdict::Fail);
+        assert!(
+            judged
+                .violations
+                .iter()
+                .any(|v| v.rule == "process.require_first_tools" && v.got == "web_search"),
+            "{:?}",
+            judged.violations
+        );
+        assert!(
+            judged
+                .violations
+                .iter()
+                .any(|v| v.rule.contains("forbid_tools.web_search")),
+            "{:?}",
+            judged.violations
+        );
+    }
+
+    #[test]
+    fn require_first_tools_rejects_empty_timeline() {
+        let report = json!({"telemetry": {"tool_timeline": []}});
+        let judged = judge_report(&report, &first_tool_rules());
+        assert_eq!(judged.process, JudgeVerdict::Fail);
+        assert!(
+            judged
+                .violations
+                .iter()
+                .any(|v| v.rule == "process.require_first_tools" && v.got == "none"),
+            "{:?}",
+            judged.violations
+        );
+    }
+
+    #[test]
+    fn require_first_command_regex_accepts_git_log() {
+        let rules = JudgeRules {
+            process: ProcessRules {
+                require_first_tools: vec!["bash".into()],
+                require_first_command_regex: r"^git\s+(log|status|branch)\b".into(),
+                forbid_tools: vec!["web_search".into(), "ask_user".into()],
+                ..ProcessRules::default()
+            },
+            ..JudgeRules::default()
+        };
+        let report = json!({
+            "telemetry": {
+                "tool_timeline": [
+                    {"tool": "bash", "command": "git log -1 --format=%s"},
+                    {"tool": "write", "path": "answer.txt"}
+                ]
+            }
+        });
+        assert!(judge_report(&report, &rules).ok());
+    }
+
+    #[test]
+    fn require_first_command_regex_rejects_non_git_bash() {
+        let rules = JudgeRules {
+            process: ProcessRules {
+                require_first_command_regex: r"^git\s+".into(),
+                ..ProcessRules::default()
+            },
+            ..JudgeRules::default()
+        };
+        let report = json!({
+            "telemetry": {
+                "tool_timeline": [{"tool": "bash", "command": "ls -la"}]
+            }
+        });
+        let judged = judge_report(&report, &rules);
+        assert_eq!(judged.process, JudgeVerdict::Fail);
+        assert!(
+            judged
+                .violations
+                .iter()
+                .any(|v| v.rule == "process.require_first_command_regex" && v.got == "ls -la"),
+            "{:?}",
+            judged.violations
+        );
+    }
+
+    #[test]
+    fn forbid_tools_catches_ask_user_later_in_tape() {
+        let report = json!({
+            "telemetry": {
+                "tool_timeline": [
+                    {"tool": "grep", "path": "src/marker.py"},
+                    {"tool": "ask_user"}
+                ]
+            }
+        });
+        let judged = judge_report(&report, &first_tool_rules());
+        assert_eq!(judged.process, JudgeVerdict::Fail);
+        assert!(
+            judged
+                .violations
+                .iter()
+                .any(|v| v.rule.contains("forbid_tools.ask_user")),
+            "{:?}",
+            judged.violations
+        );
+    }
+
+    #[test]
+    fn load_rules_rejects_invalid_first_command_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("judge.toml");
+        std::fs::write(
+            &path,
+            "[process]\nrequire_first_command_regex = \"(unclosed\"\n",
+        )
+        .unwrap();
+        let err = load_rules(&path).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("require_first_command_regex"),
+            "unexpected error: {err}"
+        );
     }
 }

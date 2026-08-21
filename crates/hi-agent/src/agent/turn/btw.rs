@@ -881,6 +881,25 @@ pub(crate) fn route_snapshot_answer(question: &str, snapshot: &str) -> Option<St
     let q = question.to_ascii_lowercase();
     let q = q.trim();
 
+    // Calendar date (UTC, from the snapshot — not training cutoff).
+    if matches_any(
+        q,
+        &[
+            "what day is it",
+            "what's the date",
+            "whats the date",
+            "what is the date",
+            "what date is it",
+            "today's date",
+            "todays date",
+            "what day is today",
+            "current date",
+        ],
+    ) && let Some(v) = snapshot_value(snapshot, "- utc_date:")
+    {
+        return Some(format!("Today (UTC): {v}."));
+    }
+
     // Git / project age.
     if matches_any(
         q,
@@ -1141,6 +1160,14 @@ mod tests {
         let snap = "- git branch: feature/btw\n- model: m\n";
         let ans = route_snapshot_answer("what branch are we on?", snap).unwrap();
         assert!(ans.contains("feature/btw"), "{ans}");
+    }
+
+    #[test]
+    fn router_answers_utc_date() {
+        let snap = "- utc_date: 2026-08-20 (Thursday)\n- git branch: main\n";
+        let ans = route_snapshot_answer("what day is it?", snap).unwrap();
+        assert!(ans.contains("2026-08-20"), "{ans}");
+        assert!(ans.contains("Thursday"), "{ans}");
     }
 
     #[test]

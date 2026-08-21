@@ -189,7 +189,15 @@ impl crate::Agent {
             turn_count: 0,
             last_suggested_prompt: None,
             extensions: None,
+            mcp: None,
         })
+    }
+
+    /// Attach connected MCP servers. Advertises `search_tool` / `use_tool` on
+    /// later turns; does not flatten each server tool's schema onto the request.
+    pub fn attach_mcp(&mut self, backend: Arc<dyn hi_tools::McpBackend>) {
+        self.mcp = Some(backend);
+        self.config.memory.offer_mcp = true;
     }
 
     /// Installs already-validated managed RSI reference context for the next
@@ -1695,14 +1703,16 @@ impl crate::Agent {
     }
 
     /// The per-turn volatile context: task-ranked memory, the task context
-    /// index / repo orientation, the session goal, long-horizon goal state,
-    /// the decision log, a matching stack skill, and named acceptance
-    /// criteria. Attached to each turn's user message (late in the transcript)
-    /// rather than the system message — rebuilding message[0] with this
-    /// content every round invalidated the entire prefix for implicit and
-    /// explicit prompt caches alike (observed: <4% cache reads on an
-    /// edit-heavy session). Mid-turn staleness is fine: each source only
-    /// changes through the model's own actions (its edits, its
+    /// index / repo orientation, sanitized git identity (branch/HEAD/origin
+    /// when this workspace *is* the git toplevel), the session goal,
+    /// long-horizon goal state, the decision log, a matching stack skill or
+    /// the code-review pack on review-shaped turns, and named acceptance
+    /// criteria. Attached to each turn's user message (late
+    /// in the transcript) rather than the system message — rebuilding
+    /// message[0] with this content every round invalidated the entire prefix
+    /// for implicit and explicit prompt caches alike (observed: <4% cache
+    /// reads on an edit-heavy session). Mid-turn staleness is fine: each
+    /// source only changes through the model's own actions (its edits, its
     /// `update_plan`/`record_decision` calls), which it already sees.
     pub(crate) fn volatile_context_block(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
@@ -1741,7 +1751,19 @@ impl crate::Agent {
                 parts.push(t.to_string());
             }
         }
-        if self.config.memory.inject_stack_skill
+        if let Some(section) = crate::git_identity::prompt_section(self.runtime.root()) {
+            parts.push(section);
+        }
+        if !self.config.subagents.is_subagent {
+            parts.push(crate::today::prompt_section());
+        }
+        if !self.config.subagents.is_subagent && self.turn_prompt_is_review() {
+            if self.config.memory.inject_review_skill
+                && let Some(section) = crate::skills::active_review_skill_section()
+            {
+                parts.push(section);
+            }
+        } else if self.config.memory.inject_stack_skill
             && let Some(section) = crate::skills::active_stack_skill_section(self.runtime.root())
         {
             parts.push(section);
@@ -1754,13 +1776,31 @@ impl crate::Agent {
         {
             parts.push(section);
         }
-        if !self.config.subagents.is_subagent {
+        if !self.config.subagents.is_subagent && self.config.memory.offer_ask_user {
             parts.push(
                 "ask_user is for product/design forks only — never instead of the next coding step."
                     .into(),
             );
         }
         (!parts.is_empty()).then(|| clip_volatile_context(&parts.join("\n\n")))
+    }
+
+    /// Whether the current turn's stored prompt is a read-only review.
+    /// Uses the same classifiers as the turn loop so `/review`, `/security`,
+    /// and implicit "review the codebase" match.
+    fn turn_prompt_is_review(&self) -> bool {
+        let Some(prompt) = self.task.last_task_prompt.as_deref() else {
+            return false;
+        };
+        if crate::steering::classify_read_only_intent(prompt).is_some() {
+            return true;
+        }
+        let read_only = self
+            .task
+            .last_task_contract
+            .as_ref()
+            .is_some_and(|contract| contract.intent == crate::TaskIntent::ReadOnly);
+        crate::steering::implicit_read_only_review_intent(prompt, read_only).is_some()
     }
 
     /// Reload project + global memory, rank bullets for `task`, and cache the

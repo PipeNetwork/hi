@@ -4150,6 +4150,10 @@ fn matching_stack_skill_lands_in_volatile_context_not_system_prompt() {
         "matching rust-workspace pack should be in volatile context: {block}"
     );
     assert!(
+        block.contains("[Today]") && block.contains("utc_date:"),
+        "parent sessions get a UTC date fragment: {block}"
+    );
+    assert!(
         block.contains("rust-workspace"),
         "pack slug should be named: {block}"
     );
@@ -4157,6 +4161,80 @@ fn matching_stack_skill_lands_in_volatile_context_not_system_prompt() {
     assert!(
         !system.contains("# Active stack skill"),
         "skill bodies must not land in the stable system prompt"
+    );
+}
+
+#[test]
+fn review_turn_injects_code_review_skill_and_skips_stack_pack() {
+    let workspace = IsolatedWorkspace::new("review-skill-volatile");
+    std::fs::write(workspace.path("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let mut cfg = workspace.config();
+    cfg.memory.inject_stack_skill = true;
+    cfg.memory.inject_review_skill = true;
+    let mut agent = agent(vec![], cfg);
+    let prompt = crate::command::expand_prompt_macro("/review parser").expect("review macro");
+    let contract = crate::TaskContract::derive(&prompt, crate::VerificationMode::Disabled);
+    agent.task.set_task(Some(prompt), Some(contract));
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(
+        block.contains("# Active review skill (`code-review`)"),
+        "review turn should inject code-review: {block}"
+    );
+    assert!(
+        !block.contains("# Active stack skill"),
+        "review turn must not follow rust-workspace: {block}"
+    );
+}
+
+#[test]
+fn coding_turn_keeps_stack_pack_without_review_skill() {
+    let workspace = IsolatedWorkspace::new("coding-skill-volatile");
+    std::fs::write(workspace.path("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let mut cfg = workspace.config();
+    cfg.memory.inject_stack_skill = true;
+    cfg.memory.inject_review_skill = true;
+    let mut agent = agent(vec![], cfg);
+    let prompt = "Fix the parser in src/lib.rs and add a unit test.";
+    let contract = crate::TaskContract::derive(prompt, crate::VerificationMode::Disabled);
+    agent
+        .task
+        .set_task(Some(prompt.to_string()), Some(contract));
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(
+        block.contains("# Active stack skill"),
+        "coding turn should keep rust-workspace: {block}"
+    );
+    assert!(
+        !block.contains("# Active review skill"),
+        "coding turn must not inject code-review: {block}"
+    );
+}
+
+#[test]
+fn subagent_skips_review_skill() {
+    let mut cfg = config();
+    cfg.subagents.is_subagent = true;
+    cfg.memory.inject_review_skill = true;
+    let mut agent = agent(vec![], cfg);
+    let prompt = crate::command::expand_prompt_macro("/review parser").expect("review macro");
+    let contract = crate::TaskContract::derive(&prompt, crate::VerificationMode::Disabled);
+    agent.task.set_task(Some(prompt), Some(contract));
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(
+        !block.contains("# Active review skill"),
+        "subagents skip the review pack: {block}"
+    );
+}
+
+#[test]
+fn subagent_volatile_context_omits_today() {
+    let mut cfg = config();
+    cfg.subagents.is_subagent = true;
+    let agent = agent(vec![], cfg);
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(
+        !block.contains("[Today]") && !block.contains("utc_date:"),
+        "subagents skip the date fragment: {block}"
     );
 }
 
@@ -4554,6 +4632,10 @@ async fn btw_session_snapshot_includes_git_facts() {
     assert!(
         snapshot.contains("- git latest commit:"),
         "latest commit missing: {snapshot}"
+    );
+    assert!(
+        snapshot.contains("- utc_date:"),
+        "utc date missing from /btw snapshot: {snapshot}"
     );
 }
 

@@ -450,7 +450,7 @@ pub fn project_fingerprint() -> Option<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let identity = if let Some(remote) = remote {
-        normalize_git_remote(&remote).unwrap_or(remote)
+        hi_agent::normalize_git_remote(&remote).unwrap_or(remote)
     } else {
         format!(
             "local:{}/{}",
@@ -461,27 +461,6 @@ pub fn project_fingerprint() -> Option<String> {
     Some(format!(
         "{:x}",
         Sha256::digest(format!("{}\0{}", identity, relative).as_bytes())
-    ))
-}
-
-fn normalize_git_remote(remote: &str) -> Option<String> {
-    let value = remote.trim().trim_end_matches('/').trim_end_matches(".git");
-    let host_path = if let Some(rest) = value.split_once("://").map(|(_, rest)| rest) {
-        let rest = rest.rsplit_once('@').map(|(_, rest)| rest).unwrap_or(rest);
-        rest.split_once('/')?
-    } else if let Some((user_host, path)) = value.split_once(':') {
-        let host = user_host
-            .rsplit_once('@')
-            .map(|(_, host)| host)
-            .unwrap_or(user_host);
-        (host, path)
-    } else {
-        return None;
-    };
-    Some(format!(
-        "{}/{}",
-        host_path.0.to_ascii_lowercase(),
-        host_path.1.trim_matches('/').to_ascii_lowercase()
     ))
 }
 

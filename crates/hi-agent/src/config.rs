@@ -659,10 +659,20 @@ pub struct AgentMemory {
     /// On by default in production; the test harness disables it so canned-
     /// provider tests measure stable token budgets and message shapes.
     pub inject_stack_skill: bool,
+    /// Whether the `code-review` pack is auto-injected on review-shaped turns.
+    /// On by default; the test harness disables it like [`Self::inject_stack_skill`].
+    pub inject_review_skill: bool,
     /// After a successful turn, predict a Claude-style "suggested next prompt"
     /// for the interactive input bar (ghost text). Side call; off for
     /// subagents / plan mode / goal auto-drive regardless of this flag.
     pub suggest_next_prompt: bool,
+    /// Advertise `ask_user` (and honor it). Off for `--report` / `--eval-input`
+    /// so measured cells cannot pause for a human. The handler still fail-closes
+    /// if the model emits the name anyway.
+    pub offer_ask_user: bool,
+    /// Advertise `search_tool` / `use_tool` (two gateway schemas, not each MCP
+    /// tool's schema). Set only after at least one `.hi/mcp` server connects.
+    pub offer_mcp: bool,
 }
 
 impl Default for AgentMemory {
@@ -683,9 +693,12 @@ impl Default for AgentMemory {
             context_exclusions: Vec::new(),
             curate_skills: false,
             inject_stack_skill: true,
+            inject_review_skill: true,
             // On by default for interactive coding; disable via profile / env /
             // `/config suggest off`.
             suggest_next_prompt: true,
+            offer_ask_user: true,
+            offer_mcp: false,
         }
     }
 }

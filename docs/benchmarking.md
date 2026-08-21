@@ -74,11 +74,18 @@ a budget fail. Live harness tasks may set `[run] steps` / `seed_image_chars`
 in `judge.toml` (or `HI_EVAL_RESUME=1`) so hi-eval resumes the same
 `--session-file`; `bench/tasks` stays single-shot.
 
-Core CI replays committed tapes (`scripts/check_harness_regression.sh`).
-The Monday scheduled workflow runs `bench/harness` as a **separate job**
-(`evaluate-harness`) and compares `artifacts/harness/summary.json` to
-`eval-baseline/harness.json`. Do not fold those rates into the SWE /
-`bench/tasks` summary.
+Core CI replays committed tapes (`scripts/check_harness_regression.sh`,
+including `bench/quality`). The Monday scheduled workflow runs live
+`bench/harness` (`evaluate-harness` vs `eval-baseline/harness.json`) and
+live `bench/quality` (`evaluate-quality` vs `eval-baseline/quality.json`)
+as **separate jobs**. Do not fold those rates into each other or into the
+SWE / `bench/tasks` summary. `hi-eval bench/quality` compares against
+`eval-baseline/quality.json` (process/budget), not `core-0.2.json`.
+Quality live compare:
+
+```bash
+scripts/check_quality_regression.sh artifacts/quality eval-baseline/quality.json
+```
 
 ## Harness-effect diagnostics
 

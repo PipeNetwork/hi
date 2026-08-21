@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["answer.txt"]
+name = "changelog-local-first"
+prompt = """Investigate how this repo changelog works in the GitHub repo. Write the unique changelog token you find locally to answer.txt. Do not search the web or ask for a GitHub handle."""
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "p=open('answer.txt').read(); assert 'QUALITY_ZX9_CHANGELOG' in p"'''

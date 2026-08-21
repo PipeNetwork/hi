@@ -3,8 +3,8 @@
 # Format: max-lines workspace-relative-path. Only files above 800 lines belong here.
 913 crates/hi-agent/src/agent/background_task.rs
 801 crates/hi-agent/src/agent/goal_turn.rs
-3014 crates/hi-agent/src/agent/lifecycle.rs
-861 crates/hi-agent/src/agent/skeptic.rs
+3054 crates/hi-agent/src/agent/lifecycle.rs
+873 crates/hi-agent/src/agent/skeptic.rs
 1326 crates/hi-agent/src/agent/tool_selection.rs
 1159 crates/hi-agent/src/agent/turn/btw.rs
 938 crates/hi-agent/src/agent/turn/fast_feedback.rs
@@ -13,15 +13,15 @@
 1948 crates/hi-agent/src/agent/turn/model_round.rs
 1972 crates/hi-agent/src/agent/turn/tools/batch.rs
 1015 crates/hi-agent/src/change_ledger.rs
-3414 crates/hi-agent/src/command.rs
-813 crates/hi-agent/src/config.rs
+3433 crates/hi-agent/src/command.rs
+826 crates/hi-agent/src/config.rs
 2628 crates/hi-agent/src/goal.rs
 1670 crates/hi-agent/src/heuristics.rs
 1064 crates/hi-agent/src/lib.rs
 2233 crates/hi-agent/src/local_skeptic.rs
 1246 crates/hi-agent/src/memory.rs
 1555 crates/hi-agent/src/session_ops.rs
-816 crates/hi-agent/src/skills.rs
+968 crates/hi-agent/src/skills.rs
 963 crates/hi-agent/src/steering/implementation.rs
 1230 crates/hi-agent/src/steering/intent.rs
 957 crates/hi-agent/src/task_contract.rs
@@ -30,7 +30,7 @@
 1590 crates/hi-agent/src/tests/plan.rs
 1529 crates/hi-agent/src/tests/retry.rs
 3474 crates/hi-agent/src/tests/steering.rs
-4656 crates/hi-agent/src/tests/turn.rs
+4783 crates/hi-agent/src/tests/turn.rs
 2093 crates/hi-agent/src/transcript.rs
 1425 crates/hi-agent/src/ui.rs
 2311 crates/hi-agent/src/verify.rs

@@ -1,0 +1,10 @@
+[process]
+require_first_tools = ["bash"]
+require_first_command_regex = "^git\\s+"
+forbid_tools = ["web_search", "ask_user"]
+
+[run]
+init_git = true
+git_branch = "main"
+git_origin = "https://github.com/example-org/quality-fixture.git"
+git_commit_message = "seed: quality-zx9-fixture"

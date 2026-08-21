@@ -264,6 +264,8 @@ pub(crate) fn config() -> AgentConfig {
             // rust-workspace stack pack body (this repo has a Cargo.toml). Tests
             // that assert the injection opt in.
             inject_stack_skill: false,
+            // Off so review-shaped canned turns don't grow by the code-review pack.
+            inject_review_skill: false,
             ..crate::AgentMemory::default()
         },
         subagents: crate::AgentSubagents {

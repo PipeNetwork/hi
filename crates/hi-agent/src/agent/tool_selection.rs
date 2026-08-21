@@ -141,8 +141,14 @@ pub(super) fn advertised_tools_with_background(
         {
             specs.push(hi_tools::explore_tool_spec());
         }
-        if !specs.is_empty() {
+        if config.memory.offer_ask_user && !specs.is_empty() {
             specs.push(hi_tools::ask_user_tool_spec());
+        }
+        // Two gateway schemas instead of flattening every MCP tool onto the
+        // request. Isolation/targeted retain below still drops them.
+        if config.memory.offer_mcp && !specs.is_empty() {
+            specs.push(hi_tools::search_tool_tool_spec());
+            specs.push(hi_tools::use_tool_tool_spec());
         }
         // Delegate: Off never; On for any mutation; Risk only isolation-shaped tasks.
         if !suppress_new_subagents && should_advertise_delegate(config, task_text, mutating) {
@@ -182,7 +188,8 @@ pub(super) fn advertised_tools_with_background(
     if targeted_mutation || targeted_multi_mutation {
         // A named small-scope edit needs evidence, an edit primitive, and a
         // way to run focused validation. It does not need repository census,
-        // web/MCP/memory schemas, coordination, or subagent tools. Keep
+        // MCP/memory schemas, coordination, or subagent tools. Web fetch/search
+        // stay only when the prompt itself is a URL or research write. Keep
         // multi_edit only for one-file work: its contract is atomic edits to
         // one file, and exposing it on a multi-file task invites the model to
         // pack unrelated paths into an invalid call before recovering with
@@ -192,6 +199,8 @@ pub(super) fn advertised_tools_with_background(
         let needs_search = task_text.is_some_and(targeted_mutation_needs_search);
         let needs_diff = task_text.is_some_and(targeted_mutation_needs_diff);
         let needs_plan = task_text.is_some_and(targeted_mutation_needs_plan);
+        let needs_web_fetch = task_text.is_some_and(targeted_mutation_needs_web_fetch);
+        let needs_web_search = task_text.is_some_and(targeted_mutation_needs_web_search);
         // A plan-driven recovery turn must retain write so the model can
         // transition from discovery to implementation after recording it.
         // Review/search-and-fix tasks may discover a replacement shape that
@@ -199,7 +208,8 @@ pub(super) fn advertised_tools_with_background(
         // already exist. Plain update-only tasks remain on edit/apply_patch.
         let needs_write =
             needs_plan || needs_search || task_text.is_some_and(targeted_mutation_needs_write);
-        let allows_shell = task_text.is_none_or(targeted_mutation_allows_shell);
+        // A known public URL should go through `web_fetch`, not `bash` curl.
+        let allows_shell = !needs_web_fetch && task_text.is_none_or(targeted_mutation_allows_shell);
         specs.retain(|spec| {
             matches!(spec.name.as_str(), "read" | "edit" | "apply_patch")
                 || (needs_search && spec.name == "grep")
@@ -207,6 +217,8 @@ pub(super) fn advertised_tools_with_background(
                 || (allows_shell && spec.name == "bash")
                 || (needs_plan && spec.name == "update_plan")
                 || (needs_write && spec.name == "write")
+                || (needs_web_fetch && spec.name == "web_fetch")
+                || (needs_web_search && spec.name == "web_search")
                 || (targeted_mutation && spec.name == "multi_edit")
                 || (background.shell && matches!(spec.name.as_str(), "bash_output" | "bash_kill"))
         });
@@ -617,6 +629,38 @@ fn write_named_file_request(lower: &str) -> bool {
     })
 }
 
+/// An exact `http(s)://…` in the prompt is a fetch, not a search. The word
+/// "https" alone (as in "write an https URL") does not count.
+fn prompt_has_concrete_http_url(lower: &str) -> bool {
+    lower.contains("http://") || lower.contains("https://")
+}
+
+/// `write answer.txt` after fetching a given URL still looks like a targeted
+/// one-file mutation. Keep `web_fetch` or the model only has `bash` curl.
+fn targeted_mutation_needs_web_fetch(task: &str) -> bool {
+    prompt_has_concrete_http_url(&task.to_ascii_lowercase())
+}
+
+/// Research / "on the web" writes are the same shape. Keep `web_search` and
+/// leave `web_fetch` out so the model does not guess a URL first. The word
+/// "web" in "do not use the web" must not open this schema.
+fn targeted_mutation_needs_web_search(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    if prompt_has_concrete_http_url(&lower) {
+        return false;
+    }
+    [
+        "search the web",
+        "web search",
+        "on the web",
+        "research ",
+        "look up online",
+        "documentation online",
+    ]
+    .iter()
+    .any(|marker| contains_unnegated(&lower, marker))
+}
+
 /// Do not advertise a process tool when the user explicitly forbids shell
 /// validation. Keeping the schema out of the request makes that constraint
 /// enforceable instead of relying on the model to ignore an available tool.
@@ -885,6 +929,72 @@ mod tests {
         assert!(!names(&web).contains(&"read"));
         assert!(!names(&web).contains(&"web_download"));
 
+        let known_url = advertised_tools(
+            &config,
+            Some((
+                "Fetch https://example.com/ at that exact URL",
+                TaskIntent::ReadOnly,
+            )),
+        );
+        assert!(
+            names(&known_url).contains(&"web_fetch"),
+            "a concrete public URL should advertise web_fetch: {:?}",
+            names(&known_url)
+        );
+        assert!(
+            names(&known_url).contains(&"web_search"),
+            "web_search stays available when a URL is present: {:?}",
+            names(&known_url)
+        );
+
+        let known_url_write = advertised_tools_with_background(
+            &config,
+            Some((
+                "Fetch https://example.com/ at that exact URL. Do not search the web \
+                 and do not ask the user. Write the page's main heading to answer.txt \
+                 as the only line.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        let known_url_write_names = names(&known_url_write);
+        assert!(
+            known_url_write_names.contains(&"web_fetch"),
+            "write-after-fetch must still advertise web_fetch: {known_url_write_names:?}"
+        );
+        assert!(
+            known_url_write_names.contains(&"write"),
+            "write-after-fetch must advertise write: {known_url_write_names:?}"
+        );
+        assert!(
+            !known_url_write_names.contains(&"bash"),
+            "write-after-fetch must not offer bash curl: {known_url_write_names:?}"
+        );
+        assert!(
+            !known_url_write_names.contains(&"web_search"),
+            "an exact URL should not open web_search: {known_url_write_names:?}"
+        );
+
+        let web_research_write = advertised_tools_with_background(
+            &config,
+            Some((
+                "Research current Zig 0.16 HTTP client behavior on the web. Do not \
+                 inspect this workspace and do not fetch a guessed URL first. Write \
+                 one cited https source URL to answer.txt as the only line.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        let web_research_names = names(&web_research_write);
+        assert!(
+            web_research_names.contains(&"web_search"),
+            "web research write must advertise web_search: {web_research_names:?}"
+        );
+        assert!(
+            !web_research_names.contains(&"web_fetch"),
+            "web research write must not guess-fetch: {web_research_names:?}"
+        );
+
         let local_freshness = advertised_tools(
             &config,
             Some(("what changed in the latest commit", TaskIntent::ReadOnly)),
@@ -908,6 +1018,48 @@ mod tests {
             names(&mutation).contains(&"ask_user"),
             "ask_user on interactive coding: {:?}",
             names(&mutation)
+        );
+        let mut eval_config = AgentConfig::default();
+        eval_config.memory.offer_ask_user = false;
+        let eval_mutation = advertised_tools(
+            &eval_config,
+            Some(("implement the parser", TaskIntent::Mutation)),
+        );
+        assert!(
+            !names(&eval_mutation).contains(&"ask_user"),
+            "ask_user off for eval/report: {:?}",
+            names(&eval_mutation)
+        );
+        assert!(
+            !names(&mutation).contains(&"search_tool") && !names(&mutation).contains(&"use_tool"),
+            "MCP gateways stay off until a server connects: {:?}",
+            names(&mutation)
+        );
+        let mut mcp_config = AgentConfig::default();
+        mcp_config.memory.offer_mcp = true;
+        let mcp_mutation = advertised_tools(
+            &mcp_config,
+            Some(("implement the parser", TaskIntent::Mutation)),
+        );
+        assert!(
+            names(&mcp_mutation).contains(&"search_tool")
+                && names(&mcp_mutation).contains(&"use_tool"),
+            "connected MCP advertises search/select, not per-tool schemas: {:?}",
+            names(&mcp_mutation)
+        );
+        let mcp_isolated = advertised_tools_with_background(
+            &mcp_config,
+            Some((
+                "Fix the bug in crates/hi-ai/src/openai/request.rs, then run the focused tests.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert!(
+            !names(&mcp_isolated).contains(&"search_tool")
+                && !names(&mcp_isolated).contains(&"use_tool"),
+            "isolation catalog must not pay MCP schema tax: {:?}",
+            names(&mcp_isolated)
         );
         // Risk policy: single-file "implement the parser" is not isolation-shaped.
         assert!(

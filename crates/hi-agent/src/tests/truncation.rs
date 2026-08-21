@@ -521,3 +521,31 @@ async fn truncation_with_partial_text_tool_call_strips_raw_protocol() {
         "fresh-tool-call nudge should be recorded: {transcript_text}"
     );
 }
+
+#[tokio::test]
+async fn length_truncated_complete_write_is_not_executed() {
+    // fx's contract: finish_reason=length with a complete-looking tool call
+    // must not permission or execute. hi strips ToolCall blocks and continues.
+    let workspace = IsolatedWorkspace::new("truncation-no-exec-write");
+    let sentinel = workspace.path("command-must-not-run.txt");
+    let mut cfg = workspace.config();
+    cfg.loop_limits.max_truncation_retries = 1;
+    let path = sentinel.to_string_lossy().to_string();
+    let mut truncated_write = write_content_completion(&path, "must-not-land");
+    truncated_write.stop_reason = Some("length".into());
+    let responses = vec![
+        truncated_write,
+        completion(vec![Content::Text("Stopped without writing.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("summarize what is in this workspace", &mut ui)
+        .await
+        .unwrap();
+    assert!(
+        !sentinel.exists(),
+        "length-truncated write must not execute: {}",
+        std::fs::read_to_string(&sentinel).unwrap_or_default()
+    );
+}

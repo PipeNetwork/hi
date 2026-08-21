@@ -13,6 +13,7 @@ mod decision;
 pub mod doctor;
 mod domain;
 pub mod events;
+mod git_identity;
 mod goal;
 pub mod help;
 mod heuristics;
@@ -34,6 +35,7 @@ mod steering;
 mod subagent;
 mod subagent_progress;
 mod task_contract;
+mod today;
 mod transcript;
 pub mod ui;
 mod verify;
@@ -188,6 +190,7 @@ pub use events::{
     AgentEvent, AgentEventKind, EventJournal, EventStream, ForkOptions, SessionDriver, SessionFork,
     SessionHandle, SessionSnapshot, TurnResult,
 };
+pub use git_identity::{normalize_git_remote, prompt_section as git_identity_prompt_section};
 pub use goal::{
     CLAIM_NOTE, DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT,
     GOAL_EVENT_LIMIT, Goal, GoalEvent, GoalPauseReason, GoalStatus, MAX_CAP_CONTINUATIONS,
@@ -1006,6 +1009,9 @@ pub struct Agent {
     /// turn start/done/error/abort. `None` when no extensions are installed
     /// (the common case). Distinct from the out-of-process `hi-hooks` system.
     pub(crate) extensions: Option<hi_agent_lifecycle::ExtensionRegistry>,
+    /// Connected MCP servers, exposed to the model only via `search_tool` /
+    /// `use_tool`. `None` when nothing connected (default coding / eval path).
+    pub(crate) mcp: Option<Arc<dyn hi_tools::McpBackend>>,
 }
 
 /// A cloneable handle to an agent's mid-turn interjection queue. The frontend

@@ -78,10 +78,13 @@ pub async fn run_search_tool(
 
     let mut lines = Vec::with_capacity(tools.len());
     for info in &tools {
-        lines.push(format!(
-            "  {} / {} — {}",
-            info.server, info.tool, info.description
-        ));
+        let mut line = format!("  {} / {} — {}", info.server, info.tool, info.description);
+        if !info.schema.is_null() && info.schema != serde_json::json!({}) {
+            let schema = serde_json::to_string(&info.schema).unwrap_or_else(|_| "{}".into());
+            line.push_str("\n    schema: ");
+            line.push_str(&schema);
+        }
+        lines.push(line);
     }
 
     let content = format!(
@@ -286,5 +289,52 @@ pub fn run_skill(backend: Option<&dyn SkillBackend>, arguments: &str) -> Result<
                 available.join(", ")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct FakeMcp;
+
+    #[async_trait::async_trait]
+    impl McpBackend for FakeMcp {
+        async fn search(&self, query: Option<&str>) -> Result<Vec<McpToolInfo>> {
+            let tool = McpToolInfo {
+                server: "demo".into(),
+                tool: "echo".into(),
+                description: "echo input".into(),
+                schema: json!({"type":"object","properties":{"text":{"type":"string"}}}),
+            };
+            Ok(match query {
+                Some(q) if !tool.tool.contains(q) && !tool.description.contains(q) => Vec::new(),
+                _ => vec![tool],
+            })
+        }
+
+        async fn call(&self, _server: &str, _tool: &str, arguments: &Value) -> Result<String> {
+            Ok(arguments.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn search_tool_includes_parameter_schema() {
+        let out = run_search_tool(Some(&FakeMcp), r#"{"query":"echo"}"#)
+            .await
+            .unwrap();
+        assert!(out.content.contains("demo / echo"));
+        assert!(
+            out.content.contains("schema:") && out.content.contains("\"text\""),
+            "search/select must return the schema, not dump it on every request: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn search_tool_without_backend_is_explicit() {
+        let out = run_search_tool(None, "{}").await.unwrap();
+        assert!(out.content.contains("No MCP servers"));
     }
 }

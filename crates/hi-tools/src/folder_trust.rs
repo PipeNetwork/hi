@@ -112,9 +112,22 @@ pub fn decide_inputs_with_interactive(
     }
 }
 
-/// Whether repo-local code-exec configs are present (`.hi/hooks/` directory).
+/// Whether repo-local code-exec configs are present (hooks or MCP servers).
 fn repo_configs_present(cwd: &Path) -> bool {
-    cwd.join(".hi/hooks").is_dir()
+    cwd.join(".hi/hooks").is_dir() || mcp_server_configs_present(cwd)
+}
+
+fn mcp_server_configs_present(cwd: &Path) -> bool {
+    let dir = cwd.join(".hi").join("mcp");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    })
 }
 
 /// An over-broad root that the store refuses to record: `$HOME`, filesystem
@@ -378,5 +391,17 @@ mod tests {
         let canon = tmp.path().canonicalize().unwrap();
         let key = workspace_key(tmp.path());
         assert_eq!(key, canon);
+    }
+
+    #[test]
+    fn mcp_json_counts_as_repo_local_code_exec() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!mcp_server_configs_present(tmp.path()));
+        let dir = tmp.path().join(".hi/mcp");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!mcp_server_configs_present(tmp.path()));
+        std::fs::write(dir.join("echo.json"), r#"{"command":"true"}"#).unwrap();
+        assert!(mcp_server_configs_present(tmp.path()));
+        assert!(repo_configs_present(tmp.path()));
     }
 }

@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["answer.txt"]
+name = "broad-web-search"
+prompt = """Research current Zig 0.16 HTTP client behavior on the web. Do not inspect this workspace and do not fetch a guessed URL first. Write one cited https source URL to answer.txt as the only line."""
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "p=open('answer.txt').read(); assert 'http' in p.lower(); assert 'QUALITY_ZX9' not in p"'''

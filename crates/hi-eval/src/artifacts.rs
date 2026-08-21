@@ -21,6 +21,9 @@ pub struct TimedOutput {
     pub timed_out: bool,
     pub output_truncated: bool,
     pub duration: Duration,
+    /// Bounded `ps` of the candidate process group, captured immediately
+    /// before SIGKILL on timeout. Empty / None when the run finished in time.
+    pub timeout_process_snapshot: Option<String>,
 }
 
 impl TimedOutput {
@@ -54,6 +57,7 @@ pub fn command_output_with_timeout(
     let stdout_reader = std::thread::spawn(move || read_bounded(stdout));
     let stderr_reader = std::thread::spawn(move || read_bounded(stderr));
     let mut timed_out = false;
+    let mut timeout_process_snapshot = None;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -61,10 +65,13 @@ pub fn command_output_with_timeout(
         if started.elapsed() >= timeout {
             timed_out = true;
             #[cfg(unix)]
-            // SAFETY: the child was placed in a fresh process group whose id is
-            // its pid. A negative pid targets that group only.
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            {
+                timeout_process_snapshot = Some(process_group_snapshot(child.id()));
+                // SAFETY: the child was placed in a fresh process group whose id is
+                // its pid. A negative pid targets that group only.
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
             }
             let _ = child.kill();
             break child.wait()?;
@@ -91,7 +98,40 @@ pub fn command_output_with_timeout(
         timed_out,
         output_truncated: stdout_truncated || stderr_truncated,
         duration: started.elapsed(),
+        timeout_process_snapshot,
     })
+}
+
+#[cfg(unix)]
+fn process_group_snapshot(pgid: u32) -> String {
+    const MAX_CHARS: usize = 4_000;
+    let output = Command::new("ps")
+        .args(["-axo", "pid,ppid,pgid,stat,etime,command"])
+        .output();
+    let Ok(output) = output else {
+        return format!("(ps failed for pgid {pgid})");
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let pgid_s = pgid.to_string();
+    let mut kept = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if i == 0 {
+            kept.push(line.to_string());
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let Some(_) = cols.next() else { continue };
+        let Some(_) = cols.next() else { continue };
+        if cols.next() == Some(pgid_s.as_str()) {
+            kept.push(line.to_string());
+        }
+    }
+    let mut joined = kept.join("\n");
+    if joined.chars().count() > MAX_CHARS {
+        joined = joined.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+        joined.push('…');
+    }
+    joined
 }
 
 fn read_bounded(mut reader: impl Read) -> (Vec<u8>, bool) {
@@ -903,10 +943,17 @@ pub fn output_summary(output: &TimedOutput) -> String {
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     let text = text.trim();
     if output.timed_out {
-        format!(
+        let mut text = format!(
             "timed out after {:.1}s: {text}",
             output.duration.as_secs_f64()
-        )
+        );
+        if let Some(snapshot) = output.timeout_process_snapshot.as_deref() {
+            if !snapshot.is_empty() {
+                text.push_str("\nprocess snapshot (pgid):\n");
+                text.push_str(snapshot);
+            }
+        }
+        text
     } else if text.is_empty() {
         format!("exit status {}", output.status)
     } else {
@@ -1597,6 +1644,19 @@ command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"
         assert!(output.timed_out);
         assert!(!output.success());
         assert!(output.duration >= Duration::from_secs(1));
+        #[cfg(unix)]
+        {
+            let snapshot = output.timeout_process_snapshot.as_deref().unwrap_or("");
+            assert!(
+                snapshot.contains("sleep") || snapshot.contains("PID"),
+                "timeout should snapshot the process group before SIGKILL, got: {snapshot}"
+            );
+            let summary = output_summary(&output);
+            assert!(
+                summary.contains("process snapshot"),
+                "output_summary should include the snapshot: {summary}"
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }

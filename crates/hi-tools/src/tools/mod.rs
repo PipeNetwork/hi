@@ -683,6 +683,26 @@ pub async fn execute_in_runtime_shared(
     name: &str,
     arguments: &str,
 ) -> ToolOutcome {
+    execute_in_runtime_shared_with(
+        root, state_root, lsp, background, read_cache, repo_map, None, name, arguments,
+    )
+    .await
+}
+
+/// Like [`execute_in_runtime_shared`] with an optional MCP backend so
+/// `search_tool` / `use_tool` can reach connected servers.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_in_runtime_shared_with(
+    root: &Path,
+    state_root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    background: &crate::BackgroundRegistry,
+    read_cache: &std::sync::Mutex<crate::ReadCache>,
+    repo_map: &std::sync::Arc<std::sync::Mutex<crate::RepoMapCache>>,
+    mcp: Option<&dyn external::McpBackend>,
+    name: &str,
+    arguments: &str,
+) -> ToolOutcome {
     execute_in_impl(
         root,
         state_root,
@@ -692,7 +712,7 @@ pub async fn execute_in_runtime_shared(
             read_cache,
             repo_map: repo_map.as_ref(),
             repo_map_arc: Some(repo_map),
-            mcp: None,
+            mcp,
             memory: None,
             skill: None,
             hunk_tracker: None,

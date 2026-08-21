@@ -37,6 +37,7 @@ pub(crate) fn build_agent(
     loaded: Option<LoadedAgentSession>,
     ledger_scan: Option<hi_agent::BackgroundScan>,
 ) -> Result<BuiltAgent> {
+    let measured = session_measured(cli.eval_input.is_some(), cli.report.is_some());
     let agent_config = AgentConfig {
         execution: if cli.subagent || cli.eval_input.is_some() {
             hi_agent::ExecutionMode::Ephemeral
@@ -88,14 +89,18 @@ pub(crate) fn build_agent(
             tool_set: quality.tool_set,
             disabled_tools: crate::tool_trim::disabled_tools(&state_root),
             // Env override lets you flip on skill auto-curation without editing a profile.
-            // Eval skips it the same way it skips finalize: the extra completion is
-            // billed and does not belong in a measured coding cell.
+            // `--eval-input` and `--report` skip it the same way they skip finalize:
+            // the extra completion is billed and does not belong in a measured cell.
+            // hi-eval uses `--report`, not `--eval-input`.
             curate_skills: session_curate_skills(
                 settings.curate_skills,
                 std::env::var_os("HI_CURATE_SKILLS").is_some(),
-                cli.eval_input.is_some(),
+                measured,
             ),
-            suggest_next_prompt: settings.suggest_next_prompt && cli.eval_input.is_none(),
+            suggest_next_prompt: settings.suggest_next_prompt && !measured,
+            // hi-eval uses `--report`, not `--eval-input`. Either flag means
+            // there is no human to answer `ask_user`.
+            offer_ask_user: !measured,
             project_context: load_project_context_from(&workspace_root),
             context_exclusions: quality.context_exclusions.clone(),
             auto_compact: !cli.no_auto_compact,
@@ -106,7 +111,7 @@ pub(crate) fn build_agent(
                 .unwrap_or(CompactionKind::Hybrid {
                     keep_recent: hi_agent::DEFAULT_KEEP_RECENT,
                 }),
-            finalize: !cli.no_finalize && cli.eval_input.is_none(),
+            finalize: !cli.no_finalize && !measured,
             ..hi_agent::AgentMemory::default()
         },
         subagents: hi_agent::AgentSubagents {
@@ -193,19 +198,21 @@ fn env_route(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
 }
 
+/// `--eval-input` and `--report` are one-shot / harness paths: no human,
+/// no extra billed completions after the task. hi-eval uses `--report`.
+fn session_measured(eval_input: bool, report: bool) -> bool {
+    eval_input || report
+}
+
 /// Skill auto-curation is a follow-up completion after a green mutating turn.
-/// Eval cells skip it so the measured model is not billed for a curator call.
-pub(crate) fn session_curate_skills(
-    settings_on: bool,
-    env_override: bool,
-    eval_mode: bool,
-) -> bool {
-    !eval_mode && (settings_on || env_override)
+/// Measured cells skip it so the scored model is not billed for a curator call.
+pub(crate) fn session_curate_skills(settings_on: bool, env_override: bool, measured: bool) -> bool {
+    !measured && (settings_on || env_override)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::session_curate_skills;
+    use super::{session_curate_skills, session_measured};
 
     #[test]
     fn eval_disables_skill_curation() {
@@ -213,5 +220,17 @@ mod tests {
         assert!(session_curate_skills(false, true, false));
         assert!(!session_curate_skills(true, true, true));
         assert!(!session_curate_skills(false, false, false));
+    }
+
+    #[test]
+    fn report_is_measured_like_eval_input() {
+        assert!(!session_measured(false, false));
+        assert!(session_measured(true, false));
+        assert!(session_measured(false, true));
+        assert!(!session_curate_skills(
+            true,
+            true,
+            session_measured(false, true)
+        ));
     }
 }

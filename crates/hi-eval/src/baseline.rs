@@ -4,7 +4,7 @@
 //! matrix. Capture after a full provider-backed run; compare subsequent runs
 //! against it so solve-rate / false-verified / cost regressions are explicit.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -114,8 +114,219 @@ pub fn default_north_star_suites() -> Vec<String> {
     ]
 }
 
-pub fn default_baseline_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("eval-baseline/core-0.2.json")
+pub fn default_baseline_path() -> PathBuf {
+    PathBuf::from("eval-baseline/core-0.2.json")
+}
+
+/// Which locked file a live run should compare against.
+///
+/// `bench/quality` and `bench/harness` must not be scored against the SWE
+/// north star (`core-0.2.json`); those suites lock process/budget instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuiteKind {
+    Coding,
+    Harness,
+    Quality,
+}
+
+pub fn classify_suites(suite_roots: &[String]) -> SuiteKind {
+    if suite_roots.is_empty() {
+        return SuiteKind::Coding;
+    }
+    let kinds: Vec<SuiteKind> = suite_roots
+        .iter()
+        .map(|root| classify_suite(root))
+        .collect();
+    if kinds.iter().all(|k| *k == SuiteKind::Quality) {
+        SuiteKind::Quality
+    } else if kinds.iter().all(|k| *k == SuiteKind::Harness) {
+        SuiteKind::Harness
+    } else {
+        SuiteKind::Coding
+    }
+}
+
+fn classify_suite(root: &str) -> SuiteKind {
+    let n = root.replace('\\', "/");
+    let n = n.trim_end_matches('/');
+    if suite_matches(&n, "bench/quality") {
+        SuiteKind::Quality
+    } else if suite_matches(&n, "bench/harness") {
+        SuiteKind::Harness
+    } else {
+        SuiteKind::Coding
+    }
+}
+
+fn suite_matches(root: &str, suite: &str) -> bool {
+    root == suite || root.ends_with(&format!("/{suite}")) || root.contains(&format!("{suite}/"))
+}
+
+pub fn default_baseline_path_for_suites(suite_roots: &[String]) -> PathBuf {
+    match classify_suites(suite_roots) {
+        SuiteKind::Quality => PathBuf::from("eval-baseline/quality.json"),
+        SuiteKind::Harness => PathBuf::from("eval-baseline/harness.json"),
+        SuiteKind::Coding => default_baseline_path(),
+    }
+}
+
+pub fn is_process_baseline_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "quality.json" || name == "harness.json")
+}
+
+/// Locked process/budget rates for `bench/harness` and `bench/quality`.
+/// Keep this schema separate from [`CodingBaseline`] so the rates cannot be
+/// averaged with SWE solve_rate.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProcessBaseline {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub captured_at: Option<String>,
+    #[serde(default)]
+    pub process_pass_rate: Option<f64>,
+    #[serde(default)]
+    pub budget_pass_rate: Option<f64>,
+    #[serde(default)]
+    pub write_overwrite_violations: u64,
+    #[serde(default)]
+    pub image_elision_misses: u64,
+    #[serde(default)]
+    pub solve_rate: Option<f64>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+impl ProcessBaseline {
+    pub fn is_captured(&self) -> bool {
+        self.process_pass_rate.is_some()
+    }
+
+    pub fn from_summary(summary: &EvaluationSummary) -> Self {
+        Self {
+            schema_version: 2,
+            captured_at: Some(utc_now_rfc3339()),
+            process_pass_rate: summary.process_pass_rate,
+            budget_pass_rate: summary.budget_pass_rate,
+            write_overwrite_violations: summary.write_overwrite_violations,
+            image_elision_misses: summary.image_elision_misses,
+            solve_rate: Some(summary.solve_rate),
+            note: Some(
+                "Captured from hi-eval summary.json. Process/budget are the gate; do not average with solve_rate."
+                    .into(),
+            ),
+        }
+    }
+}
+
+pub fn load_process_baseline(path: &Path) -> Result<ProcessBaseline> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading process baseline {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("parsing process baseline {}", path.display()))
+}
+
+pub fn write_process_baseline(path: &Path, baseline: &ProcessBaseline) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(baseline)? + "\n";
+    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+pub fn capture_process_from_summary_file(
+    summary_path: &Path,
+    baseline_path: &Path,
+) -> Result<ProcessBaseline> {
+    let text = std::fs::read_to_string(summary_path)
+        .with_context(|| format!("reading summary {}", summary_path.display()))?;
+    let summary: EvaluationSummary = serde_json::from_str(&text)
+        .with_context(|| format!("parsing summary {}", summary_path.display()))?;
+    let baseline = ProcessBaseline::from_summary(&summary);
+    write_process_baseline(baseline_path, &baseline)?;
+    Ok(baseline)
+}
+
+/// Same 5pp drop as `scripts/check_harness_regression.sh` /
+/// `scripts/check_quality_regression.sh`. Write-overwrite and image-elision
+/// must stay at 0.
+pub fn compare_to_process_baseline(
+    baseline: &ProcessBaseline,
+    summary: &EvaluationSummary,
+    rate_tolerance: f64,
+) -> BaselineCompareReport {
+    if !baseline.is_captured() {
+        return BaselineCompareReport {
+            baseline_captured: false,
+            deltas: Vec::new(),
+            regressions: 0,
+            note: "process baseline has no process_pass_rate to compare".into(),
+        };
+    }
+
+    let mut deltas = Vec::new();
+    let process_now = summary.process_pass_rate;
+    let process_regressed = match (baseline.process_pass_rate, process_now) {
+        (Some(was), Some(now)) => was - now > rate_tolerance,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    deltas.push(BaselineDelta {
+        metric: "process_pass_rate".into(),
+        baseline: baseline.process_pass_rate,
+        current: process_now,
+        delta: match (baseline.process_pass_rate, process_now) {
+            (Some(was), Some(now)) => Some(now - was),
+            _ => None,
+        },
+        higher_is_better: true,
+        regressed: process_regressed,
+    });
+
+    if let Some(was) = baseline.budget_pass_rate {
+        deltas.push(metric_delta(
+            "budget_pass_rate",
+            Some(was),
+            summary.budget_pass_rate,
+            true,
+            rate_tolerance,
+        ));
+    }
+
+    let write_now = summary.write_overwrite_violations as f64;
+    deltas.push(BaselineDelta {
+        metric: "write_overwrite_violations".into(),
+        baseline: Some(baseline.write_overwrite_violations as f64),
+        current: Some(write_now),
+        delta: Some(write_now - baseline.write_overwrite_violations as f64),
+        higher_is_better: false,
+        regressed: summary.write_overwrite_violations > 0,
+    });
+    let image_now = summary.image_elision_misses as f64;
+    deltas.push(BaselineDelta {
+        metric: "image_elision_misses".into(),
+        baseline: Some(baseline.image_elision_misses as f64),
+        current: Some(image_now),
+        delta: Some(image_now - baseline.image_elision_misses as f64),
+        higher_is_better: false,
+        regressed: summary.image_elision_misses > 0,
+    });
+
+    let regressions = deltas.iter().filter(|d| d.regressed).count();
+    let note = if regressions == 0 {
+        "no regressions vs locked process/budget baseline".into()
+    } else {
+        format!("{regressions} metric(s) regressed vs locked process/budget baseline")
+    };
+    BaselineCompareReport {
+        baseline_captured: true,
+        deltas,
+        regressions,
+        note,
+    }
 }
 
 pub fn load_baseline(path: &Path) -> Result<CodingBaseline> {
@@ -531,5 +742,99 @@ mod tests {
         assert!(!b.is_captured());
         assert!(path.is_file());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quality_and_harness_suites_select_process_baselines() {
+        assert_eq!(
+            classify_suites(&["bench/quality".into()]),
+            SuiteKind::Quality
+        );
+        assert_eq!(
+            classify_suites(&["/tmp/hi/bench/quality".into()]),
+            SuiteKind::Quality
+        );
+        assert_eq!(
+            classify_suites(&["bench/harness".into()]),
+            SuiteKind::Harness
+        );
+        assert_eq!(classify_suites(&["bench/tasks".into()]), SuiteKind::Coding);
+        assert_eq!(
+            classify_suites(&["bench/quality".into(), "bench/tasks".into()]),
+            SuiteKind::Coding
+        );
+        assert_eq!(
+            default_baseline_path_for_suites(&["bench/quality".into()]),
+            PathBuf::from("eval-baseline/quality.json")
+        );
+        assert_eq!(
+            default_baseline_path_for_suites(&["bench/harness".into()]),
+            PathBuf::from("eval-baseline/harness.json")
+        );
+        assert_eq!(
+            default_baseline_path_for_suites(&["bench/tasks".into()]),
+            default_baseline_path()
+        );
+    }
+
+    #[test]
+    fn committed_quality_json_loads_as_process_baseline() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../eval-baseline/quality.json");
+        let baseline = load_process_baseline(&path).expect("quality.json");
+        assert!(baseline.is_captured());
+        assert!((baseline.process_pass_rate.unwrap() - 5.0 / 7.0).abs() < 1e-9);
+        assert_eq!(baseline.budget_pass_rate, Some(1.0));
+    }
+
+    #[test]
+    fn process_compare_flags_one_cell_drop_on_seven_row_suite() {
+        let baseline = ProcessBaseline {
+            schema_version: 2,
+            captured_at: Some("2026-08-20".into()),
+            process_pass_rate: Some(5.0 / 7.0),
+            budget_pass_rate: Some(1.0),
+            write_overwrite_violations: 0,
+            image_elision_misses: 0,
+            solve_rate: Some(6.0 / 7.0),
+            note: None,
+        };
+        let mut worse = sample_summary(6.0 / 7.0, 0.0);
+        worse.process_pass_rate = Some(4.0 / 7.0);
+        worse.budget_pass_rate = Some(1.0);
+        let report = compare_to_process_baseline(&baseline, &worse, 0.05);
+        assert!(report.baseline_captured);
+        assert!(
+            report
+                .deltas
+                .iter()
+                .any(|d| d.metric == "process_pass_rate" && d.regressed),
+            "{:?}",
+            report.deltas
+        );
+    }
+
+    #[test]
+    fn process_compare_does_not_flag_solve_rate() {
+        let baseline = ProcessBaseline {
+            schema_version: 2,
+            captured_at: Some("2026-08-20".into()),
+            process_pass_rate: Some(5.0 / 7.0),
+            budget_pass_rate: Some(1.0),
+            write_overwrite_violations: 0,
+            image_elision_misses: 0,
+            solve_rate: Some(6.0 / 7.0),
+            note: None,
+        };
+        let mut current = sample_summary(0.5, 0.0);
+        current.process_pass_rate = Some(5.0 / 7.0);
+        current.budget_pass_rate = Some(1.0);
+        let report = compare_to_process_baseline(&baseline, &current, 0.05);
+        assert_eq!(report.regressions, 0);
+        assert!(
+            report.deltas.iter().all(|d| d.metric != "solve_rate"),
+            "solve_rate must stay out of the process gate: {:?}",
+            report.deltas
+        );
     }
 }

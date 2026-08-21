@@ -138,7 +138,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command still running at its timeout continues in the background and returns a shell handle (`sh_N`) — read output with bash_output and stop with bash_kill. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get the handle immediately. For a slow but finite build or test suite, raise `timeout` so it finishes in the foreground. For very long background work (a big download, a multi-hour job), chain the follow-up steps into the command itself (`fetch && convert`) so nothing has to babysit it. On macOS/Linux, use `python3` rather than assuming a `python` command exists. Shell handles use the `sh_` prefix; agent subagent tasks use `task_` — do not mix them.".into(),
+            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command still running at its timeout continues in the background and returns a shell handle (`sh_N`) — read output with bash_output and stop with bash_kill. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get the handle immediately. For a slow but finite build or test suite, raise `timeout` so it finishes in the foreground. For very long background work (a big download, a multi-hour job), chain the follow-up steps into the command itself (`fetch && convert`) so nothing has to babysit it. On macOS/Linux, use `python3` rather than assuming a `python` command exists. Shell handles use the `sh_` prefix; agent subagent tasks use `task_` — do not mix them. Do not curl/wget a public http(s) URL the user already gave — use `web_fetch`. Do not use the shell as a search engine — use `web_search`.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -304,7 +304,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "web_search".into(),
-            description: "Search the web for current information outside the repo — library docs, API specs, current events, model catalogs, recent release notes. Returns cited results (title, URL, snippet). Don't use this for things `read`/`grep`/`list` can answer locally.".into(),
+            description: "Search the web for current information outside the repo — library docs, API specs, current events, model catalogs, recent release notes. Returns cited results (title, URL, snippet). Don't use this for things `read`/`grep`/`list` can answer locally. If the user already gave an exact http(s) URL, use `web_fetch` instead of searching.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -316,7 +316,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "web_fetch".into(),
-            description: "Fetch a public URL and return its content (JSON pretty-printed, HTML stripped to text, truncated). No API key needed. Use this for documentation pages, public API URLs, or any direct URL the model needs to read. For search-engine results use `web_search`; for Hugging Face model discovery use `/hf` or Hub API URLs explicitly.".into(),
+            description: "Fetch a public URL and return its content (JSON pretty-printed, HTML stripped to text, truncated). No API key needed. Use this for documentation pages, public API URLs, or any direct URL the model needs to read — prefer it over `bash` curl/wget. For search-engine results use `web_search`; for Hugging Face model discovery use `/hf` or Hub API URLs explicitly.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1281,6 +1281,35 @@ mod tests {
         assert!(is_known_tool("delegate"));
         assert!(is_known_tool("ask_user"));
         assert!(!is_known_tool("hallucinated_tool"));
+    }
+
+    fn spec(name: &str) -> &'static ToolSpec {
+        TOOL_SPECS
+            .iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+    }
+
+    #[test]
+    fn web_tools_split_known_url_from_search_and_curl() {
+        let bash = spec("bash");
+        assert!(
+            bash.description.contains("web_fetch") && bash.description.contains("curl"),
+            "bash must defer given URLs to web_fetch: {}",
+            bash.description
+        );
+        let search = spec("web_search");
+        assert!(
+            search.description.contains("web_fetch"),
+            "web_search must defer exact URLs to web_fetch: {}",
+            search.description
+        );
+        let fetch = spec("web_fetch");
+        assert!(
+            fetch.description.contains("curl") || fetch.description.contains("wget"),
+            "web_fetch should beat bash curl: {}",
+            fetch.description
+        );
     }
 
     /// ADR 002: every catalog row carries an admission gate + human alternative.

@@ -635,18 +635,29 @@ fn parse_loop_id(s: &str) -> Result<u64, String> {
         .map_err(|_| format!("bad loop id '{s}' — /loop list shows ids"))
 }
 
-/// Split a `/loop` argument into its subcommand form.
 /// The purpose-built prompt for a `/loop review` PR-review watcher. The loop's
 /// child agent has shell access, so it drives `gh` directly; the session it
 /// resumes each firing remembers which PRs it already reviewed, and the
 /// quiet/loud contract makes "no new PRs" a silent `NOTHING NEW`.
-pub const REVIEW_PROMPT: &str = "Review this repository's open pull requests. Run \
+const REVIEW_LOOP_CONTRACT: &str = "Review this repository's open pull requests. Run \
     `gh pr list --state open` to find them. For each PR you have NOT already reviewed earlier in \
     this conversation, read its diff with `gh pr diff <number>` and assess it for correctness, \
     missing tests, and risks, then post a concise review with \
     `gh pr review <number> --comment --body \"<your review>\"` (a comment — do not approve or \
     request changes). If there are no pull requests you haven't already reviewed, reply with \
     exactly: NOTHING NEW. Otherwise report which PRs you reviewed and the gist of each.";
+
+/// `/loop review` prompt: contract plus the code-review procedure/findings.
+pub fn review_loop_prompt() -> String {
+    let excerpt = crate::skills::review_loop_skill_excerpt();
+    if excerpt.is_empty() {
+        REVIEW_LOOP_CONTRACT.to_string()
+    } else {
+        format!(
+            "{REVIEW_LOOP_CONTRACT}\n\nFollow the `code-review` skill (procedure and findings):\n\n{excerpt}"
+        )
+    }
+}
 
 /// Parse a fire-window spec: `H-H` (hours 0..24) with an optional `weekdays`
 /// (or `mon-fri`) token → `(start_hour, end_hour, weekdays_only)`.
@@ -668,6 +679,7 @@ pub fn parse_loop_window(s: &str) -> Option<(u8, u8, bool)> {
     Some((start, end, weekdays))
 }
 
+/// Split a `/loop` argument into its subcommand form.
 pub fn parse_loop_arg(arg: &str) -> LoopArg {
     let a = arg.trim();
     if a.is_empty() || a == "list" || a == "ls" || a == "status" {
@@ -693,7 +705,7 @@ pub fn parse_loop_arg(arg: &str) -> LoopArg {
         };
         return LoopArg::Create {
             secs,
-            prompt: REVIEW_PROMPT.to_string(),
+            prompt: review_loop_prompt(),
         };
     }
     // `trio <prompt>` — a bounded plan→execute→review loop.
@@ -2885,18 +2897,25 @@ mod tests {
             parse_loop_arg("review"),
             LoopArg::Create {
                 secs: 1800,
-                prompt: super::REVIEW_PROMPT.to_string()
+                prompt: super::review_loop_prompt()
             }
         );
         assert_eq!(
             parse_loop_arg("review 1h"),
             LoopArg::Create {
                 secs: 3600,
-                prompt: super::REVIEW_PROMPT.to_string()
+                prompt: super::review_loop_prompt()
             }
         );
         assert!(matches!(parse_loop_arg("review 5s"), LoopArg::Invalid(_)));
-        assert!(super::REVIEW_PROMPT.contains("gh pr review"));
+        let review_prompt = super::review_loop_prompt();
+        assert!(review_prompt.contains("gh pr review"));
+        assert!(review_prompt.contains("--comment"));
+        assert!(review_prompt.contains("NOTHING NEW"));
+        assert!(
+            review_prompt.contains("code-review") && review_prompt.contains("[P0]"),
+            "{review_prompt}"
+        );
         // Window parse edge cases.
         assert_eq!(super::parse_loop_window("0-24"), Some((0, 24, false)));
         assert_eq!(
