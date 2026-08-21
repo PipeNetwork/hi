@@ -2214,6 +2214,50 @@ impl crate::App {
         }
     }
 
+    /// Apply a completed `/login` poll. Returns `/provider <name>` to queue
+    /// when the credential landed so the session leaves the dead route.
+    pub(crate) async fn poll_pending_login(&mut self) -> Option<String> {
+        let finished = self
+            .pending_login
+            .as_ref()
+            .is_some_and(|(_, task)| task.is_finished());
+        if !finished {
+            return None;
+        }
+        let Some((provider, task)) = self.pending_login.take() else {
+            return None;
+        };
+        match task.await {
+            Ok(Ok(())) => {
+                self.push(Line::styled(
+                    format!(
+                        "signed in to {provider} — switching to it (run /logout {provider} to pair a different account)"
+                    ),
+                    dim(),
+                ));
+                self.follow();
+                Some(format!("/provider {provider}"))
+            }
+            Ok(Err(error)) => {
+                self.push(Line::styled(
+                    format!("/login {provider} failed: {error:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+                self.follow();
+                None
+            }
+            Err(error) if error.is_cancelled() => None,
+            Err(error) => {
+                self.push(Line::styled(
+                    format!("/login {provider} failed: {error}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+                self.follow();
+                None
+            }
+        }
+    }
+
     /// Bare `/team`: an interactive role menu — the same dropdown feel as
     /// `/model`. Enter on a role opens its model picker; the first row wires
     /// the whole team in one keystroke.

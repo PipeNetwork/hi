@@ -133,6 +133,7 @@ impl crate::App {
             provider_form: None,
             provider_picker: None,
             pending_local_catalog: None,
+            pending_login: None,
             fetching: None,
             planning: None,
             status: String::new(),

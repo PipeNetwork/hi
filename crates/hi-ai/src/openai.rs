@@ -377,7 +377,11 @@ impl Provider for OpenAiProvider {
             // replay the same attempt once. Guarded by `auth_refreshed` so a
             // source that refreshes to an equally-rejected token can't loop, and
             // skipped entirely for API keys, whose `refresh` returns false.
-            if kind == ProviderErrorKind::Auth && !auth_refreshed && self.auth.refresh().await {
+            if kind == ProviderErrorKind::Auth
+                && !crate::is_billing_or_quota_text(&text)
+                && !auth_refreshed
+                && self.auth.refresh().await
+            {
                 auth_refreshed = true;
                 sink(StreamEvent::Status(
                     "credential expired; refreshed it — retrying".to_string(),

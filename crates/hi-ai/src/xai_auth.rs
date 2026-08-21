@@ -261,12 +261,25 @@ pub async fn refresh(refresh_token: &str) -> Result<StoredToken> {
         .into_stored(Some(refresh_token))
 }
 
+/// True when `auth.json` already has an xAI OAuth credential.
+pub fn has_credential() -> bool {
+    auth_store::load(PROVIDER_ID).is_some()
+}
+
 /// Run the full device-code sign-in and persist the credential.
 ///
 /// Prints the URL and code, then blocks until the user approves in a browser.
 /// No local callback server and no browser launch — the user opens the link
 /// themselves, which also makes this work over SSH.
 pub async fn login() -> Result<()> {
+    if has_credential() {
+        println!("already signed in to xAI");
+        println!(
+            "  \x1b[2mUse `/provider xai` (or `hi --provider xai`).\n  \
+             `/logout xai` first to sign in with a different account.\x1b[0m"
+        );
+        return Ok(());
+    }
     let device = request_device_code().await?;
 
     println!("\n  Open this URL and approve the sign-in:\n");

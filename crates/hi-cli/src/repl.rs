@@ -382,20 +382,22 @@ pub(crate) async fn repl(
                         Command::Login(arg) => {
                             match login_provider_arg(arg.trim()) {
                                 Ok(LoginProvider::Xai) => {
+                                    let already = hi_ai::xai_auth::has_credential();
                                     if let Err(err) = hi_ai::xai_auth::login().await {
                                         eprintln!("\x1b[33m/login failed: {err:#}\x1b[0m");
-                                    } else {
+                                    } else if !already {
                                         println!(
-                                            "\x1b[2mRestart hi or run /provider to pick up the new credential.\x1b[0m"
+                                            "\x1b[2mRun /provider xai to use the new credential.\x1b[0m"
                                         );
                                     }
                                 }
                                 Ok(LoginProvider::Pipenetwork) => {
+                                    let already = hi_ai::pipenetwork_auth::has_credential();
                                     if let Err(err) = hi_ai::pipenetwork_auth::login().await {
                                         eprintln!("\x1b[33m/login failed: {err:#}\x1b[0m");
-                                    } else {
+                                    } else if !already {
                                         println!(
-                                            "\x1b[2mRestart hi or run /provider to pick up the new credential.\x1b[0m"
+                                            "\x1b[2mRun /provider pipenetwork to use the new credential.\x1b[0m"
                                         );
                                     }
                                 }

@@ -809,6 +809,10 @@ pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
         );
     }
     match hi_ai::provider_error_kind(err) {
+        Some(K::Auth) if hi_ai::is_billing_or_quota_text(&err.to_string()) => (
+            "auth",
+            "this provider is out of credits — /login pipenetwork then /provider pipenetwork, or add credits and /retry",
+        ),
         Some(K::Auth) => (
             "auth",
             "your API key may be invalid or expired — try /provider to reconfigure, then /retry",
@@ -1217,6 +1221,20 @@ mod tests {
         assert_eq!(kind, "capacity");
         assert!(guidance.contains("capacity is limited"));
         assert!(!error_counts_as_model_issue(&err));
+    }
+
+    #[test]
+    fn grok_credit_exhaustion_points_at_pipenetwork_not_a_dead_key() {
+        let err: anyhow::Error = ProviderError::new(
+            ProviderErrorKind::Auth,
+            "API error 403 Forbidden: You have run out of credits or need a Grok subscription. Add credits at https://grok.com/?_s=usage",
+        )
+        .into();
+        let (kind, guidance) = classify_error(&err);
+        assert_eq!(kind, "auth");
+        assert!(guidance.contains("/login pipenetwork"));
+        assert!(guidance.contains("/provider pipenetwork"));
+        assert!(!guidance.contains("API key may be invalid"));
     }
 
     #[test]

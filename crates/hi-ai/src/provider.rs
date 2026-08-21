@@ -23,6 +23,28 @@ pub enum ProviderErrorKind {
     Other,
 }
 
+/// True when an HTTP body is a billing/quota refusal, not a dead credential.
+///
+/// xAI answers "out of credits" with 403, which we otherwise classify as
+/// [`ProviderErrorKind::Auth`] and try to refresh. Refreshing a valid token
+/// cannot mint Grok credits; the user needs another provider or to top up.
+pub fn is_billing_or_quota_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "out of credits",
+        "run out of credits",
+        "insufficient credits",
+        "insufficient_quota",
+        "insufficient quota",
+        "quota exceeded",
+        "need a grok subscription",
+        "add credits",
+        "buy credits",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 impl ProviderErrorKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -758,5 +780,15 @@ mod tests {
         assert!(!provider_error_is_fallback_eligible(&err));
         assert!(!provider_route_error_is_retryable(&err));
         assert!(!provider_error_affects_health(&err));
+    }
+
+    #[test]
+    fn grok_credit_body_is_billing_not_a_dead_token() {
+        assert!(is_billing_or_quota_text(
+            "You have run out of credits or need a Grok subscription. Add credits at https://grok.com/"
+        ));
+        assert!(is_billing_or_quota_text("insufficient_quota"));
+        assert!(!is_billing_or_quota_text("invalid access token"));
+        assert!(!is_billing_or_quota_text("expired token"));
     }
 }

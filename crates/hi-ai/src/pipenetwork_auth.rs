@@ -218,8 +218,21 @@ pub async fn poll_for_key(issue: &PairingIssue) -> Result<StoredToken> {
     }
 }
 
+/// True when `auth.json` already has a pipenetwork project key.
+pub fn has_credential() -> bool {
+    auth_store::load(PROVIDER_ID).is_some()
+}
+
 /// Run the full browser pairing and persist the project API key.
 pub async fn login() -> Result<()> {
+    if has_credential() {
+        println!("already signed in to pipenetwork");
+        println!(
+            "  \x1b[2mUse `/provider pipenetwork` (or `hi --provider pipenetwork`).\n  \
+             `/logout pipenetwork` first to pair a different account.\x1b[0m"
+        );
+        return Ok(());
+    }
     let issue = request_pairing().await?;
 
     println!("\n  Open this URL and sign in to connect hi:\n");

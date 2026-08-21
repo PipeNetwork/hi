@@ -141,7 +141,11 @@ impl Provider for XaiProvider {
             let rate_limits = rate_limits_from_headers(response.headers());
             let text = response.text().await.unwrap_or_default();
             let kind = request::classify_http_error(status, &text);
-            if kind == ProviderErrorKind::Auth && !auth_refreshed && self.auth.refresh().await {
+            if kind == ProviderErrorKind::Auth
+                && !crate::is_billing_or_quota_text(&text)
+                && !auth_refreshed
+                && self.auth.refresh().await
+            {
                 auth_refreshed = true;
                 sink(StreamEvent::Status(
                     "credential expired; refreshed it — retrying".to_string(),

@@ -188,7 +188,15 @@ async fn fetch_models_inner(
 ) -> Result<Vec<ServedModel>> {
     let resp = send_with_retry_deadline(builder, budget).await?;
     if !resp.status().is_success() {
-        bail!("models endpoint returned {}", resp.status());
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if crate::is_billing_or_quota_text(&text) {
+            bail!(
+                "models endpoint returned {status}: this provider is out of credits — \
+                 /login pipenetwork then /provider pipenetwork"
+            );
+        }
+        bail!("models endpoint returned {status}");
     }
     let list: ModelsList = resp.json().await.context("parsing models list")?;
     Ok(list.data.into_iter().map(ModelEntry::into_served).collect())

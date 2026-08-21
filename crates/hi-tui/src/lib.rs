@@ -1228,6 +1228,9 @@ pub(crate) struct App {
     pub(crate) pending_local_catalog: Option<
         tokio::task::JoinHandle<anyhow::Result<Vec<hi_agent::local_skeptic::LocalCatalogModel>>>,
     >,
+    /// Background `/login` pairing/device poll. Completing it queues
+    /// `/provider <name>` so the session actually switches off the dead route.
+    pub(crate) pending_login: Option<(String, tokio::task::JoinHandle<anyhow::Result<()>>)>,
     /// Callback for launching configured multi-provider Diff Lab API runs.
     pub(crate) diff_api_runner: Option<DiffApiRunner>,
     pub(crate) race_runner: Option<RaceRunner>,
@@ -1532,6 +1535,9 @@ impl Drop for App {
             pending.task.abort();
         }
         if let Some(pending) = self.pending_local_catalog.take() {
+            pending.abort();
+        }
+        if let Some((_, pending)) = self.pending_login.take() {
             pending.abort();
         }
     }
