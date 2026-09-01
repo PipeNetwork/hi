@@ -1,0 +1,184 @@
+use super::common::*;
+use super::*;
+use std::sync::Arc;
+
+type DecisionRecords = Arc<Mutex<Vec<Vec<Decision>>>>;
+
+struct DecisionRecordingSession {
+    records: DecisionRecords,
+}
+
+impl SessionSink for DecisionRecordingSession {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _messages: &[Message]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_decisions(&mut self, decisions: &DecisionLog) -> anyhow::Result<()> {
+        self.records
+            .lock()
+            .unwrap()
+            .push(decisions.entries().to_vec());
+        Ok(())
+    }
+}
+
+struct FailingDecisionSession;
+
+impl SessionSink for FailingDecisionSession {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _messages: &[Message]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_decisions(&mut self, _decisions: &DecisionLog) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("disk full"))
+    }
+}
+
+#[tokio::test]
+async fn record_decision_persists_across_compaction_in_system_prompt() {
+    // A decision recorded via the tool survives a compaction in the system
+    // prompt (the log is injected into the system message, which compaction
+    // preserves verbatim — not summarized away).
+    let responses = vec![
+        completion(
+            vec![Content::ToolCall {
+                id: "d1".into(),
+                name: "record_decision".into(),
+                arguments: r#"{"summary":"use BTreeMap","rationale":"ordered iteration","files":["src/m.rs"]}"#.into(),
+            }],
+            1,
+            1,
+        ),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(
+            vec![Content::Text("No file changes are needed; the decision was recorded.".into())],
+            1,
+            1,
+        ),
+        completion(vec![Content::Text("Compaction summary.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    agent.run_turn("refactor", &mut NullUi).await.unwrap();
+    assert_eq!(agent.decisions().entries().len(), 1);
+    assert_eq!(agent.decisions().entries()[0].summary, "use BTreeMap");
+    let entry = agent
+        .last_turn_telemetry()
+        .tool_timeline
+        .iter()
+        .find(|entry| entry.tool == "record_decision")
+        .expect("record_decision appears in the typed tool timeline");
+    assert_eq!(entry.status, hi_tools::ToolStatus::Succeeded);
+    assert!(!entry.effects.mutation_attempted);
+
+    // The decision reaches the model via the per-turn context block — it is
+    // durable agent state, deliberately kept out of the stable system prompt
+    // so message[0] stays byte-stable for prompt caching.
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(
+        block.contains("use BTreeMap") && block.contains("ordered iteration"),
+        "decision in context block: {block}"
+    );
+
+    // A compaction that summarizes the Q&A tail must NOT lose the decision —
+    // it lives outside the transcript and is re-injected every turn.
+    agent
+        .compact_with(CompactionKind::Summarize, &mut NullUi)
+        .await
+        .unwrap();
+    let block_after = agent.volatile_context_block().unwrap_or_default();
+    assert!(
+        block_after.contains("use BTreeMap"),
+        "decision survives compaction: {block_after}"
+    );
+}
+
+#[test]
+fn resume_restores_decision_log_and_rebuilds_system_prompt() {
+    let mut decisions = DecisionLog::default();
+    decisions.record(Decision {
+        summary: "use BTreeMap".into(),
+        rationale: "ordered iteration".into(),
+        files: vec!["src/m.rs".into()],
+    });
+    let agent = Agent::resume(
+        std::sync::Arc::new(Canned(Mutex::new(Vec::new()))),
+        config(),
+        vec![Message::system("old prompt without decisions")],
+        Usage::default(),
+        Vec::new(),
+        None,
+        decisions,
+    )
+    .unwrap();
+
+    assert_eq!(agent.decisions().entries().len(), 1);
+    assert_eq!(agent.decisions().entries()[0].summary, "use BTreeMap");
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(
+        block.contains("use BTreeMap") && block.contains("ordered iteration"),
+        "resume should surface persisted decisions in the context block: {block}"
+    );
+    let sys = agent.messages()[0].text();
+    assert!(
+        !sys.contains("old prompt without decisions"),
+        "resume should rebuild, not keep stale prompt text: {sys}"
+    );
+}
+
+#[test]
+fn record_decision_persists_log_before_updating_visible_prompt() {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = agent(vec![], config());
+    agent.set_session(Box::new(DecisionRecordingSession {
+        records: records.clone(),
+    }));
+
+    let result = agent.handle_record_decision(
+        r#"{"summary":"use BTreeMap","rationale":"ordered iteration","files":["src/m.rs"]}"#,
+    );
+
+    assert_eq!(result.status, hi_tools::ToolStatus::Succeeded);
+    assert!(
+        result.content.contains("Decision recorded"),
+        "result: {}",
+        result.content
+    );
+    assert_eq!(agent.decisions().entries().len(), 1);
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0][0].summary, "use BTreeMap");
+    assert!(
+        agent
+            .volatile_context_block()
+            .unwrap_or_default()
+            .contains("use BTreeMap")
+    );
+}
+
+#[test]
+fn record_decision_keeps_visible_prompt_unchanged_when_persistence_fails() {
+    let mut agent = agent(vec![], config());
+    agent.set_session(Box::new(FailingDecisionSession));
+
+    let result = agent.handle_record_decision(
+        r#"{"summary":"use BTreeMap","rationale":"ordered iteration","files":["src/m.rs"]}"#,
+    );
+
+    assert!(
+        result.content.contains("couldn't persist decision"),
+        "result: {}",
+        result.content
+    );
+    assert_eq!(result.status, hi_tools::ToolStatus::Failed);
+    assert!(agent.decisions().entries().is_empty());
+    assert!(!agent.messages()[0].text().contains("use BTreeMap"));
+}

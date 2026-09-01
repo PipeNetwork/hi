@@ -1,0 +1,5 @@
+{
+  "telemetry": {
+    "tool_timeline": [{"tool": "write", "path": "a.rs"}]
+  }
+}

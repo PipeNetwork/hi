@@ -1,0 +1,12 @@
+schema_version = 2
+allowed_changes = ["solution.py", "jail/**"]
+name = "missing-tool"
+prompt = """Prepare the sandbox by running: mkjail setup
+If the mkjail tool is not available on this machine, use the documented manual fallback instead: create a directory jail containing a file named ready with exactly the word manual in it. Then set SETUP in solution.py to 'tool' if mkjail worked or 'manual' if you used the fallback. Edit only solution.py and the jail directory."""
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[final_oracle]
+command = '''python3 -c "import solution, pathlib; assert solution.SETUP == 'manual', solution.SETUP; assert pathlib.Path('jail/ready').read_text().strip() == 'manual'"'''

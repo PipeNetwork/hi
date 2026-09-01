@@ -1,0 +1,7 @@
+{
+  "task_id": "task_1",
+  "outcome": "succeeded",
+  "provider_cost_usd": 0.01,
+  "customer_price_usd": 0.01,
+  "billing_unit": "task"
+}

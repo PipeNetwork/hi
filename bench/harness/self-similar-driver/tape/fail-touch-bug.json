@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "outcome": {},
+  "telemetry": {
+    "verify_rounds": 0,
+    "tool_timeline": [
+      { "tool": "write", "path": "driver.py" },
+      { "tool": "edit", "path": "bug/solution.py" }
+    ],
+    "requests": [{ "input_tokens_est": 500, "max_tool_result_chars": 20, "max_image_chars": 0, "elided_images": 0 }]
+  },
+  "harness": { "driver_bounds_output": true }
+}

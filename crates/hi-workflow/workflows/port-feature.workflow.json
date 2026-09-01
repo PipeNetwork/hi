@@ -1,0 +1,13 @@
+{
+  "metadata":{"name":"port-feature","description":"Analyze and port a feature into the current workspace with verification.","version":"1"},
+  "steps":[
+    {"type":"phase","title":"Analyze"},
+    {"type":"parallel_agents","jobs":[
+      {"id":"source","prompt":"Analyze the source implementation described by {{args.input}}. Identify behavior, interfaces, tests, and dependencies.","label":"source analysis","phase":"Analyze"},
+      {"id":"target","prompt":"Analyze the target workspace for integration points and constraints for {{args.input}}.","label":"target analysis","phase":"Analyze"}
+    ]},
+    {"type":"phase","title":"Implement"},
+    {"type":"agent","id":"implement","prompt":"Port the feature into the target workspace. Preserve behavior, add tests, and run targeted verification.\nSource analysis: {{agents.source.output}}\nTarget analysis: {{agents.target.output}}","label":"implementation","phase":"Implement"},
+    {"type":"complete","result":{"result":"{{agents.implement.output}}"}}
+  ]
+}

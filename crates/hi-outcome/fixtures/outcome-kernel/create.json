@@ -1,0 +1,20 @@
+{
+  "type": "code.change",
+  "goal": "Reply with the JSON object {\"ok\": true} and nothing else.",
+  "inputs": {
+    "repository": { "id": "repo_1" }
+  },
+  "outcome_contract": {
+    "result": { "format": "git_patch" },
+    "verifiers": [
+      {
+        "type": "json_schema",
+        "required": true,
+        "schema": { "type": "object", "required": ["ok"] }
+      }
+    ]
+  },
+  "execution_policy": {
+    "maximum_cost_usd": 1.0
+  }
+}

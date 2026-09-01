@@ -1,0 +1,21 @@
+[package]
+name = "hi-x402"
+edition.workspace = true
+version.workspace = true
+description = "Solana USDC transfer + memo for hi x402 payments"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+hi-ai.workspace = true
+serde_json.workspace = true
+solana-sdk = "2.2"
+solana-client = "2.2"
+spl-associated-token-account = "6"
+spl-memo = "6"
+spl-token = "7"
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

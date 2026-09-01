@@ -1,0 +1,1808 @@
+//! Private, append-only candidate evidence for RSI-observed `hi` turns.
+//!
+//! Event records contain only metadata and content-addressed references. Full
+//! prompts, model messages, tool payloads, patches, and verification output are
+//! stored in the BLAKE3 CAS below the trace directory.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result, anyhow, ensure};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+mod spool;
+pub use spool::{DEFAULT_UPLOAD_BATCH, DurableSpool, SpoolPriority, SpoolRecord, retry_delay};
+
+pub const TRACE_SCHEMA_VERSION: u16 = 1;
+pub const DEFAULT_RUN_MAX_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_GLOBAL_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+pub const DEFAULT_RETENTION_DAYS: u64 = 30;
+const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceMode {
+    Local,
+    Managed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BlobRef {
+    pub hash: String,
+    pub size_bytes: u64,
+    pub media_type: String,
+}
+
+/// Worker-provided provenance that *labels* a candidate-authored trace with
+/// the control-plane run it claims to belong to. It is repeated in the report
+/// summary and trace manifest; events are transitively associated through
+/// `trace_id` and the manifest's hash-chain root.
+///
+/// This is a **claim, not a binding**: the trace is unsigned, so within this
+/// crate the identity only makes the trace internally consistent (tamper-
+/// evident on disk). It becomes authoritative only when the external worker
+/// independently checks the provenance against the signed control-plane
+/// manifest before accepting the evidence — see `docs/architecture.md`
+/// "Trace trust boundary" and ADR 001.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TraceIdentity {
+    pub run_id: String,
+    pub task_id: String,
+    pub candidate_id: String,
+    pub manifest_hash: String,
+    pub agent_artifact_hash: String,
+    pub repository_snapshot_hash: String,
+    pub runtime_descriptor_hash: String,
+}
+
+/// Seam that anchors a finished trace to an external trust domain.
+///
+/// The trace's hash chain gives local tamper-evidence only (see
+/// `docs/architecture.md` "Trace trust boundary"). A managed deployment
+/// supplies a `TraceAttestor` that signs the trace's terminal `root_hash` with
+/// a key the candidate cannot read, turning the locally consistent chain into
+/// worker-anchored evidence. The result string is stored verbatim in the
+/// manifest; its format is the attestor's contract (e.g. a worker signature,
+/// or [`LocalAttestor`]'s `local-signed:` ed25519 label for self-hosted runs
+/// so they can never be mistaken for worker-attested evidence).
+pub trait TraceAttestor: Send + Sync {
+    /// Produce an attestation binding `root_hash` (the trace's terminal event
+    /// hash) and `identity` (the worker-provided provenance) to an external
+    /// trust domain.
+    fn attest_trace(&self, root_hash: &str, identity: Option<&TraceIdentity>) -> Result<String>;
+}
+
+/// Self-hosted attestation: a real ed25519 signature over the trace's terminal
+/// `root_hash`, made with a **local** key. Emits `local-signed:<hex-signature>`.
+///
+/// This is *not* worker attestation — the key lives on the same machine as the
+/// trace, so it proves the trace has not been modified since signing (tamper-
+/// evidence), not that a trusted external worker anchored it. The
+/// `local-signed:` prefix keeps it distinguishable from a worker scheme, and
+/// consumers checking for worker attestation must still reject it. The prefix
+/// replaces the earlier `local-unattested:` placeholder label.
+///
+/// The signing key is a 32-byte ed25519 seed persisted at
+/// `$XDG_STATE_HOME/hi/trace-signing-key` (fallback `$HOME/.local/state/...`),
+/// created with `0600` permissions on first use.
+#[derive(Clone, Debug)]
+pub struct LocalAttestor {
+    key_path: std::path::PathBuf,
+}
+
+impl Default for LocalAttestor {
+    fn default() -> Self {
+        Self {
+            key_path: local_signing_key_path(),
+        }
+    }
+}
+
+impl LocalAttestor {
+    /// An attestor that signs with the key at `key_path`, creating it on first
+    /// use. Tests and non-standard layouts use this to avoid the shared
+    /// default location.
+    pub fn with_key_path(key_path: std::path::PathBuf) -> Self {
+        Self { key_path }
+    }
+}
+
+/// File name (under the trace state root) holding the local ed25519 seed.
+pub const LOCAL_SIGNING_KEY_FILE: &str = "trace-signing-key";
+
+/// Attestation scheme prefix emitted by [`LocalAttestor`].
+pub const LOCAL_SIGNED_PREFIX: &str = "local-signed:";
+
+impl TraceAttestor for LocalAttestor {
+    fn attest_trace(&self, root_hash: &str, _identity: Option<&TraceIdentity>) -> Result<String> {
+        let key = load_or_create_signing_key(&self.key_path)?;
+        sign_root_hash(&key, root_hash)
+    }
+}
+
+/// Attestation scheme prefix emitted by [`WorkerAttestor`].
+pub const WORKER_SIGNED_PREFIX: &str = "worker-signed:";
+
+/// A worker-provided signing oracle: given the canonical attestation message,
+/// return a signature. The signing key never enters the candidate process —
+/// the worker can back this with a unix-socket signing service, an HSM call,
+/// or a test stub. This indirection is the whole point of the trust boundary:
+/// the candidate cannot forge a worker attestation because it cannot sign.
+pub type SigningOracle = dyn Fn(&[u8]) -> Result<String> + Send + Sync;
+
+/// Worker attestation: delegates signing to a [`SigningOracle`] the external
+/// worker injects, so the trace is anchored with a key the candidate cannot
+/// read. Emits `worker-signed:<hex-signature>` over a domain-separated message
+/// binding the terminal `root_hash` to the run/candidate identity.
+///
+/// Unlike [`LocalAttestor`], this is genuine external attestation — *if* the
+/// oracle is backed by a real worker key. hi-trace defines the message format
+/// and scheme; whether the oracle is trustworthy is the deployment's contract.
+pub struct WorkerAttestor {
+    oracle: std::sync::Arc<SigningOracle>,
+}
+
+impl WorkerAttestor {
+    /// Wrap a worker signing oracle. The oracle receives the canonical message
+    /// bytes (see [`worker_attestation_message`]) and returns a hex signature.
+    pub fn new(oracle: std::sync::Arc<SigningOracle>) -> Self {
+        Self { oracle }
+    }
+
+    /// An attestor whose oracle is a worker-owned unix socket: each call
+    /// connects, writes the canonical message, and reads back a hex signature.
+    /// The signing key never leaves the worker process. Attestation runs once
+    /// at finalize, so the blocking round-trip is immaterial.
+    #[cfg(unix)]
+    pub fn from_socket(path: std::path::PathBuf) -> Self {
+        Self::new(std::sync::Arc::new(move |message: &[u8]| {
+            socket_sign(&path, message)
+        }))
+    }
+}
+
+/// Round-trip a message through a worker signing socket: connect, send the
+/// length-prefixed message, read the hex signature reply.
+#[cfg(unix)]
+fn socket_sign(path: &Path, message: &[u8]) -> Result<String> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(path)
+        .with_context(|| format!("connecting to worker signing socket {}", path.display()))?;
+    let len = u32::try_from(message.len()).context("attestation message too large")?;
+    stream
+        .write_all(&len.to_be_bytes())
+        .and_then(|()| stream.write_all(message))
+        .and_then(|()| stream.flush())
+        .context("writing to worker signing socket")?;
+    // Signal end of request so the worker can reply before we close.
+    stream.shutdown(std::net::Shutdown::Write).ok();
+    let mut reply = String::new();
+    stream
+        .read_to_string(&mut reply)
+        .context("reading from worker signing socket")?;
+    let signature = reply.trim().to_string();
+    ensure!(
+        !signature.is_empty(),
+        "worker signing socket returned an empty signature"
+    );
+    Ok(signature)
+}
+
+/// The canonical message a worker signs: a domain separator plus the identity
+/// and root hash, so a signature over this message cannot be replayed as a
+/// signature over a bare hash (or a different run's trace).
+pub fn worker_attestation_message(root_hash: &str, identity: Option<&TraceIdentity>) -> Vec<u8> {
+    let mut msg = String::from("hi-trace/worker-attestation/v1\n");
+    if let Some(id) = identity {
+        msg.push_str(&format!(
+            "run={}\ntask={}\ncandidate={}\nmanifest={}\n",
+            id.run_id, id.task_id, id.candidate_id, id.manifest_hash
+        ));
+    }
+    msg.push_str(&format!("root_hash={root_hash}"));
+    msg.into_bytes()
+}
+
+impl TraceAttestor for WorkerAttestor {
+    fn attest_trace(&self, root_hash: &str, identity: Option<&TraceIdentity>) -> Result<String> {
+        let message = worker_attestation_message(root_hash, identity);
+        let signature = (self.oracle)(&message)?;
+        Ok(format!("{WORKER_SIGNED_PREFIX}{signature}"))
+    }
+}
+
+/// Default path of the local trace-signing key, resolving the state home the
+/// same way the trace root does (`$XDG_STATE_HOME`, else `$HOME/.local/state`,
+/// else the current directory).
+pub fn local_signing_key_path() -> std::path::PathBuf {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".local/state"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    state_home.join("hi").join(LOCAL_SIGNING_KEY_FILE)
+}
+
+/// Load the local signing key, generating and persisting a fresh one (with
+/// owner-only permissions) when the file does not exist.
+pub fn load_or_create_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> {
+    use ed25519_dalek::SigningKey;
+    match fs::read(path) {
+        Ok(bytes) => {
+            let seed: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .context("local trace-signing key is not 32 bytes")?;
+            Ok(SigningKey::from_bytes(&seed))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut seed = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+            if let Some(parent) = path.parent() {
+                create_private_dir(parent)?;
+            }
+            atomic_private_write(path, &seed)?;
+            Ok(SigningKey::from_bytes(&seed))
+        }
+        Err(e) => Err(e).with_context(|| format!("reading signing key {}", path.display())),
+    }
+}
+
+/// Sign a trace root hash with the given key, returning the `local-signed:`
+/// attestation string. Public so the CLI's verify path and tests share the
+/// exact signing format the attestor emits.
+pub fn sign_root_hash(key: &ed25519_dalek::SigningKey, root_hash: &str) -> Result<String> {
+    use ed25519_dalek::Signer;
+    let signature = key.sign(root_hash.as_bytes());
+    Ok(format!(
+        "{LOCAL_SIGNED_PREFIX}{}",
+        hex::encode(signature.to_bytes())
+    ))
+}
+
+/// Verify a `local-signed:` attestation against a root hash and the local key
+/// at `key_path`. Returns `Ok(true)`/`Ok(false)` for a well-formed attestation,
+/// and `Err` when the attestation is malformed or the key cannot be read.
+pub fn verify_local_signature(attestation: &str, root_hash: &str, key_path: &Path) -> Result<bool> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let sig_hex = attestation
+        .strip_prefix(LOCAL_SIGNED_PREFIX)
+        .context("not a local-signed attestation")?;
+    let sig_bytes = hex::decode(sig_hex.trim()).context("invalid local signature encoding")?;
+    let signature = Signature::from_slice(&sig_bytes).context("invalid local signature length")?;
+    let key_bytes = fs::read(key_path)
+        .with_context(|| format!("reading signing key {}", key_path.display()))?;
+    let seed: [u8; 32] = key_bytes
+        .as_slice()
+        .try_into()
+        .context("local trace-signing key is not 32 bytes")?;
+    let verifying = VerifyingKey::from_bytes(
+        &ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes(),
+    )
+    .context("invalid local signing key")?;
+    Ok(verifying.verify(root_hash.as_bytes(), &signature).is_ok())
+}
+
+/// Verify a `worker-signed:` attestation against the worker's ed25519 public
+/// key. Unlike local verification, the candidate needs only the public key —
+/// the whole point of worker attestation. `identity` must be the trace's
+/// manifest identity so the signed message is reconstructed exactly.
+pub fn verify_worker_signature(
+    attestation: &str,
+    root_hash: &str,
+    identity: Option<&TraceIdentity>,
+    worker_public_key: &[u8; 32],
+) -> Result<bool> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let sig_hex = attestation
+        .strip_prefix(WORKER_SIGNED_PREFIX)
+        .context("not a worker-signed attestation")?;
+    let sig_bytes = hex::decode(sig_hex.trim()).context("invalid worker signature encoding")?;
+    let signature = Signature::from_slice(&sig_bytes).context("invalid worker signature length")?;
+    let verifying =
+        VerifyingKey::from_bytes(worker_public_key).context("invalid worker public key")?;
+    let message = worker_attestation_message(root_hash, identity);
+    Ok(verifying.verify(&message, &signature).is_ok())
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TraceSummary {
+    pub mode: TraceMode,
+    pub trace_schema: u16,
+    pub trace_id: String,
+    pub event_count: u64,
+    pub root_hash: String,
+    pub complete: bool,
+    pub fully_observed: bool,
+    pub candidate_evidence: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<TraceIdentity>,
+    /// External attestation over `root_hash`, when a [`TraceAttestor`] was
+    /// attached. Absent for local/unattested traces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TraceManifest {
+    pub trace_schema: u16,
+    pub trace_id: String,
+    pub mode: TraceMode,
+    pub event_count: u64,
+    pub root_hash: String,
+    pub complete: bool,
+    pub fully_observed: bool,
+    pub total_bytes: u64,
+    pub blobs: Vec<BlobRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<TraceIdentity>,
+    /// External attestation over `root_hash`, when a [`TraceAttestor`] was
+    /// attached. `validate_trace` carries it through unchanged — verifying the
+    /// attestation is the consumer's job, not this crate's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Event {
+    pub trace_schema: u16,
+    pub trace_id: String,
+    pub sequence: u64,
+    pub timestamp_unix_ms: u64,
+    pub elapsed_ms: u64,
+    pub kind: String,
+    pub stage: String,
+    pub attempt: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub causation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<String>,
+    pub previous_hash: String,
+    pub data: Value,
+    pub event_hash: String,
+}
+
+#[derive(Serialize)]
+struct EventHashMaterial<'a> {
+    trace_schema: u16,
+    trace_id: &'a str,
+    sequence: u64,
+    timestamp_unix_ms: u64,
+    elapsed_ms: u64,
+    kind: &'a str,
+    stage: &'a str,
+    attempt: u32,
+    causation: &'a Option<String>,
+    correlation: &'a Option<String>,
+    previous_hash: &'a str,
+    data: &'a Value,
+}
+
+pub struct TraceWriter {
+    dir: PathBuf,
+    trace_id: String,
+    mode: TraceMode,
+    events: File,
+    started: Instant,
+    sequence: u64,
+    root_hash: String,
+    total_bytes: u64,
+    max_bytes: u64,
+    blobs: BTreeMap<String, BlobRef>,
+    fully_observed: bool,
+    complete: bool,
+    identity: Option<TraceIdentity>,
+    attestor: Option<std::sync::Arc<dyn TraceAttestor>>,
+    /// Set at finalize from the attestor; `None` until then / when unattested.
+    attestation: Option<String>,
+}
+
+impl TraceWriter {
+    /// Create a trace at an exact directory. The caller is responsible for
+    /// choosing a fresh directory; existing content is rejected.
+    pub fn create(dir: impl AsRef<Path>, mode: TraceMode, max_bytes: u64) -> Result<Self> {
+        Self::create_with_identity(dir, mode, max_bytes, None)
+    }
+
+    /// Create a trace labeled with worker-provided run and candidate
+    /// provenance. Managed traces require this constructor; local traces may
+    /// remain anonymous for backwards compatibility. The provenance is
+    /// candidate-asserted here and only becomes authoritative when the worker
+    /// independently verifies it (see [`TraceIdentity`]).
+    pub fn create_bound(
+        dir: impl AsRef<Path>,
+        mode: TraceMode,
+        max_bytes: u64,
+        identity: TraceIdentity,
+    ) -> Result<Self> {
+        Self::create_with_identity(dir, mode, max_bytes, Some(identity))
+    }
+
+    fn create_with_identity(
+        dir: impl AsRef<Path>,
+        mode: TraceMode,
+        max_bytes: u64,
+        identity: Option<TraceIdentity>,
+    ) -> Result<Self> {
+        ensure!(max_bytes > 0, "RSI trace byte limit must be positive");
+        if mode == TraceMode::Managed {
+            ensure!(
+                identity.is_some(),
+                "managed RSI trace requires run provenance"
+            );
+        }
+        if let Some(identity) = &identity {
+            validate_identity(identity)?;
+        }
+        let dir = dir.as_ref().to_path_buf();
+        if dir.exists() {
+            ensure!(
+                fs::read_dir(&dir)?.next().is_none(),
+                "RSI trace directory is not empty"
+            );
+        } else {
+            create_private_dir(&dir)?;
+        }
+        create_private_dir(&dir.join("blobs"))?;
+        let trace_id = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| {
+                name.len() == 32
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(new_trace_id);
+        let events_path = dir.join("events.jsonl");
+        let events = private_new_file(&events_path)?;
+        let mut writer = Self {
+            dir,
+            trace_id,
+            mode,
+            events,
+            started: Instant::now(),
+            sequence: 0,
+            root_hash: ZERO_HASH.into(),
+            total_bytes: 0,
+            max_bytes,
+            blobs: BTreeMap::new(),
+            fully_observed: true,
+            complete: false,
+            identity,
+            attestor: None,
+            attestation: None,
+        };
+        writer.write_manifest(false)?;
+        Ok(writer)
+    }
+
+    /// Attach a [`TraceAttestor`] that anchors the trace at finalize time.
+    ///
+    /// Local traces stay unattested by default; managed deployments attach a
+    /// worker-backed attestor here so the finished manifest carries an
+    /// externally verifiable attestation over the terminal `root_hash`.
+    pub fn with_attestor(mut self, attestor: std::sync::Arc<dyn TraceAttestor>) -> Self {
+        self.attestor = Some(attestor);
+        self
+    }
+
+    /// Compute the attestation for the current terminal `root_hash`, if an
+    /// attestor is attached. Returns `Ok(None)` when unattested.
+    fn compute_attestation(&self) -> Result<Option<String>> {
+        match &self.attestor {
+            Some(attestor) => attestor
+                .attest_trace(&self.root_hash, self.identity.as_ref())
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Create a fresh local trace beneath `$XDG_STATE_HOME/hi/rsi`.
+    pub fn create_local(state_home: &Path, max_bytes: u64) -> Result<Self> {
+        let root = state_home.join("hi/rsi");
+        create_private_dir(&root)?;
+        prune(&root, DEFAULT_RETENTION_DAYS, DEFAULT_GLOBAL_MAX_BYTES)?;
+        let id = new_trace_id();
+        Self::create(root.join(id), TraceMode::Local, max_bytes)
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.dir
+    }
+    pub fn trace_id(&self) -> &str {
+        &self.trace_id
+    }
+
+    pub fn put_blob(&mut self, body: &[u8], media_type: impl Into<String>) -> Result<BlobRef> {
+        // Sanitize secrets from blob content. Text blobs (JSON, prompts, tool
+        // output) are scanned and replaced; binary blobs pass through unchanged
+        // when they aren't valid UTF-8. The string-level redactor handles
+        // credential-keyed JSON (`{"token":"…"}`) via its assignment pattern,
+        // so no separate tree walk is needed here.
+        let sanitized: Vec<u8>;
+        let body: &[u8] = if let Ok(text) = std::str::from_utf8(body) {
+            let redacted = hi_secrets::redact_secrets(text);
+            sanitized = redacted.into_owned().into_bytes();
+            &sanitized
+        } else {
+            body
+        };
+        let hash = blake3::hash(body).to_hex().to_string();
+        if let Some(existing) = self.blobs.get(&hash) {
+            return Ok(existing.clone());
+        }
+        let projected = self.total_bytes.saturating_add(body.len() as u64);
+        ensure!(
+            projected <= self.max_bytes,
+            "RSI trace exceeded its per-run byte limit"
+        );
+        let path = self.dir.join("blobs").join(&hash);
+        atomic_private_write(&path, body)?;
+        let blob = BlobRef {
+            hash: hash.clone(),
+            size_bytes: body.len() as u64,
+            media_type: media_type.into(),
+        };
+        self.total_bytes = projected;
+        self.blobs.insert(hash, blob.clone());
+        Ok(blob)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &mut self,
+        kind: impl Into<String>,
+        stage: impl Into<String>,
+        attempt: u32,
+        causation: Option<String>,
+        correlation: Option<String>,
+        mut data: Value,
+    ) -> Result<String> {
+        ensure!(!self.complete, "cannot append to a completed RSI trace");
+        // Sanitize secrets from trace event data before it is persisted to disk
+        // or uploaded — tool output, prompts, and model messages can carry API
+        // keys, tokens, and credentials that must never leave the local machine.
+        hi_secrets::redact_json_string_values(&mut data);
+        let kind = kind.into();
+        let stage = stage.into();
+        validate_label(&kind, "event kind")?;
+        validate_label(&stage, "event stage")?;
+        let causation = Some(causation.unwrap_or_else(|| self.root_hash.clone()));
+        let correlation =
+            Some(correlation.unwrap_or_else(|| format!("event-{}", self.sequence + 1)));
+        let sequence = self.sequence + 1;
+        let timestamp_unix_ms = unix_ms()?;
+        let elapsed_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let material = EventHashMaterial {
+            trace_schema: TRACE_SCHEMA_VERSION,
+            trace_id: &self.trace_id,
+            sequence,
+            timestamp_unix_ms,
+            elapsed_ms,
+            kind: &kind,
+            stage: &stage,
+            attempt,
+            causation: &causation,
+            correlation: &correlation,
+            previous_hash: &self.root_hash,
+            data: &data,
+        };
+        let event_hash = blake3::hash(&serde_json::to_vec(&material)?)
+            .to_hex()
+            .to_string();
+        let event = Event {
+            trace_schema: TRACE_SCHEMA_VERSION,
+            trace_id: self.trace_id.clone(),
+            sequence,
+            timestamp_unix_ms,
+            elapsed_ms,
+            kind,
+            stage,
+            attempt,
+            causation,
+            correlation,
+            previous_hash: self.root_hash.clone(),
+            data,
+            event_hash: event_hash.clone(),
+        };
+        let mut line = serde_json::to_vec(&event)?;
+        line.push(b'\n');
+        ensure!(
+            self.total_bytes.saturating_add(line.len() as u64) <= self.max_bytes,
+            "RSI trace exceeded its per-run byte limit"
+        );
+        self.events.write_all(&line)?;
+        self.events.sync_data()?;
+        self.total_bytes += line.len() as u64;
+        self.sequence = sequence;
+        self.root_hash = event_hash.clone();
+        // Keep the incomplete manifest current as well as the append-only
+        // journal. If the process is interrupted between events, recovery can
+        // still discover the latest sequence/root/blob set without requiring a
+        // clean shutdown or a second telemetry store.
+        self.write_manifest(false)?;
+        Ok(event_hash)
+    }
+
+    pub fn mark_unobserved(&mut self) {
+        self.fully_observed = false;
+    }
+
+    /// Persist the latest incomplete state after observation has been disabled.
+    /// This is best-effort recovery metadata, never a successful trace.
+    pub fn abandon(&mut self) -> Result<()> {
+        self.fully_observed = false;
+        self.complete = false;
+        self.events.sync_all()?;
+        self.write_manifest(false)?;
+        sync_dir(&self.dir)
+    }
+
+    pub fn finalize(mut self) -> Result<TraceSummary> {
+        self.complete = true;
+        self.events.sync_all()?;
+        // Anchor the finished trace: the terminal root_hash is final now, so
+        // this is the point to attest. A managed attestor turns the locally
+        // consistent chain into worker-anchored evidence; a failing attestor
+        // fails finalization rather than emitting an unattested managed trace.
+        self.attestation = self.compute_attestation()?;
+        self.write_manifest(true)?;
+        sync_dir(&self.dir)?;
+        Ok(self.summary())
+    }
+
+    pub fn summary(&self) -> TraceSummary {
+        TraceSummary {
+            mode: self.mode,
+            trace_schema: TRACE_SCHEMA_VERSION,
+            trace_id: self.trace_id.clone(),
+            event_count: self.sequence,
+            root_hash: self.root_hash.clone(),
+            complete: self.complete,
+            fully_observed: self.fully_observed,
+            candidate_evidence: true,
+            artifact_path: Some(self.dir.display().to_string()),
+            identity: self.identity.clone(),
+            attestation: self.attestation.clone(),
+        }
+    }
+
+    fn write_manifest(&mut self, complete: bool) -> Result<()> {
+        let manifest = TraceManifest {
+            trace_schema: TRACE_SCHEMA_VERSION,
+            trace_id: self.trace_id.clone(),
+            mode: self.mode,
+            event_count: self.sequence,
+            root_hash: self.root_hash.clone(),
+            complete,
+            fully_observed: self.fully_observed,
+            total_bytes: self.total_bytes,
+            blobs: self.blobs.values().cloned().collect(),
+            artifact_path: Some(self.dir.display().to_string()),
+            identity: self.identity.clone(),
+            attestation: self.attestation.clone(),
+        };
+        atomic_private_write(
+            &self.dir.join("manifest.json"),
+            &serde_json::to_vec_pretty(&manifest)?,
+        )
+    }
+}
+
+pub fn validate_trace(dir: &Path, max_bytes: u64, max_entries: usize) -> Result<TraceManifest> {
+    let dir_meta = fs::symlink_metadata(dir)?;
+    ensure!(
+        dir_meta.is_dir() && !dir_meta.file_type().is_symlink(),
+        "trace root is not a directory"
+    );
+    let manifest_path = dir.join("manifest.json");
+    let manifest: TraceManifest =
+        serde_json::from_slice(&read_regular(&manifest_path, max_bytes)?)?;
+    ensure!(
+        manifest.trace_schema == TRACE_SCHEMA_VERSION,
+        "unsupported trace schema"
+    );
+    if manifest.mode == TraceMode::Managed {
+        validate_identity(
+            manifest
+                .identity
+                .as_ref()
+                .ok_or_else(|| anyhow!("managed trace has no run provenance"))?,
+        )?;
+    } else if let Some(identity) = &manifest.identity {
+        validate_identity(identity)?;
+    }
+    ensure!(manifest.complete, "trace journal is incomplete");
+    let allowed = BTreeSet::from(["manifest.json", "events.jsonl", "blobs"]);
+    let mut entries = 0usize;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF-8 trace path"))?;
+        ensure!(allowed.contains(name), "unexpected trace entry {name}");
+        entries += 1;
+    }
+    ensure!(entries <= max_entries, "trace has too many entries");
+    let blobs_dir = dir.join("blobs");
+    let blobs_meta = fs::symlink_metadata(&blobs_dir)?;
+    ensure!(
+        blobs_meta.is_dir() && !blobs_meta.file_type().is_symlink(),
+        "trace blobs path is not a directory"
+    );
+    let expected = manifest
+        .blobs
+        .iter()
+        .map(|blob| (blob.hash.clone(), blob))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        expected.len() == manifest.blobs.len(),
+        "trace manifest contains duplicate blobs"
+    );
+    let mut seen = BTreeSet::new();
+    let mut actual_total = 0u64;
+    for entry in fs::read_dir(&blobs_dir)? {
+        let entry = entry?;
+        entries += 1;
+        ensure!(entries <= max_entries, "trace has too many entries");
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("non-UTF-8 blob path"))?;
+        ensure!(is_hash(&name), "invalid trace blob name");
+        let expected_blob = expected
+            .get(&name)
+            .ok_or_else(|| anyhow!("unreferenced trace blob"))?;
+        let body = read_regular(&entry.path(), max_bytes.saturating_sub(actual_total))?;
+        ensure!(
+            body.len() as u64 == expected_blob.size_bytes,
+            "trace blob size mismatch"
+        );
+        ensure!(
+            blake3::hash(&body).to_hex().as_str() == name,
+            "trace blob hash mismatch"
+        );
+        actual_total = actual_total
+            .checked_add(body.len() as u64)
+            .ok_or_else(|| anyhow!("trace size overflow"))?;
+        ensure!(actual_total <= max_bytes, "trace exceeds byte limit");
+        seen.insert(name);
+    }
+    ensure!(
+        seen.len() == expected.len(),
+        "trace manifest blob set mismatch"
+    );
+
+    let events_path = dir.join("events.jsonl");
+    let event_bytes = read_regular(&events_path, max_bytes.saturating_sub(actual_total))?;
+    ensure!(
+        event_bytes.is_empty() || event_bytes.ends_with(b"\n"),
+        "partial trace journal"
+    );
+    actual_total = actual_total.saturating_add(event_bytes.len() as u64);
+    ensure!(actual_total <= max_bytes, "trace exceeds byte limit");
+    ensure!(
+        actual_total == manifest.total_bytes,
+        "trace manifest byte count mismatch"
+    );
+    let mut previous = ZERO_HASH.to_string();
+    let mut count = 0u64;
+    for line in BufReader::new(event_bytes.as_slice()).lines() {
+        let line = line?;
+        ensure!(!line.is_empty(), "empty trace journal record");
+        let event: Event = serde_json::from_str(&line)?;
+        count += 1;
+        ensure!(
+            event.trace_schema == TRACE_SCHEMA_VERSION && event.trace_id == manifest.trace_id,
+            "trace event identity mismatch"
+        );
+        validate_label(&event.kind, "event kind")?;
+        validate_label(&event.stage, "event stage")?;
+        ensure!(
+            event
+                .correlation
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+                && event.causation.as_ref().is_some_and(|value| is_hash(value)),
+            "trace event metadata is incomplete"
+        );
+        ensure!(
+            event.sequence == count && event.previous_hash == previous,
+            "trace hash chain discontinuity"
+        );
+        let material = EventHashMaterial {
+            trace_schema: event.trace_schema,
+            trace_id: &event.trace_id,
+            sequence: event.sequence,
+            timestamp_unix_ms: event.timestamp_unix_ms,
+            elapsed_ms: event.elapsed_ms,
+            kind: &event.kind,
+            stage: &event.stage,
+            attempt: event.attempt,
+            causation: &event.causation,
+            correlation: &event.correlation,
+            previous_hash: &event.previous_hash,
+            data: &event.data,
+        };
+        let hash = blake3::hash(&serde_json::to_vec(&material)?)
+            .to_hex()
+            .to_string();
+        ensure!(hash == event.event_hash, "trace event hash mismatch");
+        previous = hash;
+    }
+    ensure!(
+        count == manifest.event_count && previous == manifest.root_hash,
+        "trace manifest does not match its journal"
+    );
+    Ok(manifest)
+}
+
+/// Remove only completed local traces, oldest first. Active/incomplete traces
+/// are never selected, even when the global cap is exceeded.
+pub fn prune(root: &Path, retention_days: u64, global_cap: u64) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_days.saturating_mul(86_400)))
+        .unwrap_or(UNIX_EPOCH);
+    let mut completed = Vec::new();
+    let mut total = 0u64;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let meta = fs::symlink_metadata(entry.path())?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let manifest_path = entry.path().join("manifest.json");
+        let Ok(raw) = read_regular(&manifest_path, 4 * 1024 * 1024) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<TraceManifest>(&raw) else {
+            continue;
+        };
+        if !manifest.complete {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+        total = total.saturating_add(manifest.total_bytes);
+        completed.push((modified, entry.path(), manifest.total_bytes));
+    }
+    completed.sort_by_key(|item| item.0);
+    for (modified, path, bytes) in completed {
+        if modified < cutoff || total > global_cap {
+            fs::remove_dir_all(path)?;
+            total = total.saturating_sub(bytes);
+        }
+    }
+    Ok(())
+}
+
+fn read_regular(path: &Path, max: u64) -> Result<Vec<u8>> {
+    let path_meta =
+        fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
+    ensure!(
+        path_meta.is_file() && !path_meta.file_type().is_symlink(),
+        "trace entry is not a regular file"
+    );
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let meta = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            path_meta.dev() == meta.dev() && path_meta.ino() == meta.ino(),
+            "trace entry changed before open"
+        );
+        ensure!(meta.nlink() == 1, "linked trace file rejected");
+    }
+    ensure!(meta.len() <= max, "trace entry exceeds byte limit");
+    let mut body = Vec::with_capacity(meta.len() as usize);
+    use std::io::Read as _;
+    file.take(max + 1).read_to_end(&mut body)?;
+    ensure!(
+        body.len() as u64 == meta.len(),
+        "trace entry changed while reading"
+    );
+    Ok(body)
+}
+
+fn validate_label(value: &str, label: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty() && value.len() <= 128 && !value.contains(['\0', '\r', '\n']),
+        "invalid {label}"
+    );
+    Ok(())
+}
+fn validate_identity(identity: &TraceIdentity) -> Result<()> {
+    for (label, value) in [
+        ("run id", identity.run_id.as_str()),
+        ("task id", identity.task_id.as_str()),
+        ("candidate id", identity.candidate_id.as_str()),
+    ] {
+        validate_label(value, label)?;
+    }
+    for (label, value) in [
+        ("manifest hash", &identity.manifest_hash),
+        ("agent artifact hash", &identity.agent_artifact_hash),
+        (
+            "repository snapshot hash",
+            &identity.repository_snapshot_hash,
+        ),
+        ("runtime descriptor hash", &identity.runtime_descriptor_hash),
+    ] {
+        ensure!(is_hash(value), "invalid trace {label}");
+    }
+    Ok(())
+}
+fn is_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+fn unix_ms() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
+}
+fn new_trace_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    blake3::hash(format!("{}:{now}:{counter}", std::process::id()).as_bytes()).to_hex()[..32]
+        .to_string()
+}
+fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+fn private_new_file(path: &Path) -> Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    Ok(opts.open(path)?)
+}
+fn atomic_private_write(path: &Path, body: &[u8]) -> Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("trace path has no file name"))?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!(
+        ".{name}.tmp-{}",
+        TRACE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = private_new_file(&tmp)?;
+    file.write_all(body)?;
+    file.sync_all()?;
+    match fs::rename(&tmp, path) {
+        Ok(()) => {}
+        Err(error) if path.exists() => {
+            let _ = fs::remove_file(&tmp);
+            if fs::read(path)? != body {
+                return Err(error.into());
+            }
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(error.into());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+fn sync_dir(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn temp() -> PathBuf {
+        std::env::temp_dir().join(format!("hi-trace-{}", new_trace_id()))
+    }
+
+    #[test]
+    fn round_trip_hash_chain_and_cas() {
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        let body = trace.put_blob(b"secret prompt", "text/plain").unwrap();
+        trace
+            .record(
+                "model_request",
+                "model",
+                1,
+                None,
+                Some("turn-1".into()),
+                serde_json::json!({"body": body}),
+            )
+            .unwrap();
+        let summary = trace.finalize().unwrap();
+        let manifest = validate_trace(&dir, 1024 * 1024, 20).unwrap();
+        assert_eq!(manifest.root_hash, summary.root_hash);
+        assert!(
+            !std::fs::read_to_string(dir.join("events.jsonl"))
+                .unwrap()
+                .contains("secret prompt")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.join("events.jsonl"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn json_blob_credential_value_is_redacted_on_disk() {
+        // A JSON blob reaches put_blob as raw bytes and is persisted under
+        // blobs/. The string-level redactor must catch a credential-keyed
+        // value (`{"token":"…"}`) before the bytes are written. Joined at
+        // runtime so the fixture never appears contiguously in source.
+        let secret = ["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="].concat();
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        let payload = format!(r#"{{"token":"{secret}","page":2}}"#);
+        let blob = trace
+            .put_blob(payload.as_bytes(), "application/json")
+            .unwrap();
+        trace.finalize().unwrap();
+
+        let on_disk = fs::read_to_string(dir.join("blobs").join(&blob.hash)).unwrap();
+        assert!(
+            !on_disk.contains(&secret),
+            "credential value persisted in blob: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("[REDACTED_SECRET]"),
+            "blob was not redacted: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("\"page\":2"),
+            "benign field lost: {on_disk}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn non_json_blob_still_uses_string_redaction() {
+        // A text/plain blob with an inline `token=value` assignment redacts via
+        // the string-level path (no JSON parse), preserving the prior contract.
+        let secret = ["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="].concat();
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        let payload = format!("log line token={secret} end");
+        let blob = trace.put_blob(payload.as_bytes(), "text/plain").unwrap();
+        trace.finalize().unwrap();
+        let on_disk = fs::read_to_string(dir.join("blobs").join(&blob.hash)).unwrap();
+        assert!(
+            !on_disk.contains(&secret),
+            "inline secret persisted in text blob: {on_disk}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_blob_hash_validates_against_redacted_bytes() {
+        // Managed traces are the uploadable artifact: the manifest signs each
+        // blob's content hash. put_blob redacts before hashing, so the signed
+        // hash must match the redacted bytes on disk — otherwise an uploader
+        // would ship either the secret (redact-after-hash) or a corrupt trace
+        // (hash mismatch). validate_trace re-hashes the on-disk blob and
+        // checks it against the manifest, so a passing validation proves the
+        // signed hash is of the redacted content. Joined at runtime so the
+        // fixture never appears contiguously in source.
+        let secret = ["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="].concat();
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        let payload = format!(r#"{{"token":"{secret}","page":2}}"#);
+        let blob = trace
+            .put_blob(payload.as_bytes(), "application/json")
+            .unwrap();
+        // The returned BlobRef hash is already the redacted content hash.
+        let redacted = r#"{"token":"[REDACTED_SECRET]","page":2}"#;
+        assert_eq!(
+            blob.hash,
+            blake3::hash(redacted.as_bytes()).to_hex().as_str(),
+            "blob ref hash is not the redacted-content hash"
+        );
+        trace
+            .record(
+                "tool_result",
+                "tools",
+                1,
+                None,
+                None,
+                serde_json::json!({ "content": blob }),
+            )
+            .unwrap();
+        trace.finalize().unwrap();
+
+        // Managed validation must pass against the on-disk redacted bytes, and
+        // the blob file must carry the redaction marker, never the secret.
+        let manifest = validate_trace(&dir, 1024 * 1024, 20).unwrap();
+        assert!(
+            manifest.blobs.iter().any(|b| b.hash == blob.hash),
+            "managed manifest lost the redacted blob"
+        );
+        let on_disk = fs::read_to_string(dir.join("blobs").join(&blob.hash)).unwrap();
+        assert!(
+            !on_disk.contains(&secret),
+            "secret persisted in managed blob: {on_disk}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detects_tampering_and_partial_journal() {
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        trace
+            .record("terminal", "terminal", 1, None, None, serde_json::json!({}))
+            .unwrap();
+        trace.finalize().unwrap();
+        // Replace the trailing newline with a space: the byte count is
+        // unchanged, so the byte-count gate passes and only the
+        // newline-termination ("partial trace journal") check can fire.
+        let mut raw = fs::read(dir.join("events.jsonl")).unwrap();
+        assert_eq!(raw.last(), Some(&b'\n'), "journal must end in a newline");
+        *raw.last_mut().unwrap() = b' ';
+        fs::write(dir.join("events.jsonl"), raw).unwrap();
+        let error = validate_trace(&dir, 1024 * 1024, 20)
+            .expect_err("a journal without a trailing newline must fail validation");
+        assert!(
+            format!("{error:#}").contains("partial trace journal"),
+            "expected the partial-journal check to fire, got: {error:#}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tampered_mid_chain_event_hash_is_rejected() {
+        // Negative coverage for the chain proof: corrupting the persisted
+        // event_hash of a middle event must fail validation, not just the
+        // root comparison at the end. Flip one hex digit in the middle
+        // event's hash; the recomputed hash then disagrees with the stored
+        // one at that event — before any root-hash check runs.
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        for n in 1..=3 {
+            trace
+                .record("step", "step", 1, None, None, serde_json::json!({"n": n}))
+                .unwrap();
+        }
+        trace.finalize().unwrap();
+
+        let path = dir.join("events.jsonl");
+        let on_disk = fs::read_to_string(&path).unwrap();
+        let mut events: Vec<Event> = on_disk
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        let middle = &mut events[1];
+        let flipped = if middle.event_hash.starts_with('0') {
+            '1'
+        } else {
+            '0'
+        };
+        middle.event_hash.replace_range(..1, &flipped.to_string());
+        let rewritten = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, format!("{rewritten}\n")).unwrap();
+
+        let error = validate_trace(&dir, 1024 * 1024, 20)
+            .expect_err("a tampered mid-chain hash must fail validation");
+        // Pin to the event-hash recomputation gate specifically: the tamper is
+        // byte-preserving (same-width hex), so the byte-count and chain-link
+        // gates pass, and the recomputed hash disagreeing with the stored
+        // event_hash is what must fire. A bare "hash" match would also accept
+        // "chain discontinuity", masking a regression in the recompute check.
+        assert!(
+            format!("{error:#}").contains("trace event hash mismatch"),
+            "expected the event-hash recompute check to fire, got: {error:#}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tampered_mid_chain_previous_hash_link_is_rejected() {
+        // Sibling negative case: rewriting a middle event's previous_hash
+        // pointer breaks the link itself, not the content hash. This is the
+        // reorder/splice attack — each event's content hash is still valid,
+        // so only the `previous_hash == previous` linkage check can catch it.
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        for n in 1..=3 {
+            trace
+                .record("step", "step", 1, None, None, serde_json::json!({"n": n}))
+                .unwrap();
+        }
+        trace.finalize().unwrap();
+
+        let path = dir.join("events.jsonl");
+        let on_disk = fs::read_to_string(&path).unwrap();
+        let mut events: Vec<Event> = on_disk
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        // Point event 3 at the genesis event instead of event 2, as if event 2
+        // were spliced out. Event 3's own content hash is untouched, so the
+        // link check is the only thing that can fail.
+        events[2].previous_hash = events[0].event_hash.clone();
+        let rewritten = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, format!("{rewritten}\n")).unwrap();
+
+        let error = validate_trace(&dir, 1024 * 1024, 20)
+            .expect_err("a tampered previous_hash link must fail validation");
+        assert!(
+            format!("{error:#}").contains("chain discontinuity"),
+            "expected a chain discontinuity error, got: {error:#}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn foreign_trace_journal_is_rejected() {
+        // Identity-swap attack: drop another trace's events.jsonl into this
+        // trace's directory. The foreign events carry a different trace_id, so
+        // the per-event `trace_id == manifest.trace_id` binding must reject the
+        // splice. This is what stops one managed run's journal being passed off
+        // as another's evidence.
+        //
+        // To exercise the identity binding specifically (not the earlier
+        // byte-count gate), the foreign journal must be byte-identical in
+        // length to A's. Two same-shape events differ only in timestamps, whose
+        // digit counts can vary, so instead of copying B's file we rewrite A's
+        // own journal: flip the trace_id in place. That keeps total_bytes
+        // exactly equal (ids are fixed-width hex), forcing the identity check
+        // to be the failing gate.
+        let dir_a = temp();
+        let mut trace_a =
+            TraceWriter::create_bound(&dir_a, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        trace_a
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        trace_a.finalize().unwrap();
+        validate_trace(&dir_a, 1024 * 1024, 20).unwrap();
+
+        // Rewrite the journal's trace_id to a foreign (but same-length) id and
+        // recompute nothing else — the manifest still names trace A, so the
+        // identity binding must reject it. Swapping the id breaks each event's
+        // hash too, but the identity check runs before the hash check, so it is
+        // the gate that fires.
+        let journal_path = dir_a.join("events.jsonl");
+        let first_line = fs::read_to_string(&journal_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let first_event: Event = serde_json::from_str(&first_line).unwrap();
+        let original_trace_id = first_event.trace_id.clone();
+        let foreign_id = "f".repeat(32);
+        assert_ne!(original_trace_id, foreign_id);
+        let rewritten = fs::read_to_string(&journal_path)
+            .unwrap()
+            .replace(&original_trace_id, &foreign_id);
+        fs::write(&journal_path, rewritten).unwrap();
+
+        let error = validate_trace(&dir_a, 1024 * 1024, 20)
+            .expect_err("a foreign trace_id must fail validation");
+        assert!(
+            format!("{error:#}").contains("identity mismatch"),
+            "expected an identity mismatch error, got: {error:#}"
+        );
+        fs::remove_dir_all(dir_a).unwrap();
+    }
+
+    #[test]
+    fn pruning_never_removes_an_active_trace() {
+        let root = temp();
+        create_private_dir(&root).unwrap();
+        let active_dir = root.join(new_trace_id());
+        let active = TraceWriter::create(&active_dir, TraceMode::Local, 1024 * 1024).unwrap();
+        let completed_dir = root.join(new_trace_id());
+        let mut completed =
+            TraceWriter::create(&completed_dir, TraceMode::Local, 1024 * 1024).unwrap();
+        completed
+            .record("terminal", "terminal", 1, None, None, serde_json::json!({}))
+            .unwrap();
+        completed.finalize().unwrap();
+        prune(&root, 30, 0).unwrap();
+        assert!(active_dir.exists());
+        assert!(!completed_dir.exists());
+        drop(active);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn credential_keyed_payload_is_redacted_in_persisted_events() {
+        // End-to-end: record an event whose data carries a credential-named
+        // key with a bare (prefix-less, shape-less) high-entropy value — the
+        // case only the key-context JSON walk catches — and assert the raw
+        // bytes on disk never contain the secret. Joined at runtime so the
+        // fixture never appears contiguously in source.
+        let secret = ["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="].concat();
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        trace
+            .record(
+                "tool_result",
+                "tools",
+                1,
+                None,
+                None,
+                serde_json::json!({
+                    "command": "printenv",
+                    "output": { "token": secret, "page": 2 },
+                    "note": secret,
+                }),
+            )
+            .unwrap();
+        trace.finalize().unwrap();
+
+        let on_disk = fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        let persisted: Value = serde_json::from_str(on_disk.trim()).unwrap();
+        assert_eq!(
+            persisted["data"]["output"]["token"], "[REDACTED_SECRET]",
+            "credential-keyed value was not redacted: {on_disk}"
+        );
+        assert_eq!(persisted["data"]["output"]["page"], 2);
+        assert_eq!(
+            persisted["data"]["note"], secret,
+            "non-credential key must survive"
+        );
+        // The raw file bytes are the real contract: the secret appears exactly
+        // once (the benign `note` field), never under the credential key.
+        assert_eq!(
+            on_disk.matches(&secret).count(),
+            1,
+            "secret persisted beyond the benign field: {on_disk}"
+        );
+        // Redaction must run before the event hash is computed (record()
+        // hashes the redacted `data`). If it hashed the pre-redaction payload
+        // the chain would still validate but the hash would be of the secret;
+        // validate_trace recomputes from the persisted (redacted) bytes, so a
+        // passing validation proves the hash matches the redacted content.
+        let manifest = validate_trace(&dir, 1024 * 1024, 20).unwrap();
+        assert_eq!(
+            manifest.root_hash,
+            persisted["event_hash"].as_str().unwrap(),
+            "persisted event hash does not match redacted content"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn secret_event_hash_chains_into_manifest_root() {
+        // The single-event test proves a secret event hashes its redacted
+        // bytes. This proves the *chain*: a secret-bearing event's redacted
+        // hash must become the next event's previous_hash and roll up into the
+        // manifest root. If redaction ran after hashing (or the journal kept
+        // pre-redaction bytes), the recomputed chain in validate_trace would
+        // break at the secret event and the root would not match. Joined at
+        // runtime so the fixture never appears contiguously in source.
+        let secret = ["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="].concat();
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        let h1 = trace
+            .record("init", "init", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        let h_secret = trace
+            .record(
+                "tool_result",
+                "tools",
+                1,
+                None,
+                None,
+                serde_json::json!({ "token": secret }),
+            )
+            .unwrap();
+        let h3 = trace
+            .record("done", "done", 1, None, None, serde_json::json!({"n": 3}))
+            .unwrap();
+        trace.finalize().unwrap();
+
+        // Read the persisted journal and walk the chain explicitly.
+        let on_disk = fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert!(
+            !on_disk.contains(&secret),
+            "secret persisted in journal: {on_disk}"
+        );
+        let events: Vec<Event> = on_disk
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        // Chain linkage: genesis -> secret event -> final event.
+        assert_eq!(events[0].previous_hash, ZERO_HASH);
+        assert_eq!(events[0].event_hash, h1);
+        assert_eq!(events[1].event_hash, h_secret);
+        assert_eq!(
+            events[1].data["token"], "[REDACTED_SECRET]",
+            "secret event payload not redacted"
+        );
+        assert_eq!(
+            events[2].previous_hash, h_secret,
+            "secret event's hash did not chain into the next event"
+        );
+        assert_eq!(events[2].event_hash, h3);
+
+        // validate_trace recomputes every event hash from the persisted
+        // (redacted) data and asserts previous == manifest.root_hash, so a
+        // passing validation proves the root is derived from redacted bytes
+        // chained across the secret event.
+        let manifest = validate_trace(&dir, 1024 * 1024, 20).unwrap();
+        assert_eq!(manifest.event_count, 3);
+        assert_eq!(
+            manifest.root_hash, h3,
+            "manifest root is not the terminal redacted-chain hash"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn identity() -> TraceIdentity {
+        TraceIdentity {
+            run_id: "run-1".into(),
+            task_id: "task-1".into(),
+            candidate_id: "candidate-1".into(),
+            manifest_hash: "1".repeat(64),
+            agent_artifact_hash: "2".repeat(64),
+            repository_snapshot_hash: "3".repeat(64),
+            runtime_descriptor_hash: "4".repeat(64),
+        }
+    }
+
+    #[test]
+    fn managed_trace_requires_and_preserves_provenance() {
+        let dir = temp();
+        assert!(TraceWriter::create(&dir, TraceMode::Managed, 1024).is_err());
+        let dir = temp();
+        let expected = identity();
+        let trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, expected.clone())
+                .unwrap();
+        let summary = trace.finalize().unwrap();
+        assert_eq!(summary.identity, Some(expected.clone()));
+        assert_eq!(
+            validate_trace(&dir, 1024 * 1024, 20).unwrap().identity,
+            Some(expected)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Deterministic test attestor: emits `<scheme>:<blake3(root_hash +
+    /// run_id)>`, so a test can verify the attestation binds the exact root
+    /// hash and run identity the worker supplied.
+    struct TestTraceAttestor;
+    impl TraceAttestor for TestTraceAttestor {
+        fn attest_trace(
+            &self,
+            root_hash: &str,
+            identity: Option<&TraceIdentity>,
+        ) -> Result<String> {
+            let run = identity.map(|i| i.run_id.as_str()).unwrap_or("anon");
+            let digest = blake3::hash(format!("{root_hash}:{run}").as_bytes()).to_hex();
+            Ok(format!("test-attested:{digest}"))
+        }
+    }
+
+    #[test]
+    fn unattested_trace_has_no_attestation() {
+        // Default: no attestor attached, so neither summary nor manifest carry
+        // an attestation. This is the local/self-hosted path.
+        let dir = temp();
+        let trace = TraceWriter::create(&dir, TraceMode::Local, 1024 * 1024).unwrap();
+        let summary = trace.finalize().unwrap();
+        assert_eq!(summary.attestation, None);
+        assert_eq!(
+            validate_trace(&dir, 1024 * 1024, 20).unwrap().attestation,
+            None
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn local_attestor_signs_trace_and_verifies() {
+        // A self-hosted run that opts into LocalAttestor records a real
+        // ed25519 signature (local-signed:<sig>) over the terminal root hash,
+        // which round-trips through validation and verifies against the local
+        // key. Uses an explicit key path so the test needs no env mutation.
+        let base = temp();
+        let key_path = base.join("hi").join(LOCAL_SIGNING_KEY_FILE);
+        let dir = base.join("trace");
+        let mut trace = TraceWriter::create(&dir, TraceMode::Local, 1024 * 1024)
+            .unwrap()
+            .with_attestor(std::sync::Arc::new(LocalAttestor::with_key_path(
+                key_path.clone(),
+            )));
+        trace
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        let summary = trace.finalize().unwrap();
+
+        let attestation = summary.attestation.clone().expect("local attested");
+        assert!(
+            attestation.starts_with(LOCAL_SIGNED_PREFIX),
+            "LocalAttestor must emit a local-signed: attestation, got: {attestation}"
+        );
+        // Round-trips through validation.
+        assert_eq!(
+            validate_trace(&dir, 1024 * 1024, 20)
+                .unwrap()
+                .attestation
+                .as_deref(),
+            Some(attestation.as_str())
+        );
+        // Verifies against the local key.
+        assert!(key_path.exists(), "signing key was not persisted");
+        assert!(
+            verify_local_signature(&attestation, &summary.root_hash, &key_path).unwrap(),
+            "signature must verify against the local key"
+        );
+        // Key file is owner-only on unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn local_signature_rejects_tampered_root_and_wrong_key() {
+        let state = temp().join("state2");
+        let key_path = state.join("hi").join(LOCAL_SIGNING_KEY_FILE);
+        let key = load_or_create_signing_key(&key_path).unwrap();
+        let root_hash = "a".repeat(64);
+        let attestation = sign_root_hash(&key, &root_hash).unwrap();
+
+        // Good signature verifies.
+        assert!(verify_local_signature(&attestation, &root_hash, &key_path).unwrap());
+        // A different root hash fails (the signed content changed).
+        assert!(
+            !verify_local_signature(&attestation, &"b".repeat(64), &key_path).unwrap(),
+            "tampered root hash must not verify"
+        );
+        // A different key fails (forgery without the key).
+        let other_state = temp().join("state3");
+        let other_key_path = other_state.join("hi").join(LOCAL_SIGNING_KEY_FILE);
+        let _other = load_or_create_signing_key(&other_key_path).unwrap();
+        assert!(
+            !verify_local_signature(&attestation, &root_hash, &other_key_path).unwrap(),
+            "signature must not verify under a different key"
+        );
+        // Malformed attestation errors rather than silently passing.
+        assert!(verify_local_signature("local-unattested:abc", &root_hash, &key_path).is_err());
+        fs::remove_dir_all(state).unwrap();
+        fs::remove_dir_all(other_state).unwrap();
+    }
+
+    /// An in-process worker signing oracle: signs the canonical message with a
+    /// real ed25519 key, exactly what a worker socket service would do — but
+    /// here the "worker" is a local key so the test can check the full path.
+    fn worker_oracle(key: ed25519_dalek::SigningKey) -> std::sync::Arc<SigningOracle> {
+        std::sync::Arc::new(move |message: &[u8]| {
+            use ed25519_dalek::Signer;
+            Ok(hex::encode(key.sign(message).to_bytes()))
+        })
+    }
+
+    #[test]
+    fn worker_attestor_signs_and_verifies_with_public_key() {
+        let dir = temp();
+        let worker_key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let worker_pub = worker_key.verifying_key().to_bytes();
+        let id = identity();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, id.clone())
+                .unwrap()
+                .with_attestor(std::sync::Arc::new(WorkerAttestor::new(worker_oracle(
+                    worker_key,
+                ))));
+        trace
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        let summary = trace.finalize().unwrap();
+
+        let attestation = summary.attestation.clone().expect("worker attested");
+        assert!(
+            attestation.starts_with(WORKER_SIGNED_PREFIX),
+            "expected worker-signed: attestation, got: {attestation}"
+        );
+        // Verifies against the worker public key with the manifest identity.
+        assert!(
+            verify_worker_signature(
+                &attestation,
+                &summary.root_hash,
+                summary.identity.as_ref(),
+                &worker_pub
+            )
+            .unwrap(),
+            "worker signature must verify against the worker public key"
+        );
+        // A different root hash (tampered trace) must not verify.
+        assert!(
+            !verify_worker_signature(
+                &attestation,
+                &"f".repeat(64),
+                summary.identity.as_ref(),
+                &worker_pub
+            )
+            .unwrap(),
+            "tampered root hash must not verify"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn worker_signature_rejects_wrong_key_and_identity() {
+        let dir = temp();
+        let worker_key = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+        let worker_pub = worker_key.verifying_key().to_bytes();
+        let id = identity();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, id.clone())
+                .unwrap()
+                .with_attestor(std::sync::Arc::new(WorkerAttestor::new(worker_oracle(
+                    worker_key,
+                ))));
+        trace
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        let summary = trace.finalize().unwrap();
+        let attestation = summary.attestation.clone().unwrap();
+
+        // Wrong worker public key fails (forgery without the worker key).
+        let other_pub = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(
+            !verify_worker_signature(
+                &attestation,
+                &summary.root_hash,
+                summary.identity.as_ref(),
+                &other_pub
+            )
+            .unwrap(),
+            "signature must not verify under a different worker key"
+        );
+        // A different identity (replayed onto another run) must not verify —
+        // the domain-separated message binds run/task/candidate/manifest.
+        let mut other_id = id.clone();
+        other_id.run_id = "run-other".into();
+        assert!(
+            !verify_worker_signature(
+                &attestation,
+                &summary.root_hash,
+                Some(&other_id),
+                &worker_pub
+            )
+            .unwrap(),
+            "signature must not verify under a different run identity"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn attested_trace_binds_root_hash_and_validates() {
+        // A managed trace with an attestor attached records the attestation at
+        // finalize over the terminal root_hash, and validate_trace carries it
+        // through unchanged (verifying it is the consumer's job, not this
+        // crate's).
+        let dir = temp();
+        let id = identity();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, id.clone())
+                .unwrap()
+                .with_attestor(std::sync::Arc::new(TestTraceAttestor));
+        trace
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        let summary = trace.finalize().unwrap();
+
+        // The attestation is present and binds the *final* root hash + run id.
+        let attestation = summary.attestation.clone().expect("attested");
+        let expected = format!(
+            "test-attested:{}",
+            blake3::hash(format!("{}:{}", summary.root_hash, id.run_id).as_bytes()).to_hex()
+        );
+        assert_eq!(attestation, expected, "attestation not bound to root hash");
+
+        // Round-trips through the manifest and validation.
+        let manifest = validate_trace(&dir, 1024 * 1024, 20).unwrap();
+        assert_eq!(manifest.attestation.as_deref(), Some(attestation.as_str()));
+        assert_eq!(manifest.root_hash, summary.root_hash);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn attestor_receives_terminal_root_hash_not_intermediate() {
+        // Regression: attestation must be over the *terminal* root hash (after
+        // all events), not the initial ZERO_HASH or a mid-run value. Two events
+        // make the terminal hash differ from both.
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity())
+                .unwrap()
+                .with_attestor(std::sync::Arc::new(TestTraceAttestor));
+        for n in 1..=2 {
+            trace
+                .record("step", "step", 1, None, None, serde_json::json!({"n": n}))
+                .unwrap();
+        }
+        let summary = trace.finalize().unwrap();
+        assert_ne!(summary.root_hash, ZERO_HASH);
+        let attestation = summary.attestation.expect("attested");
+        let bound = blake3::hash(format!("{}:run-1", summary.root_hash).as_bytes()).to_hex();
+        assert!(
+            attestation.contains(bound.as_str()),
+            "attestation does not bind the terminal root hash"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

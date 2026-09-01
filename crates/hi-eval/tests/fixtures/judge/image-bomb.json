@@ -1,0 +1,10 @@
+{
+  "telemetry": {
+    "tool_timeline": [{"tool": "edit", "path": "a.rs"}],
+    "requests": [{
+      "input_tokens_est": 100,
+      "max_image_chars": 2000000,
+      "elided_images": 0
+    }]
+  }
+}

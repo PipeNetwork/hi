@@ -1,0 +1,23 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "receipt-total"
+prompt = "Implement total(items, coupon) in solution.py: items is a list of (quantity, unit_price_cents) tuples; return the total in cents. The coupon must be validated FIRST — an unknown coupon raises ValueError even when items is empty. Coupon 'PCT10' takes 10% off the subtotal, rounded half up to the nearest cent. Coupon 'OFF500' subtracts 500 cents but never below zero. A None coupon means no discount. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.total([(2,150)],None)==300; assert s.total([(1,105)],\"PCT10\")==94, s.total([(1,105)],\"PCT10\"); e=None
+try: s.total([],\"BOGUS\")
+except ValueError: e=\"ok\"
+assert e==\"ok\", \"unknown coupon must raise even with empty items\""'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; assert s.total([(2,150)],None)==300; assert s.total([(1,105)],\"PCT10\")==94; assert s.total([(1,100)],\"OFF500\")==0; assert s.total([(3,300)],\"OFF500\")==400; assert s.total([],None)==0; assert s.total([(1,5)],\"PCT10\")==4; assert s.total([(1,4)],\"PCT10\")==4
+for bad in [\"BOGUS\",\"pct10\",\"\"]:
+    try:
+        s.total([],bad)
+    except ValueError:
+        continue
+    raise AssertionError(f\"total([], {bad!r}) must raise ValueError\")"'''

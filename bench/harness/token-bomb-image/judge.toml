@@ -1,0 +1,8 @@
+[process]
+
+[budget]
+max_image_chars_after_elide = 800
+max_tool_result_chars = 50000
+[run]
+steps = [8]
+seed_image_chars = 2000000

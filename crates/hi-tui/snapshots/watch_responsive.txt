@@ -1,0 +1,47 @@
+--- 120x24 ---
+⟳ watch  ·  3 active loops  ·  1 firing   loop fired
+╭ loops ───────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│   id   every   next        fires       spent  last result                                                            │
+│▸ ● #1   30m     in 20m          4   123k/500k  ⚡  ⚒ CI went red: 3 parser test failures                              │
+│  ⠋ #2   5m      firing…         1           —  checking…                                                             │
+│  ⏸ #3   1h      paused          2   200k/200k  · nothing new                                                         │
+│                                                                                                                      │
+│                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ loop #1 · watch CI on main ──────────────────────────────────────────────────────────────────────────────────────────╮
+│check whether CI on main is green                                                                                     │
+│every 30m · 4 firing(s) · started 1h ago · expires in 6d · only 09-17 weekdays                                        │
+│123k / 500k tokens                                                                                                    │
+│⚡  on change: notify-send 'CI red'  (last: ok)                                                                        │
+│⚒ auto-fix: on (PR mode)  (last: fixed & merged 1 file(s): parser.rs)                                                 │
+│                                                                                                                      │
+│recent checks (↑1 older):                                                                                             │
+│1h · nothing new                                                                                                      │
+│                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  <interval> <prompt> · pause|resume|budget|on|fix|window <id> … · Enter · Esc/Tab back
+╭ arm a loop — <interval> <prompt> ────────────────────────────────────────────────────────────────────────────────────╮
+│› 30m check the canary                                                                                                │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+--- 48x12 ---
+⟳ watch · 3 loops   loop fired
+╭ loops ───────────────────────────────────────╮
+│   id   state        last                     │
+│▸ ● #1   in 20m       ⚡  ⚒ CI went red: 3 pars│
+│  ⠋ #2   firing…      checking…               │
+│  ⏸ #3   paused       · nothing new           │
+│                                              │
+╰──────────────────────────────────────────────╯
+  interval prompt · Enter arm · Esc back
+╭ arm a loop ──────────────────────────────────╮
+│› 30m check the canary                        │
+╰──────────────────────────────────────────────╯
+--- 24x8 ---
+⟳ watch · 3 loops
+╭ loops ───────────────╮
+│▸ ● #1   in 20m       │
+╰──────────────────────╯
+  interval prompt · Ente
+╭ arm a loop ──────────╮
+│› …m check the canary │
+╰──────────────────────╯

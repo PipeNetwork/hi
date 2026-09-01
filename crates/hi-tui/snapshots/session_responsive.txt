@@ -1,0 +1,49 @@
+--- 120x24 ---
+
+  /workspace                                                                                            sandbox │ undo
+
+  ❯ review the responsive layout
+  The layout is stable.
+    thought for 3s
+    Check spacing and preserve the active input.
+  ┃ … +17 more lines · Ctrl-O to expand
+
+
+
+
+
+  ⠋ Working… 0s                                                                                                 [stop]
+
+  ╭─ /btw why? ─────────────────────────────────────────────────────────────────────────────────────────────── [Esc] ╮
+  │ ⠋ Answering…                                                                                                     │
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │❯ next step                                                                                                       │
+  ╰───────────────────────────────────────────────────────────────────────────────────────── gpt-4o · always-approve ╯
+
+  ctrl+c:interrupt  │  Shift+Tab:mode  │  ?:help
+
+--- 64x14 ---
+  /workspace                                    sandbox │ undo
+  The layout is stable.
+    thought for 3s
+    Check spacing and preserve the active input.
+  ┃ … +17 more lines · Ctrl-O to expand
+  ⠋ Working… 0s                                         [stop]
+
+  ╭─ /btw why? ─────────────────────────────────────── [Esc] ╮
+  │ ⠋ Answering…                                             │
+  ╰──────────────────────────────────────────────────────────╯
+  ╭──────────────────────────────────────────────────────────╮
+  │❯ next step                                               │
+  ╰───────────────────────────────── gpt-4o · always-approve ╯
+  ctrl+c:interrupt  │  Shift+Tab:mode  │  ?:help
+--- 24x8 ---
+  Ctrl-O to expand
+  ⠋ Working… 0s [stop]
+  ╭─ /btw wh…  [Esc] ╮
+  │ ⠋ Answering…     │
+  ╰──────────────────╯
+  ╭──────────────────╮
+  │❯ next step       │
+  ╰────────── gpt-4o ╯

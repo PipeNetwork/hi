@@ -1,0 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "merge-adjacent"
+prompt = "Implement merge(intervals) in solution.py: merge a list of [start, end] integer intervals and return them sorted by start. Touching intervals must be merged too — [1,2] and [2,3] must become [1,3]. The input may be unsorted and must not be mutated. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.merge([[1,2],[2,3]])==[[1,3]], s.merge([[1,2],[2,3]]); assert s.merge([[5,7],[1,3]])==[[1,3],[5,7]]"'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[([[1,2],[2,3]],[[1,3]]),([[5,7],[1,3]],[[1,3],[5,7]]),([[1,4],[2,3]],[[1,4]]),([],[]),([[0,0],[0,0]],[[0,0]]),([[-3,-1],[-1,2]],[[-3,2]]),([[1,10],[2,3],[4,5]],[[1,10]])]; src=[[1,2],[2,3]]; s.merge(src); assert src==[[1,2],[2,3]], \"input mutated\"; fails=[f\"merge({i}) -> {s.merge(i)!r} != {e!r}\" for i,e in cases if s.merge(i)!=e]; assert not fails, chr(10).join(fails)"'''

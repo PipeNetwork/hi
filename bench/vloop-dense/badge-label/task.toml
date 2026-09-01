@@ -1,0 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "badge-label"
+prompt = "Implement badge(name, role, years) in solution.py returning a badge label string. The role is rendered uppercase; an empty role must render as STAFF. The name is rendered title-cased, and a name longer than 12 characters must be truncated to 11 characters plus a single '~'. The years suffix is '(Ny)' for 1..9, but 0 years must render '(new)' and 10 or more must render '(veteran)'. The format is 'ROLE: Name (suffix)'. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.badge(\"ada lovelace\",\"engineer\",3)==\"ENGINEER: Ada Lovelace (3y)\", s.badge(\"ada lovelace\",\"engineer\",3); assert s.badge(\"bartholomew kuma\",\"chef\",0)==\"CHEF: Bartholomew~ (new)\", s.badge(\"bartholomew kuma\",\"chef\",0); assert s.badge(\"li\",\"\",12)==\"STAFF: Li (veteran)\", s.badge(\"li\",\"\",12)"'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[((\"ada lovelace\",\"engineer\",3),\"ENGINEER: Ada Lovelace (3y)\"),((\"bartholomew kuma\",\"chef\",0),\"CHEF: Bartholomew~ (new)\"),((\"li\",\"\",12),\"STAFF: Li (veteran)\"),((\"x\",\"ops\",10),\"OPS: X (veteran)\"),((\"exactlytwelve\",\"qa\",1),\"QA: Exactlytwel~ (1y)\"),((\"twelvechars!\",\"qa\",1),\"QA: Twelvechars! (1y)\"),((\"a b\",\"dev\",9),\"DEV: A B (9y)\")]; fails=[f\"badge{a} -> {s.badge(*a)!r} != {e!r}\" for a,e in cases if s.badge(*a)!=e]; assert not fails, chr(10).join(fails)"'''

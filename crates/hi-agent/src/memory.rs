@@ -1,0 +1,1705 @@
+//! Interactive **session** memory: hierarchical location, distillation prompt,
+//! capping, groundedness checks, recall-based decay, and concurrency-safe
+//! persistence.
+//!
+//! Distinct from [`hi_memory::RsiMemoryStore`], the RSI control-plane SQLite
+//! store for supervisor-verified hypotheses. This module owns markdown memory
+//! the agent loads into prompts (`.hi/memory.md` and the user global file).
+//!
+//! Memory is **hierarchical** — a project file (`.hi/memory.md`) for facts
+//! specific to this codebase, and a global user file (`~/.config/hi/memory.md`)
+//! for cross-project preferences that every repo would otherwise relearn from
+//! scratch ("use pnpm", "no external API keys", "terse output"). Both are
+//! loaded as context; the distiller routes each fact to the right layer.
+//!
+//! Because two `hi` processes may quit at once in the same directory, writes
+//! are serialized with an exclusive lock file (`.hi/.memory.lock`, via
+//! `O_EXCL` creation — pure std, no extra dep) and the memory body is written
+//! via temp-file + atomic `rename`, so a torn write or a concurrent
+//! distillation can never corrupt or truncate the file.
+
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// Backstop cap on the distilled memory file. The prompt does the real shaping
+/// (≤ ~20 short bullets); this just stops a runaway response from bloating the
+/// file — and thus every future session's context.
+pub(crate) const MEMORY_MAX_CHARS: usize = 2_000;
+
+/// Schema marker written as the first line of the memory file. Lets a future
+/// format change detect an old layout and migrate (or skip) instead of feeding
+/// a stale-shape body into a prompt that expects a new one.
+const MEMORY_HEADER: &str = "# hi memory v1";
+
+/// Tag the distiller prepends to a fact so the router knows to send it to the
+/// global (user-level) layer instead of the project layer.
+const GLOBAL_TAG: &str = "global:";
+
+// ---------------------------------------------------------------------------
+// Paths — hierarchical (project + global user)
+// ---------------------------------------------------------------------------
+
+/// Where the project memory lives — `.hi/memory.md` under the working directory,
+/// overridable via `HI_MEMORY_FILE` (which also makes the file IO testable). The
+/// frontend reads the same path to load it as context.
+pub fn memory_file() -> PathBuf {
+    memory_file_at(Path::new("."))
+}
+
+/// Workspace-explicit project memory path used by an [`crate::WorkspaceRuntime`].
+pub fn memory_file_at(root: &Path) -> PathBuf {
+    std::env::var_os("HI_MEMORY_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join(".hi").join("memory.md"))
+}
+
+/// Where the global (cross-project) user memory lives — `$XDG_CONFIG_HOME/hi`
+/// or `~/.config/hi/memory.md`. Overridable via `HI_GLOBAL_MEMORY_FILE`. This is
+/// the layer for facts that apply to the *user* across every repo, so each new
+/// project doesn't relearn "prefer pnpm" or "no external API keys".
+pub fn global_memory_file() -> PathBuf {
+    std::env::var_os("HI_GLOBAL_MEMORY_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let base = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                });
+            base.unwrap_or_else(|| PathBuf::from(".config"))
+                .join("hi")
+                .join("memory.md")
+        })
+}
+
+/// Read a memory file and return its body (schema header stripped). Returns an
+/// empty string when the file is missing or unreadable.
+/// Backstop on a hand-edited memory file. Distillation already caps writes at
+/// [`MEMORY_MAX_CHARS`]; this keeps a 50 MB dump from being loaded every turn.
+const MAX_LAYER_READ_BYTES: usize = 16 * 1024;
+
+pub(crate) fn read_layer(path: &Path) -> String {
+    let raw = read_capped(path, MAX_LAYER_READ_BYTES);
+    strip_header(&raw)
+}
+
+fn read_capped(path: &Path, max_bytes: usize) -> String {
+    use std::io::Read;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return String::new(),
+    };
+    let mut buf = vec![0u8; max_bytes];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return String::new(),
+    };
+    buf.truncate(n);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Read the project memory file (header stripped). Returns "" when absent.
+pub fn read_memory() -> String {
+    read_layer(&memory_file())
+}
+
+/// Read the global (user-level) memory file (header stripped). Returns "" when
+/// absent — which is the common case until the distiller has run at least once.
+pub fn read_global_memory() -> String {
+    read_layer(&global_memory_file())
+}
+
+/// A single memory bullet after read-time verification.
+#[derive(Debug, Clone)]
+pub struct AnnotatedBullet {
+    /// The bullet text, cleaned of any prior annotation.
+    pub text: String,
+    /// `true` when the bullet references a path/command that still resolves in
+    /// the current workspace, or the bullet isn't path/command-shaped at all.
+    /// `false` when it looks like a path/command but no longer checks out — a
+    /// strong stale signal.
+    pub verified: bool,
+}
+
+impl AnnotatedBullet {
+    /// Render the bullet for the system prompt. Stale bullets are marked so the
+    /// model treats them skeptically rather than acting on a broken command.
+    pub fn render(&self) -> String {
+        if self.verified {
+            self.text.clone()
+        } else {
+            format!("{}  ⚠ (may be stale)", self.text)
+        }
+    }
+}
+
+/// Read a memory layer and annotate each bullet with read-time groundedness.
+/// Path/command-shaped bullets are checked against the current workspace; a
+/// bullet that looks like a build command whose manifest is gone, or a path that
+/// no longer exists, is marked as potentially stale. Non-path bullets pass
+/// through verified. This is the read-side complement to [`verify_grounded`]
+/// (which drops bad bullets at write time); this just warns at read time so a
+/// stale fact is visible instead of silently trusted.
+pub fn read_annotated(path: &Path) -> Vec<AnnotatedBullet> {
+    let body = read_layer(path);
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            // Strip a prior ⚠ marker so we don't accumulate them across reads.
+            let cleaned = line.trim().trim_end_matches("⚠ (may be stale)").trim_end();
+            let text = cleaned.to_string();
+            let verified = match looks_like_path_or_command(&text) {
+                Some(token) => is_plausible(&token),
+                None => true,
+            };
+            AnnotatedBullet { text, verified }
+        })
+        .collect()
+}
+
+/// Read and annotate the project memory layer.
+pub fn read_project_annotated() -> Vec<AnnotatedBullet> {
+    read_annotated(&memory_file())
+}
+
+/// Workspace-explicit project memory annotation (used when the agent root
+/// differs from process cwd / `HI_MEMORY_FILE`).
+pub fn read_project_annotated_at(root: &Path) -> Vec<AnnotatedBullet> {
+    read_annotated(&memory_file_at(root))
+}
+
+// ---------------------------------------------------------------------------
+// Task-ranked memory injection (Phase P)
+// ---------------------------------------------------------------------------
+
+/// Max bullets from project memory in the system prompt (after ranking).
+pub const MEMORY_INJECT_MAX_BULLETS: usize = 12;
+/// Soft char budget for the rendered memory section body (excludes header).
+pub const MEMORY_INJECT_MAX_CHARS: usize = 1_600;
+
+/// Rank project memory bullets for the current task and render a prompt section.
+///
+/// - Task tokens (len ≥ 3) boost matching bullets to the top.
+/// - Global user prefs always follow under their own sub-heading (uncapped small).
+/// - Empty layers omit the section entirely.
+///
+/// `task` may be empty — then project bullets keep file order (still capped).
+pub fn memory_section_for_task(
+    project: &[AnnotatedBullet],
+    global: &str,
+    task: &str,
+) -> Option<String> {
+    let ranked = rank_project_bullets(project, task, MEMORY_INJECT_MAX_BULLETS);
+    let body = render_ranked_memory_layers(&ranked, global, MEMORY_INJECT_MAX_CHARS);
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "# Memory (from past sessions; task-ranked)\n\
+         Prefer bullets that match the current task; stale-marked items need re-check.\n{body}"
+    ))
+}
+
+/// Score and order project bullets for `task`. Higher score first; original
+/// order breaks ties. Returns at most `limit` bullets.
+pub fn rank_project_bullets(
+    project: &[AnnotatedBullet],
+    task: &str,
+    limit: usize,
+) -> Vec<AnnotatedBullet> {
+    if project.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let tokens = task_tokens(task);
+    let mut scored: Vec<(i32, usize, &AnnotatedBullet)> = project
+        .iter()
+        .enumerate()
+        .map(|(idx, bullet)| {
+            let mut score = bullet_task_score(&bullet.text, &tokens);
+            // Prefer still-grounded facts when scores tie-ish.
+            if bullet.verified {
+                score += 1;
+            }
+            (score, idx, bullet)
+        })
+        .collect();
+    // Higher score first; lower original index (file order) for ties.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, b)| b.clone())
+        .collect()
+}
+
+fn task_tokens(task: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in task.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '/' || ch == '.' {
+            cur.push(ch.to_ascii_lowercase());
+        } else if !cur.is_empty() {
+            push_token(&mut out, &cur);
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        push_token(&mut out, &cur);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn push_token(out: &mut Vec<String>, raw: &str) {
+    let t = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    if t.len() < 3 {
+        return;
+    }
+    // Skip ultra-common English noise.
+    match t {
+        "the" | "and" | "for" | "with" | "this" | "that" | "from" | "into" | "your" | "have"
+        | "will" | "should" | "would" | "could" | "about" | "when" | "what" | "please" | "just"
+        | "also" | "then" | "than" | "them" | "they" | "are" | "was" | "were" | "been"
+        | "being" | "use" | "using" | "used" | "make" | "need" | "wants" | "want" | "fix"
+        | "add" | "file" | "code" => {}
+        _ => out.push(t.to_string()),
+    }
+}
+
+fn bullet_task_score(text: &str, tokens: &[String]) -> i32 {
+    if tokens.is_empty() {
+        return 0;
+    }
+    let lower = text.to_ascii_lowercase();
+    let mut score = 0i32;
+    for tok in tokens {
+        if lower.contains(tok.as_str()) {
+            // Path-ish tokens weigh more (crate names, file stems).
+            let weight = if tok.contains('/') || tok.contains('.') || tok.contains('_') {
+                4
+            } else if tok.len() >= 8 {
+                3
+            } else {
+                2
+            };
+            score += weight;
+        }
+    }
+    score
+}
+
+fn render_ranked_memory_layers(
+    project: &[AnnotatedBullet],
+    global: &str,
+    max_chars: usize,
+) -> String {
+    let mut out = String::new();
+    for b in project {
+        // Annotated bullets often already start with `- ` from the file line;
+        // don't double-prefix.
+        let line = b.render();
+        let line = line
+            .trim_start()
+            .strip_prefix("- ")
+            .or_else(|| line.trim_start().strip_prefix('-'))
+            .unwrap_or(line.trim_start());
+        let candidate = if out.is_empty() {
+            format!("- {line}")
+        } else {
+            format!("{out}\n- {line}")
+        };
+        if candidate.chars().count() > max_chars && !out.is_empty() {
+            break;
+        }
+        out = candidate;
+        if out.chars().count() > max_chars {
+            break;
+        }
+    }
+    let global = global.trim();
+    if !global.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("## User-level (global)\n");
+        // Global prefs are usually few; still soft-cap the remainder.
+        let room = max_chars.saturating_sub(out.chars().count());
+        if global.chars().count() <= room {
+            out.push_str(global);
+        } else {
+            let kept: String = global.chars().take(room.saturating_sub(1)).collect();
+            out.push_str(kept.trim_end());
+            out.push('…');
+        }
+        out.push('\n');
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Distillation prompt
+// ---------------------------------------------------------------------------
+
+/// The session-end distillation prompt, folding in the current memory so the
+/// model revises it (merge / de-dupe / drop-stale) instead of appending.
+///
+/// `corrections` and `recalled` are optional enrichment sections injected into
+/// the prompt so the distiller focuses on the highest-signal material.
+pub(crate) fn memory_prompt(
+    existing: &str,
+    global: &str,
+    corrections: &str,
+    recalled: &str,
+) -> String {
+    let existing = layer_block("Current project memory", existing);
+    let global = layer_block("Current global (user) memory", global);
+    let corrections = if corrections.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nCorrections the user made this session (high-signal):\n---\n{corrections}\n---\n"
+        )
+    };
+    let recalled = if recalled.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nRecalled memory: these bullets were NOT referenced in this session. They may be stale — consider dropping or merging them if this session supersedes them:\n---\n{recalled}\n---\n"
+        )
+    };
+    format!(
+        "This coding session is ending. Maintain a small, durable memory for future work \
+         in this project — reusable notes, not a transcript.\n\n{existing}\n\n{global}\n{corrections}{recalled}\n\
+         Revise the project memory using only what THIS session actually established: keep facts \
+         that save time next time — project conventions, key decisions and constraints, \
+         non-obvious gotchas, important file locations, and the exact build/test/run commands. \
+         Drop anything transient, already obvious from the code or HI.md, or now outdated. Merge \
+         and de-duplicate.\n\nFor facts that are about the USER and apply across ALL projects \
+         (editor prefs, preferred package manager, communication style, API-key policy), prefix \
+         the bullet with `{GLOBAL_TAG}` — those are routed to the global memory. Everything else \
+         stays in project memory.\n\nOutput ONLY the updated project memory as at most ~20 short \
+         bullet points (a few words to one line each), `{GLOBAL_TAG}`-prefixed bullets included \
+         inline, no preamble. Keep existing `[#n]` ids on bullets you retain; new bullets may omit \
+         ids (they are stamped on save). If nothing durable is worth keeping, output the current \
+         memory unchanged (or nothing if it was empty)."
+    )
+}
+
+fn layer_block(label: &str, body: &str) -> String {
+    let body = if body.trim().is_empty() {
+        "(empty)"
+    } else {
+        body.trim()
+    };
+    format!("{label}:\n---\n{body}\n---")
+}
+
+// ---------------------------------------------------------------------------
+// Correction capture
+// ---------------------------------------------------------------------------
+
+/// Extract correction-shaped user messages from the transcript. A correction is
+/// a short user message that looks like it's fixing the agent's course — it
+/// starts with a negation/repair word, or follows a tool result that looks like
+/// an error. These are the highest-signal inputs for memory distillation, and
+/// without surfacing them explicitly the end-of-session model may miss them in
+/// a long transcript.
+pub(crate) fn extract_corrections(messages: &[Message]) -> String {
+    let mut out = Vec::new();
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.role != Role::User {
+            continue;
+        }
+        let raw = msg.text();
+        let text = crate::ui::strip_context_block(raw.trim());
+        // Slash commands and pasted code aren't corrections.
+        if text.starts_with('/') || text.lines().count() > 3 {
+            continue;
+        }
+        if looks_like_correction(text)
+            || (i > 0 && prev_was_error(&messages[i.saturating_sub(1)]) && !is_tool_result(msg))
+        {
+            // Strip paste-folded stdin markers that clutter the snippet.
+            let clean = text.replace("\n<<<STDIN>>>:", " ");
+            out.push(format!("- {clean}"));
+        }
+    }
+    out.join("\n")
+}
+
+fn looks_like_correction(text: &str) -> bool {
+    // Lead with a negation / repair marker. Match on the first word so "no, use
+    // pnpm" / "actually it's src/main.rs" both qualify.
+    let lower = text.to_ascii_lowercase();
+    let lead = lower
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    const MARKERS: &[&str] = &[
+        "no",
+        "no,",
+        "no.",
+        "not",
+        "wrong",
+        "actually",
+        "wait",
+        "stop",
+        "don't",
+        "dont",
+        "instead",
+        "use",
+        "should",
+        "needs",
+        "missing",
+        "incorrect",
+        "typo",
+        "prefer",
+        "i prefer",
+        "my preference",
+        "please always",
+    ];
+    MARKERS
+        .iter()
+        .any(|m| lower.starts_with(m) || lead.starts_with(m))
+}
+
+fn prev_was_error(msg: &Message) -> bool {
+    // A tool result role carrying an error-ish payload.
+    msg.role == Role::Tool && msg.text().to_ascii_lowercase().contains("error")
+}
+
+fn is_tool_result(msg: &Message) -> bool {
+    msg.role == Role::Tool
+}
+
+// ---------------------------------------------------------------------------
+// Recall signal — decay unused bullets
+// ---------------------------------------------------------------------------
+
+/// Compute which existing memory bullets were NOT referenced anywhere in this
+/// session's transcript (case-insensitive substring match on a distinguishing
+/// fragment of each bullet). These are recall candidates: facts the session
+/// succeeded without, so they're decay/merge candidates.
+///
+/// Returns the bullet lines joined by newlines (without the leading `- ` stripped)
+/// so the prompt can present them as a list. Only bullets long enough to be
+/// distinguishable are considered — very short tokens produce false positives.
+pub(crate) fn unreferenced_bullets(existing: &str, transcript: &str) -> String {
+    let haystack = transcript.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for line in existing.lines() {
+        let bullet = line.trim_start_matches('-').trim();
+        if bullet.is_empty() {
+            continue;
+        }
+        // Use a distinguishing fragment: the longest whitespace-delimited token.
+        // This avoids matching on common lead-ins ("the", "use", "project").
+        let frag = distinguishing_fragment(bullet);
+        if frag.len() < 4 {
+            continue; // too generic to trust a non-match on
+        }
+        if !haystack.contains(&frag) {
+            out.push(format!("- {bullet}"));
+        }
+    }
+    out.join("\n")
+}
+
+/// Pick the longest alphanumeric token in the bullet as the match key.
+fn distinguishing_fragment(bullet: &str) -> String {
+    bullet
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '-' && c != '_'))
+        .filter(|w| w.len() >= 4)
+        .max_by_key(|w| w.len())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+// ---------------------------------------------------------------------------
+// Groundedness — verify path/command bullets against the filesystem
+// ---------------------------------------------------------------------------
+
+/// A bullet whose leading term looks like a filesystem path (contains `/` or a
+/// known extension) or a build command. We verify these against the workspace
+/// after distillation so memory doesn't persist a hallucinated path or a build
+/// command that no longer works.
+fn looks_like_path_or_command(bullet: &str) -> Option<String> {
+    let body = bullet.trim_start_matches('-').trim();
+    if body.is_empty() {
+        return None;
+    }
+    // A command-shaped bullet: starts with a known runner.
+    let lower = body.to_ascii_lowercase();
+    const COMMANDS: &[&str] = &[
+        "cargo", "npm", "pnpm", "yarn", "make", "go ", "python", "python3", "pytest", "ruff",
+        "just ", "bun ", "deno", "tsc", "eslint", "prettier", "gradle", "mvn", "cmake", "bash",
+    ];
+    if COMMANDS.iter().any(|c| lower.starts_with(c)) {
+        return Some(body.to_string());
+    }
+    // A path-shaped bullet: scan every whitespace-delimited token for one that
+    // looks like a path (contains `/` or a file extension). Memory prose like
+    // "entry is src/main.rs" puts the path mid-sentence, so the first word
+    // alone isn't enough.
+    for word in body.split_whitespace() {
+        let word =
+            word.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != '-');
+        // A trailing '.' is sentence punctuation, not part of a path: without
+        // this, "src/main.rs." never exists and any prose word ending a
+        // sentence ("messages.") reads as having an (empty) extension — either
+        // way the bullet gets dropped as an implausible path.
+        let word = word.trim_end_matches('.');
+        if word.contains('/') || has_extension(word) {
+            return Some(word.to_string());
+        }
+    }
+    None
+}
+
+fn has_extension(s: &str) -> bool {
+    Path::new(s).extension().is_some_and(|e| {
+        let e = e.to_string_lossy();
+        // Real file extensions (rs, py, json, mp4, …) are short alphanumerics
+        // with at least one letter. This keeps version numbers ("v1.2") and
+        // abbreviations from classifying prose as a path to be verified.
+        !e.is_empty()
+            && e.len() <= 6
+            && e.chars().all(|c| c.is_ascii_alphanumeric())
+            && e.chars().any(|c| c.is_ascii_alphabetic())
+    })
+}
+
+/// Verify distilled bullets that look like paths or commands against the current
+/// workspace. Path-shaped bullets are checked for existence; command-shaped
+/// bullets are checked for the presence of the relevant manifest file (e.g.
+/// `cargo` → Cargo.toml, `pnpm` → pnpm-lock.yaml or package.json). Bullets that
+/// fail verification are dropped — a hallucinated path or a stale build command
+/// is worse than no memory.
+///
+/// This is best-effort and conservative: when in doubt we keep the bullet. The
+/// cost of a false drop (losing a real fact) is higher than a false keep.
+pub(crate) fn verify_grounded(bullets: &str) -> String {
+    bullets
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return true; // preserve blank separators
+            }
+            // Don't verify global-routed bullets here — they're extracted before
+            // this runs and may reference paths in other projects.
+            if line.trim_start_matches('-').trim().starts_with(GLOBAL_TAG) {
+                return true;
+            }
+            match looks_like_path_or_command(line) {
+                Some(token) => is_plausible(&token),
+                None => true, // not path/command-shaped → keep
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Is this token a plausible path or command in the current workspace?
+fn is_plausible(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    // Command → require the corresponding manifest to exist.
+    let manifest = if lower.starts_with("cargo") {
+        Some("Cargo.toml")
+    } else if lower.starts_with("go ") || lower.starts_with("go\t") || lower == "go" {
+        Some("go.mod")
+    } else if lower.starts_with("pnpm") {
+        // pnpm is fine with either lock file or a plain package.json.
+        return Path::new("pnpm-lock.yaml").exists()
+            || Path::new("package.json").exists()
+            || Path::new("npm-shrinkwrap.json").exists();
+    } else if lower.starts_with("npm") {
+        return Path::new("package.json").exists() || Path::new("package-lock.json").exists();
+    } else if lower.starts_with("yarn") {
+        return Path::new("package.json").exists() || Path::new("yarn.lock").exists();
+    } else if lower.starts_with("bun ") || lower == "bun" {
+        return Path::new("package.json").exists()
+            || Path::new("bun.lockb").exists()
+            || Path::new("bun.lock").exists();
+    } else if lower.starts_with("make") || lower == "make" {
+        return Path::new("Makefile").exists() || Path::new("makefile").exists();
+    } else if lower.starts_with("just") {
+        return Path::new("justfile").exists() || Path::new("Justfile").exists();
+    } else if lower.starts_with("pytest")
+        || lower.starts_with("python")
+        || lower.starts_with("ruff")
+    {
+        return Path::new("pyproject.toml").exists()
+            || Path::new("setup.py").exists()
+            || Path::new("requirements.txt").exists();
+    } else if lower.starts_with("tsc") {
+        return Path::new("tsconfig.json").exists() || Path::new("package.json").exists();
+    } else if lower.starts_with("gradle") {
+        return Path::new("build.gradle").exists()
+            || Path::new("build.gradle.kts").exists()
+            || Path::new("settings.gradle").exists();
+    } else if lower.starts_with("mvn") {
+        return Path::new("pom.xml").exists();
+    } else if lower.starts_with("cmake") {
+        return Path::new("CMakeLists.txt").exists();
+    } else if lower.starts_with("deno") {
+        return Path::new("deno.json").exists() || Path::new("deno.jsonc").exists();
+    } else {
+        None
+    };
+    if let Some(mf) = manifest {
+        return Path::new(mf).exists();
+    }
+    // Path-shaped → check existence directly. A leading "build/" or "src/"
+    // fragment is checked as-is; an absolute path is checked literally.
+    if token.starts_with('/') {
+        return Path::new(token).exists();
+    }
+    // For a token like "src/main.rs" or "crates/foo", check the path itself.
+    if token.contains('.') {
+        return Path::new(token).exists();
+    }
+    // A directory-ish fragment: check if it exists as a dir.
+    Path::new(token).exists()
+}
+
+// ---------------------------------------------------------------------------
+// Split / route — separate global-routed bullets from project bullets
+// ---------------------------------------------------------------------------
+
+/// Split distilled bullets into (project, global) by the `{GLOBAL_TAG}` prefix.
+/// Strips the tag from the global lines so the stored file is clean markdown.
+pub(crate) fn split_layers(distilled: &str) -> (String, String) {
+    let mut project = Vec::new();
+    let mut global = Vec::new();
+    for line in distilled.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix(GLOBAL_TAG) {
+            global.push(format!("- {}", rest.trim()));
+        } else {
+            project.push(trimmed.to_string());
+        }
+    }
+    (project.join("\n"), global.join("\n"))
+}
+
+// ---------------------------------------------------------------------------
+// Capping + gating
+// ---------------------------------------------------------------------------
+
+/// Trim and cap the distilled memory at [`MEMORY_MAX_CHARS`], cutting back to the
+/// last whole line so a bullet isn't sliced mid-word. Empty in → empty out.
+pub(crate) fn cap_memory(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() <= MEMORY_MAX_CHARS {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(MEMORY_MAX_CHARS).collect();
+    let kept = kept
+        .rsplit_once('\n')
+        .map(|(head, _)| head)
+        .unwrap_or(&kept);
+    format!("{}\n… (memory truncated)", kept.trim_end())
+}
+
+/// Whether to distill session memory at quit: only when enabled *and* the model
+/// actually produced output this session, so an empty or command-only session
+/// writes nothing. Shared by both frontends so the rule can't drift between them.
+pub fn should_distill_memory(enabled: bool, output_tokens: u64) -> bool {
+    enabled && output_tokens > 0
+}
+
+// ---------------------------------------------------------------------------
+// Header strip + atomic/locked write (unchanged behaviour, now public helpers)
+// ---------------------------------------------------------------------------
+
+/// Strip the schema header line from a read-back memory body, so the distiller
+/// and the context loader see only the bullets. Tolerates a missing header
+/// (e.g. a hand-written file or a pre-versioning file migrated in) by returning
+/// the body unchanged.
+pub fn strip_header(raw: &str) -> String {
+    let mut lines = raw.lines();
+    match lines.next() {
+        Some(first) if first.trim() == MEMORY_HEADER => lines.collect::<Vec<_>>().join("\n"),
+        _ => raw.trim().to_string(),
+    }
+}
+
+/// Atomically and exclusively write the distilled memory.
+///
+/// Empty bodies are skipped (no file created) so a blank distill cannot wipe
+/// existing notes. Use [`write_memory_replace`] to clear a file (forget-all).
+///
+/// - **Exclusive**: takes `.memory.lock` via `O_EXCL` creation. If another
+///   process holds it, this distillation is skipped (best-effort at quit — the
+///   other writer's revision wins). The lock is an advisory mutex scoped to the
+///   write via a guard that deletes it on drop.
+/// - **Atomic**: writes to `<file>.tmp` then `rename`s over the target, so a
+///   crash mid-write leaves the previous file intact rather than a truncated one.
+/// - **Versioned**: prepends the [`MEMORY_HEADER`] schema marker.
+/// - **Undo**: copies the previous file to a sibling `*.undo.md` sidecar.
+///
+/// Returns `Ok(notes)` with the count of non-empty lines written, or `Err` with
+/// a human-readable status string for the UI.
+pub fn write_memory(path: &Path, body: &str) -> Result<usize, String> {
+    if body.trim().is_empty() {
+        return Ok(0);
+    }
+    write_memory_replace(path, body)
+}
+
+/// Write `body` even when empty (header-only file). Used by `memory_forget`.
+pub fn write_memory_replace(path: &Path, body: &str) -> Result<usize, String> {
+    let body = body.trim();
+    let notes = body.lines().filter(|l| !l.trim().is_empty()).count();
+
+    let Some(parent) = path.parent() else {
+        return Err(format!("no parent directory for {}", path.display()));
+    };
+    if let Err(e) = fs::create_dir_all(parent) {
+        return Err(format!("couldn't create {}: {e}", parent.display()));
+    }
+
+    let _lock = take_lock(parent)?;
+    snapshot_undo(path);
+
+    let mut tmp = path.to_path_buf();
+    let mut name = tmp
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("memory.md"));
+    name.push(format!(".{}.tmp", std::process::id()));
+    tmp.set_file_name(name);
+
+    let content = format!("{MEMORY_HEADER}\n{body}\n");
+    if let Err(e) = write_tmp(&tmp, &content) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("couldn't write {}: {e}", tmp.display()));
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("couldn't install {}: {e}", path.display()));
+    }
+    Ok(notes)
+}
+
+fn write_tmp(tmp: &Path, content: &str) -> std::io::Result<()> {
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(tmp)?;
+    f.write_all(content.as_bytes())?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// A dropped-on-release exclusive lock acquired via `O_EXCL` file creation.
+struct LockGuard(PathBuf);
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// A lock older than this is presumed abandoned (the holder crashed or was
+/// killed before its `Drop` ran). Memory writes are sub-second, so minutes of
+/// age means no live holder — without this, one SIGKILL would disable memory
+/// persistence for every future session until the file is deleted by hand.
+const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+fn take_lock(parent: &Path) -> Result<LockGuard, String> {
+    let lock = parent.join(".memory.lock");
+    for _ in 0..2 {
+        match OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => return Ok(LockGuard(lock)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&lock)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > LOCK_STALE_AFTER);
+                if !stale {
+                    return Err("another session is updating memory".to_string());
+                }
+                // Break the stale lock and retry the exclusive create once (a
+                // concurrent session may break it first — losing that race
+                // lands in AlreadyExists again and errors out normally).
+                let _ = fs::remove_file(&lock);
+            }
+            Err(e) => return Err(format!("couldn't take memory lock: {e}")),
+        }
+    }
+    Err("another session is updating memory".to_string())
+}
+
+fn undo_sidecar(path: &Path) -> PathBuf {
+    // Keep a markdown extension so post-verify settlement treats the sidecar as
+    // prose (same as `.hi/memory.md`). `memory.md.undo` would look like a
+    // binary/unknown file and wipe a green verification pass.
+    let stem = path
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "memory".into());
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+        .unwrap_or("md");
+    path.with_file_name(format!("{stem}.undo.{ext}"))
+}
+
+fn snapshot_undo(path: &Path) {
+    let sidecar = undo_sidecar(path);
+    match fs::read(path) {
+        Ok(bytes) => {
+            let _ = fs::write(&sidecar, bytes);
+        }
+        Err(_) => {
+            // Previous file missing — undo should delete the new file.
+            let _ = fs::write(&sidecar, b"");
+        }
+    }
+}
+
+/// Restore the last markdown memory write for this workspace (`/undo-memory`).
+pub fn undo_memory(workspace: &Path) -> Result<String, String> {
+    let project = memory_file_at(workspace);
+    let global = global_memory_file();
+    let candidates = [undo_sidecar(&project), undo_sidecar(&global)];
+    let Some(sidecar) = candidates.iter().filter(|p| p.is_file()).max_by_key(|p| {
+        fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    }) else {
+        return Err("nothing to undo — no recent memory write in this session".into());
+    };
+    let target = if sidecar == &undo_sidecar(&project) {
+        project
+    } else {
+        global
+    };
+    let previous = fs::read(sidecar).map_err(|e| format!("couldn't read undo snapshot: {e}"))?;
+    if previous.is_empty() {
+        let _ = fs::remove_file(&target);
+    } else {
+        let Some(parent) = target.parent() else {
+            return Err(format!("no parent directory for {}", target.display()));
+        };
+        let _lock = take_lock(parent)?;
+        let mut tmp = target.clone();
+        let mut name = tmp
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("memory.md"));
+        name.push(format!(".{}.tmp", std::process::id()));
+        tmp.set_file_name(name);
+        fs::write(&tmp, &previous).map_err(|e| format!("couldn't write undo temp: {e}"))?;
+        fs::rename(&tmp, &target).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("couldn't restore {}: {e}", target.display())
+        })?;
+    }
+    let _ = fs::remove_file(sidecar);
+    Ok(format!("restored {}", target.display()))
+}
+
+/// Parse `- [#12] text` (or a legacy `- text` line).
+pub fn parse_bullet_line(line: &str) -> Option<(Option<u32>, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let rest = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix('-'))
+        .unwrap_or(trimmed)
+        .trim_start();
+    if let Some(inner) = rest.strip_prefix("[#")
+        && let Some(end) = inner.find(']')
+        && let Ok(id) = inner[..end].parse::<u32>()
+    {
+        return Some((Some(id), inner[end + 1..].trim().to_string()));
+    }
+    Some((None, rest.to_string()))
+}
+
+pub fn max_bullet_id(body: &str) -> u32 {
+    body.lines()
+        .filter_map(parse_bullet_line)
+        .filter_map(|(id, _)| id)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Stamp missing `[#n]` ids. Existing ids are kept; `next_id` is advanced past
+/// the highest id seen.
+pub fn ensure_bullet_ids(body: &str, next_id: &mut u32) -> String {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let Some((id, text)) = parse_bullet_line(line) else {
+            continue;
+        };
+        let text = text.trim_end_matches("⚠ (may be stale)").trim_end();
+        if text.is_empty() {
+            continue;
+        }
+        let id = match id {
+            Some(existing) => {
+                if existing >= *next_id {
+                    *next_id = existing.saturating_add(1);
+                }
+                existing
+            }
+            None => {
+                let assigned = *next_id;
+                *next_id = next_id.saturating_add(1);
+                assigned
+            }
+        };
+        out.push(format!("- [#{id}] {text}"));
+    }
+    out.join("\n")
+}
+
+fn render_bullet(id: u32, text: &str) -> String {
+    format!("- [#{id}] {}", text.trim())
+}
+
+pub fn update_bullet_in_body(body: &str, id: u32, text: &str) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("updated text is empty".into());
+    }
+    let mut found = false;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        match parse_bullet_line(line) {
+            Some((Some(existing), _)) if existing == id => {
+                out.push(render_bullet(id, text));
+                found = true;
+            }
+            Some((Some(existing), old)) => out.push(render_bullet(existing, &old)),
+            Some((None, old)) => out.push(format!("- {old}")),
+            None => {}
+        }
+    }
+    if !found {
+        return Err(format!("no memory bullet [#{id}]"));
+    }
+    Ok(out.join("\n"))
+}
+
+pub fn forget_bullet_in_body(body: &str, id: u32) -> Result<String, String> {
+    let mut found = false;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        match parse_bullet_line(line) {
+            Some((Some(existing), _)) if existing == id => {
+                found = true;
+            }
+            Some((Some(existing), old)) => out.push(render_bullet(existing, &old)),
+            Some((None, old)) => out.push(format!("- {old}")),
+            None => {}
+        }
+    }
+    if !found {
+        return Err(format!("no memory bullet [#{id}]"));
+    }
+    Ok(out.join("\n"))
+}
+
+fn layer_bodies(workspace: &Path) -> [(PathBuf, String, &'static str); 2] {
+    let project = memory_file_at(workspace);
+    let global = global_memory_file();
+    [
+        (project.clone(), read_layer(&project), "project"),
+        (global.clone(), read_layer(&global), "global"),
+    ]
+}
+
+fn find_bullet(workspace: &Path, id: u32) -> Option<(PathBuf, &'static str, String)> {
+    for (path, body, layer) in layer_bodies(workspace) {
+        for line in body.lines() {
+            if let Some((Some(existing), text)) = parse_bullet_line(line)
+                && existing == id
+            {
+                return Some((path, layer, text));
+            }
+        }
+    }
+    None
+}
+
+const UNDO_HINT: &str = " — `/undo-memory`";
+
+/// Markdown memory files as the interactive [`hi_tools::MemoryBackend`].
+/// Never uses RSI SQLite (`RsiMemoryStore`).
+#[derive(Clone, Debug)]
+pub struct MarkdownMemory {
+    workspace: PathBuf,
+    enabled: bool,
+}
+
+impl MarkdownMemory {
+    pub fn new(workspace: PathBuf, enabled: bool) -> Self {
+        Self { workspace, enabled }
+    }
+
+    fn refuse_writes(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.enabled,
+            "memory writes are disabled (--no-memory / --no-save)"
+        );
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl hi_tools::MemoryBackend for MarkdownMemory {
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<hi_tools::MemorySearchResult>> {
+        let q = query.trim().to_ascii_lowercase();
+        let mut hits = Vec::new();
+        for (path, body, layer) in layer_bodies(&self.workspace) {
+            for line in body.lines() {
+                let Some((id, text)) = parse_bullet_line(line) else {
+                    continue;
+                };
+                if !text.to_ascii_lowercase().contains(&q) && !q.is_empty() {
+                    continue;
+                }
+                let label = id
+                    .map(|n| format!("{layer}:#{n}"))
+                    .unwrap_or_else(|| format!("{}:{}", layer, path.display()));
+                hits.push(hi_tools::MemorySearchResult {
+                    path: label,
+                    snippet: text,
+                    score: 1.0,
+                });
+                if hits.len() >= limit {
+                    return Ok(hits);
+                }
+            }
+        }
+        Ok(hits)
+    }
+
+    async fn get(&self, path: &str) -> anyhow::Result<String> {
+        let token = path.trim();
+        if let Some(id) = parse_memory_ref(token) {
+            let Some((_, layer, text)) = find_bullet(&self.workspace, id) else {
+                anyhow::bail!("no memory bullet [#{id}]");
+            };
+            return Ok(format!("[{layer} #{id}] {text}"));
+        }
+        let file = PathBuf::from(token);
+        let body = read_layer(&file);
+        anyhow::ensure!(
+            !body.trim().is_empty(),
+            "memory file {token} is empty or missing"
+        );
+        Ok(body)
+    }
+
+    async fn update(&self, id: u32, text: &str) -> anyhow::Result<String> {
+        self.refuse_writes()?;
+        let Some((path, layer, _)) = find_bullet(&self.workspace, id) else {
+            anyhow::bail!("no memory bullet [#{id}]");
+        };
+        let next = update_bullet_in_body(&read_layer(&path), id, text)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        write_memory_replace(&path, &next).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(format!("remembered [#{id}] ({layer}){UNDO_HINT}"))
+    }
+
+    async fn forget(&self, id: u32) -> anyhow::Result<String> {
+        self.refuse_writes()?;
+        let Some((path, layer, _)) = find_bullet(&self.workspace, id) else {
+            anyhow::bail!("no memory bullet [#{id}]");
+        };
+        let next =
+            forget_bullet_in_body(&read_layer(&path), id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        write_memory_replace(&path, &next).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(format!("forgot [#{id}] ({layer}){UNDO_HINT}"))
+    }
+}
+
+fn parse_memory_ref(token: &str) -> Option<u32> {
+    let token = token.trim();
+    if let Some(rest) = token.strip_prefix('#') {
+        return rest.parse().ok();
+    }
+    for prefix in ["project:#", "global:#"] {
+        if let Some(rest) = token.strip_prefix(prefix) {
+            return rest.parse().ok();
+        }
+    }
+    None
+}
+
+pub fn next_memory_id(workspace: &Path) -> u32 {
+    let project = read_layer(&memory_file_at(workspace));
+    let global = read_global_memory();
+    max_bullet_id(&project)
+        .max(max_bullet_id(&global))
+        .saturating_add(1)
+}
+
+pub fn stamp_layer_ids(workspace: &Path, body: &str) -> String {
+    let mut next = next_memory_id(workspace);
+    ensure_bullet_ids(body, &mut next)
+}
+
+// Forward the message types so callers don't need a separate import.
+pub(crate) use hi_ai::{Message, Role};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hi_tools::MemoryBackend;
+
+    #[test]
+    fn read_layer_does_not_load_an_unbounded_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-memory-huge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("memory.md");
+        fs::write(&path, format!("{MEMORY_HEADER}\n{}", "x".repeat(200_000))).unwrap();
+        let body = read_layer(&path);
+        assert!(
+            body.len() <= MAX_LAYER_READ_BYTES,
+            "memory layer read must be capped: {}",
+            body.len()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cap_memory_trims_and_backstops() {
+        assert_eq!(cap_memory("  - a\n- b  "), "- a\n- b"); // trimmed, under budget
+        assert_eq!(cap_memory("   "), ""); // empty in → empty out
+        let big = "- a durable note\n".repeat(1000); // ≫ MEMORY_MAX_CHARS
+        let capped = cap_memory(&big);
+        assert!(
+            capped.chars().count() <= MEMORY_MAX_CHARS + 40,
+            "backstopped"
+        );
+        assert!(capped.ends_with("(memory truncated)"));
+    }
+
+    #[test]
+    fn memory_prompt_folds_in_existing_memory() {
+        let p = memory_prompt("- 4-space indent", "", "", "");
+        assert!(p.contains("- 4-space indent"), "includes current memory");
+        assert!(p.contains("Current project memory"));
+        assert!(
+            p.contains("Keep existing `[#n]` ids"),
+            "distill prompt must keep stable bullet ids: {p}"
+        );
+        assert!(
+            memory_prompt("   ", "   ", "   ", "   ").contains("(empty)"),
+            "blank → (empty)"
+        );
+        // Corrections and recalled sections only appear when non-empty.
+        let with = memory_prompt("", "", "- no, use pnpm", "");
+        assert!(with.contains("Corrections the user made"));
+        assert!(!with.contains("Recalled memory"));
+        let rec = memory_prompt("", "", "", "- old fact");
+        assert!(rec.contains("Recalled memory"));
+    }
+
+    #[test]
+    fn should_distill_memory_gates_on_enabled_and_work() {
+        assert!(should_distill_memory(true, 1), "enabled + work → distill");
+        assert!(!should_distill_memory(true, 0), "no model output → skip");
+        assert!(!should_distill_memory(false, 100), "disabled → skip");
+    }
+
+    #[test]
+    fn strip_header_removes_version_marker() {
+        let raw = format!("{MEMORY_HEADER}\n- note one\n- note two");
+        assert_eq!(strip_header(&raw), "- note one\n- note two");
+    }
+
+    #[test]
+    fn strip_header_passes_through_unversioned_body() {
+        // A hand-written or pre-versioning file has no header — keep it intact.
+        assert_eq!(strip_header("- legacy\n- notes"), "- legacy\n- notes");
+        assert_eq!(strip_header(""), "");
+    }
+
+    /// Round-trip: write a body, read it back, strip the header, get the body.
+    #[test]
+    fn write_memory_round_trips_with_header() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-mem-rt-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let notes = write_memory(&path, "- alpha\n- beta").unwrap();
+        assert_eq!(notes, 2);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.starts_with(MEMORY_HEADER), "header written");
+        assert_eq!(strip_header(&raw), "- alpha\n- beta");
+        let _ = fs::remove_file(&path);
+        // Lock sibling cleaned up.
+        let _ = fs::remove_file(path.with_file_name(".memory.lock"));
+    }
+
+    /// An empty body writes nothing and creates no file.
+    #[test]
+    fn write_memory_skips_empty_body() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-mem-empty-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert_eq!(write_memory(&path, "   \n  ").unwrap(), 0);
+        assert!(!path.exists(), "no file created for empty body");
+    }
+
+    /// A second concurrent lock attempt is rejected while the first is held.
+    #[test]
+    fn concurrent_lock_is_exclusive() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-mem-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let lock_a = take_lock(&dir);
+        assert!(lock_a.is_ok(), "first taker succeeds");
+        let lock_b = take_lock(&dir);
+        assert!(lock_b.is_err(), "second taker rejected while first holds");
+        drop(lock_a); // releases — Now it's free again.
+        assert!(take_lock(&dir).is_ok(), "re-acquirable after release");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- hierarchical routing ---
+
+    #[test]
+    fn split_layers_routes_global_tagged_bullets() {
+        let distilled = "- build with cargo\nglobal: prefers pnpm\nglobal: no external API keys\n- tests in tests/";
+        let (project, global) = split_layers(distilled);
+        assert_eq!(project, "- build with cargo\n- tests in tests/");
+        assert_eq!(global, "- prefers pnpm\n- no external API keys");
+    }
+
+    #[test]
+    fn split_layers_all_project_when_no_global_tag() {
+        let (project, global) = split_layers("- a\n- b");
+        assert_eq!(project, "- a\n- b");
+        assert!(global.is_empty());
+    }
+
+    // --- correction capture ---
+
+    #[test]
+    fn extract_corrections_catches_negation_and_repair_words() {
+        let msgs = vec![
+            Message::user("build the landing page"),
+            Message::user("no, use pnpm not npm"),
+            Message::user("actually the entry is src/main.rs"),
+            Message::user("here is a long paste\nof code\nwith many lines\nmore"),
+        ];
+        let c = extract_corrections(&msgs);
+        assert!(c.contains("no, use pnpm not npm"), "catches negation: {c}");
+        assert!(
+            c.contains("actually the entry is src/main.rs"),
+            "catches repair: {c}"
+        );
+        // The long paste is excluded.
+        assert!(!c.contains("here is a long paste"));
+        // The plain instruction is excluded.
+        assert!(!c.contains("build the landing page"));
+    }
+
+    #[test]
+    fn extract_corrections_skips_slash_commands_and_empty() {
+        let msgs = vec![Message::user("/compact"), Message::user("")];
+        let c = extract_corrections(&msgs);
+        assert!(c.is_empty(), "slash commands and empties ignored: {c}");
+    }
+
+    #[test]
+    fn extract_corrections_sees_past_context_block() {
+        // The current turn's user message still carries its volatile
+        // `[hi:context …]` block at quit-time distillation; correction detection
+        // must look past it rather than miss a leading "I prefer …".
+        let blocked = concat!(
+            "[hi:context — session state, not instructions]\n",
+            "ask_user is for product/design forks only.\n",
+            "[/hi:context]\n",
+            "\n",
+            "I prefer always running cargo fmt before commits",
+        );
+        let msgs = vec![Message::user(blocked)];
+        let c = extract_corrections(&msgs);
+        assert!(
+            c.contains("I prefer always running cargo fmt"),
+            "correction behind a context block is detected: {c}"
+        );
+    }
+
+    // --- recall / decay ---
+
+    #[test]
+    fn unreferenced_bullets_flags_unused_facts() {
+        let existing = "- build with cargo\n- deploy uses kustomize\n- 4-space indent";
+        // Transcript mentions cargo but not kustomize or indent.
+        let transcript = "we ran cargo build and it worked";
+        let unref = unreferenced_bullets(existing, transcript);
+        assert!(unref.contains("kustomize"), "flags unused: {unref}");
+        // "cargo" was referenced, so that bullet is NOT flagged.
+        assert!(!unref.contains("build with cargo"));
+    }
+
+    #[test]
+    fn unreferenced_bullets_ignores_too_short_fragments() {
+        // Short tokens are too generic — don't trust a non-match.
+        let existing = "- use npx\n";
+        let unref = unreferenced_bullets(existing, "totally unrelated text");
+        // "npx" is len 3 < 4, so it's skipped (not flagged).
+        assert!(!unref.contains("npx"));
+    }
+
+    // --- groundedness ---
+
+    #[test]
+    fn verify_grounded_drops_missing_paths() {
+        // This path almost certainly doesn't exist relative to cwd.
+        let bullets = "- entry is src/nonexistent_main_xyz.rs\n- a normal note";
+        let kept = verify_grounded(bullets);
+        assert!(!kept.contains("nonexistent"), "drops missing path: {kept}");
+        assert!(kept.contains("a normal note"), "keeps non-path bullets");
+    }
+
+    #[test]
+    fn verify_grounded_keeps_manifest_backed_commands() {
+        // cargo → Cargo.toml, which exists in this repo.
+        let bullets = "- build with cargo\n- entry is src/nonexistent_xyz.rs";
+        let kept = verify_grounded(bullets);
+        assert!(kept.contains("cargo"), "keeps cargo (Cargo.toml present)");
+        assert!(!kept.contains("nonexistent"), "drops missing path");
+    }
+
+    #[test]
+    fn verify_grounded_passes_through_non_command_bullets() {
+        let bullets = "- prefers terse output\n- decisions in ADR format";
+        let kept = verify_grounded(bullets);
+        assert_eq!(kept.trim(), bullets.trim(), "non-path/command bullets kept");
+    }
+
+    #[test]
+    fn verify_grounded_skips_global_tagged_bullets() {
+        // Global bullets may reference paths in other projects — don't verify.
+        let bullets = "global: uses /home/david/bin/custom-tool";
+        let kept = verify_grounded(bullets);
+        assert!(kept.contains("global:"), "global bullets not verified");
+    }
+
+    // --- stale-on-read annotation ---
+
+    #[test]
+    fn read_annotated_marks_missing_paths_stale() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-mem-ann-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.md");
+        write_memory(
+            &path,
+            "- entry is src/totally_missing_xyz.rs\n- prefers terse output",
+        )
+        .unwrap();
+        let annotated = read_annotated(&path);
+        assert_eq!(annotated.len(), 2);
+        // The missing path → stale.
+        let stale = annotated
+            .iter()
+            .find(|a| a.text.contains("missing"))
+            .unwrap();
+        assert!(!stale.verified, "missing path marked stale");
+        assert!(
+            stale.render().contains("may be stale"),
+            "rendered with warning"
+        );
+        // The plain bullet → verified.
+        let ok = annotated.iter().find(|a| a.text.contains("terse")).unwrap();
+        assert!(ok.verified, "non-path bullet verified");
+        assert_eq!(ok.render(), ok.text, "no warning appended");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_annotated_strips_prior_warning_marker() {
+        // A bullet that already carries the marker shouldn't accumulate a second.
+        let dir = std::env::temp_dir().join(format!(
+            "hi-mem-strip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.md");
+        write_memory(&path, "- entry is src/missing_again.rs  ⚠ (may be stale)").unwrap();
+        let annotated = read_annotated(&path);
+        assert_eq!(annotated.len(), 1);
+        // The stored text shouldn't double-up the marker.
+        assert_eq!(
+            annotated[0].text.matches("may be stale").count(),
+            0,
+            "marker stripped from stored text"
+        );
+        // But it's re-added on render since it's still stale.
+        assert!(annotated[0].render().contains("may be stale"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rank_project_bullets_prefers_task_token_hits() {
+        // File lines keep the leading "- " as stored; renderer strips it once.
+        let bullets = vec![
+            AnnotatedBullet {
+                text: "- prefers terse replies".into(),
+                verified: true,
+            },
+            AnnotatedBullet {
+                text: "- packages: crates/hi-tools — package-local cargo check".into(),
+                verified: true,
+            },
+            AnnotatedBullet {
+                text: "- stack: rust — prefer cargo --manifest-path".into(),
+                verified: true,
+            },
+            AnnotatedBullet {
+                text: "- use npm for the web app".into(),
+                verified: true,
+            },
+        ];
+        let ranked = rank_project_bullets(
+            &bullets,
+            "fix the cargo check failure in crates/hi-tools",
+            3,
+        );
+        assert_eq!(ranked.len(), 3);
+        assert!(
+            ranked[0].text.contains("hi-tools") || ranked[0].text.contains("rust"),
+            "task-matching bullets first: {:?}",
+            ranked.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+        // Unrelated npm preference should not outrank cargo/hi-tools hits.
+        assert!(
+            !ranked[0].text.contains("npm"),
+            "npm bullet should not win: {:?}",
+            ranked[0].text
+        );
+    }
+
+    #[test]
+    fn memory_section_for_task_caps_and_includes_global() {
+        let mut project = Vec::new();
+        for i in 0..20 {
+            project.push(AnnotatedBullet {
+                text: format!("- filler note number {i} about nothing special"),
+                verified: true,
+            });
+        }
+        project.push(AnnotatedBullet {
+            text: "- verify: affected-check:crates/hi-agent".into(),
+            verified: true,
+        });
+        let section = memory_section_for_task(
+            &project,
+            "- prefer pnpm over npm",
+            "run verify for hi-agent crate",
+        )
+        .expect("section");
+        assert!(section.contains("task-ranked"));
+        assert!(section.contains("hi-agent") || section.contains("verify"));
+        assert!(section.contains("User-level (global)"));
+        assert!(section.contains("prefer pnpm"));
+        // Capped — not all 21 project bullets.
+        let bullet_lines = section
+            .lines()
+            .filter(|l| l.trim_start().starts_with("- "))
+            .count();
+        assert!(
+            bullet_lines <= MEMORY_INJECT_MAX_BULLETS + 2,
+            "too many bullets injected: {bullet_lines}"
+        );
+    }
+
+    #[test]
+    fn memory_section_empty_when_no_layers() {
+        assert!(memory_section_for_task(&[], "", "anything").is_none());
+        assert!(memory_section_for_task(&[], "   \n", "").is_none());
+    }
+
+    #[test]
+    fn bullet_ids_are_stable_and_assigned() {
+        let mut next = 1;
+        let stamped = ensure_bullet_ids(
+            "- keep secrets out of logs\n- [#9] already numbered",
+            &mut next,
+        );
+        assert!(stamped.contains("[#1] keep secrets"));
+        assert!(stamped.contains("[#9] already numbered"));
+        assert_eq!(next, 10);
+        let updated = update_bullet_in_body(&stamped, 1, "keep secrets out of CI logs").unwrap();
+        assert!(updated.contains("[#1] keep secrets out of CI logs"));
+        let forgotten = forget_bullet_in_body(&updated, 9).unwrap();
+        assert!(!forgotten.contains("[#9]"));
+        assert!(forgotten.contains("[#1]"));
+    }
+
+    static MEMORY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct IsolatedMemory {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        workspace: PathBuf,
+        prev_project: Option<std::ffi::OsString>,
+        prev_global: Option<std::ffi::OsString>,
+    }
+
+    impl IsolatedMemory {
+        fn new(label: &str) -> Self {
+            let guard = MEMORY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let workspace = std::env::temp_dir().join(format!(
+                "hi-mem-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(workspace.join(".hi")).unwrap();
+            let prev_project = std::env::var_os("HI_MEMORY_FILE");
+            let prev_global = std::env::var_os("HI_GLOBAL_MEMORY_FILE");
+            // SAFETY: MEMORY_ENV_LOCK is held for the lifetime of IsolatedMemory.
+            unsafe {
+                std::env::remove_var("HI_MEMORY_FILE");
+                std::env::set_var("HI_GLOBAL_MEMORY_FILE", workspace.join("global-memory.md"));
+            }
+            Self {
+                _guard: guard,
+                workspace,
+                prev_project,
+                prev_global,
+            }
+        }
+    }
+
+    impl Drop for IsolatedMemory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.workspace);
+            // SAFETY: MEMORY_ENV_LOCK is still held until `_guard` drops.
+            unsafe {
+                match &self.prev_project {
+                    Some(v) => std::env::set_var("HI_MEMORY_FILE", v),
+                    None => std::env::remove_var("HI_MEMORY_FILE"),
+                }
+                match &self.prev_global {
+                    Some(v) => std::env::set_var("HI_GLOBAL_MEMORY_FILE", v),
+                    None => std::env::remove_var("HI_GLOBAL_MEMORY_FILE"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stamp_layer_ids_assigns_from_existing_max() {
+        let iso = IsolatedMemory::new("stamp");
+        write_memory(&memory_file_at(&iso.workspace), "- [#3] keep me").unwrap();
+        let stamped = stamp_layer_ids(&iso.workspace, "- brand new\n- [#3] keep me");
+        assert!(stamped.contains("[#4] brand new"), "{stamped}");
+        assert!(stamped.contains("[#3] keep me"), "{stamped}");
+    }
+
+    #[test]
+    fn undo_restores_previous_file() {
+        let iso = IsolatedMemory::new("undo");
+        let path = memory_file_at(&iso.workspace);
+        write_memory(&path, "- [#1] first").unwrap();
+        write_memory(&path, "- [#1] first\n- [#2] second").unwrap();
+        assert!(strip_header(&fs::read_to_string(&path).unwrap()).contains("[#2]"));
+        let msg = undo_memory(&iso.workspace).unwrap();
+        assert!(msg.contains("restored"));
+        assert!(!strip_header(&fs::read_to_string(&path).unwrap()).contains("[#2]"));
+    }
+
+    #[tokio::test]
+    async fn markdown_memory_search_update_forget_and_disabled() {
+        let iso = IsolatedMemory::new("backend");
+        let path = memory_file_at(&iso.workspace);
+        write_memory(&path, "- [#1] unique-token-pipenet-memory-test prefer pnpm").unwrap();
+        let mem = MarkdownMemory::new(iso.workspace.clone(), true);
+        let hits = mem
+            .search("unique-token-pipenet-memory-test", 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].path.contains("#1"), "{:?}", hits[0].path);
+        let got = mem.get("#1").await.unwrap();
+        assert!(got.contains("unique-token-pipenet-memory-test"), "{got}");
+        let msg = mem
+            .update(1, "unique-token-pipenet-memory-test updated")
+            .await
+            .unwrap();
+        assert!(msg.contains("remembered [#1]"), "{msg}");
+        assert!(msg.contains("/undo-memory"), "{msg}");
+        let body = read_layer(&path);
+        assert!(body.contains("updated"), "{body}");
+        let forgot = mem.forget(1).await.unwrap();
+        assert!(forgot.contains("forgot [#1]"), "{forgot}");
+        assert!(
+            !read_layer(&path).contains("unique-token-pipenet-memory-test"),
+            "{}",
+            read_layer(&path)
+        );
+        let off = MarkdownMemory::new(iso.workspace.clone(), false);
+        let err = off.update(1, "nope").await.unwrap_err();
+        assert!(
+            err.to_string().contains("disabled"),
+            "expected --no-memory refuse, got {err}"
+        );
+    }
+}

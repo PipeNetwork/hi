@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["answer.txt"]
+name = "local-discovery"
+prompt = """Find where `quality_marker_fn` is defined in this workspace. Write the relative file path as the only line of answer.txt. Do not use the web or ask the user."""
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "p=open('answer.txt').read(); assert 'marker.py' in p"'''

@@ -1,0 +1,29 @@
+{
+  "schema_version": 2,
+  "outcome": {
+    "status": "completed"
+  },
+  "telemetry": {
+    "verify_rounds": 0,
+    "tool_timeline": [
+      {
+        "tool": "bash",
+        "command": "git log -1 --format=%s",
+        "kind": "shell"
+      },
+      {
+        "tool": "write",
+        "path": "answer.txt",
+        "kind": "mutate"
+      }
+    ],
+    "requests": [
+      {
+        "input_tokens_est": 900,
+        "max_tool_result_chars": 80,
+        "max_image_chars": 0,
+        "elided_images": 0
+      }
+    ]
+  }
+}

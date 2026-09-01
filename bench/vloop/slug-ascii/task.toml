@@ -1,0 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "slug-ascii"
+prompt = "Implement slug(title) in solution.py: lowercase the title, replace runs of spaces, underscores, and punctuation with single hyphens, and strip leading/trailing hyphens. Non-ASCII characters must be dropped entirely — they must not become hyphens ('café bar' -> 'caf-bar'). It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.slug(\"café bar\")==\"caf-bar\", s.slug(\"café bar\"); assert s.slug(\"Hello,  World!\")==\"hello-world\""'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[(\"café bar\",\"caf-bar\"),(\"Hello,  World!\",\"hello-world\"),(\"  trim me  \",\"trim-me\"),(\"a_b__c\",\"a-b-c\"),(\"naïve — approach\",\"nave-approach\"),(\"100% Done\",\"100-done\"),(\"\",\"\")]; fails=[f\"slug({t!r}) -> {s.slug(t)!r} != {e!r}\" for t,e in cases if s.slug(t)!=e]; assert not fails, chr(10).join(fails)"'''

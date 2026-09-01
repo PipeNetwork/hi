@@ -1,0 +1,248 @@
+//! Build the interactive [`Agent`] from CLI settings, quality, and session state.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use hi_agent::{Agent, AgentConfig, CompactionKind};
+use hi_ai::Provider;
+
+use crate::config::{Cli, QualitySettings, RsiRequested, Settings, permits_missing_checkpoint};
+use crate::goal_drive;
+use crate::landing::LoadedAgentSession;
+use crate::project_context::{load_project_context_from, load_standing_rules};
+use crate::provider::{LiveModelMetadata, provider_label};
+
+pub(crate) struct BuiltAgent {
+    pub agent: Agent,
+    pub resume_summary: Option<String>,
+}
+
+/// Construct [`AgentConfig`] and resume or create the session agent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_agent(
+    cli: &Cli,
+    settings: &Settings,
+    quality: &QualitySettings,
+    workspace_root: PathBuf,
+    state_root: PathBuf,
+    provider: Arc<dyn Provider>,
+    live_metadata: &LiveModelMetadata,
+    max_tokens: u32,
+    planner_model: Option<String>,
+    skeptic_model: Option<String>,
+    rsi_requested: RsiRequested,
+    rsi_control: Option<Arc<dyn hi_agent::RsiControl>>,
+    rsi_remote_switch: Option<Arc<std::sync::atomic::AtomicBool>>,
+    loaded: Option<LoadedAgentSession>,
+    ledger_scan: Option<hi_agent::BackgroundScan>,
+) -> Result<BuiltAgent> {
+    hi_tools::configure_browser(settings.browser_enabled, settings.browser_allow_private);
+    let measured = session_measured(cli.eval_input.is_some(), cli.report.is_some());
+    let agent_config = AgentConfig {
+        execution: if cli.subagent || cli.eval_input.is_some() {
+            hi_agent::ExecutionMode::Ephemeral
+        } else {
+            settings.execution
+        },
+        paths: hi_agent::AgentPaths {
+            workspace_root: workspace_root.clone(),
+            state_root: state_root.clone(),
+        },
+        routing: hi_agent::AgentRouting {
+            model: settings.model.clone(),
+            provider_route: Some(provider_label(settings.provider).to_string()),
+            requested_max_tokens: settings.max_tokens,
+            max_tokens,
+            max_tokens_explicit: settings.max_tokens_explicit,
+            temperature: cli.temperature,
+            top_p: settings.top_p,
+            output_token_parameter: settings.output_token_parameter,
+            thinking_budget: settings.thinking_budget,
+            reasoning_effort: settings.reasoning_effort,
+            tool_mode: settings.tool_mode,
+            compat: settings.compat,
+            deepseek_compat: settings.deepseek_compat,
+            context_window: live_metadata.context_window,
+        },
+        gates: hi_agent::AgentGates {
+            verification: quality.verification.clone(),
+            max_verify_repairs: quality.max_verify_repairs,
+            review: quality.review,
+            allow_unverified: cli.allow_unverified,
+            skeptic_fail_open: cli.skeptic_fail_open,
+            allow_no_checkpoint: permits_missing_checkpoint(cli),
+            lsp_mode: quality.lsp_mode,
+            confirm_edits: cli.confirm_edits,
+            dry_run: cli.dry_run,
+            ..hi_agent::AgentGates::default()
+        },
+        loop_limits: hi_agent::AgentLoopLimits {
+            max_steps: cli.max_steps.unwrap_or(hi_agent::MAX_MODEL_ROUNDS),
+            max_tool_calls: cli.max_tool_calls.unwrap_or(hi_agent::MAX_TOOL_CALLS),
+            turn_soft_deadline: cli
+                .turn_deadline
+                .filter(|secs| *secs > 0)
+                .map(std::time::Duration::from_secs),
+            ..hi_agent::AgentLoopLimits::default()
+        },
+        memory: hi_agent::AgentMemory {
+            tool_set: quality.tool_set,
+            disabled_tools: crate::tool_trim::disabled_tools(&state_root),
+            // Env override lets you flip on skill auto-curation without editing a profile.
+            // `--eval-input` and `--report` skip it the same way they skip finalize:
+            // the extra completion is billed and does not belong in a measured cell.
+            // hi-eval uses `--report`, not `--eval-input`.
+            curate_skills: session_curate_skills(
+                settings.curate_skills,
+                std::env::var_os("HI_CURATE_SKILLS").is_some(),
+                measured,
+            ),
+            suggest_next_prompt: settings.suggest_next_prompt && !measured,
+            // hi-eval uses `--report`, not `--eval-input`. Either flag means
+            // there is no human to answer `ask_user`.
+            offer_ask_user: !measured,
+            offer_memory: !cli.no_memory && !cli.no_save,
+            offer_browser: settings.browser_enabled,
+            browser_allow_private: settings.browser_allow_private,
+            project_context: load_project_context_from(&workspace_root),
+            standing_rules: load_standing_rules(),
+            context_exclusions: quality.context_exclusions.clone(),
+            auto_compact: !cli.no_auto_compact,
+            compaction: cli
+                .compaction
+                .as_deref()
+                .and_then(CompactionKind::from_arg)
+                .unwrap_or(CompactionKind::Hybrid {
+                    keep_recent: hi_agent::DEFAULT_KEEP_RECENT,
+                }),
+            finalize: !cli.no_finalize && !measured,
+            ..hi_agent::AgentMemory::default()
+        },
+        subagents: hi_agent::AgentSubagents {
+            explore_subagents: settings.explore_subagents
+                || std::env::var_os("HI_EXPLORE_SUBAGENTS").is_some(),
+            // Profile/settings choose Off/Risk/On; HI_WRITE_SUBAGENTS forces On.
+            write_subagents: if std::env::var_os("HI_WRITE_SUBAGENTS").is_some() {
+                hi_agent::WriteSubagentPolicy::On
+            } else {
+                settings.write_subagents
+            },
+            // `--subagent` marks a delegate child: no explore/delegate offered (depth ≤ 1).
+            is_subagent: cli.subagent,
+            planner_model: planner_model.clone(),
+            skeptic_model,
+            // Opt-in: route the `/goal` skeptic review to a local (or any
+            // OpenAI-compatible) endpoint via HI_SKEPTIC_ENDPOINT — e.g. a running
+            // hi-local MLX/CUDA server. Requires HI_SKEPTIC_MODEL to name a model it
+            // serves. Off unless the env var is set.
+            skeptic_endpoint: std::env::var("HI_SKEPTIC_ENDPOINT")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            skeptic_endpoint_key: std::env::var("HI_SKEPTIC_ENDPOINT_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            // Team-role routes for executors. Env vars seed them at startup
+            // (mirroring the skeptic knobs); `/team` adjusts them live.
+            delegate_model: env_route("HI_DELEGATE_MODEL"),
+            delegate_endpoint: env_route("HI_DELEGATE_ENDPOINT"),
+            delegate_endpoint_key: env_route("HI_DELEGATE_ENDPOINT_KEY"),
+            explore_model: env_route("HI_EXPLORE_MODEL"),
+            explore_endpoint: env_route("HI_EXPLORE_ENDPOINT"),
+            explore_endpoint_key: env_route("HI_EXPLORE_ENDPOINT_KEY"),
+            editor_model: env_route("HI_EDITOR_MODEL"),
+            editor_endpoint: env_route("HI_EDITOR_ENDPOINT"),
+            editor_endpoint_key: env_route("HI_EDITOR_ENDPOINT_KEY"),
+            // `/goal` is a core CLI contract, not a provider-specific feature.
+            // Delegate children receive bounded tasks and therefore keep it off.
+            long_horizon: goal_drive::long_horizon_enabled(cli.subagent),
+        },
+        rsi: hi_agent::AgentRsi {
+            enabled: rsi_requested != RsiRequested::Off,
+            managed: rsi_requested == RsiRequested::Managed,
+            remote_switch: rsi_remote_switch.clone(),
+            control: rsi_control,
+        },
+        ..AgentConfig::default()
+    };
+    let resume_summary = loaded.as_ref().and_then(|l| l.resume_summary.clone());
+    let restored_plan = loaded.as_ref().map(|l| l.plan.clone()).unwrap_or_default();
+    let restored_plan_drive = loaded
+        .as_ref()
+        .map(|l| (l.plan_drive_paused, l.plan_drive_stall));
+    let restored_goal_drive = loaded.as_ref().map(|l| l.goal_drive_stall);
+    let agent_result = match loaded {
+        Some(loaded) => Agent::resume(
+            provider,
+            agent_config,
+            loaded.messages,
+            loaded.usage,
+            loaded.checkpoint_refs,
+            loaded.structured_goal,
+            loaded.decisions,
+        ),
+        None => Agent::with_background_scan(provider, agent_config, ledger_scan),
+    };
+    let mut agent = agent_result.context("initializing workspace runtime")?;
+    agent.set_usage_pricing(live_metadata.price);
+    agent.restore_plan(restored_plan);
+    if std::env::var_os("HI_LOOP_ID").is_some()
+        && agent.permission_mode() == hi_agent::PermissionMode::Always
+    {
+        // Loop children are unattended: Auto so confirms park instead of YOLO.
+        agent.set_permission_mode(hi_agent::PermissionMode::Auto);
+    }
+    if let Some((paused, stall)) = restored_plan_drive {
+        agent.restore_plan_drive(paused, stall);
+    }
+    if let Some(stall) = restored_goal_drive {
+        agent.restore_goal_drive(stall);
+    }
+
+    Ok(BuiltAgent {
+        agent,
+        resume_summary,
+    })
+}
+
+/// Read an optional team-role route env var (empty = unset).
+fn env_route(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|s| !s.trim().is_empty())
+}
+
+/// `--eval-input` and `--report` are one-shot / harness paths: no human,
+/// no extra billed completions after the task. hi-eval uses `--report`.
+fn session_measured(eval_input: bool, report: bool) -> bool {
+    eval_input || report
+}
+
+/// Skill auto-curation is a follow-up completion after a green mutating turn.
+/// Measured cells skip it so the scored model is not billed for a curator call.
+pub(crate) fn session_curate_skills(settings_on: bool, env_override: bool, measured: bool) -> bool {
+    !measured && (settings_on || env_override)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{session_curate_skills, session_measured};
+
+    #[test]
+    fn eval_disables_skill_curation() {
+        assert!(session_curate_skills(true, false, false));
+        assert!(session_curate_skills(false, true, false));
+        assert!(!session_curate_skills(true, true, true));
+        assert!(!session_curate_skills(false, false, false));
+    }
+
+    #[test]
+    fn report_is_measured_like_eval_input() {
+        assert!(!session_measured(false, false));
+        assert!(session_measured(true, false));
+        assert!(session_measured(false, true));
+        assert!(!session_curate_skills(
+            true,
+            true,
+            session_measured(false, true)
+        ));
+    }
+}

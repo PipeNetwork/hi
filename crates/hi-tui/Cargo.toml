@@ -1,0 +1,55 @@
+[package]
+name = "hi-tui"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+hi-agent.workspace = true
+hi-events.workspace = true
+hi-policy.workspace = true
+hi-ai.workspace = true
+hi-diff.workspace = true
+hi-race.workspace = true
+hi-tools.workspace = true
+hi-workflow.workspace = true
+hi-voice = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+crossterm.workspace = true
+unicode-width.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+ansi-to-tui.workspace = true
+reqwest = { workspace = true }
+tracing.workspace = true
+eye-declare = { package = "eye_declare", version = "0.7", optional = true }
+ratatui-core = { version = "0.1", optional = true }
+
+
+[lints.rust]
+# Real unsafe lives here (env set_var in single-threaded TUI cmd path); see workspace root.
+unsafe_code = "allow"
+
+[features]
+# Voice dictation (microphone + local Whisper) is opt-in so ordinary TUI builds
+# do not compile the heavy native audio stack.
+default = []
+voice = ["hi-voice/audio"]
+codebase-graph = ["hi-tools/codebase-graph", "hi-agent/codebase-graph"]
+eye-declare-spike = ["dep:eye-declare", "dep:ratatui-core"]
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "tui_render"
+harness = false
+
+[[example]]
+name = "eye_declare_spike"
+required-features = ["eye-declare-spike"]

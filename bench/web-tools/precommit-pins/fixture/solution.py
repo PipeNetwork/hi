@@ -1,0 +1,2 @@
+def pins():
+    raise NotImplementedError

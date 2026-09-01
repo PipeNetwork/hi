@@ -1,0 +1,371 @@
+//! Per-agent ownership boundary for all workspace-scoped state.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result, ensure};
+
+use crate::LspMode;
+use crate::change_ledger::ChangeLedger;
+
+/// Runtime state that must never leak between agents or workspace roots.
+pub struct WorkspaceRuntime {
+    root: PathBuf,
+    state_root: PathBuf,
+    process_runner: hi_tools::ProcessRunner,
+    lsp: Arc<hi_lsp::LspManager>,
+    lsp_enabled: std::sync::atomic::AtomicBool,
+    /// Auto mode only reuses a warm LSP server during fast feedback. Explicit
+    /// `on` (or `/lsp on`) is allowed to pay the cold-start cost on purpose.
+    lsp_fast_feedback_cold_start: std::sync::atomic::AtomicBool,
+    /// Arc so a concurrent `/btw` side loop can hold a clone while the main
+    /// turn keeps running (read-only inspect shares the same job registry).
+    background: Arc<hi_tools::BackgroundRegistry>,
+    read_cache: Arc<Mutex<hi_tools::ReadCache>>,
+    repo_map: Arc<Mutex<hi_tools::RepoMapCache>>,
+    ledger: Arc<Mutex<ChangeLedger>>,
+    context_generation: std::sync::atomic::AtomicU64,
+    hooks: Option<hi_hooks::HookRegistry>,
+}
+
+impl WorkspaceRuntime {
+    pub fn new(
+        root: impl AsRef<Path>,
+        state_root: impl AsRef<Path>,
+        lsp_mode: LspMode,
+    ) -> Result<Self> {
+        Self::new_with_scan(root, state_root, lsp_mode, None)
+    }
+
+    /// Like [`Self::new`] but accepts a pre-started [`BackgroundScan`] so the
+    /// initial workspace scan can overlap with all startup work before the
+    /// runtime is constructed.
+    pub fn new_with_scan(
+        root: impl AsRef<Path>,
+        state_root: impl AsRef<Path>,
+        lsp_mode: LspMode,
+        scan: Option<crate::change_ledger::BackgroundScan>,
+    ) -> Result<Self> {
+        let root = root.as_ref().canonicalize().with_context(|| {
+            format!("canonicalizing workspace root {}", root.as_ref().display())
+        })?;
+        ensure!(
+            root.is_dir(),
+            "workspace root is not a directory: {}",
+            root.display()
+        );
+        let state_root = absolute_state_root(&root, state_root.as_ref());
+        std::fs::create_dir_all(&state_root)
+            .with_context(|| format!("creating workspace state root {}", state_root.display()))?;
+        let state_root = state_root.canonicalize().with_context(|| {
+            format!(
+                "canonicalizing workspace state root {}",
+                state_root.display()
+            )
+        })?;
+        ensure!(
+            state_root != root && !root.starts_with(&state_root),
+            "workspace state root must be inside the workspace or disjoint from it, not equal to or an ancestor of {}",
+            root.display()
+        );
+        hi_tools::recover_workspace_transactions(&root, &state_root)
+            .context("recovering interrupted workspace transactions")?;
+        let process_runner = hi_tools::ProcessRunner::new(&root)?;
+        // In production, use a background scan (either a pre-started one passed
+        // in by the caller, or one launched here). In tests, scan synchronously
+        // so the initial snapshot is deterministic (tests write files
+        // immediately after construction and expect `reconcile` to detect them
+        // as external changes).
+        let ledger = new_ledger(&root, &state_root, scan)?;
+        let lsp = Arc::new(hi_lsp::LspManager::new(&root)?);
+        if !matches!(lsp_mode, LspMode::Off)
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let manager = lsp.clone();
+            handle.spawn(async move {
+                manager.set_enabled(true).await;
+            });
+        }
+        // Discover hooks from ~/.hi/hooks and .hi/hooks in the workspace.
+        // Folder trust gates repo-local hooks: if the workspace is untrusted,
+        // .hi/hooks/ is not loaded (prevents arbitrary command execution in
+        // untrusted repos).
+        let home = std::env::var("HOME")
+            .ok()
+            .map(|h| std::path::Path::new(&h).join(".hi/hooks"));
+        let project_hooks = root.join(".hi/hooks");
+        let trust = hi_tools::folder_trust::resolve_trust(&root);
+        let (project_hooks_dir, _) = match trust {
+            hi_tools::folder_trust::TrustOutcome::Trusted => (Some(project_hooks.as_path()), true),
+            hi_tools::folder_trust::TrustOutcome::Untrusted => (None, false),
+            hi_tools::folder_trust::TrustOutcome::Prompt => (None, false), // shouldn't happen after resolve
+        };
+        let (hooks, hook_errors) = hi_hooks::discover_hooks(home.as_deref(), project_hooks_dir);
+        for err in &hook_errors {
+            eprintln!("hook load warning: {err}");
+        }
+        Ok(Self {
+            root: root.clone(),
+            state_root,
+            process_runner,
+            lsp,
+            lsp_enabled: std::sync::atomic::AtomicBool::new(!matches!(lsp_mode, LspMode::Off)),
+            lsp_fast_feedback_cold_start: std::sync::atomic::AtomicBool::new(matches!(
+                lsp_mode,
+                LspMode::On
+            )),
+            background: Arc::new(hi_tools::BackgroundRegistry::default()),
+            read_cache: Arc::new(Mutex::new(hi_tools::ReadCache::new())),
+            repo_map: Arc::new(Mutex::new(hi_tools::RepoMapCache::new())),
+            ledger: Arc::new(Mutex::new(ledger)),
+            context_generation: std::sync::atomic::AtomicU64::new(0),
+            hooks: if hooks.is_empty() { None } else { Some(hooks) },
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    pub fn process_runner(&self) -> &hi_tools::ProcessRunner {
+        &self.process_runner
+    }
+
+    /// The loaded hook registry, if any hooks were discovered.
+    pub fn hooks(&self) -> Option<&hi_hooks::HookRegistry> {
+        self.hooks.as_ref()
+    }
+
+    pub fn lsp(&self) -> Arc<hi_lsp::LspManager> {
+        self.lsp.clone()
+    }
+
+    pub fn lsp_enabled(&self) -> bool {
+        self.lsp_enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn lsp_fast_feedback_cold_start_allowed(&self) -> bool {
+        self.lsp_fast_feedback_cold_start
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_lsp_enabled(&self, enabled: bool) {
+        self.lsp_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.lsp_fast_feedback_cold_start
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        let manager = self.lsp();
+        tokio::spawn(async move {
+            manager.set_enabled(enabled).await;
+        });
+    }
+
+    pub fn background(&self) -> &hi_tools::BackgroundRegistry {
+        &self.background
+    }
+
+    /// Cloneable handle for concurrent side loops (`/btw`).
+    pub fn background_arc(&self) -> Arc<hi_tools::BackgroundRegistry> {
+        self.background.clone()
+    }
+
+    pub fn read_cache(&self) -> &Mutex<hi_tools::ReadCache> {
+        &self.read_cache
+    }
+
+    pub fn read_cache_arc(&self) -> Arc<Mutex<hi_tools::ReadCache>> {
+        self.read_cache.clone()
+    }
+
+    pub fn repo_map(&self) -> &Mutex<hi_tools::RepoMapCache> {
+        &self.repo_map
+    }
+
+    pub fn repo_map_arc(&self) -> Arc<Mutex<hi_tools::RepoMapCache>> {
+        self.repo_map.clone()
+    }
+
+    pub fn clear_read_cache(&self) {
+        if let Ok(mut cache) = self.read_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    pub fn clear_repo_map_cache(&self) {
+        if let Ok(mut cache) = self.repo_map.lock() {
+            cache.clear();
+        }
+    }
+
+    pub fn ledger(&self) -> std::sync::MutexGuard<'_, ChangeLedger> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn ledger_arc(&self) -> Arc<Mutex<ChangeLedger>> {
+        self.ledger.clone()
+    }
+
+    /// Run [`ChangeLedger::reconcile`] on the blocking pool so a full workspace
+    /// walk cannot freeze the TUI drive loop (which co-polls the agent future).
+    pub async fn reconcile_ledger_async(&self) -> Result<Vec<hi_tools::FileChange>> {
+        self.reconcile_ledger_paths_async(None).await
+    }
+
+    /// Wait for the initial ledger scan to finish. Verification uses this
+    /// before reconciling the current workspace so a still-running startup scan
+    /// cannot hide stage mutations from its before/after comparison.
+    pub(crate) async fn ensure_ledger_scan_complete_async(&self) -> Result<()> {
+        let ledger = self.ledger.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut ledger = ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ledger.ensure_scan_complete_blocking()
+        })
+        .await
+        .context("workspace ledger scan task panicked")?
+    }
+
+    /// Reconcile an exact set of known dirty paths without walking the entire
+    /// workspace. Callers with opaque effects must use `reconcile_ledger_async`.
+    pub async fn reconcile_dirty_paths_async(
+        &self,
+        paths: Vec<String>,
+    ) -> Result<Vec<hi_tools::FileChange>> {
+        self.reconcile_ledger_paths_async(Some(paths)).await
+    }
+
+    async fn reconcile_ledger_paths_async(
+        &self,
+        paths: Option<Vec<String>>,
+    ) -> Result<Vec<hi_tools::FileChange>> {
+        let ledger = self.ledger.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut ledger = ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match paths {
+                Some(paths) => ledger.reconcile_dirty_paths(&paths),
+                None => ledger.reconcile(),
+            }
+        })
+        .await
+        .context("workspace ledger reconcile task panicked")?
+    }
+
+    pub fn invalidate_context(&self) {
+        self.context_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Mark a transcript compaction boundary. The active turn consumes the
+    /// same generation stream as workspace mutations before its next model
+    /// request. Keeping one monotonic stream lets a burst of edits and
+    /// compactions collapse into a single deterministic refresh.
+    pub fn invalidate_context_after_compaction(&self) {
+        self.invalidate_context();
+    }
+
+    pub fn context_generation(&self) -> u64 {
+        self.context_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Construct the change ledger with a background scan in production and a
+/// synchronous scan in tests (where the initial snapshot must be deterministic).
+/// If a pre-started `BackgroundScan` is provided, it is consumed instead of
+/// launching a new one.
+fn new_ledger(
+    root: &Path,
+    state_root: &Path,
+    scan: Option<crate::change_ledger::BackgroundScan>,
+) -> Result<ChangeLedger> {
+    #[cfg(not(test))]
+    {
+        if let Some(scan) = scan {
+            ChangeLedger::from_background_scan(root, Some(state_root), scan)
+        } else {
+            ChangeLedger::new_with_state_background(root, Some(state_root))
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = scan; // tests always scan synchronously
+        ChangeLedger::new_with_state(root, Some(state_root))
+    }
+}
+
+fn absolute_state_root(root: &Path, state_root: &Path) -> PathBuf {
+    if state_root.is_absolute() {
+        state_root.to_path_buf()
+    } else {
+        root.join(state_root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    fn roots(label: &str) -> (PathBuf, PathBuf) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "hi-runtime-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = base.join("workspace");
+        let state = base.join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        (root, state)
+    }
+
+    #[test]
+    fn agents_in_different_roots_have_independent_state() {
+        let (first_root, first_state) = roots("one");
+        let (second_root, second_state) = roots("two");
+        let first = WorkspaceRuntime::new(&first_root, &first_state, LspMode::Off).unwrap();
+        let second = WorkspaceRuntime::new(&second_root, &second_state, LspMode::Off).unwrap();
+        assert_ne!(first.root(), second.root());
+        assert_ne!(first.state_root(), second.state_root());
+        assert!(!Arc::ptr_eq(&first.lsp(), &second.lsp()));
+        assert!(!std::ptr::eq(first.read_cache(), second.read_cache()));
+        first.invalidate_context();
+        assert_eq!(first.context_generation(), 1);
+        assert_eq!(second.context_generation(), 0);
+        first.invalidate_context_after_compaction();
+        assert_eq!(first.context_generation(), 2);
+        assert_eq!(second.context_generation(), 0);
+        let _ = std::fs::remove_dir_all(first_root.parent().unwrap());
+        let _ = std::fs::remove_dir_all(second_root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn background_registries_are_workspace_local() {
+        let (first_root, first_state) = roots("background-one");
+        let (second_root, second_state) = roots("background-two");
+        let first = WorkspaceRuntime::new(&first_root, &first_state, LspMode::Off).unwrap();
+        let second = WorkspaceRuntime::new(&second_root, &second_state, LspMode::Off).unwrap();
+
+        let id = first
+            .background()
+            .spawn(first.process_runner(), "sleep 600")
+            .unwrap();
+        assert_eq!(first.background().ids(), vec![id.clone()]);
+        assert!(second.background().ids().is_empty());
+        assert!(second.background().poll(&id).is_err());
+        first.background().kill(&id).unwrap();
+
+        let _ = std::fs::remove_dir_all(first_root.parent().unwrap());
+        let _ = std::fs::remove_dir_all(second_root.parent().unwrap());
+    }
+}

@@ -1,0 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "log-level"
+prompt = "Implement level(line) in solution.py: extract the log level from a log line. Level tokens are matched case-insensitively as whole words among ERROR, WARN, WARNING, INFO, DEBUG; the FIRST such token in the line wins. WARNING must be normalized to WARN. The return value is always uppercase. A line whose first non-space character is '#' is a comment and must return None regardless of content. A line with no level token must return INFO. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.level(\"12:00 Warning: disk\")==\"WARN\", s.level(\"12:00 Warning: disk\"); assert s.level(\"# ERROR in comment\") is None, s.level(\"# ERROR in comment\"); assert s.level(\"all fine here\")==\"INFO\""'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[(\"12:00 Warning: disk\",\"WARN\"),(\"# ERROR in comment\",None),(\"all fine here\",\"INFO\"),(\"debug then ERROR\",\"DEBUG\"),(\"   # indented comment\",None),(\"ERRORS are not a token\",\"INFO\"),(\"mix InFo case\",\"INFO\"),(\"warn and warning\",\"WARN\")]; fails=[f\"level({l!r}) -> {s.level(l)!r} != {e!r}\" for l,e in cases if s.level(l)!=e]; assert not fails, chr(10).join(fails)"'''

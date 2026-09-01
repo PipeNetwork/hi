@@ -1,0 +1,25 @@
+{
+  "schema_version": 2,
+  "outcome": {},
+  "telemetry": {
+    "verify_rounds": 1,
+    "tool_timeline": [
+      {
+        "tool": "read",
+        "path": "solution.py"
+      },
+      {
+        "tool": "edit",
+        "path": "solution.py"
+      }
+    ],
+    "requests": [
+      {
+        "input_tokens_est": 800,
+        "max_tool_result_chars": 40,
+        "max_image_chars": 0,
+        "elided_images": 0
+      }
+    ]
+  }
+}

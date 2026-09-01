@@ -1,0 +1,13 @@
+[package]
+name = "hi-events"
+edition.workspace = true
+version.workspace = true
+description = "Structured lifecycle events and semantic activity contracts for hi"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"

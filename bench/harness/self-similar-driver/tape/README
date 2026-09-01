@@ -1,0 +1,4 @@
+`pass.json` is a live grok-4.3 `--report` from 2026-08-17 (`--configs=verify`).
+It writes `driver.py` and only *reads* `bug/` — inner edits go through host.py.
+`fail.json` never writes `driver.py`. `fail-touch-bug.json` writes the driver
+then hi-edits `bug/solution.py` (process.forbid_path_prefixes).

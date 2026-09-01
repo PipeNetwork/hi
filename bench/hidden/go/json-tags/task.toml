@@ -1,0 +1,13 @@
+schema_version = 2
+name = "go-json-tags"
+prompt = "Fix model/user.go without changing the User field names or Go types. The JSON keys must be id, display_name, and email; Email must use omitempty and no other field may. Edit only model/**."
+allowed_changes = ["model/**"]
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "python3 .hi-eval-oracle/check.py"

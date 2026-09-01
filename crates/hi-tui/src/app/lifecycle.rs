@@ -1,0 +1,636 @@
+//! `App` methods: lifecycle.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
+
+use crate::input::InputLine;
+use crate::util::notify_done;
+use crate::{
+    LocalRuntimeSwitcher, MlxProfileSwitcher, NOTIFY_THRESHOLD, ProfileInfo, ProfileLoader,
+    ProfileRemover, ProfileResolver, ProfileSaver, ReasoningEffortSaver, TurnState,
+};
+
+impl crate::App {
+    pub(crate) fn resume_goal_drive(&mut self, agent: &hi_agent::Agent) {
+        self.refresh_goal(agent);
+        self.maybe_queue_goal_drive(agent);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        provider: &str,
+        model: &str,
+        profiles: Vec<ProfileInfo>,
+        active_profile: Option<String>,
+        resolver: ProfileResolver,
+        saver: ProfileSaver,
+        loader: ProfileLoader,
+        remover: ProfileRemover,
+        reasoning_effort_saver: Option<ReasoningEffortSaver>,
+        mlx_switcher: MlxProfileSwitcher,
+        local_runtime_switcher: LocalRuntimeSwitcher,
+        mcp_url: Option<String>,
+        api_key: String,
+        diff_api_runner: Option<crate::DiffApiRunner>,
+        race_runner: Option<crate::RaceRunner>,
+        race_defaults: crate::RaceDefaults,
+        race_setup_saver: Option<crate::RaceSetupSaver>,
+    ) -> Self {
+        Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            execution: hi_agent::ExecutionMode::Ephemeral,
+            reasoning_effort: None,
+            workspace_root: std::path::PathBuf::new(),
+            input_history_path: std::path::PathBuf::new(),
+            interrupt: None,
+            active_profile,
+            profiles,
+            resolver,
+            saver,
+            loader,
+            remover,
+            reasoning_effort_saver,
+            mlx_switcher,
+            local_runtime_switcher,
+            session_remember: None,
+            local_picker: None,
+            local_directory_prompt: None,
+            local_download_confirmation: None,
+            local_startup_blocked: false,
+            local_startup_error: None,
+            local_startup_spec: None,
+            local_startup_fallback_profile: None,
+            local_runtime: None,
+            mcp_url,
+            api_key,
+            diff_api_runner,
+            race_runner,
+            race_defaults,
+            race_setup_saver,
+            event_sink: None,
+            approval_store: None,
+            transcript: Vec::new(),
+            workflow_revisions: std::collections::HashMap::new(),
+            workflow_completion_handoffs: std::collections::HashMap::new(),
+            pending: None,
+            reasoning_buffer: String::new(),
+            reasoning_started: None,
+            show_reasoning: false,
+            show_tool_output: false,
+            density: crate::Density::Comfortable,
+            mode: crate::mode::UiMode::Insert,
+            last_search: None,
+            block_cursor: 0,
+            transcript_gen: 0,
+            view_cache: crate::view_cache::TranscriptViewCache::default(),
+            view_geometry_key: None,
+            code_lang: None,
+            last_code_block: None,
+            table_buf: Vec::new(),
+            input: InputLine::default(),
+            voice: Default::default(),
+            voice_model: Default::default(),
+            voice_config: Default::default(),
+            following: true,
+            scroll: 0,
+            view_max_scroll: 0,
+            view_total: 0,
+            view_inner: ratatui::layout::Rect::default(),
+            view_scroll: 0,
+            block_row_spans: Vec::new(),
+            view_prefix: Vec::new(),
+            view_line_texts: Vec::new(),
+            select_anchor: None,
+            select_cursor: None,
+            select_dragged: false,
+            copy_toast: None,
+            mouse_capture: true,
+            minimal_screen: false,
+            vim_mode: true,
+            multiline_mode: true,
+            timeline_enabled: true,
+            timestamps_enabled: true,
+            page_flip_on_send: false,
+            total_when_unpinned: 0,
+            working: false,
+            spinner: 0,
+            started: None,
+            last_turn_latency: None,
+            finished_at: None,
+            current_tool: None,
+            current_tool_started: None,
+            queue: VecDeque::new(),
+            mid_turn_offered: VecDeque::new(),
+            queue_selected: None,
+            last_prompt: None,
+            last_turn_start: 0,
+            last_turn_snapshot: None,
+            picker: None,
+            session_picker: false,
+            session_picker_searching: false,
+            session_catalog_flags: HashMap::new(),
+            session_delete_pending: None,
+            provider_form: None,
+            provider_picker: None,
+            pending_local_catalog: None,
+            pending_login: None,
+            pending_auth: None,
+            x402_broker: None,
+            fetching: None,
+            planning: None,
+            status: String::new(),
+            plan: Vec::new(),
+            confirmation: None,
+            confirmation_scroll: 0,
+            confirmation_selected: 0,
+            confirm_focus: crate::confirm_overlay::ConfirmFocus::Options,
+            plan_approval: None,
+            memory_browser: None,
+            confirmation_waiting: 0,
+            mouse_col: 0,
+            mouse_row: 0,
+            ctx_chip_rect: ratatui::layout::Rect::default(),
+            turn_status_rect: ratatui::layout::Rect::default(),
+            git_branch: None,
+            plan_pane_expanded: true,
+            goal: None,
+            plan_mode: false,
+            permission_mode: hi_agent::PermissionMode::Always,
+            session_face_dirty: false,
+            plan_drive_paused: false,
+            last_drive: hi_agent::DriveAction::Idle {
+                reason: hi_agent::DriveIdleReason::None,
+            },
+            last_stop_reason: None,
+            ask_user_draft: String::new(),
+            fleet: Vec::new(),
+            fleet_next_id: 0,
+            workflow_runs: HashMap::new(),
+            selected_workflow_run: None,
+            workflow_overlay: None,
+            subagents: HashMap::new(),
+            inspect_subagent: None,
+            tasks_overlay: None,
+            block_viewer: None,
+            jump_picker: None,
+            rewind_picker: None,
+            timeline_hits: Vec::new(),
+            timeline_rect: ratatui::layout::Rect::default(),
+            changed_files_rect: ratatui::layout::Rect::default(),
+            diff_lab: None,
+            race: None,
+            plan_workflow_child: None,
+            loops: None,
+            usage: (0, 0),
+            usage_estimated: false,
+            session_totals: hi_ai::Usage::default(),
+            usage_pricing: None,
+            new_model_ids: HashSet::new(),
+            context_used: 0,
+            context_window: None,
+            rate_limits: None,
+            served: HashMap::new(),
+            model_ids: Vec::new(),
+            trimmed: 0,
+            current_assistant: String::new(),
+            assistant_message_open: false,
+            show_btw: false,
+            btw_scroll: 0,
+            last_btw_area: ratatui::layout::Rect::default(),
+            last_btw_close: ratatui::layout::Rect::default(),
+            btw_thread: Vec::new(),
+            last_assistant: String::new(),
+            last_turn_event: None,
+            last_turn_had_file_edits: false,
+            turn_steering_seen: HashSet::new(),
+            turn_status_seen: HashSet::new(),
+            last_changed_files: Vec::new(),
+            session_changed_files: Vec::new(),
+            suggested_prompt: None,
+            suggested_prompt_dismissed: false,
+            diff_text: None,
+            review_scroll: 0,
+            auto_approve_session: false,
+            auto_approve_paths: Vec::new(),
+            auto_approve_mcp: Vec::new(),
+            show_debug: false,
+            show_help: false,
+            palette: None,
+            tutorial: None,
+            last_telemetry: None,
+            last_turn_phase: None,
+            turn_tool_calls: 0,
+            turn_rounds: 0,
+            run_streamed_this_call: false,
+            waiting_for: None,
+            last_turn_state: TurnState::Idle,
+            last_error: None,
+            event_log: Vec::new(),
+            model_issues: HashMap::new(),
+            top_notice: None,
+            working_status: None,
+            startup_notice: None,
+            checkpoint_warning: None,
+            quit_notice: None,
+            completion: None,
+            path_completion_cache: Vec::new(),
+            focused: true,
+            focus_known: false,
+            sync_config: None,
+            sync_active: false,
+            sync_session_id: None,
+            sync_http: None,
+            session_lister: None,
+            session_completion_cache: Vec::new(),
+            session_switcher: None,
+            session_renamer: None,
+            session_host: None,
+            pending_host_enable: None,
+            pending_team_provision: None,
+            pending_local_provider: None,
+            team_picker_role: None,
+            team_role_menu: false,
+            queued_team_assignments: Vec::new(),
+            auto_setup_skeptic: false,
+            sync_control: None,
+            remote_event_tap: None,
+            base_event_tap: None,
+            sync_remote_ui: None,
+            remote_flush_callback: None,
+            remote_input_rx: None,
+            remote_input_poller: None,
+            hosting_remote_input: false,
+            steering_remote_session: None,
+        }
+    }
+
+    /// Record a focus-change report from the terminal (and that it reports them).
+    pub(crate) fn set_focus(&mut self, focused: bool) {
+        self.focused = focused;
+        self.focus_known = true;
+    }
+
+    /// Ping the terminal when a turn finishes and you're likely away: when the
+    /// terminal reports it's unfocused, or — on terminals that don't report
+    /// focus — when the turn ran long enough that you probably stepped away.
+    pub(crate) fn maybe_notify_done(&self) {
+        let elapsed = self.started.map(|t| t.elapsed()).unwrap_or_default();
+        let away = if self.focus_known {
+            !self.focused
+        } else {
+            elapsed >= NOTIFY_THRESHOLD
+        };
+        if away {
+            notify_done();
+        }
+    }
+
+    /// Surface any completed `/loop` firings: quiet checks land dim, changes
+    /// land loud (cyan) and ping the terminal when you're unfocused. Called
+    /// from the UI tick arms so results appear even while idle.
+    pub(crate) fn drain_loops(&mut self) {
+        let Some(loops) = &self.loops else { return };
+        let lines = loops.drain();
+        if lines.is_empty() {
+            return;
+        }
+        let away = self.focus_known && !self.focused;
+        for (text, loud) in lines {
+            let style = if loud {
+                ratatui::style::Style::default().fg(crate::theme::theme().accent_system)
+            } else {
+                crate::render::dim()
+            };
+            self.push(ratatui::text::Line::styled(text, style));
+            if loud && away {
+                crate::util::notify_done();
+            }
+        }
+    }
+
+    /// Mark the turn as running (or done), stamping the start time so the
+    /// prompt bar can show elapsed seconds.
+    pub(crate) fn set_working(&mut self, working: bool) {
+        let was_working = self.working;
+        if was_working && !working {
+            self.last_turn_latency = self.started.map(|started| started.elapsed());
+            if let Some(elapsed) = self.last_turn_latency {
+                let marker = match &self.last_turn_state {
+                    TurnState::Done(_) | TurnState::Warning(_) => {
+                        Some(format!("Worked for {}", crate::util::fmt_worked(elapsed)))
+                    }
+                    TurnState::Cancelled => Some(format!(
+                        "Turn cancelled by user in {}.",
+                        crate::util::fmt_worked(elapsed)
+                    )),
+                    TurnState::Failed(_) => Some(format!(
+                        "Turn failed in {}.",
+                        crate::util::fmt_worked(elapsed)
+                    )),
+                    _ => None,
+                };
+                if let Some(marker) = marker {
+                    let blank = self
+                        .transcript
+                        .last()
+                        .is_none_or(|entry| entry.text().trim().is_empty());
+                    if !blank {
+                        self.push(ratatui::text::Line::raw(""));
+                    }
+                    self.push(ratatui::text::Line::styled(marker, crate::render::dim()));
+                }
+            }
+        }
+        self.working = working;
+        self.started = working.then(Instant::now);
+        self.current_tool = None;
+        self.current_tool_started = None;
+        self.run_streamed_this_call = false;
+        self.working_status = None;
+        self.changed_files_rect = ratatui::layout::Rect::default();
+        if !working {
+            self.freeze_verb_group();
+            self.turn_steering_seen.clear();
+            self.turn_status_seen.clear();
+        }
+        if working {
+            self.checkpoint_warning = None;
+            self.top_notice = None;
+            self.last_turn_event = None;
+            self.last_turn_had_file_edits = false;
+            self.turn_steering_seen.clear();
+            self.turn_status_seen.clear();
+            self.waiting_for = Some(Duration::ZERO);
+            self.last_turn_state = TurnState::Running;
+            // Ghost-text suggestions are for the idle composer only.
+            self.suggested_prompt = None;
+            self.suggested_prompt_dismissed = false;
+            // A new turn's output would shift block ordinals and line indices;
+            // leave block-nav and drop any stale text selection.
+            if self.mode.is_block_nav() {
+                self.mode.to_insert();
+            }
+            self.clear_selection();
+        } else if matches!(self.last_turn_state, TurnState::Running) {
+            self.last_turn_state = TurnState::Idle;
+            self.waiting_for = None;
+        }
+        // Stamp the completion so the status line can flash briefly as it settles.
+        if was_working && !working {
+            self.finished_at = Some(Instant::now());
+        }
+    }
+
+    /// Drop any idle ghost-text suggestion (typing, Esc, toggle off, etc.).
+    pub(crate) fn clear_suggested_prompt(&mut self) {
+        self.suggested_prompt = None;
+        self.suggested_prompt_dismissed = false;
+    }
+
+    /// Hide the current suggestion until a new one loads (Esc on empty).
+    pub(crate) fn dismiss_suggested_prompt(&mut self) {
+        self.suggested_prompt_dismissed = true;
+    }
+
+    /// Remaining suffix of the suggestion when `text` is a proper prefix.
+    pub(crate) fn ghost_suffix(&self) -> Option<&str> {
+        if self.suggested_prompt_dismissed {
+            return None;
+        }
+        let suggestion = self.suggested_prompt.as_deref()?;
+        let text = self.input.text();
+        let rest = suggestion.strip_prefix(&text)?;
+        if rest.is_empty() { None } else { Some(rest) }
+    }
+
+    /// Accept the ghost-text suggestion into the input buffer (Tab/Right).
+    /// Inserts the remaining suffix when the draft is a matching prefix.
+    pub(crate) fn accept_suggested_prompt(&mut self) -> bool {
+        let Some(rest) = self.ghost_suffix().map(str::to_owned) else {
+            return false;
+        };
+        self.input.insert_str(&rest);
+        self.suggested_prompt = None;
+        self.suggested_prompt_dismissed = false;
+        true
+    }
+
+    pub(crate) fn record_model_issue(&mut self) {
+        let _count = {
+            let entry = self.model_issues.entry(self.model.clone()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        // Note: don't touch `last_error` here — it holds the actual failure
+        // reason set by the caller. The per-model count remains internal.
+    }
+
+    /// Invalidate the transcript view cache (structural change).
+    pub(crate) fn bump_transcript(&mut self) {
+        self.transcript_gen = self.transcript_gen.wrapping_add(1);
+    }
+
+    /// Persist the current provider/model (and profile, when set) so the next
+    /// bare `hi` in this workspace restores the same routing.
+    pub(crate) fn remember_session_routing(&self) {
+        let Some(cb) = &self.session_remember else {
+            return;
+        };
+        let profile = self
+            .active_profile
+            .as_deref()
+            .filter(|name| self.profiles.iter().any(|p| p.name == *name));
+        cb(profile, &self.provider, &self.model);
+    }
+
+    /// Whether a confirmation should be skipped because of session-wide or
+    /// path-scoped auto-approve.
+    pub(crate) fn should_auto_approve(&self, request: &hi_agent::ConfirmationRequest) -> bool {
+        if matches!(request, hi_agent::ConfirmationRequest::AskUser { .. }) {
+            return false;
+        }
+        if self.permission_mode == hi_agent::PermissionMode::Auto && request.safe_for_auto() {
+            return true;
+        }
+        match request {
+            hi_agent::ConfirmationRequest::FileEdit { path, .. } => {
+                self.auto_approve_session || self.path_auto_approved(path)
+            }
+            hi_agent::ConfirmationRequest::External { mcp_grant, .. } => mcp_grant
+                .as_ref()
+                .is_some_and(|(server, tool)| self.mcp_auto_approved(server, tool)),
+            hi_agent::ConfirmationRequest::DelegateApply { .. }
+            | hi_agent::ConfirmationRequest::ShellMutation { .. }
+            | hi_agent::ConfirmationRequest::AskUser { .. } => false,
+        }
+    }
+
+    pub(crate) fn mcp_auto_approved(&self, server: &str, tool: &str) -> bool {
+        self.auto_approve_mcp
+            .iter()
+            .any(|(s, t)| s == server && t == tool)
+    }
+
+    pub(crate) fn add_auto_approve_mcp(&mut self, server: String, tool: String) {
+        if !self.mcp_auto_approved(&server, &tool) {
+            self.auto_approve_mcp.push((server, tool));
+        }
+    }
+
+    pub(crate) fn path_auto_approved(&self, path: &str) -> bool {
+        if self.auto_approve_paths.is_empty() {
+            return false;
+        }
+        let path = path.replace('\\', "/");
+        self.auto_approve_paths.iter().any(|prefix| {
+            let p = prefix.replace('\\', "/");
+            path == p || path.starts_with(&format!("{p}/"))
+        })
+    }
+
+    /// Remember a path prefix for session-scoped auto-approve (`p` on confirm).
+    /// Uses the parent directory of a file path, or the path itself if it looks
+    /// like a directory (no extension / trailing slash).
+    pub(crate) fn add_auto_approve_path(&mut self, path: &str) {
+        let normalized = path.replace('\\', "/");
+        let prefix = {
+            let trimmed = normalized.trim_end_matches('/');
+            // Prefer the parent directory so "always allow src/" covers the file.
+            match trimmed.rsplit_once('/') {
+                Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+                _ => trimmed.to_string(),
+            }
+        };
+        if prefix.is_empty() {
+            return;
+        }
+        if !self.auto_approve_paths.iter().any(|p| p == &prefix) {
+            self.auto_approve_paths.push(prefix);
+        }
+    }
+
+    /// Path prefix label shown after `p` on a confirmation (for the status line).
+    pub(crate) fn auto_approve_prefix_for(path: &str) -> String {
+        let normalized = path.replace('\\', "/");
+        let trimmed = normalized.trim_end_matches('/');
+        match trimmed.rsplit_once('/') {
+            Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+            _ => trimmed.to_string(),
+        }
+    }
+
+    pub(crate) fn clamp_queue_selection(&mut self) {
+        if self.queue.is_empty() {
+            self.queue_selected = None;
+            return;
+        }
+        if let Some(i) = self.queue_selected {
+            self.queue_selected = Some(i.min(self.queue.len() - 1));
+        }
+    }
+
+    /// Push a next-turn prompt if under [`crate::MAX_PROMPT_QUEUE`]. Empty /
+    /// whitespace-only strings are ignored. Returns whether the prompt was
+    /// enqueued.
+    pub(crate) fn try_enqueue_prompt(&mut self, prompt: impl Into<String>) -> bool {
+        let prompt = prompt.into();
+        if prompt.trim().is_empty() {
+            return false;
+        }
+        if self.queue.len() >= crate::MAX_PROMPT_QUEUE {
+            return false;
+        }
+        self.queue.push_back(prompt);
+        self.clamp_queue_selection();
+        true
+    }
+
+    /// Like [`Self::try_enqueue_prompt`], but emits a one-line warning when the
+    /// queue is full so interactive callers don't fail silently.
+    pub(crate) fn enqueue_prompt(&mut self, prompt: impl Into<String>) -> bool {
+        let prompt = prompt.into();
+        if prompt.trim().is_empty() {
+            return false;
+        }
+        if self.try_enqueue_prompt(prompt) {
+            return true;
+        }
+        self.push(ratatui::text::Line::styled(
+            format!(
+                "prompt queue full ({}/{}) — finish or remove queued items (Alt-Down/Backspace), then retry",
+                self.queue.len(),
+                crate::MAX_PROMPT_QUEUE
+            ),
+            ratatui::style::Style::default().fg(crate::theme::theme().warning),
+        ));
+        self.follow();
+        false
+    }
+
+    /// Insert at the front (next to run). If the queue is already at the cap,
+    /// drops the newest tail entry to make room so intentional follow-ups
+    /// (plan mode, /synth-evals) are not lost.
+    pub(crate) fn enqueue_prompt_front(&mut self, prompt: impl Into<String>) -> bool {
+        let prompt = prompt.into();
+        if prompt.trim().is_empty() {
+            return false;
+        }
+        if self.queue.len() >= crate::MAX_PROMPT_QUEUE {
+            let _ = self.queue.pop_back();
+        }
+        self.queue.push_front(prompt);
+        self.clamp_queue_selection();
+        true
+    }
+
+    pub(crate) fn queue_select_next(&mut self) {
+        if self.queue.is_empty() {
+            self.queue_selected = None;
+            return;
+        }
+        let n = self.queue.len();
+        self.queue_selected = Some(match self.queue_selected {
+            Some(i) => (i + 1).min(n - 1),
+            None => 0,
+        });
+    }
+
+    pub(crate) fn queue_select_prev(&mut self) {
+        if self.queue.is_empty() {
+            self.queue_selected = None;
+            return;
+        }
+        self.queue_selected = Some(match self.queue_selected {
+            Some(0) | None => 0,
+            Some(i) => i - 1,
+        });
+    }
+
+    pub(crate) fn queue_remove_selected(&mut self) -> Option<String> {
+        let i = self.queue_selected?;
+        if i >= self.queue.len() {
+            self.queue_selected = None;
+            return None;
+        }
+        let removed = self.queue.remove(i);
+        self.clamp_queue_selection();
+        removed
+    }
+
+    pub(crate) fn queue_move_selected(&mut self, delta: i32) {
+        let Some(i) = self.queue_selected else { return };
+        if self.queue.len() < 2 {
+            return;
+        }
+        let j = if delta < 0 {
+            i.saturating_sub(1)
+        } else {
+            (i + 1).min(self.queue.len() - 1)
+        };
+        if i != j {
+            self.queue.swap(i, j);
+            self.queue_selected = Some(j);
+        }
+    }
+}

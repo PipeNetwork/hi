@@ -1,0 +1,79 @@
+[package]
+name = "hi"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "hi"
+path = "src/main.rs"
+
+[dependencies]
+hi-ai.workspace = true
+hi-x402.workspace = true
+hi-diff.workspace = true
+hi-race.workspace = true
+hi-agent.workspace = true
+hi-trace.workspace = true
+hi-agent-runtime.workspace = true
+hi-rsi-runtime.workspace = true
+hi-verifier.workspace = true
+hi-tools.workspace = true
+hi-mcp.workspace = true
+hi-lsp.workspace = true
+hi-tui.workspace = true
+hi-crash-handler.workspace = true
+hi-update.workspace = true
+hi-announcements.workspace = true
+hi-workflow.workspace = true
+hi-events.workspace = true
+hi-policy.workspace = true
+hi-control.workspace = true
+hi-routing.workspace = true
+hi-protocol.workspace = true
+hi-provider-config.workspace = true
+hi-observability.workspace = true
+hi-outcome.workspace = true
+hi-research.workspace = true
+hi-eval.workspace = true
+hi-eval-adapters.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+async-trait = { workspace = true }
+tokio.workspace = true
+tokio-util.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+rustyline.workspace = true
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+base64.workspace = true
+blake3.workspace = true
+flate2.workspace = true
+ignore.workspace = true
+tar.workspace = true
+rusqlite.workspace = true
+hi-sqlite-journal.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+libc.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# The fake OpenAI server, for the end-to-end test that drives the real binary.
+hi-ai = { workspace = true, features = ["test-support"] }
+
+
+[lints.rust]
+# Real unsafe lives here (env set_var in single-threaded CLI REPL); see workspace root.
+unsafe_code = "allow"
+
+[features]
+# Audio is opt-in because cpal/ALSA and whisper/libclang are expensive native
+# dependencies that are not needed for ordinary coding sessions.
+default = []
+voice = ["hi-tui/voice"]
+# Tree-sitter symbol index (LSP-off definition/references fallback).
+codebase-graph = ["hi-tools/codebase-graph", "hi-tui/codebase-graph", "hi-agent/codebase-graph"]

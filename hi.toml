@@ -1,0 +1,119 @@
+# hi configuration. Profiles let you keep several endpoints on hand and pick
+# one with `hi -p <name>`. See crates/hi-cli/src/config.rs for all fields.
+
+# This project adds local-model profiles, but leaves the default profile to
+# ~/.config/hi/config.toml so a hosted pipenetwork.ai setup remains the bare
+# `hi` default. Use `hi -p local` to force the small local model.
+
+# Optional execution mode. Durable mode checkpoints the prompt and each
+# completed tool batch so a restarted session keeps the latest safe point.
+# It requires normal session persistence (do not combine with --no-save).
+# execution = "durable"
+
+# Local Qwen2.5-0.5B served by `hi-local` on the GPU (CUDA backend):
+#   hi-local serve --backend cuda --execution gpu --port 8080 \
+#     --model-id qwen2.5-0.5b ~/.hi/models/qwen2.5-0.5b-instruct-q4_0.gguf
+#
+# Then talk to it with:  hi -p local "your prompt"
+[profiles.local]
+provider = "ollama"                     # OpenAI-compatible wire format; no API key needed
+model = "qwen2.5-0.5b"                   # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8080/v1"
+max_tokens = 2048                        # the model advertises max_output_tokens 2048
+tool_mode = "chat-only"                  # a 0.5B model isn't reliable at tool-calling
+
+# Local Qwen2.5-Coder-1.5B (Q8_0, ~1.6 GB) — the size that actually runs on this
+# 8 GB card with the hi-cuda backend, which is VRAM-hungry:
+#   * it keeps TWO resident copies of the weights (raw quantized tensors +
+#     normalized matrices), ~2x the file size, and
+#   * at generation time it dequantizes weight matrices to f32 scratch on-device.
+# Net: a 3B (~2.4 GB file -> ~5.1 GB resident) leaves too little for the f32
+# scratch and OOMs mid-generation; a 7B OOMs at load. 1.5B fits with headroom.
+#   hi-local serve --backend cuda --execution gpu --port 8080 \
+#     --model-id qwen2.5-coder-1.5b --max-batch-size 1 --max-batched-tokens 2048 \
+#     --kv-cache-mode legacy ~/.hi/models/qwen2.5-coder-1.5b-instruct-q8_0.gguf
+#
+# Then:  hi -p coder-1_5b "your prompt"   (TOML key can't contain a dot)
+[profiles.coder-1_5b]
+provider = "ollama"
+model = "qwen2.5-coder-1.5b"             # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8080/v1"
+max_tokens = 2048
+tool_mode = "auto"                       # small but can drive simple tool calls
+
+# Local Qwen2.5-Coder-3B (Q6_K, ~2.4 GB) — now runs on the 8 GB card thanks to
+# the single-resident weights + auto FP16 weights + last-row prefill logits +
+# FP16 paged KV. Serve with:
+#   HI_CUDA_PREFIX_CACHE=1 hi-local serve --backend cuda --execution gpu \
+#     --port 8080 --model-id qwen2.5-coder-3b --max-batch-size 1 \
+#     --max-batched-tokens 8192 --kv-cache-mode paged \
+#     ~/.hi/models/qwen2.5-coder-3b-instruct-q6_k.gguf
+[profiles.coder-3b]
+provider = "ollama"
+model = "qwen2.5-coder-3b"               # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8080/v1"
+max_tokens = 2048
+tool_mode = "auto"
+
+# Local Qwen2.5-Coder-7B (Q6_K, ~6.3 GB) on an RTX PRO 6000 Blackwell (96 GB VRAM,
+# sm_120). VRAM is not a constraint here, so serve with the paged KV cache and a
+# roomy batch. Serve with:
+#   HI_CUDA_PREFIX_CACHE=1 hi-local serve --backend cuda --execution gpu \
+#     --port 8080 --model-id qwen2.5-coder-7b --max-batch-size 4 \
+#     --max-batched-tokens 8192 --kv-cache-mode paged \
+#     ~/.hi/models/qwen2.5-coder-7b-instruct-q6_k.gguf
+#
+# Then:  hi -p coder-7b "your prompt"
+[profiles.coder-7b]
+provider = "ollama"
+model = "qwen2.5-coder-7b"               # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8080/v1"
+max_tokens = 2048                        # the model advertises max_output_tokens 2048
+tool_mode = "auto"
+
+# DeepSeek-V4-Flash (284B MoE, 13B active) on the CUDA dsv4 backend: non-expert
+# weights resident on one RTX PRO 6000 (~13.5 GB), MXFP4 experts streamed from
+# the mmap'd GGUF in host RAM. Single-request FIFO serving (no batching yet).
+# Serve with (systemd unit hi-local-v4.service, or by hand):
+#   hi-local serve --backend cuda --execution gpu --port 8081 \
+#     --model-id deepseek-v4-flash \
+#     ~/.hi/models/deepseek-v4-flash/DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf
+#
+# Then:  hi -p v4-flash "your prompt"
+[profiles.v4-flash]
+provider = "ollama"
+model = "deepseek-v4-flash"              # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8081/v1"
+max_tokens = 4096
+tool_mode = "auto"
+
+# Official DeepSeek-V4-Flash (api.deepseek.com). Key from DEEPSEEK_API_KEY.
+#   hi -p deepseek-flash "review codebase"
+[profiles.deepseek-flash]
+provider = "openai"
+model = "deepseek-v4-flash"
+base_url = "https://api.deepseek.com"
+deepseek_compat = "on"
+api_key_env = "DEEPSEEK_API_KEY"
+max_tokens = 8192
+tool_mode = "auto"
+
+# GLM-5.2 REAP50 (394B MoE, 128 experts/layer) with expert streaming: dense
+# trunk resident (~10 GB quantized), routed experts streamed through the VRAM
+# pool with the bounded-RAM disk tier underneath — built for limited-RAM boxes
+# (docs/glm52-limited-ram-streaming.md; validated under MemoryMax=32G).
+# Serve with (GPU 0 example; size the pool to the card):
+#   CUDA_VISIBLE_DEVICES=0 HI_CUDA_EXPERT_STREAMING=1 \
+#     HI_CUDA_EXPERT_POOL_BYTES=$((48*1024*1024*1024)) \
+#     HI_CUDA_EXPERT_RAM_GB=20 HI_CUDA_WEIGHTS_F16=0 \
+#     hi-local serve --backend cuda --execution gpu --port 8082 \
+#     --model-id glm-5.2 --max-batched-tokens 512 \
+#     ~/.hi/models/glm-5.2-reap50/GLM-5.2-REAP50-Q3_K_M-00001-of-00005.gguf
+#
+# Then:  hi -p glm-5.2 "your prompt"
+[profiles.glm-5.2]
+provider = "ollama"
+model = "glm-5.2"                        # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8082/v1"
+max_tokens = 4096
+tool_mode = "auto"

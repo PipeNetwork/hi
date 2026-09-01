@@ -1,0 +1,1170 @@
+//! Generic completion contract derived from a user request.
+
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{CompletionReviewPolicy, VerificationMode};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskIntent {
+    ReadOnly,
+    Mutation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevel {
+    Normal,
+    High,
+}
+
+/// The facts the turn driver uses to decide which completion gates apply.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskContract {
+    pub intent: TaskIntent,
+    /// True only when the prompt contains an explicit, imperative mutation
+    /// request ("fix the login bug"), not for the mutation-capable default
+    /// that ambiguous wording ("how do users use it?") or tool/artifact nouns
+    /// ("does cargo build build hi-mlx?") fall into. Completion gates that
+    /// demand file changes key on this; capability scoping (which tools are
+    /// advertised) keys on `intent`, which stays deliberately broad.
+    #[serde(default)]
+    pub explicit_mutation: bool,
+    pub referenced_paths: Vec<String>,
+    pub acceptance_text: Vec<String>,
+    pub verification: VerificationMode,
+    pub risk: RiskLevel,
+    /// Prompt implies tests should pass (mid-turn affected `cargo test` gate).
+    #[serde(default)]
+    pub wants_tests: bool,
+}
+
+impl TaskContract {
+    pub fn derive(prompt: &str, verification: VerificationMode) -> Self {
+        let intent = classify_intent(prompt);
+        Self {
+            intent,
+            explicit_mutation: intent == TaskIntent::Mutation
+                && explicit_mutation_request(&prompt.to_ascii_lowercase()),
+            referenced_paths: referenced_paths(prompt),
+            acceptance_text: acceptance_text(prompt),
+            verification,
+            risk: prompt_risk(prompt),
+            wants_tests: prompt_wants_tests(prompt),
+        }
+    }
+
+    /// Outcome `code.change` auto-route: explicit mutation or a test-gated prompt.
+    pub fn is_code_change_turn(&self) -> bool {
+        self.explicit_mutation || self.wants_tests
+    }
+
+    /// Mutation observed at runtime always upgrades a read-only classification.
+    pub fn observe_mutation(&mut self) {
+        self.intent = TaskIntent::Mutation;
+    }
+
+    /// Named acceptance criteria extracted from the prompt, as a volatile-context
+    /// section. `None` when the prompt had no must/should/done-when sentences.
+    pub fn acceptance_section(&self) -> Option<String> {
+        if self.acceptance_text.is_empty() {
+            return None;
+        }
+        let mut out = String::from(
+            "# Acceptance criteria\nThe user named these as done-when. Meet each one before claiming complete:\n",
+        );
+        for line in &self.acceptance_text {
+            out.push_str("- ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        Some(out)
+    }
+
+    /// Independent completion review (Phase L includes large-diff skeptic).
+    ///
+    /// Under [`CompletionReviewPolicy::Risk`], fires for
+    /// high-risk domains, write-subagent work that *ran this turn*, risky paths,
+    /// **or** a large mutation (see [`Self::is_large_mutation`]).
+    ///
+    /// `delegate_used` must reflect actual turn activity (`delegate_turn_used > 0`),
+    /// not merely that the `delegate` tool is advertised or that session-wide
+    /// `long_horizon` is on. Bare long-horizon config alone must not force review
+    /// on every tiny mutation — goal skeptic already covers team goal advance.
+    pub fn requires_review(
+        &self,
+        policy: CompletionReviewPolicy,
+        changed_files: &[String],
+        diff_lines: usize,
+        delegate_used: bool,
+    ) -> bool {
+        match policy {
+            CompletionReviewPolicy::Off => false,
+            CompletionReviewPolicy::Always => self.intent == TaskIntent::Mutation,
+            CompletionReviewPolicy::Risk => {
+                self.intent == TaskIntent::Mutation
+                    && (self.risk == RiskLevel::High
+                        || delegate_used
+                        || self.is_large_mutation(changed_files, diff_lines)
+                        || changed_files.iter().any(|path| risky_path(path)))
+            }
+        }
+    }
+
+    /// Phase L trigger: multi-file or large LOC mutation that benefits from a
+    /// second-pass diff review even when the domain isn't inherently "risky".
+    pub fn is_large_mutation(&self, changed_files: &[String], diff_lines: usize) -> bool {
+        if self.intent != TaskIntent::Mutation {
+            return false;
+        }
+        diff_lines > LARGE_DIFF_LINE_THRESHOLD
+            || changed_source_or_config_count(changed_files) >= LARGE_DIFF_FILE_THRESHOLD
+    }
+}
+
+/// Diff line count above which Risk review always runs (Phase L).
+pub const LARGE_DIFF_LINE_THRESHOLD: usize = 200;
+/// Distinct source/config files changed above which Risk review always runs.
+pub const LARGE_DIFF_FILE_THRESHOLD: usize = 3;
+
+fn classify_intent(prompt: &str) -> TaskIntent {
+    let lower = prompt.to_ascii_lowercase();
+    // A literal response contract is conversational even though verbs such as
+    // "reply" and "respond" are not repository-inspection prefixes. Without
+    // this fast path, `Reply with exactly: ok` fell into the mutation-capable
+    // default and advertised the full workspace tool catalog; a weak model
+    // then searched the repository instead of returning the requested text.
+    if prompt_requests_exact_text_response(&lower) {
+        return TaskIntent::ReadOnly;
+    }
+    if lower.trim_start().starts_with("read-only ") || lower.trim_start().starts_with("read only ")
+    {
+        return TaskIntent::ReadOnly;
+    }
+    let mutating = contains_mutation_request(&lower);
+    if mutating {
+        return TaskIntent::Mutation;
+    }
+    // Tool-directed inspection prompts often start with "use" or "call",
+    // which are not in the natural-language read-only prefix list below. Do
+    // not let that wording promote an explicitly read-only operation into a
+    // mutation-capable turn (and its much larger tool catalog).
+    if explicit_read_only_tool_request(&lower) {
+        return TaskIntent::ReadOnly;
+    }
+    let trimmed = lower.trim_start_matches('/').trim_start();
+    let clearly_read_only = [
+        "analyze",
+        "answer",
+        "audit",
+        "describe",
+        "explain",
+        "find",
+        "hello",
+        "hi",
+        "inspect",
+        "list",
+        "read",
+        "review",
+        "say",
+        "show",
+        "status",
+        "summarize",
+        "tell",
+        "thank",
+        "thanks",
+        "what",
+        "where",
+        "which",
+        "why",
+    ]
+    .iter()
+    .any(|prefix| {
+        trimmed == *prefix
+            || trimmed
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    });
+    if clearly_read_only {
+        TaskIntent::ReadOnly
+    } else {
+        // Ambiguous ordinary requests are mutation-capable by default.
+        TaskIntent::Mutation
+    }
+}
+
+/// Whether the prompt asks for a literal, tool-free text response.
+///
+/// Keep this deliberately phrase-shaped. The word `exactly` also appears in
+/// coding requests ("make the file contain exactly ..."), which must retain
+/// mutation tools; only an explicit answer/reply/output contract qualifies.
+pub(crate) fn prompt_requests_exact_text_response(prompt: &str) -> bool {
+    let normalized = prompt
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized = normalized
+        .strip_prefix("please ")
+        .unwrap_or(&normalized)
+        .trim();
+    let remainder = [
+        "reply with exactly",
+        "respond with exactly",
+        "answer with exactly",
+        "return exactly",
+        "output exactly",
+        "say exactly",
+    ]
+    .iter()
+    .find_map(|marker| normalized.strip_prefix(marker).map(str::trim));
+    let Some(remainder) = remainder else {
+        return false;
+    };
+    let words = remainder.split_whitespace().collect::<Vec<_>>();
+    !words.is_empty()
+        && words.len() <= 8
+        && !words.iter().any(|word| {
+            matches!(
+                *word,
+                "about"
+                    | "based"
+                    | "bullet"
+                    | "bullets"
+                    | "code"
+                    | "describe"
+                    | "explain"
+                    | "file"
+                    | "files"
+                    | "from"
+                    | "json"
+                    | "line"
+                    | "lines"
+                    | "list"
+                    | "repo"
+                    | "repository"
+                    | "sentence"
+                    | "sentences"
+                    | "summary"
+                    | "word"
+                    | "words"
+                    | "workspace"
+            )
+        })
+}
+
+/// Whether a turn is shaped as a direct question whose draft should be held
+/// until semantic answer checks accept it. This is intentionally independent
+/// of [`TaskIntent`]: ambiguous questions retain broad read tools by design,
+/// but a streamed canned placeholder must not leak into the UI before repair.
+pub(crate) fn prompt_is_direct_question(prompt: &str) -> bool {
+    if explicit_mutation_request(&prompt.to_ascii_lowercase()) {
+        return false;
+    }
+    let normalized = prompt
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    matches!(
+        normalized.split_whitespace().next(),
+        Some(
+            "are"
+                | "can"
+                | "could"
+                | "did"
+                | "do"
+                | "does"
+                | "how"
+                | "is"
+                | "should"
+                | "what"
+                | "when"
+                | "where"
+                | "which"
+                | "who"
+                | "why"
+                | "will"
+                | "would"
+        )
+    ) || prompt.contains('?')
+}
+
+fn explicit_read_only_tool_request(lower: &str) -> bool {
+    [
+        "use the list tool",
+        "use the read tool",
+        "read tool call",
+        "one read tool",
+        "use the grep tool",
+        "use the glob tool",
+        "call the list tool",
+        "call the read tool",
+        "call the grep tool",
+        "call the glob tool",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Whether the request contains an action verb that requires workspace
+/// mutation. A leading review verb must not erase a later implementation
+/// clause (for example, "review plan.md and let's keep building this").
+fn contains_mutation_request(lower: &str) -> bool {
+    mutation_check_words(lower)
+        .into_iter()
+        .any(is_mutation_verb)
+}
+
+/// Split text into words for mutation-verb checks, keeping hyphen/underscore
+/// compounds ("grok-build", "build_plan") as single tokens: their pieces name
+/// artifacts, not imperatives addressed to the agent.
+fn mutation_check_words(text: &str) -> Vec<&str> {
+    text.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || character == '-' || character == '_')
+    })
+    .map(|word| word.trim_matches(['-', '_']))
+    .filter(|word| !word.is_empty())
+    .collect()
+}
+
+fn is_mutation_verb(word: &str) -> bool {
+    matches!(
+        word,
+        "add"
+            | "adding"
+            | "build"
+            | "building"
+            | "change"
+            | "changing"
+            | "create"
+            | "creating"
+            | "delete"
+            | "deleting"
+            | "edit"
+            | "editing"
+            | "finish"
+            | "finishing"
+            | "fix"
+            | "fixing"
+            | "implement"
+            | "implementing"
+            | "migrate"
+            | "migrating"
+            | "modify"
+            | "modifying"
+            | "patch"
+            | "patching"
+            | "refactor"
+            | "refactoring"
+            | "remove"
+            | "removing"
+            | "rename"
+            | "renaming"
+            | "replace"
+            | "replacing"
+            | "update"
+            | "updating"
+            | "write"
+            | "writing"
+    )
+}
+
+/// Whether the request uses a mutation verb as an actual instruction to change
+/// the workspace, as opposed to a tool/artifact noun ("cargo build", "the
+/// build") or a question about behavior ("does that build hi-mlx?"). This is
+/// deliberately stricter than [`contains_mutation_request`]: it decides
+/// whether a turn that ends with no file changes counts as stalled, not which
+/// tools are advertised, so a false negative merely relaxes a completion gate
+/// while a false positive brands a correct text-only answer "incomplete ·
+/// stalled".
+pub(crate) fn explicit_mutation_request(lower: &str) -> bool {
+    let mut clause = String::new();
+    let mut clauses: Vec<(String, bool)> = Vec::new();
+    for character in lower.chars() {
+        if matches!(character, '.' | '?' | '!' | ';' | '\n') {
+            clauses.push((std::mem::take(&mut clause), character == '?'));
+        } else {
+            clause.push(character);
+        }
+    }
+    if !clause.trim().is_empty() {
+        clauses.push((clause, false));
+    }
+    clauses
+        .iter()
+        .any(|(clause, question)| clause_requests_mutation(clause, *question))
+}
+
+fn clause_requests_mutation(clause: &str, question: bool) -> bool {
+    let words = mutation_check_words(clause);
+    words.iter().enumerate().any(|(index, word)| {
+        if !is_mutation_verb(word) {
+            return false;
+        }
+        let previous = index.checked_sub(1).map(|position| words[position]);
+        if question {
+            // Inside a question, a mutation verb only counts as a request when
+            // it is directed at the agent ("can you fix …?"), never when it
+            // asks about behavior ("does that build hi-mlx?").
+            return matches!(previous, Some("you" | "please"));
+        }
+        // "Build plans the work, runs up to hundreds of agents…" — a mutation
+        // verb followed by a content word and then a determiner is the
+        // *subject* of a declarative sentence (a product or artifact name),
+        // not an imperative. A real imperative puts the determiner or the
+        // bare object right after the verb: "fix the login bug", "build a
+        // parser", "implement quicksort".
+        if declarative_subject_reading(&words, index) {
+            return false;
+        }
+        // Outside questions, skip tool/artifact-noun usages ("cargo build",
+        // "apply the patch"), bare infinitives that are not the clause's
+        // imperative ("wait for the download to finish"), and auxiliary/
+        // interrogative frames ("does it build", "will this delete data")
+        // that split across a filename dot.
+        //
+        // A first-person request frame is the narrow exception to the bare
+        // infinitive rule: "we want to build an app" is an instruction even
+        // though the mutation verb follows `to`.
+        if previous == Some("to") && first_person_mutation_request_frame(&words, index) {
+            return true;
+        }
+        !matches!(
+            previous,
+            Some(
+                "cargo"
+                    | "npm"
+                    | "pnpm"
+                    | "yarn"
+                    | "gradle"
+                    | "mvn"
+                    | "bazel"
+                    | "docker"
+                    | "make"
+                    | "cmake"
+                    | "go"
+                    | "rustc"
+                    | "to"
+                    | "the"
+                    | "a"
+                    | "an"
+                    | "this"
+                    | "that"
+                    | "these"
+                    | "those"
+                    | "it"
+                    | "its"
+                    | "my"
+                    | "your"
+                    | "our"
+                    | "their"
+                    | "release"
+                    | "debug"
+                    | "dev"
+                    | "ci"
+                    | "run"
+                    | "still"
+                    | "also"
+                    | "not"
+                    | "dont"
+                    | "doesnt"
+                    | "didnt"
+                    | "wont"
+                    | "cant"
+                    | "couldnt"
+                    | "wouldnt"
+                    | "shouldnt"
+                    | "never"
+                    | "does"
+                    | "do"
+                    | "did"
+                    | "is"
+                    | "are"
+                    | "was"
+                    | "were"
+                    | "can"
+                    | "could"
+                    | "will"
+                    | "would"
+                    | "should"
+                    | "might"
+                    | "may"
+                    | "must"
+            )
+        )
+    })
+}
+
+fn first_person_mutation_request_frame(words: &[&str], mutation_index: usize) -> bool {
+    matches!(
+        words.get(mutation_index.saturating_sub(3)..mutation_index),
+        Some(["i" | "we", "want" | "need", "to"])
+    ) || matches!(
+        words.get(mutation_index.saturating_sub(4)..mutation_index),
+        Some(["i" | "we", "would", "like", "to"])
+    )
+}
+
+/// Whether the mutation verb at `index` reads as the subject of a declarative
+/// sentence rather than an imperative: the verb is followed by a content word
+/// and only then a determiner ("Build plans the work…"). An imperative puts
+/// the determiner (or the bare object with nothing after it) directly after
+/// the verb ("fix the login bug", "build a parser", "fix ci").
+fn declarative_subject_reading(words: &[&str], index: usize) -> bool {
+    let Some(&next) = words.get(index + 1) else {
+        return false;
+    };
+    let Some(&after) = words.get(index + 2) else {
+        return false;
+    };
+    const DETERMINERS: &[&str] = &[
+        "the", "a", "an", "this", "that", "these", "those", "my", "your", "our", "its", "their",
+        "all", "any", "some", "each", "every",
+    ];
+    !DETERMINERS.contains(&next) && matches!(after, "the" | "a" | "an")
+}
+
+fn referenced_paths(prompt: &str) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for token in prompt.split_whitespace() {
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ':' | ';'
+            )
+        });
+        // Strip sentence punctuation after the surrounding-delimiter pass.
+        // `plan.md.` should resolve to `plan.md`, while ordinary prose such as
+        // `validation.` must not become a fake path with an empty extension.
+        let token = token.trim_end_matches(['.', '?', '!']);
+        if token.contains('/') || std::path::Path::new(token).extension().is_some() {
+            paths.insert(token.trim_start_matches("./").to_string());
+        }
+    }
+    paths.into_iter().collect()
+}
+
+const MAX_ACCEPTANCE_ITEMS: usize = 8;
+const MAX_ACCEPTANCE_ITEM_CHARS: usize = 200;
+
+fn acceptance_text(prompt: &str) -> Vec<String> {
+    prompt
+        .split(['\n', '.'])
+        .map(str::trim)
+        .filter(|sentence| {
+            let lower = sentence.to_ascii_lowercase();
+            [
+                "acceptance",
+                "must ",
+                "should ",
+                "success",
+                "done when",
+                "ensure ",
+                "fully ",
+                "without ",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle))
+        })
+        .map(clip_acceptance)
+        .take(MAX_ACCEPTANCE_ITEMS)
+        .collect()
+}
+
+fn clip_acceptance(text: &str) -> String {
+    if text.chars().count() <= MAX_ACCEPTANCE_ITEM_CHARS {
+        return text.to_string();
+    }
+    let clipped: String = text
+        .chars()
+        .take(MAX_ACCEPTANCE_ITEM_CHARS.saturating_sub(1))
+        .collect();
+    format!("{clipped}…")
+}
+
+/// Whether free text asks for tests / green CI as part of done.
+pub(crate) fn prompt_wants_tests(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "cargo test",
+        "cargo t ",
+        "pytest",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "go test",
+        "make test",
+        "unit test",
+        "unit tests",
+        "integration test",
+        "test suite",
+        "tests pass",
+        "tests passing",
+        "test pass",
+        "passing tests",
+        "green tests",
+        "all tests",
+        "run the tests",
+        "run tests",
+        "fix the test",
+        "fix tests",
+        "failing test",
+        "failing tests",
+        "broken test",
+        "flaky test",
+        "add a test",
+        "add tests",
+        "write a test",
+        "write tests",
+        "with tests",
+        "and tests",
+        "#[test]",
+        "verify with test",
+        "verify with cargo check/test",
+        "cargo check/test",
+        "so tests",
+        "until tests",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        // Whole-word "test" / "tests" near imperative coding verbs is enough
+        // for "fix the login test" style prompts.
+        || (lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "test" || w == "tests")
+            && [
+                "fix", "pass", "fail", "run", "add", "write", "make", "ensure", "until", "green",
+            ]
+            .iter()
+            .any(|v| lower.contains(v)))
+}
+
+/// Whether a changed path looks like a test file (not production source).
+pub(crate) fn path_looks_like_test(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_ascii_lowercase();
+    let name = p.rsplit('/').next().unwrap_or(&p);
+    p.contains("/tests/")
+        || p.contains("/test/")
+        || p.starts_with("tests/")
+        || p.starts_with("test/")
+        || p.contains("/testing/")
+        || name.contains("_test.")
+        || name.starts_with("test_")
+        || name.contains(".spec.")
+        || name.contains(".test.")
+        || name.ends_with("_test.rs")
+        || name.ends_with("_spec.rb")
+}
+
+fn prompt_risk(prompt: &str) -> RiskLevel {
+    let lower = prompt.to_ascii_lowercase();
+    if [
+        "auth",
+        "permission",
+        "security",
+        "credential",
+        "secret",
+        "migration",
+        "schema",
+        "dependency",
+        "lockfile",
+        "ci",
+        "workflow",
+        "deploy",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+    {
+        RiskLevel::High
+    } else {
+        RiskLevel::Normal
+    }
+}
+
+fn risky_path(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    is_ci_path(&lower, name)
+        || lower.contains("/migrations/")
+        || lower.starts_with("migrations/")
+        || lower.contains("auth")
+        || lower.contains("security")
+        || lower.contains("permission")
+        || is_dependency_manifest(name)
+}
+
+fn is_ci_path(path: &str, name: &str) -> bool {
+    path.starts_with(".github/")
+        || path.starts_with(".circleci/")
+        || path.starts_with(".buildkite/")
+        || path.starts_with(".woodpecker/")
+        || path.starts_with("ci/")
+        || path.contains("/ci/")
+        || matches!(
+            name,
+            ".gitlab-ci.yml"
+                | ".gitlab-ci.yaml"
+                | ".drone.yml"
+                | ".drone.yaml"
+                | "azure-pipelines.yml"
+                | "azure-pipelines.yaml"
+                | "bitbucket-pipelines.yml"
+                | "bitbucket-pipelines.yaml"
+                | "jenkinsfile"
+        )
+}
+
+fn is_dependency_manifest(name: &str) -> bool {
+    matches!(
+        name,
+        "cargo.toml"
+            | "cargo.lock"
+            | "package.json"
+            | "package-lock.json"
+            | "pnpm-workspace.yaml"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb"
+            | "deno.json"
+            | "deno.jsonc"
+            | "go.mod"
+            | "go.sum"
+            | "pyproject.toml"
+            | "requirements.txt"
+            | "pipfile"
+            | "pipfile.lock"
+            | "poetry.lock"
+            | "uv.lock"
+            | "gemfile"
+            | "gemfile.lock"
+            | "composer.json"
+            | "composer.lock"
+            | "pom.xml"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "settings.gradle"
+            | "settings.gradle.kts"
+            | "mix.exs"
+            | "mix.lock"
+            | "package.swift"
+            | "package.resolved"
+    ) || (name.starts_with("requirements-") && name.ends_with(".txt"))
+        || name.ends_with(".csproj")
+}
+
+fn changed_source_or_config_count(paths: &[String]) -> usize {
+    paths
+        .iter()
+        .filter(|path| {
+            std::path::Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "rs" | "py"
+                            | "go"
+                            | "js"
+                            | "jsx"
+                            | "ts"
+                            | "tsx"
+                            | "toml"
+                            | "json"
+                            | "yaml"
+                            | "yml"
+                    )
+                })
+        })
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcome_auto_route_separates_qa_from_cargo_mutation() {
+        let qa = TaskContract::derive("what does this parser do?", VerificationMode::Auto);
+        assert!(!qa.is_code_change_turn(), "Q&A should stay on local chat");
+        let fix = TaskContract::derive(
+            "fix the failing tests in the parser",
+            VerificationMode::Auto,
+        );
+        assert!(
+            fix.is_code_change_turn(),
+            "test-gated repair is code.change"
+        );
+        let mutate = TaskContract::derive(
+            "add a --json flag to the CLI and update the tests",
+            VerificationMode::Auto,
+        );
+        assert!(mutate.is_code_change_turn() || mutate.wants_tests);
+    }
+
+    #[test]
+    fn wants_tests_detects_test_gated_prompts() {
+        let gated = TaskContract::derive(
+            "fix the failing tests in the parser",
+            VerificationMode::Auto,
+        );
+        assert!(gated.wants_tests, "failing tests prompt");
+        let cargo = TaskContract::derive(
+            "implement foo so cargo test -p hi-tools passes",
+            VerificationMode::Auto,
+        );
+        assert!(cargo.wants_tests, "cargo test prompt");
+        let compact = TaskContract::derive("Verify with cargo check/test", VerificationMode::Auto);
+        assert!(compact.wants_tests, "compact cargo check/test plan step");
+        let plain = TaskContract::derive("rename the helper function", VerificationMode::Auto);
+        assert!(!plain.wants_tests, "rename without tests");
+    }
+
+    #[test]
+    fn acceptance_text_is_surfaced_as_a_section() {
+        let contract = TaskContract::derive(
+            "Add a --seed flag. Done when cargo test -p trainer passes. The CLI must accept an integer seed.",
+            VerificationMode::Auto,
+        );
+        assert!(
+            !contract.acceptance_text.is_empty(),
+            "extracts must/done-when sentences: {:?}",
+            contract.acceptance_text
+        );
+        let section = contract.acceptance_section().expect("section");
+        assert!(section.contains("# Acceptance criteria"));
+        assert!(section.contains("must accept") || section.contains("Done when"));
+        let empty = TaskContract::derive("rename the helper", VerificationMode::Auto);
+        assert!(empty.acceptance_section().is_none());
+    }
+
+    #[test]
+    fn fully_qualified_behavior_is_named_acceptance() {
+        let contract = TaskContract::derive(
+            "lets build a chess TUI game and also fully enable mouse usage",
+            VerificationMode::Auto,
+        );
+
+        assert!(
+            contract
+                .acceptance_text
+                .iter()
+                .any(|item| item.contains("fully enable mouse usage")),
+            "explicit completeness language must reach the completion gates: {:?}",
+            contract.acceptance_text
+        );
+    }
+
+    #[test]
+    fn acceptance_text_caps_count_and_length() {
+        let mut prompt = String::new();
+        for i in 0..20 {
+            prompt.push_str(&format!(
+                "The CLI must {}.\n",
+                "accept this very long acceptance sentence ".repeat(10) + &i.to_string()
+            ));
+        }
+        let contract = TaskContract::derive(&prompt, VerificationMode::Auto);
+        assert_eq!(contract.acceptance_text.len(), MAX_ACCEPTANCE_ITEMS);
+        assert!(
+            contract
+                .acceptance_text
+                .iter()
+                .all(|line| line.chars().count() <= MAX_ACCEPTANCE_ITEM_CHARS)
+        );
+    }
+
+    #[test]
+    fn path_looks_like_test_covers_common_layouts() {
+        assert!(path_looks_like_test("crates/hi-agent/src/tests/goal.rs"));
+        assert!(path_looks_like_test("tests/parser.rs"));
+        assert!(path_looks_like_test("src/foo_test.rs"));
+        assert!(path_looks_like_test("app.spec.ts"));
+        assert!(!path_looks_like_test("src/parser.rs"));
+        assert!(!path_looks_like_test("crates/hi-agent/src/goal.rs"));
+    }
+
+    #[test]
+    fn ordinary_implementation_wording_is_mutating() {
+        let contract = TaskContract::derive("implement the parser", VerificationMode::Auto);
+        assert_eq!(contract.intent, TaskIntent::Mutation);
+
+        let mixed = TaskContract::derive(
+            "review plan.md and lets keep building this",
+            VerificationMode::Auto,
+        );
+        assert_eq!(
+            mixed.intent,
+            TaskIntent::Mutation,
+            "a leading review clause must not remove later mutation intent"
+        );
+    }
+
+    #[test]
+    fn referenced_paths_ignore_sentence_punctuation_and_prose() {
+        let contract = TaskContract::derive(
+            "Continue the long-horizon goal. Review plan.md. Complete validation.",
+            VerificationMode::Auto,
+        );
+        assert_eq!(contract.referenced_paths, vec!["plan.md"]);
+    }
+
+    #[test]
+    fn questions_stay_mutation_capable_but_do_not_expect_mutation() {
+        for prompt in [
+            "how do users use it? does it automatically turn on if theres not enough ram?",
+            "if we do cargo build --release on a mac. does that build hi-mlx?",
+            "does it build?",
+            "review now. does mlx still build?",
+            "will this delete my sessions?",
+        ] {
+            let contract = TaskContract::derive(prompt, VerificationMode::Auto);
+            assert_eq!(
+                contract.intent,
+                TaskIntent::Mutation,
+                "capability stays broad for {prompt:?}"
+            );
+            assert!(
+                !contract.explicit_mutation,
+                "a question must not expect file changes: {prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_requests_expect_mutation() {
+        for prompt in [
+            "fix the login bug",
+            "please update the parser to handle unicode",
+            "can you fix the flaky test?",
+            "implement the parser",
+            "review plan.md and lets keep building this",
+            "lets add in all the resource pages too with full copy https://postplanify.com/",
+            "we want to build a twitter style app and seed it with agents",
+            "we would like to create a small CLI project",
+        ] {
+            let contract = TaskContract::derive(prompt, VerificationMode::Auto);
+            assert_eq!(contract.intent, TaskIntent::Mutation, "{prompt:?}");
+            assert!(contract.explicit_mutation, "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn descriptive_prose_does_not_expect_mutation() {
+        // "grok-build" is a compound name, not the verb "build"; "Build plans
+        // the work…" is a product description (subject-verb-object), not an
+        // imperative addressed to the agent.
+        let contract = TaskContract::derive(
+            "review grok-build. Build plans the work, runs many agents, and reports back. \
+             discuss how to optimize hi to support this",
+            VerificationMode::Auto,
+        );
+        assert!(!contract.explicit_mutation);
+
+        let imperative =
+            TaskContract::derive("build a durable DAG scheduler", VerificationMode::Auto);
+        assert!(imperative.explicit_mutation);
+    }
+
+    #[test]
+    fn bare_infinitive_finish_does_not_expect_mutation() {
+        // "wait … to finish" is not an imperative mutation request; the
+        // mutation verb is only the bare infinitive after "to". Branding it
+        // expected_mutation stalled wait-poll turns after two edit nudges.
+        let contract =
+            TaskContract::derive("wait for the download to finish", VerificationMode::Auto);
+        assert_eq!(contract.intent, TaskIntent::Mutation);
+        assert!(!contract.explicit_mutation);
+    }
+
+    #[test]
+    fn read_only_prefix_never_expects_mutation() {
+        let contract = TaskContract::derive("read-only fix report", VerificationMode::Auto);
+        assert_eq!(contract.intent, TaskIntent::ReadOnly);
+        assert!(!contract.explicit_mutation);
+    }
+
+    #[test]
+    fn explicit_read_only_tool_requests_are_not_promoted_to_mutation() {
+        for prompt in [
+            "Use the list tool on the repository root and report the first entry.",
+            "Call the read tool on README.md and summarize it.",
+            "Use exactly one read tool call with the paths array for Cargo.toml and crates/hi-ai/Cargo.toml. Summarize both files.",
+        ] {
+            let contract = TaskContract::derive(prompt, VerificationMode::Auto);
+            assert_eq!(contract.intent, TaskIntent::ReadOnly, "{prompt:?}");
+            assert!(!contract.explicit_mutation, "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn only_clear_questions_are_read_only() {
+        assert_eq!(
+            TaskContract::derive("explain how src/parser.rs works", VerificationMode::Auto).intent,
+            TaskIntent::ReadOnly
+        );
+        assert_eq!(
+            TaskContract::derive("parser behavior", VerificationMode::Auto).intent,
+            TaskIntent::Mutation
+        );
+    }
+
+    #[test]
+    fn literal_response_contract_is_read_only_but_format_constraints_are_not_literal() {
+        let exact = TaskContract::derive("Reply with exactly: ok", VerificationMode::Auto);
+        assert_eq!(exact.intent, TaskIntent::ReadOnly);
+        assert!(prompt_requests_exact_text_response(
+            "Please respond with exactly `all systems go`"
+        ));
+        assert!(!prompt_requests_exact_text_response(
+            "Return exactly two bullets about src/parser.rs"
+        ));
+        assert!(!prompt_requests_exact_text_response(
+            "Fix src/parser.rs and reply with exactly: done"
+        ));
+    }
+
+    #[test]
+    fn direct_questions_are_quality_buffered_without_narrowing_tool_capability() {
+        let prompt = "is there a web UI?";
+        assert!(prompt_is_direct_question(prompt));
+        assert_eq!(
+            TaskContract::derive(prompt, VerificationMode::Auto).intent,
+            TaskIntent::Mutation,
+            "ambiguous repository questions intentionally retain broad read capability"
+        );
+        assert!(!prompt_is_direct_question("can you fix the web UI?"));
+    }
+
+    #[test]
+    fn direct_file_read_requests_are_read_only() {
+        let contract = TaskContract::derive(
+            "Read README.md and state its purpose in one concise sentence",
+            VerificationMode::Auto,
+        );
+        assert_eq!(contract.intent, TaskIntent::ReadOnly);
+        assert!(!contract.explicit_mutation);
+    }
+
+    #[test]
+    fn late_mutation_upgrades_contract() {
+        let mut contract = TaskContract::derive("review the parser", VerificationMode::Auto);
+        contract.observe_mutation();
+        assert_eq!(contract.intent, TaskIntent::Mutation);
+    }
+
+    #[test]
+    fn risk_review_matrix_matches_contract() {
+        let normal = TaskContract::derive("implement parser", VerificationMode::Auto);
+        assert!(!normal.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            20,
+            false
+        ));
+        // Advertise-only / session long_horizon is not enough: small normal
+        // mutation stays NotRequired without delegate activity or other risk.
+        assert!(!normal.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            20,
+            false
+        ));
+        // Actual write-capable subagent activity this turn does force review.
+        assert!(normal.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            20,
+            true
+        ));
+        assert!(normal.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/a.rs".into(), "src/b.rs".into(), "tests/a.rs".into()],
+            20,
+            false
+        ));
+        let auth = TaskContract::derive("fix auth permissions", VerificationMode::Auto);
+        assert!(auth.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/auth.rs".into()],
+            5,
+            false
+        ));
+    }
+
+    #[test]
+    fn large_diff_triggers_risk_review() {
+        let normal = TaskContract::derive("implement parser", VerificationMode::Auto);
+        // Below both thresholds — no review.
+        assert!(!normal.is_large_mutation(&["src/parser.rs".into()], 50));
+        assert!(!normal.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            50,
+            false
+        ));
+        // LOC threshold alone.
+        assert!(normal.is_large_mutation(&["src/parser.rs".into()], LARGE_DIFF_LINE_THRESHOLD + 1));
+        assert!(normal.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            LARGE_DIFF_LINE_THRESHOLD + 1,
+            false
+        ));
+        // File-count threshold alone (source/config files).
+        let files = vec!["src/a.rs".into(), "src/b.rs".into(), "src/c.rs".into()];
+        assert!(normal.is_large_mutation(&files, 10));
+        assert!(normal.requires_review(CompletionReviewPolicy::Risk, &files, 10, false));
+        // Off policy still suppresses.
+        assert!(!normal.requires_review(
+            CompletionReviewPolicy::Off,
+            &["src/parser.rs".into()],
+            LARGE_DIFF_LINE_THRESHOLD + 50,
+            false
+        ));
+    }
+
+    #[test]
+    fn dependency_manifests_and_ci_paths_require_risk_review() {
+        let contract = TaskContract::derive("implement parser", VerificationMode::Auto);
+        for path in [
+            "Cargo.toml",
+            "frontend/package.json",
+            "service/go.mod",
+            "python/pyproject.toml",
+            "python/requirements-dev.txt",
+            ".github/workflows/ci.yml",
+            ".circleci/config.yml",
+            ".gitlab-ci.yml",
+            "azure-pipelines.yml",
+            "ci/release.sh",
+        ] {
+            assert!(
+                contract.requires_review(CompletionReviewPolicy::Risk, &[path.into()], 5, false),
+                "expected independent review for {path}"
+            );
+        }
+        assert!(!contract.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            5,
+            false
+        ));
+    }
+}

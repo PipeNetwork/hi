@@ -1,0 +1,13 @@
+schema_version = 2
+name = "typescript-client-api"
+prompt = "Refactor the TypeScript client API: rename fetchUser to loadUser, change its id parameter from number to string, URL-encode the id in `/users/<id>`, preserve the exported User interface, and update src/index.ts exports. Edit only src/**."
+allowed_changes = ["src/**"]
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "python3 .hi-eval-oracle/check.py"

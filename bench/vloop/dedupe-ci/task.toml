@@ -1,0 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "dedupe-ci"
+prompt = "Implement dedupe(words) in solution.py: remove duplicates from a list of strings comparing case-insensitively, keeping original order. The output must preserve the first-seen original spelling — never lowercase or otherwise alter the surviving entries. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.dedupe([\"Apple\",\"APPLE\",\"banana\"])==[\"Apple\",\"banana\"], s.dedupe([\"Apple\",\"APPLE\",\"banana\"])"'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[([\"Apple\",\"APPLE\",\"banana\"],[\"Apple\",\"banana\"]),([\"a\",\"A\",\"a\"],[\"a\"]),([],[]),([\"B\",\"b\",\"a\",\"A\",\"B\"],[\"B\",\"a\"]),([\"Straße\",\"STRASSE\"],[\"Straße\"]),([\"x\"],[\"x\"])]; fails=[f\"dedupe({i}) -> {s.dedupe(i)!r} != {e!r}\" for i,e in cases if s.dedupe(i)!=e]; assert not fails, chr(10).join(fails)"'''

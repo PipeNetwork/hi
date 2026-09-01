@@ -1,0 +1,15 @@
+[package]
+name = "hi-policy"
+edition.workspace = true
+version.workspace = true
+description = "Typed interactive capabilities and durable approval contracts for hi"
+
+[dependencies]
+blake3.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"

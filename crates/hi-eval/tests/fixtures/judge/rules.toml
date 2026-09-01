@@ -1,0 +1,7 @@
+[process]
+forbid_tools = ["write"]
+require_tools = ["edit"]
+
+[budget]
+max_image_chars_after_elide = 800
+max_tool_result_chars = 50000

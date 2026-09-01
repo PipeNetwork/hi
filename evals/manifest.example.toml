@@ -1,0 +1,64 @@
+# Copy this file to evals/manifest.toml and point each source at a pinned,
+# operator-owned checkout. Sources are imported before execution and are never
+# read again by a prepared run.
+schema_version = 1
+name = "hi-third-party-evals"
+
+[datasets.local_tasks]
+adapter = "legacy"
+source = "../bench/tasks"
+revision = "local-pinned-revision"
+
+[datasets.hygiene]
+adapter = "legacy"
+source = "../bench/tasks/hygiene-narrow-edit"
+revision = "local-pinned-revision"
+
+[profiles.smoke]
+datasets = ["local_tasks"]
+models = ["provider/model-id"]
+trials = 1
+backend = "host"
+claim_level = "smoke"
+treatments = ["baseline"]
+
+[datasets.harness]
+adapter = "legacy"
+source = "../bench/harness"
+revision = "local-pinned-revision"
+
+[profiles.harness]
+datasets = ["harness"]
+models = ["provider/model-id"]
+trials = 1
+backend = "host"
+claim_level = "smoke"
+treatments = ["baseline"]
+
+[profiles.hygiene]
+datasets = ["hygiene"]
+models = ["provider/model-id"]
+trials = 1
+backend = "host"
+claim_level = "smoke"
+treatments = ["baseline"]
+
+# Optional paired arms. Each arm gets a fresh attempt and its own evidence.
+# [[profiles.smoke.arms]]
+# name = "treatment-b"
+# model = "provider/other-model"
+
+# Example of a final-message task package policy:
+# [profiles.smoke.scoring]
+# named_reward = { name = "similarity", threshold = 0.8 }
+
+# Docker/Harbor profiles use a package.toml/package.json task whose
+# environment is an OCI image or Dockerfile. Each arm command runs inside the
+# image. Images must already exist locally (Docker is never asked to pull).
+# [profiles.docker_smoke]
+# datasets = ["local_tasks"]
+# backend = "docker"
+# claim_level = "smoke"
+# [[profiles.docker_smoke.arms]]
+# name = "baseline"
+# command = "./run-candidate.sh"

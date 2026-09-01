@@ -1,0 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "format-money"
+prompt = "Implement fmt(cents) in solution.py: format integer cents as US dollars with thousands separators, like 123456 -> '$1,234.56'. Negative amounts must render with the minus sign before the dollar sign, like -123456 -> '-$1,234.56', and must keep the thousands separators. Zero is '$0.00'. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.fmt(123456)==\"\$1,234.56\", s.fmt(123456); assert s.fmt(-123456)==\"-\$1,234.56\", s.fmt(-123456)"'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[(123456,\"\$1,234.56\"),(-123456,\"-\$1,234.56\"),(0,\"\$0.00\"),(5,\"\$0.05\"),(-5,\"-\$0.05\"),(100000000,\"\$1,000,000.00\"),(99,\"\$0.99\"),(-100,\"-\$1.00\")]; fails=[f\"fmt({c}) -> {s.fmt(c)!r} != {e!r}\" for c,e in cases if s.fmt(c)!=e]; assert not fails, chr(10).join(fails)"'''

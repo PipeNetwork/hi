@@ -1,0 +1,24 @@
+schema_version = 2
+allowed_changes = ["driver.py"]
+name = "self-similar-driver"
+prompt = """Write driver.py for the included host.py tool host.
+
+host.py understands one JSON object per stdin line:
+  {"op":"read","path":"bug/solution.py"}
+  {"op":"edit","path":"bug/solution.py","old":"...","new":"..."}
+  {"op":"bash","command":"python3 inner_oracle.py"}
+
+It prints a JSON result line. The inner task is: bug/solution.py add(a,b) currently subtracts and must return a+b.
+
+driver.py must loop: print one tool request, read one result, stop when bash/inner_oracle.py exits 0.
+Do not dump unbounded tool results into the next prompt (keep a short slice).
+Do not rewrite host.py or the oracle.
+Do not edit bug/ yourself — only talk to host.py.
+"""
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = "python3 host.py --scripted"

@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "note": "Re-judged 2026-08-20 live tapes (grok-4.3 / xai, --configs=baseline, --trials=1) under current judge.toml. Inspect-before-ask first tool was bash (pwd && ls) and now process-passes. Known-url still fails process (curl vs web_fetch). Broad-web-search fails process without HI_WEB_SEARCH_API_KEY (bash first). Original live summary was 4/7 process before the inspect bash allow. Oracle 6/7 is informational; do not average with process_pass_rate or SWE.",
+  "captured_at": "2026-08-20",
+  "model": "xai/grok-4.3",
+  "config": "baseline",
+  "trials": 1,
+  "process_pass_rate": 0.7142857142857143,
+  "budget_pass_rate": 1.0,
+  "write_overwrite_violations": 0,
+  "image_elision_misses": 0,
+  "max_request_tokens_p95": 4719,
+  "solve_rate": 0.8571428571428571
+}

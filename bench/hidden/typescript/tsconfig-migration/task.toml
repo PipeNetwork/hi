@@ -1,0 +1,13 @@
+schema_version = 2
+name = "typescript-tsconfig-migration"
+prompt = "Migrate tsconfig.json to the repository's strict Node ESM baseline: target ES2022, module and moduleResolution NodeNext, strict true, noUncheckedIndexedAccess true, and preserve rootDir=src and outDir=dist. Edit only tsconfig.json."
+allowed_changes = ["tsconfig.json"]
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "python3 .hi-eval-oracle/check.py"

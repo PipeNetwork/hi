@@ -1,0 +1,35 @@
+[package]
+name = "hi-voice"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+cpal = { workspace = true, optional = true }
+whisper-rs = { workspace = true, features = ["tracing_backend"], optional = true }
+reqwest.workspace = true
+futures-util.workspace = true
+
+# Metal-accelerated inference on Apple Silicon. Target dependency sections union
+# their features with the base entry above rather than replacing it.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { workspace = true, features = ["metal"], optional = true }
+
+[features]
+# `audio` carries the heavy native deps: cpal (ALSA on Linux, unlinkable in
+# static/container builds) and whisper-rs (libclang + cmake at build time).
+# Without it the crate exposes same-API stubs that report AudioNotSupported,
+# so nothing above this crate needs cfg gates.
+default = []
+audio = ["dep:cpal", "dep:whisper-rs"]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "token-bomb-guide"
+prompt = "solution.py defines add(a, b) and should return a + b. It currently subtracts. There is a huge HI.md; ignore it except as project guide. Fix only add."
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+[final_oracle]
+command = '''python3 -c "import solution as s; assert s.add(2, 3) == 5"'''

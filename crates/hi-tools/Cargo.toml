@@ -1,0 +1,45 @@
+[package]
+name = "hi-tools"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+hi-ai.workspace = true
+hi-lsp.workspace = true
+hi-secrets.workspace = true
+hi-research.workspace = true
+hi-browser.workspace = true
+hi-codebase-graph = { workspace = true, optional = true }
+hi-hunk-tracker.workspace = true
+hi-tool-host.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+similar.workspace = true
+ignore.workspace = true
+regex.workspace = true
+sha2.workspace = true
+reflink-copy.workspace = true
+toml.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[features]
+# Tree-sitter symbol index used as an LSP-off fallback for definition/references.
+# Off by default so ordinary hi builds do not compile the grammars or libgit2.
+default = []
+codebase-graph = ["dep:hi-codebase-graph"]
+
+
+[lints.rust]
+# Real unsafe lives here (libc kill / MLX FFI bindings); see workspace root.
+unsafe_code = "allow"
+
+[dev-dependencies]
+tempfile.workspace = true
+axum.workspace = true

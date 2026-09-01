@@ -1,0 +1,7 @@
+[process]
+require_tools = ["edit"]
+[budget]
+max_tool_result_chars = 50000
+[run]
+steps = [3, 8]
+seed_tool_result_chars = 80000

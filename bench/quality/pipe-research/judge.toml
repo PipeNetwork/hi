@@ -1,0 +1,3 @@
+[process]
+require_first_tools = ["research"]
+forbid_tools = ["web_fetch", "web_download", "ask_user"]

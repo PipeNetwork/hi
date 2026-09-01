@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "outcome": {},
+  "telemetry": {
+    "verify_rounds": 0,
+    "tool_timeline": [{ "tool": "read", "path": "task.txt" }],
+    "requests": [{ "input_tokens_est": 500, "max_tool_result_chars": 20, "max_image_chars": 0, "elided_images": 0 }]
+  }
+}

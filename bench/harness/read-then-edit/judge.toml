@@ -1,0 +1,5 @@
+[process]
+require_tools = ["edit"]
+mutate_after_read = true
+[budget]
+max_tool_result_chars = 50000

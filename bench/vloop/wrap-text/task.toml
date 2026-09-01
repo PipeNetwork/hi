@@ -1,0 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "wrap-text"
+prompt = "Implement wrap(text, width) in solution.py returning a list of lines. Runs of whitespace collapse to single spaces. Words longer than width must be placed on their own line unbroken — never split or hyphenate. Lines must not have leading or trailing spaces. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.wrap(\"a extraordinarily b\", 5)==[\"a\", \"extraordinarily\", \"b\"], s.wrap(\"a extraordinarily b\", 5); assert s.wrap(\"one  two   three\", 8)==[\"one two\", \"three\"]"'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[((\"a extraordinarily b\",5),[\"a\",\"extraordinarily\",\"b\"]),((\"one  two   three\",8),[\"one two\",\"three\"]),((\"\",10),[]),((\"exact fit here\",5),[\"exact\",\"fit\",\"here\"]),((\"ab cd ef\",5),[\"ab cd\",\"ef\"]),((\"  padded  \",4),[\"padded\"]),((\"x\",1),[\"x\"])]; fails=[f\"wrap{a} -> {s.wrap(*a)!r} != {e!r}\" for a,e in cases if s.wrap(*a)!=e]; assert not fails, chr(10).join(fails)"'''

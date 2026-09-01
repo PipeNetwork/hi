@@ -1,0 +1,15 @@
+[package]
+name = "hi-gix-status"
+version.workspace = true
+edition.workspace = true
+description = "Shared gix status helpers: thread budget under RLIMIT_NPROC so produce-worker spawn cannot abort under panic=abort"
+
+[dependencies]
+gix.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints.rust]
+# Real unsafe lives here (getrlimit FFI for RLIMIT_NPROC probing); see workspace root.
+unsafe_code = "allow"

@@ -1,0 +1,327 @@
+//! Verifier-gated skill auto-curation — the ACE "evolving playbook" idea.
+//!
+//! After a turn PASSES verification, make one throwaway chat-only model call that
+//! inspects that turn's trajectory and — only if it contains a genuinely reusable,
+//! general technique — emits a `SKILL.md`, which we persist as a learned skill.
+//! The verifier is the gate, so a weak local model can't poison the playbook: a
+//! skill is only ever written for a turn the ground-truth check already accepted.
+//! The prompt biases hard toward silence, and a per-session cap bounds spam.
+
+use std::sync::Arc;
+
+use hi_ai::{ChatRequest, Content, Message, RequestProfile, Role, StreamEvent, ToolMode};
+
+use crate::Ui;
+use crate::compaction;
+use crate::skills::{self, skill_roots};
+use crate::transcript::repair_invalid_tool_call_arguments_in_messages;
+
+/// Cap on skills auto-curated per session, so a long run of verified turns can't
+/// flood `.hi/skills/` even if each one tempts a lesson.
+pub(crate) const MAX_AUTO_SKILLS_PER_SESSION: u32 = 3;
+
+/// Replay window (recent messages of the just-passed turn) handed to the curator.
+const CURATE_REPLAY_MAX: usize = 30;
+
+impl crate::Agent {
+    /// After a verified turn, distill any reusable technique into a learned skill.
+    ///
+    /// Best-effort: a provider/IO error is surfaced as a status, never fatal. The
+    /// caller gates on the success signal (`last_verify == Some(true)` + changed
+    /// files), `config.memory.curate_skills`, and the per-session cap; this method also
+    /// re-checks the cap defensively. Like [`update_memory`](Self::update_memory)
+    /// it builds a throwaway message vec and does NOT record into session history.
+    pub(crate) async fn curate_turn_end(&mut self, turn_start: usize, ui: &mut dyn Ui) {
+        if self.subagents.auto_skills_written >= MAX_AUTO_SKILLS_PER_SESSION {
+            return;
+        }
+        // Just this turn's trajectory (user prompt → tool calls → results), with
+        // bulky tool outputs elided — the curator needs the shape of what worked,
+        // not the verbatim command output.
+        let all = self.messages.as_slice();
+        if turn_start >= all.len() {
+            return;
+        }
+        let mut history: Vec<Message> = all[turn_start..]
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .cloned()
+            .collect();
+        let window_start = history.len().saturating_sub(CURATE_REPLAY_MAX);
+        if window_start > 0 {
+            history.drain(..window_start);
+        }
+        if history.is_empty() {
+            return;
+        }
+        let len = history.len();
+        compaction::elide_tool_outputs(&mut history, len);
+        flatten_tool_history_for_chat_only(&mut history);
+
+        let existing = skills::learned_skills_context().unwrap_or_default();
+
+        let mut messages = Vec::with_capacity(history.len() + 2);
+        messages.push(self.minimal_system_message());
+        messages.extend_from_slice(&history);
+        messages.push(Message::user(curate_prompt(&existing)));
+        repair_invalid_tool_call_arguments_in_messages(&mut messages);
+
+        let request = ChatRequest {
+            model: self.config.routing.model.clone(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: false,
+            canonical_objective: None,
+            messages: Arc::from(messages),
+            tools: Arc::new([]), // curating — no tool use
+            max_tokens: 512,     // a skill is short
+            temperature: self.config.routing.temperature,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: RequestProfile {
+                compat: self.config.routing.compat,
+                tool_mode: ToolMode::ChatOnly,
+                stream_usage: None,
+                deepseek_compat: self.config.routing.deepseek_compat,
+                deepseek_strict: None,
+                deepseek_thinking: None,
+                output_token_parameter: self.config.routing.output_token_parameter,
+            },
+        };
+
+        ui.status("curating skill…");
+        let mut out = String::new();
+        let mut sink = |event: StreamEvent| match event {
+            StreamEvent::Text(text) => out.push_str(&text),
+            StreamEvent::Status(text) => ui.status(&text),
+            StreamEvent::Warning(text) => ui.top_status(&text),
+            StreamEvent::Reasoning(_) => {}
+            StreamEvent::WireAudit(_) => {}
+        };
+        let completion = match self.provider.stream(request, &mut sink).await {
+            Ok(completion) => completion,
+            Err(err) => {
+                self.add_side_error_usage(&err);
+                ui.status(&format!("(couldn't curate skill: {err})"));
+                return;
+            }
+        };
+        self.add_side_usage(completion.usage);
+        let _ = self.persist();
+        if out.trim().is_empty() {
+            for c in &completion.content {
+                if let Content::Text(text) = c {
+                    out.push_str(text);
+                }
+            }
+        }
+
+        // Silence bias: the model emits nothing (or no valid frontmatter) when
+        // there's no general lesson — only persist a well-formed SKILL.md.
+        let Some(skill) = parse_skill_markdown(&out) else {
+            return;
+        };
+        // Automatic curation is derived from repository-controlled context and
+        // model output. Keep it inside this workspace even if that output asks
+        // for `scope: global`; silently writing a cross-project instruction is
+        // a durable prompt-poisoning boundary. Users can still promote a
+        // reviewed skill explicitly.
+        let mut roots = skill_roots();
+        roots.project = self.workspace_root().join(".hi/skills");
+        roots.agents = self.workspace_root().join(".agents/skills");
+        if skill.scope == "global" {
+            ui.status("(automatic skill requested global scope; kept project-local)");
+        }
+        match skills::write_skill(
+            &roots,
+            "project",
+            &skill.name,
+            &skill.description,
+            &skill.body,
+        ) {
+            Ok(Some(path)) => {
+                self.subagents.auto_skills_written += 1;
+                ui.status(&format!("✓ curated skill → {}", path.display()));
+            }
+            Ok(None) => {} // a skill by this name already exists
+            Err(err) => ui.status(&format!("(skill not saved: {err})")),
+        }
+    }
+}
+
+/// Curation is deliberately tool-free, but its replay window contains tool
+/// calls and results from the completed turn. Some OpenAI-compatible routes
+/// reject that protocol history when the current request advertises no tools.
+/// Preserve a compact textual trajectory while removing wire-level tool roles
+/// and blocks before dispatch.
+fn flatten_tool_history_for_chat_only(messages: &mut Vec<Message>) {
+    for message in messages.iter_mut() {
+        let mut flattened = Vec::with_capacity(message.content.len());
+        for content in std::mem::take(&mut message.content) {
+            match content {
+                Content::Text(text) => flattened.push(Content::Text(text)),
+                Content::ToolCall { name, .. } => {
+                    flattened.push(Content::Text(format!("[tool used: {name}]")));
+                }
+                Content::ToolResult { output, .. } => {
+                    flattened.push(Content::Text(format!("[tool result]\n{output}")));
+                }
+                Content::Thinking { .. } => {}
+                Content::Image { .. } => {
+                    flattened.push(Content::Text("[image omitted]".to_string()));
+                }
+            }
+        }
+        if message.role == Role::Tool {
+            message.role = Role::User;
+        }
+        message.content = flattened;
+    }
+    messages.retain(|message| !message.content.is_empty());
+}
+
+#[cfg(test)]
+mod chat_only_history_tests {
+    use super::*;
+
+    #[test]
+    fn tool_trajectory_is_flattened_without_protocol_blocks() {
+        let mut messages = vec![
+            Message::assistant(vec![Content::ToolCall {
+                id: "call-1".to_string(),
+                name: "bash".to_string(),
+                arguments: "{\"command\":\"cargo test\"}".to_string(),
+            }]),
+            Message::tool_result("call-1", "tests passed"),
+        ];
+
+        flatten_tool_history_for_chat_only(&mut messages);
+
+        assert!(messages.iter().all(|message| message.role != Role::Tool));
+        assert!(
+            messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .all(|content| !matches!(
+                    content,
+                    Content::ToolCall { .. } | Content::ToolResult { .. }
+                ))
+        );
+        let text = messages.iter().map(Message::text).collect::<String>();
+        assert!(text.contains("[tool used: bash]"));
+        assert!(text.contains("tests passed"));
+    }
+}
+
+struct ParsedSkill {
+    name: String,
+    description: String,
+    scope: String,
+    body: String,
+}
+
+/// Curation prompt. Heavily biased toward outputting nothing, so a routine turn
+/// with no transferable lesson doesn't produce a junk skill.
+fn curate_prompt(existing_index: &str) -> String {
+    let existing = if existing_index.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\nSkills already recorded (do NOT duplicate any of these):\n{existing_index}")
+    };
+    format!(
+        "The task above was just verified as correct by an automated check.\n\n\
+         If — and ONLY if — the trajectory contains a REUSABLE, GENERAL technique that would help on \
+         FUTURE, DIFFERENT tasks (not tied to this task's specific files, names, or values), record it \
+         as a learned skill. Most turns have no such lesson; in that case output NOTHING AT ALL.\n\n\
+         When there IS a genuine transferable technique, output exactly one SKILL.md and nothing else, \
+         in this exact format:\n\
+         ---\n\
+         name: <short Title Case name>\n\
+         description: <one sentence: when to use it>\n\
+         scope: project\n\
+         ---\n\
+         # <name>\n\n\
+         <a few lines: when to use it, the procedure, and how to verify>\n\n\
+         Rules: describe the transferable METHOD, never this specific task. Automatic curation is \
+         always project-scoped; never request `scope: global`. Keep the whole file under ~30 lines. If in any doubt, output \
+         nothing.{existing}"
+    )
+}
+
+/// Extract a `SKILL.md` (frontmatter + body) from model output that may have
+/// surrounding prose or a code fence. Returns `None` unless a `---`-delimited
+/// frontmatter block with a non-empty `name` is present (the silence path).
+fn parse_skill_markdown(text: &str) -> Option<ParsedSkill> {
+    let start = text.find("---")?;
+    let lines: Vec<&str> = text[start..].lines().collect();
+    if lines.first()?.trim() != "---" {
+        return None;
+    }
+    let (mut name, mut description, mut scope) = (None, None, "project".to_string());
+    let mut close = None;
+    for (i, line) in lines.iter().enumerate().skip(1) {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            close = Some(i);
+            break;
+        }
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let value = value.trim().trim_matches('"').trim_matches('\'').trim();
+            match key.trim() {
+                "name" if !value.is_empty() => name = Some(value.to_string()),
+                "description" if !value.is_empty() => description = Some(value.to_string()),
+                "scope" if !value.is_empty() => scope = value.to_string(),
+                _ => {}
+            }
+        }
+    }
+    let name = name?;
+    let close = close?;
+    let body = lines[close + 1..]
+        .join("\n")
+        .trim()
+        .trim_end_matches("```")
+        .trim()
+        .to_string();
+    Some(ParsedSkill {
+        name,
+        description: description.unwrap_or_default(),
+        scope,
+        body,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_skill_with_prose_and_fence() {
+        let out = "Sure, here is a reusable technique:\n\n\
+                   ```markdown\n\
+                   ---\n\
+                   name: Bisect A Flaky Test\n\
+                   description: Narrow a flaky test by bisecting recent commits.\n\
+                   scope: global\n\
+                   ---\n\
+                   # Bisect A Flaky Test\n\n\
+                   Run git bisect with the test as the check.\n\
+                   ```\n";
+        let skill = parse_skill_markdown(out).unwrap();
+        assert_eq!(skill.name, "Bisect A Flaky Test");
+        assert_eq!(skill.scope, "global");
+        assert!(skill.description.starts_with("Narrow a flaky test"));
+        assert!(skill.body.contains("git bisect"));
+        assert!(!skill.body.contains("```"));
+    }
+
+    #[test]
+    fn silence_when_no_frontmatter() {
+        assert!(parse_skill_markdown("").is_none());
+        assert!(parse_skill_markdown("No reusable lesson here.").is_none());
+        // A bare horizontal rule with no `name:` is not a skill.
+        assert!(parse_skill_markdown("---\njust text\n---").is_none());
+    }
+}

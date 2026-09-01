@@ -1,0 +1,28 @@
+[package]
+name = "hi-hunk-tracker"
+version.workspace = true
+edition.workspace = true
+description = "Track file hunks (diffs) with agent/external attribution"
+
+[dependencies]
+# External
+chrono.workspace = true
+dunce.workspace = true
+rustc-hash.workspace = true
+gix.workspace = true
+serde = { workspace = true, features = ["derive", "rc"] }
+hi-gix-status.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+hi-test-utils.workspace = true
+
+[lints]
+workspace = true

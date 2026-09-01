@@ -1,0 +1,11 @@
+[package]
+name = "hi-test-utils"
+version.workspace = true
+edition.workspace = true
+description = "Shared test utilities for hi crates"
+
+[dependencies]
+
+[lints.rust]
+# test-only env::set_var for hermetic git PATH manipulation
+unsafe_code = "allow"

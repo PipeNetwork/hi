@@ -1,0 +1,13 @@
+schema_version = 2
+name = "go-invoice-api"
+prompt = "Complete the Go invoice API refactor across invoice/model.go and invoice/total.go. LineItem must expose UnitCents int64 and Quantity int64. TotalCents(items []LineItem) returns the int64 sum of UnitCents*Quantity, treating negative quantities as zero. Remove the old floating-point Total API. Edit only invoice/**."
+allowed_changes = ["invoice/**"]
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "python3 .hi-eval-oracle/check.py"

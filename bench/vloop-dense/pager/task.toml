@@ -1,0 +1,23 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "pager"
+prompt = "Implement page(items, size, number) in solution.py: return the 1-based page `number` of `items` as a list. size must be a positive int or ValueError is raised. A page number past the end returns an empty list, but page numbers below 1 raise ValueError. The LAST page may be short. The input list must not be mutated, and the returned list must be a new list even when it equals the whole input. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.page([1,2,3,4,5],2,3)==[5], s.page([1,2,3,4,5],2,3); assert s.page([1,2],5,2)==[]; e=None
+try: s.page([1],2,0)
+except ValueError: e=\"ok\"
+assert e==\"ok\", \"page 0 must raise ValueError\""'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; assert s.page([1,2,3,4,5],2,3)==[5]; assert s.page([1,2],5,2)==[]; assert s.page([1,2,3],3,1)==[1,2,3]; src=[1,2,3]; out=s.page(src,3,1); out.append(9); assert src==[1,2,3], \"must return a new list\"; assert s.page([],1,1)==[]
+for size,num in [(0,1),(-1,1),(2,0),(2,-2)]:
+    try:
+        s.page([1],size,num)
+    except ValueError:
+        continue
+    raise AssertionError(f\"page(size={size}, number={num}) must raise ValueError\")"'''

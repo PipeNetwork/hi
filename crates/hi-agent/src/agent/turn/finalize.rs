@@ -1,0 +1,859 @@
+//! Post-turn finalize recap, usage/steer formatting, and text-tool cleanup.
+
+use std::sync::Arc;
+
+use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode, ToolSpec};
+
+use crate::heuristics::{
+    humanize_count, looks_mutating, parse_text_tool_calls, textcall_id_offset,
+};
+use crate::transcript::{
+    NudgeKind, PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER,
+    repair_invalid_tool_call_arguments_in_messages,
+};
+use crate::{FINALIZE_PROMPT, Ui, partial_text_tool_call_start};
+
+use super::helpers::rate_limit_summary;
+
+fn text_is_user_visible_answer(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty() && trimmed != PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER
+}
+
+pub(super) fn turn_has_visible_assistant_text(messages: &[Message], turn_start: usize) -> bool {
+    messages
+        .get(turn_start..)
+        .into_iter()
+        .flatten()
+        .any(|message| {
+            message.role == hi_ai::Role::Assistant
+                && message
+                    .content
+                    .iter()
+                    .any(|c| matches!(c, Content::Text(t) if text_is_user_visible_answer(t)))
+        })
+}
+
+impl crate::Agent {
+    /// Generate and display the user-facing closeout. Returns `true` only when
+    /// the provider supplied non-empty recap text.
+    pub(super) async fn finalize_turn(&mut self, turn_start: usize, ui: &mut dyn Ui) -> bool {
+        // Only send the current turn's messages (plus the system prompt for
+        // context), not the entire session history. The recap only needs to
+        // know what happened *this turn* — sending 40K tokens of old context
+        // to produce a 200-token summary is pure waste.
+        let Some(turn) = self.messages.as_slice().get(turn_start..) else {
+            // Transcript replacement paths should re-anchor `turn_start`, but
+            // finalization is a best-effort side call and must never crash a
+            // completed turn if a future compaction path forgets to do so.
+            return false;
+        };
+        let mut messages = Vec::with_capacity(turn.len() + 2);
+        messages.push(self.minimal_system_message());
+        messages.extend_from_slice(turn);
+        messages.push(Message::user(FINALIZE_PROMPT));
+        repair_invalid_tool_call_arguments_in_messages(&mut messages);
+
+        let request = ChatRequest {
+            model: self.config.routing.model.clone(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: false,
+            canonical_objective: None,
+            messages: Arc::from(messages),
+            tools: Arc::new([]), // recap only — no tool use
+            max_tokens: 2048,    // throwaway call — recaps can be detailed
+            temperature: self.config.routing.temperature,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: RequestProfile {
+                compat: self.config.routing.compat,
+                tool_mode: ToolMode::ChatOnly,
+                stream_usage: None,
+                deepseek_compat: self.config.routing.deepseek_compat,
+                deepseek_strict: None,
+                deepseek_thinking: None,
+                output_token_parameter: self.config.routing.output_token_parameter,
+            },
+        };
+
+        let mut recap = String::new();
+        let mut sink = |event: StreamEvent| match event {
+            StreamEvent::Text(text) => {
+                recap.push_str(&text);
+                ui.assistant_text(&text);
+            }
+            StreamEvent::Status(text) => ui.status(&text),
+            StreamEvent::Warning(text) => ui.top_status(&text),
+            StreamEvent::Reasoning(_) => {}
+            StreamEvent::WireAudit(_) => {}
+        };
+        let completion = match self.provider.stream(request, &mut sink).await {
+            Ok(completion) => completion,
+            Err(err) => {
+                // Finalize is a side call — book its error usage without resetting
+                // the main conversation's `context_used` gauge.
+                self.add_side_error_usage(&err);
+                self.emit_usage(ui);
+                // Flush any partially-streamed recap text before the status
+                // line, so it isn't left dangling in the UI's pending buffer.
+                ui.assistant_end();
+                ui.status(&format!("(couldn't generate the final summary: {err})"));
+                return false;
+            }
+        };
+
+        // Side call: spend counts, but its small request must not clobber the
+        // main conversation's context gauge (see add_side_usage).
+        self.add_side_usage(completion.usage);
+        self.emit_usage(ui);
+
+        // Fall back to the final content if the provider didn't stream text.
+        // Emit it through the UI before assistant_end so the user actually sees
+        // the recap — without this, a provider that returns text only in the
+        // completion object (not via stream deltas) would have its summary
+        // recorded in history but never displayed, so the turn appears to end
+        // without its closing message.
+        if recap.trim().is_empty() {
+            for c in &completion.content {
+                if let Content::Text(t) = c {
+                    recap.push_str(t);
+                    ui.assistant_text(t);
+                }
+            }
+        }
+        ui.assistant_end();
+
+        if recap.trim().is_empty() {
+            return false; // nothing to record
+        }
+        // Record both the synthetic request and the recap so roles alternate.
+        // The recap is a text-only assistant message (no tool calls).
+        self.messages
+            .push_nudge(NudgeKind::Finalize, FINALIZE_PROMPT);
+        self.messages.push_assistant(vec![Content::Text(recap)]);
+        true
+    }
+
+    /// Format the completed-turn usage marker with explicitly scoped metrics.
+    pub(crate) fn usage_summary(&self, usage: &hi_ai::Usage) -> String {
+        // User-facing prompt size first. The full request can include system,
+        // tool, and history context, so putting it first made a short question
+        // like "what's your name?" appear to be a 1.5k-token user prompt.
+        let mut summary = format!(
+            "[user prompt estimate {} · output across all model calls {}{}",
+            humanize_count(self.report.last_user_prompt_tokens),
+            if self.report.last_turn_usage.estimated {
+                "~"
+            } else {
+                ""
+            },
+            humanize_count(self.report.last_turn_usage.output_tokens),
+        );
+        if self.report.last_turn_usage.cache_read_tokens > 0 {
+            summary.push_str(&format!(
+                " ⟲{}",
+                humanize_count(self.report.last_turn_usage.cache_read_tokens)
+            ));
+        }
+        // The context gauge is the point-in-time full request size, which is
+        // the number providers generally bill as input and the number that
+        // drives context-window pressure.
+        if let Some(window) = self.config.routing.context_window
+            && window > 0
+        {
+            let pct = (self.report.context_used * 100 / u64::from(window)).min(100);
+            summary.push_str(&format!(
+                " · ctx {}{pct}% ({}/{})",
+                if self.report.last_turn_usage.estimated {
+                    "~"
+                } else {
+                    ""
+                },
+                humanize_count(self.report.context_used),
+                humanize_count(u64::from(window)),
+            ));
+        } else if self.report.context_used > 0 {
+            summary.push_str(&format!(
+                " · ctx {}{}",
+                if self.report.last_turn_usage.estimated {
+                    "~"
+                } else {
+                    ""
+                },
+                humanize_count(self.report.context_used)
+            ));
+        }
+        if let Some(limits) = usage.rate_limits.and_then(rate_limit_summary) {
+            summary.push_str(&format!(" · {limits}"));
+        }
+        // Per-turn trajectory: a terse "steer" suffix when the turn needed
+        // more than one shot, so a noisy success reads differently from a clean
+        // one. Clean turns (no verify rounds, no recovery retries, no nudges,
+        // no stalls) add nothing. See `TurnTelemetry`.
+        if let Some(steer) = self.turn_steer() {
+            summary.push_str(&format!(" · {steer}"));
+        }
+        summary.push(']');
+        summary
+    }
+
+    /// A terse per-turn steering summary for the usage line, or `None` when the
+    /// turn was clean (no extra rounds of any kind, no stall). Format:
+    /// `steer: 2 verify · 1 retry · stalled` — components omitted when zero.
+    pub(crate) fn turn_steer(&self) -> Option<String> {
+        let t = &self.report.last_turn_telemetry;
+        let mut parts: Vec<String> = Vec::new();
+        if t.verify_rounds > 0 {
+            parts.push(format!("{} verify", t.verify_rounds));
+        }
+        if t.recovery_retries > 0 {
+            parts.push(format!("{} retry", t.recovery_retries));
+        }
+        if t.repeat_nudges > 0 {
+            parts.push(format!("{} repeat", t.repeat_nudges));
+        }
+        if t.continue_nudges > 0 {
+            parts.push(format!("{} continue", t.continue_nudges));
+        }
+        if t.quality_repair_nudges > 0 {
+            parts.push(format!("{} review-repair", t.quality_repair_nudges));
+        }
+        if t.truncation_retries > 0 {
+            parts.push(format!("{} trunc", t.truncation_retries));
+        }
+        if t.stalled_unfinished || t.stalled_repeating {
+            parts.push("stalled".to_string());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(format!("steer: {}", parts.join(" · ")))
+        }
+    }
+
+    pub(crate) fn request_tools_for(&self, mode: ToolMode) -> Arc<[ToolSpec]> {
+        match mode {
+            ToolMode::ChatOnly => Arc::new([]),
+            // `explore` isn't classified read-only (that keeps a read-only *child*
+            // from ever seeing it), but delegating a read-only investigation is
+            // itself read-only — so a top-level agent keeps `explore` in a
+            // read-only/review turn. A subagent never has it in `self.tools`.
+            ToolMode::ReadOnly => self
+                .tools
+                .iter()
+                .filter(|tool| {
+                    hi_tools::is_read_only(&tool.name)
+                        || (tool.name == "explore" && !self.config.subagents.is_subagent)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
+            ToolMode::Auto | ToolMode::Required => self.tools.clone(),
+        }
+    }
+
+    pub(super) fn tools_unavailable_for(&self, input: &str) -> bool {
+        matches!(
+            self.config.routing.tool_mode,
+            ToolMode::ChatOnly | ToolMode::ReadOnly
+        ) && looks_mutating(input)
+    }
+
+    /// Clean text-embedded tool-call JSON from `Content::Text` blocks in
+    /// `content`. Used on the truncation path (before `parse_text_tool_calls`
+    /// would normally run) so raw tool-call JSON doesn't leak into recorded
+    /// history. Complete tool calls are extracted and stripped; partial JSON
+    /// stays as text. `ToolCall` blocks are left in place — the caller
+    /// (`push_assistant_text_only`) strips them.
+    pub(super) fn clean_text_tool_calls_from_content(&self, content: &mut Vec<Content>) -> bool {
+        let mut new_content = Vec::new();
+        let mut saw_partial_tool_call = false;
+        for c in content.drain(..) {
+            match c {
+                Content::Text(t) => {
+                    let parsed = parse_text_tool_calls(&t, textcall_id_offset(&self.messages));
+                    if parsed.iter().any(|p| matches!(p, Content::ToolCall { .. })) {
+                        // Tool calls found — keep only the Text blocks (drop
+                        // the extracted ToolCalls; they're partial/truncated
+                        // and have no matching results).
+                        new_content.extend(
+                            parsed.into_iter().filter(|p| {
+                                matches!(p, Content::Text(_) | Content::Thinking { .. })
+                            }),
+                        );
+                    } else if let Some(index) = partial_text_tool_call_start(&t) {
+                        let prose = t[..index].trim_end();
+                        if !prose.is_empty() {
+                            new_content.push(Content::Text(prose.to_string()));
+                        }
+                        saw_partial_tool_call = true;
+                    } else {
+                        new_content.push(Content::Text(t));
+                    }
+                }
+                Content::ToolCall { .. } => saw_partial_tool_call = true,
+                other => new_content.push(other),
+            }
+        }
+        *content = new_content;
+        saw_partial_tool_call
+    }
+}
+
+/// Pure classification of the public turn outcome from settled turn state.
+/// Extracted from `run_turn` so status/stop-reason rules can be unit-tested
+/// without driving the full loop.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the classifier deliberately receives the complete settled turn state"
+)]
+pub(super) fn classify_turn_outcome(
+    verification_infrastructure_error: bool,
+    verification_unstable: bool,
+    last_verify: Option<bool>,
+    changed_files: &[String],
+    turn_had_mutation: bool,
+    no_check_executed: bool,
+    independent_review_status: crate::ReviewStatus,
+    skeptic_last_status: Option<crate::SkepticStatus>,
+    ended_at_cap: bool,
+    ended_at_deadline: bool,
+    stalled_unfinished: bool,
+    stalled_repeating: bool,
+    allow_unverified: bool,
+) -> (
+    crate::TurnStatus,
+    crate::VerificationStatus,
+    crate::ReviewStatus,
+    crate::TurnStopReason,
+) {
+    use super::helpers::combined_review_status;
+    use crate::verify::is_prose_only_path;
+    use crate::{ReviewStatus, TurnStatus, TurnStopReason, VerificationStatus};
+
+    // `no_check_executed` covers disabled verify, empty auto pipeline, and
+    // prose-only turns: there were no applicable checks. `Unverified` is for
+    // "checks should have settled but did not" (see call-site comment in loop_).
+    //
+    // Deliberately NOT escalated to `Unverified` for code no stage exercised.
+    // The obligation nudge (see `obligation::NoExecutableCheck`) asks the model
+    // to run such code itself, but a model-run bash command is not a
+    // verification *stage* — `verification_executions` stays empty either way.
+    // Classifying that as Unverified would be unsatisfiable: even a model that
+    // complied and showed passing output would still report Incomplete, in
+    // every repo without a detected pipeline. Evidence the model produced is
+    // surfaced through the nudge and transcript, not by reclassifying the turn.
+    let verification = if verification_infrastructure_error {
+        VerificationStatus::InfrastructureError
+    } else if last_verify == Some(true) {
+        VerificationStatus::Passed
+    } else if last_verify == Some(false) {
+        VerificationStatus::Failed
+    } else if (changed_files.is_empty() && !turn_had_mutation)
+        || no_check_executed
+        || (!changed_files.is_empty() && changed_files.iter().all(|path| is_prose_only_path(path)))
+    {
+        VerificationStatus::NotApplicable
+    } else {
+        VerificationStatus::Unverified
+    };
+    let skeptic_review = match skeptic_last_status {
+        Some(crate::SkepticStatus::Approved) => ReviewStatus::Passed,
+        Some(crate::SkepticStatus::Objected) => ReviewStatus::Objected,
+        // Escalated = intentional skip/scar, not a defect objection.
+        Some(crate::SkepticStatus::Escalated) => ReviewStatus::Escalated,
+        Some(crate::SkepticStatus::Unavailable) => ReviewStatus::Unavailable,
+        None => ReviewStatus::NotRequired,
+    };
+    let review = combined_review_status(independent_review_status, skeptic_review);
+    // A stall is only ever declared by the mid-loop repair machinery (the
+    // no-change/quality cascades and obligation nudges set the stall flags
+    // after actually challenging the model and exhausting their budgets).
+    // The lexical `expected_mutation` guess alone must never brand a
+    // finished tool-using answer "incomplete · stalled" here: for a
+    // discussion prompt misread as a mutation request, that overrules the
+    // model's informed judgment with weaker information.
+    //
+    // Review Escalated does not Incomplete the turn: the goal path already
+    // skipped the step with a scar and continues the run.
+    // A review objection only turns the turn Incomplete when deterministic
+    // verification actually FAILED. With green checks (Passed) the reviewer is
+    // a weaker signal than the evidence it disputes, and with NotApplicable
+    // (prose-only or no-check changes) there is no deterministic evidence to
+    // overrule either — so an objection that survives its repair budget
+    // completes the turn with the objection recorded as a scar (status
+    // ReviewObjected on a Completed turn), mirroring the Escalated rule below.
+    // Observed: a reviewer hallucinated version "0" from "0.1.0" and stalled a
+    // turn whose tests all passed; a reviewer also stalled a prose-only turn
+    // where no checks could run at all.
+    let objection_overrides = review == ReviewStatus::Objected
+        && !matches!(
+            verification,
+            VerificationStatus::Passed | VerificationStatus::NotApplicable
+        );
+    // Running out of wall clock does not by itself make the work incomplete:
+    // a turn that finished and verified with seconds to spare is Completed.
+    // It only reports Incomplete through the same conditions as any other
+    // turn (unverified mutation, failed checks, exhausted repair), with the
+    // stop reason recording *why* it stopped early.
+    // A deterministic pass is authoritative only when the turn left a real
+    // project change. A no-change turn that exhausted its steering budget or
+    // never produced a user-facing answer is still incomplete: green baseline
+    // checks cannot prove that the requested action happened.
+    let stalled = stalled_unfinished || stalled_repeating;
+    let status = if verification_infrastructure_error {
+        TurnStatus::Failed
+    } else if verification == VerificationStatus::Passed && (!stalled || !changed_files.is_empty())
+    {
+        TurnStatus::Completed
+    } else if ended_at_cap
+        || stalled
+        || verification == VerificationStatus::Failed
+        || objection_overrides
+        || (verification == VerificationStatus::Unverified && !allow_unverified)
+    {
+        TurnStatus::Incomplete
+    } else {
+        TurnStatus::Completed
+    };
+    let stop_reason = if verification_infrastructure_error {
+        TurnStopReason::InfrastructureFailure
+    } else if verification_unstable {
+        TurnStopReason::VerificationUnstable
+    } else if ended_at_cap {
+        TurnStopReason::StepLimit
+    } else if ended_at_deadline {
+        TurnStopReason::TimeLimit
+    } else if review == ReviewStatus::Objected {
+        TurnStopReason::ReviewObjected
+    } else if verification == VerificationStatus::Failed {
+        TurnStopReason::VerificationFailed
+    } else if stalled_unfinished || stalled_repeating {
+        TurnStopReason::Stalled
+    } else if verification == VerificationStatus::Unverified {
+        TurnStopReason::VerificationUnavailable
+    } else if verification == VerificationStatus::NotApplicable {
+        TurnStopReason::NoApplicableVerification
+    } else if review == ReviewStatus::Escalated {
+        TurnStopReason::ReviewEscalated
+    } else {
+        TurnStopReason::Completed
+    };
+    (status, verification, review, stop_reason)
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::classify_turn_outcome;
+    use crate::{ReviewStatus, TurnStatus, TurnStopReason, VerificationStatus};
+
+    #[test]
+    fn completed_when_verify_passed() {
+        let (status, verification, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::Passed);
+        assert_eq!(review, ReviewStatus::NotRequired);
+        assert_eq!(stop, TurnStopReason::Completed);
+    }
+
+    #[test]
+    fn unchallenged_no_change_turn_completes() {
+        // A finished answer with no file changes and no exhausted repair
+        // cascade (no stall flags) completes — the stall verdict belongs to
+        // the mid-loop challenge machinery, never to prompt classification.
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &[],
+            false,
+            true,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::NotApplicable);
+        assert_eq!(stop, TurnStopReason::NoApplicableVerification);
+    }
+
+    #[test]
+    fn exhausted_challenge_stalls() {
+        let (status, _, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &[],
+            false,
+            true,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(stop, TurnStopReason::Stalled);
+    }
+
+    #[test]
+    fn incomplete_when_unverified_and_not_allowed() {
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(verification, VerificationStatus::Unverified);
+        assert_eq!(stop, TurnStopReason::VerificationUnavailable);
+    }
+
+    #[test]
+    fn prose_only_is_not_applicable() {
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["README.md".into()],
+            true,
+            true,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::NotApplicable);
+        assert_eq!(stop, TurnStopReason::NoApplicableVerification);
+    }
+
+    #[test]
+    fn mutation_with_no_check_executed_is_not_applicable() {
+        // Empty/disabled pipeline: no stages ran → NotApplicable, not Unverified.
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["src/lib.rs".into()],
+            true,
+            true, // no_check_executed
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::NotApplicable);
+        assert_eq!(stop, TurnStopReason::NoApplicableVerification);
+    }
+
+    /// Completion-review transport failure is soft: green verify + IR Unavailable
+    /// still completes. Goal skeptic Unavailable is fail-closed at goal advance;
+    /// when folded into the public outcome it remains visible but does not alone
+    /// mark the turn Incomplete (only Objected does).
+    #[test]
+    fn independent_review_unavailable_still_completes() {
+        let (status, verification, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::Unavailable,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::Passed);
+        assert_eq!(review, ReviewStatus::Unavailable);
+        assert_eq!(stop, TurnStopReason::Completed);
+    }
+
+    #[test]
+    fn deterministic_pass_overrules_a_steering_stall() {
+        // The model can hit a repeat/no-progress guard after making the edit,
+        // while the final workspace verifier still proves the settled tree is
+        // green. That is a successful turn with diagnostic stall telemetry,
+        // not an incomplete mutation.
+        let (status, verification, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::Unavailable,
+            None,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::Passed);
+        assert_eq!(review, ReviewStatus::Unavailable);
+        assert_eq!(stop, TurnStopReason::Stalled);
+    }
+
+    #[test]
+    fn baseline_pass_cannot_complete_a_stalled_no_change_turn() {
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &[],
+            true,
+            false,
+            ReviewStatus::Unavailable,
+            None,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(verification, VerificationStatus::Passed);
+        assert_eq!(stop, TurnStopReason::Stalled);
+    }
+
+    #[test]
+    fn goal_skeptic_unavailable_is_visible_without_incompleting() {
+        let (status, _, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            Some(crate::SkepticStatus::Unavailable),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(review, ReviewStatus::Unavailable);
+        assert_eq!(stop, TurnStopReason::Completed);
+    }
+
+    #[test]
+    fn goal_skeptic_escalated_completes_with_scar() {
+        // Goal Escalated skips the step with a scar; public turn Completes so
+        // callers do not treat an intentional skip as a failed repair.
+        let (status, _, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            Some(crate::SkepticStatus::Escalated),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(review, ReviewStatus::Escalated);
+        assert_eq!(stop, TurnStopReason::ReviewEscalated);
+    }
+
+    #[test]
+    fn verified_turn_completes_with_objection_scar() {
+        // Deterministic verification passed; the reviewer still objects after
+        // its repair budget. The verified evidence wins: the turn completes
+        // and the objection rides along as a scar, instead of a reviewer
+        // false-positive stalling a passing task (observed: "0.1.0" misread
+        // as version "0" marked a reward-1 benchmark task incomplete).
+        let (status, _, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::Objected,
+            Some(crate::SkepticStatus::Approved),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(review, ReviewStatus::Objected);
+        assert_eq!(stop, TurnStopReason::ReviewObjected);
+    }
+
+    #[test]
+    fn deadline_reports_time_limit_without_inventing_incompleteness() {
+        // Work finished and verified with the budget nearly spent: the turn is
+        // Completed, and TimeLimit records only that it stopped starting new
+        // work. A deadline must not manufacture a failure.
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::Passed);
+        assert_eq!(stop, TurnStopReason::TimeLimit);
+    }
+
+    #[test]
+    fn deadline_with_unverified_mutation_is_incomplete() {
+        // Ran out of time mid-work: the mutation never got green checks, so
+        // the turn is Incomplete — and TimeLimit says why it stopped.
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(verification, VerificationStatus::Unverified);
+        assert_eq!(stop, TurnStopReason::TimeLimit);
+    }
+
+    #[test]
+    fn step_limit_outranks_deadline_when_both_fire() {
+        let (_, _, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            None,
+            true,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(stop, TurnStopReason::StepLimit);
+    }
+
+    #[test]
+    fn objection_without_green_verification_keeps_teeth() {
+        // No deterministic pass to outrank the reviewer — an exhausted
+        // objection still marks the turn Incomplete.
+        let (status, _, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::Objected,
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(review, ReviewStatus::Objected);
+        assert_eq!(stop, TurnStopReason::ReviewObjected);
+    }
+
+    #[test]
+    fn objection_with_not_applicable_verification_completes() {
+        // No deterministic checks ran (e.g. prose-only or no detected pipeline),
+        // so verification is NotApplicable. A reviewer objection that survives
+        // its repair budget should not stall the turn — there is no deterministic
+        // evidence to overrule the reviewer, but also none to corroborate it.
+        // The objection rides along as a scar on a Completed turn, mirroring the
+        // green-checks rule. Observed: a reviewer stalled a prose-only turn
+        // where no checks could run at all.
+        let (status, _, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["README.md".into()],
+            true,
+            true, // no_check_executed → NotApplicable
+            ReviewStatus::Objected,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(review, ReviewStatus::Objected);
+        assert_eq!(stop, TurnStopReason::ReviewObjected);
+    }
+}

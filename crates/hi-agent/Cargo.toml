@@ -1,0 +1,37 @@
+[package]
+name = "hi-agent"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+hi-observability.workspace = true
+hi-events.workspace = true
+hi-policy.workspace = true
+hi-ai.workspace = true
+hi-tools.workspace = true
+hi-lsp.workspace = true
+hi-secrets.workspace = true
+hi-hooks.workspace = true
+hi-agent-lifecycle.workspace = true
+anyhow.workspace = true
+async-trait = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+tokio = { workspace = true }
+uuid.workspace = true
+ignore.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tempfile.workspace = true
+
+[features]
+default = []
+codebase-graph = ["hi-tools/codebase-graph"]
+
+
+[lints.rust]
+# Test-only unsafe: env set_var/remove_var guards in test helpers.
+unsafe_code = "allow"

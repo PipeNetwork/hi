@@ -1,0 +1,60 @@
+# Living first-tool quality matrix. Status is the product backlog for routing,
+# not a second copy of judge.toml. CI checks every quality task has a row and
+# every row has a task. First-tool / forbid lists live in each judge.toml.
+schema_version = 1
+
+[[row]]
+id = "local-discovery"
+category = "local_search"
+coverage = "tape_and_live"
+baseline = "passing"
+notes = "Locked tapes grep. Catalog-trial first-tooled bash ls (one-trial variance)."
+
+[[row]]
+id = "inspect-before-ask"
+category = "ask_user_misuse"
+coverage = "tape_and_live"
+baseline = "passing"
+notes = "Live first tool bash pwd && ls. Judge allows bash after that trial."
+
+[[row]]
+id = "github-handle-not-needed"
+category = "ask_user_misuse"
+coverage = "tape_and_live"
+baseline = "passing"
+notes = "Context-only is a win. Needs git identity origin from init_git."
+
+[[row]]
+id = "changelog-local-first"
+category = "github_routing"
+coverage = "tape_and_live"
+baseline = "passing"
+notes = "Live first tool bash ls. Unique changelog token."
+
+[[row]]
+id = "git-history-local"
+category = "local_search"
+coverage = "tape_and_live"
+baseline = "passing"
+notes = "Live first tool bash git log. Subject from init_git."
+
+[[row]]
+id = "known-url-web-fetch"
+category = "provider_search_misuse"
+coverage = "tape_and_live"
+baseline = "passing"
+notes = "After targeted-mutation kept web_fetch (and dropped bash), live first tool was web_fetch then write. Do not lock a new 7-row process_pass_rate from a 2-task retry."
+
+[[row]]
+id = "broad-web-search"
+category = "provider_search_misuse"
+coverage = "tape_and_live"
+baseline = "passing"
+notes = "After targeted-mutation kept web_search, live first tool was web_search then write. Passed without HI_WEB_SEARCH_API_KEY on grok-4.3."
+
+[[row]]
+id = "pipe-research"
+category = "provider_search_misuse"
+coverage = "tape_and_live"
+baseline = "passing"
+notes = "First-class research tool over guessed web_fetch. Cheap SERP stays web_search; this row requires research()."

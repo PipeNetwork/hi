@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "outcome": {},
+  "telemetry": {
+    "verify_rounds": 1,
+    "tool_timeline": [
+      {"tool": "read", "path": "a.rs"},
+      {"tool": "edit", "path": "a.rs"}
+    ],
+    "requests": [{
+      "input_tokens_est": 1200,
+      "max_tool_result_chars": 400,
+      "max_image_chars": 40,
+      "elided_images": 1
+    }]
+  }
+}

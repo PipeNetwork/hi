@@ -1,0 +1,16 @@
+[package]
+name = "hi-routing"
+edition.workspace = true
+version.workspace = true
+description = "Capability-aware model and harness routing contracts for hi"
+
+[dependencies]
+hi-ai.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"

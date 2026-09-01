@@ -1,0 +1,13 @@
+{
+  "result": { "task_id": "task_1" },
+  "contract": {
+    "result": { "format": "git_patch" },
+    "verifiers": [
+      {
+        "type": "json_schema",
+        "required": true,
+        "schema": { "type": "object", "required": ["ok"] }
+      }
+    ]
+  }
+}

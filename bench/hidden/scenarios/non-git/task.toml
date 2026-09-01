@@ -1,0 +1,16 @@
+schema_version = 2
+name = "non-git-workspace"
+prompt = "Implement rotate_left(values, amount) in solution.py. Return a new list, support negative/oversized amounts by modulo length, and return [] for empty input. This workspace intentionally has no Git repository. Edit only solution.py."
+allowed_changes = ["solution.py"]
+
+[workspace]
+kind = "non_git"
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"

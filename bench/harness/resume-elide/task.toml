@@ -1,0 +1,10 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "resume-elide"
+prompt = "solution.py defines add(a, b) and should return a + b. It currently subtracts. Fix add. After resume, old tool results must stay elided."
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+[final_oracle]
+command = '''python3 -c "import solution as s; assert s.add(2, 3) == 5"'''
