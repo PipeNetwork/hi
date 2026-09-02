@@ -779,6 +779,35 @@ async fn empty_completion_error_is_resampled_too() {
 }
 
 #[tokio::test]
+async fn reasoning_route_empty_completion_gets_output_headroom_retry() {
+    let mut cfg = config();
+    cfg.routing.model = "pipe/glm-5.3-flash".into();
+    cfg.routing.requested_max_tokens = 768;
+    cfg.routing.max_tokens = 768;
+    cfg.routing.max_tokens_explicit = true;
+    let steps = vec![
+        ProviderStep::Completion(completion(vec![], 8, 8)),
+        ProviderStep::Completion(completion(
+            vec![Content::Text("recovered with headroom".into())],
+            12,
+            4,
+        )),
+    ];
+    let (mut agent, _requests, max_tokens) = scripted_agent_recording_max_tokens(steps, cfg);
+
+    agent.run_turn("say hi", &mut NullUi).await.unwrap();
+
+    let max_tokens = max_tokens.lock().unwrap();
+    assert_eq!(max_tokens[0], 768);
+    assert_eq!(
+        max_tokens[1],
+        hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS,
+        "reasoning-only Pipe output must get one larger recovery budget"
+    );
+    assert!(max_tokens.len() >= 2);
+}
+
+#[tokio::test]
 async fn keep_working_recovers_after_empty_retry_budget() {
     let mut cfg = config();
     cfg.loop_limits.max_empty_retries = 1;

@@ -375,14 +375,20 @@ pub fn effective_coding_agent_max_tokens(
 }
 
 pub fn is_pipenetwork_coding_route(model: &str) -> bool {
-    matches!(
-        model,
-        "ipop/coder-balanced"
-            | "pipe/auto-coder"
-            | "pipe/deepseek-v4-flash-vision-exp"
-            | "pipe/deepseek-v4-flash-0731"
-            | "pipe/deepseek-v4-flash"
-    )
+    let model = model.trim().to_ascii_lowercase();
+    model == "ipop/coder-balanced"
+        || model == "pipe/auto-coder"
+        // Keep the explicit legacy aliases accepted by the API while also
+        // recognizing canonical Pipe reasoning checkpoints. Bounded review
+        // recovery must not send a 768-token request to a model that can
+        // spend the entire budget on hidden reasoning.
+        || model == "pipe/deepseek-v4-flash-vision-exp"
+        || model == "pipe/deepseek-v4-flash-0731"
+        || model == "pipe/deepseek-v4-flash"
+        || model.starts_with("pipe/glm-5.3")
+        || model.starts_with("pipe/kimi-k3")
+        || model.starts_with("pipe/deepseek-v4")
+        || model.starts_with("pipe/qwen3.8")
 }
 
 impl ServedModel {
@@ -733,6 +739,20 @@ mod tests {
             effective_coding_agent_max_tokens("pipe/deepseek-v4-flash", 2048, false, None),
             CODING_AGENT_MIN_OUTPUT_TOKENS
         );
+    }
+
+    #[test]
+    fn canonical_pipenetwork_reasoning_models_are_coding_routes() {
+        for model in [
+            "pipe/glm-5.3",
+            "pipe/glm-5.3-flash",
+            "pipe/kimi-k3",
+            "pipe/deepseek-v4-pro",
+            "pipe/qwen3.8-max",
+        ] {
+            assert!(is_pipenetwork_coding_route(model), "{model}");
+        }
+        assert!(!is_pipenetwork_coding_route("pipe/gpt-5.5"));
     }
 
     #[test]

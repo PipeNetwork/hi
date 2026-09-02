@@ -112,6 +112,7 @@ impl crate::Agent {
             StreamEvent::Warning(text) => ui.top_status(&text),
         };
         let protocol_retry_nudge = tool_protocol_retry_nudge(&request.tools);
+        let pipenetwork_coding_route = hi_ai::is_pipenetwork_coding_route(&request.model);
         let provider_result = self.provider.stream(request, &mut sink).await;
         match provider_result {
             Ok(completion) => {
@@ -411,6 +412,19 @@ impl crate::Agent {
                     provider_error_kind(&err),
                     Some(ProviderErrorKind::MalformedStream | ProviderErrorKind::EmptyCompletion)
                 );
+                if provider_error_kind(&err) == Some(ProviderErrorKind::EmptyCompletion)
+                    && !retry_state.empty_completion_headroom_retry_attempted
+                    && pipenetwork_coding_route
+                    && request_max_tokens < hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS
+                {
+                    retry_state.empty_completion_headroom_retry_attempted = true;
+                    retry_state.record_recovery_attempt();
+                    *request_max_tokens_override = Some(hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS);
+                    ui.nudge(
+                        "⚠ the reasoning model returned no visible answer; retrying with more output headroom",
+                    );
+                    return Ok(ProviderStreamResult::Continue);
+                }
                 if empty_or_malformed && *empty_retries < self.config.loop_limits.max_empty_retries
                 {
                     *empty_retries += 1;

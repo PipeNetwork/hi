@@ -170,7 +170,18 @@ impl crate::Agent {
             force_tools_next = false;
             let current_max_tokens = request_max_tokens_override
                 .unwrap_or(self.config.routing.max_tokens);
-            request_max_tokens_override = Some(current_max_tokens.min(BOUNDED_REVIEW_FINAL_MAX_TOKENS));
+            // A small cap is useful for ordinary reviews, but it is unsafe for
+            // Pipe's reasoning models: hidden reasoning can consume all 768
+            // tokens and leave no visible answer. Give those routes one
+            // bounded, reasoning-safe final round. The retry remains bounded
+            // by the existing single forced-answer attempt and turn limits.
+            let final_max_tokens = if hi_ai::is_pipenetwork_coding_route(&self.config.routing.model)
+            {
+                current_max_tokens.max(hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS)
+            } else {
+                current_max_tokens.min(BOUNDED_REVIEW_FINAL_MAX_TOKENS)
+            };
+            request_max_tokens_override = Some(final_max_tokens);
             ui.nudge(if bounded_exact_review {
                 "bounded exact-file review gathered first-pass evidence; requesting the final answer"
             } else {
@@ -1445,6 +1456,20 @@ If the task is already complete, stop and give your final recap."
                 &assistant_text,
                 self.goals.plan_incomplete() && !background_status_answer,
             ) && !(background_status_answer && has_text);
+            if unusable
+                && !has_text
+                && !retry_state.empty_completion_headroom_retry_attempted
+                && hi_ai::is_pipenetwork_coding_route(&self.config.routing.model)
+                && request_max_tokens < hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS
+            {
+                retry_state.empty_completion_headroom_retry_attempted = true;
+                retry_state.record_recovery_attempt();
+                request_max_tokens_override = Some(hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS);
+                ui.status(
+                    "⚠ the reasoning model returned no visible final answer; retrying with more output headroom",
+                );
+                return Ok(ModelRoundControl::Continue);
+            }
             if has_text && (buffer_read_only_review_text || !streamed_assistant_text) {
                 let text_to_emit = if buffered_assistant_text.is_empty() {
                     assistant_text.as_str()
@@ -1501,6 +1526,18 @@ If the task is already complete, stop and give your final recap."
         // dead round isn't recorded, so each retry re-runs with the
         // original context.
         if calls.is_empty() && !has_text {
+            if !retry_state.empty_completion_headroom_retry_attempted
+                && hi_ai::is_pipenetwork_coding_route(&self.config.routing.model)
+                && request_max_tokens < hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS
+            {
+                retry_state.empty_completion_headroom_retry_attempted = true;
+                retry_state.record_recovery_attempt();
+                request_max_tokens_override = Some(hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS);
+                ui.status(
+                    "⚠ the reasoning model returned no visible answer; retrying with more output headroom",
+                );
+                return Ok(ModelRoundControl::Continue);
+            }
             if empty_retries < self.config.loop_limits.max_empty_retries {
                 empty_retries += 1;
                 if made_tool_call {

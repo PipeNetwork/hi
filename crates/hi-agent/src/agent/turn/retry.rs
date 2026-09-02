@@ -173,6 +173,10 @@ pub(super) struct TurnRetryState {
     pub(super) request_too_large_compacted: bool,
     pub(super) request_too_large_retried: bool,
     pub(super) output_cap_retry_attempted: bool,
+    /// A single retry that raises an undersized budget after a reasoning-only
+    /// completion. Keep this separate from the normal empty-response budget so
+    /// a transient provider response cannot turn into an unbounded retry loop.
+    pub(super) empty_completion_headroom_retry_attempted: bool,
     /// One shared retry budget for quota rate limits, route outages, and
     /// transport failures. The routed API already exhausts its compatible
     /// provider ladder, so separate budgets multiply one logical turn into a
@@ -214,6 +218,7 @@ impl TurnRetryState {
         self.request_id = None;
         self.request_attempt = 0;
         self.output_cap_retry_attempted = false;
+        self.empty_completion_headroom_retry_attempted = false;
         self.provider_route_retries = 0;
         self.capacity_retries = 0;
     }

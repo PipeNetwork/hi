@@ -20,10 +20,6 @@ struct FileState {
     digest: String,
     len: u64,
     mode: u32,
-    /// Used only to skip re-hashing unchanged files during reconcile. Not part
-    /// of content equality — a touch that preserves bytes must not look like a
-    /// mutation once the digest is reused.
-    mtime_ns: u64,
 }
 
 impl PartialEq for FileState {
@@ -82,7 +78,7 @@ impl BackgroundScan {
         let join = std::thread::Builder::new()
             .name("hi-ledger-scan".into())
             .spawn(move || {
-                let scanned = scan_workspace(&scan_root, &scan_excluded, &scan_explicit, None);
+                let scanned = scan_workspace(&scan_root, &scan_excluded, &scan_explicit);
                 // Swallow a poisoned mutex rather than panicking the scan
                 // thread: if the lock is poisoned the result is already lost,
                 // and a panic here would be silently dropped by JoinHandle
@@ -114,7 +110,7 @@ impl ChangeLedger {
             .into_iter()
             .collect::<Vec<_>>();
         let explicit_paths = BTreeSet::new();
-        let observed = scan_workspace(&root, &excluded_roots, &explicit_paths, None)?;
+        let observed = scan_workspace(&root, &excluded_roots, &explicit_paths)?;
         Ok(Self {
             root,
             excluded_roots,
@@ -341,7 +337,7 @@ impl ChangeLedger {
             let mut current = self.observed.clone();
             for relative in paths.iter().map(|path| normalize(path)) {
                 let absolute = self.root.join(&relative);
-                match read_state(&absolute, self.observed.get(&relative))? {
+                match read_state(&absolute)? {
                     Some(state) => {
                         current.insert(relative, state);
                     }
@@ -352,12 +348,7 @@ impl ChangeLedger {
             }
             current
         } else {
-            scan_workspace(
-                &self.root,
-                &self.excluded_roots,
-                &self.explicit_paths,
-                Some(&self.observed),
-            )?
+            scan_workspace(&self.root, &self.excluded_roots, &self.explicit_paths)?
         };
         let changes = diff_states(&self.observed, &current);
         self.observed = current;
@@ -408,7 +399,7 @@ impl ChangeLedger {
             let path = self.root.join(relative);
             // Tool-mediated paths always re-hash: the typed mutation is the
             // correctness boundary and must not reuse a stale fingerprint.
-            match read_state(&path, None)? {
+            match read_state(&path)? {
                 Some(state) => {
                     self.observed.insert(normalize(relative), state);
                 }
@@ -500,7 +491,6 @@ fn scan_workspace(
     root: &Path,
     excluded_roots: &[PathBuf],
     explicit_paths: &BTreeSet<String>,
-    previous: Option<&BTreeMap<String, FileState>>,
 ) -> Result<BTreeMap<String, FileState>> {
     let mut states = BTreeMap::new();
     let filter_root = root.to_path_buf();
@@ -562,8 +552,7 @@ fn scan_workspace(
         if metadata.is_file() && metadata.len() > MAX_AUTOMATIC_FILE_BYTES {
             continue;
         }
-        let prior = previous.and_then(|map| map.get(&relative));
-        if let Some(state) = read_state(path, prior)? {
+        if let Some(state) = read_state(path)? {
             states.insert(relative, state);
         }
     }
@@ -575,8 +564,7 @@ fn scan_workspace(
             continue;
         }
         let path = root.join(relative);
-        let prior = previous.and_then(|map| map.get(relative));
-        if let Some(state) = read_state(&path, prior)? {
+        if let Some(state) = read_state(&path)? {
             states.insert(relative.clone(), state);
         } else {
             states.remove(relative);
@@ -585,7 +573,7 @@ fn scan_workspace(
     Ok(states)
 }
 
-fn read_state(path: &Path, previous: Option<&FileState>) -> Result<Option<FileState>> {
+fn read_state(path: &Path) -> Result<Option<FileState>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -594,7 +582,6 @@ fn read_state(path: &Path, previous: Option<&FileState>) -> Result<Option<FileSt
         }
     };
     let mode = file_mode(&metadata);
-    let mtime_ns = mtime_as_ns(&metadata);
     if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(path)
             .with_context(|| format!("reading symlink {}", path.display()))?;
@@ -603,28 +590,22 @@ fn read_state(path: &Path, previous: Option<&FileState>) -> Result<Option<FileSt
             digest: format!("symlink:sha256:{:x}", Sha256::digest(&bytes)),
             len: bytes.len() as u64,
             mode,
-            mtime_ns,
         }));
     }
     if !metadata.is_file() {
         return Ok(None);
     }
     let len = metadata.len();
-    // Cheap fingerprint: reuse the prior digest when len/mode/mtime match so
-    // reconcile does not re-read and re-hash every unchanged source file.
-    if let Some(prev) = previous
-        && prev.len == len
-        && prev.mode == mode
-        && prev.mtime_ns == mtime_ns
-    {
-        return Ok(Some(prev.clone()));
-    }
+    // Do not reuse a previous digest based only on metadata. Filesystems can
+    // coalesce mtime/ctime updates for rapid same-size writes (for example,
+    // two `fs::write` calls in one process), which would make verification
+    // miss a real mutation. The ledger is a correctness boundary, so hash
+    // every file that is within the automatic scan limit.
     if len > MAX_AUTOMATIC_FILE_BYTES {
         return Ok(Some(FileState {
             digest: format!("oversized:{len}"),
             len,
             mode,
-            mtime_ns,
         }));
     }
     let (digest, hashed_len) = hash_file_streaming(path)?;
@@ -632,7 +613,6 @@ fn read_state(path: &Path, previous: Option<&FileState>) -> Result<Option<FileSt
         digest,
         len: hashed_len,
         mode,
-        mtime_ns,
     }))
 }
 
@@ -654,15 +634,6 @@ fn hash_file_streaming(path: &Path) -> Result<(String, u64)> {
         hashed_len += n as u64;
     }
     Ok((format!("sha256:{:x}", hasher.finalize()), hashed_len))
-}
-
-fn mtime_as_ns(metadata: &std::fs::Metadata) -> u64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 #[cfg(unix)]
@@ -987,7 +958,7 @@ mod tests {
         let generated = root.join("target/generated.txt");
         std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
         std::fs::write(&generated, "generated\n").unwrap();
-        let after = read_state(&generated, None).unwrap().unwrap();
+        let after = read_state(&generated).unwrap().unwrap();
         ledger
             .record_tool_effects(&ToolEffects {
                 mutation_attempted: true,

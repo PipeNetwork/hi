@@ -607,6 +607,9 @@ pub fn user_facing_status(text: &str) -> Option<String> {
         }
         return Some("⚠ no response yet; retrying".to_string());
     }
+    if candidate.starts_with("⚠ the reasoning model returned no visible") {
+        return Some("⚠ no visible answer yet; retrying with more output headroom".to_string());
+    }
     if candidate.starts_with("⚠ tool call interrupted by user") {
         return Some("⚠ tool call interrupted".to_string());
     }
@@ -1671,6 +1674,12 @@ mod tests {
         assert_eq!(
             user_facing_status("⚠ the model returned no response after retrying — try /retry."),
             Some("⚠ no response after retries".to_string())
+        );
+        assert_eq!(
+            user_facing_status(
+                "⚠ the reasoning model returned no visible answer; retrying with more output headroom"
+            ),
+            Some("⚠ no visible answer yet; retrying with more output headroom".to_string())
         );
     }
 
