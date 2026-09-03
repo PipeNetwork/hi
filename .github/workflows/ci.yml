@@ -98,6 +98,7 @@ jobs:
     timeout-minutes: 15
     env:
       HI_PIPE_WRAP: ${{ github.workspace }}/target/pipe-wrap/x86_64-unknown-linux-gnu/pipe-wrap
+      HI_BIN: /usr/local/bin/hi-smoke-candidate
     steps:
       - uses: actions/checkout@v5
       - name: Install Linux build dependencies
@@ -115,6 +116,12 @@ jobs:
 
       - name: Build TUI smoke binaries
         run: cargo build -p hi -p hi-smoke --no-default-features
+
+      # The hosted runner workspace can be an overlay mount that is absent
+      # after pipe-wrap creates its private root. Stage the exact candidate on
+      # the ordinary system root that the sandbox capability probe exercises.
+      - name: Stage TUI candidate outside the runner workspace mount
+        run: sudo install -m 0755 target/debug/hi "$HI_BIN"
 
       - name: Validate TUI smoke scenarios
         run: target/debug/hi-smoke validate bench/tui-smoke

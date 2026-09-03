@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 60
     env:
       HI_PIPE_WRAP: ${{ github.workspace }}/target/pipe-wrap/x86_64-unknown-linux-gnu/pipe-wrap
+      HI_BIN: /usr/local/bin/hi-smoke-candidate
     steps:
       - uses: actions/checkout@v5
       - name: Install Linux build dependencies
@@ -37,6 +38,9 @@ jobs:
 
       - name: Build release TUI smoke binaries
         run: cargo build --release -p hi -p hi-smoke --no-default-features
+
+      - name: Stage TUI candidate outside the runner workspace mount
+        run: sudo install -m 0755 target/release/hi "$HI_BIN"
 
       - name: Validate TUI smoke scenarios
         run: target/release/hi-smoke validate bench/tui-smoke
@@ -65,6 +69,7 @@ jobs:
     timeout-minutes: 60
     env:
       HI_PIPE_WRAP: ${{ github.workspace }}/target/pipe-wrap/x86_64-unknown-linux-gnu/pipe-wrap
+      HI_BIN: /usr/local/bin/hi-smoke-candidate
     steps:
       - uses: actions/checkout@v5
       - name: Install Linux build dependencies
@@ -82,6 +87,9 @@ jobs:
 
       - name: Build release TUI smoke binaries
         run: cargo build --release -p hi -p hi-smoke --no-default-features
+
+      - name: Stage TUI candidate outside the runner workspace mount
+        run: sudo install -m 0755 target/release/hi "$HI_BIN"
 
       - name: Validate TUI smoke scenarios
         run: target/release/hi-smoke validate bench/tui-smoke

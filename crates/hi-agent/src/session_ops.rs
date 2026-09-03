@@ -955,8 +955,8 @@ async fn run_hook_process(
         let input = input.as_bytes().to_vec();
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt as _;
-            stdin.write_all(&input).await?;
-            stdin.shutdown().await
+            tolerate_closed_hook_stdin(stdin.write_all(&input).await)?;
+            tolerate_closed_hook_stdin(stdin.shutdown().await)
         })
     });
     let stdout = child.stdout.take().context("hook stdout was not piped")?;
@@ -1047,6 +1047,17 @@ async fn run_hook_process(
 
 const MAX_HOOK_OUTPUT_BYTES: usize = 1024 * 1024;
 const HOOK_PIPE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn tolerate_closed_hook_stdin(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        // Hooks are allowed to ignore their input. A short-lived hook can
+        // close fd 0 before the asynchronous writer is scheduled, so EPIPE is
+        // successful delivery of the lifecycle boundary rather than a hook
+        // execution failure.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
 
 async fn read_hook_output(
     mut reader: impl tokio::io::AsyncRead + Unpin,
@@ -1738,6 +1749,19 @@ mod tests {
             hook_timeout_from_value(Some("17")),
             Some(std::time::Duration::from_secs(17))
         );
+    }
+
+    #[test]
+    fn closed_hook_stdin_is_benign_but_other_write_errors_are_not() {
+        assert!(
+            tolerate_closed_hook_stdin(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+                .is_ok()
+        );
+        let error = tolerate_closed_hook_stdin(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[cfg(unix)]
