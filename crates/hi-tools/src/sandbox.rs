@@ -147,6 +147,9 @@ pub struct SandboxConfig {
     /// Skip broad host-temp allowances. Hermetic embedded runners can place
     /// one private temp directory beneath an explicit writable root instead.
     pub deny_host_temp: bool,
+    /// Omit pipe-wrap's parent-death signal when an embedding supervisor owns
+    /// the complete process group and performs its own bounded cleanup.
+    pub supervisor_owns_lifetime: bool,
 }
 
 /// A resolved sandbox profile bound to a set of writable roots. Cheap to clone.
@@ -563,10 +566,11 @@ fn pipe_wrap_arguments_with_protected_roots(
     program: &OsStr,
     program_args: &[OsString],
 ) -> Vec<OsString> {
-    let mut args = vec![
-        OsString::from("--die-with-parent"),
-        OsString::from("--unshare-all"),
-    ];
+    let mut args = Vec::new();
+    if !config.supervisor_owns_lifetime {
+        args.push(OsString::from("--die-with-parent"));
+    }
+    args.push(OsString::from("--unshare-all"));
     if policy == SandboxPolicy::Workspace {
         // Workspace mode keeps network access for package managers, web tools,
         // and normal coding workflows while isolating the other namespaces.
@@ -641,7 +645,7 @@ fn pipe_wrap_arguments_with_protected_roots(
 
 #[cfg(any(test, target_os = "linux"))]
 fn push_flag_path(args: &mut Vec<OsString>, flag: &str, source: &Path, target: &Path) {
-    if source.exists() && target.parent().is_some_and(Path::exists) {
+    if source.exists() && (target == Path::new("/") || target.parent().is_some_and(Path::exists)) {
         args.push(OsString::from(flag));
         args.push(source.as_os_str().to_os_string());
         args.push(target.as_os_str().to_os_string());
@@ -1478,6 +1482,27 @@ mod tests {
                 "read-only overlay must follow and override the broad bind"
             );
         }
+    }
+
+    #[test]
+    fn workspace_mount_plan_includes_the_readonly_host_root() {
+        let args = pipe_wrap_arguments_with_protected_roots(
+            SandboxPolicy::Workspace,
+            &SandboxConfig::default(),
+            &[],
+            &[],
+            OsStr::new("true"),
+            &[],
+        );
+
+        assert!(
+            args.windows(3).any(|window| {
+                window[0] == OsStr::new("--ro-bind")
+                    && window[1] == OsStr::new("/")
+                    && window[2] == OsStr::new("/")
+            }),
+            "workspace sandbox must carry the host runtime and ELF interpreter: {args:?}"
+        );
     }
 
     #[test]

@@ -6,6 +6,8 @@ use std::path::{Component, Path};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
+pub(crate) const STAGED_CANDIDATE_DIR: &str = ".hi-smoke-candidate";
+
 /// A content-addressed view of the harness-owned isolation tree. The active
 /// workspace is deliberately omitted: it already has dedicated patch/listing
 /// evidence, while this snapshot protects every writable sibling made
@@ -163,7 +165,7 @@ fn collect(
         // Workspace mutations have their own binary patch and final listing.
         // Omitting the subtree also keeps this hard-invariant scan bounded for
         // scenarios that build large fixtures.
-        if portable == "workspace" {
+        if portable == "workspace" || portable == STAGED_CANDIDATE_DIR {
             continue;
         }
 

@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 
 use crate::cli::RunMode;
 use crate::discovery::{self, DiscoveredScenario};
-use crate::isolation::{IsolationEvidence, IsolationPolicy, IsolationSnapshot};
+use crate::isolation::{
+    IsolationEvidence, IsolationPolicy, IsolationSnapshot, STAGED_CANDIDATE_DIR,
+};
 use crate::live_route::LiveRoute;
 use crate::pty::{PtyProcess, RawTerminal, SpawnSpec, collect_marked_processes};
 use crate::scenario::{
@@ -523,13 +525,19 @@ impl CaseRuntime {
         initialize_git(&workspace, scenario.workspace.git)?;
         initialize_git(&initial_workspace, scenario.workspace.git)?;
         write_session_seed(&session_path, &scenario)?;
-        let outer_sandbox = match options.sandbox_requirement {
-            SandboxRequirement::Enforced => smoke_sandbox_profile(root, &options.hi_bin)?,
-            #[cfg(test)]
-            SandboxRequirement::UnitTestUnenforced => {
-                hi_tools::sandbox::SandboxProfile::new(hi_tools::sandbox::SandboxPolicy::Off, &[])
+        let (outer_sandbox, hi_bin) = match options.sandbox_requirement {
+            SandboxRequirement::Enforced => {
+                let hi_bin = stage_sandbox_candidate(root, &options.hi_bin)?;
+                (smoke_sandbox_profile(root, &hi_bin)?, hi_bin)
             }
+            #[cfg(test)]
+            SandboxRequirement::UnitTestUnenforced => (
+                hi_tools::sandbox::SandboxProfile::new(hi_tools::sandbox::SandboxPolicy::Off, &[]),
+                options.hi_bin.clone(),
+            ),
         };
+        let mut options = options.clone();
+        options.hi_bin = hi_bin;
         let isolation_baseline =
             crate::isolation::capture(root).context("capturing pre-run isolation evidence")?;
 
@@ -549,7 +557,7 @@ impl CaseRuntime {
         };
         Ok(Self {
             scenario,
-            options: options.clone(),
+            options,
             isolation: Some(isolation),
             workspace,
             initial_workspace,
@@ -2691,15 +2699,56 @@ fn extend_scenario_env_with_credential(
 }
 
 fn smoke_sandbox_config(hi_bin: &Path) -> hi_tools::sandbox::SandboxConfig {
+    let candidate_dir = hi_bin
+        .parent()
+        .expect("staged TUI candidate always has a parent directory");
     hi_tools::sandbox::SandboxConfig {
-        // Mount the candidate explicitly and read-only after the broad root
-        // bind. CI workspaces can be separate/overlay mounts which are not
-        // reliably carried through a recursive bind of `/`; without this
-        // late bind the kernel reports ENOENT when pipe-wrap tries to exec it.
-        deny_write: vec![hi_bin.to_path_buf()],
+        // Overlay the whole staging directory read-only after the broad
+        // isolation-root bind. Directory binds are preserved across
+        // pipe-wrap's private-root setup, unlike a file-level bind to a
+        // candidate on some hosted-runner mounts.
+        deny_write: vec![candidate_dir.to_path_buf()],
         deny_host_temp: true,
+        // The smoke harness retains the PTY process group, discovers escaped
+        // descendants by a run marker, and performs TERM/KILL cleanup. A
+        // parent-death signal instead ties pipe-wrap to portable-pty's short
+        // launcher lifetime and can kill a healthy sandbox after exec.
+        supervisor_owns_lifetime: true,
         ..hi_tools::sandbox::SandboxConfig::default()
     }
+}
+
+fn stage_sandbox_candidate(isolation_root: &Path, source: &Path) -> Result<PathBuf> {
+    ensure!(
+        source.is_file(),
+        "TUI smoke candidate is not a file: {}",
+        source.display()
+    );
+    let candidate_dir = isolation_root.join(STAGED_CANDIDATE_DIR);
+    fs::create_dir(&candidate_dir).with_context(|| {
+        format!(
+            "creating staged TUI candidate directory {}",
+            candidate_dir.display()
+        )
+    })?;
+    let file_name = source
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("TUI smoke candidate path has no file name")?;
+    let staged = candidate_dir.join(file_name);
+    reflink_copy::reflink_or_copy(source, &staged).with_context(|| {
+        format!(
+            "staging TUI candidate {} at {}",
+            source.display(),
+            staged.display()
+        )
+    })?;
+    let permissions = fs::metadata(source)
+        .with_context(|| format!("reading TUI candidate metadata {}", source.display()))?
+        .permissions();
+    fs::set_permissions(&staged, permissions)
+        .with_context(|| format!("setting TUI candidate permissions {}", staged.display()))?;
+    Ok(staged)
 }
 
 fn smoke_sandbox_profile(
@@ -3346,12 +3395,92 @@ mod tests {
     }
 
     #[test]
-    fn smoke_sandbox_rebinds_the_candidate_binary_read_only() {
-        let hi_bin = Path::new("/operator/target/debug/hi");
+    fn smoke_sandbox_rebinds_the_candidate_directory_read_only() {
+        let hi_bin = Path::new("/isolation/.hi-smoke-candidate/hi");
         let config = smoke_sandbox_config(hi_bin);
 
-        assert_eq!(config.deny_write, [hi_bin]);
+        assert_eq!(
+            config.deny_write,
+            [Path::new("/isolation/.hi-smoke-candidate")]
+        );
         assert!(config.deny_host_temp);
+        assert!(config.supervisor_owns_lifetime);
+    }
+
+    #[test]
+    fn sandbox_candidate_is_staged_inside_the_isolation_root() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let isolation = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("candidate-hi");
+        fs::write(&source, b"candidate-bytes").unwrap();
+        let mut permissions = fs::metadata(&source).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&source, permissions).unwrap();
+
+        let staged = stage_sandbox_candidate(isolation.path(), &source).unwrap();
+
+        assert_eq!(
+            staged,
+            isolation
+                .path()
+                .join(STAGED_CANDIDATE_DIR)
+                .join("candidate-hi")
+        );
+        assert_eq!(fs::read(&staged).unwrap(), b"candidate-bytes");
+        assert!(fs::metadata(&staged).unwrap().permissions().readonly());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_staged_candidate_child() {
+        if std::env::var_os("HI_SMOKE_STAGED_CANDIDATE_CHILD").is_some() {
+            let candidate_dir = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let error = fs::write(candidate_dir.join("write-probe"), b"must fail")
+                .expect_err("staged candidate directory must be mounted read-only");
+            assert!(
+                matches!(error.raw_os_error(), Some(libc::EROFS) | Some(libc::EACCES)),
+                "unexpected candidate-directory write error: {error}"
+            );
+            println!("staged-candidate-executed-readonly");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a working operator-provided pipe-wrap sandbox"]
+    fn sandbox_staged_candidate_executes_inside_enforced_sandbox() {
+        let isolation = tempfile::tempdir().unwrap();
+        let source = std::env::current_exe().unwrap();
+        let staged = stage_sandbox_candidate(isolation.path(), &source).unwrap();
+        let profile = smoke_sandbox_profile(isolation.path(), &staged).unwrap();
+        let (program, args) = profile.wrap_program_in(
+            staged.as_os_str(),
+            [
+                "--exact",
+                "runner::tests::sandbox_staged_candidate_child",
+                "--nocapture",
+            ],
+            isolation.path(),
+        );
+        let output = std::process::Command::new(program)
+            .args(args)
+            .env("HI_SMOKE_STAGED_CANDIDATE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "status: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("staged-candidate-executed-readonly")
+        );
     }
 
     #[cfg(unix)]

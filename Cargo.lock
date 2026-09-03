@@ -4314,6 +4314,7 @@ dependencies = [
  "hi-tools",
  "libc",
  "portable-pty",
+ "reflink-copy",
  "serde",
  "serde_json",
  "sha2 0.10.9",
