@@ -1238,7 +1238,10 @@ fn reset_stream(stream: &TcpStream) {
             std::mem::size_of_val(&linger) as libc::socklen_t,
         );
     }
-    let _ = stream.shutdown(Shutdown::Both);
+    // Do not call `shutdown` here. An orderly shutdown queues FIN before the
+    // descriptor is closed, which turns the intended reset into a successful
+    // EOF on Linux. The stream is dropped immediately after this returns; with
+    // zero-linger set, that close emits the required RST.
 }
 
 #[cfg(not(unix))]
