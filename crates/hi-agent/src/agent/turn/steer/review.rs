@@ -9,7 +9,7 @@ use hi_ai::Content;
 
 use crate::steering::{
     EvidenceTracker, ImplementationIntent, ImplementationTracker, ReviewIntent,
-    repair_nudge_with_required_next, summarize_inspected_evidence_nudge,
+    repair_nudge_with_required_next,
 };
 use crate::transcript::NudgeKind;
 use crate::{GOAL_CONTINUE_NUDGE, PLAN_CONTINUE_NUDGE, Ui};
@@ -107,80 +107,7 @@ impl crate::Agent {
             ui.status("background work continues; ending the turn with the status report");
             return Ok(RoundControl::BreakInner(false));
         }
-        if let Some(intent) = read_only_intent
-            && plan_incomplete
-        {
-            if evidence.inspection_sprawl_nudges > 0 {
-                let sprawl_mode = crate::steering::AnswerRepairMode::SprawlForceAnswer;
-                if review_repair.has_budget(sprawl_mode, &budgets) {
-                    assert!(
-                        review_repair.spend(sprawl_mode, evidence, &budgets),
-                        "sprawl force-answer spend must succeed after has_budget"
-                    );
-                    *continue_total_nudges += 1;
-                    *force_text_answer_next = true;
-                    ui.nudge(
-                "review tried to continue inspecting after the sprawl limit; forcing a bounded answer from existing evidence",
-            );
-                    self.messages
-                        .push_assistant(std::mem::take(completion_content));
-                    self.messages.push_assistant_repair_note(sprawl_mode);
-                    self.messages.push_nudge(
-                        NudgeKind::Continue,
-                        crate::steering::repair_nudge_with_required_next(
-                            sprawl_mode,
-                            summarize_inspected_evidence_nudge(intent, evidence),
-                        ),
-                    );
-                    return Ok(RoundControl::Continue);
-                }
-
-                // Budget spent: accept a non-empty forced answer instead of stalling.
-                if !assistant_text.trim().is_empty() && !plan_incomplete {
-                    let _ = review_repair.exhausted(sprawl_mode);
-                    let _ = intent;
-                    ui.status(
-                        "review sprawl force-answer budget spent; accepting the bounded answer",
-                    );
-                    // Fall through to normal emit/accept path below.
-                } else if !assistant_text.trim().is_empty() {
-                    // Still looks unfinished, but we have text — emit and end cleanly.
-                    let _ = review_repair.exhausted(sprawl_mode);
-                    let _ = intent;
-                    if buffer_read_only_review_text {
-                        let text_to_emit = if buffered_assistant_text.is_empty() {
-                            assistant_text
-                        } else {
-                            buffered_assistant_text
-                        };
-                        self.emit_assistant_text(ui, text_to_emit);
-                        ui.assistant_end();
-                    }
-                    self.messages
-                        .push_assistant(std::mem::take(completion_content));
-                    progress_tracker.no_progress_streak = 0;
-                    progress_tracker.last_no_progress_reason.clear();
-                    progress_tracker.record_final_answer();
-                    ui.status("review sprawl force-answer budget spent; accepting the last answer");
-                    return Ok(RoundControl::BreakInner(false));
-                } else {
-                    if self.try_no_progress_recovery(
-                        progress_tracker,
-                        force_tools_next,
-                        Some(continue_total_nudges),
-                        ui,
-                    ) {
-                        self.messages
-                            .push_assistant(std::mem::take(completion_content));
-                        return Ok(RoundControl::Continue);
-                    }
-                    let reason = review_repair.exhausted(sprawl_mode);
-                    progress_tracker.record(ProgressKind::None, reason, None);
-                    let _ = intent;
-                    return Ok(RoundControl::BreakInner(false));
-                }
-            }
-
+        if read_only_intent.is_some() && plan_incomplete {
             if *silent_continues < self.config.loop_limits.max_silent_continues {
                 self.messages
                     .push_assistant(std::mem::take(completion_content));

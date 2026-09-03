@@ -3,9 +3,9 @@
 //! and tracker types from [`types`](super::types).
 
 use super::constants::{
-    GAP_DEEPEN_NUDGE, IMPLEMENTATION_MISSING_VALIDATION_NUDGE, MAX_INSPECTION_SPRAWL_NUDGES,
-    NO_EVIDENCE_GAP_NUDGE, NO_EVIDENCE_REVIEW_NUDGE, NO_EVIDENCE_SECURITY_NUDGE,
-    NO_EVIDENCE_STATUS_NUDGE, REVIEW_DEEPEN_NUDGE, SECURITY_DEEPEN_NUDGE, STATUS_DEEPEN_NUDGE,
+    GAP_DEEPEN_NUDGE, IMPLEMENTATION_MISSING_VALIDATION_NUDGE, NO_EVIDENCE_GAP_NUDGE,
+    NO_EVIDENCE_REVIEW_NUDGE, NO_EVIDENCE_SECURITY_NUDGE, NO_EVIDENCE_STATUS_NUDGE,
+    REVIEW_DEEPEN_NUDGE, SECURITY_DEEPEN_NUDGE, STATUS_DEEPEN_NUDGE,
     TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE,
 };
 use super::intent::contains_any;
@@ -704,87 +704,6 @@ pub(crate) fn read_only_blocks_tool(intent: Option<ReviewIntent>, name: &str) ->
     // but it only ever launches a read-only subagent — so it's allowed to run in a
     // review turn. A subagent is never advertised `explore`, so it can't reach here.
     intent.is_some() && !hi_tools::is_read_only(name) && name != "explore"
-}
-
-pub(crate) fn inspection_sprawl_nudge(cap: u32, used: u32) -> String {
-    format!(
-        "You have reached the read-only inspection cap for this turn ({used}/{cap} file reads/searches). The results are in the conversation above. Stop inspecting now and answer from the evidence you have already gathered. Produce bounded findings tied to concrete inspected files and include a Limits section. Do not read or search more files."
-    )
-}
-
-pub(crate) fn inspection_round_cap_nudge(rounds: u32) -> String {
-    format!(
-        "You have used {rounds} consecutive inspection-only model rounds. The results are already in the conversation above. Stop inspecting now and answer from that evidence. Do not issue more read/grep/list/glob/repo_map/find_symbol/explore calls."
-    )
-}
-
-/// Whether the inspection-sprawl guard should fire this round. True when:
-/// - this is a read-only review turn (`intent.is_some()`), or the turn is not
-///   an expected-mutation implementation (open-ended inspect loops),
-/// - the user supplied an explicit inspection cap and the turn reached it,
-/// - every call this round is a read-only inspection (the model is still
-///   gathering, not answering), and
-/// - the sprawl nudge budget is not yet exhausted.
-///
-/// Distinct new evidence is intentionally not capped by default. Repeated and
-/// no-new-evidence inspection loops are handled by the cycle guard instead.
-///
-/// `repo_map` / `explore` / `find_symbol` count as inspection for both the
-/// file cap (1:1) and the all-inspection round check.
-pub(crate) fn should_nudge_inspection_sprawl(
-    intent: Option<ReviewIntent>,
-    bound_open_ended_inspection: bool,
-    evidence: &EvidenceTracker,
-    calls: &[(String, String, String)],
-    active_inspection_cap: Option<u32>,
-) -> bool {
-    if intent.is_none() && !bound_open_ended_inspection {
-        return false;
-    }
-    if !round_is_read_only_inspection(calls) {
-        return false;
-    }
-    if !inspection_budget_exhausted(evidence, active_inspection_cap) {
-        return false;
-    }
-    evidence.inspection_sprawl_nudges < MAX_INSPECTION_SPRAWL_NUDGES
-}
-
-/// Whether the inspection-sprawl guard has exhausted its budget and the turn
-/// should settle with the evidence already gathered. True on a bounded
-/// inspection turn that is still sprawling (all calls read-only inspections)
-/// after the sprawl nudge budget is spent.
-pub(crate) fn inspection_sprawl_exhausted(
-    intent: Option<ReviewIntent>,
-    bound_open_ended_inspection: bool,
-    evidence: &EvidenceTracker,
-    calls: &[(String, String, String)],
-    active_inspection_cap: Option<u32>,
-) -> bool {
-    if intent.is_none() && !bound_open_ended_inspection {
-        return false;
-    }
-    if !inspection_budget_exhausted(evidence, active_inspection_cap) {
-        return false;
-    }
-    if evidence.inspection_sprawl_nudges < MAX_INSPECTION_SPRAWL_NUDGES {
-        return false;
-    }
-    round_is_read_only_inspection(calls)
-}
-
-pub(crate) fn round_is_read_only_inspection(calls: &[(String, String, String)]) -> bool {
-    !calls.is_empty()
-        && calls
-            .iter()
-            .all(|(_, name, _)| super::types::is_read_only_inspection_tool(name))
-}
-
-pub(crate) fn inspection_budget_exhausted(
-    evidence: &EvidenceTracker,
-    active_inspection_cap: Option<u32>,
-) -> bool {
-    active_inspection_cap.is_some_and(|cap| evidence.inspection_attempt_count() >= cap)
 }
 
 pub(crate) fn read_only_blocked_tool_result(name: &str) -> String {

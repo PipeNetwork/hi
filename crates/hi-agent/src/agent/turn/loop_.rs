@@ -22,7 +22,7 @@ use crate::domain::VerifyEvidence;
 use crate::heuristics::{looks_like_continue, looks_like_new_task, tool_mode_label};
 use crate::steering::{
     EvidenceTracker, IMPLEMENTATION_EMPTY_TUI_NUDGE, ImplementationIntent, ImplementationTracker,
-    MutationRecovery, ReviewIntent, classify_implementation_intent, classify_read_only_intent,
+    MutationRecovery, classify_implementation_intent, classify_read_only_intent,
     implementation_mentions_tui, implementation_turn_prompt, implicit_read_only_review_intent,
     is_bounded_file_review, preflight_is_redundant_for_prompt, read_only_turn_prompt,
 };
@@ -248,26 +248,6 @@ impl crate::Agent {
             && !tool_free_response
             && read_only_intent.is_none()
             && task_contract.wants_tests;
-        // Keep the legacy read-only classifier responsible for review prompt
-        // shaping. A plain repository question can still have a read-only task
-        // contract, and an `explore` child is structurally read-only even when its
-        // wording is ambiguous. Apply the sprawl limit to either structural case
-        // without imposing the rigid review response format.
-        //
-        // Do **not** require `repository_context_enabled`. Live "review we have
-        // some kinda issues : models endpoint returned 403" was ReadOnly (leading
-        // review verb) but matched no repository-context marker, so sprawl never
-        // armed and the turn ran 45+ sequential RSI model rounds.
-        let structural_read_only_inspection = !tool_free_response
-            && (task_contract.intent == TaskIntent::ReadOnly || structurally_read_only_subagent);
-        let inspection_sprawl_intent = if planning_turn {
-            None
-        } else {
-            read_only_intent
-                .or_else(|| structural_read_only_inspection.then_some(ReviewIntent::Review))
-        };
-        let read_only_inspection_cap = inspection_sprawl_intent
-            .and_then(|intent| crate::steering::read_only_inspection_cap(&context_task, intent));
         let turn_input = if planning_turn {
             crate::plan_mode_prompt(&context_task)
         } else if let Some(intent) = read_only_intent {
@@ -574,7 +554,6 @@ impl crate::Agent {
                 .run_read_only_preflight(
                     intent,
                     &context_task,
-                    read_only_inspection_cap.unwrap_or(u32::MAX),
                     ui,
                     &mut evidence,
                     &mut tool_timeline,
@@ -662,8 +641,6 @@ impl crate::Agent {
             implementation_intent,
             expected_mutation,
             requested_validation,
-            inspection_sprawl_intent,
-            read_only_inspection_cap,
             turn_input: input.to_string(),
             turn_checkpoint_allowed,
             turn_checkpoint_created,

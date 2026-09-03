@@ -635,7 +635,7 @@ impl Transcript {
 
     /// Record an assistant message whose tool calls cannot be represented
     /// (truncation: the calls are partial/malformed and were never executed;
-    /// inspection sprawl / unusable forced finals: the round is discarded).
+    /// repeated inspection / unusable forced finals: the round is discarded).
     /// The `ToolCall` blocks are stripped from the recorded content so the
     /// transcript never carries `tool_use` blocks without matching
     /// `tool_result`s. Text and thinking blocks are kept.

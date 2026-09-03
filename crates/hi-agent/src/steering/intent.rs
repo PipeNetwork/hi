@@ -244,8 +244,8 @@ pub(crate) fn classify_read_only_intent(input: &str) -> Option<ReviewIntent> {
 /// intentionally conservative because it is also used to distinguish an
 /// explicit "do not edit" constraint from an implementation request.  That
 /// made a plain `review codebase` inconsistent, though: tool admission removed
-/// mutation tools while prompt steering, preflight, and review caps were not
-/// enabled.  Keep this second-stage classifier scoped to review verbs and only
+/// mutation tools while prompt steering and preflight were not enabled. Keep
+/// this second-stage classifier scoped to review verbs and only
 /// call it with the contract's read-only result.
 pub(crate) fn implicit_read_only_review_intent(
     input: &str,
@@ -255,11 +255,11 @@ pub(crate) fn implicit_read_only_review_intent(
         return None;
     }
     // Bare `review codebase` is the original hole: mutation tools were already
-    // dropped while prompt steering / preflight / sprawl caps were not enabled.
+    // dropped while prompt steering / preflight were not enabled.
     // Short issue-oriented reviews have the same shape (for example, "review
     // for any major issues"): they are requests for evidence-backed findings,
-    // not conversational status questions. Longer live reviews are bounded by
-    // structural ReadOnly sprawl instead of imposing the Findings-format repair
+    // not conversational status questions. Longer live reviews retain their
+    // structural ReadOnly behavior without imposing the Findings-format repair
     // here.
     if is_bare_codebase_review(input) || is_bare_issue_review(input) {
         return Some(no_mutation_review_intent(&normalize_intent_text(input)));
@@ -463,64 +463,6 @@ fn without_scoped_no_edit_constraints(normalized: &str) -> String {
         .join(" ")
 }
 
-/// Return the inspection cap the user explicitly requested. Ordinary read-only
-/// turns are unlimited; distinct new evidence must never become a stop reason
-/// merely because a fixed number of reads or searches has elapsed.
-pub(crate) fn read_only_inspection_cap(input: &str, _intent: ReviewIntent) -> Option<u32> {
-    explicit_read_only_inspection_cap(input)
-}
-
-pub(crate) fn explicit_read_only_inspection_cap(input: &str) -> Option<u32> {
-    let normalized = normalize_intent_text(input);
-    let words = normalized.split_whitespace().collect::<Vec<_>>();
-    let mut cap: Option<u32> = None;
-    for index in 0..words.len() {
-        let parsed = parse_inspection_cap_at(&words, index);
-        cap = match (cap, parsed) {
-            (Some(existing), Some(parsed)) => Some(existing.min(parsed)),
-            (None, Some(parsed)) => Some(parsed),
-            (existing, None) => existing,
-        };
-    }
-    cap
-}
-
-fn parse_inspection_cap_at(words: &[&str], index: usize) -> Option<u32> {
-    if words.get(index..index + 2) == Some(&["at", "most"]) {
-        return parse_cap_after_number(words, index + 2);
-    }
-    if words.get(index..index + 4) == Some(&["use", "no", "more", "than"])
-        || words.get(index..index + 3) == Some(&["no", "more", "than"])
-    {
-        let number_index = if words.get(index) == Some(&"use") {
-            index + 4
-        } else {
-            index + 3
-        };
-        return parse_cap_after_number(words, number_index);
-    }
-    if matches!(words.get(index), Some(&"max" | &"maximum")) {
-        return parse_cap_after_number(words, index + 1);
-    }
-    None
-}
-
-fn parse_cap_after_number(words: &[&str], number_index: usize) -> Option<u32> {
-    let number = words.get(number_index)?.parse::<u32>().ok()?;
-    if number == 0 {
-        return None;
-    }
-    let mut noun_index = number_index + 1;
-    if matches!(words.get(noun_index), Some(&"file" | &"tool")) {
-        noun_index += 1;
-    }
-    matches!(
-        words.get(noun_index),
-        Some(&"inspection" | &"inspections" | &"read" | &"reads")
-    )
-    .then_some(number)
-}
-
 fn expanded_read_only_macro_intent(normalized: &str) -> Option<ReviewIntent> {
     if normalized.starts_with("read only security request for") {
         Some(ReviewIntent::Security)
@@ -709,7 +651,6 @@ fn no_changes_is_a_request(unscoped: &str) -> bool {
 }
 
 pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String {
-    let cap = read_only_inspection_cap(input, intent);
     let bounded_exact_review =
         matches!(intent, ReviewIntent::Review) && is_bounded_file_review(input, false);
     let recipe = match intent {
@@ -734,19 +675,8 @@ pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String
     } else {
         " If deterministic preflight already read files, cite those paths; do not re-read them unless you need a later slice. Prefer one targeted grep or read for a gap, then answer."
     };
-    let inspection_limit_guidance = cap.map_or_else(
-        || {
-            "No automatic inspection-count ceiling applies. Continue while each inspection adds relevant evidence; repeated or no-new-evidence cycles are still stopped."
-                .to_string()
-        },
-        |cap| {
-            format!(
-                "The user explicitly requested an inspection cap: at most {cap} file reads/searches for this turn. Listings and diffs may provide context but do not raise it. Once reached, answer from gathered evidence instead of inspecting more."
-            )
-        },
-    );
     format!(
-        "{input}\n\n{}\nRead-only review guard: use only the currently advertised read-only inspection tools; never invent tool names or handles remembered from earlier turns. Do not write, edit, apply patches, or change files. Respect explicit user exclusions: never invoke a tool or inspect an artifact the user explicitly forbids, even if this review recipe mentions it. Do not narrate tool availability, stale handles, polling recovery, or internal steering to the user; inspect with the available tools and give the review directly. Use read-only inspection before the final answer. {inspection_limit_guidance} Prefer explore, repo_map, or find_symbol when covering a large tree. {recipe}{bounded_guidance} If only a directory listing is available, keep inspecting before making file-specific findings.\n{}",
+        "{input}\n\n{}\nRead-only review guard: use only the currently advertised read-only inspection tools; never invent tool names or handles remembered from earlier turns. Do not write, edit, apply patches, or change files. Respect explicit user exclusions: never invoke a tool or inspect an artifact the user explicitly forbids, even if this review recipe mentions it. Do not narrate tool availability, stale handles, polling recovery, or internal steering to the user; inspect with the available tools and give the review directly. Use read-only inspection before the final answer. Continue inspecting whenever additional evidence is relevant. Prefer explore, repo_map, or find_symbol when covering a large tree. {recipe}{bounded_guidance} If only a directory listing is available, keep inspecting before making file-specific findings.\n{}",
         crate::transcript::TURN_CONTROL_START,
         crate::transcript::TURN_CONTROL_END,
     )

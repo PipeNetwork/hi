@@ -83,7 +83,6 @@ pub(crate) const READ_ONLY_PREFLIGHT_GREP_MAX_LINES: usize = 32;
 pub(crate) const READ_ONLY_PREFLIGHT_DIFF_MAX_LINES: usize = 160;
 pub(crate) const SECURITY_PREFLIGHT_EXTRA_READ_LIMIT: u32 = 90;
 pub(crate) const DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT: u32 = 120;
-pub(crate) const READ_ONLY_PREFLIGHT_MAX_EXTRA_READS: usize = 3;
 pub(crate) const NO_EVIDENCE_SECURITY_NUDGE: &str = "This security review has no inspected evidence yet. \
 Do not finalize. Search for unsafe, unwrap, expect, panic!, command execution, filesystem/env \
 access, and secret/token/auth patterns, then read the most relevant matching files before answering.";
@@ -112,12 +111,6 @@ pub(crate) const READ_AFTER_SEARCH_NUDGE: &str = "The targeted search result is 
 Do not rerun the same search and do not use mutating tools. Read the most relevant matching file, \
 then answer from that inspected file. If you cannot pick a file to read, explain that limitation \
 and answer only from the search output.";
-
-/// How many *additional* read-only inspection rounds are allowed after the
-/// sprawl nudge before the turn settles with the available evidence. This is
-/// used only when the user explicitly requested an inspection-count cap;
-/// ordinary review turns have no count ceiling.
-pub(crate) const MAX_INSPECTION_SPRAWL_NUDGES: u32 = 2;
 
 /// Sent when the model re-reads files it already inspected earlier this turn
 /// (a multi-step read cycle like A→B→C→A→B→C that evades the exact-match

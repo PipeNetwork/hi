@@ -21,8 +21,7 @@ use crate::steering::{
     REREAD_NUDGE, SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_COMPLETED_FILE_REREAD_RESULT,
     SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT, bash_call_waits,
     bash_no_progress_signature, implementation_text_tool_nudge, inspected_paths_for_prompt,
-    inspection_round_cap_nudge, inspection_sprawl_exhausted, inspection_sprawl_nudge,
-    should_nudge_inspection_sprawl, should_nudge_read_after_repeated_search,
+    should_nudge_read_after_repeated_search,
 };
 use crate::transcript::NudgeKind;
 use crate::{MAX_TOOL_PROTOCOL_RETRIES, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE, Ui};
@@ -106,12 +105,10 @@ impl crate::Agent {
         let turn_ledger_revision = state.turn_ledger_revision;
         let read_only_intent = state.read_only_intent;
         let implementation_intent = state.implementation_intent;
-        let read_only_inspection_cap = state.read_only_inspection_cap;
         let expected_mutation = state.expected_mutation;
         let requested_validation = state.requested_validation;
         let input = state.input;
         let _user_prompt_tokens = state.user_prompt_tokens;
-        let inspection_sprawl_intent = state.inspection_sprawl_intent;
         let verifier = state.verifier;
 
         let result = async {
@@ -1324,91 +1321,6 @@ If the task is already complete, stop and give your final recap."
         repeat_sampling_rounds = 0;
         prev_call_sig = Some(call_sig);
         prev_added_no_evidence = no_new_evidence && !has_wait_poll_bash;
-
-        // Inspection-sprawl guard: a read-only review turn that keeps
-        // reading *distinct* files (each a new inspection signature, so
-        // the repeat/cycle guard above never fires) without ever
-        // producing findings. Once enough evidence has accumulated,
-        // nudge the model to answer; if it keeps sprawling past the
-        // budget, settle without fabricating an answer. This is
-        // the only guard that catches the "read 100 files, never
-        // answer" failure mode — all review-quality guards fire only
-        // on a final text answer, which never comes while the model
-        // keeps issuing tool calls.
-        //
-        // Also bounds ambiguous mutation-capable inspect loops (`/login`,
-        // "how does X work") that have neither review sprawl nor
-        // implementation discovery. Expected-mutation turns keep the
-        // dedicated discovery cap instead.
-        let bound_open_ended_inspection = !expected_mutation;
-        evidence.record_inspection_round(&calls);
-        if inspection_sprawl_exhausted(
-            inspection_sprawl_intent,
-            bound_open_ended_inspection,
-            &evidence,
-            &calls,
-            read_only_inspection_cap,
-        ) {
-            // Prefer one force-text recovery when inspection already happened.
-            // Do not keep_working here: that re-enabled tools after ChatOnly
-            // wrap-up and the live 403 review ran another 8+ inspection rounds.
-            if (evidence.saw_read || evidence.saw_search || evidence.saw_listing)
-                && !force_text_answer_next
-                && !request_text_answer
-                && !request_no_progress_final_answer
-            {
-                force_text_answer_next = true;
-                force_tools_next = false;
-                if let Some(intent) = inspection_sprawl_intent.or(read_only_intent) {
-                    ui.nudge(
-                        "review kept inspecting without findings; forcing a bounded answer from inspected evidence",
-                    );
-                    self.messages.push_nudge(
-                        NudgeKind::Continue,
-                        crate::steering::repair_nudge_with_required_next(
-                            crate::steering::ReviewRepairMode::SprawlForceAnswer,
-                            crate::steering::summarize_inspected_evidence_nudge(intent, &evidence),
-                        ),
-                    );
-                } else {
-                    ui.nudge(
-                        "kept inspecting without answering; forcing a bounded answer from inspected evidence",
-                    );
-                    self.messages.push_nudge(
-                        NudgeKind::Continue,
-                        inspection_round_cap_nudge(evidence.inspection_only_rounds),
-                    );
-                }
-                return Ok(ModelRoundControl::Continue);
-            }
-            progress_tracker.record(ProgressKind::None, "inspection_sprawl_exhausted", None);
-            ui.nudge("review kept inspecting new files without producing findings");
-            return Ok(ModelRoundControl::BreakInner(false));
-        }
-        if should_nudge_inspection_sprawl(
-            inspection_sprawl_intent,
-            bound_open_ended_inspection,
-            &evidence,
-            &calls,
-            read_only_inspection_cap,
-        ) {
-            evidence.inspection_sprawl_nudges =
-                evidence.inspection_sprawl_nudges.saturating_add(1);
-            force_text_answer_next = true;
-            let cap = read_only_inspection_cap
-                .unwrap_or_else(|| evidence.inspection_attempt_count());
-            ui.nudge(&format!(
-                "review inspected {} files/searches without answering; nudging it to produce findings",
-                evidence.inspection_attempt_count(),
-            ));
-            self.messages
-                .push_assistant_text_only(std::mem::take(&mut completion.content));
-            self.messages.push_nudge(
-                NudgeKind::Continue,
-                inspection_sprawl_nudge(cap, evidence.inspection_attempt_count()),
-            );
-            return Ok(ModelRoundControl::Continue);
-        }
 
         // This round's assistant text, joined and captured before the
         // content is moved into history. Used both to detect a content-less

@@ -34,9 +34,6 @@ pub(super) struct TurnState {
     pub implementation_intent: Option<ImplementationIntent>,
     pub expected_mutation: bool,
     pub requested_validation: bool,
-    /// When set, inspection-sprawl caps apply (same type as read-only intent).
-    pub inspection_sprawl_intent: Option<ReviewIntent>,
-    pub read_only_inspection_cap: Option<u32>,
     pub turn_input: String,
 
     // --- checkpoints / verify harness ---
@@ -165,12 +162,10 @@ impl TurnState {
             turn_ledger_revision: self.turn_ledger_revision,
             read_only_intent: self.read_only_intent,
             implementation_intent: self.implementation_intent,
-            read_only_inspection_cap: self.read_only_inspection_cap,
             expected_mutation: self.expected_mutation,
             requested_validation: self.requested_validation,
             input: &self.turn_input,
             user_prompt_tokens: self.user_prompt_tokens,
-            inspection_sprawl_intent: self.inspection_sprawl_intent,
             verifier: &self.verifier,
         }
     }

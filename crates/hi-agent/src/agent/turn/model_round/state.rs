@@ -147,11 +147,9 @@ pub(in crate::agent::turn) struct ModelRoundState<'a> {
     pub turn_ledger_revision: u64,
     pub read_only_intent: Option<ReviewIntent>,
     pub implementation_intent: Option<ImplementationIntent>,
-    pub read_only_inspection_cap: Option<u32>,
     pub expected_mutation: bool,
     pub requested_validation: bool,
     pub input: &'a str,
     pub user_prompt_tokens: u64,
-    pub inspection_sprawl_intent: Option<ReviewIntent>,
     pub verifier: &'a WorkspaceRepairVerifier,
 }

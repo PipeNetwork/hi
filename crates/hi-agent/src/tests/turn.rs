@@ -4379,11 +4379,10 @@ async fn capped_turn_wrap_up_round_is_granted_only_once() {
 }
 
 #[tokio::test]
-async fn read_only_review_sprawl_is_bounded() {
-    // An explicit user-supplied inspection cap remains authoritative. Once the
-    // model reaches it, the guard nudges for an answer and then forces the next
-    // model round to answer without tools. Ordinary reviews have no such count
-    // ceiling and are covered separately below.
+async fn read_only_review_with_explicit_count_language_remains_unbounded() {
+    // Count language in a prompt is not an agent-enforced inspection cap. The
+    // model may continue gathering distinct evidence until it has enough to
+    // answer.
     let explicit_cap = 8u32;
     let n_files = (explicit_cap + 1) as usize;
     let fixtures: Vec<TempTestPath> = (0..n_files)
@@ -4399,9 +4398,7 @@ async fn read_only_review_sprawl_is_bounded() {
         .collect();
 
     // Each initial round reads a distinct file — never a repeat, always "new
-    // evidence". The extra read attempt after the threshold should be blocked
-    // by the sprawl guard, then the final response answers from existing
-    // evidence.
+    // evidence" — and all of them should execute before the final answer.
     let mut responses: Vec<Completion> = paths
         .iter()
         .map(|p| {
@@ -4440,15 +4437,9 @@ async fn read_only_review_sprawl_is_bounded() {
     );
     agent.run_turn(&prompt, &mut ui).await.unwrap();
 
-    // The sprawl nudge fired once the threshold was crossed.
-    assert!(
-        ui.statuses.iter().any(|s| s.contains("without answering")),
-        "expected an inspection-sprawl nudge, got: {:?}",
-        ui.statuses
-    );
     assert!(
         !ui.assistant.contains("fallback summary"),
-        "sprawl should force an answer attempt before falling back: {}",
+        "the review should answer normally: {}",
         ui.assistant
     );
     let answer = agent
@@ -4458,11 +4449,11 @@ async fn read_only_review_sprawl_is_bounded() {
         answer.contains("Findings:") && answer.contains(&paths[0]),
         "expected the forced text answer as the final answer, got: {answer}"
     );
-    let modes = modes.lock().unwrap();
     assert_eq!(
-        modes.last(),
-        Some(&ToolMode::ChatOnly),
-        "the post-sprawl answer round should be forced chat-only: {modes:?}"
+        agent.last_turn_telemetry().file_reads,
+        n_files as u32,
+        "all distinct inspections should run: {:?}",
+        ui.statuses
     );
     assert!(
         ui.turn_end.is_some(),
@@ -4543,7 +4534,7 @@ async fn read_only_review_crosses_legacy_inspection_count_with_new_evidence() {
 }
 
 #[tokio::test]
-async fn read_only_review_explicit_four_inspection_cap_forces_findings() {
+async fn read_only_review_ignores_explicit_inspection_count_language() {
     let n_files = 5usize;
     let fixtures: Vec<TempTestPath> = (0..n_files)
         .map(|i| {
@@ -4589,7 +4580,7 @@ async fn read_only_review_explicit_four_inspection_cap_forces_findings() {
     let mut ui = RecUi::default();
     agent
         .run_turn(
-            "Review this codebase for issues related to ipop/coder-balanced API routing or latency. Use at most 4 file inspections. Do not modify files. Return concise findings only; must finish with Findings.",
+            "Review this codebase for issues related to ipop/coder-balanced API routing or latency. Use at most 4 file inspections if useful, but continue whenever more evidence is relevant. Do not modify files. Return concise findings only; must finish with Findings.",
             &mut ui,
         )
         .await
@@ -4597,17 +4588,18 @@ async fn read_only_review_explicit_four_inspection_cap_forces_findings() {
 
     assert!(
         ui.assistant.contains("Findings:") && ui.assistant.contains(&paths[0]),
-        "expected forced findings, got: {}",
+        "expected findings after all requested inspections, got: {}",
         ui.assistant
     );
-    assert_eq!(agent.last_turn_telemetry().file_reads, 4);
+    assert_eq!(agent.last_turn_telemetry().file_reads, 5);
     assert_eq!(agent.last_turn_telemetry().targeted_searches, 0);
     assert!(!agent.last_turn_telemetry().hit_step_cap);
-    let modes = modes.lock().unwrap();
-    assert_eq!(
-        modes.last(),
-        Some(&ToolMode::ChatOnly),
-        "the post-cap answer round should be forced chat-only: {modes:?}"
+    assert!(
+        ui.statuses
+            .iter()
+            .all(|status| !status.contains("inspection cap") && !status.contains("sprawl")),
+        "inspection count language must not trigger a stop or forced wrap-up: {:?}",
+        ui.statuses
     );
 
     for p in &paths {
@@ -4616,15 +4608,11 @@ async fn read_only_review_explicit_four_inspection_cap_forces_findings() {
 }
 
 #[tokio::test]
-async fn review_without_codebase_token_still_bounds_inspection_sprawl() {
-    // Live 403-notice prompt: leading "review" made the contract ReadOnly, but
-    // the conservative classifiers left sprawl unarmed because the text was
-    // long and never said "codebase". Structural ReadOnly + the explicit
-    // "at most 4" phrase must still force a chat-only wrap-up. Sprawl is
-    // checked before the current round's tools run, so the extra inspection
-    // is the round that observes the cap and requests the answer.
-    let explicit_cap = 4u32;
-    let n_files = (explicit_cap + 1) as usize;
+async fn read_only_review_without_codebase_token_can_keep_inspecting() {
+    // A review that does not use the word "codebase" is still allowed to
+    // inspect all of the distinct files the model requests. An incidental
+    // "at most N" phrase must not create a hidden cap.
+    let n_files = 5usize;
     let fixtures: Vec<TempTestPath> = (0..n_files)
         .map(|i| {
             let p = temp_file(&format!("403-sprawl-{i}"));
@@ -4670,33 +4658,27 @@ async fn review_without_codebase_token_still_bounds_inspection_sprawl() {
     let mut ui = RecUi::default();
     agent
         .run_turn(
-            "review we have some kinda issues : models endpoint returned 403 --- and it seems to stayon the screen. Use at most 4 file inspections.",
+            "review we have some kinda issues : models endpoint returned 403 --- and it seems to stayon the screen. Use at most 4 file inspections if useful.",
             &mut ui,
         )
         .await
         .unwrap();
     let answer = agent
         .last_assistant_text()
-        .expect("the forced wrap-up answer is retained");
+        .expect("the final answer is retained");
     assert!(
         answer.contains("Findings:"),
-        "expected a forced answer, got {answer:?}; statuses={:?} modes={:?}",
+        "expected an answer, got {answer:?}; statuses={:?} modes={:?}",
         ui.statuses,
         modes.lock().unwrap(),
     );
-    assert_eq!(agent.last_turn_telemetry().file_reads, explicit_cap);
+    assert_eq!(agent.last_turn_telemetry().file_reads, n_files as u32);
     assert!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("nudging it to produce findings")),
-        "structural sprawl must fire from the explicit cap, got: {:?}",
+            .all(|status| !status.contains("inspection cap") && !status.contains("sprawl")),
+        "the incidental count phrase must not trigger inspection sprawl: {:?}",
         ui.statuses
-    );
-    assert_eq!(
-        modes.lock().unwrap().last(),
-        Some(&ToolMode::ChatOnly),
-        "post-sprawl round must be chat-only even with keep-working enabled: {:?}",
-        modes.lock().unwrap()
     );
     assert!(
         ui.turn_end.is_some(),
@@ -4708,9 +4690,8 @@ async fn review_without_codebase_token_still_bounds_inspection_sprawl() {
 }
 
 #[tokio::test]
-async fn keep_working_does_not_reopen_inspection_after_sprawl_wrap_up() {
-    let explicit_cap = 4u32;
-    let n_files = (explicit_cap + 1) as usize;
+async fn repeated_inspection_does_not_reexecute_forever() {
+    let n_files = 5usize;
     let fixtures: Vec<TempTestPath> = (0..n_files)
         .map(|i| {
             let p = temp_file(&format!("keep-working-sprawl-{i}"));
@@ -4736,8 +4717,9 @@ async fn keep_working_does_not_reopen_inspection_after_sprawl_wrap_up() {
             )
         })
         .collect();
-    // Chat-only wrap-up emits another tool call (no text). Keep-working used
-    // to re-enable tools and demand another completion — canned would panic.
+    // A later repeated inspection is still suppressed by the no-new-evidence
+    // guard. This is distinct from the removed count-based cap: new files
+    // remain inspectable without limit.
     responses.push(completion(
         vec![Content::ToolCall {
             id: "r".into(),
@@ -4747,22 +4729,27 @@ async fn keep_working_does_not_reopen_inspection_after_sprawl_wrap_up() {
         1,
         1,
     ));
+    responses.push(completion(
+        vec![Content::Text(
+            "Findings: the repeated inspection added no new evidence; the review is complete."
+                .into(),
+        )],
+        1,
+        1,
+    ));
     let mut cfg = config();
     cfg.loop_limits.max_keep_working = 8;
     cfg.loop_limits.max_empty_retries = 0;
     let mut agent = Agent::new(std::sync::Arc::new(Canned(Mutex::new(responses))), cfg).unwrap();
     let mut ui = RecUi::default();
-    let error = agent
+    let outcome = agent
         .run_turn(
-            "review codebase and discuss status. Use at most 4 file inspections.",
+            "review codebase and discuss status. Inspect as much relevant evidence as needed.",
             &mut ui,
         )
         .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("no response after retrying"),
-        "unexpected error: {error:#}"
-    );
+        .unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
     assert!(
         !ui.statuses
             .iter()
@@ -4772,8 +4759,8 @@ async fn keep_working_does_not_reopen_inspection_after_sprawl_wrap_up() {
     );
     assert_eq!(
         ui.tool_results.len(),
-        explicit_cap as usize,
-        "the chat-only wrap-up tool call must not execute or reopen inspection: {:?}",
+        n_files + 1,
+        "the repeated inspection may be observed once but must not execute forever: {:?}",
         ui.tool_results
     );
     for p in &paths {

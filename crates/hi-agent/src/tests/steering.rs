@@ -1,10 +1,8 @@
 use super::common::*;
 use super::*;
 use crate::steering::{
-    ReviewRepairMode, counts_against_file_inspection_cap, explicit_read_only_inspection_cap,
-    inspection_sprawl_exhausted, is_read_only_inspection_tool, read_only_inspection_cap,
-    read_only_preflight_initial_calls_in, read_only_turn_prompt, repair_nudge_with_required_next,
-    should_nudge_inspection_sprawl,
+    ReviewRepairMode, is_read_only_inspection_tool, read_only_preflight_initial_calls_in,
+    read_only_turn_prompt, repair_nudge_with_required_next,
 };
 
 #[test]
@@ -96,23 +94,6 @@ fn explicit_controls_classify_as_read_only_intents() {
     );
     assert_eq!(classify_read_only_intent("status"), None);
     assert_eq!(classify_read_only_intent("fix the unsafe unwraps"), None);
-}
-
-#[test]
-fn read_only_inspection_has_no_default_count_ceiling() {
-    for intent in [
-        ReviewIntent::Review,
-        ReviewIntent::Status,
-        ReviewIntent::Roadmap,
-        ReviewIntent::Gaps,
-        ReviewIntent::Security,
-    ] {
-        assert_eq!(
-            read_only_inspection_cap("review codebase", intent),
-            None,
-            "ordinary {intent:?} must remain unlimited"
-        );
-    }
 }
 
 #[test]
@@ -240,82 +221,16 @@ fn visible_review_repair_nudges_repeat_required_next_action() {
 }
 
 #[test]
-fn explicit_read_only_inspection_cap_phrases_parse() {
-    assert_eq!(
-        explicit_read_only_inspection_cap("Review this codebase. Use at most 4 file inspections."),
-        Some(4)
-    );
-    assert_eq!(
-        explicit_read_only_inspection_cap("use no more than 4 reads"),
-        Some(4)
-    );
-    assert_eq!(
-        explicit_read_only_inspection_cap("max 4 file reads"),
-        Some(4)
-    );
-    assert_eq!(
-        explicit_read_only_inspection_cap("At most 20 file inspections; max 12 reads."),
-        Some(12)
-    );
-}
-
-#[test]
-fn explicit_read_only_inspection_cap_ignores_non_caps() {
-    assert_eq!(
-        explicit_read_only_inspection_cap("read 4 files before answering"),
-        None
-    );
-    assert_eq!(
-        explicit_read_only_inspection_cap("use 4 reads if needed"),
-        None
-    );
-    assert_eq!(
-        explicit_read_only_inspection_cap("inspect at least 4 files"),
-        None
-    );
-}
-
-#[test]
-fn read_only_inspection_cap_respects_explicit_prompt_limit() {
-    assert_eq!(
-        read_only_inspection_cap(
-            "Security review. Use at most 4 file inspections.",
-            ReviewIntent::Security
-        ),
-        Some(4)
-    );
-    assert_eq!(
-        read_only_inspection_cap(
-            "Security review. Use at most 40 file inspections.",
-            ReviewIntent::Security
-        ),
-        Some(40)
-    );
-    let prompt = read_only_turn_prompt(
+fn read_only_reviews_ignore_inspection_count_language() {
+    let prompt = "Review only crates/hi-ai/src/openai/request.rs and crates/hi-ai/src/openai/stream.rs for one concrete bug. Do not edit files.";
+    let guarded = read_only_turn_prompt(
         "Review this codebase. Use at most 4 file inspections.",
         ReviewIntent::Review,
     );
-    assert!(prompt.contains("explicitly requested an inspection cap: at most 4"));
-}
-
-#[test]
-fn bounded_exact_reviews_get_guidance_without_a_hidden_count_cap() {
-    let prompt = "Review only crates/hi-ai/src/openai/request.rs and crates/hi-ai/src/openai/stream.rs for one concrete bug. Do not edit files.";
-    assert_eq!(read_only_inspection_cap(prompt, ReviewIntent::Review), None);
-    let guarded = read_only_turn_prompt(prompt, ReviewIntent::Review);
-    assert!(guarded.contains("No automatic inspection-count ceiling applies"));
-    assert!(guarded.contains("bounded exact-file review"));
-}
-
-#[test]
-fn read_only_inspection_cap_respects_explicit_user_cap() {
-    assert_eq!(
-        read_only_inspection_cap(
-            "review codebase. Use at most 4 file inspections.",
-            ReviewIntent::Review,
-        ),
-        Some(4)
-    );
+    assert!(!guarded.contains("inspection cap"));
+    assert!(guarded.contains("Continue inspecting whenever additional evidence is relevant"));
+    let exact = read_only_turn_prompt(prompt, ReviewIntent::Review);
+    assert!(exact.contains("bounded exact-file review"));
 }
 
 #[test]
@@ -336,81 +251,6 @@ fn read_only_inspection_tools_include_context_efficient_discovery() {
     }
     assert!(!is_read_only_inspection_tool("write"));
     assert!(!is_read_only_inspection_tool("bash"));
-}
-
-#[test]
-fn repo_map_round_cannot_dodge_inspection_sprawl() {
-    let mut evidence = EvidenceTracker {
-        inspection_attempts: 8,
-        ..Default::default()
-    };
-    let calls = vec![(
-        "c".into(),
-        "repo_map".into(),
-        r#"{"task":"403 notice"}"#.into(),
-    )];
-    assert!(should_nudge_inspection_sprawl(
-        Some(ReviewIntent::Review),
-        false,
-        &evidence,
-        &calls,
-        Some(8),
-    ));
-    assert!(!inspection_sprawl_exhausted(
-        Some(ReviewIntent::Review),
-        false,
-        &evidence,
-        &calls,
-        Some(8),
-    ));
-    evidence.inspection_sprawl_nudges = 2;
-    assert!(inspection_sprawl_exhausted(
-        Some(ReviewIntent::Review),
-        false,
-        &evidence,
-        &calls,
-        Some(8),
-    ));
-}
-
-#[test]
-fn distinct_inspection_rounds_do_not_hit_a_hidden_count_cap() {
-    let evidence = EvidenceTracker {
-        inspection_only_rounds: 1_000,
-        inspection_attempts: 1_000,
-        ..Default::default()
-    };
-    let calls = vec![("c".into(), "read".into(), r#"{"path":"src/lib.rs"}"#.into())];
-    assert!(!should_nudge_inspection_sprawl(
-        None, true, &evidence, &calls, None,
-    ));
-    assert!(!inspection_sprawl_exhausted(
-        None, true, &evidence, &calls, None,
-    ));
-}
-
-#[test]
-fn evidence_tracker_counts_repo_map_as_one_inspection() {
-    let mut tracker = EvidenceTracker::default();
-    tracker.record_success("repo_map", r#"{"task":"overview"}"#, "tree summary");
-    assert_eq!(tracker.inspection_attempt_count(), 1);
-    tracker.record_success("explore", "{}", "summary of many files");
-    tracker.record_success("find_symbol", r#"{"name":"foo"}"#, "src/lib.rs:1");
-    assert_eq!(tracker.inspection_attempt_count(), 3);
-    tracker.record_success("list", r#"{"path":"."}"#, "src/");
-    assert_eq!(tracker.inspection_attempt_count(), 3);
-    assert!(counts_against_file_inspection_cap("repo_map"));
-    assert!(counts_against_file_inspection_cap("read"));
-    assert!(!counts_against_file_inspection_cap("list"));
-}
-
-#[test]
-fn evidence_tracker_counts_reads_one_to_one() {
-    let mut tracker = EvidenceTracker::default();
-    for _ in 0..4 {
-        tracker.record_success("read", r#"{"path":"src/main.rs"}"#, "file contents");
-    }
-    assert_eq!(tracker.inspection_attempt_count(), 4);
 }
 
 #[test]

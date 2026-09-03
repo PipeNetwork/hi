@@ -22,7 +22,7 @@ const COMPLETED_PLAN_TOOL_CLOSEOUT: &str =
     "The plan is complete and the successful tool results were retained.";
 
 impl crate::Agent {
-    /// Post-tool Steer: mutation recovery, repeat/idempotent guards, sprawl.
+    /// Post-tool Steer: mutation recovery and repeat/idempotent guards.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::agent::turn) fn steer_after_tools(
         &mut self,

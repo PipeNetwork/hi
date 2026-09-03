@@ -284,16 +284,11 @@ async fn explore_mutation_wording_keeps_reads_read_only_and_succeeds() {
 }
 
 #[tokio::test]
-async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer() {
-    // Two full batches stay under the Review inspection cap; the third crosses it
-    // and must be suppressed. Keep batches even-sized so the post-cap slice is
-    // non-empty for any positive cap.
-    //
-    // We use an explicit cap in the task prompt so the test is deterministic
-    // across task-scaling and project-ceiling changes.
-    let explicit_cap = 8u32;
-    let batch_size = explicit_cap.div_ceil(2).max(1) as usize;
-    let allowed_reads = batch_size * 2;
+async fn explore_batched_failed_offset_reads_can_continue_before_answer() {
+    // Failed probes are not a reason to impose a count-based inspection cap.
+    // All distinct requested files must remain available to the explorer.
+    let batch_size = 4usize;
+    let first_batch_end = batch_size * 2;
     let total_files = batch_size * 3;
     let workspace = IsolatedWorkspace::new("explore-batched-sprawl");
     let paths = (0..total_files)
@@ -312,8 +307,8 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
                     id: format!("read-{batch}-{index}"),
                     name: "read".into(),
                     // This mirrors the incident: the explorer kept probing an
-                    // offset past EOF. Failed probes must still consume its
-                    // inspection budget.
+                    // offset past EOF. A failed probe should be recoverable,
+                    // not silently turn into an inspection limit.
                     arguments: serde_json::json!({ "path": path, "offset": 2001 }).to_string(),
                 })
                 .collect(),
@@ -323,10 +318,8 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
     };
     let responses = vec![
         read_batch(0, &paths[0..batch_size]),
-        read_batch(1, &paths[batch_size..allowed_reads]),
-        // This batch is proposed after the bounded Review inspection cap has
-        // been crossed. It must be suppressed, not executed.
-        read_batch(2, &paths[allowed_reads..total_files]),
+        read_batch(1, &paths[batch_size..first_batch_end]),
+        read_batch(2, &paths[first_batch_end..total_files]),
         completion(
             vec![Content::Text(
                 "The bounded investigation found the relevant evidence in source-0.rs.".into(),
@@ -348,7 +341,7 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
     let outcome = agent
         .handle_explore(
             &format!(
-                r#"{{"task":"summarize the relevant source files. Use at most {explicit_cap} file inspections."}}"#
+                r#"{{"task":"summarize the relevant source files; inspect all relevant evidence before answering."}}"#
             ),
             &mut ui,
         )
@@ -363,8 +356,8 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
         .collect::<Vec<_>>();
     assert_eq!(
         read_results.len(),
-        allowed_reads,
-        "the post-cap batch must not execute: {:?}",
+        total_files,
+        "all distinct requested inspections must execute: {:?}",
         ui.tool_results
     );
     assert!(
@@ -372,13 +365,6 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
             .iter()
             .all(|(_, result)| result.contains("past the end")),
         "fixture must exercise failed offset probes: {read_results:?}"
-    );
-    let first_post_cap = format!("file {allowed_reads} contents");
-    assert!(
-        read_results
-            .iter()
-            .all(|(_, result)| !result.contains(&first_post_cap)),
-        "the first post-cap file was unexpectedly read: {read_results:?}"
     );
     assert_eq!(
         modes.lock().unwrap().as_slice(),
@@ -388,7 +374,7 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
             ToolMode::ReadOnly,
             ToolMode::ChatOnly,
         ],
-        "the synthesis round must be forced chat-only"
+        "the answer round should be chat-only after the requested inspections"
     );
     assert!(
         !ui.statuses

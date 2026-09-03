@@ -123,19 +123,13 @@ pub(crate) enum EvidenceKind {
     FileRead,
 }
 
-/// Read-only discovery tools. Explicit user inspection caps and the repeated-
-/// evidence guard treat these uniformly.
+/// Read-only discovery tools. The repeated-evidence guard uses these to avoid
+/// rerunning an identical inspection forever; there is no count-based cap.
 pub(crate) fn is_read_only_inspection_tool(name: &str) -> bool {
     matches!(
         name,
         "read" | "list" | "grep" | "glob" | "explore" | "repo_map" | "find_symbol"
     )
-}
-
-/// Explicit-cap accounting: every read-only inspection except `list` costs one
-/// attempt.
-pub(crate) fn counts_against_file_inspection_cap(name: &str) -> bool {
-    is_read_only_inspection_tool(name) && name != "list"
 }
 
 impl EvidenceKind {
@@ -155,10 +149,6 @@ pub(crate) struct EvidenceTracker {
     pub(crate) saw_read: bool,
     pub(crate) file_reads: u32,
     pub(crate) targeted_searches: u32,
-    /// Read/search attempts, including typed failures such as an offset past
-    /// EOF. Failed probes still consume an explicit user-supplied cap.
-    /// `repo_map` / `explore` / `find_symbol` count as one attempt each.
-    pub(crate) inspection_attempts: u32,
     pub(crate) security_unsafe_search: bool,
     pub(crate) security_execution_search: bool,
     pub(crate) security_secret_search: bool,
@@ -167,16 +157,6 @@ pub(crate) struct EvidenceTracker {
     pub(crate) search_hit_snippets: Vec<String>,
     pub(crate) first_tool_kind: Option<EvidenceKind>,
     pub(crate) quality_repair_nudges: u32,
-    /// How many inspection-cap nudges have fired this turn. This is incremented
-    /// only after a user-supplied cap is reached. Once it exceeds
-    /// [`MAX_INSPECTION_SPRAWL_NUDGES`] the turn settles with the evidence
-    /// already available rather than fabricating
-    /// a review.
-    pub(crate) inspection_sprawl_nudges: u32,
-    /// Consecutive executed model rounds whose every call was a read-only
-    /// inspection tool. Reset when a mutating or unclassified tool runs.
-    /// Compared against [`super::constants::INSPECTION_ONLY_ROUND_CAP`].
-    pub(crate) inspection_only_rounds: u32,
     /// Inspection signatures already seen this turn, used by the no-new-evidence
     /// cycle guard. Each entry is a stable key derived from a read-only tool
     /// call's identity: `read:<path>:<offset>:<limit>`,
@@ -236,9 +216,6 @@ impl EvidenceTracker {
 
     pub(crate) fn record_success(&mut self, name: &str, arguments: &str, output: &str) {
         let evidence_kind = evidence_kind_for_tool(name, arguments);
-        if counts_against_file_inspection_cap(name) {
-            self.inspection_attempts = self.inspection_attempts.saturating_add(1);
-        }
         if output.starts_with("Error:") {
             if let Some(sig) = inspection_infrastructure_error_signature(name, output) {
                 self.record_signature(sig);
@@ -452,27 +429,6 @@ impl EvidenceTracker {
 
     pub(crate) fn has_discovery(&self) -> bool {
         self.saw_listing || self.saw_search || self.saw_read
-    }
-
-    /// Inspection work spent, whether or not the underlying tool succeeded.
-    pub(crate) fn inspection_attempt_count(&self) -> u32 {
-        self.inspection_attempts
-    }
-
-    /// Track consecutive inspection-only rounds for diagnostics. Empty rounds
-    /// (chat-only wrap-up) are ignored; this counter is not a default limit.
-    pub(crate) fn record_inspection_round(&mut self, calls: &[(String, String, String)]) {
-        if calls.is_empty() {
-            return;
-        }
-        if calls
-            .iter()
-            .all(|(_, name, _)| is_read_only_inspection_tool(name))
-        {
-            self.inspection_only_rounds = self.inspection_only_rounds.saturating_add(1);
-        } else {
-            self.inspection_only_rounds = 0;
-        }
     }
 
     pub(crate) fn discovery_depth(&self) -> &'static str {

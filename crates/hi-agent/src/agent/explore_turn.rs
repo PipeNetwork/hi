@@ -335,8 +335,8 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
 
 fn explore_child_prompt(task: &str) -> String {
     // Deliberately plain phrasing: the child's read-only restriction and
-    // inspection-sprawl cap come from its task contract and capability scope,
-    // not legacy review-intent prompt shaping. Do not clip the assignment here:
+    // read-only behavior comes from its task contract and capability scope, not
+    // legacy review-intent prompt shaping. Do not clip the assignment here:
     // normal child context management owns any fit/compaction decision.
     let task = task.trim();
     format!(

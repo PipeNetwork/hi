@@ -9,8 +9,7 @@ use hi_tools::execute_in_runtime_shared;
 use crate::heuristics::emit_tool_output;
 use crate::steering::{
     DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT, EvidenceTracker, ImplementationTracker, PreflightCall,
-    READ_ONLY_PREFLIGHT_MAX_EXTRA_READS, ReviewIntent, SECURITY_PREFLIGHT_EXTRA_READ_LIMIT,
-    compact_preflight_tool_output, counts_against_file_inspection_cap,
+    ReviewIntent, SECURITY_PREFLIGHT_EXTRA_READ_LIMIT, compact_preflight_tool_output,
     implementation_preflight_command, inspection_signature, paths_from_grep_output_in,
     preferred_validation_from_preflight, preflight_path_relevant_for_intent,
     read_only_preflight_initial_calls_for_prompt,
@@ -177,46 +176,22 @@ fn record_preflight_batch(summary: &mut PreflightSummary, batch_len: usize, max_
     }
 }
 
-fn call_counts_against_inspection_cap(call: &PreflightCall) -> bool {
-    counts_against_file_inspection_cap(call.name)
-}
-
-fn cap_preflight_calls(calls: Vec<PreflightCall>, inspection_cap: u32) -> Vec<PreflightCall> {
-    let mut used = 0u32;
-    calls
-        .into_iter()
-        .filter(|call| {
-            if !call_counts_against_inspection_cap(call) {
-                return true;
-            }
-            if used >= inspection_cap {
-                return false;
-            }
-            used = used.saturating_add(1);
-            true
-        })
-        .collect()
-}
-
 impl crate::Agent {
     #[allow(clippy::too_many_arguments)] // preflight threads each turn-scoped dependency explicitly
     pub(crate) async fn run_read_only_preflight(
         &mut self,
         intent: ReviewIntent,
         prompt: &str,
-        inspection_cap: u32,
         ui: &mut dyn Ui,
         evidence: &mut EvidenceTracker,
         tool_timeline: &mut crate::agent::turn::retention::ToolTimeline,
         tool_budget: u32,
     ) -> PreflightSummary {
-        let calls = cap_preflight_calls(
-            read_only_preflight_initial_calls_for_prompt(self.runtime.root(), intent, prompt),
-            inspection_cap,
-        )
-        .into_iter()
-        .take(tool_budget as usize)
-        .collect::<Vec<_>>();
+        let calls =
+            read_only_preflight_initial_calls_for_prompt(self.runtime.root(), intent, prompt)
+                .into_iter()
+                .take(tool_budget as usize)
+                .collect::<Vec<_>>();
         if calls.is_empty() {
             return PreflightSummary::default();
         }
@@ -296,14 +271,10 @@ impl crate::Agent {
                 .with_tape(&result.call.arguments, &result.output.content),
             );
             if result.call.name == "grep" {
-                let remaining_extra_reads =
-                    inspection_cap.saturating_sub(evidence.inspection_attempt_count()) as usize;
                 for path in paths_from_grep_output_in(self.runtime.root(), &result.output.content) {
                     if !preflight_path_relevant_for_intent(intent, &path)
                         || seen_read_paths.iter().any(|existing| existing == &path)
                         || extra_reads.iter().any(|existing| existing == &path)
-                        || extra_reads.len() >= READ_ONLY_PREFLIGHT_MAX_EXTRA_READS
-                        || extra_reads.len() >= remaining_extra_reads
                     {
                         continue;
                     }
