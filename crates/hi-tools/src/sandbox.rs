@@ -380,6 +380,32 @@ impl SandboxProfile {
         (program.to_os_string(), args)
     }
 
+    /// Wrap a direct executable while preserving `cwd` across Linux
+    /// pipe-wrap's private-root setup. macOS and unwrapped commands inherit
+    /// the working directory configured on the spawned process.
+    pub fn wrap_program_in<I, S>(
+        &self,
+        program: &OsStr,
+        args: I,
+        cwd: &Path,
+    ) -> (OsString, Vec<OsString>)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let args = args
+            .into_iter()
+            .map(|argument| argument.as_ref().to_os_string())
+            .collect::<Vec<_>>();
+        let (program, mut wrapped) = self.wrap_program(program, &args);
+        #[cfg(target_os = "linux")]
+        if self.pipe_wrap.is_some() {
+            insert_pipe_wrap_chdir(&mut wrapped, args.len(), cwd);
+        }
+        let _ = cwd;
+        (program, wrapped)
+    }
+
     pub fn policy(&self) -> SandboxPolicy {
         self.policy
     }
@@ -513,6 +539,19 @@ fn pipe_wrap_arguments(
         program,
         program_args,
     )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn insert_pipe_wrap_chdir(args: &mut Vec<OsString>, program_args: usize, cwd: &Path) {
+    let separator = args
+        .len()
+        .checked_sub(program_args.saturating_add(2))
+        .expect("pipe-wrap arguments include a command separator and program");
+    debug_assert_eq!(args[separator], OsStr::new("--"));
+    args.splice(
+        separator..separator,
+        [OsString::from("--chdir"), cwd.as_os_str().to_os_string()],
+    );
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -1239,6 +1278,52 @@ mod tests {
         let (prog, args) = profile.wrap("echo hi");
         assert_eq!(prog, "sh");
         assert_eq!(args, vec!["-c", "echo hi"]);
+    }
+
+    #[test]
+    fn off_policy_cwd_aware_wrap_remains_an_unwrapped_command() {
+        let profile = SandboxProfile::new(SandboxPolicy::Off, &[]);
+        let (program, args) = profile.wrap_program_in(
+            OsStr::new("sh"),
+            [OsStr::new("-c"), OsStr::new("pwd")],
+            Path::new("/work/project"),
+        );
+
+        assert_eq!(program, OsStr::new("sh"));
+        assert_eq!(args, [OsStr::new("-c"), OsStr::new("pwd")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pipe_wrap_cwd_precedes_the_command_separator() {
+        let cwd = Path::new("/work/project");
+        let profile = SandboxProfile {
+            policy: SandboxPolicy::Workspace,
+            profile: String::new(),
+            config: SandboxConfig::default(),
+            writable_roots: Vec::new(),
+            protected_roots: Vec::new(),
+            restrict_network: false,
+            pipe_wrap: Some(PathBuf::from("/operator/pipe-wrap")),
+        };
+        let (program, args) = profile.wrap_program_in(
+            OsStr::new("/opt/hi/bin/hi"),
+            &[OsString::from("--"), OsString::from("--version")],
+            cwd,
+        );
+        let separator = args
+            .iter()
+            .position(|argument| argument == OsStr::new("--"))
+            .expect("command separator");
+
+        assert_eq!(program, OsStr::new("/operator/pipe-wrap"));
+        assert_eq!(
+            &args[separator - 2..separator],
+            [OsStr::new("--chdir"), cwd.as_os_str()]
+        );
+        assert_eq!(args[separator + 1], OsStr::new("/opt/hi/bin/hi"));
+        assert_eq!(args[separator + 2], OsStr::new("--"));
+        assert_eq!(args[separator + 3], OsStr::new("--version"));
     }
 
     #[test]

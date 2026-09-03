@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::cli::RunMode;
 use crate::discovery;
-use crate::runner::{CaseFailureKind, CaseOptions, CaseStatus};
+use crate::runner::{CaseFailureKind, CaseOptions, CaseStatus, SandboxRequirement};
 use crate::scenario::{
     Action, Assertion, Key, ProviderResponse, ProviderStep, QuiescentSource, RecordSource,
     RequestExpectation, Scenario, StreamTerminal,
@@ -89,6 +89,7 @@ pub(crate) fn run(options: FuzzOptions) -> Result<()> {
                 live_route: None,
                 keep: options.keep,
                 seed: None,
+                sandbox_requirement: SandboxRequirement::Enforced,
             };
             scope.spawn(move || {
                 loop {

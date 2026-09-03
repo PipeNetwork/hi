@@ -48,6 +48,14 @@ pub(crate) struct CaseOptions {
     pub live_route: Option<LiveRoute>,
     pub keep: bool,
     pub seed: Option<u64>,
+    pub sandbox_requirement: SandboxRequirement,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SandboxRequirement {
+    Enforced,
+    #[cfg(test)]
+    UnitTestUnenforced,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -123,6 +131,7 @@ pub(crate) fn run_suite(options: SuiteOptions) -> Result<()> {
                 live_route: live_route.clone(),
                 keep: options.keep,
                 seed: None,
+                sandbox_requirement: SandboxRequirement::Enforced,
             };
             scope.spawn(move || {
                 loop {
@@ -272,6 +281,7 @@ pub(crate) fn replay(hi_bin: &Path, replay: &Path, artifacts: &Path, keep: bool)
             live_route,
             keep,
             seed: None,
+            sandbox_requirement: SandboxRequirement::Enforced,
         },
     );
     if matches!(report.status, CaseStatus::Failed) {
@@ -513,7 +523,13 @@ impl CaseRuntime {
         initialize_git(&workspace, scenario.workspace.git)?;
         initialize_git(&initial_workspace, scenario.workspace.git)?;
         write_session_seed(&session_path, &scenario)?;
-        let outer_sandbox = smoke_sandbox_profile(root)?;
+        let outer_sandbox = match options.sandbox_requirement {
+            SandboxRequirement::Enforced => smoke_sandbox_profile(root, &options.hi_bin)?,
+            #[cfg(test)]
+            SandboxRequirement::UnitTestUnenforced => {
+                hi_tools::sandbox::SandboxProfile::new(hi_tools::sandbox::SandboxPolicy::Off, &[])
+            }
+        };
         let isolation_baseline =
             crate::isolation::capture(root).context("capturing pre-run isolation evidence")?;
 
@@ -766,9 +782,10 @@ impl CaseRuntime {
             &self.scenario.hi.env,
             (credential_name, credential_value),
         );
-        let (wrapped_program, wrapped_args) = self.outer_sandbox.wrap_program(
+        let (wrapped_program, wrapped_args) = self.outer_sandbox.wrap_program_in(
             self.options.hi_bin.as_os_str(),
             args.iter().map(String::as_str),
+            &self.workspace,
         );
         let wrapped_program = PathBuf::from(wrapped_program);
         let wrapped_args = wrapped_args
@@ -2673,14 +2690,26 @@ fn extend_scenario_env_with_credential(
     env.insert(credential.0, credential.1);
 }
 
-fn smoke_sandbox_profile(isolation_root: &Path) -> Result<hi_tools::sandbox::SandboxProfile> {
+fn smoke_sandbox_config(hi_bin: &Path) -> hi_tools::sandbox::SandboxConfig {
+    hi_tools::sandbox::SandboxConfig {
+        // Mount the candidate explicitly and read-only after the broad root
+        // bind. CI workspaces can be separate/overlay mounts which are not
+        // reliably carried through a recursive bind of `/`; without this
+        // late bind the kernel reports ENOENT when pipe-wrap tries to exec it.
+        deny_write: vec![hi_bin.to_path_buf()],
+        deny_host_temp: true,
+        ..hi_tools::sandbox::SandboxConfig::default()
+    }
+}
+
+fn smoke_sandbox_profile(
+    isolation_root: &Path,
+    hi_bin: &Path,
+) -> Result<hi_tools::sandbox::SandboxProfile> {
     let profile = hi_tools::sandbox::SandboxProfile::with_config(
         hi_tools::sandbox::SandboxPolicy::Workspace,
         &[isolation_root],
-        hi_tools::sandbox::SandboxConfig {
-            deny_host_temp: true,
-            ..hi_tools::sandbox::SandboxConfig::default()
-        },
+        smoke_sandbox_config(hi_bin),
     );
     ensure!(
         profile.is_enforced(),
@@ -3312,7 +3341,17 @@ mod tests {
             live_route: None,
             keep: false,
             seed: None,
+            sandbox_requirement: SandboxRequirement::UnitTestUnenforced,
         }
+    }
+
+    #[test]
+    fn smoke_sandbox_rebinds_the_candidate_binary_read_only() {
+        let hi_bin = Path::new("/operator/target/debug/hi");
+        let config = smoke_sandbox_config(hi_bin);
+
+        assert_eq!(config.deny_write, [hi_bin]);
+        assert!(config.deny_host_temp);
     }
 
     #[cfg(unix)]
@@ -4757,6 +4796,7 @@ fixture = "fixture"
                 live_route: None,
                 keep: false,
                 seed: Some(9),
+                sandbox_requirement: SandboxRequirement::UnitTestUnenforced,
             },
         );
 
