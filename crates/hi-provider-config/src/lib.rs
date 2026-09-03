@@ -14,13 +14,12 @@ pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 pub const PIPE_DEEPSEEK_V4_FLASH_0731_MODEL_ID: &str = "pipe/deepseek-v4-flash-0731";
 pub const PIPE_DEEPSEEK_V4_FLASH_VISION_EXP_MODEL_ID: &str = "pipe/deepseek-v4-flash-vision-exp";
 
-/// Previous hi defaults. Those aliases still rewrite to GLM on the public API;
-/// the hi coding loop itself now uses Flash Vision Exp.
+/// Previous hi defaults. Resolve them to the production Flash SKU that has
+/// both owned-RTX capacity and hosted overflow, rather than the experimental
+/// vision route whose only live leaf may be unavailable.
 pub fn remap_stale_pipenetwork_default_model(model: &str) -> Option<&'static str> {
     match model.trim() {
-        "ipop/coder-balanced" | "pipe/auto-coder" => {
-            Some(PIPE_DEEPSEEK_V4_FLASH_VISION_EXP_MODEL_ID)
-        }
+        "ipop/coder-balanced" | "pipe/auto-coder" => Some(PIPE_DEEPSEEK_V4_FLASH_0731_MODEL_ID),
         _ => None,
     }
 }
@@ -67,7 +66,7 @@ impl ProviderName {
 
     pub const fn default_model(self) -> Option<&'static str> {
         match self {
-            Self::Pipenetwork => Some(PIPE_DEEPSEEK_V4_FLASH_VISION_EXP_MODEL_ID),
+            Self::Pipenetwork => Some(PIPE_DEEPSEEK_V4_FLASH_0731_MODEL_ID),
             Self::Anthropic => Some("claude-opus-4-8"),
             Self::Xai => Some("grok-4.6"),
             _ => None,
@@ -620,7 +619,7 @@ max_tokens = 1234
         .unwrap();
 
         assert_eq!(resolved.provider, ProviderName::Pipenetwork);
-        assert_eq!(resolved.model, PIPE_DEEPSEEK_V4_FLASH_VISION_EXP_MODEL_ID);
+        assert_eq!(resolved.model, PIPE_DEEPSEEK_V4_FLASH_0731_MODEL_ID);
         assert_eq!(
             resolved.base_url,
             ProviderName::Pipenetwork.default_base_url()
@@ -930,18 +929,18 @@ anything = 42
     }
 
     #[test]
-    fn pipenetwork_default_and_stale_aliases_resolve_to_flash_vision_exp() {
+    fn pipenetwork_default_and_stale_aliases_resolve_to_flash_0731() {
         assert_eq!(
             ProviderName::Pipenetwork.default_model(),
-            Some(PIPE_DEEPSEEK_V4_FLASH_VISION_EXP_MODEL_ID)
+            Some(PIPE_DEEPSEEK_V4_FLASH_0731_MODEL_ID)
         );
         assert_eq!(
             remap_stale_pipenetwork_default_model("ipop/coder-balanced"),
-            Some(PIPE_DEEPSEEK_V4_FLASH_VISION_EXP_MODEL_ID)
+            Some(PIPE_DEEPSEEK_V4_FLASH_0731_MODEL_ID)
         );
         assert_eq!(
             remap_stale_pipenetwork_default_model("pipe/auto-coder"),
-            Some(PIPE_DEEPSEEK_V4_FLASH_VISION_EXP_MODEL_ID)
+            Some(PIPE_DEEPSEEK_V4_FLASH_0731_MODEL_ID)
         );
         assert_eq!(remap_stale_pipenetwork_default_model("pipe/glm-5.2"), None);
         assert_eq!(
@@ -960,6 +959,6 @@ anything = 42
             env(&[]),
         )
         .unwrap();
-        assert_eq!(resolved.model, PIPE_DEEPSEEK_V4_FLASH_VISION_EXP_MODEL_ID);
+        assert_eq!(resolved.model, PIPE_DEEPSEEK_V4_FLASH_0731_MODEL_ID);
     }
 }

@@ -410,7 +410,7 @@ const AUTO_SELECT: [(&str, ProviderName, &str); 4] = [
     (
         "PIPENETWORK_API_KEY",
         ProviderName::Pipenetwork,
-        "pipe/deepseek-v4-flash-vision-exp",
+        "pipe/deepseek-v4-flash-0731",
     ),
     (
         "OPENROUTER_API_KEY",
@@ -449,7 +449,7 @@ pub(crate) fn auto_select_env_name() -> Option<&'static str> {
 const X402_AUTO_SELECT: (&str, ProviderName, &str) = (
     "HI_X402_KEYPAIR",
     ProviderName::Pipenetwork,
-    "pipe/deepseek-v4-flash-vision-exp",
+    "pipe/deepseek-v4-flash-0731",
 );
 
 fn auto_select_entry(file: &Config) -> Option<&'static (&'static str, ProviderName, &'static str)> {

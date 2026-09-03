@@ -512,7 +512,7 @@ fn bare_provider_reuses_key_from_default_profile_for_that_provider() {
     assert_eq!(via_alias.api_key, "profile-pipe-key");
     // Preset path keeps provider defaults for model — it is not a silent
     // rename of the profile; only the credential is borrowed.
-    assert_eq!(settings.model, "pipe/deepseek-v4-flash-vision-exp");
+    assert_eq!(settings.model, "pipe/deepseek-v4-flash-0731");
 }
 
 /// When default_profile targets a different provider, still borrow from any
@@ -2913,13 +2913,13 @@ fn no_setup_when_an_api_key_in_the_env_auto_selects_a_provider() {
 }
 
 #[test]
-fn pipenetwork_env_key_auto_selects_flash_vision_exp() {
+fn pipenetwork_env_key_auto_selects_flash_0731() {
     let env = ClearedSetupEnv::new();
     env.set("PIPENETWORK_API_KEY", "test-key");
     let selected = auto_select(&Config::default()).expect("pipenetwork key should auto-select");
     drop(env);
     assert_eq!(selected.0, ProviderName::Pipenetwork);
-    assert_eq!(selected.1, "pipe/deepseek-v4-flash-vision-exp");
+    assert_eq!(selected.1, "pipe/deepseek-v4-flash-0731");
 }
 
 /// The notice is only for the case where the env var is doing *all* the work.
@@ -3404,7 +3404,7 @@ fn provider_override_falls_back_to_provider_default_model() {
     let cli = Cli::try_parse_from(["hi", "--provider", "pipenetwork"]).unwrap();
     let settings = resolve(&cli, &config).unwrap();
     drop(env);
-    assert_eq!(settings.model, "pipe/deepseek-v4-flash-vision-exp");
+    assert_eq!(settings.model, "pipe/deepseek-v4-flash-0731");
 }
 
 #[test]
@@ -3449,7 +3449,7 @@ fn last_session_model_is_ignored_after_profile_provider_changes() {
 }
 
 #[test]
-fn last_session_stale_pipenetwork_default_remaps_to_flash_vision_exp() {
+fn last_session_stale_pipenetwork_default_remaps_to_flash_0731() {
     use super::{LastSession, save_last_session};
     let dir = std::env::temp_dir().join(format!(
         "hi-stale-session-{}",
@@ -3481,7 +3481,7 @@ fn last_session_stale_pipenetwork_default_remaps_to_flash_vision_exp() {
     drop(env);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(settings.provider, ProviderName::Pipenetwork);
-    assert_eq!(settings.model, "pipe/deepseek-v4-flash-vision-exp");
+    assert_eq!(settings.model, "pipe/deepseek-v4-flash-0731");
 }
 
 #[test]
