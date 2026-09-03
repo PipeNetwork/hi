@@ -107,17 +107,18 @@ impl crate::Agent {
             ui.status("background work continues; ending the turn with the status report");
             return Ok(RoundControl::BreakInner(false));
         }
-        if read_only_intent.is_some() && plan_incomplete {
-            if *silent_continues < self.config.loop_limits.max_silent_continues {
-                self.messages
-                    .push_assistant(std::mem::take(completion_content));
-                *silent_continues += 1;
-                *continue_total_nudges += 1;
-                *force_tools_next = true;
-                self.messages
-                    .push_nudge(NudgeKind::Continue, continue_nudge);
-                return Ok(RoundControl::Continue);
-            }
+        if read_only_intent.is_some()
+            && plan_incomplete
+            && *silent_continues < self.config.loop_limits.max_silent_continues
+        {
+            self.messages
+                .push_assistant(std::mem::take(completion_content));
+            *silent_continues += 1;
+            *continue_total_nudges += 1;
+            *force_tools_next = true;
+            self.messages
+                .push_nudge(NudgeKind::Continue, continue_nudge);
+            return Ok(RoundControl::Continue);
         }
         // Table-driven implementation completeness (order = IMPLEMENTATION_COMPLETENESS_CASCADE).
         // Ordinary expected_mutation turns get the no-change gate for finished

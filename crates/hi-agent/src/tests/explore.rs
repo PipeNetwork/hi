@@ -340,9 +340,7 @@ async fn explore_batched_failed_offset_reads_can_continue_before_answer() {
 
     let outcome = agent
         .handle_explore(
-            &format!(
-                r#"{{"task":"summarize the relevant source files; inspect all relevant evidence before answering."}}"#
-            ),
+            r#"{"task":"summarize the relevant source files; inspect all relevant evidence before answering."}"#,
             &mut ui,
         )
         .await;
