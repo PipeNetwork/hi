@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use crate::circuit_breaker::{BreakerConfig, BreakerObserver, CircuitBreaker, Outcome};
 use crate::provider::{
-    Provider, ProviderError, ServedModel, provider_error_affects_health,
+    Provider, ProviderCapabilities, ProviderError, ServedModel, provider_error_affects_health,
     provider_error_is_fallback_eligible, provider_error_kind, provider_error_usage,
 };
 use crate::types::{ChatRequest, Completion, StreamEvent, Usage};
@@ -72,6 +72,18 @@ impl FallbackProvider {
 
 #[async_trait]
 impl Provider for FallbackProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.chain
+            .iter()
+            .map(|backend| backend.provider.capabilities())
+            .reduce(|left, right| ProviderCapabilities {
+                native_tool_calls: left.native_tool_calls && right.native_tool_calls,
+                streamed_tool_call_deltas: left.streamed_tool_call_deltas
+                    && right.streamed_tool_call_deltas,
+            })
+            .unwrap_or_default()
+    }
+
     async fn stream(
         &self,
         request: ChatRequest,

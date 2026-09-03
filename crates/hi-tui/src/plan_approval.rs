@@ -61,6 +61,7 @@ impl PlanApproval {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlanApprovalOutcome {
     Continue,
+    Park,
     Approve,
     RequestChanges,
     Quit,
@@ -141,10 +142,7 @@ pub(crate) fn handle_key(app: &mut App, key: &KeyEvent) -> PlanApprovalOutcome {
             KeyCode::Char('1') | KeyCode::Char('a') if !ctrl => PlanApprovalOutcome::Approve,
             KeyCode::Char('2') | KeyCode::Char('r') if !ctrl => PlanApprovalOutcome::RequestChanges,
             KeyCode::Char('3') | KeyCode::Char('q') if !ctrl => PlanApprovalOutcome::Quit,
-            KeyCode::Esc => {
-                card.parked = true;
-                PlanApprovalOutcome::Continue
-            }
+            KeyCode::Esc => PlanApprovalOutcome::Park,
             KeyCode::Enter => {
                 card.focus = PlanApprovalFocus::Choices;
                 PlanApprovalOutcome::Continue
@@ -167,10 +165,7 @@ pub(crate) fn handle_key(app: &mut App, key: &KeyEvent) -> PlanApprovalOutcome {
             KeyCode::Char('1') | KeyCode::Char('a') if !ctrl => PlanApprovalOutcome::Approve,
             KeyCode::Char('2') | KeyCode::Char('r') if !ctrl => PlanApprovalOutcome::RequestChanges,
             KeyCode::Char('3') | KeyCode::Char('q') if !ctrl => PlanApprovalOutcome::Quit,
-            KeyCode::Esc => {
-                card.parked = true;
-                PlanApprovalOutcome::Continue
-            }
+            KeyCode::Esc => PlanApprovalOutcome::Park,
             KeyCode::Enter => match card.selected {
                 1 => PlanApprovalOutcome::RequestChanges,
                 2 => PlanApprovalOutcome::Quit,
@@ -289,17 +284,52 @@ impl App {
         self.plan_approval.as_ref().is_some_and(|p| !p.parked)
     }
 
-    pub(crate) fn unpark_plan_approval(&mut self) {
+    /// Reopen a parked card. Returns `true` only for the transition, so repeated
+    /// `/view-plan` dispatches cannot consume or emit the unpark twice.
+    pub(crate) fn unpark_plan_approval(&mut self) -> bool {
         if let Some(card) = self.plan_approval.as_mut() {
+            if !card.parked {
+                return false;
+            }
             card.parked = false;
             card.focus = PlanApprovalFocus::Preview;
+            self.session_face_dirty = true;
             self.status = "Waiting on plan approval".into();
+            let _ = self.trace_approval_shown("plan");
+            return true;
         }
+        false
+    }
+
+    pub(crate) fn park_plan_approval_local(&mut self) {
+        let Some(card) = self.plan_approval.as_mut() else {
+            return;
+        };
+        if card.parked {
+            return;
+        }
+        card.parked = true;
+        self.session_face_dirty = true;
+        self.status = "plan approval parked — /view-plan".into();
+        self.trace_approval_decided("plan", "parked");
+    }
+
+    pub(crate) fn park_plan_approval(&mut self, agent: &mut Agent) {
+        self.park_plan_approval_local();
+        self.push_session_face(agent);
     }
 
     pub(crate) fn open_plan_approval(&mut self) {
         self.plan_approval = Some(PlanApproval::new());
         self.status = "Waiting on plan approval".into();
+        let _ = self.trace_approval_shown("plan");
+    }
+
+    pub(crate) fn restore_parked_plan_approval(&mut self) {
+        let mut card = PlanApproval::new();
+        card.parked = true;
+        self.plan_approval = Some(card);
+        self.status = "plan approval parked — /view-plan".into();
     }
 
     pub(crate) fn maybe_open_plan_approval(&mut self) {
@@ -340,15 +370,18 @@ impl App {
     }
 
     pub(crate) fn apply_plan_approve(&mut self, agent: &mut Agent) {
+        self.trace_approval_decided("plan", "approved");
         self.plan_approval = None;
         self.plan_mode = false;
         self.plan_drive_paused = false;
+        self.plan_drive_pause_dirty = true;
         self.session_face_dirty = true;
         self.push_session_face(agent);
         self.status = "plan approved — driving leftover work".into();
     }
 
     pub(crate) fn apply_plan_request_changes(&mut self, agent: &mut Agent) {
+        self.trace_approval_decided("plan", "request_changes");
         let prompt = self.comment_prompt();
         self.plan_approval = None;
         self.plan_mode = true;
@@ -362,25 +395,31 @@ impl App {
     }
 
     pub(crate) fn apply_plan_quit(&mut self, agent: &mut Agent) {
+        self.trace_approval_decided("plan", "quit");
         self.plan_approval = None;
         self.plan_mode = false;
         self.plan_drive_paused = true;
+        self.plan_drive_pause_dirty = true;
         self.session_face_dirty = true;
         self.push_session_face(agent);
         self.status = "plan drive paused".into();
+        self.trace_drive_state("drive_paused", "plan_drive", "plan_approval_quit");
     }
 
     /// Mid-turn / no-agent path: flip App flags; [`App::push_session_face`]
     /// applies them when the agent is free again.
     pub(crate) fn apply_plan_approve_local(&mut self) {
+        self.trace_approval_decided("plan", "approved");
         self.plan_approval = None;
         self.plan_mode = false;
         self.plan_drive_paused = false;
+        self.plan_drive_pause_dirty = true;
         self.session_face_dirty = true;
         self.status = "plan approved — driving leftover work".into();
     }
 
     pub(crate) fn apply_plan_request_changes_local(&mut self) {
+        self.trace_approval_decided("plan", "request_changes");
         let prompt = self.comment_prompt();
         self.plan_approval = None;
         self.plan_mode = true;
@@ -393,10 +432,13 @@ impl App {
     }
 
     pub(crate) fn apply_plan_quit_local(&mut self) {
+        self.trace_approval_decided("plan", "quit");
         self.plan_approval = None;
         self.plan_mode = false;
         self.plan_drive_paused = true;
+        self.plan_drive_pause_dirty = true;
         self.session_face_dirty = true;
         self.status = "plan drive paused".into();
+        self.trace_drive_state("drive_paused", "plan_drive", "plan_approval_quit");
     }
 }

@@ -9,10 +9,6 @@ use std::path::Path;
 use crate::agent::plan_goal::planner_input;
 use crate::goal::{Goal, GoalStatus};
 
-/// Workflow and ingest share this cap — a 40-milestone plan fits; a 600-line
-/// dump must be split.
-pub const MAX_PLAN_OBJECTIVES: usize = 512;
-
 /// One checklist row, including already-checked items so a rerun does not redo them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanItem {
@@ -160,8 +156,7 @@ pub fn ingest_plan_document(root: &Path, objective: &str) -> Option<IngestedPlan
         if !is_markdown_path(&path) || !is_solid_checklist(&body) {
             continue;
         }
-        let mut items = parse_plan_items(&body);
-        items.truncate(MAX_PLAN_OBJECTIVES);
+        let items = parse_plan_items(&body);
         if items.is_empty() {
             continue;
         }
@@ -514,6 +509,21 @@ It should be: get two people to successfully buy and sell one physical item.
         assert_eq!(goal.sub_goals[0].status, GoalStatus::Done);
         assert_eq!(goal.sub_goals[1].status, GoalStatus::Active);
         assert_eq!(goal.sub_goals[1].description, "wire the CLI");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ingest_preserves_more_than_512_objectives() {
+        let root = temp_root("long-checklist");
+        let plan = (1..=600)
+            .map(|index| format!("- [ ] objective {index}\n"))
+            .collect::<String>();
+        std::fs::write(root.join("plan.md"), plan).unwrap();
+
+        let ingested = ingest_plan_document(&root, "implement plan.md").expect("checklist");
+        assert_eq!(ingested.items.len(), 600);
+        assert_eq!(ingested.items.last().unwrap().description, "objective 600");
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

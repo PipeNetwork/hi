@@ -13,6 +13,7 @@ hi-codebase-graph = { workspace = true, optional = true }
 hi-hunk-tracker.workspace = true
 hi-tool-host.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

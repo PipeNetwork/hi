@@ -10,11 +10,12 @@ non-trivial change — a brief bullet list of the key edits (grouped by file) an
 command(s) to run or test it. Write it in past tense, covering only what you actually did; don't \
 restate the plan or pad it. For a trivial change or a plain question, a single line is enough.";
 
-/// Ending instruction when a finalization step will write the recap: the model
-/// shouldn't duplicate it, just confirm completion.
-const DEFERRED_RECAP_INSTRUCTION: &str = " When the task is done, stop. A separate step will write \
-the final summary for the user, so you don't need to compose a full recap yourself — just make \
-sure the work is actually complete and finish with at most a one-line note.";
+/// Ending instruction when a finalization step may expand the recap. The main
+/// model must still leave a concrete result; otherwise a failed side call can
+/// turn a completed coding run into an apparently answerless stall.
+const DEFERRED_RECAP_INSTRUCTION: &str = " When the task is done, stop and finish with one concrete \
+sentence naming what changed and the verification result. A separate step may expand that summary, \
+but never answer with a generic completion claim such as 'completed the requested action'.";
 
 /// Builds the **stable** system message: identity, rules, working directory,
 /// and durable project guides (HI.md/skills). Deliberately excludes anything

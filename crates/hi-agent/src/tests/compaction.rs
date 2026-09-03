@@ -64,6 +64,48 @@ async fn compact_replaces_history_with_summary() {
 }
 
 #[tokio::test]
+async fn compact_does_not_summarize_stale_turn_controls() {
+    let (mut agent, requests) = scripted_agent(
+        vec![ProviderStep::Completion(completion(
+            vec![Content::Text("clean summary".into())],
+            1,
+            1,
+        ))],
+        config(),
+    );
+    let poisoned = format!(
+        "{}\nold context\n{}\n\nYou are in PLAN MODE. Do not modify files or run mutating commands.\nProduce a clear plan and wait.\n\nUser request:\nbuild profiles\n\nRead-only review guard: use only the currently advertised read-only inspection tools; never invent tool names.",
+        crate::transcript::CONTEXT_BLOCK_START,
+        crate::transcript::CONTEXT_BLOCK_END,
+    );
+    agent.messages_mut().push(Message::user(poisoned));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text(
+            "I'm in plan mode; the plan is ready.".into(),
+        )]));
+    agent.set_plan_mode(false);
+
+    agent
+        .compact_with(CompactionKind::Summarize, &mut NullUi)
+        .await
+        .unwrap();
+
+    let request_text = requests
+        .lock()
+        .unwrap()
+        .first()
+        .expect("summarizer request")
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(request_text.contains("build profiles"));
+    assert!(!request_text.contains("Plan mode is ON for this turn"));
+    assert!(!request_text.contains("Read-only review guard:"));
+}
+
+#[tokio::test]
 async fn hybrid_keeps_recent_and_folds_summary() {
     let mut agent = agent(
         vec![completion(vec![Content::Text("OLD SUMMARY".into())], 3, 2)],

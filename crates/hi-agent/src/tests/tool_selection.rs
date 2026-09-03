@@ -32,6 +32,163 @@ async fn exact_text_response_contract_advertises_no_tools() {
 }
 
 #[tokio::test]
+async fn non_coding_response_continuation_advertises_no_tools_or_edit_nudges() {
+    let workspace = IsolatedWorkspace::new("non-coding-response-no-tools");
+    let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordRequests {
+        responses: Mutex::new(vec![completion(
+            vec![Content::Text(
+                "QUEUED_LIVE_OK is included in this response.".into(),
+            )],
+            1,
+            1,
+        )]),
+        tool_names: tool_names.clone(),
+        modes,
+    };
+    let mut config = workspace.config();
+    config.memory.tool_set = ToolSet::Full;
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config).unwrap();
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn(
+            "Add the exact token QUEUED_LIVE_OK to that response. This is not a coding task and requires no file changes.",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        tool_names.lock().unwrap().as_slice(),
+        &[Vec::<String>::new()]
+    );
+    assert!(
+        ui.statuses.iter().all(|status| {
+            !status.contains("implementation") && !status.contains("file changes")
+        }),
+        "a conversational response must not enter implementation settlement: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn terminal_response_with_queued_user_text_stays_tool_free() {
+    let workspace = IsolatedWorkspace::new("queued-terminal-response-no-tools");
+    let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordRequests {
+        responses: Mutex::new(vec![completion(
+            vec![Content::Text(
+                "The terminal remains responsive. QUEUED_LIVE_OK is included.".into(),
+            )],
+            1,
+            1,
+        )]),
+        tool_names: tool_names.clone(),
+        modes,
+    };
+    let mut config = workspace.config();
+    config.memory.tool_set = ToolSet::Full;
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config).unwrap();
+    agent.interjection_inbox().push(
+        "Add the exact token QUEUED_LIVE_OK to that response. This is not a coding task and requires no file changes.",
+    );
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn(
+            "This is a terminal responsiveness test, not a coding task. Reply with two short sentences and incorporate any user message that arrives while you are working. Do not use tools or modify files.",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        tool_names.lock().unwrap().as_slice(),
+        &[Vec::<String>::new()]
+    );
+    let transcript = agent
+        .messages()
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(transcript.contains("QUEUED_LIVE_OK"), "{transcript}");
+    assert!(
+        !transcript.contains("This is an implementation request"),
+        "tool-free user steering must not trigger the mutation settlement nudge: {transcript}"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .all(|status| !status.contains("implementation")),
+        "statuses: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn live_read_only_canary_bypasses_review_skill_preflight_and_tools() {
+    let workspace = IsolatedWorkspace::new("live-read-only-canary-no-tools");
+    std::fs::write(workspace.path("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordRequests {
+        responses: Mutex::new(vec![completion(
+            vec![Content::Text("live read-only canary complete".into())],
+            1,
+            1,
+        )]),
+        tool_names: tool_names.clone(),
+        modes,
+    };
+    let mut config = workspace.config();
+    config.memory.tool_set = ToolSet::Full;
+    config.memory.inject_review_skill = true;
+    config.memory.inject_stack_skill = true;
+    config.gates.read_only_preflight = true;
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config).unwrap();
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn(
+            "Without changing files or using tools, answer only: live read-only canary complete.",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(ui.assistant, "live read-only canary complete");
+    assert!(
+        ui.tool_results.is_empty(),
+        "preflight must not run: {:#?}",
+        ui.tool_results
+    );
+    assert_eq!(
+        tool_names.lock().unwrap().as_slice(),
+        &[Vec::<String>::new()],
+        "the provider request must disable native tools"
+    );
+    let transcript = agent
+        .messages()
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !transcript.contains("# Active review skill")
+            && !transcript.contains("# Active stack skill")
+            && !transcript.contains("Read-only review guard"),
+        "tool-free canary must retain its direct response contract: {transcript}"
+    );
+}
+
+#[tokio::test]
 async fn program_question_gets_repository_tools_in_dynamic_mode() {
     let workspace = IsolatedWorkspace::new("dynamic-program-question");
     std::fs::write(
@@ -179,7 +336,7 @@ async fn explicit_no_edit_batched_review_uses_the_lean_catalog_on_first_request(
 }
 
 #[tokio::test]
-async fn bounded_exact_review_switches_to_text_after_first_evidence_pass() {
+async fn bounded_exact_review_does_not_hide_tools_after_first_evidence_pass() {
     let workspace = IsolatedWorkspace::new("bounded-exact-review-text-follow-up");
     for path in [
         "crates/hi-ai/src/openai/request.rs",
@@ -241,10 +398,10 @@ async fn bounded_exact_review_switches_to_text_after_first_evidence_pass() {
         "wrap-up keeps the same catalog for prefix cache: {:?}",
         requests[1]
     );
-    assert_eq!(
+    assert_ne!(
         modes[1],
         ToolMode::ChatOnly,
-        "bounded exact-file review follow-up is chat-only: {modes:?}"
+        "ordinary exact-file review must not acquire a hidden one-pass cap: {modes:?}"
     );
 }
 
@@ -358,7 +515,7 @@ async fn bare_review_codebase_first_request_advertises_inspection_tools() {
 }
 
 #[tokio::test]
-async fn bare_review_codebase_wraps_up_chat_only_after_two_inspection_rounds() {
+async fn bare_review_codebase_keeps_tools_after_two_distinct_inspection_rounds() {
     let workspace = IsolatedWorkspace::new("bare-review-codebase-wrap-up");
     std::fs::write(
         workspace.path("Cargo.toml"),
@@ -430,16 +587,20 @@ async fn bare_review_codebase_wraps_up_chat_only_after_two_inspection_rounds() {
         "second inspection request should advertise tools: {:?}",
         requests[1]
     );
-    let last = requests.last().expect("wrap-up request");
+    let last = requests.last().expect("final answer request");
     assert!(
         !last.is_empty(),
-        "wrap-up keeps the inspection catalog for prefix cache: {last:?}"
+        "answer request keeps the inspection catalog for prefix cache: {last:?}"
     );
-    assert_eq!(*modes.last().expect("wrap-up mode"), ToolMode::ChatOnly);
+    assert_ne!(
+        *modes.last().expect("answer mode"),
+        ToolMode::ChatOnly,
+        "distinct inspections must not trigger a hidden two-round cap: {modes:?}"
+    );
 }
 
 #[tokio::test]
-async fn bare_review_citation_repair_after_wrap_up_keeps_inspection_tools() {
+async fn bare_review_citation_repair_keeps_inspection_tools_without_a_hidden_wrap_up() {
     let workspace = IsolatedWorkspace::new("bare-review-citation-repair-keeps-tools");
     std::fs::write(
         workspace.path("Cargo.toml"),
@@ -472,7 +633,7 @@ async fn bare_review_citation_repair_after_wrap_up_keeps_inspection_tools() {
                 1,
                 1,
             ),
-            // Wrap-up with no citation of inspected paths → ConcreteAnswer repair.
+            // Answer with no citation of inspected paths → ConcreteAnswer repair.
             completion(
                 vec![Content::Text(
                     "The codebase looks generally healthy with no obvious issues.".into(),
@@ -507,17 +668,17 @@ async fn bare_review_citation_repair_after_wrap_up_keeps_inspection_tools() {
     let modes = modes.lock().unwrap();
     assert!(
         requests.len() >= 4,
-        "inspection, wrap-up, and citation-repair: {requests:?}"
+        "inspection, answer, and citation-repair: {requests:?}"
     );
-    assert_eq!(
+    assert_ne!(
         modes.get(2).copied(),
         Some(ToolMode::ChatOnly),
-        "first wrap-up is still chat-only: {modes:?}"
+        "ordinary answer request must retain tools: {modes:?}"
     );
     let repair = requests.get(3).expect("citation-repair request");
     assert!(
         !repair.is_empty(),
-        "citation-repair after wrap-up must keep inspection tools: requests={requests:?} modes={modes:?}"
+        "citation-repair must keep inspection tools: requests={requests:?} modes={modes:?}"
     );
     assert_ne!(
         modes.get(3).copied(),

@@ -33,8 +33,14 @@ pub(crate) struct RsiBootstrap {
 impl RsiBootstrap {
     /// Resolve CLI/config RSI mode, enforce interactive invariants, load managed
     /// descriptor when required, and open the managed trace writer.
-    pub(crate) fn initialize(cli: &Cli, file: &Config, prompt_input: Option<&str>) -> Result<Self> {
+    pub(crate) fn initialize(
+        cli: &Cli,
+        file: &Config,
+        prompt_input: Option<&str>,
+        launches_external_workflow: bool,
+    ) -> Result<Self> {
         let requested = crate::config::resolve_rsi(cli, file)?;
+        validate_managed_process_topology(requested, cli.best_of, launches_external_workflow)?;
         if requested == RsiRequested::Managed && prompt_input.is_none() {
             anyhow::bail!("managed RSI requires a noninteractive one-shot prompt");
         }
@@ -78,6 +84,33 @@ impl RsiBootstrap {
     pub(crate) fn is_managed(&self) -> bool {
         self.requested == RsiRequested::Managed
     }
+}
+
+/// Managed evidence and budgets are process-scoped. `--best-of` launches
+/// independent `hi` processes which cannot share the worker's signed ledger or
+/// trace, so accepting that combination would silently escape the descriptor.
+fn validate_managed_process_topology(
+    requested: RsiRequested,
+    best_of: u32,
+    launches_external_workflow: bool,
+) -> Result<()> {
+    if requested == RsiRequested::Managed && best_of > 1 {
+        anyhow::bail!(
+            "managed RSI does not support --best-of: candidate processes cannot share the signed runtime budget and trace"
+        );
+    }
+    if requested == RsiRequested::Managed && launches_external_workflow {
+        anyhow::bail!(
+            "managed RSI does not support automatic plan workflows: child processes cannot share the signed runtime budget and trace"
+        );
+    }
+    Ok(())
+}
+
+/// An external delegate is another independent `hi` process, so managed RSI
+/// must keep delegation in-process where the signed budget ledger is shared.
+pub(crate) fn external_delegate_allowed(requested: RsiRequested, is_subagent: bool) -> bool {
+    requested != RsiRequested::Managed && !is_subagent
 }
 
 fn emit_run_started(
@@ -240,12 +273,15 @@ pub(crate) fn wrap_provider(
 }
 
 /// Bind the process's effective limits to the managed descriptor (fail-closed).
+#[allow(clippy::too_many_arguments)] // mirrors every signed runtime field at the binding boundary
 pub(crate) fn bind_managed_effective(
     managed: Option<&ManagedRuntimeDescriptor>,
     settings: &Settings,
     quality_max_verify_repairs: u32,
     quality_tool_set_label: &str,
     cli: &Cli,
+    effective_max_steps: u32,
+    effective_max_tool_calls: u32,
     max_tokens: u32,
 ) -> Result<()> {
     let Some(runtime) = managed else {
@@ -253,8 +289,8 @@ pub(crate) fn bind_managed_effective(
     };
     runtime.bind_effective(&EffectiveRuntime {
         model_role: &settings.model,
-        max_model_calls: cli.max_steps.unwrap_or(hi_agent::MAX_MODEL_ROUNDS),
-        max_tool_calls: cli.max_tool_calls.unwrap_or(hi_agent::MAX_TOOL_CALLS),
+        max_model_calls: effective_max_steps,
+        max_tool_calls: effective_max_tool_calls,
         max_output_tokens: max_tokens,
         max_repair_iterations: quality_max_verify_repairs,
         trace_bytes: cli.rsi_max_bytes.expect("clap requires RSI trace size"),
@@ -262,4 +298,307 @@ pub(crate) fn bind_managed_effective(
         tool_mode: settings.tool_mode.label(),
     })?;
     Ok(())
+}
+
+/// Resolve the actual per-turn model-call limit once, before validating or
+/// constructing the agent. Ordinary sessions are unlimited by default. A
+/// managed worker remains bounded by its signed descriptor when the user did
+/// not request a smaller explicit cap.
+pub(crate) fn effective_max_steps(
+    explicit: Option<u32>,
+    managed: Option<&ManagedRuntimeDescriptor>,
+) -> u32 {
+    match (explicit, managed) {
+        // `u32::MAX` is the agent's unlimited sentinel. A signed managed
+        // descriptor must remain enforceable even when it carries that numeric
+        // value, so reserve the sentinel and clamp managed work to max - 1.
+        (Some(limit), Some(_)) => limit.min(u32::MAX - 1),
+        (None, Some(runtime)) => runtime.budgets.model_calls.min(u32::MAX - 1),
+        (Some(limit), None) => limit,
+        (None, None) => hi_agent::MAX_MODEL_ROUNDS,
+    }
+}
+
+/// Resolve the per-turn tool-execution cap. Ordinary sessions are unlimited;
+/// managed workers inherit the signed descriptor unless the caller requests a
+/// smaller explicit cap.
+pub(crate) fn effective_max_tool_calls(
+    explicit: Option<u32>,
+    managed: Option<&ManagedRuntimeDescriptor>,
+) -> u32 {
+    match (explicit, managed) {
+        // Managed execution must always carry a finite in-process cap. Reserve
+        // u32::MAX for ordinary-session "unlimited", even when a descriptor's
+        // u64 budget is larger than the agent counter can represent.
+        (Some(limit), Some(_)) => limit.min(u32::MAX - 1),
+        (None, Some(runtime)) => runtime.budgets.tool_calls.min(u64::from(u32::MAX - 1)) as u32,
+        (Some(limit), None) => limit,
+        (None, None) => hi_agent::MAX_TOOL_CALLS,
+    }
+}
+
+/// Resolve productive verification repairs. Ordinary sessions use the public
+/// unlimited sentinel. A managed worker inherits its signed finite budget only
+/// when the operator/project did not explicitly choose a value; explicit
+/// values remain visible to `bind_managed_effective`, which rejects violations.
+pub(crate) fn effective_max_verify_repairs(
+    configured: u32,
+    explicitly_configured: bool,
+    managed: Option<&ManagedRuntimeDescriptor>,
+) -> u32 {
+    match (explicitly_configured, managed) {
+        (false, Some(runtime)) => runtime.budgets.repair_iterations.min(u32::MAX - 1),
+        (true, Some(_)) => configured.min(u32::MAX - 1),
+        (_, None) => configured,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use hi_rsi_runtime::{
+        CandidateIdentity, IsolationProfile, ManagedRuntimeDescriptor, MutationLevel,
+        RuntimeBudgets, RuntimePolicy,
+    };
+
+    use crate::config::RsiRequested;
+
+    use super::{
+        RsiBootstrap, bind_managed_effective, effective_max_steps, effective_max_tool_calls,
+        effective_max_verify_repairs, external_delegate_allowed, validate_managed_process_topology,
+    };
+
+    fn descriptor(model_calls: u32) -> ManagedRuntimeDescriptor {
+        ManagedRuntimeDescriptor {
+            schema_version: 1,
+            protocol_major: 1,
+            identity: CandidateIdentity {
+                run_id: "run-1".into(),
+                task_id: "task-1".into(),
+                candidate_id: "candidate-1".into(),
+                manifest_hash: "1".repeat(64),
+                agent_artifact_hash: "2".repeat(64),
+                repository_snapshot_hash: "3".repeat(64),
+                source_repository: "pipe/hi".into(),
+                source_commit: "abc123".into(),
+            },
+            budgets: RuntimeBudgets {
+                wall_time_seconds: 60,
+                cpu_time_seconds: 60,
+                memory_bytes: 1024,
+                disk_bytes: 1024,
+                input_tokens: 100,
+                output_tokens: 100,
+                tool_calls: 10,
+                cost_microusd: 100,
+                model_calls,
+                repair_iterations: 2,
+                trace_bytes: 4096,
+            },
+            policy: RuntimePolicy {
+                task_policy_version: "task-v1".into(),
+                mutation_level: MutationLevel::Workflow,
+                workflow_entrypoint: "intake".into(),
+                model_role: "implementer".into(),
+                tool_set: "minimal".into(),
+                tool_mode: "auto".into(),
+                filesystem_mode: "worktree-write".into(),
+                allowed_tools: vec!["read".into(), "write".into()],
+                network_allowlist: vec![],
+                isolation: IsolationProfile::Namespace,
+                trusted_launcher: true,
+            },
+            runtime_package: None,
+            issued_at_unix_ms: 1_000,
+            expires_at_unix_ms: 2_000,
+        }
+    }
+
+    fn cli(max_steps: Option<u32>, max_tool_calls: Option<u32>) -> crate::config::Cli {
+        let mut args = vec![
+            "hi".to_string(),
+            "--provider".to_string(),
+            "openai".to_string(),
+            "--model".to_string(),
+            "implementer".to_string(),
+            "--base-url".to_string(),
+            "http://127.0.0.1:9/v1".to_string(),
+            "--api-key".to_string(),
+            "test-key".to_string(),
+            "--rsi-max-bytes".to_string(),
+            "4096".to_string(),
+        ];
+        if let Some(max_steps) = max_steps {
+            args.push("--max-steps".to_string());
+            args.push(max_steps.to_string());
+        }
+        if let Some(max_tool_calls) = max_tool_calls {
+            args.push("--max-tool-calls".to_string());
+            args.push(max_tool_calls.to_string());
+        }
+        crate::config::Cli::try_parse_from(args).unwrap()
+    }
+
+    fn bind(
+        runtime: &ManagedRuntimeDescriptor,
+        explicit_steps: Option<u32>,
+        explicit_tools: Option<u32>,
+    ) -> anyhow::Result<(u32, u32)> {
+        let cli = cli(explicit_steps, explicit_tools);
+        let settings = crate::config::resolve(&cli, &crate::config::Config::default())?;
+        let max_steps = effective_max_steps(cli.max_steps, Some(runtime));
+        let max_tool_calls = effective_max_tool_calls(cli.max_tool_calls, Some(runtime));
+        bind_managed_effective(
+            Some(runtime),
+            &settings,
+            2,
+            "minimal",
+            &cli,
+            max_steps,
+            max_tool_calls,
+            100,
+        )?;
+        Ok((max_steps, max_tool_calls))
+    }
+
+    #[test]
+    fn ordinary_default_is_unlimited_and_explicit_cap_wins() {
+        assert_eq!(hi_agent::MAX_MODEL_ROUNDS, u32::MAX);
+        assert_eq!(hi_agent::MAX_TOOL_CALLS, u32::MAX);
+        assert_eq!(hi_agent::UNLIMITED_REPAIR_CYCLES, u32::MAX);
+        assert_eq!(effective_max_steps(None, None), u32::MAX);
+        assert_eq!(effective_max_steps(Some(7), None), 7);
+        assert_eq!(effective_max_tool_calls(None, None), u32::MAX);
+        assert_eq!(effective_max_tool_calls(Some(9), None), 9);
+        assert_eq!(
+            effective_max_verify_repairs(hi_agent::UNLIMITED_REPAIR_CYCLES, false, None),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn managed_default_matches_descriptor_and_explicit_cap_is_validated() {
+        let runtime = descriptor(12);
+        assert_eq!(
+            effective_max_verify_repairs(hi_agent::UNLIMITED_REPAIR_CYCLES, false, Some(&runtime)),
+            runtime.budgets.repair_iterations,
+            "an ordinary managed worker must inherit its signed repair budget"
+        );
+        assert_eq!(
+            effective_max_verify_repairs(1, true, Some(&runtime)),
+            1,
+            "an explicit finite repair cap must remain explicit for binding"
+        );
+        let inherited = effective_max_steps(None, Some(&runtime));
+        assert_eq!(inherited, 12);
+        assert_eq!(
+            bind(&runtime, None, None).expect("the descriptor's exact budgets must bind"),
+            (12, 10)
+        );
+
+        let smaller = effective_max_steps(Some(7), Some(&runtime));
+        assert_eq!(smaller, 7);
+        assert_eq!(
+            bind(&runtime, Some(7), Some(8)).expect("explicit smaller caps must bind"),
+            (7, 8)
+        );
+
+        let larger = effective_max_steps(Some(13), Some(&runtime));
+        assert!(
+            bind(&runtime, Some(larger), None).is_err(),
+            "an explicit cap above the signed descriptor must be rejected"
+        );
+
+        let inherited_tools = effective_max_tool_calls(None, Some(&runtime));
+        assert_eq!(inherited_tools, 10);
+        assert!(
+            bind(&runtime, None, Some(11)).is_err(),
+            "an explicit tool cap above the signed descriptor must be rejected"
+        );
+
+        let sentinel_sized = descriptor(u32::MAX);
+        assert_eq!(
+            effective_max_steps(None, Some(&sentinel_sized)),
+            u32::MAX - 1,
+            "a managed budget must never turn into the ordinary unlimited sentinel"
+        );
+        assert_eq!(
+            bind(&sentinel_sized, None, None)
+                .expect("the sentinel-sized signed budget should bind")
+                .0,
+            u32::MAX - 1
+        );
+    }
+
+    #[test]
+    fn managed_workers_reject_multi_process_model_call_topologies() {
+        assert!(validate_managed_process_topology(RsiRequested::Managed, 2, false).is_err());
+        assert!(validate_managed_process_topology(RsiRequested::Managed, 1, false).is_ok());
+        assert!(validate_managed_process_topology(RsiRequested::Off, 4, true).is_ok());
+
+        assert!(!external_delegate_allowed(RsiRequested::Managed, false));
+        assert!(!external_delegate_allowed(RsiRequested::Off, true));
+        assert!(external_delegate_allowed(RsiRequested::Off, false));
+    }
+
+    #[test]
+    fn managed_best_of_is_rejected_before_runtime_descriptor_io() {
+        let cli = crate::config::Cli::try_parse_from([
+            "hi",
+            "--rsi-managed",
+            "--rsi-trace-dir",
+            "/definitely/missing/trace-dir",
+            "--rsi-max-bytes",
+            "4096",
+            "--rsi-runtime-descriptor",
+            "/definitely/missing/runtime-descriptor.json",
+            "--best-of",
+            "2",
+        ])
+        .expect("the combination is structurally valid and rejected by RSI bootstrap");
+
+        let error = match RsiBootstrap::initialize(
+            &cli,
+            &crate::config::Config::default(),
+            Some("implement the task"),
+            false,
+        ) {
+            Ok(_) => panic!("managed workers cannot launch independent best-of processes"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("does not support --best-of"),
+            "topology validation must happen before descriptor I/O: {error:#}"
+        );
+    }
+
+    #[test]
+    fn managed_automatic_workflow_is_rejected_before_runtime_descriptor_io() {
+        let cli = crate::config::Cli::try_parse_from([
+            "hi",
+            "--rsi-managed",
+            "--rsi-trace-dir",
+            "/definitely/missing/trace-dir",
+            "--rsi-max-bytes",
+            "4096",
+            "--rsi-runtime-descriptor",
+            "/definitely/missing/runtime-descriptor.json",
+            "plan.md",
+        ])
+        .expect("the combination is structurally valid and rejected by RSI bootstrap");
+
+        let error = match RsiBootstrap::initialize(
+            &cli,
+            &crate::config::Config::default(),
+            Some("plan.md"),
+            true,
+        ) {
+            Ok(_) => panic!("managed workers cannot launch independent workflow processes"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("automatic plan workflows"),
+            "topology validation must happen before descriptor I/O: {error:#}"
+        );
+    }
 }

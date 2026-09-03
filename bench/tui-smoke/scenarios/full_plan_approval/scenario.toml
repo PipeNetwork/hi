@@ -1,0 +1,91 @@
+schema_version = 1
+name = "full-plan-creation-and-approval"
+tags = ["curated"]
+timeout_ms = 45000
+
+[[provider.steps]]
+id = "create-plan"
+[provider.steps.response]
+kind = "tool_call"
+name = "update_plan"
+arguments = { steps = [{ title = "Complete approved smoke plan", status = "pending" }] }
+
+[[provider.steps]]
+id = "plan-ready"
+[provider.steps.response]
+kind = "text"
+text = "The smoke plan is ready for approval."
+
+[[provider.steps]]
+id = "complete-approved-plan"
+[provider.steps.response]
+kind = "tool_call"
+name = "update_plan"
+arguments = { steps = [{ title = "Complete approved smoke plan", status = "done", completion_evidence = "The plan-creation and approval lifecycle was exercised; this scenario intentionally requires no workspace mutation." }] }
+
+[[provider.steps]]
+id = "approved-plan-answer"
+[provider.steps.response]
+kind = "text"
+text = "The approved smoke plan is complete."
+
+[[provider.steps]]
+id = "approved-plan-no-file-change-explanation"
+[provider.steps.expect]
+body_contains = ["no successful file changes"]
+[provider.steps.response]
+kind = "text"
+text = "No file changes are needed; this smoke case only verifies full plan creation, approval, and completion."
+
+[[actions]]
+kind = "send_line"
+text = "/plan complete an approved smoke plan"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/plan/mode" = true, "/data/plan/incomplete" = true }
+timeout_ms = 10000
+
+[[actions]]
+kind = "send_line"
+text = "/plan off"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "approval_shown" }
+timeout_ms = 5000
+
+[[actions]]
+kind = "send_key"
+key = "tab"
+
+[[actions]]
+kind = "send_key"
+key = "enter"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/plan/incomplete" = false }
+timeout_ms = 15000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "approval_decided", "/data/decision" = "approved" }
+exact = 1
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

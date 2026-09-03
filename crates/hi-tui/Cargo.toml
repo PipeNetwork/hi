@@ -22,10 +22,12 @@ futures-util.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
+blake3.workspace = true
 chrono.workspace = true
 ansi-to-tui.workspace = true
 reqwest = { workspace = true }
 tracing.workspace = true
+libc.workspace = true
 eye-declare = { package = "eye_declare", version = "0.7", optional = true }
 ratatui-core = { version = "0.1", optional = true }
 
@@ -41,6 +43,12 @@ default = []
 voice = ["hi-voice/audio"]
 codebase-graph = ["hi-tools/codebase-graph", "hi-agent/codebase-graph"]
 eye-declare-spike = ["dep:eye-declare", "dep:ratatui-core"]
+# INTERNAL SMOKE NEGATIVE CONTROL ONLY. This intentionally lets rejected
+# generic completion text reach the transcript and also disables the matching
+# agent guard. Never enable it in normal, packaged, or release binaries.
+smoke-negative-control-disable-generic-completion-guards = [
+    "hi-agent/smoke-negative-control-disable-generic-completion-guards",
+]
 
 [dev-dependencies]
 criterion.workspace = true

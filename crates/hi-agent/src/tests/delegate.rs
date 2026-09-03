@@ -22,6 +22,31 @@ struct WritingStubRunner {
     root: std::path::PathBuf,
 }
 
+struct LimitTrackingRunner {
+    step_limits: std::sync::Arc<std::sync::Mutex<Vec<Option<u32>>>>,
+    tool_limits: std::sync::Arc<std::sync::Mutex<Vec<Option<u32>>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::DelegateRunner for LimitTrackingRunner {
+    fn set_max_steps(&self, max_steps: Option<u32>) {
+        self.step_limits.lock().unwrap().push(max_steps);
+    }
+
+    fn set_max_tool_calls(&self, max_tool_calls: Option<u32>) {
+        self.tool_limits.lock().unwrap().push(max_tool_calls);
+    }
+
+    async fn run(&self, _task: &str, _verify: Option<&str>) -> crate::DelegateOutcome {
+        crate::DelegateOutcome {
+            status: hi_tools::ToolStatus::Succeeded,
+            applied: false,
+            changed_files: Vec::new(),
+            summary: "unused".into(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::DelegateRunner for StubRunner {
     async fn run(&self, task: &str, _verify: Option<&str>) -> crate::DelegateOutcome {
@@ -115,28 +140,36 @@ async fn delegate_missing_task_errors() {
     assert_eq!(agent.subagents.delegate_subagents_used, 0);
 }
 
-#[tokio::test]
-async fn delegate_respects_turn_budget() {
-    // At the cap, it returns before touching the working tree.
+#[test]
+fn delegate_default_remains_unlimited_when_counters_saturate() {
     let mut agent = agent(Vec::new(), delegate_config());
-    agent.subagents.delegate_turn_used = crate::agent::MAX_DELEGATE_SUBAGENTS_PER_TURN;
-    let mut ui = NullUi;
-    let out = agent
-        .handle_delegate(r#"{"task":"do something"}"#, &mut ui)
-        .await;
-    assert_eq!(out.status, hi_tools::ToolStatus::Denied);
-    assert!(
-        out.content.contains("budget exhausted"),
-        "got: {}",
-        out.content
+    agent.subagents.delegate_turn_used = u32::MAX - 1;
+    agent.subagents.delegate_subagents_used = u32::MAX - 1;
+
+    assert_eq!(
+        agent
+            .subagents
+            .try_begin_delegate(crate::agent::MAX_DELEGATE_SUBAGENTS_PER_TURN),
+        Some(u32::MAX),
+        "the unlimited sentinel must never become a quota at counter saturation"
     );
     assert_eq!(
-        agent.subagents.delegate_turn_used,
-        crate::agent::MAX_DELEGATE_SUBAGENTS_PER_TURN
+        agent
+            .subagents
+            .try_begin_delegate(crate::agent::MAX_DELEGATE_SUBAGENTS_PER_TURN),
+        Some(u32::MAX),
+        "saturated accounting must stay non-wrapping and non-blocking"
     );
-    // Per-turn budget: the next turn refills it.
-    agent.subagents.begin_turn();
-    assert_eq!(agent.subagents.delegate_turn_used, 0);
+    assert_eq!(agent.subagents.delegate_turn_used, u32::MAX);
+    assert_eq!(agent.subagents.delegate_subagents_used, u32::MAX);
+}
+
+#[test]
+fn delegate_accounting_honors_an_explicit_finite_limit() {
+    let mut agent = agent(Vec::new(), delegate_config());
+    agent.subagents.delegate_turn_used = 17;
+    assert_eq!(agent.subagents.try_begin_delegate(17), None);
+    assert_eq!(agent.subagents.delegate_turn_used, 17);
 }
 
 #[test]
@@ -157,6 +190,35 @@ fn set_write_subagents_toggles_advertisement() {
     // Risk without a multi-file task still advertises when tools refresh with no task
     // (startup Full-ish path uses task=None → treated as eligible when enabled).
     assert!(has(&agent), "risk policy still enables the tool family");
+}
+
+#[test]
+fn runtime_step_limit_changes_propagate_to_attached_delegate_runner() {
+    let mut cfg = delegate_config();
+    cfg.loop_limits.max_steps = 7;
+    cfg.loop_limits.max_tool_calls = 13;
+    let mut agent = agent(Vec::new(), cfg);
+    let step_limits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tool_limits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    agent.set_delegate_runner(std::sync::Arc::new(LimitTrackingRunner {
+        step_limits: step_limits.clone(),
+        tool_limits: tool_limits.clone(),
+    }));
+
+    agent.set_max_steps_limit(None);
+    agent.set_max_steps_limit(Some(9));
+    agent.set_max_steps_auto();
+
+    assert_eq!(
+        *step_limits.lock().unwrap(),
+        [Some(7), None, Some(9), None],
+        "attachment and every runtime update must govern later delegate children"
+    );
+    assert_eq!(
+        *tool_limits.lock().unwrap(),
+        [Some(13)],
+        "runtime step changes must preserve the independently synchronized tool cap"
+    );
 }
 
 #[tokio::test]

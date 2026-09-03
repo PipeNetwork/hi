@@ -1,0 +1,110 @@
+schema_version = 1
+name = "live-write-tool-mutation"
+tags = ["live_extended"]
+timeout_ms = 600000
+
+[terminal]
+cols = 132
+rows = 40
+
+[hi]
+args = ["--allow-unverified"]
+
+[[actions]]
+kind = "send_line"
+text = "Use the write tool, not bash or any other tool, exactly once. Create the relative file live-write-proof.txt containing exactly HI_LIVE_WRITE_OK with no trailing newline. Do not touch any other file. After the tool succeeds, reply briefly."
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_started", "/data/origin" = "user" }
+timeout_ms = 240000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started", "/data/name" = "write" }
+timeout_ms = 240000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_result", "/data/name" = "write" }
+timeout_ms = 30000
+
+[[actions]]
+kind = "wait_file"
+path = "live-write-proof.txt"
+exists = true
+timeout_ms = 30000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled" }
+# The child turn deadline is 240s. Leave a 30s evidence-flush grace period
+# before the harness's independent 300s outer-turn watchdog.
+timeout_ms = 270000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "user" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started", "/data/name" = "write" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "write" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_result", "/data/name" = "write" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "approval_shown" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 1 }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/accepted" = true, "/response_status" = 200 }
+at_least = 1
+
+[[assertions]]
+kind = "file"
+path = "live-write-proof.txt"
+exists = true
+equals = "HI_LIVE_WRITE_OK"
+
+[[assertions]]
+kind = "exit"
+code = 0

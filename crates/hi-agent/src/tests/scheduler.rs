@@ -90,7 +90,7 @@ async fn hard_tool_budget_reserves_only_the_model_ordered_prefix() {
         .run_turn("read the requested files", &mut ui)
         .await
         .unwrap();
-    assert_eq!(outcome.stop_reason, crate::TurnStopReason::StepLimit);
+    assert_eq!(outcome.stop_reason, crate::TurnStopReason::ToolLimit);
     assert!(
         ui.statuses
             .iter()
@@ -99,6 +99,8 @@ async fn hard_tool_budget_reserves_only_the_model_ordered_prefix() {
         ui.statuses
     );
     let telemetry = agent.last_turn_telemetry();
+    assert!(telemetry.hit_tool_cap);
+    assert!(!telemetry.hit_step_cap);
     assert_eq!(telemetry.tool_calls, 2, "the denied suffix is not spent");
     assert_eq!(
         telemetry.tool_timeline.len(),

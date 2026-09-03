@@ -1,0 +1,28 @@
+[package]
+name = "hi-smoke"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "hi-smoke"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+hi-ai = { workspace = true, features = ["test-support"] }
+hi-tools.workspace = true
+libc.workspace = true
+portable-pty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+url.workspace = true
+vt100.workspace = true
+
+[lints.rust]
+# Unix process-group termination is required to clean up a wedged PTY tree.
+unsafe_code = "allow"

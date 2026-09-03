@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 use reqwest::header;
 use serde_json::Value;
 
-use crate::provider::{Provider, ProviderError, ProviderErrorKind};
+use crate::provider::{Provider, ProviderCapabilities, ProviderError, ProviderErrorKind};
 use crate::token::{StaticToken, TokenSource};
 use crate::types::{
     ChatRequest, Completion, RateLimitBucket, RateLimitState, StreamEvent, Usage,
@@ -48,6 +48,13 @@ impl XaiProvider {
 
 #[async_trait]
 impl Provider for XaiProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calls: true,
+            streamed_tool_call_deltas: true,
+        }
+    }
+
     async fn stream(
         &self,
         request: ChatRequest,
@@ -88,6 +95,8 @@ impl Provider for XaiProvider {
                     Some(response.status().as_u16()),
                 ))));
                 let rate_limits = rate_limits_from_headers(response.headers());
+                // Long reasoning silence is unlimited by default; the guard
+                // activates only when the operator configured an idle window.
                 let stream = crate::http::idle_guard(
                     crate::http::debug_tap(response.bytes_stream()),
                     crate::http::xai_stream_idle_window(),

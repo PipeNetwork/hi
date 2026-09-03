@@ -1,0 +1,123 @@
+schema_version = 1
+name = "completed-plan-settles-without-provider-recap"
+tags = ["curated", "pr"]
+timeout_ms = 30000
+
+[hi]
+args = ["--allow-unverified"]
+
+[[session.plan]]
+title = "Create completed-plan.txt and finish the plan"
+status = "pending"
+
+[[provider.steps]]
+id = "write-completed-plan-file"
+[provider.steps.expect]
+body_contains = ["Create completed-plan.txt"]
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "completed-plan.txt", content = "completed plan retained\n" }
+
+[[provider.steps]]
+id = "finish-plan"
+[provider.steps.expect]
+body_contains = ["completed-plan.txt"]
+[provider.steps.response]
+kind = "tool_call"
+name = "update_plan"
+arguments = { steps = [{ title = "Create completed-plan.txt and finish the plan", status = "done" }] }
+
+[[actions]]
+kind = "wait_provider_request"
+count = 2
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 1, "/data/plan/incomplete" = false, "/data/next_drive/action" = "idle" }
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_quiescent"
+source = "provider"
+quiet_ms = 500
+timeout_ms = 3000
+
+[[actions]]
+kind = "capture_screen"
+name = "completed_without_recap"
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "write" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "update_plan" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/verification" = "not_applicable", "/data/outcome/stop_reason" = "no_applicable_verification", "/data/outcome/changed_file_count" = 1, "/data/plan/incomplete" = false, "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "none" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/role" = "Assistant" }
+contains = { "/content/0/Text" = "The plan is complete and the successful tool results were retained." }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/type" = "plan_cleared" }
+exact = 1
+
+[[assertions]]
+kind = "screen"
+snapshot = "completed_without_recap"
+contains = ["The plan is complete", "successful tool results were retained"]
+
+[[assertions]]
+kind = "file"
+path = "completed-plan.txt"
+exists = true
+equals = "completed plan retained\n"
+
+[[assertions]]
+kind = "workspace_patch"
+contains = ["diff --git a/completed-plan.txt b/completed-plan.txt", "+completed plan retained"]
+excludes = ["unrelated.txt"]
+
+[[assertions]]
+kind = "workspace_listing"
+contains = ["./completed-plan.txt"]
+excludes = ["unrelated.txt"]
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

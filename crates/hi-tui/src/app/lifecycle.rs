@@ -159,6 +159,7 @@ impl crate::App {
             permission_mode: hi_agent::PermissionMode::Always,
             session_face_dirty: false,
             plan_drive_paused: false,
+            plan_drive_pause_dirty: false,
             last_drive: hi_agent::DriveAction::Idle {
                 reason: hi_agent::DriveIdleReason::None,
             },
@@ -194,6 +195,7 @@ impl crate::App {
             model_ids: Vec::new(),
             trimmed: 0,
             current_assistant: String::new(),
+            current_assistant_streamed_bytes: 0,
             assistant_message_open: false,
             show_btw: false,
             btw_scroll: 0,
@@ -254,6 +256,7 @@ impl crate::App {
             queued_team_assignments: Vec::new(),
             auto_setup_skeptic: false,
             sync_control: None,
+            tui_event_trace: None,
             remote_event_tap: None,
             base_event_tap: None,
             sync_remote_ui: None,
@@ -530,57 +533,42 @@ impl crate::App {
         }
     }
 
-    /// Push a next-turn prompt if under [`crate::MAX_PROMPT_QUEUE`]. Empty /
-    /// whitespace-only strings are ignored. Returns whether the prompt was
-    /// enqueued.
+    /// Push a next-turn prompt. Empty / whitespace-only strings are ignored.
+    /// The queue deliberately grows with accepted work so a long-running turn
+    /// cannot silently discard distinct user or synthetic follow-ups.
     pub(crate) fn try_enqueue_prompt(&mut self, prompt: impl Into<String>) -> bool {
         let prompt = prompt.into();
         if prompt.trim().is_empty() {
             return false;
         }
-        if self.queue.len() >= crate::MAX_PROMPT_QUEUE {
-            return false;
-        }
         self.queue.push_back(prompt);
         self.clamp_queue_selection();
+        if let Some(prompt) = self.queue.back() {
+            self.trace_prompt_queued(prompt);
+        }
         true
     }
 
-    /// Like [`Self::try_enqueue_prompt`], but emits a one-line warning when the
-    /// queue is full so interactive callers don't fail silently.
+    /// Interactive alias for [`Self::try_enqueue_prompt`].
     pub(crate) fn enqueue_prompt(&mut self, prompt: impl Into<String>) -> bool {
         let prompt = prompt.into();
         if prompt.trim().is_empty() {
             return false;
         }
-        if self.try_enqueue_prompt(prompt) {
-            return true;
-        }
-        self.push(ratatui::text::Line::styled(
-            format!(
-                "prompt queue full ({}/{}) — finish or remove queued items (Alt-Down/Backspace), then retry",
-                self.queue.len(),
-                crate::MAX_PROMPT_QUEUE
-            ),
-            ratatui::style::Style::default().fg(crate::theme::theme().warning),
-        ));
-        self.follow();
-        false
+        self.try_enqueue_prompt(prompt)
     }
 
-    /// Insert at the front (next to run). If the queue is already at the cap,
-    /// drops the newest tail entry to make room so intentional follow-ups
-    /// (plan mode, /synth-evals) are not lost.
+    /// Insert at the front (next to run) without displacing queued work.
     pub(crate) fn enqueue_prompt_front(&mut self, prompt: impl Into<String>) -> bool {
         let prompt = prompt.into();
         if prompt.trim().is_empty() {
             return false;
         }
-        if self.queue.len() >= crate::MAX_PROMPT_QUEUE {
-            let _ = self.queue.pop_back();
-        }
         self.queue.push_front(prompt);
         self.clamp_queue_selection();
+        if let Some(prompt) = self.queue.front() {
+            self.trace_prompt_queued(prompt);
+        }
         true
     }
 
@@ -615,6 +603,9 @@ impl crate::App {
         }
         let removed = self.queue.remove(i);
         self.clamp_queue_selection();
+        if let Some(prompt) = removed.as_deref() {
+            self.trace_prompt_removed(prompt);
+        }
         removed
     }
 

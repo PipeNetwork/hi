@@ -9,7 +9,15 @@ use crate::steering::ImplementationTracker;
 use crate::transcript::NudgeKind;
 use crate::{TaskContract, Ui};
 
-pub(super) type PendingCheck = (String, String, tokio::task::JoinHandle<(bool, String)>);
+/// Proactive checks run concurrently with the rest of a tool batch, but they
+/// remain owned by that turn. A plain `JoinHandle` detaches on drop; wrapping it
+/// makes cancellation abort the task, which drops the process future and lets
+/// `ProcessRunner` kill the check's complete process group.
+pub(super) type PendingCheck = (
+    String,
+    String,
+    tokio_util::task::AbortOnDropHandle<(bool, String)>,
+);
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn append_fast_feedback(
@@ -131,5 +139,43 @@ pub(super) async fn append_fast_feedback(
         ),
     );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingCheck;
+
+    #[tokio::test]
+    async fn dropping_pending_check_aborts_its_owned_task() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = Dropped(task_dropped);
+            std::future::pending::<()>().await;
+            (true, String::new())
+        });
+        tokio::task::yield_now().await;
+        let pending: PendingCheck = (
+            "src/lib.rs".into(),
+            "check".into(),
+            tokio_util::task::AbortOnDropHandle::new(handle),
+        );
+
+        drop(pending);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborting the pending check should promptly drop its task");
     }
 }

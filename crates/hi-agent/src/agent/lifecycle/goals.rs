@@ -34,10 +34,13 @@ impl crate::Agent {
     /// Only takes effect when `config.subagents.long_horizon` is on; when set, the goal's
     /// state is injected into the system prompt each turn so the agent resumes
     /// the active sub-goal. Returns whether it was accepted.
-    pub fn set_structured_goal(&mut self, goal: Option<Goal>) -> Result<bool> {
+    pub fn set_structured_goal(&mut self, mut goal: Option<Goal>) -> Result<bool> {
         if !self.config.subagents.long_horizon && goal.is_some() {
             return Ok(false);
         }
+        let migrated_legacy_goal_budget = goal
+            .as_mut()
+            .is_some_and(Goal::clear_legacy_automatic_budget);
         if let Some(session) = self.session.as_mut() {
             if let Some(g) = &goal {
                 session.record_goal(g)?;
@@ -54,6 +57,8 @@ impl crate::Agent {
             self.goals.free_text = None;
         }
         self.goals.set_structured(goal);
+        self.pending_legacy_goal_budget_migration =
+            migrated_legacy_goal_budget && self.session.is_none();
         self.refresh_system_message();
         Ok(true)
     }
@@ -171,8 +176,8 @@ impl crate::Agent {
     pub fn try_set_goal_turn_budget(&mut self, budget: Option<u32>) -> Result<bool> {
         self.update_structured_goal(|goal| {
             goal.turn_budget = budget;
-            // An explicit choice stops the automatic rescaling: from here
-            // the number is the user's, and it stays where they put it.
+            // Preserve the legacy marker only for session migration; every
+            // explicit command installs exactly the user's value.
             goal.budget_auto = false;
             goal.turns_spent = 0;
             if goal.pause_reason == crate::goal::GoalPauseReason::Budget {

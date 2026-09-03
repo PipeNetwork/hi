@@ -208,14 +208,13 @@ for report in root.rglob("report.json"):
     telemetry = data.get("telemetry", {})
     step_cap = bool(telemetry.get("stopped_by_step_cap") or telemetry.get("hit_step_cap"))
     repair_exhausted = bool(telemetry.get("review_repair_stopped_by_exhaustion"))
-    stalled = bool(telemetry.get("stalled_unfinished") or telemetry.get("stalled_repeating"))
-    accepted = status == 0 and not stalled and not step_cap and not leak
-    useful_incomplete = status == 0 and repair_exhausted and not step_cap and not leak
-    recovered = accepted or useful_incomplete
+    recovered = status == 0 and not step_cap and not leak
+    accepted = recovered and not repair_exhausted
+    repair_recovered = recovered and repair_exhausted
     groups[(branch, model, scenario)].append({
         "recovered": recovered,
         "accepted": accepted,
-        "useful_incomplete": useful_incomplete,
+        "repair_recovered": repair_recovered,
         "nudges": int(telemetry.get("quality_repair_nudges") or 0),
         "step_cap": step_cap,
         "repair_exhausted": repair_exhausted,
@@ -224,13 +223,13 @@ for report in root.rglob("report.json"):
     })
 
 print("\nsummary")
-print("branch\tmodel\tscenario\tn\trecovery\taccepted\tincomplete\tavg_nudges_recovered\tstep_cap\trepair_exhausted\tleaks\treasons")
+print("branch\tmodel\tscenario\tn\trecovery\taccepted\trepair_recovered\tavg_nudges_recovered\tstep_cap\trepair_exhausted\tleaks\treasons")
 for key in sorted(groups):
     rows = groups[key]
     n = len(rows)
     recovered = sum(r["recovered"] for r in rows)
     accepted = sum(r["accepted"] for r in rows)
-    incomplete = sum(r["useful_incomplete"] for r in rows)
+    repair_recovered = sum(r["repair_recovered"] for r in rows)
     recovered_nudges = [r["nudges"] for r in rows if r["recovered"]]
     avg_nudges = sum(recovered_nudges) / len(recovered_nudges) if recovered_nudges else 0.0
     step_cap = sum(r["step_cap"] for r in rows)
@@ -239,7 +238,7 @@ for key in sorted(groups):
     reasons = ",".join(sorted({r["reason"] for r in rows if r["reason"]})) or "-"
     print(
         f"{key[0]}\t{key[1]}\t{key[2]}\t{n}\t"
-        f"{recovered}/{n}\t{accepted}/{n}\t{incomplete}/{n}\t"
+        f"{recovered}/{n}\t{accepted}/{n}\t{repair_recovered}/{n}\t"
         f"{avg_nudges:.2f}\t{step_cap}\t{repair_exhausted}\t{leaks}\t{reasons}"
     )
 

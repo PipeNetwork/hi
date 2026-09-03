@@ -10,8 +10,6 @@ use std::time::Duration;
 use crate::condense::truncate;
 use crate::process::ProcessRunner;
 
-const CARGO_CHECK_TIMEOUT_SECS: u64 = 180;
-const PACKAGE_TEST_TIMEOUT_SECS: u64 = 300;
 const MAX_FEEDBACK_CHARS: usize = 4_000;
 const MAX_FAST_DEPENDENT_CHECKS: usize = 4;
 
@@ -475,7 +473,14 @@ pub async fn run_affected_cargo_checks(
     changed_files: &[String],
     already_checked: &mut BTreeSet<String>,
 ) -> CargoCommandOutcome {
-    run_affected_cargo_command(root, changed_files, already_checked, CargoSubcommand::Check).await
+    run_affected_cargo_command_with_timeout(
+        root,
+        changed_files,
+        already_checked,
+        CargoSubcommand::Check,
+        crate::tools::check_timeout(),
+    )
+    .await
 }
 
 /// Run `cargo test --quiet` for each affected package after a clean check.
@@ -485,7 +490,14 @@ pub async fn run_affected_cargo_tests(
     changed_files: &[String],
     already_tested: &mut BTreeSet<String>,
 ) -> CargoCommandOutcome {
-    run_affected_cargo_command(root, changed_files, already_tested, CargoSubcommand::Test).await
+    run_affected_cargo_command_with_timeout(
+        root,
+        changed_files,
+        already_tested,
+        CargoSubcommand::Test,
+        crate::tools::check_timeout(),
+    )
+    .await
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -502,13 +514,6 @@ impl CargoSubcommand {
         }
     }
 
-    fn timeout(self) -> Duration {
-        match self {
-            Self::Check => Duration::from_secs(CARGO_CHECK_TIMEOUT_SECS),
-            Self::Test => Duration::from_secs(PACKAGE_TEST_TIMEOUT_SECS),
-        }
-    }
-
     fn label(self) -> &'static str {
         match self {
             Self::Check => "cargo check",
@@ -517,11 +522,12 @@ impl CargoSubcommand {
     }
 }
 
-async fn run_affected_cargo_command(
+async fn run_affected_cargo_command_with_timeout(
     root: &Path,
     changed_files: &[String],
     already_ran: &mut BTreeSet<String>,
     command: CargoSubcommand,
+    timeout: Option<Duration>,
 ) -> CargoCommandOutcome {
     let rust_paths = rust_source_paths(changed_files.iter());
     if rust_paths.is_empty() {
@@ -609,7 +615,10 @@ async fn run_affected_cargo_command(
             OsString::from("--manifest-path"),
             OsString::from(&manifest_arg),
         ];
-        let execution = match runner.run_program("cargo", &args, command.timeout()).await {
+        let execution = match runner
+            .run_program_maybe_timeout("cargo", &args, timeout)
+            .await
+        {
             Ok(execution) => execution,
             Err(error) => {
                 return CargoCommandOutcome::Unavailable {
@@ -672,8 +681,6 @@ fn remove_new_cargo_lockfiles(candidates: &BTreeSet<PathBuf>, preexisting: &BTre
         }
     }
 }
-
-const POLYGLOT_CHECK_TIMEOUT_SECS: u64 = 180;
 
 /// Mid-turn typecheck/build/lint for non-Rust packages (tsc / go build / ruff).
 /// Seals share the check namespace with `cargo check` for WorkspaceRepair skip of
@@ -806,7 +813,7 @@ pub async fn run_affected_polyglot_checks(
         root,
         jobs,
         already_checked,
-        Duration::from_secs(POLYGLOT_CHECK_TIMEOUT_SECS),
+        crate::tools::check_timeout(),
         "package check",
     )
     .await
@@ -909,7 +916,7 @@ pub async fn run_affected_polyglot_tests(
         root,
         jobs,
         already_tested,
-        Duration::from_secs(PACKAGE_TEST_TIMEOUT_SECS),
+        crate::tools::check_timeout(),
         "package test",
     )
     .await
@@ -1048,7 +1055,7 @@ async fn run_polyglot_jobs(
     root: &Path,
     jobs: Vec<PackageTestJob>,
     already_ran: &mut BTreeSet<String>,
-    timeout: Duration,
+    timeout: Option<Duration>,
     pass_label: &'static str,
 ) -> CargoCommandOutcome {
     if jobs.is_empty() {
@@ -1082,7 +1089,10 @@ async fn run_polyglot_jobs(
             continue;
         }
 
-        let execution = match runner.run_program(job.program, &job.args, timeout).await {
+        let execution = match runner
+            .run_program_maybe_timeout(job.program, &job.args, timeout)
+            .await
+        {
             Ok(execution) => execution,
             Err(_error) => {
                 // Missing toolchain — skip that job (don't mark package done).
@@ -1651,11 +1661,45 @@ mod tests {
                 kind: PolyglotJobKind::Build,
             }],
             &mut seen,
-            Duration::from_millis(25),
+            Some(Duration::from_millis(25)),
             "package check",
         )
         .await;
         assert!(matches!(outcome, CargoCommandOutcome::TimedOut { .. }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn polyglot_default_without_timeout_waits_for_completion() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-poly-unbounded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut seen = BTreeSet::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_polyglot_jobs(
+                &root,
+                vec![PackageTestJob {
+                    label: "demo".into(),
+                    program: "sh",
+                    args: vec![OsString::from("-c"), OsString::from("sleep 0.05")],
+                    kind: PolyglotJobKind::Build,
+                }],
+                &mut seen,
+                None,
+                "package check",
+            ),
+        )
+        .await
+        .expect("an unlimited job still completes when its process exits");
+        assert!(matches!(outcome, CargoCommandOutcome::Passed { .. }));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1689,7 +1733,7 @@ mod tests {
                 },
             ],
             &mut seen,
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
             "package check",
         )
         .await;

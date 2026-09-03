@@ -1,10 +1,135 @@
 //! Shared leftover-work drive: classify prompts, decide enqueue vs idle,
 //! and judge whether a plan-drive turn made real progress.
 
+use std::collections::HashSet;
+
 use crate::{
     GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT, PLAN_DRIVE_PROMPT, PLAN_DRIVE_STALL_LIMIT,
     ProgressEvent, TurnStopReason,
 };
+use sha2::{Digest, Sha256};
+
+const DRIVE_EVIDENCE_REASONS: &[&str] = &["new file evidence", "new targeted search evidence"];
+
+/// Exact evidence already credited inside one structural drive scope.
+///
+/// Only fixed-size SHA-256 values are retained: raw read paths/search patterns
+/// never enter session metadata. The set deliberately does not evict entries.
+/// Pure investigation steps may keep crediting novel evidence, while cycling
+/// through any finite collection eventually stays non-novel. The lifecycle
+/// layer separately limits evidence-only orientation on implementation steps.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DriveEvidenceLedger {
+    hashes: HashSet<String>,
+}
+
+impl DriveEvidenceLedger {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    pub(crate) fn restore(&mut self, hashes: impl IntoIterator<Item = String>) {
+        self.hashes = hashes
+            .into_iter()
+            .filter(|hash| valid_drive_evidence_hash(hash))
+            .collect();
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<String> {
+        let mut hashes = self.hashes.iter().cloned().collect::<Vec<_>>();
+        hashes.sort_unstable();
+        hashes
+    }
+
+    pub(crate) fn clear(&mut self) -> bool {
+        if self.hashes.is_empty() {
+            return false;
+        }
+        self.hashes.clear();
+        true
+    }
+
+    /// Record every signed evidence event and return only hashes not previously
+    /// credited in this structural scope.
+    pub(crate) fn record_novel(&mut self, telemetry: &crate::TurnTelemetry) -> Vec<String> {
+        let mut added = Vec::new();
+        // This complete, non-diagnostic collection is not subject to progress
+        // trail head/tail compaction.
+        for hash in &telemetry.drive_evidence_hashes {
+            if valid_drive_evidence_hash(hash) && self.hashes.insert(hash.clone()) {
+                added.push(hash.clone());
+            }
+        }
+        // Compatibility/focused-test fallback for telemetry built before the
+        // dedicated complete collection was populated.
+        for event in &telemetry.progress_events {
+            if !progress_event_is_drive_evidence(event) {
+                continue;
+            }
+            let Some(signature) = event.signature.as_deref() else {
+                // A missing signature cannot prove cross-turn novelty. Valid
+                // production read/search calls always carry one; malformed
+                // calls already classify as errors rather than evidence.
+                continue;
+            };
+            let hash = hash_drive_evidence_signature(signature);
+            if self.hashes.insert(hash.clone()) {
+                added.push(hash);
+            }
+        }
+        added
+    }
+}
+
+pub(crate) fn hash_drive_evidence_signature(signature: &str) -> String {
+    format!("{:x}", Sha256::digest(signature.as_bytes()))
+}
+
+fn valid_drive_evidence_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn progress_event_is_drive_evidence(event: &ProgressEvent) -> bool {
+    event.kind == "meaningful" && DRIVE_EVIDENCE_REASONS.contains(&event.reason.as_str())
+}
+
+pub(crate) fn progress_event_is_structural_or_mutation(event: &ProgressEvent) -> bool {
+    event.kind == "meaningful"
+        && matches!(
+            event.reason.as_str(),
+            "changed plan state"
+                | "substantive edit"
+                | "successful mutation"
+                | "successful validation after mutation"
+        )
+}
+
+/// Whether read/search novelty may keep the current plan step running without
+/// any structural or workspace progress.
+///
+/// Pure investigation and validation steps can legitimately finish a turn
+/// with evidence alone. Implementation steps cannot: they get one orientation
+/// turn, tracked by the persisted evidence ledger, and subsequent read-only
+/// turns advance the semantic stall circuit even when they inspect new files.
+pub(crate) fn plan_step_allows_continual_evidence(step: Option<&str>) -> bool {
+    step.is_some_and(crate::agent::plan_goal::is_meta_milestone)
+}
+
+/// Step-aware instruction for a fresh plan-recovery epoch.
+///
+/// The recovery window retains only evidence fingerprints, not raw tool
+/// output. Say that explicitly so the model may re-read the narrow facts it
+/// needs rather than being ordered to act on context that no longer exists.
+pub(crate) fn plan_recovery_instruction(step: Option<&str>) -> &'static str {
+    if plan_step_allows_continual_evidence(step) {
+        "The preceding automatic turn did not advance this investigation or validation step. This fresh strategy epoch dropped prior tool-output contents while retaining their fingerprints for repetition detection. Use a narrower question or command, gather genuinely new targeted evidence when needed, then record a concrete conclusion or validation result and advance the plan. Re-read old evidence only when necessary; cycling through inspection alone will not count as progress."
+    } else {
+        "The preceding automatic turn only inspected and did not advance this implementation step. This fresh strategy epoch dropped prior tool-output contents while retaining their fingerprints for repetition detection. Re-read only the narrow evidence needed to act, then make the smallest safe mutation and validate it, or use a genuinely different implementation/delegation strategy. Do not reopen broad inspection."
+    }
+}
 
 /// How a prompt entered the turn loop.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -13,6 +138,29 @@ pub enum DriveKind {
     User,
     Plan,
     Goal,
+}
+
+/// Why checklist auto-drive is paused.
+///
+/// A manual pause is durable user intent and survives ordinary conversation.
+/// An interruption pause is a stop latch: it prevents an abandoned synthetic
+/// turn from restarting by itself, but the next real user turn consumes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PlanDrivePause {
+    #[default]
+    Running,
+    Manual,
+    Interrupted,
+}
+
+impl PlanDrivePause {
+    pub(crate) fn is_paused(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+
+    pub(crate) fn resumes_on_user_input(self) -> bool {
+        matches!(self, Self::Interrupted)
+    }
 }
 
 impl DriveKind {
@@ -39,15 +187,49 @@ impl DriveKind {
     }
 }
 
+/// Whether a settled outcome must stop autonomous plan/goal driving until the
+/// user explicitly intervenes.
+///
+/// A landed mutation can be useful even when verification is unavailable, and
+/// explicitly configured per-turn caps intentionally split work across turns.
+/// Those outcomes remain resumable. Actual verification/review failures and
+/// every cancellation, block, infrastructure failure, or no-progress stop are
+/// fail-closed.
+pub(crate) fn outcome_blocks_automatic_drive(outcome: &crate::TurnOutcome) -> bool {
+    if matches!(
+        outcome.status,
+        crate::TurnStatus::Cancelled | crate::TurnStatus::Blocked
+    ) || matches!(
+        outcome.stop_reason,
+        TurnStopReason::Cancelled
+            | TurnStopReason::TurnLimit
+            | TurnStopReason::InfrastructureFailure
+            | TurnStopReason::NoProgress
+    ) {
+        return true;
+    }
+    if outcome.status != crate::TurnStatus::Failed {
+        return false;
+    }
+    match outcome.stop_reason {
+        TurnStopReason::VerificationUnavailable => outcome.changed_files.is_empty(),
+        TurnStopReason::StepLimit | TurnStopReason::ToolLimit | TurnStopReason::TimeLimit => false,
+        _ => true,
+    }
+}
+
 /// Why plan auto-drive is not enqueueing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanDriveIdleReason {
     NoLeftover,
     PlanMode,
+    ApprovalParked,
     Paused,
     Parked,
     GoalDriving,
     Cancelled,
+    Blocked,
+    NoProgress,
     Infrastructure,
 }
 
@@ -93,6 +275,11 @@ impl PlanDriveAction {
                     reason: PlanDriveIdleReason::Infrastructure,
                 };
             }
+            Some(TurnStopReason::NoProgress) => {
+                return Self::Idle {
+                    reason: PlanDriveIdleReason::NoProgress,
+                };
+            }
             _ => {}
         }
         if !plan_incomplete {
@@ -134,11 +321,14 @@ impl PlanDriveAction {
 pub enum DriveIdleReason {
     None,
     PlanMode,
+    PlanApprovalParked,
     GoalPaused,
     GoalParked,
     PlanPaused,
     PlanParked,
     Cancelled,
+    Blocked,
+    NoProgress,
     Infrastructure,
 }
 
@@ -203,6 +393,11 @@ impl DriveAction {
                 reason: DriveIdleReason::PlanMode,
             },
             PlanDriveAction::Idle {
+                reason: PlanDriveIdleReason::ApprovalParked,
+            } => Self::Idle {
+                reason: DriveIdleReason::PlanApprovalParked,
+            },
+            PlanDriveAction::Idle {
                 reason: PlanDriveIdleReason::Paused,
             } => Self::Idle {
                 reason: DriveIdleReason::PlanPaused,
@@ -218,6 +413,16 @@ impl DriveAction {
                 reason: DriveIdleReason::Cancelled,
             },
             PlanDriveAction::Idle {
+                reason: PlanDriveIdleReason::Blocked,
+            } => Self::Idle {
+                reason: DriveIdleReason::Blocked,
+            },
+            PlanDriveAction::Idle {
+                reason: PlanDriveIdleReason::NoProgress,
+            } => Self::Idle {
+                reason: DriveIdleReason::NoProgress,
+            },
+            PlanDriveAction::Idle {
                 reason: PlanDriveIdleReason::Infrastructure,
             } => Self::Idle {
                 reason: DriveIdleReason::Infrastructure,
@@ -231,8 +436,9 @@ impl DriveAction {
     }
 }
 
-/// Consecutive synthetic drive turns in one-shot before the loop stops.
-pub const ONE_SHOT_DRIVE_TURN_LIMIT: u32 = 32;
+/// Unlimited sentinel for one-shot synthetic drive turns. Fault/no-progress
+/// guards still park a stuck drive; productive work has no default turn count.
+pub const ONE_SHOT_DRIVE_TURN_LIMIT: u32 = u32::MAX;
 
 /// Live goal-drive status for `/goal status` and report JSON.
 pub fn goal_drive_status(goal_leftover: bool, paused: bool, stall: u32) -> &'static str {
@@ -247,7 +453,7 @@ pub fn goal_drive_status(goal_leftover: bool, paused: bool, stall: u32) -> &'sta
     }
 }
 
-/// Park copy when goal-drive stalls out. Never suggests `/retry`.
+/// Park copy when goal-drive runs out of useful progress. Never suggests `/retry`.
 pub fn goal_drive_park_message(leftover: Option<&str>) -> String {
     format!(
         "goal drive parked: {}",
@@ -258,14 +464,14 @@ pub fn goal_drive_park_message(leftover: Option<&str>) -> String {
 /// Copy when a stuck goal step is skipped so the rest of the plan can drive.
 pub fn goal_drive_skip_message(failed: &str, next: Option<&str>) -> String {
     match next {
-        Some(next) => format!("goal step stalled — skipped `{failed}`; driving `{next}`"),
-        None => format!("goal step stalled — skipped `{failed}`"),
+        Some(next) => format!("goal step made no progress — skipped `{failed}`; driving `{next}`"),
+        None => format!("goal step made no progress — skipped `{failed}`"),
     }
 }
 
-/// Copy when stall-skipped steps are queued for another pass.
+/// Copy when no-progress steps are queued for another pass.
 pub fn goal_drive_requeue_message(count: usize) -> String {
-    format!("goal drive: {count} stalled step(s) queued for a second pass")
+    format!("goal drive: {count} no-progress step(s) queued for a second pass")
 }
 
 /// Result of recording whether a goal-drive turn made progress.
@@ -275,8 +481,8 @@ pub enum GoalDriveProgress {
     Unchanged,
     /// Stall counter reset after real progress.
     Reset,
-    /// No progress; stall is still below the park/skip limit.
-    Stalled { stall: u32 },
+    /// No progress; the retry count is still below the park/skip limit.
+    NoProgress { count: u32 },
     /// The stuck step was skipped; the next pending step is now active.
     Skipped {
         failed: String,
@@ -306,18 +512,26 @@ const PLAN_DRIVE_PROGRESS_REASONS: &[&str] = &[
     "substantive edit",
     "successful mutation",
     "successful validation after mutation",
+    // Investigation is productive work too. These labels are novel inside one
+    // turn; Agent's drive evidence ledger enforces novelty across turns.
+    "new file evidence",
+    "new targeted search evidence",
 ];
 
-/// Whether a goal-drive turn made real progress: the structured goal changed
-/// in a way that counts as drive work, or files were edited. File edits must
-/// count even when the model never called `update_plan` — otherwise a
-/// productive cap/resume turn parks on the next "already done" text answer.
+pub(crate) fn progress_event_counts_as_plan_drive(event: &ProgressEvent) -> bool {
+    event.kind == "meaningful" && PLAN_DRIVE_PROGRESS_REASONS.contains(&event.reason.as_str())
+}
+
+/// Turn-local goal progress classifier. Multi-turn frontends must use
+/// [`crate::Agent::goal_drive_turn_made_progress`] so read/search novelty is
+/// checked against the session's persisted structural scope.
 pub fn goal_drive_made_progress(
     before: Option<&crate::Goal>,
     after: Option<&crate::Goal>,
+    telemetry: &[ProgressEvent],
     changed_files: &[String],
 ) -> bool {
-    if !changed_files.is_empty() {
+    if !changed_files.is_empty() || telemetry.iter().any(progress_event_counts_as_plan_drive) {
         return true;
     }
     match (after, before) {
@@ -326,10 +540,8 @@ pub fn goal_drive_made_progress(
     }
 }
 
-/// Whether a plan-drive turn made real progress: the next step identity
-/// changed, a mutation landed, or a plan-state meaningful event fired.
-/// Reads classified as meaningful (`new file evidence`, `new targeted search
-/// evidence`) do not count.
+/// Turn-local plan progress classifier. Multi-turn frontends must use
+/// [`crate::Agent::plan_drive_turn_made_progress`] for cross-turn novelty.
 pub fn plan_drive_made_progress(
     before_step: Option<&str>,
     after_step: Option<&str>,
@@ -342,9 +554,7 @@ pub fn plan_drive_made_progress(
     if !changed_files.is_empty() {
         return true;
     }
-    telemetry.iter().any(|event| {
-        event.kind == "meaningful" && PLAN_DRIVE_PROGRESS_REASONS.contains(&event.reason.as_str())
-    })
+    telemetry.iter().any(progress_event_counts_as_plan_drive)
 }
 
 /// Consecutive no-progress plan-drive turns. Any user turn or a progress
@@ -516,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_drive_progress_ignores_read_evidence() {
+    fn drive_progress_counts_novel_read_evidence() {
         let read = [ProgressEvent {
             kind: "meaningful".into(),
             reason: "new file evidence".into(),
@@ -527,7 +737,7 @@ mod tests {
             reason: "substantive edit".into(),
             signature: None,
         }];
-        assert!(!plan_drive_made_progress(
+        assert!(plan_drive_made_progress(
             Some("a"),
             Some("a"),
             &read,
@@ -553,17 +763,119 @@ mod tests {
         ));
         let goal = crate::Goal::new("ship", vec!["a".into(), "b".into()]);
         assert!(
-            goal_drive_made_progress(Some(&goal), Some(&goal), &["crates/api/src/lib.rs".into()]),
+            goal_drive_made_progress(
+                Some(&goal),
+                Some(&goal),
+                &[],
+                &["crates/api/src/lib.rs".into()]
+            ),
             "file edits count as goal-drive progress even when the goal state is unchanged"
         );
         assert!(
-            !goal_drive_made_progress(Some(&goal), Some(&goal), &[]),
+            goal_drive_made_progress(Some(&goal), Some(&goal), &read, &[]),
+            "novel read evidence counts as goal-drive progress"
+        );
+        assert!(
+            !goal_drive_made_progress(Some(&goal), Some(&goal), &[], &[]),
             "an unchanged goal with no file edits is a stall"
         );
         assert_eq!(next_plan_drive_stall(true, false, 3), 4);
         let parked = plan_drive_park_message(Some("1/2 remaining — wire the scheduler"));
         assert!(parked.contains("1/2 remaining — wire the scheduler"));
         assert!(!parked.contains("/retry"));
+    }
+
+    #[test]
+    fn productive_investigation_can_continue_past_the_stall_threshold() {
+        let goal = crate::Goal::new("ship", vec!["investigate".into()]);
+        let mut plan_stall = PLAN_DRIVE_STALL_LIMIT.saturating_sub(1);
+        let mut goal_stall = GOAL_DRIVE_STALL_LIMIT.saturating_sub(1);
+
+        for turn in 0..8 {
+            let evidence = [ProgressEvent {
+                kind: "meaningful".into(),
+                reason: if turn % 2 == 0 {
+                    "new file evidence".into()
+                } else {
+                    "new targeted search evidence".into()
+                },
+                signature: Some(format!("turn-{turn}")),
+            }];
+            plan_stall = next_plan_drive_stall(
+                true,
+                plan_drive_made_progress(Some("investigate"), Some("investigate"), &evidence, &[]),
+                plan_stall,
+            );
+            goal_stall = if goal_drive_made_progress(Some(&goal), Some(&goal), &evidence, &[]) {
+                0
+            } else {
+                goal_stall.saturating_add(1)
+            };
+            assert_eq!(plan_stall, 0, "plan drive parked on productive turn {turn}");
+            assert_eq!(goal_stall, 0, "goal drive parked on productive turn {turn}");
+        }
+
+        assert_eq!(plan_drive_status(true, false, plan_stall), "running");
+        assert_eq!(goal_drive_status(true, false, goal_stall), "running");
+    }
+
+    #[test]
+    fn recovery_instruction_is_step_aware_and_truthful_about_retention() {
+        let implementation = plan_recovery_instruction(Some("Implement the parser"));
+        assert!(implementation.contains("make the smallest safe mutation"));
+        assert!(implementation.contains("dropped prior tool-output contents"));
+        assert!(implementation.contains("retaining their fingerprints"));
+
+        let investigation = plan_recovery_instruction(Some("Audit build logs"));
+        assert!(investigation.contains("concrete conclusion or validation result"));
+        assert!(investigation.contains("dropped prior tool-output contents"));
+        assert!(!investigation.contains("make the smallest safe mutation"));
+    }
+
+    #[test]
+    fn evidence_ledger_does_not_evict_and_recredit_a_finite_cycle() {
+        let mut ledger = DriveEvidenceLedger::default();
+        let mut telemetry = crate::TurnTelemetry {
+            drive_evidence_hashes: (0..300)
+                .map(|index| hash_drive_evidence_signature(&format!("read:file-{index}")))
+                .collect(),
+            ..crate::TurnTelemetry::default()
+        };
+        assert_eq!(ledger.record_novel(&telemetry).len(), 300);
+
+        telemetry.drive_evidence_hashes = vec![
+            hash_drive_evidence_signature("read:file-0"),
+            hash_drive_evidence_signature("read:file-299"),
+        ];
+        assert!(
+            ledger.record_novel(&telemetry).is_empty(),
+            "crossing the former bounded-ledger size must not recredit old evidence"
+        );
+    }
+
+    #[test]
+    fn unlimited_retry_bookkeeping_still_reaches_the_no_progress_stall_guard() {
+        let mut goal = crate::Goal::new("ship", vec!["fix the failing check".into()]);
+        let mut stall = 0;
+
+        for attempt in 1..=GOAL_DRIVE_STALL_LIMIT {
+            let before = goal.clone();
+            assert!(goal.record_failure(
+                format!("failed attempt {attempt}"),
+                crate::DEFAULT_SUBGOAL_RETRIES,
+            ));
+            let made_progress = goal_drive_made_progress(Some(&before), Some(&goal), &[], &[]);
+            assert!(
+                !made_progress,
+                "attempt counters and notes are diagnostics, not productive evidence"
+            );
+            stall = next_plan_drive_stall(true, made_progress, stall);
+        }
+
+        assert_eq!(stall, GOAL_DRIVE_STALL_LIMIT);
+        assert_eq!(goal_drive_status(true, false, stall), "parked");
+        assert_eq!(goal.status, crate::GoalStatus::Active);
+        assert_eq!(goal.sub_goals[0].attempts, GOAL_DRIVE_STALL_LIMIT);
     }
 
     #[test]

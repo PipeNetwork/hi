@@ -65,55 +65,80 @@ async fn explore_missing_task_errors() {
     assert_eq!(agent.subagents.explore_subagents_used, 0);
 }
 
-#[tokio::test]
-async fn explore_respects_turn_budget() {
+#[test]
+fn explore_default_remains_unlimited_when_counters_saturate() {
     let mut agent = agent(Vec::new(), explore_config());
-    agent.subagents.explore_turn_used = crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN;
-    let mut ui = NullUi;
-    let out = agent
-        .handle_explore(r#"{"task":"anything"}"#, &mut ui)
-        .await;
-    assert_eq!(out.status, hi_tools::ToolStatus::Denied);
-    assert!(
-        out.content.contains("budget exhausted"),
-        "got: {}",
-        out.content
-    );
-    // Cap is not exceeded (no model call was made).
+    agent.subagents.explore_turn_used = u32::MAX - 1;
+    agent.subagents.explore_subagents_used = u32::MAX - 1;
+
     assert_eq!(
-        agent.subagents.explore_turn_used,
-        crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN
+        agent
+            .subagents
+            .try_begin_explore(crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN),
+        Some(u32::MAX),
+        "the unlimited sentinel must never become a quota at counter saturation"
     );
-    // The budget is per-turn: a new turn refills it while lifetime slot
-    // numbering keeps counting up.
-    agent.subagents.begin_turn();
-    assert_eq!(agent.subagents.explore_turn_used, 0);
+    assert_eq!(
+        agent
+            .subagents
+            .try_begin_explore(crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN),
+        Some(u32::MAX),
+        "saturated accounting must stay non-wrapping and non-blocking"
+    );
+    assert_eq!(agent.subagents.explore_turn_used, u32::MAX);
+    assert_eq!(agent.subagents.explore_subagents_used, u32::MAX);
+}
+
+#[test]
+fn explore_accounting_still_honors_an_explicit_finite_limit() {
+    let mut agent = agent(Vec::new(), explore_config());
+    agent.subagents.explore_turn_used = 7;
+    assert_eq!(agent.subagents.try_begin_explore(7), None);
+    assert_eq!(agent.subagents.explore_turn_used, 7);
+}
+
+#[test]
+fn explore_child_preserves_project_context_past_the_old_boundary() {
+    let project_context = format!("{}FINAL CONTEXT RULE", "context ".repeat(600));
+    let mut cfg = explore_config();
+    cfg.memory.project_context = Some(project_context.clone());
+    let mut agent = agent(Vec::new(), cfg);
+
+    let job = agent
+        .prepare_explore(r#"{"task":"inspect the relevant implementation"}"#)
+        .expect("explore job");
+
+    assert_eq!(
+        job.child_config.memory.project_context.as_deref(),
+        Some(project_context.as_str())
+    );
+    assert!(
+        job.child_config
+            .memory
+            .project_context
+            .as_deref()
+            .is_some_and(|context| context.ends_with("FINAL CONTEXT RULE"))
+    );
 }
 
 #[tokio::test]
-async fn run_turn_refills_the_explore_budget_each_turn() {
-    // Regression (user-reported on an old build): "explore budget exhausted
-    // (8 subagents this session)" — the budget was session-scoped, so a long
-    // session permanently lost the explore tool. The cap is a per-turn
-    // runaway guard: `run_turn` itself must refill it at turn start, not
-    // just `SubagentSessionState::begin_turn` in isolation.
+async fn run_turn_resets_per_turn_explore_accounting() {
     let mut agent = agent(
         vec![completion(vec![Content::Text("ok".into())], 1, 1)],
         explore_config(),
     );
-    agent.subagents.explore_turn_used = crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN;
-    agent.subagents.explore_subagents_used = crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN;
+    agent.subagents.explore_turn_used = 37;
+    agent.subagents.explore_subagents_used = 37;
     let mut ui = NullUi;
 
     agent.run_turn("say ok", &mut ui).await.unwrap();
 
     assert_eq!(
         agent.subagents.explore_turn_used, 0,
-        "a new turn starts with a full explore budget"
+        "a new turn resets explicit-quota accounting"
     );
     assert_eq!(
-        agent.subagents.explore_subagents_used,
-        crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN,
+        agent.subagents.explore_subagents_used, 37,
         "lifetime slot numbering is preserved across turns"
     );
 }

@@ -22,22 +22,34 @@ fn sse_with_usage(text: &str) -> String {
 }
 
 /// A temp dir that removes itself on drop (so a panicking test doesn't leak it).
-struct TempDir(PathBuf);
+struct TempDir {
+    root: PathBuf,
+    workspace: PathBuf,
+}
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("hi-e2e-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
+        let root = std::env::temp_dir().join(format!("hi-e2e-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        Self { root, workspace }
     }
     fn path(&self) -> &Path {
-        &self.0
+        &self.workspace
     }
 }
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+fn isolated_home(workspace: &Path) -> PathBuf {
+    workspace
+        .parent()
+        .expect("test workspace should have a temp root")
+        .join("home")
 }
 
 /// Run the `hi` binary in `dir`, pointed at `server_url`, driving the `--plain`
@@ -45,7 +57,10 @@ impl Drop for TempDir {
 fn run_hi(dir: &Path, server_url: &str, extra_args: &[&str], stdin_script: &str) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_hi"))
         .current_dir(dir)
-        .env("HOME", dir) // isolate config + session storage from the real home
+        // Keep user-scoped state outside the workspace. Otherwise trace/session
+        // bookkeeping looks like a candidate mutation and creates a spurious
+        // verification obligation in these CLI behavior tests.
+        .env("HOME", isolated_home(dir))
         .env("HI_MODEL", "fake/model")
         .env("HI_BASE_URL", server_url)
         .env("HI_API_KEY", "test")
@@ -75,7 +90,7 @@ fn run_hi_one_shot_output(
 ) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_hi"))
         .current_dir(dir)
-        .env("HOME", dir)
+        .env("HOME", isolated_home(dir))
         .env("HI_MODEL", "fake/model")
         .env("HI_BASE_URL", server_url)
         .env("HI_API_KEY", "test")
@@ -135,12 +150,12 @@ fn one_shot_report_creates_parent_directories() {
 }
 
 #[test]
-fn review_repair_report_contains_stall_telemetry() {
+fn review_repair_report_settles_without_obsolete_failure_states() {
     let weak_review = "The repository looks healthy and organized.";
     // Surplus responses: the weak review triggers 4 quality-repair nudges
     // plus keep-working recoveries (14 model calls total), all served by this
     // one fake server. Extra responses sit unused but prevent a dead-connection
-    // error that would mask the real incomplete-review exit code.
+    // error that would mask the settled review outcome.
     let Some(server) = FakeOpenAiServer::new(
         (0..20)
             .map(|_| Response::sse(sse_with_usage(weak_review)))
@@ -167,8 +182,8 @@ fn review_repair_report_contains_stall_telemetry() {
     );
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "incomplete review must fail\nstdout: {}\nstderr: {}",
+        Some(0),
+        "bounded review repair should settle normally\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -181,7 +196,9 @@ fn review_repair_report_contains_stall_telemetry() {
     let visible_lower = visible.to_ascii_lowercase();
     assert!(
         !visible_lower.contains("insufficient evidence")
-            && !visible_lower.contains("quality_rejected"),
+            && !visible_lower.contains("quality_rejected")
+            && !visible_lower.contains("incomplete")
+            && !visible_lower.contains("stalled"),
         "review repair text should not leak visibly:\n{visible}"
     );
     let bodies = server.bodies();
@@ -204,12 +221,10 @@ fn review_repair_report_contains_stall_telemetry() {
 
     let text = std::fs::read_to_string(&report).expect("report should be written");
     let json: serde_json::Value = serde_json::from_str(&text).expect("report json");
+    assert_eq!(json["outcome"]["status"], "completed");
+    assert_eq!(json["outcome"]["stop_reason"], "no_applicable_verification");
     let telemetry = &json["telemetry"];
     assert_eq!(telemetry["quality_repair_nudges"], 4);
-    assert_eq!(
-        telemetry["last_stall_reason"],
-        "review_listing_only_exhausted"
-    );
     assert_eq!(
         telemetry["review_repair_exhaustion_reason"],
         "review_listing_only_exhausted"
@@ -217,8 +232,11 @@ fn review_repair_report_contains_stall_telemetry() {
     assert_eq!(telemetry["review_repair_counts"]["review_listing_only"], 4);
     assert_eq!(telemetry["review_repair_stopped_by_exhaustion"], true);
     assert_eq!(telemetry["stopped_by_step_cap"], false);
-    assert_eq!(telemetry["stalled_unfinished"], true);
+    assert_eq!(telemetry["stopped_by_tool_cap"], false);
+    assert!(telemetry.get("stalled_unfinished").is_none());
+    assert!(telemetry.get("stalled_repeating").is_none());
     assert_eq!(telemetry["hit_step_cap"], false);
+    assert_eq!(telemetry["hit_tool_cap"], false);
     assert!(telemetry["progress_events"].is_array());
     assert!(telemetry["tool_timeline"].is_array());
     assert!(
@@ -235,12 +253,9 @@ fn review_repair_report_contains_stall_telemetry() {
 fn memory_distills_at_quit_and_reloads_next_session() {
     // Round 1: an explicit user preference remains eligible for memory even
     // without a verifier-backed mutation, followed by quit-time distillation.
-    // The turn consumes two model calls (the prose reply plus a
-    // verification-obligation nudge from the bookkeeping state writes); the
-    // distillation needs its own response, so stock two usage-bearing turn
-    // responses then the cargo-fmt distillation text.
+    // User-scoped bookkeeping lives outside the workspace, so the turn consumes
+    // one model call and quit-time distillation consumes the second.
     let Some(server1) = FakeOpenAiServer::new(vec![
-        Response::sse(sse_with_usage("Done — fixed it.")),
         Response::sse(sse_with_usage("Done — fixed it.")),
         Response::sse(sse_text("- always run cargo fmt before commits")),
     ]) else {

@@ -12,9 +12,6 @@ use crate::decision::Decision;
 use crate::memory::{self, MEMORY_MAX_CHARS};
 use crate::verify::VerificationExecution;
 
-/// Cap auto-recorded coding facts per session (decision log also caps at 12).
-pub(crate) const MAX_CODING_FACTS_PER_SESSION: u32 = 8;
-
 /// Inputs from one green, file-changing turn.
 pub(crate) struct CodingFactInput<'a> {
     pub changed_files: &'a [String],

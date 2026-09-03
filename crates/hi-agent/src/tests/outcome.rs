@@ -17,12 +17,20 @@ struct CancelDuringSuggestionProvider {
     calls: std::sync::atomic::AtomicUsize,
 }
 
+struct HangAfterMainProvider {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
 struct DecisionReplacementSession {
     decisions: std::sync::Arc<Mutex<DecisionLog>>,
 }
 
 struct OutcomeRecordingSession {
     outcomes: std::sync::Arc<Mutex<Vec<TurnOutcome>>>,
+}
+
+struct PlanPauseOrderSession {
+    records: std::sync::Arc<Mutex<Vec<String>>>,
 }
 
 impl SessionSink for DecisionReplacementSession {
@@ -55,6 +63,42 @@ impl SessionSink for OutcomeRecordingSession {
         _: Option<&str>,
     ) -> anyhow::Result<()> {
         self.outcomes.lock().unwrap().push(outcome.clone());
+        Ok(())
+    }
+}
+
+impl SessionSink for PlanPauseOrderSession {
+    fn record(&mut self, _: &[Message], _: Usage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _: &[Message]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_state_replacement(
+        &mut self,
+        _: &[Message],
+        _: Option<&Goal>,
+        _: &DecisionLog,
+        _: &[PlanStep],
+    ) -> anyhow::Result<()> {
+        self.records.lock().unwrap().push("rewind".into());
+        Ok(())
+    }
+
+    fn record_plan_drive_state_with_policy(
+        &mut self,
+        paused: bool,
+        _: u32,
+        resume_on_user_input: bool,
+        _: bool,
+        _: &[String],
+    ) -> anyhow::Result<()> {
+        self.records
+            .lock()
+            .unwrap()
+            .push(format!("pause:{paused}:{resume_on_user_input}"));
         Ok(())
     }
 }
@@ -123,6 +167,11 @@ struct CancelAfterToolUi {
     fired: bool,
 }
 
+struct CancelAfterToolCountUi {
+    cancellation: TurnCancellation,
+    remaining: usize,
+}
+
 impl Ui for CancelAfterToolUi {
     fn assistant_text(&mut self, _: &str) {}
     fn assistant_reasoning(&mut self, _: &str) {}
@@ -131,6 +180,34 @@ impl Ui for CancelAfterToolUi {
     fn tool_result(&mut self, _: &str, _: &str) {
         if !self.fired {
             self.fired = true;
+            self.cancellation.cancel();
+        }
+    }
+    fn status(&mut self, _: &str) {}
+    fn turn_end(&mut self, _: &str) {}
+}
+
+impl Ui for CancelAfterToolCountUi {
+    fn assistant_text(&mut self, _: &str) {}
+    fn assistant_reasoning(&mut self, _: &str) {}
+    fn assistant_end(&mut self) {}
+    fn tool_call(&mut self, _: &str, _: &str) {}
+    fn tool_result(&mut self, _: &str, _: &str) {
+        self.remaining = self.remaining.saturating_sub(1);
+        if self.remaining == 0 {
+            self.cancellation.cancel();
+        }
+    }
+    fn plan_result_id(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: hi_tools::ToolStatus,
+        _: &[PlanStep],
+    ) {
+        self.remaining = self.remaining.saturating_sub(1);
+        if self.remaining == 0 {
             self.cancellation.cancel();
         }
     }
@@ -184,6 +261,23 @@ impl Provider for CancelDuringSuggestionProvider {
                 self.cancellation.cancel();
                 std::future::pending().await
             }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for HangAfterMainProvider {
+    async fn stream(
+        &self,
+        _request: ChatRequest,
+        _sink: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> anyhow::Result<Completion> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Ok(completion(vec![Content::Text("done".into())], 1, 1))
+        } else {
+            // Simulate a provider whose primary response completed but whose
+            // optional next-prompt request never produces a response.
+            std::future::pending().await
         }
     }
 }
@@ -357,7 +451,7 @@ async fn ambiguous_question_answered_in_text_completes() {
 
     // "how …" is not a recognized read-only opener, so the contract intent
     // defaults to mutation-capable. Answering it with text and no file
-    // changes must still complete rather than report "incomplete · stalled".
+    // changes must still complete after the bounded implementation challenge.
     let outcome = agent
         .run_turn(
             "how do users use it? does that build hi-mlx or turn on automatically?",
@@ -375,11 +469,9 @@ async fn ambiguous_question_answered_in_text_completes() {
 }
 
 #[tokio::test]
-async fn explicit_mutation_request_without_changes_is_stalled() {
+async fn explicit_mutation_request_without_changes_settles_with_the_available_answer() {
     // Explicit mutation turns now share the implementation no-change cascade
-    // (two edit nudges) before branding incomplete · stalled. A single
-    // text-only diagnosis used to skip repair entirely and stall only at
-    // classify — with zero mid-loop incomplete status.
+    // (two edit nudges) before accepting the available user-visible answer.
     let workspace = IsolatedWorkspace::new("outcome-explicit-no-changes");
     let mut agent = agent(
         vec![
@@ -411,22 +503,27 @@ async fn explicit_mutation_request_without_changes_is_stalled() {
 
     let outcome = agent.run_turn("fix the parser bug", &mut ui).await.unwrap();
 
-    assert_eq!(outcome.status, TurnStatus::Incomplete);
-    assert_eq!(outcome.stop_reason, TurnStopReason::Stalled);
-    assert!(
-        agent.last_turn_telemetry().stalled_unfinished,
-        "cascade exhaustion must set stalled_unfinished mid-loop"
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.verification, VerificationStatus::NotApplicable);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
     );
     assert_eq!(
         agent.last_turn_telemetry().continue_nudges,
         2,
-        "two no-change repair continues before stall"
+        "two no-change repair continues before bounded settlement"
     );
     assert!(
+        ui.statuses.iter().any(|s| s.contains("no file changes")),
+        "expected no-change repair status, got: {:?}",
         ui.statuses
-            .iter()
-            .any(|s| s.contains("no file changes") || s.contains("turn stopped incomplete")),
-        "expected no-change repair / incomplete status, got: {:?}",
+    );
+    assert!(
+        !ui.statuses.iter().any(|status| {
+            status.contains("incomplete") || status.to_ascii_lowercase().contains("stalled")
+        }),
+        "no-change repair must not manufacture a legacy terminal state: {:?}",
         ui.statuses
     );
 }
@@ -441,7 +538,10 @@ async fn conversational_greenfield_request_cannot_complete_without_work() {
             1,
         )
     };
-    let mut agent = agent(vec![generic(), generic(), generic()], workspace.config());
+    let mut agent = agent(
+        vec![generic(), generic(), generic(), generic()],
+        workspace.config(),
+    );
     let mut ui = RecordingUi::default();
 
     let outcome = agent
@@ -455,8 +555,11 @@ async fn conversational_greenfield_request_cannot_complete_without_work() {
         .await
         .unwrap();
 
-    assert_eq!(outcome.status, TurnStatus::Incomplete);
-    assert_eq!(outcome.stop_reason, TurnStopReason::Stalled);
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
     assert!(
         ui.statuses
             .iter()
@@ -467,19 +570,8 @@ async fn conversational_greenfield_request_cannot_complete_without_work() {
 }
 
 #[tokio::test]
-async fn explicit_cargo_test_request_requires_an_observed_successful_command() {
+async fn explicit_validation_request_requires_an_observed_successful_command() {
     let workspace = IsolatedWorkspace::new("outcome-explicit-validation");
-    std::fs::create_dir_all(workspace.path("src")).unwrap();
-    std::fs::write(
-        workspace.path("Cargo.toml"),
-        "[package]\nname = \"validation_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    std::fs::write(
-        workspace.path("src/lib.rs"),
-        "pub fn ok() -> bool { true }\n",
-    )
-    .unwrap();
 
     let mut agent = agent(
         vec![
@@ -488,9 +580,9 @@ async fn explicit_cargo_test_request_requires_an_observed_successful_command() {
                 1,
                 1,
             ),
-            bash_completion("cargo test --quiet"),
+            bash_completion("true # validate"),
             completion(
-                vec![Content::Text("`cargo test --quiet` passed.".into())],
+                vec![Content::Text("The requested validation passed.".into())],
                 1,
                 1,
             ),
@@ -501,7 +593,7 @@ async fn explicit_cargo_test_request_requires_an_observed_successful_command() {
 
     let outcome = agent
         .run_turn(
-            "Run cargo test --quiet to verify the agent seeding changes compile and pass.",
+            "Run cargo test --quiet before reporting that the work passes.",
             &mut ui,
         )
         .await
@@ -570,8 +662,8 @@ async fn tool_using_turn_with_explicit_noop_answer_completes_after_challenge() {
         TurnStopReason::NoApplicableVerification
     );
     assert!(
-        !agent.last_turn_telemetry().stalled_unfinished,
-        "an unchallenged informed answer must not be branded stalled"
+        agent.last_turn_telemetry().no_progress_streak == 0,
+        "an unchallenged informed answer must not accumulate no-progress state"
     );
 }
 
@@ -613,8 +705,8 @@ async fn no_change_challenge_accepts_explicit_decline() {
         TurnStopReason::NoApplicableVerification
     );
     assert!(
-        !agent.last_turn_telemetry().stalled_unfinished,
-        "an accepted decline must not be branded stalled"
+        agent.last_turn_telemetry().no_progress_streak == 0,
+        "an accepted decline must not accumulate no-progress state"
     );
     assert_eq!(
         agent.last_turn_telemetry().continue_nudges,
@@ -697,15 +789,14 @@ async fn leftover_goal_rejects_explicit_mutation_decline() {
 
 #[tokio::test]
 async fn explicit_mutation_text_only_gets_edit_repair_then_lands() {
-    // Live fingerprint: "fix …" + text diagnosis used to print
-    // "verification skipped — no files changed" then incomplete · stalled
-    // without ever forcing an edit. The cascade must nudge, then accept a
-    // write and complete.
+    // Live fingerprint: "fix …" + text diagnosis used to settle without ever
+    // forcing an edit. The cascade must nudge, then accept a write and complete.
     let workspace = IsolatedWorkspace::new("outcome-explicit-repair-lands");
     std::fs::create_dir_all(workspace.path("src")).unwrap();
     std::fs::write(workspace.path("src/parser.rs"), "fn parse() {}\n").unwrap();
     let mut cfg = workspace.config();
     cfg.gates.verification = crate::VerificationMode::Disabled;
+    cfg.gates.allow_unverified = true;
     let mut agent = agent(
         vec![
             completion(
@@ -726,26 +817,20 @@ async fn explicit_mutation_text_only_gets_edit_repair_then_lands() {
     let outcome = agent.run_turn("fix the parser bug", &mut ui).await.unwrap();
 
     assert_eq!(outcome.status, TurnStatus::Completed);
-    assert_eq!(
-        outcome.stop_reason,
-        TurnStopReason::NoApplicableVerification
-    );
+    assert_eq!(outcome.verification, VerificationStatus::Unverified);
+    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationUnavailable);
     assert!(
-        !agent.last_turn_telemetry().stalled_unfinished,
-        "successful write must not leave the turn unfinished"
+        agent.last_turn_telemetry().no_progress_streak == 0,
+        "successful write must not leave no-progress state behind"
     );
     assert!(
         ui.statuses.iter().any(|s| s.contains("no file changes")),
         "expected no-change repair nudge before the write, got: {:?}",
         ui.statuses
     );
-    assert!(
-        !ui.statuses
-            .iter()
-            .any(|s| s.contains("turn stopped incomplete")),
-        "must not hard-stop incomplete after the edit lands: {:?}",
-        ui.statuses
-    );
+    assert!(!ui.statuses.iter().any(|status| {
+        status.contains("incomplete") || status.to_ascii_lowercase().contains("stalled")
+    }));
 }
 
 #[tokio::test]
@@ -845,9 +930,9 @@ async fn public_rsi_skips_local_read_only_preflight() {
 
 #[tokio::test]
 async fn mutation_without_verify_pipeline_is_not_applicable_not_unverified() {
-    // Empty auto-detect workspace: no Cargo.toml/package.json/etc. A successful
-    // mutation must not scream "incomplete · unverified changes" — there were
-    // never any checks to run. That is `NotApplicable` / completed.
+    // Empty auto-detect workspace: no Cargo.toml/package.json/etc. After the
+    // model directly validates the mutation, there is no remaining applicable
+    // pipeline stage. That is `NotApplicable` / completed.
     let workspace = IsolatedWorkspace::new("outcome-no-pipeline-mutation");
     let path = "created.rs";
     let write = completion(
@@ -859,14 +944,17 @@ async fn mutation_without_verify_pipeline_is_not_applicable_not_unverified() {
         1,
         1,
     );
+    let smoke = bash_completion("true # validate");
     let done = completion(vec![Content::Text("done".into())], 1, 1);
-    let mut agent = agent(vec![write, done], workspace.config());
+    let mut cfg = workspace.config();
+    cfg.gates.verification = VerificationMode::Auto;
+    let mut agent = agent(vec![write, smoke, done], cfg);
 
     let outcome = agent
         .run_turn("create the file", &mut NullUi)
         .await
         .unwrap();
-    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.status, TurnStatus::Completed, "{outcome:#?}");
     assert_eq!(outcome.verification, VerificationStatus::NotApplicable);
     assert_eq!(
         outcome.stop_reason,
@@ -876,7 +964,7 @@ async fn mutation_without_verify_pipeline_is_not_applicable_not_unverified() {
 }
 
 #[tokio::test]
-async fn disabled_verification_mutation_is_not_applicable() {
+async fn disabled_verification_mutation_is_unverified_and_failed_by_default() {
     let workspace = IsolatedWorkspace::new("outcome-disabled-verify-mutation");
     let path = "created.rs";
     let mut cfg = workspace.config();
@@ -897,19 +985,49 @@ async fn disabled_verification_mutation_is_not_applicable() {
         .run_turn("create the file", &mut NullUi)
         .await
         .unwrap();
-    assert_eq!(outcome.status, TurnStatus::Completed);
-    assert_eq!(outcome.verification, VerificationStatus::NotApplicable);
-    assert_eq!(
-        outcome.stop_reason,
-        TurnStopReason::NoApplicableVerification
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.verification, VerificationStatus::Unverified);
+    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationUnavailable);
+}
+
+#[tokio::test]
+async fn disabled_verification_stays_unverified_after_model_run_smoke_check() {
+    let workspace = IsolatedWorkspace::new("outcome-disabled-verify-with-smoke");
+    let path = "created.rs";
+    let mut cfg = workspace.config();
+    cfg.gates.verification = crate::VerificationMode::Disabled;
+    let write = completion(
+        vec![Content::ToolCall {
+            id: "write-1".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({ "path": path, "content": "changed\n" }).to_string(),
+        }],
+        1,
+        1,
     );
+    let mut agent = agent(
+        vec![
+            write,
+            bash_completion("true # validate"),
+            completion(vec![Content::Text("done".into())], 1, 1),
+        ],
+        cfg,
+    );
+
+    let outcome = agent
+        .run_turn("create the file", &mut NullUi)
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.verification, VerificationStatus::Unverified);
+    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationUnavailable);
 }
 
 #[tokio::test]
 async fn failed_verify_budget_exhausted_stays_failed_not_not_applicable() {
-    // A project with a verify pipeline that fails must still report Failed /
-    // Incomplete after the repair budget — not quietly collapse to NotApplicable
-    // just because the next outer-loop check returns NotRun (budget spent).
+    // A project with a verify pipeline that fails must still report Failed
+    // after the repair budget — not quietly collapse to NotApplicable just
+    // because the next outer-loop check returns NotRun (budget spent).
     let workspace = IsolatedWorkspace::new("outcome-failed-verify-budget");
     let mut cfg = workspace.config();
     cfg.gates.verification =
@@ -929,7 +1047,7 @@ async fn failed_verify_budget_exhausted_stays_failed_not_not_applicable() {
         .run_turn("change the file", &mut NullUi)
         .await
         .unwrap();
-    assert_eq!(outcome.status, TurnStatus::Incomplete);
+    assert_eq!(outcome.status, TurnStatus::Failed);
     assert_eq!(outcome.verification, VerificationStatus::Failed);
     assert_eq!(outcome.stop_reason, TurnStopReason::VerificationFailed);
 }
@@ -979,11 +1097,8 @@ async fn independent_review_reports_unavailable_after_persistent_errors() {
 /// IR integration helpers: prose paths avoid mid-turn Rust cargo/LSP feedback
 /// (which can consume ~30s and extra model rounds in empty workspaces).
 fn independent_review_cfg(workspace: &IsolatedWorkspace) -> AgentConfig {
-    // Verify stages run under ProcessRunner sandbox (HI_SANDBOX). Some
-    // environments reject sandbox-exec; IR tests only need a green stage.
-    unsafe {
-        std::env::set_var("HI_SANDBOX", "off");
-    }
+    // `config()` initializes the test process's sandbox policy once, before
+    // the runner is constructed. Avoid another process-global env write here.
     let mut cfg = workspace.config();
     cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.gates.review = ReviewPolicy::Always;
@@ -1028,18 +1143,18 @@ async fn repeated_model_authored_validation_failure_is_bounded_across_edits() {
     let workspace = IsolatedWorkspace::new("outcome-repeated-validation");
     let failure = "printf 'running 1 test\\ntest moves::checkmate_detected ... FAILED\\n\\nfailures:\\n    moves::checkmate_detected\\n\\ntest result: FAILED. 0 passed; 1 failed\\n' >&2; false # cargo test";
     let steps = vec![
-        ProviderStep::Completion(write_file_completion("write-state", "state.txt", "one\n")),
+        ProviderStep::Completion(write_file_completion("write-state", "state.rs", "one\n")),
         ProviderStep::Completion(bash_completion(failure)),
         ProviderStep::Completion(edit_file_completion(
             "edit-state-1",
-            "state.txt",
+            "state.rs",
             "one\n",
             "two\n",
         )),
         ProviderStep::Completion(bash_completion(failure)),
         ProviderStep::Completion(edit_file_completion(
             "edit-state-2",
-            "state.txt",
+            "state.rs",
             "two\n",
             "three\n",
         )),
@@ -1057,7 +1172,7 @@ async fn repeated_model_authored_validation_failure_is_bounded_across_edits() {
         .await
         .unwrap();
 
-    assert_eq!(outcome.status, TurnStatus::Incomplete);
+    assert_eq!(outcome.status, TurnStatus::Failed);
     assert_eq!(requests.lock().unwrap().len(), 6);
     assert!(
         ui.statuses
@@ -1070,7 +1185,7 @@ async fn repeated_model_authored_validation_failure_is_bounded_across_edits() {
         ui.statuses
             .iter()
             .any(|status| status.contains("persisted after focused repair")),
-        "third unchanged repair should terminate incomplete: {:?}",
+        "third unchanged repair should stop the bounded run: {:?}",
         ui.statuses
     );
 }
@@ -1199,7 +1314,7 @@ async fn hygiene_gate_reenters_model_on_unreferenced_creates() {
 
 #[tokio::test]
 async fn independent_review_unavailable_completes_with_visible_status() {
-    // Soft transport failure: IR outage must not incomplete a green turn.
+    // Soft transport failure: an IR outage must not fail a green turn.
     let workspace = IsolatedWorkspace::new("outcome-review-unavailable");
     let path = "reviewed.txt";
     let steps = vec![
@@ -1284,6 +1399,70 @@ async fn independent_review_object_allows_one_repair_then_pass() {
     assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert_eq!(outcome.review, ReviewStatus::Passed);
+}
+
+#[tokio::test]
+async fn default_independent_review_repairs_continue_past_one_productive_cycle() {
+    let workspace = IsolatedWorkspace::new("outcome-review-unlimited-default");
+    let path = "reviewed-twice.txt";
+    let responses = vec![
+        write_file_completion("write-review", path, "v1\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("initial implementation".into())], 1, 1),
+        completion(
+            vec![Content::Text("OBJECT\n- first concrete defect".into())],
+            1,
+            1,
+        ),
+        write_file_completion("repair-one", path, "v2\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("first repair".into())], 1, 1),
+        completion(
+            vec![Content::Text("OBJECT\n- second concrete defect".into())],
+            1,
+            1,
+        ),
+        write_file_completion("repair-two", path, "v3 fixed\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("second repair".into())], 1, 1),
+        completion(vec![Content::Text("APPROVE".into())], 1, 1),
+    ];
+    let cfg = independent_review_cfg(&workspace);
+    assert_eq!(
+        cfg.gates.max_independent_review_repairs,
+        crate::UNLIMITED_REPAIR_CYCLES
+    );
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn(
+            "implement the reviewed file through every productive repair",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.review, ReviewStatus::Passed);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path(path)).unwrap(),
+        "v3 fixed\n"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("repair cycle 2/unlimited")),
+        "the second productive review repair must be allowed: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .all(|status| !status.contains("4294967295")),
+        "the unlimited sentinel must not leak into UI text: {:?}",
+        ui.statuses
+    );
 }
 
 #[tokio::test]
@@ -1428,7 +1607,7 @@ async fn mutation_after_verification_invalidates_pass_and_verified_revision() {
         .await
         .unwrap();
 
-    assert_eq!(outcome.status, TurnStatus::Incomplete);
+    assert_eq!(outcome.status, TurnStatus::Failed);
     assert_eq!(outcome.verification, VerificationStatus::Unverified);
     assert_eq!(outcome.review, ReviewStatus::Unavailable);
     assert!(outcome.verified_workspace_revision.is_none());
@@ -1464,7 +1643,7 @@ async fn ui_turn_end_mutation_cannot_create_a_false_current_revision_pass() {
 
     let outcome = agent.run_turn("implement work.rs", &mut ui).await.unwrap();
 
-    assert_eq!(outcome.status, TurnStatus::Incomplete);
+    assert_eq!(outcome.status, TurnStatus::Failed);
     assert_eq!(outcome.verification, VerificationStatus::Unverified);
     assert!(outcome.verified_workspace_revision.is_none());
     assert!(outcome.changed_files.contains(&"work.rs".to_string()));
@@ -1660,9 +1839,9 @@ fn turn_outcome_exit_codes_match_one_shot_table() {
     );
     assert_eq!(
         base(
-            TurnStatus::Incomplete,
+            TurnStatus::Failed,
             VerificationStatus::Unverified,
-            TurnStopReason::Stalled
+            TurnStopReason::VerificationUnavailable
         )
         .exit_code(false),
         1
@@ -1823,6 +2002,192 @@ async fn slow_cancellation_rollback_is_owned_and_awaited_exactly_once() {
 }
 
 #[tokio::test]
+async fn cancelled_plan_drive_persists_interruption_before_transcript_rewind() {
+    let workspace = IsolatedWorkspace::new("cancel-plan-pause-order");
+    let mut cfg = workspace.config();
+    cfg.gates.verification = VerificationMode::Disabled;
+    cfg.memory.finalize = false;
+    cfg.memory.suggest_next_prompt = false;
+    let cancellation = TurnCancellation::new();
+    let provider = std::sync::Arc::new(CancelThenCompleteProvider {
+        cancellation: cancellation.clone(),
+    });
+    let mut agent = Agent::new(provider, cfg).unwrap();
+    agent.restore_plan(vec![PlanStep {
+        title: "finish safely".into(),
+        status: PlanStatus::Active,
+    }]);
+    let records = std::sync::Arc::new(Mutex::new(Vec::new()));
+    agent.set_session(Box::new(PlanPauseOrderSession {
+        records: records.clone(),
+    }));
+
+    let outcome = agent
+        .run_turn_cancellable(PLAN_DRIVE_PROMPT, &mut NullUi, cancellation)
+        .await
+        .expect("cancellation should settle to a typed outcome");
+
+    assert_eq!(outcome.status, TurnStatus::Cancelled);
+    assert!(agent.plan_drive_paused());
+    let records = records.lock().unwrap();
+    let pause = records
+        .iter()
+        .position(|record| record == "pause:true:true")
+        .expect("interruption pause record");
+    let rewind = records
+        .iter()
+        .position(|record| record == "rewind")
+        .expect("transcript rewind record");
+    assert!(pause < rewind, "records={records:?}");
+}
+
+#[tokio::test]
+async fn cancelled_user_steering_keeps_interruption_pause_durable() {
+    let workspace = IsolatedWorkspace::new("cancel-user-interruption-resume");
+    let mut cfg = workspace.config();
+    cfg.gates.verification = VerificationMode::Disabled;
+    cfg.memory.finalize = false;
+    cfg.memory.suggest_next_prompt = false;
+    let cancellation = TurnCancellation::new();
+    let provider = std::sync::Arc::new(CancelThenCompleteProvider {
+        cancellation: cancellation.clone(),
+    });
+    let mut agent = Agent::new(provider, cfg).unwrap();
+    agent.restore_plan(vec![PlanStep {
+        title: "finish safely".into(),
+        status: PlanStatus::Active,
+    }]);
+    agent.restore_plan_drive_with_policy(true, true, 0, Vec::new());
+
+    let outcome = agent
+        .run_turn_cancellable(
+            "steer the interrupted implementation",
+            &mut NullUi,
+            cancellation,
+        )
+        .await
+        .expect("cancellation should settle to a typed outcome");
+
+    assert_eq!(outcome.status, TurnStatus::Cancelled);
+    assert!(
+        agent.plan_drive_paused(),
+        "failed steering must not unlock autonomous plan drive"
+    );
+    assert!(
+        agent.prepare_plan_drive_for_turn(DriveKind::User).unwrap(),
+        "the retained pause must remain interruption-resumable"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_reopens_plan_step_whose_workspace_effect_was_rolled_back() {
+    let workspace = IsolatedWorkspace::new("cancel-plan-completion-rollback");
+    let changed = workspace.path("cancelled-plan-work.txt");
+    let mut cfg = workspace.config();
+    cfg.gates.verification = VerificationMode::Disabled;
+    cfg.memory.finalize = false;
+    cfg.memory.suggest_next_prompt = false;
+    let update_plan = completion(
+        vec![Content::ToolCall {
+            id: "plan-done".into(),
+            name: "update_plan".into(),
+            arguments: serde_json::json!({
+                "steps": [
+                    {
+                        "title": "Implement the parser fix",
+                        "status": "done"
+                    },
+                    {
+                        "title": "Document the parser behavior",
+                        "status": "pending"
+                    }
+                ]
+            })
+            .to_string(),
+        }],
+        1,
+        1,
+    );
+    let (mut agent, _) = scripted_agent(
+        vec![
+            ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
+            ProviderStep::Completion(update_plan),
+            ProviderStep::DelayedCompletion(
+                std::time::Duration::from_secs(5),
+                completion(vec![Content::Text("too late".into())], 1, 1),
+            ),
+        ],
+        cfg,
+    );
+    agent.restore_plan(vec![
+        PlanStep {
+            title: "Implement the parser fix".into(),
+            status: PlanStatus::Active,
+        },
+        PlanStep {
+            title: "Document the parser behavior".into(),
+            status: PlanStatus::Pending,
+        },
+    ]);
+    let cancellation = TurnCancellation::new();
+    let mut ui = CancelAfterToolCountUi {
+        cancellation: cancellation.clone(),
+        remaining: 2,
+    };
+
+    let outcome = agent
+        .run_turn_cancellable("continue the implementation", &mut ui, cancellation)
+        .await
+        .expect("cancellation cleanup should produce a typed outcome");
+
+    assert_eq!(outcome.status, TurnStatus::Cancelled);
+    assert!(
+        !changed.exists(),
+        "the cancelled turn's workspace effect was not rolled back"
+    );
+    assert_eq!(
+        agent.current_plan()[0].status,
+        PlanStatus::Active,
+        "the rolled-back implementation must not remain durably complete"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_rolls_back_after_the_bounded_checkpoint_stack_is_full() {
+    let workspace = IsolatedWorkspace::new("cancel-full-checkpoint-stack");
+    let mut cfg = workspace.config();
+    cfg.gates.verification = VerificationMode::Disabled;
+    cfg.memory.finalize = false;
+    cfg.memory.suggest_next_prompt = false;
+    let mut agent = agent(vec![write_completion("cancelled-at-cap.txt")], cfg);
+    agent.workspace.checkpoints = (0..MAX_CHECKPOINTS)
+        .map(|index| format!("{index:040x}"))
+        .collect();
+    let checkpoints_before = agent.checkpoint_refs().to_vec();
+    let cancellation = TurnCancellation::new();
+    let mut ui = CancelAfterToolUi {
+        cancellation: cancellation.clone(),
+        fired: false,
+    };
+
+    let outcome = agent
+        .run_turn_cancellable("write cancelled-at-cap.txt", &mut ui, cancellation)
+        .await
+        .expect("cancellation cleanup should produce a typed outcome");
+
+    assert_eq!(outcome.status, TurnStatus::Cancelled);
+    assert!(
+        !workspace.path("cancelled-at-cap.txt").exists(),
+        "the new checkpoint must be identified and restored even when retention keeps the count flat"
+    );
+    assert_eq!(
+        agent.checkpoint_refs(),
+        checkpoints_before,
+        "cancellation must restore the exact bounded pre-turn undo stack"
+    );
+}
+
+#[tokio::test]
 async fn cancellation_that_wins_outer_race_overrides_normal_body_settlement() {
     let workspace = IsolatedWorkspace::new("cancel-normal-settlement");
     let mut cfg = workspace.config();
@@ -1937,11 +2302,41 @@ async fn cancellation_during_late_suggestion_does_not_publish_a_normal_outcome_o
     assert_eq!(outcome.status, TurnStatus::Cancelled);
     assert!(
         recorded.lock().unwrap().is_empty(),
-        "the pre-cancellation incomplete outcome leaked into durable diagnostics"
+        "the pre-cancellation outcome leaked into durable diagnostics"
     );
     assert!(
         !workspace.path(".hi/state/learning/findings.jsonl").exists(),
         "the cancelled attempt contaminated the findings ledger"
+    );
+}
+
+#[tokio::test]
+async fn hanging_late_suggestion_cannot_keep_a_completed_turn_working() {
+    let workspace = IsolatedWorkspace::new("hanging-late-suggestion");
+    let mut cfg = workspace.config();
+    cfg.routing.tool_mode = ToolMode::ChatOnly;
+    cfg.gates.verification = VerificationMode::Disabled;
+    cfg.memory.finalize = false;
+    cfg.memory.suggest_next_prompt = true;
+    let provider = std::sync::Arc::new(HangAfterMainProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut agent = Agent::new(provider.clone(), cfg).unwrap();
+    agent.side_call_timeout = Some(std::time::Duration::from_millis(25));
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        agent.run_turn("answer briefly", &mut NullUi),
+    )
+    .await
+    .expect("a hanging optional call must be bounded")
+    .expect("the completed primary turn should still settle normally");
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the primary call and exactly one bounded suggestion call should run"
     );
 }
 
@@ -2059,7 +2454,7 @@ async fn cancelled_turn_dispatches_abort_instead_of_done_lifecycle_hook() {
 }
 
 #[tokio::test]
-async fn turn_limit_rejection_does_not_report_a_user_interrupt() {
+async fn turn_limit_settles_as_completed_without_reporting_a_user_interrupt() {
     let workspace = IsolatedWorkspace::new("turn-limit-lifecycle");
     let mut cfg = workspace.config();
     cfg.max_turns = Some(0);
@@ -2071,8 +2466,9 @@ async fn turn_limit_rejection_does_not_report_a_user_interrupt() {
     let outcome = agent
         .run_turn("must not start", &mut NullUi)
         .await
-        .expect("turn limit is a typed cancellation outcome");
+        .expect("turn limit is a typed bounded-settlement outcome");
 
+    assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(outcome.stop_reason, TurnStopReason::TurnLimit);
     assert_eq!(agent.turn_phase(), TurnPhase::Done);
     assert_eq!(probe.starts.load(std::sync::atomic::Ordering::SeqCst), 0);

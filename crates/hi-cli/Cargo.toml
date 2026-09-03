@@ -77,3 +77,10 @@ default = []
 voice = ["hi-tui/voice"]
 # Tree-sitter symbol index (LSP-off definition/references fallback).
 codebase-graph = ["hi-tools/codebase-graph", "hi-tui/codebase-graph", "hi-agent/codebase-graph"]
+# INTERNAL SMOKE NEGATIVE CONTROL ONLY. This deliberately removes production
+# answer-integrity guards so the PTY suite can prove its regressions detect the
+# old failure mode. Never enable this feature in a user or release build.
+smoke-negative-control-disable-generic-completion-guards = [
+    "hi-agent/smoke-negative-control-disable-generic-completion-guards",
+    "hi-tui/smoke-negative-control-disable-generic-completion-guards",
+]

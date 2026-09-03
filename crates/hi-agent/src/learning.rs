@@ -1,11 +1,11 @@
 //! Append-only learning ledgers under `<state-root>/learning/`.
 //!
 //! `findings.jsonl` is the automatic intake for harness post-mortems: every
-//! turn that ends badly (stalled, verification failed, infrastructure
-//! failure) appends one evidence record pointing at what happened, so `hi
-//! metrics` can surface failure patterns instead of someone re-deriving them
-//! from raw session transcripts by hand — which is how every defect found in
-//! live runs had to be recovered before this existed.
+//! turn that really fails (verification failure, infrastructure failure, or a
+//! failed legacy settlement) appends one evidence record pointing at what
+//! happened. This lets `hi metrics` surface failure patterns instead of
+//! someone re-deriving them from raw session transcripts by hand — which is
+//! how every defect found in live runs had to be recovered before this existed.
 
 use std::path::Path;
 
@@ -33,9 +33,13 @@ pub struct Finding {
     pub review: crate::ReviewStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_unavailable_reason: Option<String>,
-    /// Last stall reason the progress tracker recorded, when there was one.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub last_stall_reason: String,
+    /// Last no-progress reason the progress tracker recorded, when there was one.
+    #[serde(
+        default,
+        alias = "last_stall_reason",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub last_no_progress_reason: String,
     pub changed_files: usize,
     pub model: String,
     /// Failure shape of the steering hint that was in the session context
@@ -50,15 +54,13 @@ pub struct Finding {
 }
 
 /// Whether a turn outcome warrants a finding record. Completed-and-verified
-/// turns are the healthy path; everything that ends incomplete, failed, or
-/// with failed verification is post-mortem material.
+/// turns are the healthy path; everything that fails or ends with failed
+/// verification is post-mortem material.
 pub fn outcome_warrants_finding(outcome: &TurnOutcome) -> bool {
-    matches!(outcome.status, TurnStatus::Incomplete | TurnStatus::Failed)
+    outcome.status == TurnStatus::Failed
         || matches!(
             outcome.stop_reason,
-            TurnStopReason::Stalled
-                | TurnStopReason::VerificationFailed
-                | TurnStopReason::InfrastructureFailure
+            TurnStopReason::VerificationFailed | TurnStopReason::InfrastructureFailure
         )
 }
 
@@ -139,7 +141,7 @@ pub fn render_report(state_root: &Path) -> String {
 /// targets — the shape is stamped onto findings recorded while the hint is
 /// active, so `hi metrics` can show recurrence-under-hint.
 pub struct ContextHint {
-    /// Debug-formatted stop reason the hint targets (e.g. "Stalled").
+    /// Debug-formatted stop reason the hint targets (e.g. "StepLimit").
     pub shape: String,
     /// The one-line hint text injected into the session context.
     pub text: String,
@@ -201,7 +203,7 @@ pub fn context_hint(state_root: &Path) -> Option<ContextHint> {
     }
     let advice = match reason.as_str() {
         "VerificationFailed" => "run the affected package-local check yourself before finishing",
-        "Stalled" => "act on tool evidence immediately instead of re-polling or re-reading",
+        "StepLimit" => "act on tool evidence before consuming the turn's work limit",
         "InfrastructureFailure" => {
             "verification infra has been failing; prefer narrow package-local checks"
         }
@@ -352,10 +354,10 @@ pub fn synth_evals_prompt(state_root: &Path) -> Option<(usize, String)> {
     // transcripts instead of fuzzy-matching session files by mtime.
     let mut groups: std::collections::BTreeMap<String, (usize, Vec<String>)> = Default::default();
     for finding in &all[done..] {
-        let detail = if finding.last_stall_reason.is_empty() {
+        let detail = if finding.last_no_progress_reason.is_empty() {
             finding.review_unavailable_reason.as_deref().unwrap_or("-")
         } else {
-            &finding.last_stall_reason
+            &finding.last_no_progress_reason
         };
         let entry = groups
             .entry(format!("{:?} / {detail}", finding.stop_reason))
@@ -439,7 +441,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("learning")).unwrap();
-        let line = r#"{"ts":1,"status":"Incomplete","stop_reason":"Stalled","verification":"Passed","review":"NotRequired","changed_files":0,"model":"m","failure_shape":"repeat_inspect"}"#;
+        let line = r#"{"ts":1,"status":"Incomplete","stop_reason":"Stalled","verification":"passed","review":"not_required","changed_files":0,"model":"m","failure_shape":"repeat_inspect"}"#;
         let mut body = String::new();
         while body.len() < MAX_LEDGER_READ_BYTES + 8_000 {
             body.push_str(line);
@@ -491,9 +493,13 @@ mod tests {
             TurnStatus::Completed,
             TurnStopReason::Completed
         )));
+        assert!(!outcome_warrants_finding(&outcome(
+            TurnStatus::Completed,
+            TurnStopReason::StepLimit
+        )));
         assert!(outcome_warrants_finding(&outcome(
-            TurnStatus::Incomplete,
-            TurnStopReason::Stalled
+            TurnStatus::Failed,
+            TurnStopReason::StepLimit
         )));
         assert!(outcome_warrants_finding(&outcome(
             TurnStatus::Failed,
@@ -510,15 +516,15 @@ mod tests {
             ts: 1,
             session_id: Some("42-refactor".into()),
             turn: Some(5),
-            status: TurnStatus::Incomplete,
-            stop_reason: TurnStopReason::Stalled,
+            status: TurnStatus::Failed,
+            stop_reason: TurnStopReason::StepLimit,
             verification: VerificationStatus::Passed,
             review: ReviewStatus::Unavailable,
             review_unavailable_reason: Some("provider timed out".into()),
-            last_stall_reason: "repeated idempotent tool output".into(),
+            last_no_progress_reason: "repeated idempotent tool output".into(),
             changed_files: 3,
             model: "test-model".into(),
-            hint_active: Some("Stalled".into()),
+            hint_active: Some("StepLimit".into()),
             failure_shape: None,
         };
         append_finding(&dir, &finding);
@@ -529,10 +535,30 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].stop_reason, TurnStopReason::Stalled);
+        assert_eq!(parsed[0].stop_reason, TurnStopReason::StepLimit);
         assert_eq!(parsed[0].session_id.as_deref(), Some("42-refactor"));
         assert_eq!(parsed[0].turn, Some(5));
-        assert_eq!(parsed[0].hint_active.as_deref(), Some("Stalled"));
+        assert_eq!(parsed[0].hint_active.as_deref(), Some("StepLimit"));
+        assert_eq!(
+            parsed[0].last_no_progress_reason,
+            "repeated idempotent tool output"
+        );
+        assert!(
+            raw.contains("\"last_no_progress_reason\""),
+            "new finding omitted canonical no-progress field: {raw}"
+        );
+        assert!(
+            !raw.contains("\"last_stall_reason\""),
+            "new finding leaked legacy no-progress field: {raw}"
+        );
+        assert!(
+            !raw.contains("incomplete"),
+            "new finding leaked legacy status: {raw}"
+        );
+        assert!(
+            !raw.contains("stalled"),
+            "new finding leaked legacy reason: {raw}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -564,9 +590,9 @@ mod tests {
         )
         .unwrap();
         let hint = context_hint(&dir).expect("repeated shape steers");
-        assert_eq!(hint.shape, "Stalled");
+        assert_eq!(hint.shape, "NoProgress");
         assert!(
-            hint.text.contains("Stalled"),
+            hint.text.contains("NoProgress"),
             "hint names the shape: {}",
             hint.text
         );
@@ -596,7 +622,7 @@ mod tests {
         )
         .unwrap();
         let (signatures, prompt) = synth_evals_prompt(&dir).expect("fresh findings");
-        assert_eq!(signatures, 2, "two distinct stall signatures");
+        assert_eq!(signatures, 2, "two distinct no-progress signatures");
         assert!(
             prompt.contains("2x"),
             "duplicate signature counted: {prompt}"

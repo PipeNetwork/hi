@@ -47,6 +47,9 @@ const RECORD_TYPE_MESSAGE: &str = "message";
 const RECORD_TYPE_USAGE: &str = "usage";
 const RECORD_TYPE_CHECKPOINTS: &str = "checkpoints";
 const RECORD_TYPE_STATE_REPLACEMENT: &str = "state_replacement";
+const RECORD_TYPE_PLAN_DRIVE: &str = "plan_drive";
+const RECORD_TYPE_PLAN_APPROVAL: &str = "plan_approval";
+const RECORD_TYPE_GOAL_DRIVE: &str = "goal_drive";
 const MAX_RECORD_WIRE_BYTES: usize = 5_000_000;
 // Leave room for JSON escaping and chunk metadata so each encoded chunk_part
 // remains below the 1 MiB wire contract.
@@ -306,7 +309,7 @@ impl RemoteSessionSink {
     /// suspect offset can always be reset to 0 rather than trusted.
     pub fn reconcile_jsonl(&self, path: &std::path::Path) -> Result<()> {
         use sha2::{Digest, Sha256};
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
         let mut offset = self.store.track_jsonl(&self.session_id, path)?;
         let mut file = match std::fs::File::open(path) {
             Ok(file) => file,
@@ -325,16 +328,25 @@ impl RemoteSessionSink {
             self.store.set_jsonl_offset(&self.session_id, offset)?;
         }
         file.seek(SeekFrom::Start(offset))?;
-        let mut remaining = Vec::new();
-        file.read_to_end(&mut remaining)?;
-        let mut consumed = 0usize;
-        for line in remaining.split_inclusive(|byte| *byte == b'\n') {
+        // Read only the file length observed above: a concurrently appending
+        // session must not make reconciliation chase a moving EOF forever.
+        // Retain at most one JSONL record instead of the entire unsynced tail.
+        let mut reader = BufReader::new(file.take(len.saturating_sub(offset)));
+        let mut line = Vec::new();
+        let mut consumed_any = false;
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
             if !line.ends_with(b"\n") {
+                // Leave an incomplete crash/concurrent-write tail for the next
+                // reconciliation rather than publishing a partial record.
                 break;
             }
             let payload = std::str::from_utf8(&line[..line.len() - 1])?;
             if payload.is_empty() {
-                consumed += line.len();
+                consumed_any = true;
                 offset = offset.saturating_add(line.len() as u64);
                 continue;
             }
@@ -353,10 +365,10 @@ impl RemoteSessionSink {
                 );
                 self.enqueue_reconciled(&base_id, record_type, payload)?;
             }
-            consumed += line.len();
+            consumed_any = true;
             offset = offset.saturating_add(line.len() as u64);
         }
-        if consumed > 0 {
+        if consumed_any {
             self.store.set_jsonl_offset(&self.session_id, offset)?;
         }
         Ok(())
@@ -482,6 +494,36 @@ impl RemoteSessionSink {
                 }))?,
             );
         }
+        // These are last-write-wins records, so seed even the running/default
+        // values. The destination session may already contain an older pause,
+        // park, stall, or evidence ledger that this snapshot must clear.
+        self.push(
+            RECORD_TYPE_PLAN_DRIVE,
+            &serde_json::to_string(&serde_json::json!({
+                "type": "plan_drive",
+                "paused": loaded.plan_drive_paused,
+                "resume_on_user_input": loaded.plan_drive_resume_on_user_input,
+                "stall": loaded.plan_drive_stall,
+                "evidence_reset": true,
+                "evidence_add": loaded.plan_drive_evidence,
+            }))?,
+        );
+        self.push(
+            RECORD_TYPE_PLAN_APPROVAL,
+            &serde_json::to_string(&serde_json::json!({
+                "type": "plan_approval",
+                "parked": loaded.plan_approval_parked,
+            }))?,
+        );
+        self.push(
+            RECORD_TYPE_GOAL_DRIVE,
+            &serde_json::to_string(&serde_json::json!({
+                "type": "goal_drive",
+                "stall": loaded.goal_drive_stall,
+                "evidence_reset": true,
+                "evidence_add": loaded.goal_drive_evidence,
+            }))?,
+        );
         Ok(())
     }
 
@@ -1265,13 +1307,59 @@ impl SessionSink for SyncSession {
     }
 
     fn record_plan_drive(&mut self, paused: bool, stall: u32) -> Result<()> {
-        self.local.record_plan_drive(paused, stall)?;
+        self.record_plan_drive_state(paused, stall, false, &[])
+    }
+
+    fn record_plan_drive_state(
+        &mut self,
+        paused: bool,
+        stall: u32,
+        evidence_reset: bool,
+        evidence_add: &[String],
+    ) -> Result<()> {
+        self.local
+            .record_plan_drive_state(paused, stall, evidence_reset, evidence_add)?;
+        self.reconcile_best_effort();
+        Ok(())
+    }
+
+    fn record_plan_drive_state_with_policy(
+        &mut self,
+        paused: bool,
+        stall: u32,
+        resume_on_user_input: bool,
+        evidence_reset: bool,
+        evidence_add: &[String],
+    ) -> Result<()> {
+        self.local.record_plan_drive_state_with_policy(
+            paused,
+            stall,
+            resume_on_user_input,
+            evidence_reset,
+            evidence_add,
+        )?;
+        self.reconcile_best_effort();
+        Ok(())
+    }
+
+    fn record_plan_approval_parked(&mut self, parked: bool) -> Result<()> {
+        self.local.record_plan_approval_parked(parked)?;
         self.reconcile_best_effort();
         Ok(())
     }
 
     fn record_goal_drive(&mut self, stall: u32) -> Result<()> {
-        self.local.record_goal_drive(stall)?;
+        self.record_goal_drive_state(stall, false, &[])
+    }
+
+    fn record_goal_drive_state(
+        &mut self,
+        stall: u32,
+        evidence_reset: bool,
+        evidence_add: &[String],
+    ) -> Result<()> {
+        self.local
+            .record_goal_drive_state(stall, evidence_reset, evidence_add)?;
         self.reconcile_best_effort();
         Ok(())
     }
@@ -1563,6 +1651,19 @@ impl hi_agent::Ui for MultiplexUi {
         self.remote.push_event(hi_tui::event::UiEvent::ToolResult {
             name: name.to_string(),
             result: display_result,
+        });
+    }
+    fn plan_result_id(
+        &mut self,
+        id: &str,
+        name: &str,
+        result: &str,
+        status: hi_tools::ToolStatus,
+        steps: &[hi_agent::PlanStep],
+    ) {
+        self.primary.plan_result_id(id, name, result, status, steps);
+        self.remote.push_event(hi_tui::event::UiEvent::Plan {
+            steps: steps.to_vec(),
         });
     }
     fn status(&mut self, text: &str) {
@@ -2455,7 +2556,10 @@ fn render_live_event(event: &hi_tui::event::UiEvent, live_status: &mut Option<St
         return;
     }
     let keep_live_status = match event {
-        UiEvent::BtwEnd | UiEvent::SessionUsage { .. } | UiEvent::RateLimits { .. } => true,
+        UiEvent::BtwEnd
+        | UiEvent::ProviderRequest { .. }
+        | UiEvent::SessionUsage { .. }
+        | UiEvent::RateLimits { .. } => true,
         UiEvent::Status { text } => hi_agent::ui::user_facing_status(text).is_none(),
         UiEvent::SubagentProgress { activity, .. } => activity.is_empty(),
         _ => false,
@@ -2485,6 +2589,7 @@ fn render_live_event(event: &hi_tui::event::UiEvent, live_status: &mut Option<St
             eprintln!("\x1b[2m  ← btw {name}: {clipped}\x1b[0m");
         }
         UiEvent::BtwEnd => {}
+        UiEvent::ProviderRequest { .. } => {}
         UiEvent::Reasoning { text } => {
             eprintln!("\x1b[2m{text}\x1b[0m");
         }
@@ -2959,14 +3064,7 @@ pub async fn run_resume_local(
     // apply the remote state, then attach the seeded local continuation plus a
     // remote sink for subsequent portal records.
     agent.detach_session();
-    agent.apply_loaded_session(
-        loaded.messages,
-        loaded.usage,
-        loaded.checkpoint_refs,
-        loaded.goal,
-        loaded.decisions,
-        loaded.plan,
-    )?;
+    crate::session::apply_loaded_session(agent, loaded)?;
     let sync_session = SyncSession::new(local, remote);
     let sync_handle = sync_session.remote_handle();
     agent.set_session(Box::new(sync_session));

@@ -1,0 +1,58 @@
+schema_version = 1
+name = "live-read-only-canary"
+tags = ["live"]
+timeout_ms = 600000
+
+[[actions]]
+kind = "send_line"
+text = "Without changing files or using tools, answer only: live read-only canary complete."
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled" }
+# The child turn deadline is 240s. Leave a 30s evidence-flush grace period
+# before the harness's independent 300s outer-turn watchdog.
+timeout_ms = 270000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "user" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 0 }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/accepted" = true, "/response_status" = 200 }
+at_least = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "approval_shown" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/role" = "Assistant" }
+exact = 1
+
+[[assertions]]
+kind = "exit"
+code = 0

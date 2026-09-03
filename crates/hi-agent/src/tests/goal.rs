@@ -55,6 +55,25 @@ struct GoalClearingSession {
     clears: Arc<Mutex<usize>>,
 }
 
+struct GoalRecordingSession {
+    goals: Arc<Mutex<Vec<Goal>>>,
+}
+
+impl SessionSink for GoalRecordingSession {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _messages: &[Message]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_goal(&mut self, goal: &Goal) -> anyhow::Result<()> {
+        self.goals.lock().unwrap().push(goal.clone());
+        Ok(())
+    }
+}
+
 impl SessionSink for GoalClearingSession {
     fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
@@ -102,6 +121,39 @@ fn goal_updates_system_prompt_and_clear_history_keeps_it() {
             .unwrap_or_default()
             .contains("[Current session goal]"),
         "goal marker removed"
+    );
+}
+
+#[test]
+fn transient_goal_preserves_tail_past_the_old_boundary_in_context() {
+    const OLD_GOAL_LIMIT: usize = 500;
+    const OLD_COMBINED_CONTEXT_LIMIT: usize = 24_000;
+    let objective = format!(
+        "{}FINAL TRANSIENT GOAL REQUIREMENT MUST SURVIVE",
+        "G".repeat(OLD_GOAL_LIMIT + 20)
+    );
+    let mut agent = agent(vec![], config());
+    // Put the canonical goal after enough other volatile sections that the old
+    // head-only combined-context cap discarded the goal in its entirety.
+    agent.task.set_memory_context(Some(format!(
+        "[Earlier memory]\n{}",
+        "M".repeat(OLD_COMBINED_CONTEXT_LIMIT / 2)
+    )));
+    agent.task.set_task_context(Some(format!(
+        "[Earlier task context]\n{}",
+        "T".repeat(OLD_COMBINED_CONTEXT_LIMIT / 2)
+    )));
+
+    agent
+        .set_transient_goal(Some(format!("  {objective}\n")))
+        .unwrap();
+
+    assert_eq!(agent.goal(), Some(objective.as_str()));
+    let context = agent.volatile_context_block().unwrap_or_default();
+    assert!(context.chars().count() > OLD_COMBINED_CONTEXT_LIMIT);
+    assert!(
+        context.contains(&format!("[Current session goal]\n{objective}")),
+        "goal tail missing: {context}"
     );
 }
 
@@ -346,6 +398,11 @@ fn resume_restores_structured_goal_and_rebuilds_system_prompt() {
         vec!["write tests".into(), "merge parser".into()],
     );
     goal.advance();
+    // Sessions written before productive work became unlimited carried a
+    // generated budget. Loading must remove it, including a budget-only pause.
+    goal.turn_budget = Some(25);
+    goal.budget_auto = true;
+    goal.pause(GoalPauseReason::Budget);
     let history = vec![
         Message::system("old prompt\n\n[Long-horizon goal]\nstale objective\nstale step"),
         Message::user("previous request"),
@@ -357,6 +414,10 @@ fn resume_restores_structured_goal_and_rebuilds_system_prompt() {
         agent.structured_goal().is_some(),
         "structured goal restored"
     );
+    let restored = agent.structured_goal().unwrap();
+    assert_eq!(restored.turn_budget, None);
+    assert!(!restored.budget_auto);
+    assert!(!restored.is_paused());
     let block = agent.volatile_context_block().unwrap_or_default();
     assert!(
         block.contains("Long-horizon goal"),
@@ -374,6 +435,58 @@ fn resume_restores_structured_goal_and_rebuilds_system_prompt() {
     assert!(
         !sys.contains("stale objective") && !sys.contains("stale step"),
         "resume should rebuild the system prompt from loaded metadata, not keep stale saved goal text: {sys}"
+    );
+}
+
+#[test]
+fn legacy_automatic_budget_migration_is_persisted_once_after_sink_attachment() {
+    let mut cfg = config();
+    cfg.subagents.long_horizon = true;
+    let mut legacy = Goal::new("finish the migration", vec!["ship it".into()]);
+    legacy.turn_budget = Some(25);
+    legacy.budget_auto = true;
+    legacy.pause(GoalPauseReason::Budget);
+
+    let mut first = resumed_agent(
+        vec![Message::system("system")],
+        Usage::default(),
+        Some(legacy),
+        cfg.clone(),
+    );
+    let first_records = Arc::new(Mutex::new(Vec::new()));
+    first.set_session(Box::new(GoalRecordingSession {
+        goals: first_records.clone(),
+    }));
+
+    let persisted = {
+        let records = first_records.lock().unwrap();
+        assert_eq!(records.len(), 1, "migration writes one replacement goal");
+        records[0].clone()
+    };
+    assert_eq!(persisted.turn_budget, None);
+    assert!(!persisted.budget_auto);
+    assert!(!persisted.is_paused());
+
+    // Reloading the replacement must remain unbudgeted and must not append a
+    // second migration record merely because a sink is attached.
+    let mut second = resumed_agent(
+        vec![Message::system("system")],
+        Usage::default(),
+        Some(persisted),
+        cfg,
+    );
+    let second_records = Arc::new(Mutex::new(Vec::new()));
+    second.set_session(Box::new(GoalRecordingSession {
+        goals: second_records.clone(),
+    }));
+
+    let restored = second.structured_goal().unwrap();
+    assert_eq!(restored.turn_budget, None);
+    assert!(!restored.budget_auto);
+    assert!(!restored.is_paused());
+    assert!(
+        second_records.lock().unwrap().is_empty(),
+        "an already-normalized goal must not be rewritten"
     );
 }
 
@@ -506,6 +619,66 @@ async fn skeptic_gate_objection_blocks_advance_and_records_note() {
 }
 
 #[tokio::test]
+async fn productive_verified_skeptic_objections_do_not_exhaust_the_default_goal() {
+    let workspace = IsolatedWorkspace::new("goal-skeptic-unlimited-retries");
+    let mut cfg = workspace.config();
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
+    let changed = workspace.path("changed.rs");
+    let changed = changed.to_string_lossy().to_string();
+    let mut steps = Vec::new();
+    for attempt in 1..=4 {
+        steps.push(ProviderStep::Completion(write_content_completion(
+            &changed,
+            &format!(
+                "verified revision {attempt}: {}",
+                "substantial implementation evidence comfortably past the trivial-diff exemption; "
+                    .repeat(attempt as usize)
+            ),
+        )));
+        steps.push(ProviderStep::Completion(completion(
+            vec![Content::Text("done".into())],
+            1,
+            1,
+        )));
+        steps.push(ProviderStep::Completion(completion(
+            vec![Content::Text(format!(
+                "OBJECT\n- revision {attempt} exposes one more concrete edge case"
+            ))],
+            1,
+            1,
+        )));
+    }
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    for attempt in 1..=4 {
+        agent
+            .run_turn(&format!("address reviewer round {attempt}"), &mut ui)
+            .await
+            .unwrap();
+        let goal = agent.structured_goal().expect("goal remains installed");
+        assert_eq!(goal.status, GoalStatus::Active);
+        assert_eq!(goal.active_index(), Some(0));
+        assert_eq!(goal.sub_goals[0].attempts, attempt);
+        assert_eq!(goal.skeptic_objections, attempt);
+        assert!(goal.should_auto_drive());
+    }
+
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        12,
+        "each productive turn must reach write, final answer, and skeptic review"
+    );
+}
+
+#[tokio::test]
 async fn skeptic_gate_works_unconfigured_by_reviewing_with_the_session_model() {
     // `/goal team on` must work with zero configuration: no `skeptic_model`
     // set, the gate reviews with the session model instead of reporting
@@ -559,6 +732,44 @@ async fn skeptic_gate_works_unconfigured_by_reviewing_with_the_session_model() {
             .any(|m| m.text().contains("code reviewer acting as a merge gate")),
         "the extra call carried the skeptic review prompt"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn verified_goal_waits_for_skeptic_past_the_legacy_side_call_deadline() {
+    let workspace = IsolatedWorkspace::new("goal-skeptic-slow-review");
+    let mut cfg = workspace.config();
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.review = ReviewPolicy::Off;
+    let changed = workspace.path("changed.rs");
+    let changed = changed.to_string_lossy().to_string();
+    let steps = vec![
+        ProviderStep::Completion(write_content_completion(
+            &changed,
+            "a substantial implementation body, comfortably past the trivial-diff exemption",
+        )),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ProviderStep::DelayedCompletion(
+            std::time::Duration::from_secs(16),
+            completion(vec![Content::Text("APPROVE".into())], 1, 1),
+        ),
+    ];
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+
+    agent.run_turn("go", &mut RecUi::default()).await.unwrap();
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(
+        goal.sub_goals[0].status,
+        GoalStatus::Done,
+        "a slow successful review must not hold verified progress"
+    );
+    assert_eq!(goal.skeptic_unavailable, 0);
+    assert_eq!(requests.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -781,8 +992,10 @@ async fn skeptic_gate_skips_review_on_trivial_diff() {
 }
 
 #[tokio::test]
-async fn skeptic_gate_fails_closed_on_provider_error() {
-    // Default: skeptic outage holds goal progress (fail-closed). Edits stay on disk.
+async fn skeptic_outage_does_not_park_verified_productive_goal_by_default() {
+    // Reviewer availability is not evidence against verified primary work. The
+    // transport retries once with bounded backoff, then leaves a diagnostic scar
+    // while the goal keeps advancing.
     let workspace = IsolatedWorkspace::new("goal-skeptic-error");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
@@ -812,10 +1025,17 @@ async fn skeptic_gate_fails_closed_on_provider_error() {
     agent.run_turn("go", &mut ui).await.unwrap();
 
     let goal = agent.structured_goal().unwrap();
-    assert_ne!(
-        goal.sub_goals[0].status,
-        GoalStatus::Done,
-        "fail-closed must not advance on skeptic error"
+    assert_eq!(goal.sub_goals[0].status, GoalStatus::Done);
+    assert_eq!(
+        goal.active_index(),
+        Some(1),
+        "the next step remains drivable"
+    );
+    assert!(!goal.paused, "reviewer outage must not park the goal");
+    assert!(goal.should_auto_drive(), "continual drive remains enabled");
+    assert_eq!(
+        goal.sub_goals[0].attempts, 0,
+        "reviewer outage must not consume the primary work retry budget"
     );
     assert_eq!(goal.skeptic_objections, 0);
     assert_eq!(goal.skeptic_unavailable, 1);
@@ -825,15 +1045,25 @@ async fn skeptic_gate_fails_closed_on_provider_error() {
         ui.statuses
             .iter()
             .any(|status| status.contains("skeptic unavailable")
-                && status.contains("goal progress held")),
+                && status.contains("deterministic verification passed")
+                && status.contains("advancing without review")),
         "statuses: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("goal progress held")
+                || status.contains("sub-goal failed this turn")),
+        "an auxiliary outage must not be reported as primary-work failure: {:?}",
         ui.statuses
     );
 }
 
 #[tokio::test]
 async fn skeptic_gate_fails_open_when_configured() {
-    // Opt-in legacy: skeptic_fail_open advances despite reviewer outage.
+    // Keep the legacy compatibility flag accepted while the safe unavailable
+    // policy now applies regardless of its value.
     let workspace = IsolatedWorkspace::new("goal-skeptic-fail-open");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
@@ -867,6 +1097,70 @@ async fn skeptic_gate_fails_open_when_configured() {
         "fail-open advanced despite the skeptic error"
     );
     assert_eq!(goal.skeptic_unavailable, 1);
+    assert_eq!(goal.sub_goals[0].attempts, 0);
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("advancing without review")),
+        "statuses: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn skeptic_no_verdict_does_not_park_or_charge_verified_productive_goal() {
+    let workspace = IsolatedWorkspace::new("goal-skeptic-no-verdict");
+    let mut cfg = workspace.config();
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
+    let tmp = workspace.path("changed.rs");
+    let p = tmp.to_string_lossy().to_string();
+    let steps = vec![
+        ProviderStep::Completion(write_content_completion(
+            &p,
+            "a substantial implementation body, comfortably past the trivial-diff exemption",
+        )),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ProviderStep::Completion(completion(
+            vec![Content::Text(
+                "I reviewed the patch but forgot to emit a protocol verdict.".into(),
+            )],
+            1,
+            1,
+        )),
+    ];
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(goal.sub_goals[0].status, GoalStatus::Done);
+    assert_eq!(goal.active_index(), Some(1));
+    assert_eq!(goal.sub_goals[0].attempts, 0);
+    assert!(!goal.paused);
+    assert!(goal.should_auto_drive());
+    assert_eq!(goal.skeptic_unavailable, 1);
+    assert_eq!(goal.last_skeptic_status, Some(SkepticStatus::Unavailable));
+    assert_eq!(agent.last_turn_telemetry().skeptic_unavailable_count, 1);
+    assert!(
+        agent
+            .last_turn_telemetry()
+            .review_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("did not contain a verdict"))
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        3,
+        "a no-verdict reply is diagnosed once rather than entering an unbounded review loop"
+    );
     assert!(
         ui.statuses
             .iter()
@@ -959,16 +1253,15 @@ async fn skeptic_gate_reviews_update_plan_completion_and_reverts_on_objection() 
 }
 
 #[tokio::test]
-async fn long_horizon_driver_records_failure_on_stall() {
-    // A turn that stalls (repeat guard exhausts) records a sub-goal attempt
-    // so the next turn sees the prior note (and doesn't repeat the approach).
-    let mut cfg = config();
+async fn repeated_write_without_validation_records_unverified_workspace_failure() {
+    // Repeating an idempotent mutation is diagnostic only, but the resulting
+    // code change still owes verification. That real verification failure must
+    // remain visible without inventing a heuristic terminal state.
+    let workspace = IsolatedWorkspace::new("long-horizon-stall");
+    let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
     cfg.loop_limits.max_repeat_nudges = 1;
-    // Model re-issues the same tool call → repeat guard stalls the turn
-    // after exhausting the (1) nudge budget. Three identical writes: the
-    // second triggers a nudge, the third exhausts the budget and breaks
-    // stalled.
+    // The model re-issues the same tool call after the repair nudge.
     let responses = vec![
         write_completion("lhstall"),
         write_completion("lhstall"),
@@ -982,40 +1275,32 @@ async fn long_horizon_driver_records_failure_on_stall() {
         )))
         .unwrap();
     let mut ui = RecUi::default();
-    agent.run_turn("go", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file("lhstall");
+    let outcome = agent.run_turn("go", &mut ui).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationUnavailable);
     let goal = agent.structured_goal().expect("goal still set");
-    assert_eq!(goal.active_index(), Some(0), "didn't advance (stalled)");
+    assert_eq!(goal.active_index(), Some(0));
     assert!(
-        goal.sub_goals[0].attempts > 0,
-        "recorded a failure attempt: {:?}",
-        goal.sub_goals[0]
+        ui.statuses
+            .iter()
+            .all(|status| !status.to_ascii_lowercase().contains("stalled")),
+        "no synthetic terminal status should be shown: {:?}",
+        ui.statuses
     );
     assert!(
         goal.sub_goals[0]
             .notes
             .iter()
-            .any(|n| n.contains("stalled")),
-        "stall reason recorded as a note: {:?}",
+            .any(|note| note.contains("unverified workspace changes")),
+        "the durable goal must retain the real verification failure: {:?}",
         goal.sub_goals[0].notes
-    );
-    // The next turn's context block surfaces the "don't repeat" notes on the
-    // active sub-goal, so the next turn doesn't repeat the failed approach.
-    assert!(
-        agent
-            .volatile_context_block()
-            .unwrap_or_default()
-            .contains("don't repeat these"),
-        "retry notes in context block"
     );
 }
 
 #[tokio::test]
-async fn long_horizon_driver_records_failure_on_unfinished_turn() {
-    // A turn can be unfinished without being an exact repeat stall, for example
-    // when an implementation task only scaffolds setup and never edits source.
-    // That should count as a failed attempt on the active sub-goal, not advance
-    // as a clean changed-files turn.
+async fn scaffolding_only_turn_does_not_invent_a_goal_failure() {
+    // Heuristic incompleteness is not a public failure. A scaffolding-only
+    // turn settles normally and leaves the active goal available to continue.
     let workspace = IsolatedWorkspace::new("goal-unfinished-scaffold");
     let dir = workspace.path("scaffold");
     let dir_string = dir.to_string_lossy().to_string();
@@ -1037,37 +1322,24 @@ async fn long_horizon_driver_records_failure_on_unfinished_turn() {
         .unwrap();
     let mut ui = RecUi::default();
 
-    agent
+    let outcome = agent
         .run_turn("/build a small CLI project tracker", &mut ui)
         .await
         .unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
 
     let goal = agent.structured_goal().expect("goal still set");
     assert_eq!(
         goal.active_index(),
         Some(0),
-        "unfinished turn did not advance"
+        "bounded settlement leaves the current goal active"
     );
-    assert!(
-        goal.sub_goals[0].attempts > 0,
-        "unfinished turn should record an attempt: {:?}",
-        goal.sub_goals[0]
-    );
-    assert!(
-        goal.sub_goals[0]
-            .notes
-            .iter()
-            .any(|note| note.contains("without completing")),
-        "unfinished reason recorded: {:?}",
-        goal.sub_goals[0].notes
-    );
-    assert!(
-        agent
-            .volatile_context_block()
-            .unwrap_or_default()
-            .contains("don't repeat these"),
-        "retry notes in context block"
-    );
+    assert_eq!(goal.sub_goals[0].attempts, 0);
+    assert!(goal.sub_goals[0].notes.is_empty());
 }
 
 #[tokio::test]
@@ -1098,10 +1370,11 @@ async fn long_horizon_driver_records_verify_failure_reason_after_exhaustion() {
         .unwrap();
 
     let mut ui = RecUi::default();
-    agent.run_turn("go", &mut ui).await.unwrap();
+    let outcome = agent.run_turn("go", &mut ui).await.unwrap();
 
     assert_eq!(agent.last_verify(), Some(false));
-    assert!(agent.last_turn_telemetry().stalled_unfinished);
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationFailed);
     let goal = agent.structured_goal().expect("goal still set");
     assert_eq!(
         goal.active_index(),
@@ -1368,6 +1641,45 @@ async fn completion_audit_appends_missing_work_and_goal_stays_active() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn completion_audit_waits_past_the_legacy_side_call_deadline() {
+    let workspace = IsolatedWorkspace::new("goal-audit-slow-review");
+    let changed = workspace.path("changed.rs");
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(write_content_completion(
+                &changed.to_string_lossy(),
+                "a substantial implementation body, comfortably past the trivial-diff exemption",
+            )),
+            ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+            ProviderStep::DelayedCompletion(
+                std::time::Duration::from_secs(16),
+                completion(
+                    vec![Content::Text(
+                        "Implement the newly discovered production adapter".into(),
+                    )],
+                    1,
+                    1,
+                ),
+            ),
+        ],
+        audit_cfg(&workspace),
+    );
+    agent.set_structured_goal(Some(single_step_goal())).unwrap();
+
+    agent.run_turn("go", &mut RecUi::default()).await.unwrap();
+
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(
+        goal.status,
+        GoalStatus::Active,
+        "a slow audit must still reopen a goal with missing work"
+    );
+    assert_eq!(goal.sub_goals.len(), 2);
+    assert_eq!(goal.audit_rounds, 1);
+    assert_eq!(requests.lock().unwrap().len(), 3);
+}
+
 #[tokio::test]
 async fn completion_audit_complete_finishes_goal() {
     let workspace = IsolatedWorkspace::new("goal-audit-complete");
@@ -1404,31 +1716,39 @@ async fn completion_audit_complete_finishes_goal() {
 }
 
 #[tokio::test]
-async fn completion_audit_cap_reached_finishes_without_another_call() {
-    let workspace = IsolatedWorkspace::new("goal-audit-cap");
-    let changed = workspace.path("changed.rs");
-    // No auditor completion scripted: at the cap no audit call may fire (the
-    // Canned provider would panic if one did).
-    let responses = vec![
-        write_content_completion(
-            &changed.to_string_lossy(),
-            "a substantial implementation body, comfortably past the trivial-diff exemption",
-        ),
-        completion(vec![Content::Text("done".into())], 1, 1),
-    ];
-    let mut agent = agent(responses, audit_cfg(&workspace));
+async fn completion_audit_continues_past_the_historical_ten_round_ceiling() {
+    let workspace = IsolatedWorkspace::new("goal-audit-unlimited-rounds");
+    let mut agent = agent(
+        vec![completion(
+            vec![Content::Text(
+                "Implement the newly discovered production adapter".into(),
+            )],
+            1,
+            1,
+        )],
+        audit_cfg(&workspace),
+    );
     let mut goal = single_step_goal();
-    goal.audit_rounds = crate::agent::audit_goal::MAX_AUDIT_ROUNDS;
+    goal.sub_goals[0].status = GoalStatus::Done;
+    goal.status = GoalStatus::Done;
+    goal.audit_rounds = 10;
     agent.set_structured_goal(Some(goal)).unwrap();
     let mut ui = RecUi::default();
 
-    agent.run_turn("go", &mut ui).await.unwrap();
+    agent.audit_goal_completion(&mut ui).await;
 
-    assert_eq!(agent.structured_goal().unwrap().status, GoalStatus::Done);
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(goal.audit_rounds, 11);
+    assert_eq!(goal.status, GoalStatus::Active);
+    assert_eq!(goal.sub_goals.len(), 2);
+    assert_eq!(
+        goal.sub_goals[1].description,
+        "Implement the newly discovered production adapter"
+    );
     assert!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("long-horizon goal complete")),
+            .any(|s| s.contains("continuing (audit round 11)")),
         "statuses: {:?}",
         ui.statuses
     );
@@ -1505,12 +1825,9 @@ async fn completion_audit_step_limit_saturated_finishes_with_warning() {
 }
 
 #[tokio::test]
-async fn exhausted_sub_goal_skips_to_next_step_instead_of_failing_goal() {
-    // The qtest failure: the last sub-goal thrashed to budget exhaustion and
-    // record_failure marked the WHOLE goal Failed — killing the drive with
-    // 20/21 milestones done. With pending work remaining, the driver must
-    // skip past the dead step and keep driving.
-    let mut cfg = config();
+async fn third_failed_sub_goal_attempt_remains_active_under_unlimited_default() {
+    let workspace = IsolatedWorkspace::new("long-horizon-skip");
+    let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
     cfg.loop_limits.max_repeat_nudges = 1;
     let responses = vec![
@@ -1521,26 +1838,25 @@ async fn exhausted_sub_goal_skips_to_next_step_instead_of_failing_goal() {
     let mut agent = agent(responses, cfg);
     let mut goal = Goal::new("refactor", vec!["stuck step".into(), "next step".into()]);
     goal.team = false;
-    goal.sub_goals[0].attempts = 2; // one more failure exhausts the budget
+    goal.sub_goals[0].attempts = 2;
     agent.set_structured_goal(Some(goal)).unwrap();
     let mut ui = RecUi::default();
 
     agent.run_turn("go", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file("lhskip");
-
     let goal = agent.structured_goal().expect("goal still set");
     assert_eq!(
         goal.sub_goals[0].status,
-        GoalStatus::Failed,
-        "the dead step stays visible as Failed"
+        GoalStatus::Active,
+        "the ordinary retry policy must not fail the step at a fixed attempt count"
     );
-    assert_eq!(goal.active_index(), Some(1), "skipped to the next step");
-    assert_eq!(goal.status, GoalStatus::Active, "goal survives");
-    assert!(goal.should_auto_drive(), "the drive keeps its momentum");
+    assert_eq!(goal.sub_goals[0].attempts, 3);
+    assert_eq!(goal.active_index(), Some(0), "the same step remains active");
+    assert_eq!(goal.status, GoalStatus::Active);
+    assert!(goal.should_auto_drive());
     assert!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("skipping to the next step")),
+            .any(|s| s.contains("will retry next turn")),
         "statuses: {:?}",
         ui.statuses
     );
@@ -1584,14 +1900,69 @@ async fn step_capped_turn_with_progress_is_a_continuation_not_a_failure() {
     assert_eq!(goal.status, GoalStatus::Active);
     assert!(goal.should_auto_drive(), "drive keeps going");
     assert!(
-        ui.statuses.iter().any(|s| s.contains("continuing (1/")),
+        ui.statuses.iter().any(|s| s.contains("continuing (1)")),
         "statuses: {:?}",
         ui.statuses
     );
 }
 
 #[tokio::test]
-async fn step_capped_turn_past_continuation_budget_records_failure() {
+async fn tool_capped_goal_turn_is_an_accurately_labeled_continuation() {
+    let workspace = IsolatedWorkspace::new("goal-tool-cap-continuation");
+    let changed = workspace.path("changed.rs");
+    let mut cfg = workspace.config();
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.loop_limits.max_tool_calls = 1;
+    let responses = vec![
+        write_content_completion(
+            &changed.to_string_lossy(),
+            "a substantial implementation body, comfortably past the trivial-diff exemption",
+        ),
+        completion(
+            vec![Content::Text(
+                "Reached the configured tool-call budget after landing the implementation.".into(),
+            )],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut goal = Goal::new("build it", vec!["big milestone".into(), "next".into()]);
+    goal.team = false;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert!(!agent.last_turn_telemetry().hit_step_cap);
+    assert!(agent.last_turn_telemetry().hit_tool_cap);
+    assert_eq!(goal.active_index(), Some(0), "same milestone stays active");
+    assert_eq!(goal.sub_goals[0].attempts, 0, "no retry budget burned");
+    assert_eq!(
+        goal.sub_goals[0].cap_continuations, 1,
+        "work-cap continuation counted"
+    );
+    assert!(goal.should_auto_drive(), "drive keeps going");
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("tool-call cap with progress")),
+        "goal settlement must name the cap that actually fired: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("step cap with progress")),
+        "a tool-only cap must not be mislabeled as a step cap: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn productive_step_capped_turn_continues_past_legacy_forty_turn_ceiling() {
     let workspace = IsolatedWorkspace::new("goal-cap-exhausted");
     let changed = workspace.path("changed.rs");
     let mut cfg = workspace.config();
@@ -1611,7 +1982,7 @@ async fn step_capped_turn_past_continuation_budget_records_failure() {
         vec!["thrashing milestone".into(), "next".into()],
     );
     goal.team = false;
-    goal.sub_goals[0].cap_continuations = MAX_CAP_CONTINUATIONS;
+    goal.sub_goals[0].cap_continuations = 40;
     agent.set_structured_goal(Some(goal)).unwrap();
     let mut ui = RecUi::default();
 
@@ -1619,16 +1990,68 @@ async fn step_capped_turn_past_continuation_budget_records_failure() {
 
     let goal = agent.structured_goal().expect("goal still set");
     assert_eq!(
-        goal.sub_goals[0].attempts, 1,
-        "past the continuation budget, capped turns burn retries again"
+        goal.sub_goals[0].attempts, 0,
+        "productive caps never burn retries"
     );
+    assert_eq!(
+        goal.sub_goals[0].cap_continuations, 41,
+        "the old 40-turn ceiling is now an ordinary diagnostic count"
+    );
+    assert_eq!(goal.active_index(), Some(0));
+    assert!(goal.should_auto_drive());
+    assert!(goal.sub_goals[0].notes.is_empty());
     assert!(
-        goal.sub_goals[0]
-            .notes
+        ui.statuses.iter().any(
+            |status| status.contains("step cap with progress") && status.contains("continuing")
+        ),
+        "statuses: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn productive_tool_capped_turn_remains_continuable_at_saturated_counter() {
+    let workspace = IsolatedWorkspace::new("goal-tool-cap-exhausted");
+    let changed = workspace.path("changed.rs");
+    let mut cfg = workspace.config();
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.loop_limits.max_tool_calls = 1;
+    let responses = vec![
+        write_content_completion(
+            &changed.to_string_lossy(),
+            "a substantial implementation body, comfortably past the trivial-diff exemption",
+        ),
+        completion(
+            vec![Content::Text(
+                "Reached the configured tool-call budget.".into(),
+            )],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut goal = Goal::new("build it", vec!["big milestone".into(), "next".into()]);
+    goal.team = false;
+    goal.sub_goals[0].cap_continuations = MAX_CAP_CONTINUATIONS;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(goal.sub_goals[0].attempts, 0);
+    assert_eq!(goal.sub_goals[0].cap_continuations, u32::MAX);
+    assert_eq!(goal.active_index(), Some(0));
+    assert!(goal.should_auto_drive());
+    assert!(goal.sub_goals[0].notes.is_empty());
+    assert!(
+        ui.statuses
             .iter()
-            .any(|n| n.contains("step cap")),
-        "notes: {:?}",
-        goal.sub_goals[0].notes
+            .any(|status| status.contains("tool-call cap with progress")
+                && status.contains("continuing")),
+        "statuses: {:?}",
+        ui.statuses
     );
 }
 

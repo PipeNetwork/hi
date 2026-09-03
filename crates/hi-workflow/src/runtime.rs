@@ -129,7 +129,7 @@ impl WorkflowRuntimeManager {
         workflow_name: String,
         script: String,
         args: serde_json::Value,
-        agent_budget: u64,
+        agent_budget: Option<u64>,
     ) -> Result<String, RuntimeError> {
         if self.active.len() >= MAX_ACTIVE_RUNS {
             return Err(RuntimeError::AtCapacity);
@@ -168,7 +168,7 @@ impl WorkflowRuntimeManager {
         workflow_name: String,
         script: String,
         args: serde_json::Value,
-        agent_budget: u64,
+        agent_budget: Option<u64>,
         approval: (&str, &str),
     ) -> Result<String, RuntimeError> {
         if self.active.len() >= MAX_ACTIVE_RUNS {
@@ -229,14 +229,14 @@ impl WorkflowRuntimeManager {
         // active even though no engine task was spawned.
         let journal = Journal::load(stored.journal_path)?;
         let mut manifest = stored.manifest;
-        if let Some(budget) = raised_budget {
+        if let (Some(current), Some(budget)) = (manifest.agent_budget, raised_budget) {
             if budget < manifest.agent_spent {
                 return Err(RuntimeError::InvalidBudget {
                     raised: budget,
                     spent: manifest.agent_spent,
                 });
             }
-            manifest.agent_budget = budget.max(manifest.agent_budget);
+            manifest.agent_budget = Some(budget.max(current));
         }
         manifest.status = StoredRunStatus::Running;
         manifest.outcome = None;
@@ -296,14 +296,14 @@ impl WorkflowRuntimeManager {
             ));
         }
         let mut manifest = stored.manifest;
-        if let Some(budget) = raised_budget {
+        if let (Some(current), Some(budget)) = (manifest.agent_budget, raised_budget) {
             if budget < manifest.agent_spent {
                 return Err(RuntimeError::InvalidBudget {
                     raised: budget,
                     spent: manifest.agent_spent,
                 });
             }
-            manifest.agent_budget = budget.max(manifest.agent_budget);
+            manifest.agent_budget = Some(budget.max(current));
         }
         let journal = Journal::load(stored.journal_path)?;
 
@@ -738,7 +738,7 @@ mod tests {
                 "test".into(),
                 "complete(1);".into(),
                 serde_json::json!({}),
-                8,
+                Some(8),
             )
             .unwrap();
 
@@ -753,7 +753,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
         let mut manager = WorkflowRuntimeManager::new(store.clone());
-        let manifest = WorkflowRunManifest::new("panic-run".into(), "test".into(), 8).unwrap();
+        let manifest =
+            WorkflowRunManifest::new("panic-run".into(), "test".into(), Some(8)).unwrap();
         store
             .register(&manifest, "complete(1);", &serde_json::json!({}))
             .unwrap();
@@ -789,7 +790,8 @@ mod tests {
     fn resume_rejects_budget_below_spend_without_mutating_state() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let mut manifest = WorkflowRunManifest::new("budget".into(), "test".into(), 10).unwrap();
+        let mut manifest =
+            WorkflowRunManifest::new("budget".into(), "test".into(), Some(10)).unwrap();
         manifest.agent_spent = 7;
         manifest.status = StoredRunStatus::Paused;
         store
@@ -809,11 +811,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resume_does_not_turn_an_unlimited_run_into_a_finite_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WorkflowRunStore::new(dir.path());
+        let mut manifest = WorkflowRunManifest::new("unlimited".into(), "test".into(), None)
+            .expect("valid unlimited manifest");
+        manifest.agent_spent = 129;
+        manifest.status = StoredRunStatus::Paused;
+        store
+            .register(&manifest, "complete(1);", &serde_json::json!({}))
+            .unwrap();
+        let mut manager = WorkflowRuntimeManager::new(store.clone());
+
+        manager
+            .resume("unlimited", Some(1))
+            .expect("a finite raise hint cannot lower an unlimited run");
+        assert_eq!(store.load("unlimited").unwrap().manifest.agent_budget, None);
+        assert!(matches!(
+            manager.join("unlimited").await.unwrap(),
+            WorkflowOutcome::Completed { .. }
+        ));
+    }
+
     #[test]
     fn resume_rejects_a_corrupt_journal_before_publishing_running() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let mut manifest = WorkflowRunManifest::new("corrupt".into(), "test".into(), 8).unwrap();
+        let mut manifest =
+            WorkflowRunManifest::new("corrupt".into(), "test".into(), Some(8)).unwrap();
         manifest.status = StoredRunStatus::Paused;
         store
             .register(&manifest, "complete(1);", &serde_json::json!({}))
@@ -838,7 +864,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
         let mut manifest =
-            WorkflowRunManifest::new("declarative".into(), "test".into(), 8).unwrap();
+            WorkflowRunManifest::new("declarative".into(), "test".into(), Some(8)).unwrap();
         manifest.engine = crate::WorkflowEngineKind::Declarative;
         manifest.status = StoredRunStatus::Paused;
         store
@@ -866,7 +892,8 @@ mod tests {
     async fn a_second_manager_cannot_resume_a_run_owned_by_the_first() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let mut manifest = WorkflowRunManifest::new("exclusive".into(), "test".into(), 8).unwrap();
+        let mut manifest =
+            WorkflowRunManifest::new("exclusive".into(), "test".into(), Some(8)).unwrap();
         manifest.status = StoredRunStatus::Paused;
         store
             .register(&manifest, "complete(1);", &serde_json::json!({}))
@@ -895,7 +922,7 @@ mod tests {
                 "test".into(),
                 "complete(1);".into(),
                 serde_json::json!({}),
-                8,
+                Some(8),
             )
             .unwrap();
         let observer = WorkflowRuntimeManager::new(store.clone());
@@ -917,7 +944,7 @@ mod tests {
             ("paused", StoredRunStatus::Paused),
             ("done", StoredRunStatus::Completed),
         ] {
-            let mut manifest = WorkflowRunManifest::new(id.into(), "test".into(), 8).unwrap();
+            let mut manifest = WorkflowRunManifest::new(id.into(), "test".into(), Some(8)).unwrap();
             manifest.status = status;
             store
                 .register(&manifest, "complete(1);", &serde_json::json!({}))
@@ -953,7 +980,7 @@ mod tests {
                 "test".into(),
                 "complete(1);".into(),
                 serde_json::json!({}),
-                8,
+                Some(8),
                 ("approval-1", "digest-1"),
             )
             .unwrap();
@@ -991,7 +1018,7 @@ mod tests {
             "test".into(),
             "complete(1);".into(),
             serde_json::json!({}),
-            8,
+            Some(8),
             ("approval-1", "digest-1"),
         );
         crate::store::clear_atomic_write_failure_for_test();
@@ -1017,7 +1044,7 @@ mod tests {
                 "test".into(),
                 "complete(1);".into(),
                 serde_json::json!({}),
-                8,
+                Some(8),
                 ("approval-1", "digest-1"),
             )
             .unwrap();
@@ -1055,7 +1082,7 @@ mod tests {
                 "test".into(),
                 "complete(1);".into(),
                 serde_json::json!({}),
-                8,
+                Some(8),
                 ("approval-1", "digest-1"),
             )
             .unwrap();
@@ -1084,7 +1111,7 @@ mod tests {
                 "test".into(),
                 "complete(1);".into(),
                 serde_json::json!({}),
-                8,
+                Some(8),
                 ("approval-1", "digest-1"),
             )
             .unwrap();
@@ -1125,7 +1152,7 @@ mod tests {
                 "guarded".into(),
                 "complete(1);".into(),
                 serde_json::json!({}),
-                8,
+                Some(8),
                 ("approval-1", "digest-1"),
             )
             .unwrap();
@@ -1136,7 +1163,7 @@ mod tests {
                     format!("active-{index}"),
                     "complete(1);".into(),
                     serde_json::json!({}),
-                    8,
+                    Some(8),
                 )
                 .unwrap();
         }
@@ -1160,7 +1187,7 @@ mod tests {
                 "test".into(),
                 "complete(1);".into(),
                 serde_json::json!({}),
-                8,
+                Some(8),
                 ("approval-1", "digest-1"),
             )
             .unwrap();
@@ -1180,24 +1207,19 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn shutdown_uses_one_deadline_and_persists_timeouts() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
         let mut manager = WorkflowRuntimeManager::new(store.clone());
         for id in ["slow-a", "slow-b"] {
-            let manifest = WorkflowRunManifest::new(id.into(), "test".into(), 8).unwrap();
+            let manifest = WorkflowRunManifest::new(id.into(), "test".into(), Some(8)).unwrap();
             store
                 .register(&manifest, "complete(1);", &serde_json::json!({}))
                 .unwrap();
             let (host_tx, host_rx) = mpsc::unbounded_channel();
             drop(host_tx);
-            let task = tokio::task::spawn_blocking(|| {
-                std::thread::sleep(Duration::from_millis(200));
-                WorkflowOutcome::Completed {
-                    result: serde_json::Value::Null,
-                }
-            });
+            let task = tokio::spawn(std::future::pending::<WorkflowOutcome>());
             let ownership = store.try_claim(id).unwrap().unwrap();
             manager.active.insert(
                 id.into(),
@@ -1210,9 +1232,14 @@ mod tests {
                 },
             );
         }
+        let timeout = Duration::from_millis(20);
         let started = tokio::time::Instant::now();
-        manager.shutdown(Duration::from_millis(20)).await;
-        assert!(started.elapsed() < Duration::from_millis(100));
+        manager.shutdown(timeout).await;
+        assert_eq!(
+            started.elapsed(),
+            timeout,
+            "two timed-out runs must share one shutdown deadline"
+        );
         assert!(manager.active.is_empty());
         for id in ["slow-a", "slow-b"] {
             assert_eq!(

@@ -144,19 +144,25 @@ impl LspClient {
     /// harmless. Once bytes are available, phase 2 commits to reading the full
     /// frame under its own generous grace; only if *that* stalls is the client
     /// marked poisoned (respawned by the manager on the next query).
-    async fn read_one(&self, budget: Duration) -> ReadOutcome {
+    async fn read_one(&self, budget: Option<Duration>) -> ReadOutcome {
         let mut stdout = self.stdout.lock().await;
-        match tokio::time::timeout(budget, stdout.fill_buf()).await {
-            Err(_) => return ReadOutcome::Idle,
-            Ok(Err(_)) => {
+        let buffered = match budget {
+            Some(budget) => match tokio::time::timeout(budget, stdout.fill_buf()).await {
+                Err(_) => return ReadOutcome::Idle,
+                Ok(result) => result,
+            },
+            None => stdout.fill_buf().await,
+        };
+        match buffered {
+            Err(_) => {
                 self.mark_poisoned();
                 return ReadOutcome::Closed;
             }
-            Ok(Ok([])) => {
+            Ok([]) => {
                 self.mark_poisoned();
                 return ReadOutcome::Closed;
             }
-            Ok(Ok(_)) => {}
+            Ok(_) => {}
         }
         match tokio::time::timeout(MESSAGE_GRACE, read_message(&mut stdout)).await {
             Ok(Some(msg)) => ReadOutcome::Message(msg),
@@ -209,6 +215,16 @@ impl LspClient {
     /// drops the servers lock before calling, so different languages still run
     /// concurrently.
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        self.request_with_timeout(method, params, request_timeout())
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
         let _io = self.io.lock().await;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let body = json!({
@@ -221,12 +237,18 @@ impl LspClient {
             let mut stdin = self.stdin.lock().await;
             write_message(&mut stdin, &body.to_string()).await?;
         }
-        let deadline = Instant::now() + request_timeout();
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                bail!("LSP request `{method}` timed out");
-            }
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        bail!("LSP request `{method}` timed out");
+                    }
+                    Some(remaining)
+                }
+                None => None,
+            };
             match self.read_one(remaining).await {
                 ReadOutcome::Idle => continue, // deadline re-checked above
                 ReadOutcome::Closed => {
@@ -331,7 +353,7 @@ impl LspClient {
             if remaining.is_zero() {
                 return DrainOutcome::Ok;
             }
-            match self.read_one(remaining).await {
+            match self.read_one(Some(remaining)).await {
                 ReadOutcome::Message(msg) => {
                     if let Ok(v) = serde_json::from_slice::<Value>(&msg) {
                         if self.handle_server_request(&v).await.unwrap_or(false) {
@@ -341,6 +363,56 @@ impl LspClient {
                     }
                 }
                 ReadOutcome::Idle => {}
+                ReadOutcome::Closed | ReadOutcome::Poisoned => return DrainOutcome::Dead,
+            }
+        }
+    }
+
+    /// Wait for an authoritative push-diagnostics publication for this exact
+    /// document generation. With no configured request timeout this wait is
+    /// unlimited and remains cancellable by its caller; transport closure or
+    /// a partial-frame stall still poisons the server immediately.
+    pub(crate) async fn wait_for_current_diagnostics(
+        &self,
+        uri: &str,
+        version: u64,
+    ) -> DrainOutcome {
+        self.wait_for_current_diagnostics_with_timeout(uri, version, request_timeout())
+            .await
+    }
+
+    async fn wait_for_current_diagnostics_with_timeout(
+        &self,
+        uri: &str,
+        version: u64,
+        timeout: Option<Duration>,
+    ) -> DrainOutcome {
+        let _io = self.io.lock().await;
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        loop {
+            if self.has_current_pushed_diagnostics(uri, version) {
+                return DrainOutcome::Ok;
+            }
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return DrainOutcome::Ok;
+                    }
+                    Some(remaining)
+                }
+                None => None,
+            };
+            match self.read_one(remaining).await {
+                ReadOutcome::Message(msg) => {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&msg) {
+                        if self.handle_server_request(&v).await.unwrap_or(false) {
+                            continue;
+                        }
+                        self.capture_notification(&v);
+                    }
+                }
+                ReadOutcome::Idle => return DrainOutcome::Ok,
                 ReadOutcome::Closed | ReadOutcome::Poisoned => return DrainOutcome::Dead,
             }
         }
@@ -356,7 +428,9 @@ impl LspClient {
         // Skip the graceful JSON-RPC goodbye on a desynced stream — the
         // `shutdown` request would only misread frames until its timeout.
         if !self.is_poisoned() {
-            let _ = self.request("shutdown", None).await;
+            let _ = self
+                .request_with_timeout("shutdown", None, Some(Duration::from_secs(2)))
+                .await;
             let _ = self.notify("exit", Value::Null).await;
         }
         // Give the server a moment to exit gracefully, then force-kill so a
@@ -388,6 +462,14 @@ impl LspClient {
     /// `publishDiagnostics`), if any. Returns a clone of the raw JSON values.
     pub(crate) fn get_pushed_diagnostics(&self, uri: &str) -> Option<PublishedDiagnostics> {
         lock_recover(&self.pushed_diagnostics).get(uri).cloned()
+    }
+
+    fn has_current_pushed_diagnostics(&self, uri: &str, version: u64) -> bool {
+        self.get_pushed_diagnostics(uri)
+            .is_some_and(|published| match published.version {
+                Some(published_version) => published_version == version,
+                None => version == 0,
+            })
     }
 
     /// Drop any cached pushed diagnostics for a URI. Called before a
@@ -542,6 +624,93 @@ pub fn uri_to_path(uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    async fn silent_client() -> LspClient {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "cat >/dev/null"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn silent test server");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        LspClient {
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(BufReader::new(stdout)),
+            io: Mutex::new(()),
+            poisoned: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            versions: StdMutex::new(HashMap::new()),
+            pushed_diagnostics: StdMutex::new(HashMap::new()),
+            capabilities: Value::Null,
+            root: PathBuf::from("/tmp"),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn kill_test_client(client: &LspClient) {
+        client.mark_poisoned();
+        let mut child = client.child.lock().await;
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn productive_waits_are_unlimited_cancellable_and_explicitly_boundable() {
+        let client = silent_client().await;
+
+        let error = client
+            .request_with_timeout("test/slow", None, Some(Duration::from_millis(10)))
+            .await
+            .expect_err("an explicit request timeout must still fire");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(
+            !client.is_poisoned(),
+            "an idle timeout keeps framing intact"
+        );
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(15),
+            client.request_with_timeout("test/unlimited", None, None),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the default request must remain pending until caller cancellation"
+        );
+        assert!(
+            !client.is_poisoned(),
+            "idle cancellation keeps framing intact"
+        );
+
+        assert_eq!(
+            client
+                .wait_for_current_diagnostics_with_timeout(
+                    "file:///tmp/wait.rs",
+                    0,
+                    Some(Duration::from_millis(10)),
+                )
+                .await,
+            DrainOutcome::Ok,
+            "an explicit diagnostic timeout must remain available"
+        );
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(15),
+            client.wait_for_current_diagnostics_with_timeout("file:///tmp/wait.rs", 0, None),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the default push-diagnostic wait must remain pending and cancellable"
+        );
+
+        kill_test_client(&client).await;
+    }
 
     #[test]
     fn configuration_request_gets_one_result_per_item() {

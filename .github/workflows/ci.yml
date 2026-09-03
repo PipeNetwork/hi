@@ -34,22 +34,22 @@ jobs:
         run: >-
           cargo clippy
           -p hi-ai -p hi-tools -p hi-lsp -p hi-agent
-          -p hi-tui -p hi -p hi-eval
+          -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
-          --all-targets -- -D warnings
+          --all-targets -- -A clippy::large-enum-variant -D warnings
 
       - name: Core tests
         run: >-
           cargo nextest run
           -p hi-ai -p hi-tools -p hi-lsp -p hi-agent
-          -p hi-tui -p hi -p hi-eval
+          -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
 
       - name: Core doctests
         run: >-
           cargo test --doc
           -p hi-ai -p hi-tools -p hi-lsp -p hi-agent
-          -p hi-tui -p hi -p hi-eval
+          -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
 
       - name: Voice feature compile
@@ -91,6 +91,54 @@ jobs:
 
       - name: Source file-size ratchet
         run: scripts/check_file_size.sh
+
+  tui-smoke:
+    name: interactive TUI smoke (provider-free)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HI_PIPE_WRAP: ${{ github.workspace }}/target/pipe-wrap/x86_64-unknown-linux-gnu/pipe-wrap
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Linux sandbox helper
+        run: tools/build-pipe-wrap.sh
+
+      - name: Build TUI smoke binaries
+        run: cargo build -p hi -p hi-smoke --no-default-features
+
+      - name: Validate TUI smoke scenarios
+        run: target/debug/hi-smoke validate bench/tui-smoke
+
+      - name: Run curated TUI smoke scenarios
+        run: >-
+          target/debug/hi-smoke run bench/tui-smoke
+          --mode scripted
+          --tag pr
+          --artifacts artifacts/tui-smoke
+
+      - name: Run fixed TUI chaos seeds
+        run: >-
+          target/debug/hi-smoke fuzz bench/tui-smoke
+          --seed-start 0
+          --seeds 12
+          --jobs 4
+          --artifacts artifacts/tui-smoke-fuzz
+
+      - name: Upload TUI smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-smoke-pr-${{ github.run_id }}
+          path: |
+            artifacts/tui-smoke
+            artifacts/tui-smoke-fuzz
+          if-no-files-found: error
+          retention-days: 30
 
   # PR CI is deliberately provider-free. Network/model-backed evaluation runs
   # only in the scheduled workflow and cannot make pull-request checks flaky.

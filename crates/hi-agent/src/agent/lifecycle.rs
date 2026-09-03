@@ -78,7 +78,7 @@ impl crate::Agent {
         history: Vec<Message>,
         usage: Usage,
         checkpoint_refs: Vec<String>,
-        structured_goal: Option<Goal>,
+        mut structured_goal: Option<Goal>,
         decisions: DecisionLog,
     ) -> Result<Self> {
         let persisted = history.len();
@@ -92,12 +92,17 @@ impl crate::Agent {
                 .drain(0..agent.workspace.checkpoints.len() - crate::MAX_CHECKPOINTS);
         }
         agent.decisions = decisions;
+        let migrated_legacy_goal_budget = structured_goal
+            .as_mut()
+            .is_some_and(crate::Goal::clear_legacy_automatic_budget);
         agent.goals.structured = agent
             .config
             .subagents
             .long_horizon
             .then_some(structured_goal)
             .flatten();
+        agent.pending_legacy_goal_budget_migration =
+            migrated_legacy_goal_budget && agent.goals.structured.is_some();
         // Seed the context-occupancy gauge from the restored transcript. It
         // starts at 0 otherwise, which disables the graceful pre-turn
         // compaction (gated on this gauge) for the first resumed turn — a
@@ -111,7 +116,7 @@ impl crate::Agent {
 
     fn with_messages(
         provider: Arc<dyn Provider>,
-        config: AgentConfig,
+        mut config: AgentConfig,
         messages: Vec<Message>,
         persisted: usize,
         scan: Option<crate::change_ledger::BackgroundScan>,
@@ -123,6 +128,7 @@ impl crate::Agent {
         // action") into the next turn's context.
         messages.strip_finalize_pair();
         messages.strip_trailing_nudges();
+        messages.strip_previous_turn_blocks();
         messages.repair_for_provider();
         messages
             .validate_and_repair_for_provider()
@@ -131,11 +137,16 @@ impl crate::Agent {
         // incremental session recorder doesn't slice past the end.
         let persisted = persisted.min(messages.len());
         config.gates.verification.validate()?;
-        let runtime = WorkspaceRuntime::new_with_scan(
+        #[cfg(test)]
+        let sandbox_policy = config.sandbox_policy;
+        #[cfg(not(test))]
+        let sandbox_policy = None;
+        let runtime = WorkspaceRuntime::new_with_scan_and_sandbox(
             &config.paths.workspace_root,
             &config.paths.state_root,
             config.gates.lsp_mode,
             scan,
+            sandbox_policy,
         )?;
         let tools = advertised_tools(&config, None);
         let last_effective_route = crate::EffectiveModelRoute {
@@ -146,6 +157,42 @@ impl crate::Agent {
         // endpoint (e.g. a local hi-local server) when configured. Shared with
         // the runtime `/config skeptic-local` toggle so their wiring can't drift.
         let skeptic_provider = crate::local_skeptic::build_skeptic_provider(&config);
+        let engine_runtime =
+            hi_engine_host::EngineRuntime::new(hi_engine_host::ModuleValidationPolicy {
+                allow_unsigned: config.engine.allow_unsigned,
+                trusted_keys: hi_engine_host::parse_trusted_keys(&config.engine.trusted_key_hex)?,
+                max_guest_fuel: config.engine.max_guest_fuel,
+                max_guest_memory_bytes: config.engine.max_guest_memory_bytes,
+                max_guest_step_ms: config.engine.max_guest_step_ms,
+                ..hi_engine_host::ModuleValidationPolicy::default()
+            })?;
+        if config.engine.mode == hi_engine_api::EngineMode::Wasm {
+            if let Some(module_path) =
+                hi_engine_host::discover_module_path(config.engine.module_path.as_deref())
+            {
+                match engine_runtime.reload(&module_path) {
+                    Ok(_) => {
+                        config.engine.module_path = Some(module_path.clone());
+                        if config.engine.watch
+                            && let Err(error) = engine_runtime.start_watch(module_path)
+                        {
+                            tracing::warn!(%error, "WASM engine watch could not start");
+                        }
+                    }
+                    Err(error) => {
+                        // The optional logic module must not make ordinary
+                        // native turns unusable. The rejection is retained in
+                        // logs and the config surface still makes the selected
+                        // mode/path visible.
+                        tracing::warn!(%error, "WASM engine module rejected; using native engine");
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "WASM engine selected but no module was found; using native engine until a validated module is loaded"
+                );
+            }
+        }
         let btw_jobs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let btw_dispatch = crate::agent::turn::btw::BtwDispatcher::new(btw_jobs.clone());
         Ok(Self {
@@ -155,6 +202,8 @@ impl crate::Agent {
             team_local_servers: Vec::new(),
             driver_local_server: None,
             config,
+            engine_runtime,
+            side_call_timeout: crate::agent::turn::DEFAULT_SIDE_CALL_TIMEOUT,
             runtime,
             task: crate::domain::TaskContextState::default(),
             messages,
@@ -174,6 +223,7 @@ impl crate::Agent {
             undo_test_probe: None,
             repair_effort_escalated: false,
             goals: crate::domain::GoalState::default(),
+            pending_legacy_goal_budget_migration: false,
             decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),
             prefix_stability: crate::prefix_stability::PrefixStability::default(),
@@ -185,15 +235,20 @@ impl crate::Agent {
             pending_block: None,
             rsi_observe: crate::domain::RsiObserveState::default(),
             plan_mode: false,
-            plan_drive_paused: false,
+            plan_drive_pause: crate::plan_drive::PlanDrivePause::Running,
+            plan_approval_parked: false,
             plan_drive_stall: 0,
             goal_drive_stall: 0,
+            plan_drive_evidence: crate::plan_drive::DriveEvidenceLedger::default(),
+            goal_drive_evidence: crate::plan_drive::DriveEvidenceLedger::default(),
             interactive_session: false,
             drive_restore_permission: None,
             goal_requeue_notice: None,
             ask_user_calls: 0,
             ask_user_drive_streak: 0,
             turn_drive_kind: crate::DriveKind::User,
+            pending_plan_interruption_resume: false,
+            turn_consumed_plan_interruption: false,
             permission_mode: crate::PermissionMode::default(),
             approval_parked: false,
             turn_count: 0,
@@ -361,6 +416,30 @@ impl crate::Agent {
     pub fn set_session(&mut self, session: Box<dyn SessionSink>) {
         self.session = Some(session);
         self.publish_model_context();
+        if let Err(error) = self.persist_pending_legacy_goal_budget_migration() {
+            // `set_session` predates fallible attachment. Keep the migration
+            // dirty so the next durable boundary retries it and surfaces an
+            // error instead of silently treating the old budget as persisted.
+            tracing::warn!(%error, "could not persist migrated legacy goal budget");
+        }
+    }
+
+    fn persist_pending_legacy_goal_budget_migration(&mut self) -> Result<()> {
+        if !self.pending_legacy_goal_budget_migration {
+            return Ok(());
+        }
+        let Some(goal) = self.goals.structured.as_ref() else {
+            self.pending_legacy_goal_budget_migration = false;
+            return Ok(());
+        };
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        session
+            .record_goal(goal)
+            .context("persisting normalized legacy goal budget")?;
+        self.pending_legacy_goal_budget_migration = false;
+        Ok(())
     }
 
     /// Tell the session sink which model this agent runs, so a remote viewer
@@ -390,7 +469,7 @@ impl crate::Agent {
         history: Vec<Message>,
         usage: Usage,
         checkpoint_refs: Vec<String>,
-        structured_goal: Option<Goal>,
+        mut structured_goal: Option<Goal>,
         decisions: DecisionLog,
         plan: Vec<hi_tools::PlanStep>,
     ) -> Result<()> {
@@ -400,6 +479,7 @@ impl crate::Agent {
         // JSONL file or remote ipop records.
         messages.strip_finalize_pair();
         messages.strip_trailing_nudges();
+        messages.strip_previous_turn_blocks();
         messages.repair_for_provider();
         messages
             .validate_and_repair_for_provider()
@@ -416,12 +496,17 @@ impl crate::Agent {
                 .drain(0..self.workspace.checkpoints.len() - crate::MAX_CHECKPOINTS);
         }
         self.decisions = decisions;
+        let migrated_legacy_goal_budget = structured_goal
+            .as_mut()
+            .is_some_and(crate::Goal::clear_legacy_automatic_budget);
         self.goals.structured = self
             .config
             .subagents
             .long_horizon
             .then_some(structured_goal)
             .flatten();
+        self.pending_legacy_goal_budget_migration =
+            migrated_legacy_goal_budget && self.goals.structured.is_some();
         // Clear per-turn / transient state from the previous session, matching
         // what `with_messages` initializes to None/empty for a fresh agent.
         self.goals.free_text = None;
@@ -438,6 +523,7 @@ impl crate::Agent {
         // stale. Clear it so the next turn re-snapshots from scratch.
         self.invalidate_snapshot();
         self.runtime.clear_read_cache();
+        self.persist_pending_legacy_goal_budget_migration()?;
         Ok(())
     }
 
@@ -456,6 +542,8 @@ impl crate::Agent {
     /// Attach the runner that executes write-capable `delegate` subagents. Without
     /// one, the `delegate` tool reports itself unavailable.
     pub fn set_delegate_runner(&mut self, runner: std::sync::Arc<dyn crate::DelegateRunner>) {
+        runner.set_max_steps(self.max_steps_limit());
+        runner.set_max_tool_calls(self.max_tool_calls_cap());
         self.subagents.delegate_runner = Some(runner);
     }
 
@@ -508,6 +596,17 @@ impl crate::Agent {
         .iter()
         .cloned()
         .collect();
+        // `run_program` is negotiated at the provider boundary rather than
+        // inserted into the global catalog. This keeps ordinary providers and
+        // text-only routes byte-for-byte on the existing tool set.
+        if self.config.program.mode_enabled()
+            && self.provider.capabilities().native_tool_calls
+            && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
+            && !specs.is_empty()
+            && !specs.iter().any(|spec| spec.name == "run_program")
+        {
+            specs.push(hi_tools::run_program_tool_spec());
+        }
         if !matches!(self.config.memory.tool_set, crate::ToolSet::Minimal) {
             let window = self.config.routing.context_window.filter(|w| *w > 0);
             let occupancy =
@@ -596,14 +695,34 @@ impl crate::Agent {
     /// fallback after a failed durable discard so the current process still
     /// reflects the user's explicit interrupt.
     pub fn restore_state_snapshot(&mut self, snapshot: &crate::AgentStateSnapshot) {
+        self.restore_state_snapshot_with_workspace_rollback(snapshot, false);
+    }
+
+    pub(crate) fn restore_state_snapshot_with_workspace_rollback(
+        &mut self,
+        snapshot: &crate::AgentStateSnapshot,
+        workspace_rolled_back: bool,
+    ) {
         // Keep checklist progress from the abandoned turn (see prefer_plan_progress).
-        let plan =
-            crate::domain::GoalState::prefer_plan_progress(&snapshot.last_plan, self.goals.plan());
+        let plan = if workspace_rolled_back {
+            crate::domain::GoalState::prefer_plan_progress_after_workspace_rollback(
+                &snapshot.last_plan,
+                self.goals.plan(),
+            )
+        } else {
+            crate::domain::GoalState::prefer_plan_progress(&snapshot.last_plan, self.goals.plan())
+        };
+        let plan_drive_scope_changed = crate::heuristics::next_plan_step_title(&snapshot.last_plan)
+            != crate::heuristics::next_plan_step_title(&plan);
         self.goals.restore_triple(
             snapshot.goal.clone(),
             snapshot.structured_goal.clone(),
             plan,
         );
+        if plan_drive_scope_changed {
+            self.plan_drive_stall = 0;
+            self.plan_drive_evidence.clear();
+        }
         self.decisions = snapshot.decisions.clone();
         self.refresh_system_message();
     }
@@ -611,13 +730,24 @@ impl crate::Agent {
     /// Durably discard a turn by rewinding both the transcript and the
     /// prompt-injected side state to a pre-turn snapshot.
     ///
-    /// Plan checklist progress is **not** rolled back: an interrupt after
-    /// `update_plan` advanced (or finished) steps keeps that progress so a
-    /// restarted prompt does not show a stale incomplete plan.
+    /// Plan checklist progress is normally retained: an interrupt after a
+    /// bookkeeping-only `update_plan` should not show a stale checklist. The
+    /// cancellation owner uses the rollback-aware variant below when it also
+    /// restored workspace files, because completion claims backed by those
+    /// removed effects are no longer true.
     pub fn rewind_to_snapshot_durable(
         &mut self,
         len: usize,
         snapshot: &crate::AgentStateSnapshot,
+    ) -> Result<()> {
+        self.rewind_to_snapshot_durable_with_workspace_rollback(len, snapshot, false)
+    }
+
+    pub(crate) fn rewind_to_snapshot_durable_with_workspace_rollback(
+        &mut self,
+        len: usize,
+        snapshot: &crate::AgentStateSnapshot,
+        workspace_rolled_back: bool,
     ) -> Result<()> {
         let len = len.min(self.messages.len());
         let mut next = self.messages.as_slice()[..len].to_vec();
@@ -627,8 +757,16 @@ impl crate::Agent {
             .long_horizon
             .then_some(snapshot.structured_goal.clone())
             .flatten();
-        let plan =
-            crate::domain::GoalState::prefer_plan_progress(&snapshot.last_plan, self.goals.plan());
+        let plan = if workspace_rolled_back {
+            crate::domain::GoalState::prefer_plan_progress_after_workspace_rollback(
+                &snapshot.last_plan,
+                self.goals.plan(),
+            )
+        } else {
+            crate::domain::GoalState::prefer_plan_progress(&snapshot.last_plan, self.goals.plan())
+        };
+        let plan_drive_scope_changed = crate::heuristics::next_plan_step_title(&snapshot.last_plan)
+            != crate::heuristics::next_plan_step_title(&plan);
         // Durable session: keep unfinished progress; drop a fully-done checklist
         // so resume does not resurrect it (live UI still shows finished below).
         let session_plan: &[hi_tools::PlanStep] =
@@ -647,7 +785,24 @@ impl crate::Agent {
             next.push(system);
         }
 
+        // Session rewinds must serialize the durable latch, not the effective
+        // UI state. During a transactional user resume the badge is hidden,
+        // but a crash before successful settlement must still restore paused.
+        let plan_drive_paused = self.durable_plan_drive_paused();
+        let plan_drive_resume_on_user_input = self.plan_drive_resumes_on_user_input();
         if let Some(session) = self.session.as_mut() {
+            if plan_drive_scope_changed {
+                // Reset the old scope first. A crash/failure between these two
+                // append-only records then leaves the old plan with a clean
+                // ledger, never the new next step with inherited stall/evidence.
+                session.record_plan_drive_state_with_policy(
+                    plan_drive_paused,
+                    0,
+                    plan_drive_resume_on_user_input,
+                    true,
+                    &[],
+                )?;
+            }
             session.record_state_replacement(
                 &next,
                 structured_goal.as_ref(),
@@ -659,6 +814,10 @@ impl crate::Agent {
         self.persisted = self.messages.len();
         self.goals
             .restore_triple(snapshot.goal.clone(), structured_goal, plan);
+        if plan_drive_scope_changed {
+            self.plan_drive_stall = 0;
+            self.plan_drive_evidence.clear();
+        }
         self.decisions = snapshot.decisions.clone();
         Ok(())
     }
@@ -1119,13 +1278,20 @@ impl crate::Agent {
         if !self.config.subagents.is_subagent {
             parts.push(crate::today::prompt_section());
         }
-        if !self.config.subagents.is_subagent && self.turn_prompt_is_review() {
+        let tool_free_response = self
+            .task
+            .last_task_prompt
+            .as_deref()
+            .is_some_and(crate::task_contract::prompt_requests_tool_free_response);
+        if !tool_free_response && !self.config.subagents.is_subagent && self.turn_prompt_is_review()
+        {
             if self.config.memory.inject_review_skill
                 && let Some(section) = crate::skills::active_review_skill_section()
             {
                 parts.push(section);
             }
-        } else if self.config.memory.inject_stack_skill
+        } else if !tool_free_response
+            && self.config.memory.inject_stack_skill
             && let Some(section) = crate::skills::active_stack_skill_section(self.runtime.root())
         {
             parts.push(section);
@@ -1147,16 +1313,29 @@ impl crate::Agent {
         if let Some(budget) = self.token_budget.fragment() {
             parts.push(budget.to_string());
         }
-        (!parts.is_empty()).then(|| clip_volatile_context(&parts.join("\n\n")))
+        // This block carries canonical task/goal requirements as well as
+        // summaries. Keep it intact here; `ensure_request_fits_context` owns
+        // explicit model-window fitting and can compact with full knowledge of
+        // the request instead of silently discarding the tail up front.
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
     }
 
     /// Whether the current turn's stored prompt is a read-only review.
     /// Uses the same classifiers as the turn loop so `/review`, `/security`,
     /// and implicit "review the codebase" match.
     fn turn_prompt_is_review(&self) -> bool {
+        // Planning is its own read-only scope. Treating it as code review
+        // injects defect-first review instructions and answer-repair gates into
+        // a turn whose successful output is an unfinished implementation plan.
+        if self.plan_mode {
+            return false;
+        }
         let Some(prompt) = self.task.last_task_prompt.as_deref() else {
             return false;
         };
+        if crate::task_contract::prompt_requests_tool_free_response(prompt) {
+            return false;
+        }
         if crate::steering::classify_read_only_intent(prompt).is_some() {
             return true;
         }
@@ -1180,7 +1359,12 @@ impl crate::Agent {
         // the package-local check itself when verification keeps failing).
         // The targeted shape is remembered so findings recorded under the
         // hint carry it — that recurrence data is how a hint earns its keep.
-        let hint = crate::learning::context_hint(self.runtime.state_root());
+        let hint = self
+            .config
+            .memory
+            .learning
+            .then(|| crate::learning::context_hint(self.runtime.state_root()))
+            .flatten();
         self.task.active_hint_shape = hint.as_ref().map(|h| h.shape.clone());
         if let Some(hint) = hint {
             next = Some(match next {
@@ -1365,6 +1549,11 @@ impl crate::Agent {
         &self.report.last_turn_telemetry.verification_executions
     }
 
+    /// Lifetime raw change-ledger events compacted into exact aggregate state.
+    pub fn ledger_events_dropped(&self) -> u64 {
+        self.runtime.ledger().dropped_event_count()
+    }
+
     /// Typed outcome of the most recent successfully finalized turn.
     pub fn last_turn_outcome(&self) -> Option<&crate::TurnOutcome> {
         self.report.last_turn_outcome.as_ref()
@@ -1418,6 +1607,7 @@ impl crate::Agent {
                 .unwrap_or_else(|| "default".into()),
             output_token_parameter: c.routing.output_token_parameter.label().to_string(),
             max_steps: self.max_steps_setting(),
+            max_tool_calls: self.max_tool_calls_setting(),
             tool_mode: c.routing.tool_mode.label().to_string(),
             compat: c.routing.compat.label().to_string(),
             deepseek_compat: c.routing.deepseek_compat.label().to_string(),
@@ -1453,6 +1643,118 @@ impl crate::Agent {
                 Ok(_) => "on".into(),
                 Err(_) => "auto".into(),
             },
+            engine_mode: c.engine.mode.as_str().to_string(),
+            engine_module: c
+                .engine
+                .module_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".into()),
+        }
+    }
+
+    /// Inspect or reload the optional decision engine without touching the
+    /// active turn. Reloads are generation-pinned by `EngineRuntime` and are
+    /// therefore safe to request while a provider stream is still running.
+    pub fn engine_command(&mut self, argument: &str) -> String {
+        let mut parts = argument.split_whitespace();
+        let action = parts.next().unwrap_or("status").to_ascii_lowercase();
+        match action.as_str() {
+            "status" | "show" => {
+                let status = hi_engine_host::status(&self.engine_runtime);
+                let current = status.current.map_or_else(
+                    || "none".to_string(),
+                    |module| {
+                        format!(
+                            "v{} (generation {}, {})",
+                            module.guest_version,
+                            module.generation,
+                            &module.module_sha256[..12]
+                        )
+                    },
+                );
+                let pending = status.pending.map_or_else(
+                    || "none".to_string(),
+                    |module| {
+                        format!(
+                            "v{} (generation {})",
+                            module.guest_version, module.generation
+                        )
+                    },
+                );
+                format!(
+                    "engine: {}\n  module: {}\n  current: {current}\n  pending: {pending}\n  watch: {}",
+                    self.config.engine.mode.as_str(),
+                    self.config
+                        .engine
+                        .module_path
+                        .as_deref()
+                        .map_or("<auto>", |path| path.to_str().unwrap_or("<non-utf8>")),
+                    if self.engine_runtime.is_watching() {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                )
+            }
+            "native" | "rust" | "off" => {
+                self.config.engine.mode = hi_engine_api::EngineMode::Native;
+                self.engine_runtime.stop_watch();
+                "engine mode: native (WASM remains loaded but is not selected)".into()
+            }
+            "wasm" | "component" => {
+                self.config.engine.mode = hi_engine_api::EngineMode::Wasm;
+                if let Some(path) = parts.next().map(std::path::PathBuf::from) {
+                    self.config.engine.module_path = Some(path);
+                }
+                self.reload_engine_module()
+            }
+            "reload" => self.reload_engine_module(),
+            "watch" => match parts.next().unwrap_or("on") {
+                "off" | "disable" => {
+                    self.config.engine.watch = false;
+                    self.engine_runtime.stop_watch();
+                    "engine module watch: off".into()
+                }
+                "on" | "enable" => {
+                    let Some(path) = self.engine_module_path() else {
+                        return "engine watch unavailable: set HI_ENGINE_MODULE or provide /engine wasm <path>".into();
+                    };
+                    match self.engine_runtime.start_watch(path) {
+                        Ok(()) => {
+                            self.config.engine.watch = true;
+                            "engine module watch: on (reloads become active next turn)".into()
+                        }
+                        Err(error) => format!("engine watch failed: {error:#}"),
+                    }
+                }
+                other => format!("usage: /engine watch [on|off] — got {other:?}"),
+            },
+            other => format!(
+                "usage: /engine [status|native|wasm [path]|reload|watch on|off] — got {other:?}"
+            ),
+        }
+    }
+
+    fn engine_module_path(&self) -> Option<std::path::PathBuf> {
+        hi_engine_host::discover_module_path(self.config.engine.module_path.as_deref())
+    }
+
+    fn reload_engine_module(&mut self) -> String {
+        let Some(path) = self.engine_module_path() else {
+            return "engine reload unavailable: set HI_ENGINE_MODULE or place engine.wasm beside hi".into();
+        };
+        match self.engine_runtime.reload(&path) {
+            Ok(info) => {
+                self.config.engine.module_path = Some(path.clone());
+                format!(
+                    "engine candidate loaded: v{} generation {} — active next turn ({})",
+                    info.guest_version,
+                    info.generation,
+                    path.display()
+                )
+            }
+            Err(error) => format!("engine reload rejected: {error:#}"),
         }
     }
 
@@ -1558,8 +1860,8 @@ impl crate::Agent {
         self.config.routing.temperature = temperature;
     }
 
-    /// Human-readable live step-limit setting. `off` means the user explicitly
-    /// disabled the finite automatic per-turn cap.
+    /// Human-readable live step-limit setting. `off` means model rounds are
+    /// unlimited, which is also the ordinary default.
     pub fn max_steps_setting(&self) -> String {
         if self.config.loop_limits.max_steps == u32::MAX {
             "off".to_string()
@@ -1568,21 +1870,59 @@ impl crate::Agent {
         }
     }
 
+    /// Numeric model-round cap for child-process launchers. `None` means the
+    /// ordinary unlimited/default behavior.
+    pub fn max_steps_limit(&self) -> Option<u32> {
+        (self.config.loop_limits.max_steps != u32::MAX).then_some(self.config.loop_limits.max_steps)
+    }
+
+    /// Human-readable live tool-call limit. `off` means ordinary turns have no
+    /// count ceiling; managed workers and explicit CLI caps render their finite
+    /// effective value.
+    pub fn max_tool_calls_setting(&self) -> String {
+        if self.config.loop_limits.max_tool_calls == u32::MAX {
+            "off".to_string()
+        } else {
+            self.config.loop_limits.max_tool_calls.to_string()
+        }
+    }
+
     pub fn max_tool_calls_limit(&self) -> u32 {
         self.config.loop_limits.max_tool_calls
+    }
+
+    /// Numeric tool-call cap for child-process launchers. `None` means the
+    /// ordinary unlimited/default behavior.
+    pub fn max_tool_calls_cap(&self) -> Option<u32> {
+        (self.config.loop_limits.max_tool_calls != u32::MAX)
+            .then_some(self.config.loop_limits.max_tool_calls)
+    }
+
+    /// Numeric verification-repair cap for child-process launchers. `None`
+    /// means the ordinary unlimited/default behavior.
+    pub fn max_verify_repairs_cap(&self) -> Option<u32> {
+        (self.config.gates.max_verify_repairs != crate::UNLIMITED_REPAIR_CYCLES)
+            .then_some(self.config.gates.max_verify_repairs)
     }
 
     /// Set a fixed per-turn step cap, or disable the cap with `None`.
     pub fn set_max_steps_limit(&mut self, limit: Option<u32>) {
         self.config.loop_limits.max_steps = limit.unwrap_or(u32::MAX).max(1);
+        if let Some(runner) = &self.subagents.delegate_runner {
+            runner.set_max_steps(self.max_steps_limit());
+        }
     }
 
-    /// Restore the finite automatic per-turn model-round budget.
+    /// Restore the unlimited automatic per-turn model-round default.
     pub fn set_max_steps_auto(&mut self) {
         self.config.loop_limits.max_steps = crate::MAX_MODEL_ROUNDS;
+        if let Some(runner) = &self.subagents.delegate_runner {
+            runner.set_max_steps(None);
+        }
     }
 
     pub(crate) fn persist(&mut self) -> Result<()> {
+        self.persist_pending_legacy_goal_budget_migration()?;
         if let Some(session) = self.session.as_mut() {
             // Clamp the cursor: transcript-shrinking ops (`strip_trailing_nudges`,
             // `strip_finalize_pair`) pop messages without adjusting `persisted`,
@@ -1664,19 +2004,4 @@ impl Drop for crate::Agent {
         // extend the lifetime of child agents after the owning Agent is gone.
         self.bg_tasks.shutdown();
     }
-}
-
-/// Combined cap for the per-turn volatile block. Individual sections are
-/// already bounded; this is the last line of defense if they stack.
-const MAX_VOLATILE_CONTEXT_CHARS: usize = 24_000;
-
-fn clip_volatile_context(text: &str) -> String {
-    if text.chars().count() <= MAX_VOLATILE_CONTEXT_CHARS {
-        return text.to_string();
-    }
-    let clipped: String = text
-        .chars()
-        .take(MAX_VOLATILE_CONTEXT_CHARS.saturating_sub(1))
-        .collect();
-    format!("{clipped}…")
 }

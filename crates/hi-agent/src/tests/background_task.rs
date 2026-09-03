@@ -12,6 +12,15 @@ fn bg_config() -> AgentConfig {
 
 struct BackgroundDropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
+struct BackgroundDelegateRunner;
+
+#[async_trait::async_trait]
+impl crate::DelegateRunner for BackgroundDelegateRunner {
+    async fn run(&self, _task: &str, _verify: Option<&str>) -> crate::DelegateOutcome {
+        unreachable!("background general-purpose children run in-process")
+    }
+}
+
 impl Drop for BackgroundDropFlag {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -176,6 +185,133 @@ async fn handle_task_unknown_subagent_type_fails() {
         "got: {}",
         outcome.content
     );
+}
+
+#[tokio::test]
+async fn handle_task_reports_registry_capacity_as_actionable_denial() {
+    let mut agent = agent(Vec::new(), bg_config());
+    let registry = agent.background_task_registry();
+    for index in 0..16 {
+        registry
+            .spawn(
+                &format!("capacity-{index}"),
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        std::future::pending::<()>().await;
+                        unreachable!("capacity fixture must remain live")
+                    })
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut ui = NullUi;
+    let outcome = agent
+        .handle_task(
+            r#"{"description":"one more","prompt":"inspect one more thing","subagent_type":"explore"}"#,
+            &mut ui,
+        )
+        .await;
+
+    assert_eq!(outcome.status, hi_tools::ToolStatus::Denied);
+    assert!(outcome.content.contains("background task capacity reached"));
+    assert!(outcome.content.contains("get_task_output or wait_tasks"));
+}
+
+#[tokio::test]
+async fn general_purpose_task_continues_an_incomplete_plan_after_a_recap() {
+    let mut cfg = bg_config();
+    cfg.memory.tool_set = ToolSet::Full;
+    let root = cfg.paths.workspace_root.clone();
+    let plan = |id: &str, first: &str, second: &str, third: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: id.into(),
+                name: "update_plan".into(),
+                arguments: serde_json::json!({
+                    "steps": [
+                        {"title": "write the first file", "status": first},
+                        {"title": "write the second file", "status": second},
+                        {"title": "write the third file", "status": third}
+                    ]
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let write = |id: &str, path: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: id.into(),
+                name: "write".into(),
+                arguments: serde_json::json!({"path": path, "content": path}).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        plan("plan-start", "active", "pending", "pending"),
+        write("write-first", "bg-first.txt"),
+        plan("plan-middle", "done", "active", "pending"),
+        completion(
+            vec![Content::Text("The first step is complete.".into())],
+            1,
+            1,
+        ),
+        write("write-second", "bg-second.txt"),
+        plan("plan-late", "done", "done", "active"),
+        completion(
+            vec![Content::Text("The second step is complete.".into())],
+            1,
+            1,
+        ),
+        write("write-third", "bg-third.txt"),
+        plan("plan-done", "done", "done", "done"),
+        completion(
+            vec![Content::Text("All background steps are complete.".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, cfg);
+    agent.set_delegate_runner(std::sync::Arc::new(BackgroundDelegateRunner));
+    let mut ui = NullUi;
+    let spawned = agent
+        .handle_task(
+            r#"{"description":"three writes","prompt":"Implement all three file writes as a multi-step plan.","subagent_type":"general-purpose"}"#,
+            &mut ui,
+        )
+        .await;
+    assert_eq!(spawned.status, hi_tools::ToolStatus::Succeeded);
+    let task_id = spawned
+        .content
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("general-purpose task spawned: "))
+        .expect("spawned task id");
+    let result = agent
+        .handle_wait_tasks(
+            &serde_json::json!({
+                "task_ids": [task_id],
+                "timeout_ms": 5_000
+            })
+            .to_string(),
+        )
+        .await;
+
+    assert!(
+        result.content.contains("— Completed:"),
+        "child stopped before its second productive step: {}",
+        result.content
+    );
+    assert!(root.join("bg-first.txt").is_file());
+    assert!(root.join("bg-second.txt").is_file());
+    assert!(root.join("bg-third.txt").is_file());
 }
 
 #[test]

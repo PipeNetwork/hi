@@ -144,10 +144,26 @@ impl crate::Agent {
             StreamEvent::Warning(text) => ui.top_status(&text),
             StreamEvent::Reasoning(_) => {}
             StreamEvent::WireAudit(_) => {}
+            StreamEvent::ToolCallDelta { .. } => {}
         };
-        let completion = match self.provider.stream(request, &mut sink).await {
-            Ok(completion) => completion,
-            Err(err) => {
+        let timeout = self.side_call_timeout();
+        let completion = match crate::agent::turn::await_side_call(
+            timeout,
+            self.provider.stream(request, &mut sink),
+        )
+        .await
+        {
+            Err(timeout) => {
+                ui.assistant_end();
+                let _ = self.persist();
+                ui.status(&format!(
+                    "(memory update timed out after {:.1}s)",
+                    timeout.as_secs_f64()
+                ));
+                return;
+            }
+            Ok(Ok(completion)) => completion,
+            Ok(Err(err)) => {
                 self.add_side_error_usage(&err);
                 // Flush any partially-streamed memory text before the status.
                 ui.assistant_end();

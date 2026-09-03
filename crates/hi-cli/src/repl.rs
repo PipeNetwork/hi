@@ -1045,9 +1045,9 @@ pub(crate) async fn repl(
                         );
                     }
                     if plan_drive_turn {
-                        agent.set_plan_drive_paused(true);
+                        agent.pause_plan_drive_until_user_input()?;
                         println!(
-                            "\x1b[33mplan drive interrupted — paused; /plan resume to continue\x1b[0m"
+                            "\x1b[33mplan drive interrupted — paused; reply to steer and resume, or use /plan resume\x1b[0m"
                         );
                     }
                 } else if driven.as_ref().is_some_and(Result::is_err) {
@@ -1073,15 +1073,18 @@ pub(crate) async fn repl(
                         .and_then(|result| result.as_ref().ok())
                         .cloned();
                     pending_drive = None;
+                    if goal_drive_turn {
+                        let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::User);
+                    }
+                    if plan_drive_turn {
+                        agent.pause_plan_drive_until_user_input()?;
+                    }
                 } else {
                     // Long-horizon auto-drive: keep pulling toward leftover work.
                     // Drive turns that change nothing count toward a stall park.
                     if goal_drive_turn {
-                        let made_progress = hi_agent::goal_drive_made_progress(
-                            goal_before.as_ref(),
-                            agent.structured_goal(),
-                            agent.last_changed_files(),
-                        );
+                        let made_progress =
+                            agent.goal_drive_turn_made_progress(goal_before.as_ref());
                         match agent.note_goal_drive_progress(made_progress) {
                             hi_agent::GoalDriveProgress::Skipped { failed, next } => {
                                 println!(
@@ -1107,12 +1110,8 @@ pub(crate) async fn repl(
                         );
                     }
                     if plan_drive_turn {
-                        let made_progress = hi_agent::plan_drive_made_progress(
-                            plan_step_before.as_deref(),
-                            agent.next_plan_step_title(),
-                            &agent.last_turn_telemetry().progress_events,
-                            agent.last_changed_files(),
-                        );
+                        let made_progress =
+                            agent.plan_drive_turn_made_progress(plan_step_before.as_deref());
                         agent.note_plan_drive_progress(made_progress);
                         if agent.plan_drive_status() == "parked" {
                             println!(

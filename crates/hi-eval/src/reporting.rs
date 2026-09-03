@@ -111,23 +111,14 @@ pub fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config
             // Trajectory diagnostic: how much steering did the representative
             // candidate need, on average? Lower is better — a clean turn needs 0
             // extra rounds. Verify rounds + recovery retries + repeat/continue
-            // nudges, averaged across the config's cells. Plus the stall rate, so a
-            // config that passes but only by repeatedly nudging a stuck model reads
-            // as noisier than one that solves cleanly.
+            // nudges, averaged across the config's cells.
             let avg_extra: f64 = rows
                 .iter()
                 .map(|r| r.trajectory.extra_rounds() as f64)
                 .sum::<f64>()
                 / rows.len() as f64;
-            let stalls = rows
-                .iter()
-                .filter(|r| r.trajectory.stalled_unfinished || r.trajectory.stalled_repeating)
-                .count();
-            if avg_extra > 0.0 || stalls > 0 {
-                println!(
-                    "           steer: {avg_extra:.1} extra rnd/cell · {stalls} stall(s) of {} cells",
-                    rows.len()
-                );
+            if avg_extra > 0.0 {
+                println!("           steer: {avg_extra:.1} extra rnd/cell",);
             }
             // Verify-repair diagnostic: how often the loop entered repair
             // (verify_rounds >= 2 means at least one round failed), how often
@@ -190,7 +181,7 @@ pub fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config
             // trial's per-turn input-token trajectory — "how fast does context
             // accumulate vs. how far does the goal get". The exemplar is the row
             // that drove the most turns. Watch for ctx climbing while goal/done
-            // stalls: that's the bloat the compaction/curation levers should flatten.
+            // plateaus: that's the bloat the compaction/curation levers should flatten.
             if let Some(row) = rows
                 .iter()
                 .filter(|r| !r.growth.is_empty())

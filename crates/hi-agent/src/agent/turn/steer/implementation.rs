@@ -4,8 +4,8 @@ use crate::agent::mutation_recovery_turn::MutationRecoveryControl;
 use crate::steering::{
     BACKGROUND_WAIT_FINAL_NUDGE, BACKGROUND_WAIT_STATUS_NUDGE, EvidenceTracker,
     IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker, MutationRecovery,
-    REREAD_NUDGE, ReviewIntent, WAIT_POLL_STATIC_NUDGE, bash_call_waits,
-    implementation_text_tool_nudge, tool_validation_retry_nudge,
+    REREAD_NUDGE, WAIT_POLL_STATIC_NUDGE, bash_call_waits, implementation_text_tool_nudge,
+    tool_validation_retry_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::ui::Ui;
@@ -18,15 +18,16 @@ use super::super::progress::{
 use super::super::tools::ToolBatchOutcome;
 use super::RoundControl;
 
+const COMPLETED_PLAN_TOOL_CLOSEOUT: &str =
+    "The plan is complete and the successful tool results were retained.";
+
 impl crate::Agent {
     /// Post-tool Steer: mutation recovery, repeat/idempotent guards, sprawl.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::agent::turn) fn steer_after_tools(
         &mut self,
-        calls: &[(String, String, String)],
         batch: &ToolBatchOutcome,
         expected_mutation: bool,
-        read_only_intent: Option<ReviewIntent>,
         implementation_intent: Option<ImplementationIntent>,
         implementation_tracker: &mut ImplementationTracker,
         evidence: &mut EvidenceTracker,
@@ -37,13 +38,8 @@ impl crate::Agent {
         suppress_bookkeeping_tools_next: &mut bool,
         text_tool_fallback_next: &mut bool,
         tool_validation_text_fallback_used: &mut bool,
-        force_no_progress_final_answer_next: &mut bool,
-        prev_added_no_evidence: &mut bool,
-        prev_call_sig: &mut Option<Vec<(String, String)>>,
         deepseek_strict_fallback_active: &mut bool,
         deepseek_strict_fallback_used: &mut bool,
-        stalled_repeating: &mut bool,
-        stalled_unfinished: &mut bool,
         ui: &mut dyn Ui,
     ) -> RoundControl {
         let ToolBatchOutcome {
@@ -61,6 +57,8 @@ impl crate::Agent {
             ..
         } = *batch;
         let protocol_validation_errors = &batch.protocol_validation_errors;
+        let calls = batch.calls.as_slice();
+        let read_only_intent = batch.read_only_intent;
         // Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
         self.set_turn_phase(TurnPhase::Steer);
         if interrupted_calls > 0 {
@@ -71,8 +69,7 @@ impl crate::Agent {
             // can immediately replay the skipped plan/decision call while the
             // concrete work is still waiting for recovery.
             *suppress_bookkeeping_tools_next |= interrupted_coordination_calls > 0;
-            *prev_added_no_evidence = false;
-            *stalled_repeating = false;
+            progress_tracker.prev_added_no_evidence = false;
             progress_tracker.record(
                 ProgressKind::Weak,
                 "user skipped a tool call; task remains active",
@@ -107,11 +104,9 @@ impl crate::Agent {
                 *repeat_nudges += 1;
                 *force_tools_next = true;
                 *text_tool_fallback_next = false;
-                *force_no_progress_final_answer_next = false;
-                *prev_added_no_evidence = false;
-                *prev_call_sig = None;
-                *stalled_repeating = false;
-                *stalled_unfinished = false;
+                progress_tracker.force_no_progress_final_answer_next = false;
+                progress_tracker.prev_added_no_evidence = false;
+                progress_tracker.prev_call_sig = None;
                 let guidance = protocol_validation_errors
                     .iter()
                     .take(3)
@@ -131,11 +126,9 @@ impl crate::Agent {
                 *tool_validation_text_fallback_used = true;
                 *force_tools_next = false;
                 *text_tool_fallback_next = true;
-                *force_no_progress_final_answer_next = false;
-                *prev_added_no_evidence = false;
-                *prev_call_sig = None;
-                *stalled_repeating = false;
-                *stalled_unfinished = false;
+                progress_tracker.force_no_progress_final_answer_next = false;
+                progress_tracker.prev_added_no_evidence = false;
+                progress_tracker.prev_call_sig = None;
                 let guidance = protocol_validation_errors
                     .iter()
                     .take(3)
@@ -151,20 +144,42 @@ impl crate::Agent {
                 );
                 return RoundControl::Continue;
             }
-            if self.keep_working_after_stall(
-                progress_tracker,
-                force_tools_next,
-                stalled_unfinished,
-                stalled_repeating,
-                None,
-                ui,
-            ) {
+            if self.try_no_progress_recovery(progress_tracker, force_tools_next, None, ui) {
                 return RoundControl::Continue;
             }
-            *stalled_unfinished = true;
             ui.status(&format!(
                 "tool arguments kept failing validation ({validation_summary})"
             ));
+            return RoundControl::BreakInner(false);
+        }
+
+        // A final, successful bookkeeping-only batch is itself a terminal
+        // signal once concrete work has landed. Asking the main provider for
+        // one more prose recap adds no execution value and can turn completed
+        // work into a false infrastructure failure if that optional request is
+        // empty or the route becomes unavailable. Settle through the normal
+        // outer reconciliation/verification path, with a deterministic visible
+        // closeout so finalization does not issue another provider request.
+        let completed_plan_after_bookkeeping = plan_changed_this_batch
+            && calls.iter().all(|(_, name, _)| name == "update_plan")
+            // Structured long-horizon goals have an independent completion
+            // auditor at settlement. Keep their normal model-answer round so
+            // the audit receives the intended response and can commit the
+            // durable goal transition after verification.
+            && self.goals.structured.is_none()
+            && !self.goals.plan().is_empty()
+            && !self.goals.plan_incomplete()
+            && (implementation_tracker.mutation_seen || implementation_tracker.validation_seen);
+        if completed_plan_after_bookkeeping {
+            self.emit_assistant_text(ui, COMPLETED_PLAN_TOOL_CLOSEOUT);
+            ui.assistant_end();
+            self.messages.push_assistant(vec![hi_ai::Content::Text(
+                COMPLETED_PLAN_TOOL_CLOSEOUT.into(),
+            )]);
+            progress_tracker.no_progress_streak = 0;
+            progress_tracker.last_no_progress_reason.clear();
+            progress_tracker.record_final_answer();
+            ui.status("plan completed; settling from successful tool evidence");
             return RoundControl::BreakInner(false);
         }
         match self.handle_mutation_recovery(
@@ -179,8 +194,9 @@ impl crate::Agent {
             MutationRecoveryControl::None => {}
             MutationRecoveryControl::Continue => return RoundControl::Continue,
             MutationRecoveryControl::Break => {
-                *stalled_unfinished = true;
-                ui.status(&self.incomplete_turn_status("implementation_discovery_exhausted"));
+                ui.nudge(
+                    "implementation discovery budget was exhausted; settling with current evidence",
+                );
                 return RoundControl::BreakInner(false);
             }
         }
@@ -190,8 +206,7 @@ impl crate::Agent {
         // turn burned a model round per poll. A round that only watched
         // still-running background work is waiting, full stop. After the
         // budget, steer to a terminal status answer; a quiet-but-running
-        // process is not a stalled turn, so no repeat budgets are consumed
-        // and no sticky stall flags are left behind.
+        // process is not a no-progress turn, so no repeat budgets are consumed.
         //
         // Exception: a poll whose fresh output carried failure diagnostics
         // (compiler errors, test failures, panics) is new work arriving, not
@@ -211,11 +226,9 @@ impl crate::Agent {
         if waiting_round && progress_tracker.waiting_rounds >= WAITING_ROUND_BUDGET {
             let first_request = !progress_tracker.awaiting_background;
             progress_tracker.awaiting_background = true;
-            *stalled_repeating = false;
-            *stalled_unfinished = false;
             *repeat_nudges = 0;
             *force_tools_next = false;
-            *force_no_progress_final_answer_next = false;
+            progress_tracker.force_no_progress_final_answer_next = false;
             progress_tracker.record(
                 ProgressKind::Weak,
                 AWAITING_BACKGROUND_REASON,
@@ -230,7 +243,7 @@ impl crate::Agent {
             } else {
                 // Still polling after the wrap-up request — force the next
                 // round tool-free so the status answer actually lands.
-                *force_no_progress_final_answer_next = true;
+                progress_tracker.force_no_progress_final_answer_next = true;
                 ui.nudge("still polling after the wrap-up request — forcing a final status answer");
                 self.messages
                     .push_nudge(NudgeKind::Continue, BACKGROUND_WAIT_FINAL_NUDGE);
@@ -248,8 +261,7 @@ impl crate::Agent {
             .iter()
             .find(|handle| handle.registry_was_empty);
         if let Some(guessed) = guessed_handle {
-            *prev_added_no_evidence = true;
-            *stalled_repeating = true;
+            progress_tracker.prev_added_no_evidence = true;
             ui.nudge(&format!(
                 "the model named background handle `{}`, which has never existed this session — steering it away from the invented handle",
                 guessed.id
@@ -267,13 +279,12 @@ impl crate::Agent {
             && hashable_idempotent_results == calls.len()
             && repeated_idempotent_results == calls.len();
         if repeated_result_no_progress {
-            *prev_added_no_evidence = true;
+            progress_tracker.prev_added_no_evidence = true;
             let repeat_budget_available =
                 *repeat_nudges < self.config.loop_limits.max_repeat_nudges;
             let no_new_after_mutation = implementation_tracker.mutation_seen;
             if repeat_budget_available {
                 *repeat_nudges += 1;
-                *stalled_repeating = true;
                 let waiting_round = calls
                     .iter()
                     .any(|(_, name, args)| name == "bash" && bash_call_waits(args));
@@ -284,10 +295,13 @@ impl crate::Agent {
                         "repeated idempotent tool output"
                     },
                     no_progress_signature_for_calls(calls),
-                ) && implementation_intent.is_none();
+                ) && implementation_intent.is_none()
+                    && !(expected_mutation
+                        && !implementation_tracker.mutation_seen
+                        && !implementation_tracker.validation_seen);
                 if waiting_round {
                     ui.nudge(&format!(
-                "the wait-and-check poll returned the same output — nudging the model to diagnose the stalled process ({repeat_nudges}/{})",
+                "the wait-and-check poll returned the same output — nudging the model to diagnose the idle process ({repeat_nudges}/{})",
                 self.config.loop_limits.max_repeat_nudges
             ));
                 } else {
@@ -302,7 +316,7 @@ impl crate::Agent {
                     REREAD_NUDGE
                 };
                 let nudge = if force_final_after_nudge {
-                    *force_no_progress_final_answer_next = true;
+                    progress_tracker.force_no_progress_final_answer_next = true;
                     *force_tools_next = false;
                     format!("{base_nudge}\n\n{NO_PROGRESS_FINAL_ANSWER_NUDGE}")
                 } else {
@@ -319,11 +333,10 @@ impl crate::Agent {
             if !no_new_after_mutation {
                 if let Some(intent) = read_only_intent {
                     // Prefer one force-text recovery when inspection already happened.
-                    if !*force_no_progress_final_answer_next {
-                        *force_no_progress_final_answer_next = true;
+                    if !progress_tracker.force_no_progress_final_answer_next {
+                        progress_tracker.force_no_progress_final_answer_next = true;
                         *force_tools_next = false;
                         *repeat_nudges = 0;
-                        *stalled_repeating = false;
                         ui.nudge(
                             "review kept getting the same inspection output; forcing a bounded answer",
                         );
@@ -338,18 +351,10 @@ impl crate::Agent {
                         );
                         return RoundControl::Continue;
                     }
-                    if self.keep_working_after_stall(
-                        progress_tracker,
-                        force_tools_next,
-                        stalled_unfinished,
-                        stalled_repeating,
-                        None,
-                        ui,
-                    ) {
-                        *prev_call_sig = None;
+                    if self.try_no_progress_recovery(progress_tracker, force_tools_next, None, ui) {
+                        progress_tracker.prev_call_sig = None;
                         return RoundControl::Continue;
                     }
-                    *stalled_unfinished = true;
                     progress_tracker.record(
                         ProgressKind::None,
                         "repeat_same_inspection_output",
@@ -357,7 +362,6 @@ impl crate::Agent {
                     );
                     ui.nudge("review kept getting the same inspection output");
                     let _ = intent;
-                    ui.status(&self.incomplete_turn_status("repeat_same_inspection_output"));
                     return RoundControl::BreakInner(false);
                 }
                 if (implementation_intent.is_some() || expected_mutation)
@@ -382,18 +386,10 @@ impl crate::Agent {
                         return RoundControl::Continue;
                     }
 
-                    if self.keep_working_after_stall(
-                        progress_tracker,
-                        force_tools_next,
-                        stalled_unfinished,
-                        stalled_repeating,
-                        None,
-                        ui,
-                    ) {
-                        *prev_call_sig = None;
+                    if self.try_no_progress_recovery(progress_tracker, force_tools_next, None, ui) {
+                        progress_tracker.prev_call_sig = None;
                         return RoundControl::Continue;
                     }
-                    *stalled_unfinished = true;
                     progress_tracker.record(
                         ProgressKind::None,
                         "implementation_repeat_no_edit",
@@ -402,7 +398,6 @@ impl crate::Agent {
                     ui.nudge(
                         "implementation repeated equivalent inspection output without editing",
                     );
-                    ui.status(&self.incomplete_turn_status("implementation_repeat_no_edit"));
                     return RoundControl::BreakInner(false);
                 }
             }
@@ -412,9 +407,7 @@ impl crate::Agent {
                 && progress_tracker.take_repeated_validation_diagnosis()
             {
                 *force_tools_next = true;
-                *force_no_progress_final_answer_next = false;
-                *stalled_unfinished = false;
-                *stalled_repeating = false;
+                progress_tracker.force_no_progress_final_answer_next = false;
                 ui.nudge(
                     "the same validation failure survived two repair cycles — requesting a focused root-cause diagnosis",
                 );
@@ -426,17 +419,13 @@ impl crate::Agent {
                 && let Some(failure_signature) =
                     progress_tracker.repeated_validation_repair_exhausted()
             {
-                *stalled_unfinished = true;
-                *stalled_repeating = false;
                 *force_tools_next = false;
                 progress_tracker.record(
                     ProgressKind::None,
                     "same validation failure survived focused repair",
                     Some(failure_signature),
                 );
-                ui.status(&self.incomplete_turn_status(
-                    "same validation failure persisted after focused repair",
-                ));
+                ui.status("the same validation failure persisted after focused repair");
                 return RoundControl::BreakInner(false);
             }
         }

@@ -32,15 +32,55 @@ use hi_rsi_runtime::{
 };
 use hi_verifier::{AttestingVerifier, Attestor, CheckSpec};
 
-/// Objectives above this need a split plan — a single run of thousands of
-/// delegate children is not a supervisable unit of work.
-const MAX_OBJECTIVES: usize = hi_agent::MAX_PLAN_OBJECTIVES;
 /// Default concurrent objective delegates per wave; the cross-process
 /// resource governor additionally caps live children machine-wide.
 const DEFAULT_WAVE_CONCURRENCY: u16 = 4;
 
+/// Keep a finite control-plane lease alive while productive workflow work is
+/// still running. The lease is a crash detector, not a workflow deadline: if
+/// this future is dropped, renewals stop and ordinary expiry recovery remains
+/// intact.
+async fn with_workflow_lease_heartbeat<T>(
+    store: hi_control::ControlStore,
+    attempt_id: &str,
+    fencing_token: u64,
+    lease_ttl_ms: u64,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let attempt_id = attempt_id.to_string();
+    let heartbeat_interval_ms = (lease_ttl_ms / 3).max(1);
+    let heartbeat = async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(heartbeat_interval_ms)).await;
+            store.renew_attempt(
+                &attempt_id,
+                fencing_token,
+                hi_control::now_ms(),
+                lease_ttl_ms,
+            )?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::pin!(heartbeat);
+    tokio::pin!(operation);
+    tokio::select! {
+        result = &mut operation => result,
+        heartbeat_result = &mut heartbeat => {
+            heartbeat_result.context("renewing workflow control-plane lease")?;
+            Err(anyhow!("workflow control-plane lease heartbeat stopped unexpectedly"))
+        }
+    }
+}
+
 /// Detach `hi workflow run <plan>` so the REPL/TUI stays interactive.
-pub(crate) fn spawn_detached_workflow_run(exe: &Path, plan: &str) -> Result<(u32, PathBuf)> {
+pub(crate) fn spawn_detached_workflow_run(
+    exe: &Path,
+    plan: &str,
+    max_steps: Option<u32>,
+    max_tool_calls: Option<u32>,
+    max_verify_repairs: Option<u32>,
+) -> Result<(u32, PathBuf)> {
     let log = std::env::temp_dir().join(format!(
         "hi-workflow-plan-{}-{}.log",
         std::process::id(),
@@ -51,8 +91,18 @@ pub(crate) fn spawn_detached_workflow_run(exe: &Path, plan: &str) -> Result<(u32
     let stderr_file = log_file
         .try_clone()
         .context("cannot clone workflow log handle")?;
-    let child = std::process::Command::new(exe)
-        .args(["workflow", "run", plan])
+    let mut command = std::process::Command::new(exe);
+    command.args(["workflow", "run", plan]);
+    if let Some(max_steps) = max_steps {
+        command.args(["--max-steps", &max_steps.to_string()]);
+    }
+    if let Some(max_tool_calls) = max_tool_calls {
+        command.args(["--max-tool-calls", &max_tool_calls.to_string()]);
+    }
+    if let Some(max_verify_repairs) = max_verify_repairs {
+        command.args(["--max-verify-repairs", &max_verify_repairs.to_string()]);
+    }
+    let child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log_file))
         .stderr(std::process::Stdio::from(stderr_file))
@@ -70,6 +120,9 @@ pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
     let mut parallel = DEFAULT_WAVE_CONCURRENCY;
     let mut retries = 0_u32;
     let mut bestof = 0_u32;
+    let mut max_steps = None;
+    let mut max_tool_calls = None;
+    let mut max_verify_repairs = None;
     let mut dry_run = false;
     let mut resume = false;
     let mut check_off = false;
@@ -113,6 +166,30 @@ pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
                     .context("--bestof requires a number between 2 and 4")?
                     .clamp(2, 4);
             }
+            "--max-steps" => {
+                max_steps = Some(parse_workflow_execution_cap(
+                    "--max-steps",
+                    iter.next()
+                        .ok_or_else(|| anyhow!("--max-steps requires a number"))?,
+                    false,
+                )?);
+            }
+            "--max-tool-calls" => {
+                max_tool_calls = Some(parse_workflow_execution_cap(
+                    "--max-tool-calls",
+                    iter.next()
+                        .ok_or_else(|| anyhow!("--max-tool-calls requires a number"))?,
+                    true,
+                )?);
+            }
+            "--max-verify-repairs" => {
+                max_verify_repairs = Some(parse_workflow_execution_cap(
+                    "--max-verify-repairs",
+                    iter.next()
+                        .ok_or_else(|| anyhow!("--max-verify-repairs requires a number"))?,
+                    true,
+                )?);
+            }
             "--resume" => resume = true,
             "--dry-run" => dry_run = true,
             "--check-off" => check_off = true,
@@ -151,6 +228,9 @@ pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
         parallel,
         retries,
         bestof,
+        max_steps,
+        max_tool_calls,
+        max_verify_repairs,
         dry_run,
         resume,
         check_off,
@@ -158,10 +238,24 @@ pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
     .await
 }
 
+fn parse_workflow_execution_cap(label: &str, value: &str, allow_zero: bool) -> Result<u32> {
+    let value = value
+        .parse::<u32>()
+        .with_context(|| format!("{label} requires a 32-bit unsigned integer"))?;
+    ensure!(
+        value != u32::MAX,
+        "{label} reserves {} for the unlimited internal sentinel; use at most {}",
+        u32::MAX,
+        u32::MAX - 1
+    );
+    ensure!(allow_zero || value > 0, "{label} must be at least 1");
+    Ok(value)
+}
+
 fn print_usage() {
     println!(
         "hi workflow — run a plan of objectives through the local workflow engine\n\n\
-         USAGE:\n  hi workflow run <plan.md> [--verify CMD] [--parallel N] [--retries N] [--bestof N] [--check-off] [--dry-run]\n  \
+         USAGE:\n  hi workflow run <plan.md> [--verify CMD] [--parallel N] [--retries N] [--bestof N] [--max-steps N] [--max-tool-calls N] [--max-verify-repairs N] [--check-off] [--dry-run]\n  \
          hi workflow resume <plan.md>\n  \
          hi workflow verify [report.json]\n\n\
          Objectives are unchecked markdown checkboxes (`- [ ] …`), else numbered\n\
@@ -194,10 +288,6 @@ fn objective_stage_id(index: usize) -> StageId {
 /// failure. Wave concurrency is bounded separately from fan-out width.
 pub(crate) fn plan_graph(objective_count: usize, wave_concurrency: u16) -> Result<WorkflowGraph> {
     ensure!(objective_count >= 1, "the plan has no objectives");
-    ensure!(
-        objective_count <= MAX_OBJECTIVES,
-        "the plan has {objective_count} objectives; split it below {MAX_OBJECTIVES}"
-    );
     let stage = |kind: StageKind, role: Option<&str>, trusted: bool| StageDefinition {
         kind,
         model_role: role.map(str::to_owned),
@@ -260,7 +350,9 @@ pub(crate) fn plan_graph(objective_count: usize, wave_concurrency: u16) -> Resul
             from: StageId::from("scatter"),
             to: id.clone(),
             condition: TransitionCondition::StagePassed,
-            priority: index as u16 - 1,
+            // Priority is ordering metadata, not a work quota. Saturate only
+            // the wire representation while preserving every objective stage.
+            priority: u16::try_from(index.saturating_sub(1)).unwrap_or(u16::MAX),
         });
         // Failed objectives still join; the objectives gate decides the run.
         edges.push(TransitionRule {
@@ -297,8 +389,11 @@ pub(crate) fn plan_graph(objective_count: usize, wave_concurrency: u16) -> Resul
         stages,
         edges,
         limits: WorkflowLimits {
-            maximum_transitions: (objective_count as u32 + 8) * 2,
-            maximum_parallelism: objective_count.max(4) as u16,
+            maximum_transitions: u32::try_from(objective_count)
+                .unwrap_or(u32::MAX)
+                .saturating_add(8)
+                .saturating_mul(2),
+            maximum_parallelism: u16::try_from(objective_count.max(4)).unwrap_or(u16::MAX),
             maximum_concurrency: Some(wave_concurrency.max(1)),
         },
     };
@@ -503,6 +598,8 @@ pub(crate) struct BestOfEscalation {
     pub workspace_root: PathBuf,
     pub state_root: PathBuf,
     pub candidates: u32,
+    pub max_steps: Option<u32>,
+    pub max_tool_calls: Option<u32>,
     pub max_verify: u32,
 }
 
@@ -626,7 +723,8 @@ impl StageModel for LocalStageModel {
                             verify: &verify,
                             prompt: &prompt,
                             candidates: escalation.candidates,
-                            max_steps: None,
+                            max_steps: escalation.max_steps,
+                            max_tool_calls: escalation.max_tool_calls,
                             max_verify: escalation.max_verify,
                             workspace_root: &escalation.workspace_root,
                             state_root: &escalation.state_root,
@@ -728,6 +826,9 @@ async fn run(
     parallel: u16,
     retries: u32,
     bestof: u32,
+    max_steps: Option<u32>,
+    max_tool_calls: Option<u32>,
+    max_verify_repairs: Option<u32>,
     dry_run: bool,
     resume: bool,
     check_off: bool,
@@ -794,6 +895,7 @@ async fn run(
     let config = crate::config::load_config(None)?;
     let settings = crate::config::resolve(&cli, &config)?;
     let quality = crate::config::resolve_quality(&cli, &workspace_root)?;
+    let effective_max_verify_repairs = max_verify_repairs.unwrap_or(quality.max_verify_repairs);
     let verify_command = verify_override
         .or_else(|| {
             crate::report::pipeline_command(&quality.verification.resolved_stages(&workspace_root))
@@ -828,8 +930,9 @@ async fn run(
         settings.base_url.clone(),
         settings.api_key.clone(),
         Some(verify_command.clone()),
-        cli.max_steps,
-        quality.max_verify_repairs,
+        max_steps,
+        max_tool_calls,
+        effective_max_verify_repairs,
         workspace_root.clone(),
         state_root.clone(),
     )?;
@@ -850,7 +953,9 @@ async fn run(
                 workspace_root: workspace_root.clone(),
                 state_root: state_root.clone(),
                 candidates: bestof,
-                max_verify: quality.max_verify_repairs,
+                max_steps,
+                max_tool_calls,
+                max_verify: effective_max_verify_repairs,
             })
         })
         .transpose()?;
@@ -867,7 +972,7 @@ async fn run(
         name: "workspace_verification".into(),
         program: "/bin/sh".into(),
         arguments: vec!["-lc".into(), verify_command.clone()],
-        timeout: std::time::Duration::from_secs(1_800),
+        timeout: hi_tools::check_timeout(),
         required: true,
         // Local self-hosted mode: the user's toolchain (rustup, nvm, …)
         // needs the user's environment. Reports stay `local-signed:`.
@@ -887,18 +992,22 @@ async fn run(
         checkpoint_dir.clone(),
     )?;
 
+    // The local workflow runtime shares the managed-runtime ledger shape, but
+    // it is operator-owned and has no implicit productive-work budget. Keep
+    // every ledger dimension effectively unbounded; explicit CLI/graph limits
+    // and OS/process safety controls remain authoritative where configured.
     let budgets = RuntimeBudgets {
-        wall_time_seconds: 24 * 60 * 60,
-        cpu_time_seconds: 24 * 60 * 60,
-        memory_bytes: 1,
-        disk_bytes: 1,
-        input_tokens: 1_000_000_000,
-        output_tokens: 1_000_000_000,
-        tool_calls: (objectives.len() as u64 + 16) * 8,
-        cost_microusd: 1,
-        model_calls: (objectives.len() as u32 + 16) * 2,
-        repair_iterations: 4,
-        trace_bytes: 1_000_000_000,
+        wall_time_seconds: u64::MAX,
+        cpu_time_seconds: u64::MAX,
+        memory_bytes: u64::MAX,
+        disk_bytes: u64::MAX,
+        input_tokens: u64::MAX,
+        output_tokens: u64::MAX,
+        tool_calls: u64::MAX,
+        cost_microusd: u64::MAX,
+        model_calls: u32::MAX,
+        repair_iterations: u32::MAX,
+        trace_bytes: u64::MAX,
     };
     let starting_commit = git_head(&workspace_root).unwrap_or_else(|| "unknown".into());
     let mut state = RunState {
@@ -985,26 +1094,36 @@ async fn run(
     println!("state: {}", workflow_state.display());
 
     let executor = WorkflowExecutor::new(graph, driver, SharedBudgetLedger::new(&budgets));
-    let outcome = if resume {
-        let checkpoint = latest_checkpoint(&checkpoint_dir)?.ok_or_else(|| {
-            anyhow!(
-                "no sealed checkpoint to resume under {}",
-                checkpoint_dir.display()
-            )
-        })?;
-        println!(
-            "resuming from checkpoint sequence {} at {:?}",
-            checkpoint.created_at_sequence,
-            checkpoint
-                .workflow_position
-                .iter()
-                .map(|stage| stage.0.as_str())
-                .collect::<Vec<_>>()
-        );
-        executor.resume(&checkpoint, &mut state).await?
-    } else {
-        executor.execute(&mut state).await?
+    let workflow = async {
+        if resume {
+            let checkpoint = latest_checkpoint(&checkpoint_dir)?.ok_or_else(|| {
+                anyhow!(
+                    "no sealed checkpoint to resume under {}",
+                    checkpoint_dir.display()
+                )
+            })?;
+            println!(
+                "resuming from checkpoint sequence {} at {:?}",
+                checkpoint.created_at_sequence,
+                checkpoint
+                    .workflow_position
+                    .iter()
+                    .map(|stage| stage.0.as_str())
+                    .collect::<Vec<_>>()
+            );
+            executor.resume(&checkpoint, &mut state).await
+        } else {
+            executor.execute(&mut state).await
+        }
     };
+    let outcome = with_workflow_lease_heartbeat(
+        control_store.clone(),
+        &lease.attempt.attempt_id,
+        lease.fencing_token,
+        hi_control::DEFAULT_LEASE_TTL_MS,
+        workflow,
+    )
+    .await?;
 
     let attempt_status = match &outcome {
         TerminalOutcome::Succeeded => hi_control::AttemptStatus::Succeeded,
@@ -1190,6 +1309,83 @@ fn git_head(root: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn productive_workflow_outlives_and_renews_its_control_lease() {
+        let state = tempfile::tempdir().unwrap();
+        let store = hi_control::ControlStore::open_for_state(state.path()).unwrap();
+        let run = store
+            .create_run(hi_control::NewRun {
+                run_id: Some("long-workflow".into()),
+                kind: hi_control::RunKind::Workflow,
+                workspace_id: None,
+                scope: None,
+                session_id: None,
+                parent_run_id: None,
+                policy_snapshot: None,
+                route_snapshot: None,
+                provenance: None,
+                desired_state: hi_control::DesiredState::Run,
+            })
+            .unwrap();
+        let lease_ttl_ms = 1_000;
+        let lease = store
+            .claim_attempt(
+                &run.run_id,
+                "test-worker",
+                hi_control::now_ms(),
+                lease_ttl_ms,
+            )
+            .unwrap();
+
+        let value = with_workflow_lease_heartbeat(
+            store.clone(),
+            &lease.attempt.attempt_id,
+            lease.fencing_token,
+            lease_ttl_ms,
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(1_250)).await;
+                Ok(42)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, 42);
+        store
+            .complete_attempt(
+                &lease.attempt.attempt_id,
+                lease.fencing_token,
+                hi_control::AttemptStatus::Succeeded,
+                hi_control::now_ms(),
+                None,
+            )
+            .expect("a productive workflow must retain its lease past the original TTL");
+    }
+
+    #[test]
+    fn workflow_execution_caps_match_top_level_cli_semantics() {
+        assert_eq!(
+            parse_workflow_execution_cap("--max-steps", "7", false).unwrap(),
+            7
+        );
+        assert_eq!(
+            parse_workflow_execution_cap("--max-tool-calls", "0", true).unwrap(),
+            0
+        );
+        assert!(parse_workflow_execution_cap("--max-steps", "0", false).is_err());
+        assert!(
+            parse_workflow_execution_cap("--max-tool-calls", &u32::MAX.to_string(), true).is_err()
+        );
+        assert_eq!(
+            parse_workflow_execution_cap("--max-verify-repairs", "0", true).unwrap(),
+            0
+        );
+        assert!(
+            parse_workflow_execution_cap("--max-verify-repairs", &u32::MAX.to_string(), true)
+                .is_err()
+        );
+    }
 
     #[test]
     fn local_attestor_signs_and_signature_verifies() {
@@ -1398,7 +1594,7 @@ mod tests {
 
     #[test]
     fn plan_graph_validates_across_sizes_and_bounds_concurrency() {
-        for count in [1, 2, 7, 200] {
+        for count in [1, 2, 7, 200, 600] {
             let graph = plan_graph(count, 4).unwrap();
             assert_eq!(graph.limits.effective_concurrency(), 4);
             assert_eq!(
@@ -1412,7 +1608,8 @@ mod tests {
             );
         }
         assert!(plan_graph(0, 4).is_err());
-        assert!(plan_graph(MAX_OBJECTIVES + 1, 4).is_err());
+        let graph = plan_graph(600, 4).expect("old 512-objective ceiling is removed");
+        assert!(graph.stages.contains_key(&objective_stage_id(600)));
     }
 
     struct FlakyRunner {

@@ -3,7 +3,9 @@ use super::*;
 use std::sync::Arc;
 
 type CompactionRecords = Arc<Mutex<Vec<Vec<Message>>>>;
-type StateReplacementRecords = Arc<Mutex<Vec<(Vec<Message>, Option<Goal>, Vec<Decision>)>>>;
+type StateReplacementRecords =
+    Arc<Mutex<Vec<(Vec<Message>, Option<Goal>, Vec<Decision>, Vec<PlanStep>)>>>;
+type PlanDriveStateRecords = Arc<Mutex<Vec<(bool, u32, bool, bool, Vec<String>)>>>;
 
 struct CompactionRecordingSession {
     records: CompactionRecords,
@@ -11,6 +13,7 @@ struct CompactionRecordingSession {
 
 struct StateReplacementRecordingSession {
     records: StateReplacementRecords,
+    plan_drive_records: Option<PlanDriveStateRecords>,
 }
 
 impl SessionSink for CompactionRecordingSession {
@@ -38,13 +41,34 @@ impl SessionSink for StateReplacementRecordingSession {
         messages: &[Message],
         goal: Option<&Goal>,
         decisions: &DecisionLog,
-        _plan: &[crate::PlanStep],
+        plan: &[crate::PlanStep],
     ) -> anyhow::Result<()> {
         self.records.lock().unwrap().push((
             messages.to_vec(),
             goal.cloned(),
             decisions.entries().to_vec(),
+            plan.to_vec(),
         ));
+        Ok(())
+    }
+
+    fn record_plan_drive_state_with_policy(
+        &mut self,
+        paused: bool,
+        stall: u32,
+        resume_on_user_input: bool,
+        reset_evidence: bool,
+        evidence_add: &[String],
+    ) -> anyhow::Result<()> {
+        if let Some(records) = &self.plan_drive_records {
+            records.lock().unwrap().push((
+                paused,
+                stall,
+                resume_on_user_input,
+                reset_evidence,
+                evidence_add.to_vec(),
+            ));
+        }
         Ok(())
     }
 }
@@ -125,6 +149,7 @@ fn retry_rewind_restores_state_snapshot_and_rebuilt_system_prompt() {
         .push(Message::assistant(vec![Content::Text("old answer".into())]));
     agent.set_session(Box::new(StateReplacementRecordingSession {
         records: records.clone(),
+        plan_drive_records: None,
     }));
 
     agent.rewind_to_snapshot_durable(start, &snapshot).unwrap();
@@ -199,6 +224,161 @@ fn interrupt_rewind_keeps_plan_progress_instead_of_rolling_back() {
     assert!(
         plan.iter().all(|s| s.status == PlanStatus::Done),
         "interrupt must not roll a completed checklist back: {plan:?}"
+    );
+}
+
+#[test]
+fn cancelled_workspace_rollback_reopens_implementation_completion_durably() {
+    use hi_tools::{PlanStatus, PlanStep};
+
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let mut subject = agent(vec![], config());
+    subject.goals.last_plan = vec![PlanStep {
+        title: "Implement the parser fix".into(),
+        status: PlanStatus::Active,
+    }];
+    let start = subject.messages().len();
+    let snapshot = subject.state_snapshot();
+
+    // The abandoned turn claimed completion from an edit which cancellation
+    // subsequently removed by restoring the pre-turn workspace checkpoint.
+    subject.goals.last_plan[0].status = PlanStatus::Done;
+    subject
+        .messages_mut()
+        .push(Message::user("continue the plan"));
+    subject.set_session(Box::new(StateReplacementRecordingSession {
+        records: records.clone(),
+        plan_drive_records: None,
+    }));
+
+    subject
+        .rewind_to_snapshot_durable_with_workspace_rollback(start, &snapshot, true)
+        .unwrap();
+
+    assert_eq!(subject.current_plan()[0].status, PlanStatus::Active);
+    let persisted = records.lock().unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].3[0].status, PlanStatus::Active);
+
+    // The state handed to a restarted Agent must remain unfinished too.
+    let mut resumed = agent(vec![], config());
+    resumed.restore_plan(persisted[0].3.clone());
+    assert_eq!(resumed.current_plan()[0].status, PlanStatus::Active);
+}
+
+#[test]
+fn cancelled_rewind_retains_meta_progress_and_resets_drive_scope_durably() {
+    use hi_tools::{PlanStatus, PlanStep};
+
+    let state_records = Arc::new(Mutex::new(Vec::new()));
+    let drive_records = Arc::new(Mutex::new(Vec::new()));
+    let evidence_hash = "a".repeat(64);
+    let mut subject = agent(vec![], config());
+    subject.goals.last_plan = vec![
+        PlanStep {
+            title: "Inspect the existing parser".into(),
+            status: PlanStatus::Active,
+        },
+        PlanStep {
+            title: "Implement the parser fix".into(),
+            status: PlanStatus::Pending,
+        },
+    ];
+    subject.restore_plan_drive_with_policy(false, false, 3, vec![evidence_hash.clone()]);
+    let start = subject.messages().len();
+    let snapshot = subject.state_snapshot();
+
+    // Read-only bookkeeping survives the workspace rewind, so the next step
+    // changes. Stall/evidence from the inspection scope must not poison it.
+    subject.goals.last_plan[0].status = PlanStatus::Done;
+    subject.goals.last_plan[1].status = PlanStatus::Active;
+    subject.set_session(Box::new(StateReplacementRecordingSession {
+        records: state_records.clone(),
+        plan_drive_records: Some(drive_records.clone()),
+    }));
+
+    subject
+        .rewind_to_snapshot_durable_with_workspace_rollback(start, &snapshot, true)
+        .unwrap();
+
+    assert_eq!(subject.current_plan()[0].status, PlanStatus::Done);
+    assert_eq!(subject.current_plan()[1].status, PlanStatus::Active);
+    assert_eq!(subject.plan_drive_stall(), 0);
+    assert!(subject.plan_drive_evidence.is_empty());
+
+    let persisted_plan = state_records.lock().unwrap()[0].3.clone();
+    let drive_record = drive_records.lock().unwrap()[0].clone();
+    assert_eq!(drive_record, (false, 0, false, true, Vec::new()));
+
+    // Replay the prior evidence plus the emitted reset exactly as session
+    // loading does: the newly-active step starts with a clean drive scope.
+    let mut resumed_evidence = vec![evidence_hash];
+    if drive_record.3 {
+        resumed_evidence.clear();
+    }
+    resumed_evidence.extend(drive_record.4);
+    let mut resumed = agent(vec![], config());
+    resumed.restore_plan(persisted_plan);
+    resumed.restore_plan_drive_with_policy(
+        drive_record.0,
+        drive_record.2,
+        drive_record.1,
+        resumed_evidence,
+    );
+    assert_eq!(
+        resumed.next_plan_step_title(),
+        Some("Implement the parser fix")
+    );
+    assert_eq!(resumed.plan_drive_stall(), 0);
+    assert!(resumed.plan_drive_evidence.is_empty());
+}
+
+#[test]
+fn transactional_user_resume_rewind_serializes_the_durable_interruption_latch() {
+    use hi_tools::{PlanStatus, PlanStep};
+
+    let state_records = Arc::new(Mutex::new(Vec::new()));
+    let drive_records = Arc::new(Mutex::new(Vec::new()));
+    let mut subject = agent(vec![], config());
+    subject.restore_plan(vec![
+        PlanStep {
+            title: "Implement the parser fix".into(),
+            status: PlanStatus::Active,
+        },
+        PlanStep {
+            title: "Validate the parser fix".into(),
+            status: PlanStatus::Pending,
+        },
+    ]);
+    subject.restore_plan_drive_with_policy(true, true, 0, Vec::new());
+    let start = subject.messages().len();
+    let snapshot = subject.state_snapshot();
+
+    assert!(
+        subject
+            .prepare_plan_drive_for_turn(crate::DriveKind::User)
+            .unwrap()
+    );
+    subject.begin_drive_turn(crate::DriveKind::User).unwrap();
+    assert!(
+        !subject.plan_drive_paused(),
+        "the active user turn should render as resumed"
+    );
+    subject.goals.last_plan[0].status = PlanStatus::Done;
+    subject.goals.last_plan[1].status = PlanStatus::Active;
+    subject.set_session(Box::new(StateReplacementRecordingSession {
+        records: state_records,
+        plan_drive_records: Some(drive_records.clone()),
+    }));
+
+    subject
+        .rewind_to_snapshot_durable(start, &snapshot)
+        .unwrap();
+
+    assert_eq!(
+        drive_records.lock().unwrap().as_slice(),
+        &[(true, 0, true, true, Vec::new())],
+        "a rewind during transactional resume must not persist the hidden UI state as running"
     );
 }
 
@@ -779,35 +959,6 @@ async fn empty_completion_error_is_resampled_too() {
 }
 
 #[tokio::test]
-async fn reasoning_route_empty_completion_gets_output_headroom_retry() {
-    let mut cfg = config();
-    cfg.routing.model = "pipe/glm-5.3-flash".into();
-    cfg.routing.requested_max_tokens = 768;
-    cfg.routing.max_tokens = 768;
-    cfg.routing.max_tokens_explicit = true;
-    let steps = vec![
-        ProviderStep::Completion(completion(vec![], 8, 8)),
-        ProviderStep::Completion(completion(
-            vec![Content::Text("recovered with headroom".into())],
-            12,
-            4,
-        )),
-    ];
-    let (mut agent, _requests, max_tokens) = scripted_agent_recording_max_tokens(steps, cfg);
-
-    agent.run_turn("say hi", &mut NullUi).await.unwrap();
-
-    let max_tokens = max_tokens.lock().unwrap();
-    assert_eq!(max_tokens[0], 768);
-    assert_eq!(
-        max_tokens[1],
-        hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS,
-        "reasoning-only Pipe output must get one larger recovery budget"
-    );
-    assert!(max_tokens.len() >= 2);
-}
-
-#[tokio::test]
 async fn keep_working_recovers_after_empty_retry_budget() {
     let mut cfg = config();
     cfg.loop_limits.max_empty_retries = 1;
@@ -835,6 +986,82 @@ async fn keep_working_recovers_after_empty_retry_budget() {
         ui.statuses
     );
     assert_eq!(requests.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn unlimited_default_still_bounds_persistent_empty_recovery_at_six_requests() {
+    let mut cfg = config();
+    // The common test fixture disables keep-working. Restore the production
+    // default so this covers the complete composed recovery budget while the
+    // ordinary model-round limit is unlimited.
+    cfg.loop_limits.max_keep_working = crate::MAX_KEEP_WORKING;
+    assert_eq!(cfg.loop_limits.max_steps, u32::MAX);
+    assert_eq!(cfg.loop_limits.max_empty_retries, crate::MAX_EMPTY_RETRIES);
+
+    let steps = (0..6)
+        .map(|_| ProviderStep::Error(ProviderErrorKind::EmptyCompletion))
+        .collect();
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+
+    let err = agent
+        .run_turn("answer despite a persistently empty provider", &mut NullUi)
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("scripted provider error"),
+        "the terminal empty-completion error should surface: {err:#}"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        6,
+        "initial plus two empty retries on each side of one keep-working recovery"
+    );
+    assert_eq!(agent.last_turn_telemetry().effective_max_steps, u32::MAX);
+    assert!(!agent.last_turn_telemetry().hit_step_cap);
+}
+
+#[tokio::test]
+async fn unlimited_default_interleaved_503_does_not_reopen_empty_recovery_budget() {
+    let mut cfg = config();
+    cfg.loop_limits.max_keep_working = crate::MAX_KEEP_WORKING;
+    assert_eq!(cfg.loop_limits.max_steps, u32::MAX);
+
+    let empty = || ProviderStep::Error(ProviderErrorKind::EmptyCompletion);
+    let temporary_503 = ProviderStep::ErrorMessage(
+        ProviderErrorKind::ModelUnavailable,
+        r#"{"error":"model temporarily unavailable","code":"model_unavailable","retryable":true,"retry_after_seconds":0}"#
+            .into(),
+    );
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            empty(),
+            empty(),
+            empty(),
+            temporary_503,
+            empty(),
+            empty(),
+            empty(),
+        ],
+        cfg,
+    );
+
+    let err = agent
+        .run_turn("answer through empty responses and one 503", &mut NullUi)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::EmptyCompletion)
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        7,
+        "the one 503 replay composes with, but does not reset, the six-request empty budget"
+    );
+    assert_eq!(agent.last_turn_telemetry().effective_max_steps, u32::MAX);
+    assert!(!agent.last_turn_telemetry().hit_step_cap);
 }
 
 #[tokio::test]
@@ -1307,6 +1534,7 @@ async fn repeated_invalid_mutation_arguments_fall_back_to_text_and_survive_narra
     ];
     let mut cfg = workspace.config();
     cfg.loop_limits.max_repeat_nudges = 1;
+    cfg.gates.allow_unverified = true;
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
 
@@ -1315,6 +1543,11 @@ async fn repeated_invalid_mutation_arguments_fall_back_to_text_and_survive_narra
         .await
         .unwrap();
 
+    // This fixture intentionally disables deterministic verification; the
+    // fallback behavior under test is the tool-channel recovery itself.
+    // Permit the resulting unverified workspace to settle as completed.
+    // Production defaults still require a verification seal.
+    assert_eq!(outcome.verification, VerificationStatus::Unverified);
     assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(std::fs::read_to_string(source).unwrap(), "fn main() {}\n");
     assert!(
@@ -1516,7 +1749,7 @@ async fn terminal_error_resets_stale_turn_telemetry() {
         scripted_agent(vec![ProviderStep::Error(ProviderErrorKind::Auth)], config());
     agent.report.last_turn_telemetry = TurnTelemetry {
         repeat_nudges: 99,
-        stalled_unfinished: true,
+        no_progress_streak: 99,
         tool_calls: 42,
         ..TurnTelemetry::default()
     };
@@ -1530,10 +1763,7 @@ async fn terminal_error_resets_stale_turn_telemetry() {
     let telemetry = agent.last_turn_telemetry();
     assert_eq!(telemetry.repeat_nudges, 0);
     assert_eq!(telemetry.tool_calls, 0);
-    assert!(
-        !telemetry.stalled_unfinished,
-        "terminal error should report this failed turn, not stale prior telemetry"
-    );
+    assert_eq!(telemetry.no_progress_streak, 0);
 }
 
 #[tokio::test]
@@ -1599,6 +1829,48 @@ async fn terminal_error_after_tool_progress_reports_changed_files_and_tools() {
             .any(|entry| entry.tool == "write" && entry.path == path_string),
         "write tool telemetry should be retained after terminal error: {:?}",
         telemetry.tool_timeline
+    );
+}
+
+#[tokio::test]
+async fn pipe_serviceability_blip_after_tool_progress_retries_and_settles() {
+    let workspace = IsolatedWorkspace::new("retry-pipe-serviceability-after-tool");
+    let path = workspace.path("live-write-proof.txt");
+    let path_string = path.to_string_lossy().to_string();
+    let mut cfg = workspace.config();
+    cfg.gates.allow_unverified = true;
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(write_completion(&path_string)),
+            ProviderStep::Error(ProviderErrorKind::EmptyCompletion),
+            ProviderStep::ErrorMessage(
+                ProviderErrorKind::ModelUnavailable,
+                "requested model is not currently serviceable".into(),
+            ),
+            ProviderStep::Completion(completion(
+                vec![Content::Text("Created the requested file.".into())],
+                5,
+                3,
+            )),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn("write the requested file, then finish", &mut ui)
+        .await
+        .expect("a transient Pipe serviceability blip should recover");
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert!(path.exists(), "the completed tool mutation was lost");
+    assert_eq!(requests.lock().unwrap().len(), 4);
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("provider overloaded") && status.contains("1/6")),
+        "the serviceability error did not use the capacity retry lane: {:?}",
+        ui.statuses
     );
 }
 

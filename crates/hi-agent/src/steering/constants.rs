@@ -113,53 +113,17 @@ Do not rerun the same search and do not use mutating tools. Read the most releva
 then answer from that inspected file. If you cannot pick a file to read, explain that limitation \
 and answer only from the search output.";
 
-/// Default file-read + targeted-search cap for read-only review turns. Listings
-/// and diffs remain useful context, but they do not increase this count.
-/// Sized for multi-crate workspaces: enough greps + file reads to ground findings
-/// before the sprawl nudge forces an answer; still bounded so review turns cannot
-/// churn toward max_steps on distinct-file thrash.
-///
-/// Resolved by [`super::intent::read_only_inspection_cap`]: an explicit user
-/// phrase wins, then the exact-file cap of 4, otherwise this default.
-pub(crate) const REVIEW_INSPECTION_CAP: u32 = 32;
-/// A closed-set exact-file review should finish after one batched pass and a
-/// small amount of targeted verification; a broad review keeps the larger cap.
-pub(crate) const BOUNDED_FILE_REVIEW_INSPECTION_CAP: u32 = 4;
-
 /// How many *additional* read-only inspection rounds are allowed after the
-/// sprawl nudge before the turn stops incomplete.
+/// sprawl nudge before the turn settles with the available evidence. This is
+/// used only when the user explicitly requested an inspection-count cap;
+/// ordinary review turns have no count ceiling.
 pub(crate) const MAX_INSPECTION_SPRAWL_NUDGES: u32 = 2;
-
-/// Consecutive model rounds whose every tool is read-only inspection
-/// (`read`/`grep`/`list`/`glob`/`repo_map`/`find_symbol`/`explore`). File-count
-/// caps still allow many serial RSI calls on a large repo (~20+ minutes when
-/// each round is 30–60s). This round cap forces an answer first. Implementation
-/// discovery keeps its own [`MUTATION_DISCOVERY_ROUND_CAP`] and is excluded.
-pub(crate) const INSPECTION_ONLY_ROUND_CAP: u32 = 16;
-
-/// Successful `read` calls allowed against one still-truncated file before
-/// further pages stop counting as new evidence.
-///
-/// The default 2,000-line page is clipped to the ~5k-char tool-result budget
-/// (~100 lines of Rust). Models that follow the `read more with offset N`
-/// footer need several pages to finish a typical source file. Exact same-page
-/// re-reads and paging after a complete read still add nothing.
-pub(crate) const MAX_PAGED_READS_PER_PATH: u32 = 8;
-
-/// A mutation-capable turn may inspect a bounded amount of evidence before it
-/// must attempt the requested edit. This protects against models that keep
-/// reading/planning indefinitely while repeatedly promising to act. After the
-/// two advisory nudges the turn requires an edit, then stops incomplete if
-/// inspection continues.
-pub(crate) const MUTATION_DISCOVERY_ROUND_CAP: u32 = 10;
-pub(crate) const MUTATION_DISCOVERY_ROUNDS_PER_NUDGE: u32 = 2;
-pub(crate) const MAX_MUTATION_DISCOVERY_NUDGES: u32 = 2;
 
 /// Sent when the model re-reads files it already inspected earlier this turn
 /// (a multi-step read cycle like A→B→C→A→B→C that evades the exact-match
 /// repeat guard). The file contents are already in the transcript above —
 /// re-reading will only reproduce them. Nudges the model to act on what it
-/// already has instead of cycling until the step cap.
+/// already has instead of cycling indefinitely.
 pub(crate) const REREAD_NUDGE: &str = "You already read these files earlier this turn and their contents \
 are already in the conversation above — reading them again will only repeat the same output. If the \
 first read had no \"read more with offset N\" footer, you already have the entire file; do not page it. \
@@ -267,8 +231,8 @@ pub(crate) fn tool_validation_retry_nudge(tool: &str, error: &str) -> String {
         "The `{tool}` tool call was rejected by client-side schema validation: {error}. Emit a new `{tool}` call with a complete JSON object that satisfies the declared schema. Do not repeat the invalid arguments; include every required property and use the correct JSON types."
     )
 }
-pub(crate) const TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE: &str = "Structured tool calls have been rejected \
-repeatedly by the provider. For this next response only, do not use provider/function tool calling. \
+pub(crate) const TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE: &str = "Structured tool calling did not produce \
+an executable tool call in the previous attempts. For this next response only, do not use provider/function tool calling. \
 Emit exactly one plain-text tool call in this XML-ish format and no markdown fences:\n\
 <tool_call>write<arg_key>path</arg_key><arg_value>src/main.rs</arg_value><arg_key>content</arg_key><arg_value>file contents here</arg_value></tool_call>\n\
 For shell commands use:\n\
@@ -277,7 +241,9 @@ Keep the edit compact; a minimal working vertical slice is better than a huge in
 
 #[cfg(test)]
 mod protocol_retry_tests {
-    use super::{tool_protocol_retry_nudge, tool_validation_retry_nudge};
+    use super::{
+        TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, tool_protocol_retry_nudge, tool_validation_retry_nudge,
+    };
     use hi_ai::ToolSpec;
 
     fn tool(name: &str) -> ToolSpec {
@@ -316,5 +282,11 @@ mod protocol_retry_tests {
         assert!(nudge.contains("`read`"));
         assert!(nudge.contains("'path' is a required property"));
         assert!(nudge.contains("complete JSON object"));
+    }
+
+    #[test]
+    fn text_fallback_does_not_invent_a_provider_rejection() {
+        assert!(TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE.contains("did not produce an executable"));
+        assert!(!TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE.contains("rejected repeatedly by the provider"));
     }
 }

@@ -472,13 +472,16 @@ impl crate::App {
                 self.pending = None;
                 self.code_lang = None;
                 self.current_assistant.clear();
+                self.current_assistant_streamed_bytes = 0;
                 self.last_assistant.clear();
                 self.status.clear();
                 self.last_turn_state = crate::TurnState::Idle;
                 self.last_prompt = None;
                 self.last_turn_snapshot = None;
                 self.last_turn_start = agent.messages().len();
-                self.queue.clear();
+                while let Some(prompt) = self.queue.pop_front() {
+                    self.trace_prompt_removed(&prompt);
+                }
                 self.mid_turn_offered.clear();
                 self.plan = agent.current_plan().to_vec();
                 self.goal = agent.structured_goal().cloned();
@@ -1551,25 +1554,10 @@ impl crate::App {
             self.stop_host_mode();
         }
         let mut queued = 0usize;
-        let mut rejected = 0usize;
         for prompt in incoming {
             if self.try_enqueue_prompt(prompt) {
                 queued += 1;
-            } else {
-                rejected += 1;
             }
-        }
-        if rejected > 0 {
-            self.push(Line::styled(
-                format!(
-                    "← dropped {rejected} remote prompt{} — queue full ({}/{})",
-                    if rejected == 1 { "" } else { "s" },
-                    self.queue.len(),
-                    crate::MAX_PROMPT_QUEUE
-                ),
-                Style::default().fg(crate::theme::theme().warning),
-            ));
-            self.follow();
         }
         if queued > 0 {
             self.push(Line::styled(
@@ -1915,7 +1903,7 @@ pub(crate) fn local_runtime_phase_line(
 }
 
 /// Heartbeat cadence for the provider-picker runtime. The loading phase gets
-/// the fastest refresh because it is the phase most likely to look stalled;
+/// the fastest refresh because it is the phase most likely to look idle;
 /// compilation and download use a gentler cadence to avoid needless redraws.
 pub(crate) fn local_runtime_heartbeat_ticks(
     phase: &hi_agent::local_skeptic::LocalRuntimePhase,

@@ -10,9 +10,12 @@ blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+# Verification/fuzz commands run in private Unix process groups so timeout or
+# parent exit cannot strand descendant processes or inherited output pipes.
+unsafe_code = "allow"

@@ -33,6 +33,7 @@ pub use app::run;
 pub use daemon::run_loops_daemon;
 pub use file_mentions::expand_file_mentions;
 pub use loops::set_loop_paused;
+pub use tui_event_trace::{TUI_EVENT_TRACE_SCHEMA_VERSION, TuiEventTrace};
 mod block_viewer;
 mod btw;
 mod chrome;
@@ -52,6 +53,7 @@ mod subagent_overlay;
 mod sync_tui;
 mod theme;
 mod timeline;
+mod tui_event_trace;
 mod turn_status;
 mod tutorial;
 mod util;
@@ -231,7 +233,15 @@ pub struct FleetLauncher {
     /// the child (`--verify`) and re-run as the ground-truth merge gate.
     pub verify: Option<String>,
     pub max_verify: u32,
-    pub max_steps: u32,
+    /// Shared explicit model-round cap for child turns. `0` means omitted / the
+    /// ordinary unlimited default. It is atomic so `/config steps` changes in
+    /// the interactive Agent also govern later loop and fleet children.
+    pub max_steps: std::sync::atomic::AtomicU32,
+    /// Shared explicit tool-execution cap for child turns. `u64::MAX` means
+    /// omitted / the ordinary unlimited default; every `u32` value, including
+    /// zero, is preserved losslessly. This is wider than the CLI value solely
+    /// so the sentinel cannot collide with an explicit cap.
+    pub max_tool_calls: std::sync::atomic::AtomicU64,
     /// Allocates a unique session file for a new fleet row (collision-safe).
     pub session_path: Box<dyn Fn() -> Result<std::path::PathBuf> + Send + Sync>,
     /// Lists this project's resumable fleet sessions (`/fleet status`).
@@ -243,6 +253,65 @@ pub struct FleetLauncher {
     pub loop_session_path: Box<dyn Fn() -> Result<std::path::PathBuf> + Send + Sync>,
     /// Where `/loop` definitions persist across restarts (per project).
     pub loops_file: Option<std::path::PathBuf>,
+}
+
+impl FleetLauncher {
+    pub(crate) fn model_step_limit(&self) -> Option<u32> {
+        match self.max_steps.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            value => Some(value),
+        }
+    }
+
+    pub(crate) fn set_model_step_limit(&self, max_steps: Option<u32>) {
+        self.max_steps
+            .store(max_steps.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn model_tool_call_limit(&self) -> Option<u32> {
+        match self
+            .max_tool_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            u64::MAX => None,
+            value => u32::try_from(value).ok(),
+        }
+    }
+
+    pub(crate) fn model_verify_repair_limit(&self) -> Option<u32> {
+        (self.max_verify != hi_agent::UNLIMITED_REPAIR_CYCLES).then_some(self.max_verify)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_model_tool_call_limit(&self, max_tool_calls: Option<u32>) {
+        self.max_tool_calls.store(
+            max_tool_calls.map(u64::from).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// CLI arguments that make a child inherit the parent's explicit model
+    /// and tool caps. Omitted caps stay omitted so children keep hi's ordinary
+    /// unlimited defaults.
+    pub(crate) fn child_execution_cap_args(&self) -> Vec<std::ffi::OsString> {
+        child_execution_cap_args(self.model_step_limit(), self.model_tool_call_limit())
+    }
+}
+
+pub(crate) fn child_execution_cap_args(
+    max_steps: Option<u32>,
+    max_tool_calls: Option<u32>,
+) -> Vec<std::ffi::OsString> {
+    let mut arguments = Vec::new();
+    if let Some(max_steps) = max_steps {
+        arguments.push("--max-steps".into());
+        arguments.push(max_steps.to_string().into());
+    }
+    if let Some(max_tool_calls) = max_tool_calls {
+        arguments.push("--max-tool-calls".into());
+        arguments.push(max_tool_calls.to_string().into());
+    }
+    arguments
 }
 
 /// Resolves a fleet session id into re-adoption info (`/fleet resume`).
@@ -472,6 +541,9 @@ pub struct RunOptions {
     /// persisted and consumed before the side effect is allowed to run.
     pub approval_store: Option<Arc<dyn hi_policy::ApprovalStore>>,
     pub fleet_launcher: FleetLauncher,
+    /// Optional flushed, redacted lifecycle trace used by the interactive
+    /// smoke harness. This is independent from delegate progress JSONL.
+    pub tui_event_trace: Option<TuiEventTrace>,
     pub remote_event_tap: Option<RemoteEventTap>,
     pub remote_flush_callback: Option<RemoteFlushCallback>,
     pub sync_config: Option<SyncConfig>,
@@ -594,9 +666,8 @@ pub(crate) fn diff_for_files_sync(root: &std::path::Path, files: &[String]) -> S
 }
 
 pub(crate) const TICK: Duration = Duration::from_millis(120);
-/// Only show an informational notice after a long, genuinely silent wait. This
-/// is deliberately not a model-health signal: hosted APIs may buffer and retry
-/// on the backend without streaming visible tokens to the TUI.
+/// Informational notice for a quiet backend. This is not a health verdict;
+/// cancellation and any explicitly configured deadline remain completion controls.
 const DEFAULT_WATCHDOG_STUCK_SECS: u64 = 180;
 const MIN_WATCHDOG_STUCK_SECS: u64 = 30;
 const MAX_WATCHDOG_STUCK_SECS: u64 = 1_800;
@@ -955,7 +1026,12 @@ fn workflow_snapshot_lines(snapshot: &hi_workflow::WorkflowRunSnapshot) -> Vec<L
     lines.push(Line::styled(
         format!(
             "  agents · {}/{} · {} ms",
-            snapshot.agents_used, snapshot.agent_budget, snapshot.elapsed_ms
+            snapshot.agents_used,
+            snapshot
+                .agent_budget
+                .map(|budget| budget.to_string())
+                .unwrap_or_else(|| "unlimited".to_owned()),
+            snapshot.elapsed_ms
         ),
         Style::default().fg(th.gray_dim),
     ));
@@ -1300,6 +1376,10 @@ pub(crate) struct App {
     pub(crate) session_face_dirty: bool,
     /// Mirrored from the agent so chrome can show paused/parked.
     pub(crate) plan_drive_paused: bool,
+    /// A frontend action explicitly changed plan pause state. Keep this
+    /// separate from generic face changes so mirroring an interrupted pause
+    /// cannot turn it into durable manual `/plan pause` intent.
+    pub(crate) plan_drive_pause_dirty: bool,
     /// Cached leftover-work gate, refreshed after each turn and `/plan`/`/goal`.
     pub(crate) last_drive: hi_agent::DriveAction,
     /// Last turn's stop reason, used to keep Cancelled / infrastructure idle.
@@ -1373,6 +1453,9 @@ pub(crate) struct App {
     /// Assistant prose currently streaming. Tool output is intentionally not
     /// included; `/copy` copies the assistant's answer, not command logs.
     pub(crate) current_assistant: String,
+    /// Bytes from `current_assistant` already rendered. Exact generic
+    /// completion candidates stay buffered until their full shape is known.
+    pub(crate) current_assistant_streamed_bytes: usize,
     /// Whether the current streamed assistant response already owns an
     /// `AssistantMessage` entry. `AssistantEnd` closes this boundary so
     /// separate model rounds cannot be merged into one transcript block.
@@ -1538,6 +1621,9 @@ pub(crate) struct App {
     pub(crate) pending_host_enable:
         Option<tokio::task::JoinHandle<anyhow::Result<Option<crate::SessionHostEnable>>>>,
     pub(crate) sync_control: Option<crate::SyncControl>,
+    /// Handle for typed interactive lifecycle records and propagation of a
+    /// write failure observed inside the composed `RemoteEventTap`.
+    pub(crate) tui_event_trace: Option<crate::TuiEventTrace>,
     /// The remote event tap for live streaming. When set, the `drive` function
     /// calls this after each `UiEvent` is applied to `App`, forwarding events
     /// to the `RemoteUi` for ipop sync. Set at startup or by `/sync on`.
@@ -1621,11 +1707,6 @@ pub(crate) enum TurnState {
     Failed(String),
     Cancelled,
 }
-
-/// Hard cap on next-turn prompts in [`App::queue`]. Bounds memory when many
-/// lines are submitted mid-turn or remote attach floods the host. Further
-/// enqueues are rejected (with a status note) once full — oldest work is kept.
-pub(crate) const MAX_PROMPT_QUEUE: usize = 64;
 
 /// Max transcript lines kept for display and scrolling. Older lines scroll off
 /// the top (the full session is still in the JSONL log). Bounds the u16 scroll

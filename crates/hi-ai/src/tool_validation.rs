@@ -12,9 +12,28 @@ use serde_json::Value;
 
 use crate::{Completion, Content, ProviderError, ProviderErrorKind, ToolMode, ToolSpec};
 
-const MAX_TOOL_CALLS: usize = 128;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_TOTAL_TOOL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
+/// Aggregate retained payload budget for one model-emitted tool batch. This is
+/// a memory/resource guard, not a call-count ceiling: every call consumes a
+/// conservative slot charge plus its encoded fields, so small valid batches
+/// may contain well over the historical 128-call limit while empty-call floods
+/// still cannot grow without bound.
+pub(crate) const MAX_TOTAL_TOOL_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const TOOL_CALL_SLOT_OVERHEAD_BYTES: usize = 128;
+
+/// Reserve retained memory against the aggregate per-response tool budget.
+/// Checked arithmetic makes overflow a refusal rather than accidentally
+/// turning saturation into permission.
+pub(crate) fn try_reserve_tool_payload(total: &mut usize, additional: usize) -> bool {
+    let Some(next) = total.checked_add(additional) else {
+        return false;
+    };
+    if next > MAX_TOTAL_TOOL_PAYLOAD_BYTES {
+        return false;
+    }
+    *total = next;
+    true
+}
 
 static VALIDATORS: OnceLock<Mutex<HashMap<String, Arc<jsonschema::Validator>>>> = OnceLock::new();
 
@@ -56,12 +75,6 @@ pub fn validate_client_tool_calls(
             "model emitted tool calls when tools were disabled",
         ));
     }
-    if calls.len() > MAX_TOOL_CALLS {
-        return Err(tool_protocol_error(
-            "model exceeded the client tool-call count limit",
-        ));
-    }
-
     validate_client_tool_batch_limits(calls.iter().map(|(_, _, arguments)| arguments.as_str()))?;
 
     let mut ids = HashSet::new();
@@ -76,23 +89,19 @@ pub fn validate_client_tool_calls(
     Ok(())
 }
 
-/// Enforce aggregate count/size limits before any call in a batch executes.
+/// Enforce an aggregate retained-memory limit before any call in a batch
+/// executes. There is deliberately no independent call-count ceiling.
 pub fn validate_client_tool_batch_limits<'a>(
     arguments: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), ProviderError> {
-    let mut count = 0usize;
     let mut total_bytes = 0usize;
     for argument in arguments {
-        count = count.saturating_add(1);
-        total_bytes = total_bytes.saturating_add(argument.len());
-        if count > MAX_TOOL_CALLS {
+        if !try_reserve_tool_payload(
+            &mut total_bytes,
+            TOOL_CALL_SLOT_OVERHEAD_BYTES.saturating_add(argument.len()),
+        ) {
             return Err(tool_protocol_error(
-                "model exceeded the client tool-call count limit",
-            ));
-        }
-        if total_bytes > MAX_TOTAL_TOOL_ARGUMENT_BYTES {
-            return Err(tool_protocol_error(
-                "model exceeded the total client tool-argument size limit",
+                "model exceeded the total client tool payload size limit",
             ));
         }
     }
@@ -365,9 +374,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_batches_before_execution() {
-        let arguments = vec!["{}"; MAX_TOOL_CALLS + 1];
-        assert!(validate_client_tool_batch_limits(arguments).is_err());
+    fn accepts_batches_beyond_the_legacy_count_ceiling() {
+        let arguments = vec!["{}"; 175];
+        assert!(validate_client_tool_batch_limits(arguments).is_ok());
+
+        let completion = Completion {
+            content: (0..175)
+                .map(|index| Content::ToolCall {
+                    id: format!("call_{index}"),
+                    name: "read".to_string(),
+                    arguments: r#"{"path":"README.md"}"#.to_string(),
+                })
+                .collect(),
+            ..Completion::default()
+        };
+        assert!(validate_client_tool_calls(&completion, &[tool()], ToolMode::Auto).is_ok());
+    }
+
+    #[test]
+    fn rejects_aggregate_payload_overflow_before_execution() {
+        let payload = "x".repeat(MAX_TOTAL_TOOL_PAYLOAD_BYTES / 2);
+        assert!(
+            validate_client_tool_batch_limits([payload.as_str(), payload.as_str(), "{}"]).is_err()
+        );
     }
 
     #[test]

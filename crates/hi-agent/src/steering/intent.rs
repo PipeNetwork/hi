@@ -463,17 +463,11 @@ fn without_scoped_no_edit_constraints(normalized: &str) -> String {
         .join(" ")
 }
 
-/// File-read/search cap for a read-only turn: an explicit user phrase is
-/// authoritative, else 4 for a closed-set exact-file review, else
-/// [`super::constants::REVIEW_INSPECTION_CAP`].
-pub(crate) fn read_only_inspection_cap(input: &str, intent: ReviewIntent) -> u32 {
-    if let Some(explicit) = explicit_read_only_inspection_cap(input) {
-        return explicit;
-    }
-    if matches!(intent, ReviewIntent::Review) && is_bounded_file_review(input, false) {
-        return super::constants::BOUNDED_FILE_REVIEW_INSPECTION_CAP;
-    }
-    super::constants::REVIEW_INSPECTION_CAP
+/// Return the inspection cap the user explicitly requested. Ordinary read-only
+/// turns are unlimited; distinct new evidence must never become a stop reason
+/// merely because a fixed number of reads or searches has elapsed.
+pub(crate) fn read_only_inspection_cap(input: &str, _intent: ReviewIntent) -> Option<u32> {
+    explicit_read_only_inspection_cap(input)
 }
 
 pub(crate) fn explicit_read_only_inspection_cap(input: &str) -> Option<u32> {
@@ -740,8 +734,21 @@ pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String
     } else {
         " If deterministic preflight already read files, cite those paths; do not re-read them unless you need a later slice. Prefer one targeted grep or read for a gap, then answer."
     };
+    let inspection_limit_guidance = cap.map_or_else(
+        || {
+            "No automatic inspection-count ceiling applies. Continue while each inspection adds relevant evidence; repeated or no-new-evidence cycles are still stopped."
+                .to_string()
+        },
+        |cap| {
+            format!(
+                "The user explicitly requested an inspection cap: at most {cap} file reads/searches for this turn. Listings and diffs may provide context but do not raise it. Once reached, answer from gathered evidence instead of inspecting more."
+            )
+        },
+    );
     format!(
-        "{input}\n\nRead-only review guard: use only the currently advertised read-only inspection tools; never invent tool names or handles remembered from earlier turns. Do not write, edit, apply patches, or change files. Respect explicit user exclusions: never invoke a tool or inspect an artifact the user explicitly forbids, even if this review recipe mentions it. Do not narrate tool availability, stale handles, polling recovery, or internal steering to the user; inspect with the available tools and give the review directly. Use read-only inspection before the final answer. Active inspection cap: at most {cap} file reads/searches for this turn; listings and diffs may provide context but do not raise the cap. Prefer explore, repo_map, or find_symbol when covering a large tree. Once the cap is reached, answer from gathered evidence instead of inspecting more. {recipe}{bounded_guidance} If only a directory listing is available, keep inspecting before making file-specific findings."
+        "{input}\n\n{}\nRead-only review guard: use only the currently advertised read-only inspection tools; never invent tool names or handles remembered from earlier turns. Do not write, edit, apply patches, or change files. Respect explicit user exclusions: never invoke a tool or inspect an artifact the user explicitly forbids, even if this review recipe mentions it. Do not narrate tool availability, stale handles, polling recovery, or internal steering to the user; inspect with the available tools and give the review directly. Use read-only inspection before the final answer. {inspection_limit_guidance} Prefer explore, repo_map, or find_symbol when covering a large tree. {recipe}{bounded_guidance} If only a directory listing is available, keep inspecting before making file-specific findings.\n{}",
+        crate::transcript::TURN_CONTROL_START,
+        crate::transcript::TURN_CONTROL_END,
     )
 }
 
@@ -998,7 +1005,12 @@ pub(crate) fn implementation_turn_prompt(input: &str, intent: ImplementationInte
     if intent.tui {
         rules.push("For a TUI with no clear existing stack, default to Rust with Ratatui and Crossterm. In an empty directory, prefer `cargo init --bin .` before editing so Cargo.toml already has a valid target. Do not run a foreground TUI directly; validate with unit tests, cargo build/check/test, or a bounded smoke command such as `timeout 5s cargo run`.".to_string());
     }
-    format!("{input}\n\n{}", rules.join("\n"))
+    format!(
+        "{input}\n\n{}\n{}\n{}",
+        crate::transcript::TURN_CONTROL_START,
+        rules.join("\n"),
+        crate::transcript::TURN_CONTROL_END,
+    )
 }
 
 #[cfg(test)]

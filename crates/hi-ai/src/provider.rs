@@ -218,6 +218,7 @@ pub fn provider_route_error_is_retryable(err: &anyhow::Error) -> bool {
                     &[
                         "temporarily unavailable",
                         "temporary unavailable",
+                        "not currently serviceable",
                         "try again",
                     ],
                 )
@@ -298,6 +299,10 @@ pub fn provider_error_is_temporary_overload(err: &anyhow::Error) -> bool {
             "glm overloaded",
             "glm-5.2 overloaded",
             "temporarily at capacity",
+            // Pipe can report a transient backend assignment failure inside
+            // an otherwise accepted SSE stream. "Currently" distinguishes
+            // this from permanent unknown/unsupported-model configuration.
+            "not currently serviceable",
         ],
     ) || (mentions_any(&lower, &["overloaded", "over capacity"])
         && mentions_any(&lower, &["try again", "retry", "temporarily", "temporary"]))
@@ -375,20 +380,14 @@ pub fn effective_coding_agent_max_tokens(
 }
 
 pub fn is_pipenetwork_coding_route(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
-    model == "ipop/coder-balanced"
-        || model == "pipe/auto-coder"
-        // Keep the explicit legacy aliases accepted by the API while also
-        // recognizing canonical Pipe reasoning checkpoints. Bounded review
-        // recovery must not send a 768-token request to a model that can
-        // spend the entire budget on hidden reasoning.
-        || model == "pipe/deepseek-v4-flash-vision-exp"
-        || model == "pipe/deepseek-v4-flash-0731"
-        || model == "pipe/deepseek-v4-flash"
-        || model.starts_with("pipe/glm-5.3")
-        || model.starts_with("pipe/kimi-k3")
-        || model.starts_with("pipe/deepseek-v4")
-        || model.starts_with("pipe/qwen3.8")
+    matches!(
+        model,
+        "ipop/coder-balanced"
+            | "pipe/auto-coder"
+            | "pipe/deepseek-v4-flash-vision-exp"
+            | "pipe/deepseek-v4-flash-0731"
+            | "pipe/deepseek-v4-flash"
+    )
 }
 
 impl ServedModel {
@@ -653,11 +652,24 @@ pub trait Provider: Send + Sync {
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion>;
 
+    /// Capabilities that affect how the agent may advertise optional action
+    /// protocols. The default is deliberately conservative for third-party
+    /// providers and test doubles.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
+
     /// The models this endpoint actually serves (via its `/models` route), with
     /// any live metadata reported. Default: empty.
     async fn list_models(&self) -> Result<Vec<ServedModel>> {
         Ok(Vec::new())
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    pub native_tool_calls: bool,
+    pub streamed_tool_call_deltas: bool,
 }
 
 #[cfg(test)]
@@ -742,20 +754,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_pipenetwork_reasoning_models_are_coding_routes() {
-        for model in [
-            "pipe/glm-5.3",
-            "pipe/glm-5.3-flash",
-            "pipe/kimi-k3",
-            "pipe/deepseek-v4-pro",
-            "pipe/qwen3.8-max",
-        ] {
-            assert!(is_pipenetwork_coding_route(model), "{model}");
-        }
-        assert!(!is_pipenetwork_coding_route("pipe/gpt-5.5"));
-    }
-
-    #[test]
     fn parses_output_cap_limit_from_provider_error_text() {
         let err = ProviderError::new(
             ProviderErrorKind::RequestTooLarge,
@@ -824,6 +822,18 @@ mod tests {
         let err = anyhow::Error::new(err);
         assert!(provider_error_is_temporary_overload(&err));
         assert_eq!(provider_retry_after_seconds(&err), Some(0));
+    }
+
+    #[test]
+    fn pipe_serviceability_blip_is_temporary_capacity() {
+        let err = ProviderError::new(
+            ProviderErrorKind::ModelUnavailable,
+            "requested model is not currently serviceable",
+        );
+
+        let err = anyhow::Error::new(err);
+        assert!(provider_error_is_temporary_overload(&err));
+        assert!(provider_route_error_is_retryable(&err));
     }
 
     #[test]

@@ -18,11 +18,10 @@ use crate::heuristics::{
 use crate::steering::{
     BOOKKEEPING_REPOST_NUDGE, IMPLEMENTATION_NO_CHANGES_NUDGE, MUTATION_SAFE_CONTEXT_WINDOW,
     PLAN_REPOST_NUDGE, READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE,
-    REREAD_NUDGE, ReviewIntent, SKIPPED_BOOKKEEPING_REPOST_RESULT,
-    SKIPPED_COMPLETED_FILE_REREAD_RESULT, SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT,
-    bash_call_waits, bash_no_progress_signature, implementation_text_tool_nudge,
-    inspected_paths_for_prompt, inspection_round_cap_nudge, inspection_sprawl_exhausted,
-    inspection_sprawl_nudge, is_bare_codebase_review, is_bounded_file_review,
+    REREAD_NUDGE, SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_COMPLETED_FILE_REREAD_RESULT,
+    SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT, bash_call_waits,
+    bash_no_progress_signature, implementation_text_tool_nudge, inspected_paths_for_prompt,
+    inspection_round_cap_nudge, inspection_sprawl_exhausted, inspection_sprawl_nudge,
     should_nudge_inspection_sprawl, should_nudge_read_after_repeated_search,
 };
 use crate::transcript::NudgeKind;
@@ -35,7 +34,12 @@ use super::progress::{
     TOOL_LIMIT_WRAP_UP_NUDGE, forced_final_answer_is_unusable, no_progress_signature_for_calls,
 };
 
-const BOUNDED_REVIEW_FINAL_MAX_TOKENS: u32 = 768;
+/// `u32::MAX` is the public "unlimited" sentinel, not a finite cap that can be
+/// reached. Keeping that distinction here also prevents the cap's extra wrap-up
+/// request from overflowing the model-round counter at the sentinel boundary.
+fn model_step_cap_reached(steps: u32, max_steps: u32) -> bool {
+    max_steps != u32::MAX && steps >= max_steps
+}
 
 impl crate::Agent {
     /// Emit one assistant text chunk on the main task stream. `/btw` answers are
@@ -57,27 +61,24 @@ impl crate::Agent {
         let mut generic_completion_retries = *state.generic_completion_retries;
         let mut continue_total_nudges = *state.continue_total_nudges;
         let mut repeat_nudges = *state.repeat_nudges;
-        let mut repeat_sampling_rounds = *state.repeat_sampling_rounds;
         let mut force_tools_next = *state.force_tools_next;
         let mut text_tool_fallback_next = *state.text_tool_fallback_next;
         let mut force_text_answer_next = *state.force_text_answer_next;
-        let mut force_no_progress_final_answer_next = *state.force_no_progress_final_answer_next;
         let mut suppress_bookkeeping_tools_next = *state.suppress_bookkeeping_tools_next;
-        let mut prev_added_no_evidence = *state.prev_added_no_evidence;
         let made_tool_call = *state.made_tool_call;
+        let mut provider_exhausted = *state.provider_exhausted;
         let mut turn_start = *state.turn_start;
-        let mut stalled_repeating = *state.stalled_repeating;
-        let mut stalled_unfinished = *state.stalled_unfinished;
         let mut context_generation_seen = *state.context_generation_seen;
         let mut indexed_ledger_revision = *state.indexed_ledger_revision;
         let sched_tool_calls = *state.sched_tool_calls;
         let sched_max_concurrent = *state.sched_max_concurrent;
         let sched_serial_runs = *state.sched_serial_runs;
         let mut tool_schema_tokens = *state.tool_schema_tokens;
+        let mut program_fallback_next = *state.program_fallback_next;
+        let program_fallback_used = *state.program_fallback_used;
         let ended_at_cap = *state.ended_at_cap;
         let mut cap_wrap_up_requested = *state.cap_wrap_up_requested;
-        let mut review_wrap_up_requested = *state.review_wrap_up_requested;
-        let mut prev_call_sig = std::mem::take(state.prev_call_sig);
+        let mut cap_kind = *state.cap_kind;
         let deepseek_strict_fallback_active = *state.deepseek_strict_fallback_active;
         let mut retry_state = std::mem::take(state.retry_state);
         let mut request_max_tokens_override = std::mem::take(state.request_max_tokens_override);
@@ -85,10 +86,14 @@ impl crate::Agent {
         let mut effective_fallback_route = std::mem::take(state.effective_fallback_route);
         let mut ranked_context_paths = std::mem::take(state.ranked_context_paths);
         let mut progress_tracker = std::mem::take(state.progress_tracker);
+        let mut repeat_sampling_rounds = progress_tracker.repeat_sampling_rounds;
+        let mut force_no_progress_final_answer_next =
+            progress_tracker.force_no_progress_final_answer_next;
+        let mut prev_added_no_evidence = progress_tracker.prev_added_no_evidence;
+        let mut prev_call_sig = std::mem::take(&mut progress_tracker.prev_call_sig);
         let mut evidence = std::mem::take(state.evidence);
         let mut implementation_tracker = std::mem::take(state.implementation_tracker);
         let mut review_repair = std::mem::take(state.review_repair);
-        let tool_guardrail = std::mem::take(state.tool_guardrail);
         let last_verify_attributions = std::mem::take(state.last_verify_attributions);
         let tool_timeline = std::mem::take(state.tool_timeline);
         let mut advertised_tool_names = std::mem::take(state.advertised_tool_names);
@@ -108,10 +113,6 @@ impl crate::Agent {
         let _user_prompt_tokens = state.user_prompt_tokens;
         let inspection_sprawl_intent = state.inspection_sprawl_intent;
         let verifier = state.verifier;
-        let bounded_exact_review = matches!(read_only_intent, Some(ReviewIntent::Review))
-            && is_bounded_file_review(context_task, false);
-        let bare_codebase_review = matches!(read_only_intent, Some(ReviewIntent::Review))
-            && is_bare_codebase_review(context_task);
 
         let result = async {
         self.set_turn_phase(TurnPhase::Model);
@@ -120,8 +121,11 @@ impl crate::Agent {
         // with no final answer. The sticky flag makes the second hit terminal.
         let mut request_cap_wrap_up = false;
         let mut request_tool_cap_wrap_up = false;
-        let step_cap_reached = steps >= max_steps;
-        let tool_cap_reached = sched_tool_calls >= max_tool_calls;
+        let step_cap_reached = model_step_cap_reached(steps, max_steps);
+        let tool_cap_reached = self
+            .config
+            .loop_limits
+            .tool_call_cap_reached(sched_tool_calls);
         if step_cap_reached || tool_cap_reached {
             if cap_wrap_up_requested {
                 return Ok(ModelRoundControl::BreakInner(true));
@@ -129,6 +133,12 @@ impl crate::Agent {
             cap_wrap_up_requested = true;
             request_cap_wrap_up = true;
             request_tool_cap_wrap_up = tool_cap_reached && !step_cap_reached;
+            cap_kind = Some(match (step_cap_reached, tool_cap_reached) {
+                (true, true) => crate::domain::TurnCapKind::Both,
+                (true, false) => crate::domain::TurnCapKind::Step,
+                (false, true) => crate::domain::TurnCapKind::Tool,
+                (false, false) => unreachable!("cap branch requires a reached cap"),
+            });
             let (status, nudge) = if request_tool_cap_wrap_up {
                 (
                     format!(
@@ -152,43 +162,7 @@ impl crate::Agent {
             self.messages
                 .push_nudge_or_fold(NudgeKind::Continue, nudge);
         }
-        // A bounded exact-file review has already gathered the evidence it
-        // requested once any read/search succeeds. DeepSeek otherwise tends to
-        // interpret a truncated first pass as permission to page forever,
-        // even when the prompt explicitly asks for a best-effort answer. Make
-        // the next request text-only so the model summarizes the evidence it
-        // has. Bare repo-wide reviews get two model-directed inspection rounds
-        // before this guard; detailed reviews retain their normal loop.
-        if (bounded_exact_review || (bare_codebase_review && steps > 1))
-            && evidence.has_discovery()
-            && !request_cap_wrap_up
-            && !force_text_answer_next
-            && !review_wrap_up_requested
-        {
-            review_wrap_up_requested = true;
-            force_text_answer_next = true;
-            force_tools_next = false;
-            let current_max_tokens = request_max_tokens_override
-                .unwrap_or(self.config.routing.max_tokens);
-            // A small cap is useful for ordinary reviews, but it is unsafe for
-            // Pipe's reasoning models: hidden reasoning can consume all 768
-            // tokens and leave no visible answer. Give those routes one
-            // bounded, reasoning-safe final round. The retry remains bounded
-            // by the existing single forced-answer attempt and turn limits.
-            let final_max_tokens = if hi_ai::is_pipenetwork_coding_route(&self.config.routing.model)
-            {
-                current_max_tokens.max(hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS)
-            } else {
-                current_max_tokens.min(BOUNDED_REVIEW_FINAL_MAX_TOKENS)
-            };
-            request_max_tokens_override = Some(final_max_tokens);
-            ui.nudge(if bounded_exact_review {
-                "bounded exact-file review gathered first-pass evidence; requesting the final answer"
-            } else {
-                "bare codebase review completed its inspection pass; requesting the final answer"
-            });
-        }
-        steps += 1;
+        steps = steps.saturating_add(1);
 
         // Mid-turn input: `/btw` side questions are answered off-band (bounded
         // read-only tool loop, concurrent with this round). Remaining plain
@@ -301,7 +275,11 @@ impl crate::Agent {
         if request_text_answer || request_no_progress_final_answer {
             progress_tracker.record_forced_final_answer_attempt();
         }
-        force_no_progress_final_answer_next = false;
+        // Keep the no-progress final-answer request sticky until it produces a
+        // usable response. A provider may accept the request but return an
+        // empty/malformed stream; clearing the flag before that response made
+        // the retry tool-capable again and allowed the generic post-tool nudge
+        // to contradict the existing "stop using tools" instruction.
 
         // After a continue-nudge, force this round to call a tool rather
         // than narrate again or come back empty. Only when tools are
@@ -330,6 +308,16 @@ impl crate::Agent {
         let requested_request_max_tokens =
             request_max_tokens_override.unwrap_or(self.config.routing.max_tokens);
         let mut request_tools = self.request_tools_for(tool_availability_mode);
+        if program_fallback_next {
+            program_fallback_next = false;
+            request_tools = request_tools
+                .iter()
+                .filter(|tool| tool.name != "run_program")
+                .cloned()
+                .collect::<Vec<_>>()
+                .into();
+            ui.status("retrying with ordinary structured tools after run_program failure");
+        }
         if suppress_bookkeeping_tools_next {
             suppress_bookkeeping_tools_next = false;
             request_tools = super::model_request::apply_bookkeeping_suppress(request_tools, true);
@@ -339,8 +327,17 @@ impl crate::Agent {
             &mut advertised_tool_names,
             &mut tool_schema_tokens,
         );
+        // Destructive context recovery rebuilds the current turn from `input`.
+        // A forced-final instruction normally lives in a later synthetic user
+        // nudge, so rebuilding from the raw input alone silently loses the
+        // instruction even though the sticky ChatOnly flag survives. Carry the
+        // policy in the recovery seed as well; ordinary requests remain
+        // byte-for-byte unchanged.
+        let forced_final_recovery_input = request_no_progress_final_answer
+            .then(|| format!("{input}\n\n{NO_PROGRESS_FINAL_ANSWER_NUDGE}"));
+        let recovery_input = forced_final_recovery_input.as_deref().unwrap_or(input);
         let context_preflight = match self.ensure_request_fits_context(
-            input,
+            recovery_input,
             turn_start,
             requested_request_max_tokens,
             request_tool_schema_tokens,
@@ -354,6 +351,7 @@ impl crate::Agent {
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
                 self.report.last_compat_fallbacks = compat_fallbacks.clone();
+                let model_telemetry = self.report.last_turn_telemetry.clone();
                 self.report.last_turn_telemetry = build_turn_telemetry(
                     max_steps,
                     verifier.round(),
@@ -362,11 +360,27 @@ impl crate::Agent {
                     continue_total_nudges,
                     truncation_total_retries,
                     &progress_tracker,
-                    ended_at_cap,
-                    stalled_unfinished,
-                    stalled_repeating,
+                    ended_at_cap
+                        && matches!(
+                            cap_kind,
+                            Some(
+                                crate::domain::TurnCapKind::Step
+                                    | crate::domain::TurnCapKind::Both
+                            )
+                        ),
+                    ended_at_cap
+                        && matches!(
+                            cap_kind,
+                            Some(
+                                crate::domain::TurnCapKind::Tool
+                                    | crate::domain::TurnCapKind::Both
+                            )
+                        ),
                     &last_verify_attributions,
                     verifier.executions(),
+                    verifier.executions_dropped(),
+                    verifier.execution_count(),
+                    verifier.successful_test_stage(),
                     sched_tool_calls,
                     sched_max_concurrent,
                     sched_serial_runs,
@@ -375,6 +389,9 @@ impl crate::Agent {
                     &review_repair,
                     &self.prefix_stability,
                 );
+                self.report
+                    .last_turn_telemetry
+                    .inherit_model_diagnostics(model_telemetry);
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
@@ -458,8 +475,7 @@ impl crate::Agent {
 
         self.report
             .last_turn_telemetry
-            .requests
-            .push(crate::census_messages(self.messages.as_slice()));
+            .record_request_census(crate::census_messages(self.messages.as_slice()));
         self.report.last_turn_telemetry.model_requests = self
             .report
             .last_turn_telemetry
@@ -491,30 +507,47 @@ impl crate::Agent {
                     || requested_validation
                     || crate::task_contract::prompt_is_direct_question(context_task),
                 request_max_tokens,
+                request_no_progress_final_answer,
                 &mut retry_state,
                 &mut request_max_tokens_override,
                 &mut empty_retries,
                 &mut force_tools_next,
                 &mut text_tool_fallback_next,
                 made_tool_call,
+                implementation_tracker.mutation_seen || implementation_tracker.validation_seen,
+                &mut provider_exhausted,
                 &mut turn_start,
                 turn_ledger_revision,
                 &turn_snapshot,
-                input,
+                recovery_input,
                 max_steps,
                 verifier,
                 repeat_nudges,
                 &mut continue_total_nudges,
                 truncation_total_retries,
                 &mut progress_tracker,
-                ended_at_cap,
-                &mut stalled_unfinished,
-                &mut stalled_repeating,
+                ended_at_cap
+                    && matches!(
+                        cap_kind,
+                        Some(
+                            crate::domain::TurnCapKind::Step
+                                | crate::domain::TurnCapKind::Both
+                        )
+                    ),
+                ended_at_cap
+                    && matches!(
+                        cap_kind,
+                        Some(
+                            crate::domain::TurnCapKind::Tool
+                                | crate::domain::TurnCapKind::Both
+                        )
+                    ),
                 &last_verify_attributions,
                 sched_tool_calls,
                 sched_max_concurrent,
                 sched_serial_runs,
                 &tool_timeline,
+                state.speculation_registry,
                 &evidence,
                 &review_repair,
                 &mut compat_fallbacks,
@@ -581,21 +614,28 @@ impl crate::Agent {
         // produced and nudge it to continue from the cutoff, instead
         // of treating the truncation as a natural stop (which would
         // end the turn on a half-finished output and leave the model
-        // "picking up where it stalled" on the next prompt). Bounded
-        // by a *dedicated* truncation budget (separate from
-        // `empty_retries`) so a big task that legitimately hits the
-        // cap several times can still finish without the user typing
-        // "continue".
+        // "picking up where it stopped" on the next prompt). This uses a
+        // *dedicated* truncation policy (separate from `empty_retries`). The
+        // ordinary policy is unlimited because every truncated response is
+        // valid productive output; bounded integrations can still opt into a
+        // finite retry count.
         let truncated = matches!(
             completion.stop_reason.as_deref(),
             Some("length" | "max_tokens")
         );
-        if truncated && truncation_retries < self.config.loop_limits.max_truncation_retries {
-            truncation_retries += 1;
-            truncation_total_retries += 1;
+        if truncated
+            && self
+                .config
+                .loop_limits
+                .truncation_retry_available(truncation_retries)
+        {
+            truncation_retries = truncation_retries.saturating_add(1);
+            truncation_total_retries = truncation_total_retries.saturating_add(1);
             ui.nudge(&format!(
                 "⚠ the model hit the output token limit — continuing ({truncation_retries}/{})",
-                self.config.loop_limits.max_truncation_retries
+                crate::config::repair_limit_label(
+                    self.config.loop_limits.max_truncation_retries
+                )
             ));
             // Clean text-embedded tool-call JSON (local models) from the
             // truncated content before recording. Complete tool calls are
@@ -647,24 +687,23 @@ impl crate::Agent {
         // Truncation budget exhausted: the model kept hitting the output
         // token cap through the whole retry budget. Record the truncated
         // output (stripping partial tool calls, as above) and warn the
-        // user — the task may be incomplete. Don't silently end the turn
+        // user — the output may be partial. Don't silently end the turn
         // on a half-finished output without surfacing what happened.
         if truncated {
             self.clean_text_tool_calls_from_content(&mut completion.content);
             self.messages
                 .push_assistant_text_only(std::mem::take(&mut completion.content));
-            if self.keep_working_after_stall(
+            ui.status(
+                "⚠ output truncated — the model remained incomplete after the retry budget; stopping with the partial response",
+            );
+            if self.try_no_progress_recovery(
                 &mut progress_tracker,
                 &mut force_tools_next,
-                &mut stalled_unfinished,
-                &mut stalled_repeating,
                 Some(&mut continue_total_nudges),
                 ui,
             ) {
                 return Ok(ModelRoundControl::Continue);
             }
-            stalled_unfinished = true;
-            ui.status(&self.incomplete_turn_status("output_truncated"));
             return Ok(ModelRoundControl::BreakInner(false));
         }
         // A public RSI response is terminal, not a local planning round to nudge.
@@ -777,8 +816,8 @@ impl crate::Agent {
         // A plain-text tool fallback is useful only if the model actually
         // emits a parseable call. The old one-shot flag was cleared before the
         // response arrived, so a narrative answer ("Let me read the file")
-        // silently abandoned recovery and fell into the generic no-tool stall
-        // path. Keep the same fallback active for one bounded correction.
+        // silently abandoned recovery and fell into the generic no-tool path.
+        // Keep the same fallback active for one bounded correction.
         let text_fallback_narration = request_text_tool_fallback
             && calls.is_empty()
             && looks_like_unfinished_step(
@@ -839,7 +878,7 @@ impl crate::Agent {
         // completed/missing/pruned handles are caught below by the
         // stale-background no-new-evidence path. Bounded; past the
         // budget the turn ends with an honest "stuck repeating" notice
-        // rather than looping until `max_steps`.
+        // rather than looping indefinitely.
         let call_sig: Vec<(String, String)> = calls
             .iter()
             .map(|(_, name, args)| (name.clone(), args.clone()))
@@ -877,7 +916,7 @@ impl crate::Agent {
         // A→B→C→A→B→C — including grep/list cycles, not just re-reads —
         // that evade the exact-match check because each round differs
         // from the one right before it. On large workspaces such a cycle
-        // can otherwise loop until `max_steps` without ever re-issuing an
+        // can otherwise loop indefinitely without ever re-issuing an
         // identical round. `EvidenceTracker::round_adds_evidence` keys on
         // a stable per-inspection signature (read path/page, list path,
         // grep pattern/glob/path/context, stale background handle id), so
@@ -891,7 +930,7 @@ impl crate::Agent {
         // new evidence is allowed through (e.g. re-reading a file once a
         // broader search has surfaced something to re-examine). Extra pages
         // of a complete file are no-new-evidence; a later page of a still-
-        // truncated file counts (capped per path). Once the turn has made a successful
+        // truncated file counts without an arbitrary page limit. Once the turn has made a successful
         // mutation, this guard is advisory only: after the nudge budget
         // is spent, execute the inspection rather than hard-stalling a
         // long implementation harness in the middle of a later plan step.
@@ -948,8 +987,7 @@ impl crate::Agent {
             if repeat_budget_available {
                 repeat_nudges += 1;
                 repeat_sampling_rounds += 1;
-                stalled_repeating = true;
-                let stall_reason = if all_plan_reposts {
+                let no_progress_reason = if all_plan_reposts {
                     "unchanged plan repost"
                 } else if all_bookkeeping_reposts {
                     "repeated bookkeeping call"
@@ -962,19 +1000,20 @@ impl crate::Agent {
                 } else {
                     "skipped repeated calls"
                 };
-                // Never force a chat-only "final answer" after bookkeeping
-                // loops on a mutation turn. That path exists for inspection
-                // stalls where the model already has evidence to summarize;
-                // on an edit request it just ends the turn incomplete with
-                // zero file changes (live: "I started the fix but didn't
-                // land the edit"). Keep tools required and let the
-                // budget-exhausted branch hand off to implementation repair.
+                // Never force a chat-only "final answer" while a mutation
+                // turn still has no productive tool evidence. That path exists
+                // for inspection stalls where the model already has evidence
+                // to summarize; on an edit request it just ends the turn with
+                // zero file changes. Once work has landed, a bounded recap is
+                // valid again.
+                let mutation_evidence_seen = implementation_tracker.mutation_seen
+                    || implementation_tracker.validation_seen;
                 let force_final_after_nudge = progress_tracker.record_no_progress_nudge(
-                    stall_reason,
+                    no_progress_reason,
                     no_progress_signature_for_calls(&calls),
                 ) && !no_new_after_mutation
                     && implementation_intent.is_none()
-                    && !(expected_mutation && all_bookkeeping_reposts);
+                    && (!expected_mutation || mutation_evidence_seen);
                 let nudge = if all_bookkeeping_reposts {
                     if all_plan_reposts {
                         ui.nudge(&format!(
@@ -1102,69 +1141,58 @@ If the task is already complete, stop and give your final recap."
                 return Ok(ModelRoundControl::Continue);
             }
             if stale_background_handle_call {
-                if self.keep_working_after_stall(
+                if self.try_no_progress_recovery(
                     &mut progress_tracker,
                     &mut force_tools_next,
-                    &mut stalled_unfinished,
-                    &mut stalled_repeating,
                     Some(&mut continue_total_nudges),
                     ui,
                 ) {
                     prev_call_sig = None;
                     return Ok(ModelRoundControl::Continue);
                 }
-                ui.status(&self.incomplete_turn_status("stale_background_handle"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             if has_no_progress_bash {
-                if self.keep_working_after_stall(
+                if self.try_no_progress_recovery(
                     &mut progress_tracker,
                     &mut force_tools_next,
-                    &mut stalled_unfinished,
-                    &mut stalled_repeating,
                     Some(&mut continue_total_nudges),
                     ui,
                 ) {
                     prev_call_sig = None;
                     return Ok(ModelRoundControl::Continue);
                 }
-                stalled_unfinished = true;
                 progress_tracker.record(
                     ProgressKind::None,
                     "repeat_no_op_bash",
                     None,
                 );
                 ui.nudge("model repeated no-op shell commands");
-                ui.status(&self.incomplete_turn_status("repeat_no_op_bash"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             if read_only_intent.is_some() && evidence.saw_search && !evidence.saw_read {
-                if self.keep_working_after_stall(
+                if self.try_no_progress_recovery(
                     &mut progress_tracker,
                     &mut force_tools_next,
-                    &mut stalled_unfinished,
-                    &mut stalled_repeating,
                     Some(&mut continue_total_nudges),
                     ui,
                 ) {
                     prev_call_sig = None;
                     return Ok(ModelRoundControl::Continue);
                 }
-                stalled_unfinished = true;
                 progress_tracker.record(
                     ProgressKind::None,
                     "repeat_search_without_read",
                     None,
                 );
                 ui.nudge("review repeated the same search without reading files");
-                ui.status(&self.incomplete_turn_status("repeat_search_without_read"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             if let Some(intent) = read_only_intent
                 && (evidence.saw_read || evidence.saw_search)
             {
-                // One force-text attempt before stalling: if the model already
-                // inspected, prefer a chat answer over Incomplete.
+                // One force-text attempt before settling: if the model already
+                // inspected, prefer a chat answer over another tool round.
                 if !force_text_answer_next
                     && !request_text_answer
                     && !request_no_progress_final_answer
@@ -1172,7 +1200,6 @@ If the task is already complete, stop and give your final recap."
                     force_text_answer_next = true;
                     force_tools_next = false;
                     repeat_nudges = 0;
-                    stalled_repeating = false;
                     ui.nudge(
                         "review repeated the same command after inspection; forcing a bounded answer from inspected evidence",
                     );
@@ -1185,18 +1212,15 @@ If the task is already complete, stop and give your final recap."
                     );
                     return Ok(ModelRoundControl::Continue);
                 }
-                if self.keep_working_after_stall(
+                if self.try_no_progress_recovery(
                     &mut progress_tracker,
                     &mut force_tools_next,
-                    &mut stalled_unfinished,
-                    &mut stalled_repeating,
                     Some(&mut continue_total_nudges),
                     ui,
                 ) {
                     prev_call_sig = None;
                     return Ok(ModelRoundControl::Continue);
                 }
-                stalled_unfinished = true;
                 progress_tracker.record(
                     ProgressKind::None,
                     "repeat_after_inspection",
@@ -1204,7 +1228,6 @@ If the task is already complete, stop and give your final recap."
                 );
                 ui.nudge("review repeated the same command after inspection");
                 let _ = (intent, &evidence);
-                ui.status(&self.incomplete_turn_status("repeat_after_inspection"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             // Implementation / explicit-mutation turns that burned the
@@ -1215,18 +1238,18 @@ If the task is already complete, stop and give your final recap."
             //      record_decision) that never even inspected the tree
             // Case (2) used to fall through to the generic "kept
             // re-running the same command" stop because the old gate
-            // required saw_read/saw_search. That branded turns as
-            // `incomplete · stalled` after two plan re-posts even when
-            // the model still had the implementation repair budget —
-            // exactly the "I started that fix but didn't land the
-            // edit" stall. Bookkeeping is zero-progress meta-work, not
+            // required saw_read/saw_search. That ended turns after two plan
+            // re-posts even when the model still had the implementation repair
+            // budget — exactly the "I started that fix but didn't land the
+            // edit" failure mode. Bookkeeping is zero-progress meta-work, not
             // a dangerous inspection loop; hand it the same edit nudge.
-            let bookkeeping_only_stall = calls
+            let bookkeeping_only_no_progress = calls
                 .iter()
                 .all(|(_, name, _)| hi_tools::is_coordination(name));
             let implementation_needs_mutation = !implementation_tracker.mutation_seen
                 && (implementation_intent.is_some() || expected_mutation)
-                && ((evidence.saw_read || evidence.saw_search) || bookkeeping_only_stall);
+                && ((evidence.saw_read || evidence.saw_search)
+                    || bookkeeping_only_no_progress);
             if implementation_needs_mutation {
                 if implementation_tracker.no_change_nudges < 2 {
                     implementation_tracker.no_change_nudges += 1;
@@ -1235,17 +1258,13 @@ If the task is already complete, stop and give your final recap."
                     let use_text_fallback = implementation_tracker.no_change_nudges >= 2;
                     force_tools_next = !use_text_fallback;
                     text_tool_fallback_next = use_text_fallback;
-                    // Clear the sticky repeat stall: we are converting it
-                    // into an implementation-repair continue, not ending
-                    // the turn as stalled_repeating.
-                    stalled_repeating = false;
                     // Drop the sticky prev signature so the next real
                     // tool call isn't immediately compared against the
                     // bookkeeping-only round that just exhausted the
                     // repeat budget.
                     prev_call_sig = None;
                     prev_added_no_evidence = false;
-                    if bookkeeping_only_stall {
+                    if bookkeeping_only_no_progress {
                         // Keep bookkeeping withheld while we demand real
                         // work — otherwise the model just re-posts the
                         // plan again on the repair round.
@@ -1267,18 +1286,15 @@ If the task is already complete, stop and give your final recap."
                     return Ok(ModelRoundControl::Continue);
                 }
 
-                if self.keep_working_after_stall(
+                if self.try_no_progress_recovery(
                     &mut progress_tracker,
                     &mut force_tools_next,
-                    &mut stalled_unfinished,
-                    &mut stalled_repeating,
                     Some(&mut continue_total_nudges),
                     ui,
                 ) {
                     prev_call_sig = None;
                     return Ok(ModelRoundControl::Continue);
                 }
-                stalled_unfinished = true;
                 progress_tracker.record(
                     ProgressKind::None,
                     "implementation_no_mutation",
@@ -1287,30 +1303,24 @@ If the task is already complete, stop and give your final recap."
                 ui.nudge(
                     "implementation kept repeating without editing; no file changes were made",
                 );
-                ui.status(&self.incomplete_turn_status("implementation_no_mutation"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
-            if self.keep_working_after_stall(
+            if self.try_no_progress_recovery(
                 &mut progress_tracker,
                 &mut force_tools_next,
-                &mut stalled_unfinished,
-                &mut stalled_repeating,
                 Some(&mut continue_total_nudges),
                 ui,
             ) {
                 prev_call_sig = None;
                 return Ok(ModelRoundControl::Continue);
             }
-            ui.status(&self.incomplete_turn_status("repeat_same_command"));
-            stalled_repeating = true;
             return Ok(ModelRoundControl::BreakInner(false));
         }
         // A different set of calls (or none) this round — the model moved
-        // on, so clear any pending repeat-stall state. A wait-poll
+        // on. A wait-poll
         // round is not counted as the first wasted round of a cycle:
         // waiting on external state is progress-neutral, not evidence
         // of a loop.
-        stalled_repeating = false;
         repeat_sampling_rounds = 0;
         prev_call_sig = Some(call_sig);
         prev_added_no_evidence = no_new_evidence && !has_wait_poll_bash;
@@ -1320,7 +1330,7 @@ If the task is already complete, stop and give your final recap."
         // the repeat/cycle guard above never fires) without ever
         // producing findings. Once enough evidence has accumulated,
         // nudge the model to answer; if it keeps sprawling past the
-        // budget, stop incomplete rather than fabricate an answer. This is
+        // budget, settle without fabricating an answer. This is
         // the only guard that catches the "read 100 files, never
         // answer" failure mode — all review-quality guards fire only
         // on a final text answer, which never comes while the model
@@ -1371,10 +1381,8 @@ If the task is already complete, stop and give your final recap."
                 }
                 return Ok(ModelRoundControl::Continue);
             }
-            stalled_unfinished = true;
             progress_tracker.record(ProgressKind::None, "inspection_sprawl_exhausted", None);
             ui.nudge("review kept inspecting new files without producing findings");
-            ui.status(&self.incomplete_turn_status("inspection_sprawl_exhausted"));
             return Ok(ModelRoundControl::BreakInner(false));
         }
         if should_nudge_inspection_sprawl(
@@ -1456,20 +1464,6 @@ If the task is already complete, stop and give your final recap."
                 &assistant_text,
                 self.goals.plan_incomplete() && !background_status_answer,
             ) && !(background_status_answer && has_text);
-            if unusable
-                && !has_text
-                && !retry_state.empty_completion_headroom_retry_attempted
-                && hi_ai::is_pipenetwork_coding_route(&self.config.routing.model)
-                && request_max_tokens < hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS
-            {
-                retry_state.empty_completion_headroom_retry_attempted = true;
-                retry_state.record_recovery_attempt();
-                request_max_tokens_override = Some(hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS);
-                ui.status(
-                    "⚠ the reasoning model returned no visible final answer; retrying with more output headroom",
-                );
-                return Ok(ModelRoundControl::Continue);
-            }
             if has_text && (buffer_read_only_review_text || !streamed_assistant_text) {
                 let text_to_emit = if buffered_assistant_text.is_empty() {
                     assistant_text.as_str()
@@ -1482,37 +1476,35 @@ If the task is already complete, stop and give your final recap."
             if unusable {
                 // Weak-but-non-empty forced answers still count as a deliverable.
                 if has_text && !assistant_text.trim().is_empty() {
+                    force_no_progress_final_answer_next = false;
                     self.messages
                         .push_assistant(std::mem::take(&mut completion.content));
-                    stalled_repeating = false;
-                    stalled_unfinished = false;
                     progress_tracker.no_progress_streak = 0;
-                    progress_tracker.last_stall_reason.clear();
+                    progress_tracker.last_no_progress_reason.clear();
                     progress_tracker.record_final_answer();
                     ui.status("forced final answer was weak; accepting available text");
                     return Ok(ModelRoundControl::BreakInner(false));
                 }
-                if self.keep_working_after_stall(
-                    &mut progress_tracker,
-                    &mut force_tools_next,
-                    &mut stalled_unfinished,
-                    &mut stalled_repeating,
-                    Some(&mut continue_total_nudges),
-                    ui,
-                ) {
+                if empty_retries < self.config.loop_limits.max_empty_retries {
+                    empty_retries += 1;
+                    ui.nudge(&format!(
+                        "the forced final answer was empty; retrying tool-free ({empty_retries}/{})",
+                        self.config.loop_limits.max_empty_retries
+                    ));
                     return Ok(ModelRoundControl::Continue);
                 }
                 self.messages
                     .push_assistant_text_only(std::mem::take(&mut completion.content));
-                stalled_unfinished = true;
                 progress_tracker.record(
                     ProgressKind::None,
                     "forced_final_unusable",
                     None,
                 );
-                ui.status(&self.incomplete_turn_status("forced_final_unusable"));
-                return Ok(ModelRoundControl::BreakInner(false));
+                return Err(anyhow::anyhow!(
+                    "model returned no usable final answer after bounded recovery"
+                ));
             }
+            force_no_progress_final_answer_next = false;
             self.messages
                 .push_assistant(std::mem::take(&mut completion.content));
             progress_tracker.record_final_answer();
@@ -1526,18 +1518,6 @@ If the task is already complete, stop and give your final recap."
         // dead round isn't recorded, so each retry re-runs with the
         // original context.
         if calls.is_empty() && !has_text {
-            if !retry_state.empty_completion_headroom_retry_attempted
-                && hi_ai::is_pipenetwork_coding_route(&self.config.routing.model)
-                && request_max_tokens < hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS
-            {
-                retry_state.empty_completion_headroom_retry_attempted = true;
-                retry_state.record_recovery_attempt();
-                request_max_tokens_override = Some(hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS);
-                ui.status(
-                    "⚠ the reasoning model returned no visible answer; retrying with more output headroom",
-                );
-                return Ok(ModelRoundControl::Continue);
-            }
             if empty_retries < self.config.loop_limits.max_empty_retries {
                 empty_retries += 1;
                 if made_tool_call {
@@ -1552,22 +1532,40 @@ If the task is already complete, stop and give your final recap."
                 ));
                 return Ok(ModelRoundControl::Continue);
             }
-            if self.keep_working_after_stall(
-                &mut progress_tracker,
-                &mut force_tools_next,
-                &mut stalled_unfinished,
-                &mut stalled_repeating,
-                Some(&mut continue_total_nudges),
-                ui,
-            ) {
-                return Ok(ModelRoundControl::Continue);
+            // The provider can occasionally return accepted-but-empty streams
+            // after every requested tool has already succeeded (observed on the
+            // live Pipe route immediately after a write + final update_plan).
+            // A completed checklist plus concrete mutation/validation evidence
+            // is a stronger terminal signal than a missing prose recap. Preserve
+            // that productive outcome with an explicit deterministic message;
+            // do not turn finished work into an infrastructure failure merely
+            // because the optional summary channel exhausted its fault retries.
+            let completed_plan_with_tool_evidence = !self.goals.plan().is_empty()
+                && !self.goals.plan_incomplete()
+                && (implementation_tracker.mutation_seen
+                    || implementation_tracker.validation_seen);
+            if completed_plan_with_tool_evidence {
+                self.emit_assistant_text(
+                    ui,
+                    super::model_retry::COMPLETED_PLAN_EMPTY_RECAP_FALLBACK,
+                );
+                ui.assistant_end();
+                self.messages.push_assistant(vec![Content::Text(
+                    super::model_retry::COMPLETED_PLAN_EMPTY_RECAP_FALLBACK.into(),
+                )]);
+                progress_tracker.no_progress_streak = 0;
+                progress_tracker.last_no_progress_reason.clear();
+                progress_tracker.record_final_answer();
+                ui.status(
+                    "provider returned no final recap; closing from the completed plan and tool evidence",
+                );
+                return Ok(ModelRoundControl::BreakInner(false));
             }
-            ui.status("⚠ the model returned no response after retrying");
-            stalled_unfinished = true;
-            return Ok(ModelRoundControl::BreakInner(false));
+            ui.status("⚠ the model returned no response after retrying — ending this bounded turn");
+            return Err(anyhow::anyhow!("model returned no response after retrying"));
         }
         // Real output this round — clear the retry counter so the
-        // temperature bump is transient: a later, unrelated stall gets
+        // temperature bump is transient: a later, unrelated empty response gets
         // its own budget rather than inheriting this one's elevation.
         empty_retries = 0;
         retry_state.protocol_retries = 0;
@@ -1597,13 +1595,11 @@ If the task is already complete, stop and give your final recap."
                 &mut force_tools_next,
                 &mut force_text_answer_next,
                 &mut text_tool_fallback_next,
-                &mut stalled_repeating,
-                &mut stalled_unfinished,
                 &mut buffered_assistant_text,
                 buffer_read_only_review_text,
                 steps,
                 ui,
-            ) {
+            )? {
                 super::steer::RoundControl::Continue => return Ok(ModelRoundControl::Continue),
                 super::steer::RoundControl::BreakInner(hit) => return Ok(ModelRoundControl::BreakInner(hit)),
             }
@@ -1638,37 +1634,37 @@ If the task is already complete, stop and give your final recap."
         *state.generic_completion_retries = generic_completion_retries;
         *state.continue_total_nudges = continue_total_nudges;
         *state.repeat_nudges = repeat_nudges;
-        *state.repeat_sampling_rounds = repeat_sampling_rounds;
         *state.force_tools_next = force_tools_next;
         *state.text_tool_fallback_next = text_tool_fallback_next;
         *state.force_text_answer_next = force_text_answer_next;
-        *state.force_no_progress_final_answer_next = force_no_progress_final_answer_next;
         *state.suppress_bookkeeping_tools_next = suppress_bookkeeping_tools_next;
-        *state.prev_added_no_evidence = prev_added_no_evidence;
         *state.made_tool_call = made_tool_call;
+        *state.provider_exhausted = provider_exhausted;
         *state.turn_start = turn_start;
-        *state.stalled_repeating = stalled_repeating;
-        *state.stalled_unfinished = stalled_unfinished;
         *state.context_generation_seen = context_generation_seen;
         *state.indexed_ledger_revision = indexed_ledger_revision;
         *state.sched_tool_calls = sched_tool_calls;
         *state.sched_max_concurrent = sched_max_concurrent;
         *state.sched_serial_runs = sched_serial_runs;
         *state.tool_schema_tokens = tool_schema_tokens;
+        *state.program_fallback_next = program_fallback_next;
+        *state.program_fallback_used = program_fallback_used;
         *state.ended_at_cap = ended_at_cap;
         *state.cap_wrap_up_requested = cap_wrap_up_requested;
-        *state.review_wrap_up_requested = review_wrap_up_requested;
-        *state.prev_call_sig = prev_call_sig;
+        *state.cap_kind = cap_kind;
         *state.retry_state = retry_state;
         *state.request_max_tokens_override = request_max_tokens_override;
         *state.compat_fallbacks = compat_fallbacks;
         *state.effective_fallback_route = effective_fallback_route;
         *state.ranked_context_paths = ranked_context_paths;
+        progress_tracker.repeat_sampling_rounds = repeat_sampling_rounds;
+        progress_tracker.force_no_progress_final_answer_next = force_no_progress_final_answer_next;
+        progress_tracker.prev_added_no_evidence = prev_added_no_evidence;
+        progress_tracker.prev_call_sig = prev_call_sig;
         *state.progress_tracker = progress_tracker;
         *state.evidence = evidence;
         *state.implementation_tracker = implementation_tracker;
         *state.review_repair = review_repair;
-        *state.tool_guardrail = tool_guardrail;
         *state.last_verify_attributions = last_verify_attributions;
         *state.tool_timeline = tool_timeline;
         *state.advertised_tool_names = advertised_tool_names;
@@ -1683,6 +1679,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unlimited_step_sentinel_is_never_a_reached_finite_cap() {
+        assert!(!model_step_cap_reached(u32::MAX, u32::MAX));
+        assert!(!model_step_cap_reached(6, 7));
+        assert!(model_step_cap_reached(7, 7));
+        assert!(model_step_cap_reached(8, 7));
+    }
+
+    #[test]
     fn empty_completion_retry_disables_deepseek_thinking() {
         assert_eq!(deepseek_thinking_for_round(None, false, false, 0), None);
         assert_eq!(
@@ -1690,7 +1694,12 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            deepseek_thinking_for_round(Some(ReviewIntent::Review), true, false, 0),
+            deepseek_thinking_for_round(
+                Some(crate::steering::ReviewIntent::Review),
+                true,
+                false,
+                0
+            ),
             Some(true)
         );
     }

@@ -1,38 +1,38 @@
-//! Per-turn progress classification and no-progress stall tracking.
+//! Per-turn progress classification and no-progress tracking.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use hi_ai::Content;
 
 use crate::ProgressEvent;
 use crate::heuristics::{looks_like_unfinished_step, parse_text_tool_calls};
 use crate::steering::{
-    EvidenceTracker, ImplementationTracker, bash_no_progress_signature, classify_bash_command,
-    evidence_kind_for_tool, implementation_tool_call_validates,
+    EvidenceTracker, ImplementationTracker, ToolLoopGuardrail, bash_no_progress_signature,
+    classify_bash_command, evidence_kind_for_tool, implementation_tool_call_validates,
     implementation_tool_result_landed_mutation, implementation_tool_result_landed_substantive_edit,
     inspection_signature,
 };
 
-pub(super) const PROGRESS_EVENT_LIMIT: usize = 20;
+use super::retention::ProgressEventLog;
+
 pub(super) const NO_PROGRESS_FINAL_ANSWER_NUDGE_THRESHOLD: u32 = 2;
 pub(super) const NO_PROGRESS_FINAL_ANSWER_NUDGE: &str = "You have not made new progress after repeated tool-use nudges. Stop using tools now and give the best final answer from the evidence already in the conversation. If the task cannot be completed from that evidence, say exactly what is missing.";
 /// Sent when a turn reaches its configured step cap: one final tool-free round
 /// so the model reports where it left the work instead of the turn dying
-/// mid-flight with no answer. The uniform default cap or a deliberate override
-/// (`--max-steps`, `/config steps <n>`, or an internal subagent budget) can
-/// trigger it.
+/// mid-flight with no answer. Only a deliberate override (`--max-steps`,
+/// `/config steps <n>`, or an internal subagent budget) can trigger it.
 pub(super) const STEP_LIMIT_WRAP_UP_NUDGE: &str = "You have reached this turn's step limit. Stop using tools now. In a short final answer, report what you completed, what remains unfinished, and the exact state you are leaving the work in (files changed, checks not yet run). Do not claim the task is complete unless it actually is; the user can raise or remove the limit with /config steps.";
 pub(super) const TOOL_LIMIT_WRAP_UP_NUDGE: &str = "You have reached this turn's tool-call limit. Stop using tools now. In a short final answer, report what you completed, what remains unfinished, and the exact state you are leaving the work in (files changed, checks not yet run). Do not claim the task is complete unless it actually is; the user can raise the limit with --max-tool-calls.";
 /// Progress reason shared between the waiting-round recovery (Steer) and the
 /// final-answer acceptance paths: it marks the turn as blocked only on live
 /// background work, so a status answer is a valid terminal outcome.
 pub(super) const AWAITING_BACKGROUND_REASON: &str = "background process is still running";
-/// Consecutive waiting rounds (only polls/status probes of a still-running
-/// background process) tolerated before the turn is steered to end with a
-/// status report. Three rounds ≈ one launch check plus two follow-ups — enough
-/// to catch a fast finish without funding an open-ended babysitting loop.
+/// Consecutive waiting rounds tolerated before the turn is steered to end with
+/// a status report. This catches fast completions without allowing unbounded
+/// model-driven polling.
 pub(super) const WAITING_ROUND_BUDGET: u32 = 3;
 pub(super) const REPEATED_VALIDATION_DIAGNOSIS_NUDGE: &str = "The same deterministic validation failure survived another edit-and-test cycle. Stop applying variants of the previous patch. Re-read the failing code and trace the relevant state transition from the assertion backward; if an independent explore tool is available, use it for one focused root-cause diagnosis before editing again. Then make one bounded fix and rerun the narrowest failing validation.";
+const FAILED_VALIDATION_LIMIT: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProgressKind {
@@ -57,6 +57,7 @@ pub(super) struct ToolProgressLabel {
     pub(super) reason: String,
     pub(super) signature: Option<String>,
     validation_scope: Option<String>,
+    validation_selector: Option<String>,
     validation_failure: Option<String>,
 }
 
@@ -71,6 +72,7 @@ impl ToolProgressLabel {
             reason: reason.into(),
             signature,
             validation_scope: None,
+            validation_selector: None,
             validation_failure: None,
         }
     }
@@ -78,14 +80,15 @@ impl ToolProgressLabel {
     fn validation(
         kind: ProgressKind,
         reason: impl Into<String>,
-        scope: String,
+        coverage: ValidationCoverage,
         failure: Option<String>,
     ) -> Self {
         Self {
             kind,
             reason: reason.into(),
             signature: failure.clone(),
-            validation_scope: Some(scope),
+            validation_scope: Some(coverage.scope),
+            validation_selector: coverage.selector,
             validation_failure: failure,
         }
     }
@@ -93,6 +96,8 @@ impl ToolProgressLabel {
 
 #[derive(Clone, Debug)]
 struct ValidationFailureProgress {
+    scope: String,
+    selector: Option<String>,
     signature: String,
     repeats: u32,
     diagnosis_nudged: bool,
@@ -105,31 +110,39 @@ pub(super) struct ProgressTracker {
     pub(super) no_progress_nudges: u32,
     pub(super) forced_final_answer_attempts: u32,
     pub(super) last_progress_reason: String,
-    pub(super) last_stall_reason: String,
-    /// Consecutive tool rounds that only watched still-running background
-    /// work (see [`WAITING_ROUND_BUDGET`]). Reset by any non-waiting round.
+    pub(super) last_no_progress_reason: String,
+    /// Consecutive tool rounds that only watched still-running background work.
     pub(super) waiting_rounds: u32,
-    /// Sticky once the waiting budget is spent: the turn is blocked on live
-    /// background work, so plan-continue nudges are suppressed and a status
-    /// answer ends the turn. Cleared by a round that does real work.
+    /// Sticky once the waiting budget is spent, until a round does real work.
     pub(super) awaiting_background: bool,
-    /// Extra recoveries after a stall budget was spent (`max_keep_working`).
+    /// Extra recoveries after a no-progress budget was spent (`max_keep_working`).
     pub(super) keep_working_rounds: u32,
-    /// Signature of the stall that last consumed keep-working. A following
-    /// round with the same signature is not another recovery.
+    /// Signature of the no-progress event that last consumed keep-working.
     pub(super) keep_working_blocked_signature: Option<String>,
-    /// Whether any tool ran since the last keep-working recovery. The
-    /// blocked-signature guard only applies when this is true: a tool that
-    /// re-issues the stalled action is a real repeat, but two consecutive
-    /// text-only recap stalls share a stale tool signature without the model
-    /// re-issuing anything.
+    /// Whether a tool ran since the last keep-working recovery.
     pub(super) saw_tool_since_keep_working: bool,
-    /// Failed model-authored validation commands keyed by validator family.
-    /// Entries survive unrelated green validators so `cargo check` cannot
-    /// erase a still-failing `cargo test` repair trajectory.
+    /// Cross-round repeat-loop state lives here so the newer owned turn bag can
+    /// retain its construction shape while preserving the established guards.
+    pub(super) repeat_sampling_rounds: u32,
+    pub(super) force_no_progress_final_answer_next: bool,
+    pub(super) prev_added_no_evidence: bool,
+    pub(super) prev_call_sig: Option<Vec<(String, String)>>,
+    pub(super) tool_guardrail: ToolLoopGuardrail,
+    /// Failed model-authored validation commands keyed by validator family and
+    /// any narrowing selector. Entries survive unrelated or narrower green
+    /// validators so they cannot erase a still-failing broader trajectory.
     failed_validations: BTreeMap<String, ValidationFailureProgress>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    failed_validations_dropped: u64,
     pub(super) mutation_epoch: u32,
-    pub(super) events: Vec<ProgressEvent>,
+    /// Bounded diagnostic trail. Correctness-relevant plan-drive evidence is
+    /// pinned separately so middle compaction cannot turn productive work into
+    /// a false stall.
+    pub(super) events: ProgressEventLog,
+    plan_drive_progress_event: Option<ProgressEvent>,
+    /// Complete hashed read/search identities for cross-turn drive correctness.
+    /// Unlike the diagnostic event trail, this set is never head/tail compacted.
+    drive_evidence_hashes: HashSet<String>,
 }
 
 impl ProgressTracker {
@@ -139,15 +152,56 @@ impl ProgressTracker {
         reason: impl Into<String>,
         signature: Option<String>,
     ) {
-        self.events.push(ProgressEvent {
+        let event = ProgressEvent {
             kind: kind.as_str().to_string(),
             reason: reason.into(),
             signature,
-        });
-        if self.events.len() > PROGRESS_EVENT_LIMIT {
-            let excess = self.events.len() - PROGRESS_EVENT_LIMIT;
-            self.events.drain(0..excess);
+        };
+        if self.plan_drive_progress_event.is_none()
+            && crate::plan_drive::progress_event_counts_as_plan_drive(&event)
+        {
+            self.plan_drive_progress_event = Some(event.clone());
         }
+        if crate::plan_drive::progress_event_is_drive_evidence(&event)
+            && let Some(signature) = event.signature.as_deref()
+        {
+            self.drive_evidence_hashes
+                .insert(crate::plan_drive::hash_drive_evidence_signature(signature));
+        }
+        self.events.push(event);
+    }
+
+    /// Materialize the bounded trail for reports/settlement. If the one
+    /// correctness-relevant plan-drive event fell in the compacted middle,
+    /// reinsert that exact event and evict one non-prefix diagnostic instead.
+    pub(super) fn retained_events(&self) -> Vec<ProgressEvent> {
+        let mut events = self.events.to_vec();
+        let Some(pinned) = self.plan_drive_progress_event.as_ref() else {
+            return events;
+        };
+        if events.iter().any(|event| event == pinned) {
+            return events;
+        }
+        if events.len() >= super::retention::PROGRESS_EVENT_LIMIT {
+            events.remove(super::retention::PROGRESS_EVENT_HEAD);
+        }
+        events.insert(super::retention::PROGRESS_EVENT_HEAD, pinned.clone());
+        events
+    }
+
+    pub(super) fn retained_events_dropped(&self) -> u64 {
+        let retained = self.retained_events().len() as u64;
+        self.events.total().saturating_sub(retained)
+    }
+
+    pub(super) fn drive_evidence_hashes(&self) -> Vec<String> {
+        let mut hashes = self
+            .drive_evidence_hashes
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        hashes.sort_unstable();
+        hashes
     }
 
     pub(super) fn record(
@@ -164,7 +218,7 @@ impl ProgressTracker {
             }
             ProgressKind::None => {
                 self.no_progress_streak = self.no_progress_streak.saturating_add(1);
-                self.last_stall_reason = reason.clone();
+                self.last_no_progress_reason = reason.clone();
             }
         }
         self.push_event(kind, reason, signature);
@@ -192,11 +246,6 @@ impl ProgressTracker {
         reason: impl Into<String>,
         signature: Option<String>,
     ) -> bool {
-        // A signature here means the model issued a tool call this round (e.g.
-        // a repeat caught by the repeat guard before execution). The
-        // keep-working blocked-signature guard must treat that as a tool ran,
-        // so a re-issued stalled action is still blocked even though the
-        // repeat guard skipped `record_tool`.
         if signature.is_some() {
             self.saw_tool_since_keep_working = true;
         }
@@ -207,12 +256,6 @@ impl ProgressTracker {
     }
 
     pub(super) fn record_tool(&mut self, label: &ToolProgressLabel) {
-        // A tool ran this round, so the next keep-working guard can compare
-        // against this round's signature (the model may be re-issuing the
-        // stalled action). Without this flag, two consecutive text-only recap
-        // stalls would both compare against the last *tool* signature (which
-        // never changed between them) and the second recovery would be
-        // wrongly blocked.
         self.saw_tool_since_keep_working = true;
         self.push_event(label.kind, label.reason.clone(), label.signature.clone());
     }
@@ -248,12 +291,23 @@ impl ProgressTracker {
         }) {
             self.mutation_epoch = self.mutation_epoch.saturating_add(1);
         }
-        for scope in labels.iter().filter_map(|label| {
-            (label.reason == "successful validation after mutation")
-                .then(|| label.validation_scope.clone())
-                .flatten()
-        }) {
-            self.failed_validations.remove(&scope);
+        for label in labels
+            .iter()
+            .filter(|label| label.reason == "successful validation after mutation")
+        {
+            let Some(scope) = label.validation_scope.as_ref() else {
+                continue;
+            };
+            let selector = label.validation_selector.as_ref();
+            self.failed_validations.retain(|_, progress| {
+                progress.scope != *scope
+                    || selector.is_some_and(|selector| {
+                        progress
+                            .selector
+                            .as_ref()
+                            .is_none_or(|failed| failed != selector)
+                    })
+            });
         }
         for label in labels
             .iter()
@@ -265,7 +319,9 @@ impl ProgressTracker {
             ) else {
                 continue;
             };
-            match self.failed_validations.get_mut(scope) {
+            let selector = label.validation_selector.clone();
+            let key = validation_failure_key(scope, selector.as_deref());
+            match self.failed_validations.get_mut(&key) {
                 Some(progress) if progress.signature == *signature => {
                     if progress.mutation_epoch != self.mutation_epoch {
                         progress.repeats = progress.repeats.saturating_add(1);
@@ -274,6 +330,8 @@ impl ProgressTracker {
                 }
                 Some(progress) => {
                     *progress = ValidationFailureProgress {
+                        scope: scope.clone(),
+                        selector,
                         signature: signature.clone(),
                         repeats: 1,
                         diagnosis_nudged: false,
@@ -281,9 +339,18 @@ impl ProgressTracker {
                     };
                 }
                 None => {
+                    if self.failed_validations.len() >= FAILED_VALIDATION_LIMIT
+                        && let Some(evicted) = self.failed_validations.keys().next().cloned()
+                    {
+                        self.failed_validations.remove(&evicted);
+                        self.failed_validations_dropped =
+                            self.failed_validations_dropped.saturating_add(1);
+                    }
                     self.failed_validations.insert(
-                        scope.clone(),
+                        key,
                         ValidationFailureProgress {
+                            scope: scope.clone(),
+                            selector,
                             signature: signature.clone(),
                             repeats: 1,
                             diagnosis_nudged: false,
@@ -345,7 +412,7 @@ pub(super) fn forced_final_answer_is_unusable(text: &str, plan_incomplete: bool)
 pub(super) fn signature_seen(evidence: &EvidenceTracker, signature: &Option<String>) -> bool {
     signature
         .as_ref()
-        .is_some_and(|sig| evidence.seen_signatures.iter().any(|seen| seen == sig))
+        .is_some_and(|signature| evidence.has_seen_signature(signature))
 }
 
 pub(super) fn background_handle_terminal(name: &str, output: &str) -> bool {
@@ -364,9 +431,9 @@ pub(super) fn background_handle_terminal(name: &str, output: &str) -> bool {
     }
 }
 
-/// Coarse validator identity used only for cross-edit convergence. Options and
-/// test filters intentionally do not split a runner family, while combined
-/// commands keep every family so an unrelated green command cannot clear it.
+/// Coarse validator identity used only for cross-edit convergence. Combined
+/// commands keep every family so an unrelated green command cannot clear it;
+/// narrowing selectors are tracked separately from this family name.
 fn contains_command_phrase(command: &str, phrase: &str) -> bool {
     command.match_indices(phrase).any(|(start, matched)| {
         let before = command[..start].chars().next_back();
@@ -376,7 +443,177 @@ fn contains_command_phrase(command: &str, phrase: &str) -> bool {
     })
 }
 
-fn validation_scope(arguments: &str) -> Option<String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ValidationCoverage {
+    scope: String,
+    /// A normalized narrowing selector within `scope`. `None` means the
+    /// validator covered the whole family (for example plain `cargo test`).
+    selector: Option<String>,
+}
+
+fn validation_failure_key(scope: &str, selector: Option<&str>) -> String {
+    selector.map_or_else(
+        || scope.to_string(),
+        |selector| format!("{scope}\u{1e}{selector}"),
+    )
+}
+
+/// Return the parts of a `cargo test` invocation that narrow which tests are
+/// covered. Presentation/execution flags such as `--quiet`, `--release`, and
+/// `--nocapture` are deliberately ignored. The result is conservative:
+/// unknown flags count as selectors, because retaining a stale failure is
+/// safer than letting a narrow green command erase a broader red one.
+fn cargo_test_selector(command: &str) -> Option<String> {
+    let lower = command.to_ascii_lowercase();
+    let (start, matched) = lower.match_indices("cargo test").find(|(start, matched)| {
+        let before = lower[..*start].chars().next_back();
+        let after = lower[*start + matched.len()..].chars().next();
+        before.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+            && after.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+    })?;
+    let rest = &lower[start + matched.len()..];
+    let end = ["&&", "||", ";", "|", "\n"]
+        .into_iter()
+        .filter_map(|separator| rest.find(separator))
+        .min()
+        .unwrap_or(rest.len());
+    let words = rest[..end]
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character| matches!(character, '\'' | '"' | '(' | ')' | '[' | ']'))
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut selectors = Vec::new();
+    let mut index = 0;
+    let mut harness_args = false;
+    while index < words.len() {
+        let word = words[index];
+        if word == "--" {
+            harness_args = true;
+            index += 1;
+            continue;
+        }
+
+        if harness_args {
+            if matches!(word, "--nocapture" | "--show-output") {
+                index += 1;
+                continue;
+            }
+            if matches!(word, "--color" | "--format" | "--test-threads") {
+                index = (index + 2).min(words.len());
+                continue;
+            }
+            if word.starts_with("--color=")
+                || word.starts_with("--format=")
+                || word.starts_with("--test-threads=")
+            {
+                index += 1;
+                continue;
+            }
+            selectors.push(format!("harness:{word}"));
+            index += 1;
+            continue;
+        }
+
+        if matches!(
+            word,
+            "-p" | "--package"
+                | "--exclude"
+                | "--manifest-path"
+                | "--bin"
+                | "--example"
+                | "--test"
+                | "--bench"
+        ) {
+            let value = words.get(index + 1).copied().unwrap_or("<missing>");
+            selectors.push(format!("{word}={value}"));
+            index = (index + 2).min(words.len());
+            continue;
+        }
+        if matches!(
+            word,
+            "--lib" | "--bins" | "--examples" | "--tests" | "--benches" | "--doc"
+        ) || word.starts_with("-p") && word.len() > 2
+            || [
+                "--package=",
+                "--exclude=",
+                "--manifest-path=",
+                "--bin=",
+                "--example=",
+                "--test=",
+                "--bench=",
+            ]
+            .iter()
+            .any(|prefix| word.starts_with(prefix))
+        {
+            selectors.push(word.to_string());
+            index += 1;
+            continue;
+        }
+
+        if matches!(
+            word,
+            "--features"
+                | "--target"
+                | "--target-dir"
+                | "--jobs"
+                | "-j"
+                | "--profile"
+                | "--color"
+                | "--message-format"
+                | "--config"
+                | "-z"
+        ) {
+            index = (index + 2).min(words.len());
+            continue;
+        }
+        if matches!(
+            word,
+            "--quiet"
+                | "-q"
+                | "--verbose"
+                | "-v"
+                | "--workspace"
+                | "--all"
+                | "--all-targets"
+                | "--all-features"
+                | "--no-default-features"
+                | "--release"
+                | "--locked"
+                | "--offline"
+                | "--frozen"
+                | "--keep-going"
+                | "--no-run"
+                | "--future-incompat-report"
+        ) || word.starts_with("--features=")
+            || word.starts_with("--target=")
+            || word.starts_with("--target-dir=")
+            || word.starts_with("--jobs=")
+            || word.starts_with("-j") && word.len() > 2
+            || word.starts_with("--profile=")
+            || word.starts_with("--color=")
+            || word.starts_with("--message-format=")
+            || word.starts_with("--config=")
+            || word.starts_with("-z") && word.len() > 2
+        {
+            index += 1;
+            continue;
+        }
+
+        selectors.push(if word.starts_with('-') {
+            format!("flag:{word}")
+        } else {
+            format!("filter:{word}")
+        });
+        index += 1;
+    }
+
+    (!selectors.is_empty()).then(|| selectors.join(" "))
+}
+
+fn validation_coverage(arguments: &str) -> Option<ValidationCoverage> {
     let command = crate::steering::bash_command(arguments)?;
     let compact = command
         .to_ascii_lowercase()
@@ -417,14 +654,20 @@ fn validation_scope(arguments: &str) -> Option<String> {
             families.push(family);
         }
     }
-    if families.is_empty() {
-        Some(format!(
-            "command:{}",
-            hi_policy::normalize_command(&command)
-        ))
+    let scope = if families.is_empty() {
+        format!("command:{}", hi_policy::normalize_command(&command))
     } else {
-        Some(families.join("+"))
-    }
+        families.join("+")
+    };
+    let selector = (scope == "cargo:test")
+        .then(|| cargo_test_selector(&command))
+        .flatten();
+    Some(ValidationCoverage { scope, selector })
+}
+
+#[cfg(test)]
+fn validation_scope(arguments: &str) -> Option<String> {
+    validation_coverage(arguments).map(|coverage| coverage.scope)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -470,7 +713,7 @@ pub(super) fn classify_tool_progress(
     }
     if error {
         if implementation_tool_call_validates(name, arguments)
-            && let Some(scope) = validation_scope(arguments)
+            && let Some(coverage) = validation_coverage(arguments)
             && let Some(digest) = crate::verify_digest::digest_failure(workspace_root, output)
         {
             let signature = digest
@@ -481,7 +724,7 @@ pub(super) fn classify_tool_progress(
             return ToolProgressLabel::validation(
                 ProgressKind::Weak,
                 "validation command failed",
-                scope,
+                coverage,
                 Some(signature),
             );
         }
@@ -496,12 +739,12 @@ pub(super) fn classify_tool_progress(
     if tracker_before.mutation_seen
         && validation_succeeded
         && implementation_tool_call_validates(name, arguments)
-        && let Some(scope) = validation_scope(arguments)
+        && let Some(coverage) = validation_coverage(arguments)
     {
         return ToolProgressLabel::validation(
             ProgressKind::Meaningful,
             "successful validation after mutation",
-            scope,
+            coverage,
             None,
         );
     }
@@ -537,25 +780,43 @@ mod validation_progress_tests {
     }
 
     fn failed_validation(scope: &str, signature: &str) -> ToolProgressLabel {
+        failed_validation_with_selector(scope, None, signature)
+    }
+
+    fn failed_validation_with_selector(
+        scope: &str,
+        selector: Option<&str>,
+        signature: &str,
+    ) -> ToolProgressLabel {
         ToolProgressLabel::validation(
             ProgressKind::Weak,
             "validation command failed",
-            scope.to_string(),
+            ValidationCoverage {
+                scope: scope.to_string(),
+                selector: selector.map(str::to_string),
+            },
             Some(signature.to_string()),
         )
     }
 
     fn passed_validation(scope: &str) -> ToolProgressLabel {
+        passed_validation_with_selector(scope, None)
+    }
+
+    fn passed_validation_with_selector(scope: &str, selector: Option<&str>) -> ToolProgressLabel {
         ToolProgressLabel::validation(
             ProgressKind::Meaningful,
             "successful validation after mutation",
-            scope.to_string(),
+            ValidationCoverage {
+                scope: scope.to_string(),
+                selector: selector.map(str::to_string),
+            },
             None,
         )
     }
 
     #[test]
-    fn validation_scope_separates_check_from_test_and_ignores_test_filters() {
+    fn validation_scope_separates_check_from_test_and_tracks_test_filters() {
         assert_eq!(
             validation_scope(r#"{"command":"cargo test moves::checkmate_detected"}"#).as_deref(),
             Some("cargo:test")
@@ -563,6 +824,149 @@ mod validation_progress_tests {
         assert_eq!(
             validation_scope(r#"{"command":"cargo check --workspace"}"#).as_deref(),
             Some("cargo:check")
+        );
+        assert_eq!(
+            validation_coverage(r#"{"command":"cargo test --quiet moves::checkmate_detected"}"#)
+                .and_then(|coverage| coverage.selector)
+                .as_deref(),
+            Some("filter:moves::checkmate_detected")
+        );
+        assert_eq!(
+            validation_coverage(r#"{"command":"cargo test --workspace --quiet"}"#)
+                .and_then(|coverage| coverage.selector),
+            None
+        );
+    }
+
+    #[test]
+    fn plan_drive_progress_is_pinned_across_bounded_middle_compaction() {
+        let mut tracker = ProgressTracker::default();
+        for index in 0..400 {
+            let (kind, reason) = if index == 100 {
+                (ProgressKind::Meaningful, "substantive edit".to_string())
+            } else {
+                (ProgressKind::None, format!("no-progress event {index}"))
+            };
+            tracker.record(kind, reason, Some(format!("event-{index:03}")));
+        }
+
+        let retained = tracker.retained_events();
+        assert_eq!(
+            retained.len(),
+            super::super::retention::PROGRESS_EVENT_LIMIT
+        );
+        assert_eq!(tracker.retained_events_dropped(), 144);
+        assert_eq!(retained[31].signature.as_deref(), Some("event-031"));
+        assert_eq!(retained[32].signature.as_deref(), Some("event-100"));
+        assert_eq!(retained[33].signature.as_deref(), Some("event-177"));
+        assert_eq!(
+            retained.last().unwrap().signature.as_deref(),
+            Some("event-399")
+        );
+        assert!(crate::plan_drive_made_progress(
+            Some("same step"),
+            Some("same step"),
+            &retained,
+            &[] as &[String],
+        ));
+    }
+
+    #[test]
+    fn drive_evidence_hashes_are_complete_when_diagnostics_compact() {
+        let mut tracker = ProgressTracker::default();
+        for index in 0..400 {
+            tracker.record(
+                ProgressKind::Meaningful,
+                "new file evidence",
+                Some(format!("read:file-{index}:1:default")),
+            );
+        }
+
+        assert_eq!(
+            tracker.retained_events().len(),
+            super::super::retention::PROGRESS_EVENT_LIMIT
+        );
+        assert_eq!(tracker.drive_evidence_hashes().len(), 400);
+    }
+
+    #[test]
+    fn targeted_validation_pass_does_not_clear_full_suite_failure() {
+        let mut tracker = ProgressTracker::default();
+        tracker.record_round_from_tools(&[failed_validation("cargo:test", "full-suite-red")]);
+
+        tracker.record_round_from_tools(&[passed_validation_with_selector(
+            "cargo:test",
+            Some("filter:round_trip"),
+        )]);
+
+        assert!(tracker.failed_validations.contains_key("cargo:test"));
+    }
+
+    #[test]
+    fn full_suite_pass_clears_targeted_validation_failures() {
+        let mut tracker = ProgressTracker::default();
+        tracker.record_round_from_tools(&[
+            failed_validation_with_selector("cargo:test", Some("filter:first_case"), "first-red"),
+            failed_validation_with_selector("cargo:test", Some("filter:second_case"), "second-red"),
+        ]);
+
+        tracker.record_round_from_tools(&[passed_validation("cargo:test")]);
+
+        assert!(tracker.failed_validations.is_empty());
+    }
+
+    #[test]
+    fn distinct_failed_validation_selectors_have_bounded_repair_memory() {
+        let mut tracker = ProgressTracker::default();
+        for index in 0..300 {
+            tracker.record_round_from_tools(&[failed_validation_with_selector(
+                "cargo:test",
+                Some(&format!("filter:test-{index}")),
+                &format!("failure-{index}"),
+            )]);
+        }
+
+        assert_eq!(tracker.failed_validations.len(), FAILED_VALIDATION_LIMIT);
+        assert_eq!(tracker.failed_validations_dropped, 44);
+        assert!(
+            tracker
+                .failed_validations
+                .contains_key(&validation_failure_key(
+                    "cargo:test",
+                    Some("filter:test-299")
+                )),
+            "new validation evidence must still be tracked after diagnostic eviction"
+        );
+    }
+
+    #[test]
+    fn matching_targeted_pass_clears_only_matching_targeted_failure() {
+        let mut tracker = ProgressTracker::default();
+        tracker.record_round_from_tools(&[
+            failed_validation_with_selector("cargo:test", Some("filter:first_case"), "first-red"),
+            failed_validation_with_selector("cargo:test", Some("filter:second_case"), "second-red"),
+        ]);
+
+        tracker.record_round_from_tools(&[passed_validation_with_selector(
+            "cargo:test",
+            Some("filter:first_case"),
+        )]);
+
+        assert!(
+            !tracker
+                .failed_validations
+                .contains_key(&validation_failure_key(
+                    "cargo:test",
+                    Some("filter:first_case")
+                ))
+        );
+        assert!(
+            tracker
+                .failed_validations
+                .contains_key(&validation_failure_key(
+                    "cargo:test",
+                    Some("filter:second_case")
+                ))
         );
     }
 

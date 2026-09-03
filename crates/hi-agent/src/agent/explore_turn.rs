@@ -1,6 +1,6 @@
-//! Read-only `explore` subagent: delegate a bounded investigation to a child
+//! Read-only `explore` subagent: delegate an investigation to a child
 //! agent that shares the parent's provider (via `Arc`) but runs with read-only
-//! tools, its own fresh context, and a small step budget, then returns a concise
+//! tools and its own fresh context, then returns a concise
 //! answer to the parent.
 //!
 //! Depth is capped at 1: the child is built with `explore_subagents = false`, and
@@ -31,10 +31,10 @@ pub(crate) fn explore_tool_outcome(
     }
 }
 
-/// Cap on `explore` subagents per turn, to bound cost if the model
-/// over-delegates within one task. Refilled every turn ([`crate::domain::SubagentSessionState::begin_turn`])
-/// so long sessions never starve of exploration.
-pub(crate) const MAX_EXPLORE_SUBAGENTS_PER_TURN: u32 = 8;
+/// Sentinel used when ordinary `explore` work has no per-turn count ceiling.
+/// Parallel fan-out remains independently bounded so unlimited sequential work
+/// cannot create an unbounded concurrent wave.
+pub(crate) const MAX_EXPLORE_SUBAGENTS_PER_TURN: u32 = u32::MAX;
 
 /// Per-round tool fan-out for one child explore turn. Children carry no step
 /// ceiling: like the parent loop, they end via the repeat/no-progress/stall
@@ -44,8 +44,7 @@ pub(crate) const MAX_EXPLORE_SUBAGENTS_PER_TURN: u32 = 8;
 const EXPLORE_MAX_PARALLEL_TOOLS: usize = 4;
 
 /// Maximum number of explore subagents to run concurrently within a single
-/// tool batch. The turn budget is eight, so one batch can consume the whole
-/// budget without waiting for a second wave.
+/// tool batch.
 pub(crate) const MAX_PARALLEL_EXPLORES: usize = 8;
 
 /// A prepared-but-not-yet-running explore subagent job. Extracted from the
@@ -67,9 +66,9 @@ pub(crate) struct ExploreResult {
     pub(crate) usage: hi_ai::Usage,
 }
 impl crate::Agent {
-    /// Prepare an explore subagent job: check budget, build the child config,
-    /// and extract the provider. Returns `None` if the budget is exhausted or
-    /// the task is empty. The returned job owns everything it needs to run
+    /// Prepare an explore subagent job: reserve accounting, build the child config,
+    /// and extract the provider. Returns `None` if the task is empty or a slot
+    /// cannot be reserved. The returned job owns everything it needs to run
     /// concurrently with other explore jobs.
     pub(crate) fn prepare_explore(&mut self, arguments: &str) -> Option<ExploreJob> {
         let task = serde_json::from_str::<Value>(arguments)
@@ -83,18 +82,10 @@ impl crate::Agent {
             .subagents
             .try_begin_explore(MAX_EXPLORE_SUBAGENTS_PER_TURN)?;
         let child_model = self.effective_explore_child_model();
-        let child_project_context = self
-            .config
-            .memory
-            .project_context
-            .as_deref()
-            .map(|context| {
-                const MAX_CHILD_CONTEXT_CHARS: usize = 4_000;
-                context
-                    .chars()
-                    .take(MAX_CHILD_CONTEXT_CHARS)
-                    .collect::<String>()
-            });
+        // Requirements in project context are part of the delegated assignment.
+        // Preserve them intact and let the child's normal context fitting decide
+        // how to compact the complete request if the model window requires it.
+        let child_project_context = self.config.memory.project_context.clone();
         let child_config = AgentConfig {
             paths: crate::AgentPaths {
                 workspace_root: self.runtime.root().to_path_buf(),
@@ -139,6 +130,7 @@ impl crate::Agent {
                 project_context: child_project_context,
                 finalize: false,
                 curate_skills: false,
+                learning: self.config.memory.learning,
                 suggest_next_prompt: false,
                 ..crate::AgentMemory::default()
             },
@@ -237,10 +229,7 @@ impl crate::Agent {
         }
         let Some(job) = self.prepare_explore(arguments) else {
             return explore_tool_outcome(
-                format!(
-                    "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_TURN} subagents this \
-                     turn); investigate directly for the rest of this turn."
-                ),
+                "explore unavailable: could not prepare the requested subagent; investigate directly.",
                 hi_tools::ToolStatus::Denied,
             );
         };
@@ -316,9 +305,7 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
                     crate::TurnStatus::Completed => hi_tools::ToolStatus::Succeeded,
                     crate::TurnStatus::Blocked => hi_tools::ToolStatus::Denied,
                     crate::TurnStatus::Cancelled => hi_tools::ToolStatus::Cancelled,
-                    crate::TurnStatus::Incomplete | crate::TurnStatus::Failed => {
-                        hi_tools::ToolStatus::Failed
-                    }
+                    crate::TurnStatus::Failed => hi_tools::ToolStatus::Failed,
                 };
                 let answer = answer.unwrap_or_else(|| {
                     status = hi_tools::ToolStatus::Failed;
@@ -346,26 +333,17 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
     }
 }
 
-const MAX_EXPLORE_TASK_CHARS: usize = 2_000;
-
 fn explore_child_prompt(task: &str) -> String {
     // Deliberately plain phrasing: the child's read-only restriction and
     // inspection-sprawl cap come from its task contract and capability scope,
-    // not legacy review-intent prompt shaping.
-    let task = clip_chars(task.trim(), MAX_EXPLORE_TASK_CHARS);
+    // not legacy review-intent prompt shaping. Do not clip the assignment here:
+    // normal child context management owns any fit/compaction decision.
+    let task = task.trim();
     format!(
         "Answer this question about the codebase. Read and search the relevant files as needed, then \
          reply with a concise, self-contained answer that cites the specific files and locations \
          supporting it.\n\nQuestion: {task}"
     )
-}
-
-fn clip_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
-    format!("{clipped}…")
 }
 
 /// The model explore children run: `HI_EXPLORE_MODEL` env (highest, a live
@@ -407,14 +385,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explore_child_prompt_clips_a_huge_task() {
-        let prompt = explore_child_prompt(&"TASK ".repeat(2_000));
-        assert!(
-            prompt.chars().count() < MAX_EXPLORE_TASK_CHARS + 400,
-            "{}",
-            prompt.chars().count()
-        );
-        assert!(!prompt.contains(&"TASK ".repeat(500)), "{prompt}");
+    fn explore_child_prompt_preserves_requirements_past_the_old_boundary() {
+        let task = format!("{}FINAL REQUIREMENT", "TASK ".repeat(500));
+        let prompt = explore_child_prompt(&task);
+        assert!(prompt.contains(&task));
+        assert!(prompt.ends_with("FINAL REQUIREMENT"));
     }
 
     #[test]

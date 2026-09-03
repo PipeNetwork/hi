@@ -25,6 +25,7 @@ fn expected_side_effect_class(meta: &ToolMetadata) -> &'static str {
         }
         ToolCapability::Memory => "workspace_read",
         ToolCapability::Skill => "none",
+        ToolCapability::Structure => "none",
         ToolCapability::Web => {
             // web_download mutates via filesystem_mutating; search/fetch
             // and inject-gated browser_exec are network (page effects).
@@ -56,6 +57,12 @@ fn read_only_tools_are_classified() {
     assert!(!is_read_only("bash"));
     assert!(!is_read_only("bash_kill"));
     assert!(!is_read_only("browser_exec"));
+    assert_eq!(speculation_class("read"), SpeculationClass::PureLocal);
+    assert_eq!(
+        speculation_class("web_search"),
+        SpeculationClass::IdempotentExternal
+    );
+    assert_eq!(speculation_class("write"), SpeculationClass::Never);
 }
 #[test]
 fn filesystem_mutating_tools_are_classified() {
@@ -100,6 +107,7 @@ fn metadata_catalog_covers_every_schema_once() {
     assert!(is_known_tool("research"));
     assert!(is_known_tool("research_read"));
     assert!(is_known_tool("browser_exec"));
+    assert!(is_known_tool("run_program"));
     assert!(!is_known_tool("hallucinated_tool"));
 }
 
@@ -471,6 +479,7 @@ fn capability_matrix_known_tool_side_effects() {
         ("memory_update", "workspace_write"),
         ("memory_forget", "workspace_write"),
         ("skill", "none"),
+        ("run_program", "none"),
         ("browser_exec", "network"),
     ];
     for (name, want) in pins {

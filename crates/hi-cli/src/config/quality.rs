@@ -6,6 +6,10 @@ use super::*;
 pub struct QualitySettings {
     pub verification: VerificationMode,
     pub max_verify_repairs: u32,
+    /// Whether the repair budget came from CLI/project configuration rather
+    /// than the ordinary unlimited default. Managed workers use this to inherit
+    /// their signed finite budget without weakening an explicit local request.
+    pub max_verify_repairs_explicit: bool,
     pub review: ReviewPolicy,
     pub clippy: bool,
     pub lsp_mode: LspMode,
@@ -131,12 +135,18 @@ pub fn resolve_quality(cli: &Cli, root: &Path) -> Result<QualitySettings> {
         }
     }
 
+    let configured_max_verify_repairs = cli.max_verify_repairs.or(quality.max_verify_repairs);
+    if configured_max_verify_repairs == Some(hi_agent::UNLIMITED_REPAIR_CYCLES) {
+        bail!(
+            "[quality].max_verify_repairs must be at most {}; omit it for unlimited repairs",
+            hi_agent::UNLIMITED_REPAIR_CYCLES - 1
+        );
+    }
     Ok(QualitySettings {
         verification,
-        max_verify_repairs: cli
-            .max_verify_repairs
-            .or(quality.max_verify_repairs)
-            .unwrap_or(2),
+        max_verify_repairs: configured_max_verify_repairs
+            .unwrap_or(hi_agent::UNLIMITED_REPAIR_CYCLES),
+        max_verify_repairs_explicit: configured_max_verify_repairs.is_some(),
         review: cli
             .review
             .map(ReviewPolicy::from)

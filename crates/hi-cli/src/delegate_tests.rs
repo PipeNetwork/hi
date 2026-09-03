@@ -15,6 +15,142 @@ use crate::candidate_merge::{
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn delegate_child_budget_precedes_outer_kill_and_preserves_explicit_cap() {
+    let uncapped = crate::delegate::delegate_child_budget_arguments(None, None, None)
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        uncapped.is_empty(),
+        "ordinary delegates must inherit no model, tool, or time ceiling"
+    );
+
+    let capped = crate::delegate::delegate_child_budget_arguments(Some(7), Some(13), Some(120))
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        capped,
+        [
+            "--turn-deadline",
+            "60",
+            "--max-steps",
+            "7",
+            "--max-tool-calls",
+            "13"
+        ]
+    );
+
+    assert_eq!(
+        crate::delegate::delegate_timeout_secs_from_value(Some("120")),
+        Some(120),
+        "ordinary configured delegate timeouts must remain exact"
+    );
+    assert_eq!(
+        crate::delegate::delegate_timeout_secs_from_value(Some("0")),
+        None,
+        "zero explicitly disables the delegate timeout"
+    );
+    assert_eq!(
+        crate::delegate::delegate_timeout_secs_from_value(None),
+        None
+    );
+    assert_eq!(
+        crate::delegate::delegate_timeout_secs_from_value(Some("invalid")),
+        None
+    );
+    assert_eq!(
+        crate::delegate::delegate_timeout_secs_from_value(Some("1")),
+        Some(1)
+    );
+
+    let short = crate::delegate::delegate_child_budget_arguments(None, None, Some(1))
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(short.is_empty());
+
+    let managed_zero = crate::delegate::delegate_child_budget_arguments(None, Some(0), None)
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(managed_zero, ["--max-tool-calls", "0"]);
+}
+
+#[test]
+fn delegate_capacity_wait_is_unlimited_by_default_and_explicit_when_requested() {
+    assert_eq!(
+        crate::delegate::delegate_queue_timeout_secs_from_value(None),
+        None
+    );
+    assert_eq!(
+        crate::delegate::delegate_queue_timeout_secs_from_value(Some("0")),
+        None
+    );
+    assert_eq!(
+        crate::delegate::delegate_queue_timeout_secs_from_value(Some("invalid")),
+        None
+    );
+    assert_eq!(
+        crate::delegate::delegate_queue_timeout_secs_from_value(Some("3")),
+        Some(3)
+    );
+    assert!(
+        !crate::delegate::queue_wait_timed_out(Duration::from_secs(100_000), None),
+        "an ordinary capacity wait must not acquire a hidden wall-clock deadline"
+    );
+    assert!(crate::delegate::queue_wait_timed_out(
+        Duration::from_millis(1),
+        Some(Duration::from_millis(1))
+    ));
+}
+
+#[test]
+fn delegate_runner_runtime_step_limit_can_be_cleared_and_reinstalled() {
+    let root = temp_path("dynamic-step-limit");
+    let workspace = root.join("workspace");
+    let state = root.join("state");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let runner = crate::delegate::CliDelegateRunner::new(
+        PathBuf::from("hi"),
+        "openai".into(),
+        "test-model".into(),
+        "http://127.0.0.1:1/v1".into(),
+        "test-key".into(),
+        None,
+        Some(7),
+        Some(13),
+        0,
+        workspace,
+        state,
+    )
+    .unwrap();
+    assert_eq!(runner.configured_max_steps(), Some(7));
+    assert_eq!(runner.configured_max_tool_calls(), Some(13));
+
+    hi_agent::DelegateRunner::set_max_steps(&runner, None);
+    assert_eq!(runner.configured_max_steps(), None);
+    hi_agent::DelegateRunner::set_max_steps(&runner, Some(9));
+    assert_eq!(runner.configured_max_steps(), Some(9));
+    assert_eq!(
+        runner.configured_max_tool_calls(),
+        Some(13),
+        "changing the model-round cap must preserve the tool-call cap"
+    );
+
+    hi_agent::DelegateRunner::set_max_tool_calls(&runner, None);
+    assert_eq!(runner.configured_max_tool_calls(), None);
+    hi_agent::DelegateRunner::set_max_tool_calls(&runner, Some(0));
+    assert_eq!(
+        runner.configured_max_tool_calls(),
+        Some(0),
+        "a managed zero-tool budget must not collide with unlimited"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn report_json(verification: &str, review: &str) -> Value {
     serde_json::json!({
         "schema_version": 2,
@@ -434,6 +570,7 @@ fn delegate_route_overrides_switch_the_child_to_the_openai_compat_route() {
         "cloud-key".into(),
         Some("true".into()),
         None,
+        None,
         1,
         workspace,
         state,
@@ -513,6 +650,7 @@ fn missing_verify_pipeline_derives_a_build_gate_for_known_project_types() {
         "k".into(),
         None,
         None,
+        None,
         1,
         rust_ws.clone(),
         state.clone(),
@@ -529,6 +667,7 @@ fn missing_verify_pipeline_derives_a_build_gate_for_known_project_types() {
         "https://api.pipenetwork.ai/v1".into(),
         "k".into(),
         Some("true".into()),
+        None,
         None,
         1,
         rust_ws,

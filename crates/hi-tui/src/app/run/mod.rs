@@ -86,6 +86,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         event_sink,
         approval_store,
         fleet_launcher,
+        tui_event_trace,
         remote_event_tap,
         remote_flush_callback,
         sync_config,
@@ -142,6 +143,11 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         race_defaults,
         race_setup_saver,
     );
+    // Install lifecycle tracing before startup restoration can enqueue a plan
+    // or goal drive.  Those prompts are real queue members just like input
+    // accepted after first paint, so their enqueue must precede the matching
+    // dequeue in the diagnostic stream.
+    app.tui_event_trace = tui_event_trace.clone();
     app.session_remember = session_remember;
     app.x402_broker = x402_broker;
     app.event_sink = event_sink.clone();
@@ -205,6 +211,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     app.session_renamer = session_renamer;
     app.session_host = session_host;
     app.sync_control = sync_control;
+    let remote_event_tap =
+        crate::tui_event_trace::compose_remote_event_tap(remote_event_tap, tui_event_trace.clone());
     app.base_event_tap = remote_event_tap.clone();
     app.remote_event_tap = remote_event_tap;
     app.remote_flush_callback = remote_flush_callback;
@@ -241,7 +249,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     // Load the on-disk /models cache so model metadata (window/price)
     // applies instantly at startup, without blocking on the network. The live
     // fetch still runs in the background and refreshes this; the cache just
-    // covers the cold-start gap so the UI never looks stalled.
+    // covers the cold-start gap so the UI never looks idle.
     let models_cache_key = hi_ai::cache_key(&provider, &base_url);
     if let Some(cached) = hi_ai::load_cache(&models_cache_key).await {
         app.model_ids = cached.iter().map(|m| m.id.clone()).collect();
@@ -353,9 +361,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     if std::env::var_os("HI_STARTUP_TRACE").is_some() {
         eprintln!("[startup-tui] interactive (first frame ready)");
     }
+    terminal.draw(|frame| app.render(frame))?;
+    let first_frame = terminal.size()?;
+    app.trace_ready(first_frame.width, first_frame.height)?;
     // Startup metadata fetch: race the live `/models` fetch against the first
     // keystroke, with a spinner ticking and the screen redrawing each tick so
-    // the UI never looks stalled. The on-disk cache already applied instantly
+    // the UI never looks idle. The on-disk cache already applied instantly
     // above; this just refreshes it. The fetch future is pinned locally (not
     // spawned — `Agent` isn't `Send`) and dropped before the main loop so its
     // borrow of `agent` doesn't block mutable uses during turns. A first input
@@ -394,10 +405,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     let mut hf_state = hi_tools::HfCommandState::default();
 
     'session: loop {
+        app.check_tui_event_trace()?;
         // Run a queued command first (typed while the previous turn ran);
         // otherwise edit the input line until the user submits.
+        let mut line_was_queued = false;
         let line = match app.queue.pop_front() {
             Some(queued) => {
+                line_was_queued = true;
+                app.trace_prompt_dequeued(&queued)?;
                 // Hosted-steer mode: forward to the remote host over ipop.
                 if app.maybe_forward_steered_prompt(&queued).await {
                     continue 'session;
@@ -508,7 +523,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                                 app.poll_pending_local_provider(agent).await;
                                                 app.poll_pending_local_catalog().await;
                                                 if let Some(cmd) = app.poll_pending_login().await {
-                                                    app.queue.push_front(cmd);
+                                                    let _ = app.enqueue_prompt_front(cmd);
                                                     continue 'session;
                                                 }
                                                 // Host mode: pull any attach prompts into the
@@ -554,7 +569,17 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         app.diff_lab.as_mut().unwrap().handle_paste(&text);
                         continue;
                     }
-                    Event::Mouse(mouse) => app.handle_mouse(mouse),
+                    Event::Resize(width, height) => {
+                        // Acknowledge SIGWINCH before accepting the harness's
+                        // next action. The next input-loop iteration redraws at
+                        // the new size; no user input is consumed or discarded.
+                        app.trace_resized(width, height)?;
+                        continue 'input;
+                    }
+                    Event::Mouse(mouse) => {
+                        app.handle_mouse(mouse);
+                        app.push_session_face(agent);
+                    }
                     // A paste arrives as one event. Route it to whichever input
                     // surface is active: the provider form (its current field),
                     // or the main input line. Without this, a paste while the
@@ -1074,6 +1099,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 app.apply_plan_approve(agent);
                                 break 'input hi_agent::PLAN_DRIVE_PROMPT.to_string();
                             }
+                            Some(ChordPipeline::PlanPark) => {
+                                app.park_plan_approval(agent);
+                                continue 'input;
+                            }
                             Some(ChordPipeline::PlanRequestChanges) => {
                                 app.apply_plan_request_changes(agent);
                                 continue 'input;
@@ -1171,6 +1200,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 }
             },
         };
+        if !line_was_queued {
+            app.trace_immediate_prompt(&line)?;
+        }
         // A line is committed — drop any lingering completion menu state.
         app.completion = None;
 
@@ -1271,6 +1303,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         .await?;
                     }
                     app.set_working(false);
+                    app.push_session_face(agent);
+                    app.refresh_goal(agent);
                     // Flush live events after compact too (background, non-blocking).
                     if let Some(rui) = &app.sync_remote_ui {
                         let rui = rui.clone();
@@ -1544,7 +1578,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     dim(),
                                 ));
                                 app.follow();
-                                app.queue.push_front("/provider xai".into());
+                                let _ = app.enqueue_prompt_front("/provider xai");
                                 continue;
                             }
                             match hi_ai::xai_auth::request_device_code().await {
@@ -1598,7 +1632,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     dim(),
                                 ));
                                 app.follow();
-                                app.queue.push_front("/provider pipenetwork".into());
+                                let _ = app.enqueue_prompt_front("/provider pipenetwork");
                                 continue;
                             }
                             match hi_ai::pipenetwork_auth::request_pairing().await {
@@ -1658,7 +1692,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                             dim(),
                                         ));
                                         app.follow();
-                                        app.queue.push_front("/provider pipenetwork".into());
+                                        let _ = app.enqueue_prompt_front("/provider pipenetwork");
                                     }
                                     Err(error) => {
                                         app.push(Line::styled(
@@ -2087,7 +2121,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     Ok(Ok(spec)) => {
                                         app.push(Line::styled(
                                             format!(
-                                                "✓ loop#{} armed — every {}, expires in 7d, firing now: {}",
+                                                "✓ loop#{} armed — every {}, runs until cancelled, firing now: {}",
                                                 spec.id,
                                                 crate::loops::humanize_secs(spec.interval_secs),
                                                 spec.name(),
@@ -2148,8 +2182,15 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                             .unwrap_or(0);
                                         for l in specs {
                                             let due_in = l.next_ms.saturating_sub(now) / 1000;
-                                            let expires_h =
-                                                l.expires_ms.saturating_sub(now) / 3_600_000;
+                                            let lifetime = l
+                                                .expires_ms
+                                                .map(|expires| {
+                                                    format!(
+                                                        "expires {}h",
+                                                        expires.saturating_sub(now) / 3_600_000
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| "no expiry".to_string());
                                             let next = if l.paused {
                                                 "paused".to_string()
                                             } else {
@@ -2183,14 +2224,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                             }
                                             app.push(Line::styled(
                                                 format!(
-                                                    "  #{} every {} · {} · {} firing(s){}{} · expires {}h · {}",
+                                                    "  #{} every {} · {} · {} firing(s){}{} · {} · {}",
                                                     l.id,
                                                     crate::loops::humanize_secs(l.interval_secs),
                                                     next,
                                                     l.firings,
                                                     cost,
                                                     marks,
-                                                    expires_h,
+                                                    lifetime,
                                                     l.name(),
                                                 ),
                                                 dim(),
@@ -2449,19 +2490,23 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             let plan = plan_result
                                 .unwrap_or_else(|| Ok(prompt.clone()))
                                 .unwrap_or_else(|_| prompt.clone());
+                            let round_limit = max_rounds.map_or_else(
+                                || "unlimited rounds".to_string(),
+                                |max| format!("max {max} rounds"),
+                            );
                             app.push(Line::styled(
-                                format!("trio: plan ready, executing (max {max_rounds} rounds)"),
+                                format!("trio: plan ready, executing ({round_limit})"),
                                 Style::default().fg(crate::theme::theme().accent_system),
                             ));
                             app.follow();
 
                             // ── Execute → Review loop ────────────────────────
-                            let mut round: u8 = 0;
+                            let mut round: u64 = 0;
                             let mut last_objections: Vec<String> = Vec::new();
                             let mut approved = false;
                             let mut loop_stopped = false;
-                            while round < max_rounds {
-                                round += 1;
+                            while !drive::trio_round_cap_reached(round, max_rounds) {
+                                round = round.saturating_add(1);
                                 // Build the execute input: plan + prompt + any
                                 // objections from the previous round.
                                 let run_line = if round == 1 {
@@ -2486,6 +2531,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 };
 
                                 // ── Execute phase: run a normal turn ────────
+                                app.push_session_face(agent);
                                 // Mirrors the main turn path so cancellation,
                                 // background-process cleanup, and session-state
                                 // rewind are handled identically.
@@ -2660,6 +2706,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 app.last_telemetry = Some(agent.last_turn_telemetry().clone());
                                 app.last_turn_phase = Some(agent.turn_phase().label());
                                 app.diff_text = None;
+                                app.push_session_face(agent);
                                 app.refresh_goal(agent);
 
                                 if driven.value.is_none() {
@@ -2706,7 +2753,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 // Cancellable via Esc/Ctrl-C (fail-open on cancel
                                 // — treat as approved so the loop exits cleanly).
                                 app.push(Line::styled(
-                                    format!("trio: reviewing round {round}/{max_rounds}…"),
+                                    format!(
+                                        "trio: reviewing round {}…",
+                                        drive::trio_round_label(round, max_rounds)
+                                    ),
                                     Style::default().fg(crate::theme::theme().accent_system),
                                 ));
                                 app.follow();
@@ -2759,7 +2809,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                         approved = true;
                                         app.push(Line::styled(
                                             format!(
-                                                "✓ trio: approved in round {round}/{max_rounds}"
+                                                "✓ trio: approved in round {}",
+                                                drive::trio_round_label(round, max_rounds)
                                             ),
                                             Style::default()
                                                 .fg(crate::theme::theme().accent_success),
@@ -2801,6 +2852,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                             ));
                                         }
                                         app.follow();
+                                        loop_stopped = true;
                                         break;
                                     }
                                     hi_agent::SkepticVerdict::Unavailable(msg) => {
@@ -2814,7 +2866,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     }
                                 }
                             }
-                            if !approved && !loop_stopped {
+                            if !approved
+                                && !loop_stopped
+                                && let Some(max_rounds) = max_rounds
+                            {
+                                debug_assert!(drive::trio_round_cap_reached(
+                                    round,
+                                    Some(max_rounds)
+                                ));
                                 app.push(Line::styled(
                                     format!("trio: hit round cap ({max_rounds}) without approval"),
                                     Style::default().fg(crate::theme::theme().warning),
@@ -2946,6 +3005,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             &mut app,
                             rest,
                             &fleet_launcher.exe,
+                            fleet_launcher.model_step_limit(),
+                            fleet_launcher.model_tool_call_limit(),
+                            fleet_launcher.model_verify_repair_limit(),
                         );
                         continue;
                     }
@@ -3115,6 +3177,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 &mut app,
                                 &plan.to_string_lossy(),
                                 &fleet_launcher.exe,
+                                fleet_launcher.model_step_limit(),
+                                fleet_launcher.model_tool_call_limit(),
+                                fleet_launcher.model_verify_repair_limit(),
                             );
                         }
                         Err(err) => {
@@ -3154,7 +3219,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     if let Some(goal) = agent.try_ingest_goal(&objective) {
                         app.set_ingested_goal(agent, &goal_argument, goal);
                         agent.reset_goal_drive_stall();
-                        app.maybe_queue_goal_drive(agent);
+                        app.maybe_queue_explicit_goal_drive(agent);
                         continue;
                     }
                     app.planning = Some(Instant::now());
@@ -3214,7 +3279,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     // A goal is a contract: start pulling toward it immediately.
                     // The user monitors and steers — pause/Esc stops the drive.
                     agent.reset_goal_drive_stall();
-                    app.maybe_queue_goal_drive(agent);
+                    app.maybe_queue_explicit_goal_drive(agent);
                     continue;
                 }
                 // Other `/goal` forms (read/pause/resume/limit/clear, or an
@@ -3226,12 +3291,17 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     app.handle_goal(agent, &arg);
                     if could_drive {
                         agent.reset_goal_drive_stall();
-                        app.maybe_queue_goal_drive(agent);
+                        app.maybe_queue_explicit_goal_drive(agent);
                     }
                     continue;
                 }
                 other => {
                     app.handle_command(agent, other).await;
+                    // `/config steps` mutates the in-process Agent. Keep the
+                    // shared child launcher aligned so future loop/fleet turns
+                    // do not retain a startup cap that the user turned off (or
+                    // miss a cap that the user just opted into).
+                    fleet_launcher.set_model_step_limit(agent.max_steps_limit());
                     continue;
                 }
             }
@@ -3332,6 +3402,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     // Remove any remaining fleet worktrees (sessions stay on disk, resumable).
     crate::dashboard::cleanup_fleet(&mut app);
 
+    app.trace_session_ended(agent)?;
+
     Ok(())
 }
 #[cfg(test)]
@@ -3408,7 +3480,7 @@ mod tests {
         app.mid_turn_offered.push_back("first".into());
         app.mid_turn_offered.push_back("second".into());
         // Agent applied both mid-turn (inbox empty).
-        reconcile_queue_with_interjections(&mut app, &inbox);
+        reconcile_queue_with_interjections(&mut app, &inbox, true);
         assert_eq!(
             app.queue.iter().cloned().collect::<Vec<_>>(),
             vec!["/status".to_string()],
@@ -3425,7 +3497,7 @@ mod tests {
         app.mid_turn_offered.push_back("keep me".into());
         inbox.push("keep me");
         // Turn ended before Model drained the inbox.
-        reconcile_queue_with_interjections(&mut app, &inbox);
+        reconcile_queue_with_interjections(&mut app, &inbox, true);
         assert_eq!(
             app.queue.iter().cloned().collect::<Vec<_>>(),
             vec!["keep me".to_string()],
@@ -3443,10 +3515,26 @@ mod tests {
         app.mid_turn_offered.push_back("applied".into());
         app.mid_turn_offered.push_back("pending".into());
         inbox.push("pending");
-        reconcile_queue_with_interjections(&mut app, &inbox);
+        reconcile_queue_with_interjections(&mut app, &inbox, true);
         assert_eq!(
             app.queue.iter().cloned().collect::<Vec<_>>(),
             vec!["pending".to_string()]
         );
+    }
+
+    #[test]
+    fn reconcile_keeps_consumed_interjection_when_drive_failed() {
+        let mut app = test_app("p", "m");
+        let inbox = hi_agent::InterjectionInbox::default();
+        app.queue.push_back("retry after failure".into());
+        app.mid_turn_offered.push_back("retry after failure".into());
+        // The agent drained the inbox before its provider request failed.
+        reconcile_queue_with_interjections(&mut app, &inbox, false);
+        assert_eq!(
+            app.queue.iter().cloned().collect::<Vec<_>>(),
+            vec!["retry after failure".to_string()],
+            "a failed drive must not discard queued user work"
+        );
+        assert!(app.mid_turn_offered.is_empty());
     }
 }

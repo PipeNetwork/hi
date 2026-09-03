@@ -207,7 +207,7 @@ impl crate::Agent {
         inspection_cap: u32,
         ui: &mut dyn Ui,
         evidence: &mut EvidenceTracker,
-        tool_timeline: &mut Vec<ToolCallEntry>,
+        tool_timeline: &mut crate::agent::turn::retention::ToolTimeline,
         tool_budget: u32,
     ) -> PreflightSummary {
         let calls = cap_preflight_calls(
@@ -431,7 +431,7 @@ impl crate::Agent {
         &mut self,
         ui: &mut dyn Ui,
         tracker: &mut ImplementationTracker,
-        tool_timeline: &mut Vec<ToolCallEntry>,
+        tool_timeline: &mut crate::agent::turn::retention::ToolTimeline,
     ) -> PreflightSummary {
         let arguments = serde_json::json!({
             "command": implementation_preflight_command(),

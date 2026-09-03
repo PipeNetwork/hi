@@ -1,0 +1,109 @@
+schema_version = 1
+name = "held-request-cancel-resume"
+tags = ["curated", "pr", "fuzz_state_template"]
+timeout_ms = 45000
+
+[session]
+plan_drive_paused = true
+
+[[session.plan]]
+title = "Finish the resumable step"
+status = "pending"
+
+[[provider.steps]]
+id = "held-drive"
+[provider.steps.response]
+kind = "hold"
+gate = "held-drive"
+
+[[provider.steps]]
+id = "resume-completes-plan"
+[provider.steps.expect]
+body_contains = ["Finish the resumable step"]
+[provider.steps.response]
+kind = "tool_call"
+name = "update_plan"
+arguments = { steps = [{ title = "Finish the resumable step", status = "done", completion_evidence = "This smoke scenario only verifies persisted cancellation and resume state; no workspace change is required." }] }
+
+[[provider.steps]]
+id = "resume-final-answer"
+[provider.steps.response]
+kind = "text"
+text = "The resumed plan step is complete."
+
+[[provider.steps]]
+id = "resume-no-file-change-explanation"
+[provider.steps.expect]
+body_contains = ["no successful file changes"]
+[provider.steps.response]
+kind = "text"
+text = "No file changes are needed; this smoke case only resumes and completes the persisted checklist state."
+
+[[actions]]
+kind = "send_line"
+text = "/plan resume"
+
+[[actions]]
+kind = "wait_provider_request"
+count = 1
+timeout_ms = 10000
+
+[[actions]]
+kind = "send_key"
+key = "ctrl_c"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "drive_paused", "/data/kind" = "plan_drive" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "release_gate"
+gate = "held-drive"
+
+[[actions]]
+kind = "wait_event_absent"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+duration_ms = 750
+
+[[actions]]
+kind = "send_line"
+text = "/plan resume"
+
+[[actions]]
+kind = "wait_provider_request"
+count = 3
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/plan/incomplete" = false }
+timeout_ms = 10000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "cancelled" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "drive_paused", "/data/kind" = "plan_drive" }
+at_least = 1
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

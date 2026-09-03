@@ -1,0 +1,136 @@
+schema_version = 1
+name = "live-active-turn-queue-and-resize"
+tags = ["live_extended"]
+timeout_ms = 600000
+
+[terminal]
+cols = 132
+rows = 40
+
+[[actions]]
+kind = "send_line"
+text = "This is a terminal responsiveness test, not a coding task. Reply with two short sentences and incorporate any user message that arrives while you are working. Do not use tools; this request has no workspace component."
+
+[[actions]]
+kind = "send_line"
+text = "Include the exact token QUEUED_LIVE_OK in that response. This is not a coding task; do not use tools or change files."
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_started", "/data/origin" = "user" }
+timeout_ms = 240000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "prompt_queued", "/data/origin" = "user", "/data/queue_depth" = 1 }
+timeout_ms = 30000
+
+[[actions]]
+kind = "resize"
+cols = 101
+rows = 31
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "prompt_dequeued", "/data/origin" = "user" }
+# The first turn can begin its final bounded fault-recovery request immediately
+# before the child's 240s soft deadline. Give that already-started request the
+# same 30s settlement/evidence grace as the turn_settled wait below; the
+# harness-owned 300s outer-turn watchdog remains authoritative.
+timeout_ms = 270000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled" }
+# The child turn deadline is 240s. Leave a 30s evidence-flush grace period
+# before the harness's independent 300s outer-turn watchdog.
+timeout_ms = 270000
+
+[[actions]]
+kind = "wait_quiescent"
+source = "events"
+quiet_ms = 500
+timeout_ms = 30000
+
+[[actions]]
+kind = "capture_screen"
+name = "final"
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "prompt_queued", "/data/origin" = "user" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "prompt_dequeued", "/data/origin" = "user" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "user" }
+# The second prompt may be consumed as an in-flight interjection or, if the
+# first response wins the race, as the next FIFO user turn. Both paths must be
+# exactly-once and are constrained by the queue/dequeue assertions above.
+at_least = 1
+at_most = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "resized", "/data/width" = 101, "/data/height" = 31, "/data/queue_depth" = 1 }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "approval_shown" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 0 }
+at_least = 1
+at_most = 2
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/accepted" = true, "/response_status" = 200 }
+at_least = 1
+
+[[assertions]]
+kind = "all_records"
+source = "provider_requests"
+equals = { "/tool_count" = 0, "/native_tools_enabled" = false }
+at_least = 1
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/role" = "Assistant" }
+at_least = 1
+at_most = 2
+
+[[assertions]]
+kind = "record_sequence"
+source = "events"
+pointer = "/event"
+values = ["ready", "turn_started", "prompt_queued", "resized", "prompt_dequeued", "turn_settled", "session_ended"]
+
+[[assertions]]
+kind = "exit"
+code = 0

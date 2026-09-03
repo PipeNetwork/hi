@@ -1,0 +1,14 @@
+[package]
+name = "hi-engine-guest"
+edition.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+
+[lints.rust]
+# wit-bindgen emits the ABI exports and required unsafe glue for the component.
+unsafe_code = "allow"

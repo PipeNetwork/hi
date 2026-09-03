@@ -6,7 +6,7 @@
 //! |---|---|---|
 //! | **Answer repair** | [`ReviewRepairMode`] / [`AnswerRepairMode`], [`crate::ReviewRepairBudgets`] | Steer |
 //! | **Completion review** | [`crate::ReviewPolicy`] / [`crate::CompletionReviewPolicy`], [`crate::SkepticVerdict`] → [`crate::ReviewStatus`] | after WorkspaceRepair |
-//! | **Goal skeptic** | `skeptic_gate`, `skeptic_fail_open` → [`crate::ReviewStatus`] | goal advance |
+//! | **Goal skeptic** | `skeptic_gate` → [`crate::ReviewStatus`] | goal advance |
 //!
 //! These modes nudge the model when a read-only **answer** is weak (no
 //! evidence, generic template, …). They never run shell stages.

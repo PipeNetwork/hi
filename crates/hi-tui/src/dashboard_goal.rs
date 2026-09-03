@@ -26,11 +26,13 @@ pub(crate) struct TurnReport {
     pub(crate) total_tokens: u64,
     pub(crate) goal: Option<RowGoal>,
     pub(crate) goal_raw: Option<String>,
-    pub(crate) outcome_status: Option<String>,
     pub(crate) leftover: Option<String>,
     pub(crate) plan: Option<RowPlan>,
     pub(crate) changed_files: Vec<String>,
     pub(crate) progress_events: Vec<hi_agent::ProgressEvent>,
+    /// Agent-owned exact cross-turn stall counters. Absent on older child reports.
+    pub(crate) plan_drive_stall: Option<u32>,
+    pub(crate) goal_drive_stall: Option<u32>,
 }
 
 pub(crate) fn parse_report(text: &str) -> Option<TurnReport> {
@@ -126,10 +128,6 @@ pub(crate) fn parse_report(text: &str) -> Option<TurnReport> {
             .unwrap_or(0),
         goal_raw: goal_value.map(|goal| goal.to_string()),
         goal,
-        outcome_status: value
-            .pointer("/outcome/status")
-            .and_then(|status| status.as_str())
-            .map(str::to_string),
         leftover,
         plan,
         changed_files: value
@@ -146,6 +144,14 @@ pub(crate) fn parse_report(text: &str) -> Option<TurnReport> {
             .pointer("/telemetry/progress_events")
             .and_then(|events| serde_json::from_value(events.clone()).ok())
             .unwrap_or_default(),
+        plan_drive_stall: value
+            .pointer("/telemetry/plan_drive_stall")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok()),
+        goal_drive_stall: value
+            .pointer("/telemetry/goal_drive_stall")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok()),
     })
 }
 
@@ -153,9 +159,10 @@ pub(crate) fn next_drive_stall(
     was_driving: bool,
     previous_goal: &Option<String>,
     new_goal: &Option<String>,
+    productive_evidence: bool,
     current: u32,
 ) -> u32 {
-    if was_driving && same_drive_state(previous_goal, new_goal) {
+    if was_driving && same_drive_state(previous_goal, new_goal) && !productive_evidence {
         current.saturating_add(1)
     } else {
         0
@@ -164,7 +171,7 @@ pub(crate) fn next_drive_stall(
 
 /// Compare the parts of a reported goal that represent work. `turns_spent` is
 /// accounting, not progress: it changes on every synthetic drive turn and
-/// must not keep a stalled fleet row alive indefinitely. Keep the comparison
+/// must not keep an unchanged fleet row alive indefinitely. Keep the comparison
 /// tolerant of older/malformed reports by falling back to the raw JSON.
 fn same_drive_state(previous: &Option<String>, new: &Option<String>) -> bool {
     if previous == new {
@@ -249,16 +256,6 @@ pub(crate) fn plan_drive_action(
     }
 }
 
-pub(crate) fn should_retry_goal_turn(
-    was_driving: bool,
-    outcome_status: Option<&str>,
-    goal: Option<&RowGoal>,
-) -> bool {
-    was_driving
-        && outcome_status == Some("incomplete")
-        && goal.is_some_and(|goal| goal.active && !goal.paused)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,9 +307,10 @@ mod tests {
     fn stall_counts_only_unchanged_drive_turns() {
         let first = Some(r#"{"done":1,"total":3}"#.to_string());
         let next = Some(r#"{"done":2,"total":3}"#.to_string());
-        assert_eq!(next_drive_stall(false, &first, &first, 5), 0);
-        assert_eq!(next_drive_stall(true, &first, &next, 1), 0);
-        assert_eq!(next_drive_stall(true, &first, &first, 0), 1);
+        assert_eq!(next_drive_stall(false, &first, &first, false, 5), 0);
+        assert_eq!(next_drive_stall(true, &first, &next, false, 1), 0);
+        assert_eq!(next_drive_stall(true, &first, &first, false, 0), 1);
+        assert_eq!(next_drive_stall(true, &first, &first, true, 3), 0);
     }
 
     #[test]
@@ -321,13 +319,16 @@ mod tests {
             Some(r#"{"done":1,"total":3,"turns_spent":4,"events":[{"kind":"set"}]}"#.to_string());
         let after =
             Some(r#"{"done":1,"total":3,"turns_spent":5,"events":[{"kind":"set"}]}"#.to_string());
-        assert_eq!(next_drive_stall(true, &before, &after, 2), 3);
+        assert_eq!(next_drive_stall(true, &before, &after, false, 2), 3);
     }
 
     #[test]
     fn stall_counter_saturates() {
         let goal = Some(r#"{"done":1,"total":3}"#.to_string());
-        assert_eq!(next_drive_stall(true, &goal, &goal, u32::MAX), u32::MAX);
+        assert_eq!(
+            next_drive_stall(true, &goal, &goal, false, u32::MAX),
+            u32::MAX
+        );
     }
 
     #[test]
@@ -342,40 +343,8 @@ mod tests {
         let before = raw(0, 0);
         let retried = raw(1, 0);
         let advanced = raw(1, 1);
-        assert_eq!(next_drive_stall(true, &before, &retried, 1), 0);
-        assert_eq!(next_drive_stall(true, &retried, &advanced, 1), 0);
-    }
-
-    #[test]
-    fn incomplete_drive_retries_but_infrastructure_failure_does_not() {
-        let active = RowGoal {
-            done: 0,
-            total: 2,
-            active: true,
-            paused: false,
-            drive: None,
-            phases: Vec::new(),
-        };
-        assert!(should_retry_goal_turn(
-            true,
-            Some("incomplete"),
-            Some(&active)
-        ));
-        assert!(!should_retry_goal_turn(true, Some("failed"), Some(&active)));
-        assert!(!should_retry_goal_turn(
-            false,
-            Some("incomplete"),
-            Some(&active)
-        ));
-        let paused = RowGoal {
-            paused: true,
-            ..active
-        };
-        assert!(!should_retry_goal_turn(
-            true,
-            Some("incomplete"),
-            Some(&paused)
-        ));
+        assert_eq!(next_drive_stall(true, &before, &retried, false, 1), 0);
+        assert_eq!(next_drive_stall(true, &retried, &advanced, false, 1), 0);
     }
 
     #[test]

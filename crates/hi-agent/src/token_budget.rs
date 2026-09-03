@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use crate::Ui;
 use crate::compaction;
-use crate::transcript::{CONTEXT_BLOCK_END, CONTEXT_BLOCK_START};
+use crate::transcript::{CONTEXT_BLOCK_END, CONTEXT_BLOCK_START, strip_turn_scoped_user_text};
 use crate::{AUTO_KEEP_RECENT, FALLBACK_CONTEXT_WINDOW};
 
 /// Occupancy at or above this percent may advertise and honor `new_context`.
@@ -167,14 +167,7 @@ fn threshold_notice(threshold: u8, remaining: u64, window: u32, pct: u8) -> Stri
 }
 
 pub(crate) fn inner_user_text(text: &str) -> String {
-    if text.starts_with(CONTEXT_BLOCK_START)
-        && let Some(end) = text.find(CONTEXT_BLOCK_END)
-    {
-        return text[end + CONTEXT_BLOCK_END.len()..]
-            .trim_start_matches('\n')
-            .to_string();
-    }
-    text.to_string()
+    strip_turn_scoped_user_text(text)
 }
 
 fn wrap_current_task(volatile: Option<&str>, task: &str) -> String {
@@ -242,19 +235,38 @@ impl crate::Agent {
         Ok(())
     }
 
-    /// Replace the transcript with the stable system message. Goal, decisions,
-    /// memory, and stall counters live on `Agent` and survive. A new window
-    /// epoch resets drive stalls so a poisoned thread can keep running.
-    fn wipe_conversation_keep_identity(&mut self) -> Result<()> {
+    /// Start a clean strategy epoch for an automatic plan turn that has
+    /// already produced an evidence-only no-change result. Unlike a user
+    /// `/window`, this deliberately preserves the plan-drive stall and its
+    /// evidence ledger: dropping poisoned conversation must not make old
+    /// inspection look novel or grant another orientation turn.
+    pub(crate) fn apply_plan_recovery_window(&mut self, ui: &mut dyn Ui) -> Result<()> {
+        self.wipe_conversation_keep_identity_inner(false)?;
+        ui.status(
+            "fresh plan-recovery context — prior tool output dropped; plan, decisions, and no-progress evidence kept as fingerprints",
+        );
+        Ok(())
+    }
+
+    fn wipe_conversation_keep_identity_inner(&mut self, reset_drive_state: bool) -> Result<()> {
         self.token_budget.advance_window();
         self.replace_history_with_compaction(vec![self.system_message()])?;
         self.runtime.invalidate_context_after_compaction();
         self.report.context_used = 0;
         self.token_budget
             .begin_turn(0, self.config.routing.context_window);
-        self.reset_goal_drive_stall();
-        self.reset_plan_drive_stall();
+        if reset_drive_state {
+            self.reset_goal_drive_stall();
+            self.reset_plan_drive_stall();
+        }
         Ok(())
+    }
+
+    /// Replace the transcript with the stable system message. Goal, decisions,
+    /// memory, and stall counters live on `Agent` and survive. A new window
+    /// epoch resets drive stalls so a poisoned thread can keep running.
+    fn wipe_conversation_keep_identity(&mut self) -> Result<()> {
+        self.wipe_conversation_keep_identity_inner(true)
     }
 
     /// If occupancy is past the auto-compact threshold, reclaim room before
@@ -286,7 +298,11 @@ impl crate::Agent {
         }
         let pct = self.report.context_used * 100 / u64::from(occupancy_window);
         if continual_drive {
-            self.wipe_conversation_keep_identity()?;
+            // An automatic context rollover is transport maintenance, not new
+            // user intent. Preserve semantic no-progress/evidence state so a
+            // large read cannot renew an implementation step's one allowed
+            // orientation turn. Explicit `/window` still resets it.
+            self.wipe_conversation_keep_identity_inner(false)?;
             ui.status(&format!(
                 "context ~{pct}% full — fresh window so the goal can keep running (conversation dropped, goal/decisions kept)"
             ));
@@ -407,6 +423,12 @@ mod tests {
     fn inner_user_text_strips_volatile_block() {
         let wrapped = format!("{CONTEXT_BLOCK_START}\ngoal\n{CONTEXT_BLOCK_END}\n\nfix the parser");
         assert_eq!(inner_user_text(&wrapped), "fix the parser");
+        let controlled = format!(
+            "{CONTEXT_BLOCK_START}\ngoal\n{CONTEXT_BLOCK_END}\n\n{}\nPlan mode is OFF.\n{}\n\nbuild all of that",
+            crate::transcript::TURN_CONTROL_START,
+            crate::transcript::TURN_CONTROL_END,
+        );
+        assert_eq!(inner_user_text(&controlled), "build all of that");
         assert_eq!(inner_user_text("plain"), "plain");
     }
 }

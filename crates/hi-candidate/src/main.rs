@@ -46,7 +46,10 @@ async fn main() -> Result<()> {
     let peer: Handshake = protocol.receive(Duration::from_secs(1)).await?;
     peer.validate_peer(PeerRole::Bootstrap, &descriptor_hash, &nonce)?;
     loop {
-        let envelope: Envelope = protocol.receive(Duration::from_secs(300)).await?;
+        // A quiet managed session is still healthy. Individual envelopes carry
+        // their own execution deadlines; waiting for the next one must not turn
+        // into a hidden five-minute candidate lifetime.
+        let envelope: Envelope = protocol.receive_unlimited().await?;
         envelope.validate(unix_ms()?)?;
         match envelope.message {
             Message::ExecuteStage(request) => {

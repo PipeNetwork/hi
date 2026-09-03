@@ -476,6 +476,15 @@ pub struct ChatRequest {
 pub enum StreamEvent {
     Text(String),
     Reasoning(String),
+    /// Provider-native tool-call fragments. These are intentionally separate
+    /// from visible text: agent runtimes may use them for speculative
+    /// execution, while frontends must never render them as transcript text.
+    ToolCallDelta {
+        index: usize,
+        id_delta: Option<String>,
+        name_delta: Option<String>,
+        arguments_delta: String,
+    },
     // Boxed: the audit payload (~264 B) dwarfs the other variants, so keeping
     // it inline would pad every streamed Text/Reasoning event on the hot path.
     WireAudit(Box<WireAudit>),
@@ -767,6 +776,8 @@ pub struct WireAudit {
     pub tool_count: usize,
     pub strict_schema: bool,
     pub tool_choice: Option<String>,
+    /// One-based logical request attempt. Compatibility-shape fallbacks retain
+    /// this ordinal and are distinguished by [`Self::compatibility_fallback`].
     pub request_attempt: u32,
     pub compatibility_fallback: Option<String>,
     pub accepted: bool,

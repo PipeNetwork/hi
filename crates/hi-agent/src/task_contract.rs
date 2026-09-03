@@ -131,12 +131,14 @@ pub const LARGE_DIFF_FILE_THRESHOLD: usize = 3;
 
 fn classify_intent(prompt: &str) -> TaskIntent {
     let lower = prompt.to_ascii_lowercase();
-    // A literal response contract is conversational even though verbs such as
-    // "reply" and "respond" are not repository-inspection prefixes. Without
-    // this fast path, `Reply with exactly: ok` fell into the mutation-capable
-    // default and advertised the full workspace tool catalog; a weak model
-    // then searched the repository instead of returning the requested text.
-    if prompt_requests_exact_text_response(&lower) {
+    // A direct, explicitly tool-free response contract is conversational even
+    // when it contains words that are mutation verbs in coding requests. The
+    // live queue/resizing canary says "do not use tools or modify files", and
+    // its follow-up says "add ... to that response"; treating either `modify`
+    // or `add` as an edit request made a weak model search the repository and
+    // then activated the missing-mutation nudge. Honor the response contract
+    // before applying the mutation-capable default.
+    if prompt_requests_tool_free_response(&lower) {
         return TaskIntent::ReadOnly;
     }
     if lower.trim_start().starts_with("read-only ") || lower.trim_start().starts_with("read only ")
@@ -262,6 +264,129 @@ pub(crate) fn prompt_requests_exact_text_response(prompt: &str) -> bool {
                     | "workspace"
             )
         })
+}
+
+/// Whether the user explicitly requests a conversational response with no
+/// tool work.
+///
+/// This deliberately does not equate every "no file changes" prompt with
+/// tool-free chat: read-only repository reviews need inspection tools. It
+/// covers an explicit ban on tool use, plus a narrow non-coding response
+/// continuation shape used by mid-turn queued follow-ups.
+pub(crate) fn prompt_requests_tool_free_response(prompt: &str) -> bool {
+    if prompt_requests_exact_text_response(prompt) {
+        return true;
+    }
+    let normalized = prompt
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let response_continuation = [
+        "that response",
+        "this response",
+        "your response",
+        "previous response",
+        "reply with",
+        "respond with",
+        "answer with",
+        "reply only",
+        "respond only",
+        "answer only",
+        "return only",
+        "output only",
+        "say only",
+        "return the exact",
+        "output the exact",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let conjoined_without_tool_use = [
+        "without changing files or",
+        "without changing any files or",
+        "without modifying files or",
+        "without modifying any files or",
+        "without editing files or",
+        "without editing any files or",
+        "without writing files or",
+        "without writing any files or",
+        "without file changes or",
+        "with no file changes or",
+    ]
+    .iter()
+    .any(|head| {
+        normalized.find(head).is_some_and(|start| {
+            let tail = normalized[start + head.len()..].trim_start();
+            [
+                "using tools",
+                "using any tools",
+                "calling tools",
+                "calling any tools",
+                "tool use",
+                "tool calls",
+            ]
+            .iter()
+            .any(|tool_clause| tail.starts_with(tool_clause))
+        })
+    });
+    let explicit_tool_ban = [
+        "do not use tools",
+        "do not use any tools",
+        "don t use tools",
+        "don t use any tools",
+        "do not call tools",
+        "do not call any tools",
+        "don t call tools",
+        "don t call any tools",
+        "without using tools",
+        "without any tools",
+        "no tool calls",
+        "requires no tools",
+        "requires no tool calls",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+        || conjoined_without_tool_use
+        || normalized.contains("no file changes and no tool use");
+    // Do not mistake a literal phrase inside a coding request (for example,
+    // "implement detection for 'do not use tools'") for an instruction to
+    // disable the coding catalog. Shared negations such as "do not use tools
+    // or modify files" are handled by `explicit_mutation_request`, so a real
+    // affirmative coding clause still wins here.
+    if explicit_tool_ban && !explicit_mutation_request(&prompt.to_ascii_lowercase()) {
+        return true;
+    }
+
+    let explicitly_non_coding = [
+        "not a coding task",
+        "not a code task",
+        "non coding task",
+        "noncoding task",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let no_file_work = [
+        "no file changes",
+        "requires no file changes",
+        "without changing files",
+        "without modifying files",
+        "do not change files",
+        "do not modify files",
+        "do not edit files",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    explicitly_non_coding && no_file_work && response_continuation
 }
 
 /// Whether a turn is shaped as a direct question whose draft should be held
@@ -391,10 +516,10 @@ fn is_mutation_verb(word: &str) -> bool {
 /// the workspace, as opposed to a tool/artifact noun ("cargo build", "the
 /// build") or a question about behavior ("does that build hi-mlx?"). This is
 /// deliberately stricter than [`contains_mutation_request`]: it decides
-/// whether a turn that ends with no file changes counts as stalled, not which
-/// tools are advertised, so a false negative merely relaxes a completion gate
-/// while a false positive brands a correct text-only answer "incomplete ·
-/// stalled".
+/// whether a turn that ends with no file changes receives an implementation
+/// challenge, not which tools are advertised. A false negative merely relaxes
+/// that challenge, while a false positive needlessly challenges a correct
+/// text-only answer.
 pub(crate) fn explicit_mutation_request(lower: &str) -> bool {
     let mut clause = String::new();
     let mut clauses: Vec<(String, bool)> = Vec::new();
@@ -420,6 +545,12 @@ fn clause_requests_mutation(clause: &str, question: bool) -> bool {
             return false;
         }
         let previous = index.checked_sub(1).map(|position| words[position]);
+        // A negation can govern two alternatives: "do not use tools or modify
+        // files" forbids both actions. Looking only at the immediately prior
+        // word (`or`) incorrectly branded `modify` as an affirmative edit.
+        if mutation_is_in_shared_or_negation(&words, index) {
+            return false;
+        }
         if question {
             // Inside a question, a mutation verb only counts as a request when
             // it is directed at the agent ("can you fix …?"), never when it
@@ -493,6 +624,8 @@ fn clause_requests_mutation(clause: &str, question: bool) -> bool {
                     | "wouldnt"
                     | "shouldnt"
                     | "never"
+                    | "without"
+                    | "avoid"
                     | "does"
                     | "do"
                     | "did"
@@ -510,6 +643,30 @@ fn clause_requests_mutation(clause: &str, question: bool) -> bool {
                     | "must"
             )
         )
+    })
+}
+
+fn mutation_is_in_shared_or_negation(words: &[&str], mutation_index: usize) -> bool {
+    let Some(or_index) = words[..mutation_index]
+        .iter()
+        .rposition(|word| *word == "or")
+    else {
+        return false;
+    };
+    // The governed alternative starts immediately after `or` (allow one
+    // adverb, as in "or otherwise modify"). Avoid reaching across unrelated
+    // prose in the same sentence.
+    if mutation_index.saturating_sub(or_index) > 2 {
+        return false;
+    }
+    let left = &words[..or_index];
+    left.iter().enumerate().rev().any(|(index, word)| {
+        if or_index.saturating_sub(index) > 8 {
+            return false;
+        }
+        (*word == "not" && index > 0 && words[index - 1] == "do")
+            || (*word == "t" && index > 0 && words[index - 1] == "don")
+            || *word == "never"
     })
 }
 
@@ -876,8 +1033,9 @@ mod tests {
         let mut prompt = String::new();
         for i in 0..20 {
             prompt.push_str(&format!(
-                "The CLI must {}.\n",
-                "accept this very long acceptance sentence ".repeat(10) + &i.to_string()
+                "The CLI must {}{}.\n",
+                "accept this very long acceptance sentence ".repeat(10),
+                i
             ));
         }
         let contract = TaskContract::derive(&prompt, VerificationMode::Auto);
@@ -1037,6 +1195,54 @@ mod tests {
         ));
         assert!(!prompt_requests_exact_text_response(
             "Fix src/parser.rs and reply with exactly: done"
+        ));
+    }
+
+    #[test]
+    fn explicit_tool_free_response_contracts_do_not_become_mutations() {
+        for prompt in [
+            "This is a terminal responsiveness test, not a coding task. Reply with two short sentences and incorporate any user message that arrives while you are working. Do not use tools or modify files.",
+            "Add the exact token QUEUED_LIVE_OK to that response. This is not a coding task and requires no file changes.",
+            "Without changing files or using tools, answer only: live read-only canary complete.",
+            "Without modifying any files or calling any tools, reply only: READY.",
+            "With no file changes or tool use, output only READY.",
+        ] {
+            let contract = TaskContract::derive(prompt, VerificationMode::Auto);
+            assert!(prompt_requests_tool_free_response(prompt), "{prompt:?}");
+            assert_eq!(contract.intent, TaskIntent::ReadOnly, "{prompt:?}");
+            assert!(!contract.explicit_mutation, "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn tool_free_response_detection_preserves_real_coding_requests() {
+        for prompt in [
+            "Fix src/parser.rs but do not modify tests.",
+            "Add the exact token QUEUED_LIVE_OK to src/output.txt; do not modify any other files.",
+            "Create live-write-proof.txt using the write tool exactly once.",
+            "Implement detection for the literal phrase 'do not use tools'.",
+            "Implement a parser that recognizes the literal sentence 'Without changing files or using tools, answer only: READY'.",
+        ] {
+            let contract = TaskContract::derive(prompt, VerificationMode::Auto);
+            assert!(!prompt_requests_tool_free_response(prompt), "{prompt:?}");
+            assert_eq!(contract.intent, TaskIntent::Mutation, "{prompt:?}");
+            assert!(contract.explicit_mutation, "{prompt:?}");
+        }
+
+        let inspection =
+            "This is not a coding task. Answer what README.md says; no file changes are required.";
+        assert!(
+            !prompt_requests_tool_free_response(inspection),
+            "read-only repository questions still need inspection tools"
+        );
+        let explicit_review =
+            "Without changing files, review the codebase using tools and report concrete findings.";
+        assert!(
+            !prompt_requests_tool_free_response(explicit_review),
+            "an affirmative request to review with tools must retain inspection capability"
+        );
+        assert!(!explicit_mutation_request(
+            "do not use tools or modify files"
         ));
     }
 

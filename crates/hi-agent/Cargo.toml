@@ -8,30 +8,42 @@ hi-observability.workspace = true
 hi-events.workspace = true
 hi-policy.workspace = true
 hi-ai.workspace = true
+hi-engine-api.workspace = true
+hi-engine-host.workspace = true
 hi-tools.workspace = true
+hi-workflow.workspace = true
 hi-lsp.workspace = true
 hi-secrets.workspace = true
 hi-hooks.workspace = true
 hi-agent-lifecycle.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
 async-trait = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 uuid.workspace = true
 ignore.workspace = true
 sha2.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
 codebase-graph = ["hi-tools/codebase-graph"]
+# INTERNAL SMOKE NEGATIVE CONTROL ONLY. Enabling this intentionally accepts
+# low-information generic completion claims. It exists solely to demonstrate
+# that the interactive smoke regressions fail when their production guard is absent.
+smoke-negative-control-disable-generic-completion-guards = []
 
 
 [lints.rust]
-# Test-only unsafe: env set_var/remove_var guards in test helpers.
+# Lifecycle-hook process groups use libc for descendant cleanup; tests also use
+# unsafe env guards for process-global configuration.
 unsafe_code = "allow"

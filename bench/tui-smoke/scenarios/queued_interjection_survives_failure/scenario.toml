@@ -1,0 +1,154 @@
+schema_version = 1
+name = "queued-interjection-survives-failed-turn"
+tags = ["curated", "pr"]
+timeout_ms = 45000
+
+[[provider.steps]]
+id = "gated-empty-primary"
+[provider.steps.response]
+kind = "raw_sse"
+body = "data: [DONE]\n\n"
+gate = "first-empty"
+
+[[provider.steps]]
+id = "empty-retry-1"
+[provider.steps.response]
+kind = "raw_sse"
+body = "data: [DONE]\n\n"
+
+[[provider.steps]]
+id = "empty-retry-2"
+[provider.steps.response]
+kind = "raw_sse"
+body = "data: [DONE]\n\n"
+
+[[provider.steps]]
+id = "empty-keep-working-primary"
+[provider.steps.response]
+kind = "raw_sse"
+body = "data: [DONE]\n\n"
+
+[[provider.steps]]
+id = "empty-keep-working-retry-1"
+[provider.steps.response]
+kind = "raw_sse"
+body = "data: [DONE]\n\n"
+
+[[provider.steps]]
+id = "empty-keep-working-retry-2"
+[provider.steps.response]
+kind = "raw_sse"
+body = "data: [DONE]\n\n"
+
+[[provider.steps]]
+id = "queued-user-turn"
+[provider.steps.expect]
+body_contains = ["QUEUED_AFTER_FAILURE_OK"]
+[provider.steps.response]
+kind = "text"
+text = "QUEUED_AFTER_FAILURE_OK"
+
+[[actions]]
+kind = "send_line"
+text = "Reply with a short acknowledgement without using tools."
+
+[[actions]]
+kind = "wait_provider_request"
+count = 1
+timeout_ms = 10000
+
+[[actions]]
+kind = "send_line"
+text = "Reply with exactly QUEUED_AFTER_FAILURE_OK and do not use tools."
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "prompt_queued", "/data/origin" = "user", "/data/queue_depth" = 1 }
+timeout_ms = 5000
+
+[[actions]]
+kind = "release_gate"
+gate = "first-empty"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/stop_reason" = "infrastructure_failure" }
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "prompt_dequeued", "/data/origin" = "user" }
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_started", "/data/origin" = "user" }
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_provider_request"
+count = 7
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed" }
+timeout_ms = 15000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 7
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "prompt_queued", "/data/origin" = "user" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "prompt_dequeued", "/data/origin" = "user" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "user" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/stop_reason" = "infrastructure_failure" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed" }
+exact = 1
+
+[[assertions]]
+kind = "record_sequence"
+source = "events"
+pointer = "/event"
+values = ["turn_started", "prompt_queued", "turn_settled", "prompt_dequeued", "turn_started", "turn_settled", "session_ended"]
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+contains = { "/body" = "QUEUED_AFTER_FAILURE_OK" }
+at_least = 1
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

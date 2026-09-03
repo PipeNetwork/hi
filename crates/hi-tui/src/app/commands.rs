@@ -1399,7 +1399,14 @@ impl crate::App {
             Ok(path) => match std::env::current_exe() {
                 Ok(exe) => {
                     let plan = agent.workspace_root().join(&path);
-                    crate::workflow_tui::handle_plan_workflow(self, &plan.to_string_lossy(), &exe);
+                    crate::workflow_tui::handle_plan_workflow(
+                        self,
+                        &plan.to_string_lossy(),
+                        &exe,
+                        agent.max_steps_limit(),
+                        agent.max_tool_calls_cap(),
+                        agent.max_verify_repairs_cap(),
+                    );
                 }
                 Err(err) => {
                     self.push(Line::styled(
@@ -1617,10 +1624,26 @@ impl crate::App {
     pub(crate) fn refresh_goal(&mut self, agent: &Agent) {
         self.goal = agent.structured_goal().cloned();
         self.plan = agent.current_plan().to_vec();
-        self.plan_mode = agent.plan_mode();
-        self.plan_drive_paused = agent.plan_drive_paused();
-        self.permission_mode = agent.permission_mode();
-        self.last_drive = agent.drive_decision(None);
+        // A Shift-Tab made while a turn/compaction owns `&mut Agent` is a
+        // pending frontend choice. Do not overwrite it with the old Agent
+        // flags before `push_session_face` gets the borrow back.
+        if !self.session_face_dirty {
+            self.plan_mode = agent.plan_mode();
+            self.plan_drive_paused = agent.plan_drive_paused();
+            self.permission_mode = agent.permission_mode();
+            self.last_drive = agent.drive_decision(None);
+            if agent.plan_approval_parked()
+                && self.plan_has_leftover()
+                && !self.plan_mode
+                && self.plan_approval.is_none()
+            {
+                self.restore_parked_plan_approval();
+            } else if !self.plan_has_leftover()
+                && self.plan_approval.as_ref().is_some_and(|card| card.parked)
+            {
+                self.plan_approval = None;
+            }
+        }
     }
 
     /// Recompute the leftover-work cache from mirrored App fields (tests).
@@ -1666,6 +1689,20 @@ impl crate::App {
     /// Queue the Agent-owned leftover-work drive when the queue is empty.
     pub(crate) fn maybe_queue_goal_drive(&mut self, agent: &Agent) {
         self.maybe_queue_drive(agent, None);
+    }
+
+    /// Queue only a goal drive after a user explicitly creates/resumes one.
+    /// The explicit command is authority to move past a prior failed/cancelled
+    /// settlement, while a missing goal must not accidentally start plan work.
+    pub(crate) fn maybe_queue_explicit_goal_drive(&mut self, agent: &Agent) {
+        if !self.queue.is_empty() || self.plan_approval.is_some() {
+            return;
+        }
+        if let hi_agent::DriveAction::Enqueue(hi_agent::DriveKind::Goal) =
+            agent.explicit_goal_drive_decision()
+        {
+            let _ = self.try_enqueue_prompt(hi_agent::GOAL_CONTINUE_PROMPT);
+        }
     }
 
     pub(crate) fn maybe_queue_drive(
@@ -1880,6 +1917,11 @@ impl crate::App {
                 }
             }
             Command::Status => self.report_status(agent),
+            Command::Engine(arg) => {
+                for line in agent.engine_command(&arg).lines() {
+                    self.push(Line::styled(line.to_string(), dim()));
+                }
+            }
             Command::Durable(arg) => self.handle_durable(agent, &arg),
             Command::Turns(arg) => {
                 self.handle_turns(agent, hi_agent::command::parse_turns_arg(&arg));
@@ -1950,7 +1992,9 @@ impl crate::App {
             }
             Command::ViewPlan => {
                 if self.plan_approval.is_some() {
-                    self.unpark_plan_approval();
+                    if self.unpark_plan_approval() {
+                        self.push_session_face(agent);
+                    }
                 } else if self.plan_has_leftover() && !self.plan_mode {
                     self.open_plan_approval();
                 } else {
@@ -2009,7 +2053,8 @@ impl crate::App {
                     }
                     if let Some(prompt) = effect.follow_up_prompt {
                         // Plan mode and /synth-evals hand back a prompt to run
-                        // as the next turn. Prefer front-of-queue even at cap.
+                        // as the next turn. Put it first without displacing any
+                        // work that was already queued.
                         self.plan_approval = None;
                         let _ = self.enqueue_prompt_front(prompt);
                         self.push(Line::styled(
@@ -2181,6 +2226,7 @@ impl crate::App {
                         self.pending = None;
                         self.code_lang = None;
                         self.current_assistant.clear();
+                        self.current_assistant_streamed_bytes = 0;
                         self.last_assistant.clear();
                         self.status.clear();
                         self.last_turn_state = TurnState::Idle;
@@ -2251,6 +2297,7 @@ impl crate::App {
                         self.push(row("reasoning:      ", s.reasoning_effort));
                         self.push(row("temperature:    ", s.temperature));
                         self.push(row("steps:          ", s.max_steps));
+                        self.push(row("tool-calls:     ", s.max_tool_calls));
                         self.push(row("tool-mode:      ", s.tool_mode));
                         self.push(row("compat:         ", s.compat));
                         self.push(row("verify:         ", s.verify));
@@ -2337,10 +2384,8 @@ impl crate::App {
                     ConfigArg::MaxStepsAuto => {
                         agent.set_max_steps_auto();
                         self.push(Line::styled(
-                            format!(
-                                "step limit → {} (automatic; applies next turn)",
-                                hi_agent::MAX_MODEL_ROUNDS
-                            ),
+                            "step limit → unlimited (automatic default; applies next turn)"
+                                .to_string(),
                             dim(),
                         ));
                     }
@@ -2486,6 +2531,7 @@ impl crate::App {
                     | ConfigArg::Verify(_)
                     | ConfigArg::Lsp(_)
                     | ConfigArg::Delegate(_)
+                    | ConfigArg::Engine(_)
                     | ConfigArg::Theme(_)
                     | ConfigArg::Density(_)
                     | ConfigArg::Mouse(_) => {}

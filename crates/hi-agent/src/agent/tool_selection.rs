@@ -58,13 +58,13 @@ pub(super) fn advertised_tools_with_background(
     task: Option<(&str, TaskIntent)>,
     background: BackgroundToolAvailability,
 ) -> Arc<[ToolSpec]> {
-    // Literal answer contracts are the one task shape where failing closed is
-    // correct for every catalog mode, including Full/Minimal. Advertising even
-    // a read tool for `Reply with exactly: ok` invites repository wandering and
-    // violates the user's output contract.
+    // Explicitly tool-free answer contracts are the one task shape where
+    // failing closed is correct for every catalog mode, including
+    // Full/Minimal. Advertising even a read tool invites repository wandering
+    // and violates the user's response contract.
     if task.is_some_and(|(text, intent)| {
         intent == TaskIntent::ReadOnly
-            && crate::task_contract::prompt_requests_exact_text_response(text)
+            && crate::task_contract::prompt_requests_tool_free_response(text)
     }) {
         return Vec::<ToolSpec>::new().into();
     }
@@ -132,6 +132,7 @@ pub(super) fn advertised_tools_with_background(
                 hi_tools::ToolCapability::Skill => {
                     repo_relevant || matches!(config.memory.tool_set, ToolSet::Full)
                 }
+                hi_tools::ToolCapability::Structure => true,
             }
         })
         .cloned()
@@ -339,6 +340,7 @@ fn slim_pipe_flash_dynamic_tools(config: &AgentConfig, specs: &mut Vec<ToolSpec>
                 | "edit"
                 | "multi_edit"
                 | "apply_patch"
+                | "run_program"
                 | "bash"
                 | "bash_output"
                 | "bash_kill"
@@ -525,20 +527,20 @@ mod tests {
             names(&mutation)
         );
         assert!(
-            names(&mutation).contains(&"ask_user"),
-            "ask_user on interactive coding: {:?}",
+            !names(&mutation).contains(&"ask_user"),
+            "ask_user stays off for autonomous coding: {:?}",
             names(&mutation)
         );
-        let mut eval_config = AgentConfig::default();
-        eval_config.memory.offer_ask_user = false;
-        let eval_mutation = advertised_tools(
-            &eval_config,
+        let mut interactive_config = AgentConfig::default();
+        interactive_config.memory.offer_ask_user = true;
+        let interactive_mutation = advertised_tools(
+            &interactive_config,
             Some(("implement the parser", TaskIntent::Mutation)),
         );
         assert!(
-            !names(&eval_mutation).contains(&"ask_user"),
-            "ask_user off for eval/report: {:?}",
-            names(&eval_mutation)
+            names(&interactive_mutation).contains(&"ask_user"),
+            "ask_user is available only after explicit opt-in: {:?}",
+            names(&interactive_mutation)
         );
         assert!(
             !names(&mutation).contains(&"search_tool") && !names(&mutation).contains(&"use_tool"),

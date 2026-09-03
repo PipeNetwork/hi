@@ -2,9 +2,9 @@
 //! skeptic-local on`).
 //!
 //! The skeptic gate runs a bounded critique call before a turn may advance a
-//! sub-goal. Transport failures yield `Unavailable`; product policy
-//! (`skeptic_fail_open`, default fail-closed) decides whether that blocks
-//! advance. It fires often, so routing it to a small local model keeps the
+//! sub-goal. Transport failures yield `Unavailable`; the goal records that
+//! diagnostic but does not let reviewer availability veto deterministically
+//! verified productive work. It fires often, so routing it to a small local model keeps the
 //! coding driver and planner on the main model while making the review free and
 //! private. Turning the feature on detects the machine's local-inference
 //! backend (Apple-Silicon MLX or NVIDIA CUDA), fetches a small default review

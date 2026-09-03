@@ -7,8 +7,8 @@
 //! transcripts that violate this on the next request. Historically the agent
 //! managed `Arc<Vec<Message>>` directly at ~20 call sites in `run_turn`, with
 //! each site responsible for keeping the transcript provider-safe — a fragile
-//! invariant that produced real bugs (orphan `tool_use` blocks from the repeat
-//! guard; verify nudges accumulating because they were detected by
+//! invariant that produced real bugs (orphan `tool_use` blocks from legacy
+//! retry paths; verify nudges accumulating because they were detected by
 //! string-matching).
 //!
 //! [`Transcript`] wraps the `Arc<Vec<Message>>` and exposes only intentional
@@ -145,8 +145,7 @@ fn immediate_tool_block_end(
 /// distinguish a nudge from a user message quoting the same text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NudgeKind {
-    /// Sent when the model re-issues the exact same tool call as the previous
-    /// round; tells it to act on the output it already has.
+    /// Sent when the model re-issues the previous round's exact tool calls.
     Repeat,
     /// Sent by bounded structured plan/goal recovery and other completion
     /// gates. Ordinary prose alone never triggers an automatic continuation.
@@ -293,6 +292,119 @@ pub(crate) fn read_call_key(arguments: &str) -> Option<ReadCallKey> {
 /// start so the transcript carries exactly one copy.
 pub(crate) const CONTEXT_BLOCK_START: &str = "[hi:context — session state, not instructions]";
 pub(crate) const CONTEXT_BLOCK_END: &str = "[/hi:context]";
+const LEGACY_CONTEXT_BLOCK_START: &str = "[hi:context - session state, not instructions]";
+
+/// Markers for instructions that are authoritative for exactly one model
+/// turn. Unlike ordinary user text, these controls must not survive in the
+/// provider history after the turn ends: doing so let an old PLAN MODE
+/// instruction override a later `/plan off` even though mutation tools were
+/// available again.
+pub(crate) const TURN_CONTROL_START: &str = "[hi:turn-control — current turn only]";
+pub(crate) const TURN_CONTROL_END: &str = "[/hi:turn-control]";
+
+const LEGACY_PLAN_MODE_START: &str = "You are in PLAN MODE.";
+const LEGACY_PLAN_REQUEST_MARKER: &str = "\n\nUser request:\n";
+const LEGACY_TURN_CONTROL_SUFFIXES: &[&str] = &[
+    "\n\nRead-only review guard: use only the currently advertised read-only inspection tools;",
+    "\n\nImplementation guard: inspect the workspace before choosing files or stack.",
+];
+const HISTORICAL_CONTROL_TURN: &str =
+    "[Historical turn; injected context/control removed and no user text remained.]";
+
+fn has_turn_scoped_user_text(text: &str) -> bool {
+    text.contains(CONTEXT_BLOCK_START)
+        || text.contains(LEGACY_CONTEXT_BLOCK_START)
+        || text.contains(TURN_CONTROL_START)
+        || text.trim_start().starts_with(LEGACY_PLAN_MODE_START)
+        || LEGACY_TURN_CONTROL_SUFFIXES
+            .iter()
+            .any(|suffix| text.contains(suffix))
+}
+
+fn has_plan_mode_control(text: &str) -> bool {
+    text.trim_start().starts_with(LEGACY_PLAN_MODE_START)
+        || text.find(TURN_CONTROL_START).is_some_and(|start| {
+            let rest = &text[start + TURN_CONTROL_START.len()..];
+            let control = rest
+                .find(TURN_CONTROL_END)
+                .map(|end| &rest[..end])
+                .unwrap_or(rest);
+            control.contains("Plan mode is ON for this turn")
+        })
+}
+
+fn strip_delimited_blocks(text: &str, start: &str, end: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(relative_start) = text[cursor..].find(start) {
+        let block_start = cursor + relative_start;
+        let content_start = block_start + start.len();
+        let Some(relative_end) = text[content_start..].find(end) else {
+            // A malformed or user-quoted opener is not safe to erase.
+            output.push_str(&text[cursor..]);
+            return output;
+        };
+        output.push_str(&text[cursor..block_start]);
+        cursor = content_start + relative_end + end.len();
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn strip_legacy_turn_control_suffix(text: &str) -> &str {
+    let end = LEGACY_TURN_CONTROL_SUFFIXES
+        .iter()
+        .filter_map(|suffix| text.find(suffix))
+        .min()
+        .unwrap_or(text.len());
+    &text[..end]
+}
+
+fn strip_legacy_plan_mode_control(text: &str) -> Option<String> {
+    let trimmed = text.trim_start_matches('\n');
+    if !trimmed.starts_with(LEGACY_PLAN_MODE_START) {
+        return None;
+    }
+    let Some(marker) = trimmed.find(LEGACY_PLAN_REQUEST_MARKER) else {
+        return Some(String::new());
+    };
+    let request = &trimmed[marker + LEGACY_PLAN_REQUEST_MARKER.len()..];
+    let request = strip_legacy_turn_control_suffix(request).trim_matches('\n');
+    Some(if request.is_empty() {
+        String::new()
+    } else {
+        request.to_string()
+    })
+}
+
+/// Return the durable user-authored portion of a model-facing turn message.
+/// This is shared by turn startup and fresh-window task recovery so neither
+/// path can accidentally promote a one-turn mode/guard instruction into the
+/// next turn's request.
+pub(crate) fn strip_turn_scoped_user_text(text: &str) -> String {
+    let has_delimited_control = text.contains(TURN_CONTROL_START)
+        && text.find(TURN_CONTROL_START).is_some_and(|start| {
+            text[start + TURN_CONTROL_START.len()..].contains(TURN_CONTROL_END)
+        });
+    let was_plan_control = has_plan_mode_control(text);
+    let mut cleaned = strip_delimited_blocks(text, CONTEXT_BLOCK_START, CONTEXT_BLOCK_END);
+    cleaned = strip_delimited_blocks(&cleaned, LEGACY_CONTEXT_BLOCK_START, CONTEXT_BLOCK_END);
+    cleaned = strip_delimited_blocks(&cleaned, TURN_CONTROL_START, TURN_CONTROL_END);
+    if !has_delimited_control {
+        cleaned = strip_legacy_plan_mode_control(&cleaned).unwrap_or(cleaned);
+        cleaned = strip_legacy_turn_control_suffix(&cleaned).to_string();
+    }
+    let cleaned = cleaned.trim_matches('\n');
+    let cleaned = if was_plan_control {
+        cleaned
+            .strip_prefix("User request:\n")
+            .unwrap_or(cleaned)
+            .trim_start()
+    } else {
+        cleaned
+    };
+    cleaned.to_string()
+}
 
 /// The conversation transcript, enforcing provider-safety invariants.
 #[derive(Clone, Debug)]
@@ -528,26 +640,25 @@ impl Transcript {
     /// transcript never carries `tool_use` blocks without matching
     /// `tool_result`s. Text and thinking blocks are kept.
     ///
-    /// Note: the repeat guard no longer uses this — a *skipped-but-valid* call
-    /// is recorded via [`push_assistant_with_results`] with a synthetic
-    /// "[not executed: …]" result, so the model can see what happened to the
-    /// call it just made instead of a bare placeholder.
+    /// A model round with a partial or unusable tool call is recorded without
+    /// the incomplete call blocks so the next provider request stays valid.
     ///
     /// [`push_assistant_with_results`]: Self::push_assistant_with_results
-    /// Strip volatile context blocks from earlier turns' user messages,
-    /// keeping their real user text. Called at turn start before the fresh
-    /// block is attached, so the transcript carries exactly one copy — the
-    /// current turn's. This rewrites at most one late message per turn (the
-    /// previous turn's user message), which costs one prefix-cache
-    /// re-anchor per *turn* instead of the per-*round* full invalidation the
-    /// old volatile system message caused.
-    pub(crate) fn strip_previous_context_blocks(&mut self) {
+    /// Strip volatile context and one-turn instruction blocks from earlier
+    /// user messages, keeping the real user text. Called at turn start before
+    /// fresh blocks are attached, so only the current mode/review/build guard
+    /// remains authoritative.
+    ///
+    /// The legacy cleanup is deliberate migration code for sessions written
+    /// before turn controls were delimited. Those sessions persisted a bare
+    /// `You are in PLAN MODE` prefix (and sometimes a read-only review suffix)
+    /// as if it were durable user intent. Preserve only the actual request.
+    pub(crate) fn strip_previous_turn_blocks(&mut self) {
         let has_block = self.messages.iter().any(|message| {
             message.role == Role::User
-                && message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, Content::Text(text) if text.starts_with(CONTEXT_BLOCK_START)))
+                && message.content.iter().any(
+                    |block| matches!(block, Content::Text(text) if has_turn_scoped_user_text(text)),
+                )
         });
         if !has_block {
             return;
@@ -558,13 +669,14 @@ impl Transcript {
             }
             for block in &mut message.content {
                 if let Content::Text(text) = block
-                    && text.starts_with(CONTEXT_BLOCK_START)
-                    && let Some(end) = text.find(CONTEXT_BLOCK_END)
+                    && has_turn_scoped_user_text(text)
                 {
-                    let rest = text[end + CONTEXT_BLOCK_END.len()..]
-                        .trim_start_matches('\n')
-                        .to_string();
-                    *text = rest;
+                    let cleaned = strip_turn_scoped_user_text(text);
+                    *text = if cleaned.trim().is_empty() {
+                        HISTORICAL_CONTROL_TURN.to_string()
+                    } else {
+                        cleaned
+                    };
                 }
             }
         }
@@ -901,10 +1013,10 @@ impl Transcript {
     // ---- rollback / reset ----------------------------------------------
 
     /// Strip trailing synthetic nudge messages (any `Role::User` message whose
-    /// text starts with a known nudge marker). Called at turn end so a stall
-    /// (repeat-nudge, continue-nudge, verify-fail) doesn't leave a synthetic
+    /// text starts with a known nudge marker). Called at turn end so a failed
+    /// or interrupted turn doesn't leave a synthetic
     /// user message as the last entry — which would absorb the next real prompt
-    /// via [`push_user_or_fold`] and make the model "pick up where it stalled"
+    /// via [`push_user_or_fold`] and make the model "pick up where it stopped"
     /// instead of addressing the new request.
     ///
     /// Only trailing nudges are removed: a nudge followed by a real assistant
@@ -1173,6 +1285,82 @@ mod tests {
             name: name.into(),
             arguments: "{}".into(),
         }])
+    }
+
+    #[test]
+    fn previous_turn_controls_are_ephemeral_and_preserve_user_text() {
+        let marked_plan = format!(
+            "{CONTEXT_BLOCK_START}\nrepo state\n{CONTEXT_BLOCK_END}\n\n\
+{TURN_CONTROL_START}\nPlan mode is ON for this turn.\n{TURN_CONTROL_END}\n\n\
+User request:\nbuild the follow graph"
+        );
+        let marked_build = format!(
+            "fix the graph\n\n{TURN_CONTROL_START}\nImplementation guard: edit files.\n{TURN_CONTROL_END}"
+        );
+        let legacy_plan = "You are in PLAN MODE. Do not modify files.\n\n\
+Produce a plan.\n\nUser request:\ncreate the profiles page\n\n\
+Read-only review guard: use only the currently advertised read-only inspection tools; never invent tool names. Do not write anything.";
+        let mut transcript = Transcript::new(vec![
+            user(&marked_plan),
+            assistant_text("plan ready"),
+            user(&marked_build),
+            assistant_text("done"),
+            user(legacy_plan),
+        ]);
+
+        transcript.strip_previous_turn_blocks();
+
+        assert_eq!(transcript.as_slice()[0].text(), "build the follow graph");
+        assert_eq!(transcript.as_slice()[2].text(), "fix the graph");
+        assert_eq!(transcript.as_slice()[4].text(), "create the profiles page");
+        assert!(transcript.as_slice().iter().all(|message| {
+            let text = message.text();
+            !text.contains(TURN_CONTROL_START)
+                && !text.contains(CONTEXT_BLOCK_START)
+                && !text.contains("Read-only review guard:")
+                && !text.starts_with(LEGACY_PLAN_MODE_START)
+        }));
+    }
+
+    #[test]
+    fn legacy_empty_plan_control_becomes_non_directive_history() {
+        let mut transcript = Transcript::new(vec![user(
+            "You are in PLAN MODE. Do not modify files.\n\nProduce a plan and wait.",
+        )]);
+
+        transcript.strip_previous_turn_blocks();
+
+        assert_eq!(transcript.as_slice()[0].text(), HISTORICAL_CONTROL_TURN);
+    }
+
+    #[test]
+    fn turn_control_cleanup_does_not_rewrite_unrelated_user_blocks() {
+        let poisoned =
+            format!("{TURN_CONTROL_START}\nPlan mode is OFF.\n{TURN_CONTROL_END}\n\nfix it");
+        let quoted = "Document this phrase:\n\nImplementation guard: this is user-authored prose.";
+        let mut transcript = Transcript::new(vec![
+            user(&poisoned),
+            assistant_text("ok"),
+            user(""),
+            assistant_text("ok"),
+            user(quoted),
+        ]);
+
+        transcript.strip_previous_turn_blocks();
+
+        assert_eq!(transcript.as_slice()[0].text(), "fix it");
+        assert_eq!(transcript.as_slice()[2].text(), "");
+        assert_eq!(transcript.as_slice()[4].text(), quoted);
+    }
+
+    #[test]
+    fn normal_control_preserves_user_text_that_quotes_legacy_plan_language() {
+        let quoted = "You are in PLAN MODE. This sentence is evidence from a bug report, not a current instruction.";
+        let controlled = format!(
+            "{TURN_CONTROL_START}\nPlan mode is OFF for this turn.\n{TURN_CONTROL_END}\n\n{quoted}"
+        );
+
+        assert_eq!(strip_turn_scoped_user_text(&controlled), quoted);
     }
 
     #[test]
@@ -2073,11 +2261,11 @@ mod tests {
 
     #[test]
     fn strip_trailing_nudges_removes_trailing_nudge() {
-        // A turn that ended with a repeat-nudge: the last message is a
+        // A turn that ended with a synthetic nudge: the last message is a
         // synthetic user nudge. Stripping should remove it, leaving the
         // assistant text as the last message.
         let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
-        t.push_nudge(NudgeKind::Repeat, "Act on the output above.");
+        t.push_nudge(NudgeKind::Continue, "Act on the output above.");
         assert_eq!(t.as_slice().last().unwrap().role, Role::User);
         t.strip_trailing_nudges();
         assert_eq!(t.as_slice().last().unwrap().role, Role::Assistant);
@@ -2132,11 +2320,11 @@ mod tests {
         t.strip_finalize_pair();
         assert_eq!(t.len(), len);
 
-        // A trailing repeat-nudge (not finalize) is also a no-op for this method.
+        // A trailing continuation nudge (not finalize) is also a no-op for this method.
         let mut t = Transcript::new(vec![user("do it"), assistant_text("done")]);
-        t.push_nudge(NudgeKind::Repeat, "Act on the output.");
+        t.push_nudge(NudgeKind::Continue, "Act on the output.");
         let len = t.len();
         t.strip_finalize_pair();
-        assert_eq!(t.len(), len, "repeat nudge is not a finalize pair");
+        assert_eq!(t.len(), len, "continuation nudge is not a finalize pair");
     }
 }

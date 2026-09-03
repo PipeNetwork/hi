@@ -59,7 +59,7 @@ pub(super) fn reconcile_verified_revision_with_message(
     // Only *code/config* deltas after the pass wipe it. Prose-only writes
     // (learned skills, docs) and empty deltas (revision bookkeeping with no
     // file change) must not flip a green turn into
-    // "incomplete · checks did not settle".
+    // a generic checks-did-not-settle warning.
     if post_verify_delta_is_benign(delta_since_verified) {
         // Keep the pass; refresh the sealed revision to the new head so
         // later settlement checks compare against the prose write too.

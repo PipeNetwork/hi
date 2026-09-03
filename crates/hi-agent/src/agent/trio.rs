@@ -1,4 +1,4 @@
-//! The `/loop trio` workflow: a bounded plan → execute → review loop for
+//! The `/loop trio` workflow: a plan → execute → review loop for
 //! medium-sized tasks that need more structure than a bare prompt but less
 //! than a full `/goal`. Modeled on the trio extension's single-session
 //! planner→executor→reviewer pattern, but built as a transient loop (no
@@ -16,13 +16,14 @@
 //!    fail-open gate as `/goal team`) reviews the turn's diff. `Approve`
 //!    stops the loop; `Object` sends it back for another execute round with
 //!    the objections visible.
-//! 4. **Stop** — the loop ends when the reviewer approves, `max_rounds` is
-//!    hit, or the executor's turn fails verification.
+//! 4. **Stop** — the loop ends when the reviewer approves or the executor's
+//!    turn fails verification. There is no default round limit; users who
+//!    need a finite boundary can opt into one with `--rounds N`.
 //!
 //! Unlike `/goal team`, this is a **per-task** review (one review of the whole
 //! execution), not a per-step review. Unlike `/goal`, there's no growing
 //! checklist, no autonomous drive, and no session persistence — it's a
-//! bounded loop that stops.
+//! transient loop that stops.
 
 use std::sync::Arc;
 
@@ -95,9 +96,18 @@ impl crate::Agent {
                 text.push_str(&t);
             }
         };
-        let completion = match self.provider.stream(request, &mut sink).await {
-            Ok(c) => c,
-            Err(err) => {
+        let timeout = self.side_call_timeout();
+        let completion = match crate::agent::turn::await_side_call(
+            timeout,
+            self.provider.stream(request, &mut sink),
+        )
+        .await
+        {
+            Err(_) => {
+                return Ok(prompt.to_string());
+            }
+            Ok(Ok(c)) => c,
+            Ok(Err(err)) => {
                 self.add_side_error_usage(&err);
                 // Planner failure is non-fatal — fall back to the prompt.
                 return Ok(prompt.to_string());
@@ -171,9 +181,21 @@ impl crate::Agent {
                 text.push_str(&t);
             }
         };
-        let completion = match self.provider.stream(request, &mut sink).await {
-            Ok(c) => c,
-            Err(err) => {
+        let timeout = self.side_call_timeout();
+        let completion = match crate::agent::turn::await_side_call(
+            timeout,
+            self.provider.stream(request, &mut sink),
+        )
+        .await
+        {
+            Err(timeout) => {
+                return SkepticVerdict::Unavailable(format!(
+                    "reviewer timed out after {:.1}s",
+                    timeout.as_secs_f64()
+                ));
+            }
+            Ok(Ok(c)) => c,
+            Ok(Err(err)) => {
                 self.add_side_error_usage(&err);
                 // Fail-open: a reviewer error can't wedge the loop.
                 return SkepticVerdict::Unavailable(format!("reviewer error: {err:#}"));

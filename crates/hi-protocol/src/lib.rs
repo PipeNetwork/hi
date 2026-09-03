@@ -295,21 +295,33 @@ impl FramedUnix {
         &mut self,
         deadline: Duration,
     ) -> Result<T, ProtocolError> {
-        let bytes = timeout(deadline, async {
-            let length = self.stream.read_u32().await? as usize;
-            if length == 0 || length > self.maximum_frame_bytes {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid frame length",
-                ));
-            }
-            let mut bytes = vec![0; length];
-            self.stream.read_exact(&mut bytes).await?;
-            Ok::<_, io::Error>(bytes)
-        })
-        .await
-        .map_err(|_| ProtocolError::Deadline)??;
+        let bytes = timeout(deadline, self.receive_frame())
+            .await
+            .map_err(|_| ProtocolError::Deadline)??;
         serde_json::from_slice(&bytes).map_err(|e| ProtocolError::Invalid(e.to_string()))
+    }
+
+    /// Receive the next frame without imposing an idle-session deadline.
+    ///
+    /// Frame-size validation and peer EOF still fail normally. Long-lived
+    /// protocol owners should cancel by dropping this future or closing the
+    /// stream rather than turning an idle connection into a fixed lifetime.
+    pub async fn receive_unlimited<T: DeserializeOwned>(&mut self) -> Result<T, ProtocolError> {
+        let bytes = self.receive_frame().await?;
+        serde_json::from_slice(&bytes).map_err(|e| ProtocolError::Invalid(e.to_string()))
+    }
+
+    async fn receive_frame(&mut self) -> Result<Vec<u8>, io::Error> {
+        let length = self.stream.read_u32().await? as usize;
+        if length == 0 || length > self.maximum_frame_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid frame length",
+            ));
+        }
+        let mut bytes = vec![0; length];
+        self.stream.read_exact(&mut bytes).await?;
+        Ok(bytes)
     }
 }
 
@@ -434,5 +446,28 @@ mod tests {
             rx.receive::<Handshake>(Duration::from_secs(1)).await,
             Err(ProtocolError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn unlimited_receive_waits_for_a_delayed_frame() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut tx = FramedUnix::new(left);
+        let mut rx = FramedUnix::new(right);
+        let handshake = Handshake {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            role: PeerRole::Candidate,
+            descriptor_hash: "a".repeat(64),
+            nonce: "delayed".into(),
+            client: None,
+        };
+        let expected = handshake.clone();
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            tx.send(&handshake, Duration::from_secs(1)).await.unwrap();
+        });
+
+        assert_eq!(rx.receive_unlimited::<Handshake>().await.unwrap(), expected);
+        sender.await.unwrap();
     }
 }

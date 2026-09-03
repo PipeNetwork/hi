@@ -61,39 +61,52 @@ fn delegate_tool_outcome(
     }
 }
 
-/// Default cap on `delegate` subagents per turn. Refilled every turn
-/// ([`crate::domain::SubagentSessionState::begin_turn`]). This is a
-/// runaway-spawn backstop, not a cost control: at 4 it fired mid-task in live
-/// runs ("delegate budget exhausted") and forced the driver to mop up work a
-/// delegate should have finished, so it sits at the configurable ceiling.
-pub(crate) const MAX_DELEGATE_SUBAGENTS_PER_TURN: u32 = MAX_CONFIGURED_DELEGATES;
-const MAX_CONFIGURED_DELEGATES: u32 = 16;
+/// Sentinel used when ordinary `delegate` work has no per-turn count ceiling.
+/// Concurrency and shared-resource admission remain independently bounded.
+pub(crate) const MAX_DELEGATE_SUBAGENTS_PER_TURN: u32 = u32::MAX;
+const MAX_CONFIGURED_PARALLEL_DELEGATES: usize = 16;
 
-/// The per-turn delegate cap. `HI_DELEGATE_SESSION_LIMIT` keeps its name for
-/// compatibility but now bounds each turn, not the whole session.
+/// Optional per-turn delegate cap. `HI_DELEGATE_SESSION_LIMIT` keeps its name
+/// for compatibility; unset, zero, and invalid values leave ordinary work
+/// unlimited. An explicit positive value is not constrained by the separate
+/// parallel fan-out ceiling.
 pub(crate) fn delegate_turn_limit() -> u32 {
-    configured_delegate_limit(
-        std::env::var("HI_DELEGATE_SESSION_LIMIT").ok().as_deref(),
-        MAX_DELEGATE_SUBAGENTS_PER_TURN as usize,
-    ) as u32
+    configured_delegate_turn_limit(std::env::var("HI_DELEGATE_SESSION_LIMIT").ok().as_deref())
 }
 
 /// Default maximum number of delegate subagents in one tool batch.
 pub(crate) const MAX_PARALLEL_DELEGATES: usize = 4;
 
 pub(crate) fn parallel_delegate_limit() -> usize {
-    configured_delegate_limit(
+    configured_parallel_delegate_limit(
         std::env::var("HI_PARALLEL_DELEGATES").ok().as_deref(),
         MAX_PARALLEL_DELEGATES,
     )
 }
 
-fn configured_delegate_limit(value: Option<&str>, default: usize) -> usize {
+fn configured_delegate_turn_limit(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        // The in-process counter reserves MAX for unlimited. Preserve an
+        // explicit environment cap at the largest enforceable finite value.
+        .map(|value| value.min(u32::MAX - 1))
+        .unwrap_or(MAX_DELEGATE_SUBAGENTS_PER_TURN)
+}
+
+fn configured_parallel_delegate_limit(value: Option<&str>, default: usize) -> usize {
     value
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
-        .clamp(1, MAX_CONFIGURED_DELEGATES as usize)
+        .clamp(1, MAX_CONFIGURED_PARALLEL_DELEGATES)
+}
+
+pub(crate) fn delegate_limit_denial(limit: u32) -> String {
+    format!(
+        "delegate limit reached (HI_DELEGATE_SESSION_LIMIT={limit} for this turn); \
+         implement the rest directly or raise/remove that explicit setting."
+    )
 }
 
 /// A prepared-but-not-yet-running delegate subagent job. Extracted from the
@@ -263,10 +276,10 @@ pub(crate) fn file_sets_disjoint(
 }
 
 impl crate::Agent {
-    /// Prepare a delegate subagent job: check budget, extract the runner and
+    /// Prepare a delegate subagent job: check an optional explicit quota, extract the runner and
     /// verify command, and extract the file set from the task description.
-    /// Returns `None` if the budget is exhausted, no runner is attached, or
-    /// the task is empty.
+    /// Returns `None` if an explicit quota is exhausted, no runner is attached,
+    /// or the task is empty.
     pub(crate) fn prepare_delegate(&mut self, arguments: &str) -> Option<(DelegateJob, u64)> {
         let parsed = serde_json::from_str::<Value>(arguments).ok();
         let task = parsed
@@ -278,7 +291,7 @@ impl crate::Agent {
             return None;
         }
         let session_limit = delegate_turn_limit();
-        if self.subagents.delegate_turn_used >= session_limit {
+        if session_limit != u32::MAX && self.subagents.delegate_turn_used >= session_limit {
             return None;
         }
         let runner = self.subagents.delegate_runner.clone()?;
@@ -373,15 +386,12 @@ impl crate::Agent {
                 false,
             );
         }
-        // Budget before runner so exhausted turns get a clear budget message
-        // even when a runner is attached (and tests that only set the counter).
+        // Check an explicit quota before the runner so a configured stop gets a
+        // clear explanation. The default sentinel is intentionally never a cap.
         let session_limit = delegate_turn_limit();
-        if self.subagents.delegate_turn_used >= session_limit {
+        if session_limit != u32::MAX && self.subagents.delegate_turn_used >= session_limit {
             return delegate_tool_outcome(
-                format!(
-                    "delegate budget exhausted ({session_limit} this turn); \
-                     implement the rest directly for this turn."
-                ),
+                delegate_limit_denial(session_limit),
                 hi_tools::ToolStatus::Denied,
                 false,
                 false,
@@ -558,7 +568,7 @@ impl crate::Agent {
         output
     }
 
-    /// Release a delegate budget slot when the job failed before running.
+    /// Release delegate accounting when the job failed before running.
     pub(crate) fn release_delegate_slot(&mut self) {
         self.subagents.release_delegate();
     }
@@ -633,10 +643,33 @@ mod tests {
     }
 
     #[test]
-    fn configured_limits_are_clamped() {
-        assert_eq!(configured_delegate_limit(Some("999"), 4), 16);
-        assert_eq!(configured_delegate_limit(Some("0"), 4), 4);
-        assert_eq!(configured_delegate_limit(Some("bad"), 4), 4);
+    fn delegate_turn_limit_defaults_unlimited_and_preserves_explicit_values() {
+        assert_eq!(configured_delegate_turn_limit(None), u32::MAX);
+        assert_eq!(configured_delegate_turn_limit(Some("0")), u32::MAX);
+        assert_eq!(configured_delegate_turn_limit(Some("bad")), u32::MAX);
+        assert_eq!(configured_delegate_turn_limit(Some("17")), 17);
+        assert_eq!(
+            configured_delegate_turn_limit(Some("4294967295")),
+            u32::MAX - 1
+        );
+        assert_eq!(
+            configured_delegate_turn_limit(Some("4294967294")),
+            u32::MAX - 1
+        );
+    }
+
+    #[test]
+    fn explicit_delegate_limit_denial_names_the_operator_setting() {
+        let message = delegate_limit_denial(23);
+        assert!(message.contains("HI_DELEGATE_SESSION_LIMIT=23"));
+        assert!(message.contains("raise/remove"));
+    }
+
+    #[test]
+    fn parallel_delegate_limit_remains_an_independent_concurrency_bound() {
+        assert_eq!(configured_parallel_delegate_limit(Some("999"), 4), 16);
+        assert_eq!(configured_parallel_delegate_limit(Some("0"), 4), 4);
+        assert_eq!(configured_parallel_delegate_limit(Some("bad"), 4), 4);
     }
 
     #[test]

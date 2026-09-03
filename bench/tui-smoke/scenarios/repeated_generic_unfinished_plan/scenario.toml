@@ -1,0 +1,77 @@
+schema_version = 1
+name = "repeated-generic-unfinished-plan"
+tags = ["curated", "pr", "generic-completion-guard-negative-control"]
+timeout_ms = 30000
+
+[[session.plan]]
+title = "Wire timeline replies and likes"
+status = "pending"
+
+[[provider.steps]]
+id = "generic-first"
+[provider.steps.expect]
+body_contains = ["Wire timeline replies and likes"]
+[provider.steps.response]
+kind = "text"
+text = "Completed the requested action."
+
+[[provider.steps]]
+id = "generic-bounded-retry"
+[provider.steps.expect]
+body_contains = ["actual result"]
+[provider.steps.response]
+kind = "text"
+text = "Completed the requested action."
+
+[[actions]]
+kind = "wait_provider_request"
+count = 2
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/stop_reason" = "infrastructure_failure" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_quiescent"
+source = "provider"
+quiet_ms = 400
+timeout_ms = 3000
+
+[[actions]]
+kind = "capture_screen"
+name = "bounded_failure"
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/plan/incomplete" = true, "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "infrastructure" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 2
+
+[[assertions]]
+kind = "screen"
+snapshot = "bounded_failure"
+excludes = ["Completed the requested action."]
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

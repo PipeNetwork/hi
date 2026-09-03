@@ -1186,10 +1186,26 @@ fn sync_parent(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
-    File::open(parent)
-        .with_context(|| format!("opening directory {} for sync", parent.display()))?
-        .sync_all()
-        .with_context(|| format!("syncing directory {}", parent.display()))
+    let result = File::open(parent)
+        .with_context(|| format!("opening directory {} for sync", parent.display()))
+        .and_then(|file| {
+            file.sync_all()
+                .with_context(|| format!("syncing directory {}", parent.display()))
+        });
+    #[cfg(target_os = "macos")]
+    if result.as_ref().is_err_and(|error| {
+        error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    }) {
+        // macOS commonly rejects fsync on directory handles (EPERM), even
+        // though the atomic file rename and file fsync succeeded. Treat that
+        // platform limitation as best-effort directory durability; do not
+        // turn a valid user-visible mutation into a failed transaction.
+        return Ok(());
+    }
+    result
 }
 
 #[cfg(not(unix))]

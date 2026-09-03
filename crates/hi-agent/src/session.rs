@@ -87,9 +87,54 @@ pub trait SessionSink: Send {
         Ok(())
     }
 
+    /// Persist plan-drive state plus an evidence-ledger delta. `reset_evidence`
+    /// starts a new structural scope; `evidence_add` contains only fixed-size
+    /// hashes newly credited in that scope. The default preserves compatibility
+    /// with sinks that only store pause/stall state.
+    fn record_plan_drive_state(
+        &mut self,
+        paused: bool,
+        stall: u32,
+        _reset_evidence: bool,
+        _evidence_add: &[String],
+    ) -> Result<()> {
+        self.record_plan_drive(paused, stall)
+    }
+
+    /// Persist plan-drive state together with whether an interruption pause is
+    /// consumed by the next real user turn. The compatibility default drops
+    /// only that policy bit while retaining the established pause/stall data.
+    fn record_plan_drive_state_with_policy(
+        &mut self,
+        paused: bool,
+        stall: u32,
+        _resume_on_user_input: bool,
+        reset_evidence: bool,
+        evidence_add: &[String],
+    ) -> Result<()> {
+        self.record_plan_drive_state(paused, stall, reset_evidence, evidence_add)
+    }
+
+    /// Persist whether the TUI plan-approval card was explicitly parked.
+    /// This is intentionally separate from `/plan pause`: reopening the card
+    /// consumes the approval park without resuming a paused drive.
+    fn record_plan_approval_parked(&mut self, _parked: bool) -> Result<()> {
+        Ok(())
+    }
+
     /// Persist goal-drive stall. Last write wins. Default no-op.
     fn record_goal_drive(&mut self, _stall: u32) -> Result<()> {
         Ok(())
+    }
+
+    /// Goal-drive counterpart to [`Self::record_plan_drive_state`].
+    fn record_goal_drive_state(
+        &mut self,
+        stall: u32,
+        _reset_evidence: bool,
+        _evidence_add: &[String],
+    ) -> Result<()> {
+        self.record_goal_drive(stall)
     }
 
     /// Persist the intra-session decision log so a resumed session keeps the

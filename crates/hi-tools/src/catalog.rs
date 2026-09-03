@@ -16,6 +16,43 @@ pub use optional_specs::{
     task_tool_spec, use_tool_tool_spec, wait_tasks_tool_spec,
 };
 
+/// Whether a tool is safe to pre-launch while a program is still streaming.
+/// This is deliberately separate from `read_only`: a read-only operation can
+/// still be nondeterministic, expensive, private, or externally observable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeculationClass {
+    Never,
+    PureLocal,
+    IdempotentExternal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolCostClass {
+    Normal,
+    Expensive,
+}
+
+/// The provider-facing envelope for a restricted Rhai program. It is kept out
+/// of `TOOL_SPECS` so providers without native tool calling see no schema.
+pub fn run_program_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "run_program".into(),
+        description: "Execute a bounded Rhai program. The final expression is returned. Use `tool(name, #{...})` for existing tools and `parallel([#{name: \"read\", args: #{path: \"src/lib.rs\"}}])` for independent calls. No filesystem, process, network, imports, dynamic evaluation, time, sleep, or exit functions are available; only approved host tools may run.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "maxLength": 262144,
+                    "description": "Rhai source whose final expression is the program result."
+                }
+            },
+            "required": ["source"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 /// The tools advertised to the model each turn.
 fn build_tool_specs() -> Vec<ToolSpec> {
     vec![
@@ -32,7 +69,8 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                             "type": "object",
                             "properties": {
                                 "title": { "type": "string", "description": "Short description of the step (a few words)." },
-                                "status": { "type": "string", "enum": ["pending", "active", "done"], "description": "pending (not started), active (in progress now), or done." }
+                                "status": { "type": "string", "enum": ["pending", "active", "done"], "description": "pending (not started), active (in progress now), or done." },
+                                "completion_evidence": { "type": "string", "description": "Optional concrete reason an implementation step is already satisfied or needs no workspace change. Use only when marking it done without a successful mutation or validation in this turn." }
                             },
                             "required": ["title", "status"]
                         }
@@ -148,12 +186,12 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command still running at its timeout continues in the background and returns a shell handle (`sh_N`) — read output with bash_output and stop with bash_kill. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get the handle immediately. For a slow but finite build or test suite, raise `timeout` so it finishes in the foreground. For very long background work (a big download, a multi-hour job), chain the follow-up steps into the command itself (`fetch && convert`) so nothing has to babysit it. On macOS/Linux, use `python3` rather than assuming a `python` command exists. Shell handles use the `sh_` prefix; agent subagent tasks use `task_` — do not mix them. Do not curl/wget a public http(s) URL the user already gave — use `web_fetch`. Do not use the shell as a search engine — use `web_search`. To inspect a workspace file, use the `read` tool instead of `cat`/`sed`/`head`.".into(),
+            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. Foreground commands wait until completion by default; omit timeout (or use 0) for no deadline, and the user can still cancel the turn cooperatively. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get a shell handle immediately, then read output with bash_output or stop it with bash_kill. For very long background work (a big download, a multi-hour job), chain the follow-up steps into the command itself (`fetch && convert`) so nothing has to babysit it. On macOS/Linux, use `python3` rather than assuming a `python` command exists. Shell handles use the `sh_` prefix; agent subagent tasks use `task_` — do not mix them. Do not curl/wget a public http(s) URL the user already gave — use `web_fetch`. Do not use the shell as a search engine — use `web_search`. To inspect a workspace file, use the `read` tool instead of `cat`/`sed`/`head`.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "The command to run." },
-                    "timeout": { "type": "integer", "description": "Optional wall-clock limit in seconds (default 600, max 3600). Raise it for a slow test/build suite. Ignored when run_in_background is true." },
+                    "timeout": { "type": "integer", "description": "Optional explicit wall-clock limit in seconds. Omit it or use 0 for no deadline. Ignored when run_in_background is true." },
                     "run_in_background": { "type": "boolean", "description": "Run detached and return a handle id immediately instead of waiting for the command to exit. Use for servers/watchers/long-lived processes." }
                 },
                 "required": ["command"]
@@ -388,6 +426,8 @@ pub enum ToolCapability {
     Mcp,
     Memory,
     Skill,
+    /// Structured orchestration capability (for example `run_program`).
+    Structure,
 }
 
 /// Why a tool is first-class instead of bash/skill — see
@@ -416,6 +456,10 @@ pub struct ToolMetadata {
     pub admission: ToolAdmission,
     /// Human-protocol alternative considered (bash/CLI/skill/editor).
     pub alternative: &'static str,
+    /// Independent policy for speculative program execution.
+    pub speculation: SpeculationClass,
+    pub cancellation_supported: bool,
+    pub cost_class: ToolCostClass,
 }
 
 macro_rules! tool_metadata {
@@ -436,11 +480,52 @@ macro_rules! tool_metadata {
             minimal: $minimal,
             admission: ToolAdmission::$admission,
             alternative: $alternative,
+            speculation: SpeculationClass::Never,
+            cancellation_supported: true,
+            cost_class: ToolCostClass::Normal,
+        }
+    };
+    (
+        $name:literal,
+        $capability:ident,
+        $read_only:literal,
+        $mutating:literal,
+        $minimal:literal,
+        $admission:ident,
+        $alternative:literal,
+        $speculation:ident,
+        $cost_class:ident
+    ) => {
+        ToolMetadata {
+            name: $name,
+            capability: ToolCapability::$capability,
+            read_only: $read_only,
+            filesystem_mutating: $mutating,
+            minimal: $minimal,
+            admission: ToolAdmission::$admission,
+            alternative: $alternative,
+            speculation: SpeculationClass::$speculation,
+            cancellation_supported: true,
+            cost_class: ToolCostClass::$cost_class,
         }
     };
 }
 
+const RUN_PROGRAM_METADATA: ToolMetadata = ToolMetadata {
+    name: "run_program",
+    capability: ToolCapability::Structure,
+    read_only: true,
+    filesystem_mutating: false,
+    minimal: false,
+    admission: ToolAdmission::Reliability,
+    alternative: "ordinary structured tool calls",
+    speculation: SpeculationClass::Never,
+    cancellation_supported: true,
+    cost_class: ToolCostClass::Normal,
+};
+
 pub const TOOL_CATALOG: &[ToolMetadata] = &[
+    RUN_PROGRAM_METADATA,
     tool_metadata!(
         "update_plan",
         Coordination,
@@ -493,7 +578,9 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         false,
         true,
         Reliability,
-        "bash cat/sed with line noise"
+        "bash cat/sed with line noise",
+        PureLocal,
+        Normal
     ),
     tool_metadata!(
         "write",
@@ -552,7 +639,9 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         Safety,
         "bash kill without handle tracking"
     ),
-    tool_metadata!("list", Repository, true, false, true, Structure, "bash ls"),
+    tool_metadata!(
+        "list", Repository, true, false, true, Structure, "bash ls", PureLocal, Normal
+    ),
     tool_metadata!(
         "diff",
         Repository,
@@ -560,7 +649,9 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         false,
         false,
         Structure,
-        "bash git diff"
+        "bash git diff",
+        PureLocal,
+        Normal
     ),
     tool_metadata!(
         "grep",
@@ -569,7 +660,9 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         false,
         true,
         Structure,
-        "bash rg/grep"
+        "bash rg/grep",
+        PureLocal,
+        Normal
     ),
     tool_metadata!(
         "glob",
@@ -578,7 +671,9 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         false,
         true,
         Structure,
-        "bash find"
+        "bash find",
+        PureLocal,
+        Normal
     ),
     tool_metadata!(
         "repo_map",
@@ -587,7 +682,9 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         false,
         true,
         Structure,
-        "blind list/grep orientation"
+        "blind list/grep orientation",
+        PureLocal,
+        Expensive
     ),
     tool_metadata!(
         "find_symbol",
@@ -596,7 +693,9 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         false,
         true,
         Structure,
-        "bash rg for definitions"
+        "bash rg for definitions",
+        PureLocal,
+        Normal
     ),
     tool_metadata!(
         "apply_patch",
@@ -642,7 +741,9 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         false,
         false,
         Structure,
-        "bash curl to a search API"
+        "bash curl to a search API",
+        IdempotentExternal,
+        Normal
     ),
     tool_metadata!(
         "web_fetch",
@@ -651,7 +752,9 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         false,
         false,
         Structure,
-        "bash curl | html2text"
+        "bash curl | html2text",
+        IdempotentExternal,
+        Expensive
     ),
     tool_metadata!(
         "research",
@@ -660,7 +763,9 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         false,
         false,
         Structure,
-        "web_search + web_fetch without rerank"
+        "web_search + web_fetch without rerank",
+        IdempotentExternal,
+        Expensive
     ),
     tool_metadata!(
         "research_read",
@@ -669,7 +774,9 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         false,
         false,
         Reliability,
-        "web_fetch of a researched page_id"
+        "web_fetch of a researched page_id",
+        IdempotentExternal,
+        Expensive
     ),
     tool_metadata!(
         "web_download",
@@ -809,7 +916,20 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
 ];
 
 pub fn tool_metadata(name: &str) -> Option<&'static ToolMetadata> {
-    TOOL_CATALOG.iter().find(|metadata| metadata.name == name)
+    if name == RUN_PROGRAM_METADATA.name {
+        Some(&RUN_PROGRAM_METADATA)
+    } else {
+        TOOL_CATALOG.iter().find(|metadata| metadata.name == name)
+    }
+}
+
+/// Returns the explicit speculation class for a built-in tool. The allowlist
+/// is intentionally tiny; adding a read-only tool does not implicitly make it
+/// eligible for shadow execution.
+pub fn speculation_class(name: &str) -> SpeculationClass {
+    tool_metadata(name)
+        .map(|metadata| metadata.speculation)
+        .unwrap_or(SpeculationClass::Never)
 }
 
 pub fn is_known_tool(name: &str) -> bool {

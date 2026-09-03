@@ -373,6 +373,7 @@ impl crate::App {
                     self.last_drive,
                     hi_agent::DriveAction::Idle {
                         reason: hi_agent::DriveIdleReason::PlanParked
+                            | hi_agent::DriveIdleReason::PlanApprovalParked
                     }
                 ) {
                     header.push_str(" · parked");
@@ -980,6 +981,20 @@ impl crate::App {
                 &mut info_spans,
                 &th,
                 Span::styled("durable", Style::default().fg(th.accent_success)),
+            );
+        }
+        if ui_layout.show_secondary_chrome() {
+            let reasoning = self
+                .reasoning_effort
+                .map(|effort| effort.as_str())
+                .unwrap_or("off");
+            chrome::push_chip(
+                &mut info_spans,
+                &th,
+                Span::styled(
+                    format!("reasoning: {reasoning}"),
+                    Style::default().fg(th.gray),
+                ),
             );
         }
         if ui_layout.show_secondary_chrome() {

@@ -4,8 +4,9 @@
 //! Resuming loads every line back as conversation history. Branching/tree
 //! sessions (pi-style) are a future extension; this is a linear log.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Take, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -65,13 +66,35 @@ enum SessionMeta {
     PlanDrive {
         #[serde(default)]
         paused: bool,
+        /// `Some(true)` identifies an interruption latch that a genuine user
+        /// turn consumes. Missing legacy records are inferred as interruption
+        /// pauses only when they follow a cancelled synthetic-drive rollback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_on_user_input: Option<bool>,
         #[serde(default)]
         stall: u32,
+        /// Delta-encoded exact novelty ledger. Raw tool signatures are hashed
+        /// before reaching this record. A reset starts a new plan-step scope.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        evidence_reset: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        evidence_add: Vec<String>,
+    },
+    /// The leftover-plan approval card was explicitly parked with Escape.
+    /// Kept separate from `PlanDrive.paused` so `/view-plan` cannot silently
+    /// consume an explicit `/plan pause`.
+    PlanApproval {
+        #[serde(default)]
+        parked: bool,
     },
     /// Goal auto-drive stall. Last write wins. Pause stays on `Goal`.
     GoalDrive {
         #[serde(default)]
         stall: u32,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        evidence_reset: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        evidence_add: Vec<String>,
     },
     /// One turn's final outcome, including why review produced no verdict
     /// when it didn't (that reason used to exist only as a transient status
@@ -105,6 +128,40 @@ enum SessionMeta {
         #[serde(default)]
         plan: Vec<hi_agent::PlanStep>,
     },
+}
+
+/// Open a stable, bounded snapshot of an append-only session. Limiting the
+/// reader to the length observed from the opened file descriptor prevents a
+/// busy writer from extending a status or resume scan indefinitely.
+pub(crate) fn session_snapshot_reader(path: &Path) -> std::io::Result<BufReader<Take<File>>> {
+    let file = File::open(path)?;
+    let snapshot_len = file.metadata()?.len();
+    Ok(BufReader::new(file.take(snapshot_len)))
+}
+
+/// Count JSONL records with fixed memory. A final unterminated record still
+/// counts, matching `str::lines()` and making crash-truncated tails visible in
+/// session listings without allocating their contents.
+fn session_line_count(path: &Path) -> usize {
+    let Ok(mut reader) = session_snapshot_reader(path) else {
+        return 0;
+    };
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut lines = 0_usize;
+    let mut saw_bytes = false;
+    let mut ended_with_newline = false;
+    loop {
+        let Ok(read) = reader.read(&mut buffer) else {
+            return 0;
+        };
+        if read == 0 {
+            break;
+        }
+        saw_bytes = true;
+        ended_with_newline = buffer[read - 1] == b'\n';
+        lines = lines.saturating_add(buffer[..read].iter().filter(|byte| **byte == b'\n').count());
+    }
+    lines.saturating_add(usize::from(saw_bytes && !ended_with_newline))
 }
 
 /// Appends messages to a session's JSONL file.
@@ -240,11 +297,55 @@ impl SessionSink for JsonlSession {
     }
 
     fn record_plan_drive(&mut self, paused: bool, stall: u32) -> Result<()> {
-        self.append_meta(&SessionMeta::PlanDrive { paused, stall })
+        self.record_plan_drive_state(paused, stall, false, &[])
+    }
+
+    fn record_plan_drive_state(
+        &mut self,
+        paused: bool,
+        stall: u32,
+        evidence_reset: bool,
+        evidence_add: &[String],
+    ) -> Result<()> {
+        self.record_plan_drive_state_with_policy(paused, stall, false, evidence_reset, evidence_add)
+    }
+
+    fn record_plan_drive_state_with_policy(
+        &mut self,
+        paused: bool,
+        stall: u32,
+        resume_on_user_input: bool,
+        evidence_reset: bool,
+        evidence_add: &[String],
+    ) -> Result<()> {
+        self.append_meta(&SessionMeta::PlanDrive {
+            paused,
+            resume_on_user_input: Some(resume_on_user_input),
+            stall,
+            evidence_reset,
+            evidence_add: evidence_add.to_vec(),
+        })
+    }
+
+    fn record_plan_approval_parked(&mut self, parked: bool) -> Result<()> {
+        self.append_meta(&SessionMeta::PlanApproval { parked })
     }
 
     fn record_goal_drive(&mut self, stall: u32) -> Result<()> {
-        self.append_meta(&SessionMeta::GoalDrive { stall })
+        self.record_goal_drive_state(stall, false, &[])
+    }
+
+    fn record_goal_drive_state(
+        &mut self,
+        stall: u32,
+        evidence_reset: bool,
+        evidence_add: &[String],
+    ) -> Result<()> {
+        self.append_meta(&SessionMeta::GoalDrive {
+            stall,
+            evidence_reset,
+            evidence_add: evidence_add.to_vec(),
+        })
     }
 
     fn record_state_replacement(
@@ -278,10 +379,51 @@ pub struct LoadedSession {
     pub plan: Vec<hi_agent::PlanStep>,
     /// Plan-drive pause restored from the last `PlanDrive` record.
     pub plan_drive_paused: bool,
+    /// Whether the restored pause is an interruption latch consumed by the
+    /// next genuine user turn instead of durable manual `/plan pause` intent.
+    pub plan_drive_resume_on_user_input: bool,
+    /// Whether leftover plan work is waiting on a parked approval card.
+    pub plan_approval_parked: bool,
     /// Consecutive no-progress plan-drive turns restored with pause.
     pub plan_drive_stall: u32,
     /// Consecutive no-progress goal-drive turns. Pause stays on `Goal`.
     pub goal_drive_stall: u32,
+    /// SHA-256 evidence identities already credited in the current plan scope.
+    pub plan_drive_evidence: Vec<String>,
+    /// SHA-256 evidence identities already credited in the current goal scope.
+    pub goal_drive_evidence: Vec<String>,
+}
+
+/// Replace an already-running agent with every durable part of a loaded
+/// session. In-place session switches and remote `resume-local` must restore
+/// the drive latches and evidence ledgers too, not only conversation history.
+pub fn apply_loaded_session(agent: &mut hi_agent::Agent, loaded: LoadedSession) -> Result<()> {
+    let LoadedSession {
+        messages,
+        usage,
+        checkpoint_refs,
+        name: _,
+        goal,
+        decisions,
+        plan,
+        plan_drive_paused,
+        plan_drive_resume_on_user_input,
+        plan_approval_parked,
+        plan_drive_stall,
+        goal_drive_stall,
+        plan_drive_evidence,
+        goal_drive_evidence,
+    } = loaded;
+    agent.apply_loaded_session(messages, usage, checkpoint_refs, goal, decisions, plan)?;
+    agent.restore_plan_drive_with_policy(
+        plan_drive_paused,
+        plan_drive_resume_on_user_input,
+        plan_drive_stall,
+        plan_drive_evidence,
+    );
+    agent.restore_plan_approval_parked(plan_approval_parked);
+    agent.restore_goal_drive(goal_drive_stall, goal_drive_evidence);
+    Ok(())
 }
 
 /// Atomically cache reconstructed session state at `path`. A failed restore
@@ -304,11 +446,27 @@ pub fn cache_loaded_session(path: &Path, loaded: &LoadedSession) -> Result<()> {
         )?;
         session.record(&[], loaded.usage)?;
         session.record_checkpoints(&loaded.checkpoint_refs)?;
-        if loaded.plan_drive_paused || loaded.plan_drive_stall > 0 {
-            session.record_plan_drive(loaded.plan_drive_paused, loaded.plan_drive_stall)?;
+        if loaded.plan_drive_paused
+            || loaded.plan_drive_stall > 0
+            || !loaded.plan_drive_evidence.is_empty()
+        {
+            session.record_plan_drive_state_with_policy(
+                loaded.plan_drive_paused,
+                loaded.plan_drive_stall,
+                loaded.plan_drive_resume_on_user_input,
+                true,
+                &loaded.plan_drive_evidence,
+            )?;
         }
-        if loaded.goal_drive_stall > 0 {
-            session.record_goal_drive(loaded.goal_drive_stall)?;
+        if loaded.plan_approval_parked {
+            session.record_plan_approval_parked(true)?;
+        }
+        if loaded.goal_drive_stall > 0 || !loaded.goal_drive_evidence.is_empty() {
+            session.record_goal_drive_state(
+                loaded.goal_drive_stall,
+                true,
+                &loaded.goal_drive_evidence,
+            )?;
         }
         if let Some(name) = &loaded.name {
             session.append_meta(&SessionMeta::Name { name: name.clone() })?;
@@ -549,9 +707,7 @@ pub fn local_sessions() -> Vec<FleetSessionInfo> {
                 .duration_since(modified)
                 .map(|d| humanize(d.as_secs()))
                 .unwrap_or_else(|_| "?".into());
-            let lines = fs::read_to_string(&path)
-                .map(|t| t.lines().count())
-                .unwrap_or(0);
+            let lines = session_line_count(&path);
             FleetSessionInfo {
                 id,
                 title,
@@ -597,9 +753,7 @@ fn fleet_sessions_in(dir: &Path) -> Vec<FleetSessionInfo> {
                 .duration_since(modified)
                 .map(|d| humanize(d.as_secs()))
                 .unwrap_or_else(|_| "?".into());
-            let lines = fs::read_to_string(&path)
-                .map(|t| t.lines().count())
-                .unwrap_or(0);
+            let lines = session_line_count(&path);
             FleetSessionInfo {
                 id,
                 title,
@@ -630,33 +784,52 @@ pub struct SessionGoalSummary {
     pub total: usize,
 }
 
+/// Minimal metadata view for fleet goal status. In particular, parsing a
+/// `state_replacement` ignores its potentially large message transcript while
+/// retaining the authoritative replacement goal.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum GoalSummaryRecord {
+    Goal {
+        goal: hi_agent::Goal,
+    },
+    GoalCleared,
+    StateReplacement {
+        #[serde(default)]
+        goal: Option<hi_agent::Goal>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// Header-only view used by listings. Unknown fields (notably message content
+/// and state-replacement transcripts) are skipped by serde instead of being
+/// materialized merely to find a title or last-written name.
+#[derive(Deserialize)]
+struct SessionDisplayHeader {
+    #[serde(default)]
+    role: Option<Role>,
+    #[serde(default, rename = "type")]
+    record_type: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
 /// Read the last-written goal state from a session file (`goal` /
 /// `goal_cleared` / `state_replacement` meta lines, last-wins — mirroring the
 /// resume loader) without loading the whole conversation.
 pub fn session_goal_summary(path: &Path) -> Option<SessionGoalSummary> {
-    let text = fs::read_to_string(path).ok()?;
+    let reader = session_snapshot_reader(path).ok()?;
     let mut goal: Option<hi_agent::Goal> = None;
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+    for line in reader.lines() {
+        let Ok(line) = line else {
             continue;
         };
-        match value.get("type").and_then(|t| t.as_str()) {
-            Some("goal") => {
-                if let Some(g) = value
-                    .get("goal")
-                    .and_then(|g| serde_json::from_value(g.clone()).ok())
-                {
-                    goal = Some(g);
-                }
-            }
-            Some("goal_cleared") => goal = None,
-            Some("state_replacement") => {
-                goal = value
-                    .get("goal")
-                    .filter(|g| !g.is_null())
-                    .and_then(|g| serde_json::from_value(g.clone()).ok());
-            }
-            _ => {}
+        match serde_json::from_str::<GoalSummaryRecord>(&line) {
+            Ok(GoalSummaryRecord::Goal { goal: next }) => goal = Some(next),
+            Ok(GoalSummaryRecord::GoalCleared) => goal = None,
+            Ok(GoalSummaryRecord::StateReplacement { goal: next }) => goal = next,
+            Ok(GoalSummaryRecord::Other) | Err(_) => {}
         }
     }
     goal.map(|g| SessionGoalSummary {
@@ -711,6 +884,10 @@ pub fn new_fleet_session_path() -> Result<PathBuf> {
 /// different directory (e.g. an id copied from a `--list-sessions` run
 /// elsewhere, or resuming after `cd`-ing to another project).
 pub fn session_path(id: &str) -> Result<PathBuf> {
+    // Session ids become local path components here, including on the global
+    // fallback. Validate before touching the data root so `--resume ../...`
+    // can never escape a sessions directory or target an arbitrary file.
+    crate::sync::validate_session_id(id)?;
     let name = if id.ends_with(".jsonl") {
         id.to_string()
     } else {
@@ -774,22 +951,25 @@ fn session_display_name(path: &Path) -> String {
 /// derived from the first user message. Streaming via `BufReader` avoids
 /// loading the entire file into memory (some sessions are several MB).
 fn session_display_name_impl(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
-    use std::io::BufRead;
+    let reader = session_snapshot_reader(path).ok()?;
     let mut custom_name = None;
     let mut first_user = None;
-    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-        if first_user.is_none()
-            && let Ok(message) = serde_json::from_str::<Message>(&line)
-            && message.role == Role::User
-        {
-            let title = session_title(&message.text());
-            if !title.is_empty() {
-                first_user = Some(title);
+    for line in reader.lines().map_while(Result::ok) {
+        if let Ok(header) = serde_json::from_str::<SessionDisplayHeader>(&line) {
+            if first_user.is_none()
+                && header.role == Some(Role::User)
+                && let Ok(message) = serde_json::from_str::<Message>(&line)
+            {
+                let title = session_title(&message.text());
+                if !title.is_empty() {
+                    first_user = Some(title);
+                }
             }
-        }
-        if let Ok(SessionMeta::Name { name: next }) = serde_json::from_str::<SessionMeta>(&line) {
-            custom_name = (!next.trim().is_empty()).then(|| next.trim().to_string());
+            if header.record_type.as_deref() == Some("name")
+                && let Some(next) = header.name
+            {
+                custom_name = (!next.trim().is_empty()).then(|| next.trim().to_string());
+            }
         }
     }
     custom_name.or(first_user)
@@ -818,10 +998,124 @@ pub fn latest_session() -> Option<PathBuf> {
         })
 }
 
+fn apply_drive_evidence_delta(evidence: &mut BTreeSet<String>, reset: bool, added: Vec<String>) {
+    if reset {
+        evidence.clear();
+    }
+    evidence.extend(added.into_iter().filter(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }));
+}
+
+/// Recover the meaning of pre-policy `plan_drive` pause records without
+/// treating every old manual `/plan pause` as interruption-resumable.
+///
+/// Old cancellation cleanup first replaced the transcript with a shorter
+/// snapshot that discarded a synthetic plan-drive prompt, then wrote one or
+/// more paused drive records (usage/checkpoint records could sit between).
+/// That rollback signature is specific enough to migrate the interruption;
+/// an otherwise bare legacy pause retains the historical manual semantics.
+#[derive(Default)]
+struct LegacyPlanPauseMigration {
+    cancellation_candidate: bool,
+    inferred_interruption_chain: bool,
+    /// A missing-policy pause was identified as an interruption latch. Keep
+    /// this separate from `inferred_interruption_chain`: ordinary turn records
+    /// end the adjacent pause-record chain but must not forget that a later
+    /// legacy user turn can consume the inferred latch.
+    inferred_pause_active: bool,
+    /// Whether the first turn-starting user message after the inferred pause
+    /// was real user work rather than a synthetic plan/goal continuation.
+    /// Later user-role nudge messages in the same turn must not overwrite it.
+    pending_real_user_turn: Option<bool>,
+}
+
+impl LegacyPlanPauseMigration {
+    fn note_state_replacement(&mut self, before: &[Message], replacement: &[Message]) {
+        self.cancellation_candidate = replacement.len() < before.len()
+            && before[replacement.len()..].iter().any(|message| {
+                message.role == Role::User && message.text().contains(hi_agent::PLAN_DRIVE_PROMPT)
+            });
+        self.inferred_interruption_chain = false;
+        // A replacement abandons the attempted turn. A subsequent successful
+        // user turn may still consume the older inferred interruption latch.
+        self.pending_real_user_turn = None;
+    }
+
+    fn clear_boundary(&mut self) {
+        self.cancellation_candidate = false;
+        self.inferred_interruption_chain = false;
+    }
+
+    fn invalidate(&mut self) {
+        self.clear_boundary();
+        self.inferred_pause_active = false;
+        self.pending_real_user_turn = None;
+    }
+
+    fn resolve(&mut self, paused: bool, explicit: Option<bool>) -> bool {
+        let inferred = explicit.is_none()
+            && paused
+            && (self.cancellation_candidate || self.inferred_interruption_chain);
+        let resume_on_user_input = explicit.unwrap_or(inferred);
+        self.cancellation_candidate = false;
+        self.inferred_interruption_chain = paused && resume_on_user_input;
+        // Every drive-state record is authoritative. Only an adjacent legacy
+        // chain remains eligible for completed-user-turn migration; an
+        // explicit-policy record or a later unrelated record supersedes it.
+        self.inferred_pause_active = inferred;
+        self.pending_real_user_turn = None;
+        resume_on_user_input
+    }
+
+    fn note_message(&mut self, message: &Message) {
+        self.clear_boundary();
+        if self.inferred_pause_active
+            && self.pending_real_user_turn.is_none()
+            && message.role == Role::User
+        {
+            let text = message.text();
+            // Persisted prompts may have session-context wrappers prepended,
+            // so exact `DriveKind::from_prompt` classification is too narrow
+            // for legacy logs. The synthetic sentinels themselves are unique.
+            let synthetic = text.contains(hi_agent::PLAN_DRIVE_PROMPT)
+                || text.contains(hi_agent::GOAL_CONTINUE_PROMPT);
+            self.pending_real_user_turn = Some(!synthetic);
+        }
+    }
+
+    fn completed_user_turn_consumes_pause(
+        &mut self,
+        status: hi_agent::TurnStatus,
+        stop_reason: hi_agent::TurnStopReason,
+    ) -> bool {
+        let successful = status == hi_agent::TurnStatus::Completed
+            && !matches!(
+                stop_reason,
+                hi_agent::TurnStopReason::Cancelled
+                    | hi_agent::TurnStopReason::TurnLimit
+                    | hi_agent::TurnStopReason::InfrastructureFailure
+                    | hi_agent::TurnStopReason::NoProgress
+            );
+        let consume =
+            self.inferred_pause_active && self.pending_real_user_turn == Some(true) && successful;
+        self.pending_real_user_turn = None;
+        if consume {
+            self.inferred_pause_active = false;
+            self.inferred_interruption_chain = false;
+            self.cancellation_candidate = false;
+        }
+        consume
+    }
+}
+
 /// Load a session's messages back into conversation history.
 pub fn load_history(path: &Path) -> Result<LoadedSession> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("reading session {}", path.display()))?;
+    let mut reader = session_snapshot_reader(path)
+        .with_context(|| format!("opening session {}", path.display()))?;
     let mut messages = Vec::new();
     let mut usage = Usage::default();
     let mut checkpoint_refs = Vec::new();
@@ -830,15 +1124,43 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let mut loaded_plan = Vec::new();
     let mut loaded_name = None;
     let mut loaded_plan_drive_paused = false;
+    let mut loaded_plan_drive_resume_on_user_input = false;
+    let mut legacy_plan_pause = LegacyPlanPauseMigration::default();
+    let mut loaded_plan_approval_parked = false;
     let mut loaded_plan_drive_stall = 0;
     let mut loaded_goal_drive_stall = 0;
-    for line in text.lines() {
+    let mut loaded_plan_drive_evidence = BTreeSet::new();
+    let mut loaded_goal_drive_evidence = BTreeSet::new();
+    let mut record = Vec::new();
+    loop {
+        record.clear();
+        if reader
+            .read_until(b'\n', &mut record)
+            .with_context(|| format!("reading session {}", path.display()))?
+            == 0
+        {
+            break;
+        }
+        if record.last() == Some(&b'\n') {
+            record.pop();
+        }
+        if record.last() == Some(&b'\r') {
+            record.pop();
+        }
+        let Ok(line) = std::str::from_utf8(&record) else {
+            // A concurrent/crashed append may leave an incomplete UTF-8 tail.
+            // Treat it like any other corrupted record and retain later valid
+            // records when the corruption is in the middle of an old log.
+            legacy_plan_pause.invalidate();
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
         if let Ok(meta) = serde_json::from_str::<SessionMeta>(line) {
             match meta {
                 SessionMeta::Name { name } => {
+                    legacy_plan_pause.clear_boundary();
                     loaded_name = (!name.trim().is_empty()).then(|| name.trim().to_string());
                 }
                 SessionMeta::Usage {
@@ -865,41 +1187,106 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                 SessionMeta::Compaction {
                     messages: compacted,
                 } => {
+                    legacy_plan_pause.clear_boundary();
                     // Replace all prior messages with the compacted set.
                     messages = compacted;
                 }
                 SessionMeta::Goal { goal } => {
+                    legacy_plan_pause.clear_boundary();
                     loaded_goal = Some(goal);
                 }
                 SessionMeta::GoalCleared => {
+                    legacy_plan_pause.clear_boundary();
                     loaded_goal = None;
+                    loaded_goal_drive_evidence.clear();
                 }
                 SessionMeta::Decisions { decisions } => {
+                    legacy_plan_pause.clear_boundary();
                     loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
                 }
                 SessionMeta::Plan { steps } => {
+                    legacy_plan_pause.clear_boundary();
                     loaded_plan = steps;
                 }
-                SessionMeta::PlanCleared => loaded_plan.clear(),
-                SessionMeta::PlanDrive { paused, stall } => {
+                SessionMeta::PlanCleared => {
+                    legacy_plan_pause.clear_boundary();
+                    loaded_plan.clear();
+                    loaded_plan_drive_evidence.clear();
+                }
+                SessionMeta::PlanDrive {
+                    paused,
+                    resume_on_user_input,
+                    stall,
+                    evidence_reset,
+                    evidence_add,
+                } => {
                     loaded_plan_drive_paused = paused;
+                    loaded_plan_drive_resume_on_user_input =
+                        legacy_plan_pause.resolve(paused, resume_on_user_input);
                     loaded_plan_drive_stall = stall;
+                    apply_drive_evidence_delta(
+                        &mut loaded_plan_drive_evidence,
+                        evidence_reset,
+                        evidence_add,
+                    );
                 }
-                SessionMeta::GoalDrive { stall } => {
+                SessionMeta::PlanApproval { parked } => {
+                    legacy_plan_pause.clear_boundary();
+                    loaded_plan_approval_parked = parked;
+                }
+                SessionMeta::GoalDrive {
+                    stall,
+                    evidence_reset,
+                    evidence_add,
+                } => {
+                    legacy_plan_pause.clear_boundary();
                     loaded_goal_drive_stall = stall;
+                    apply_drive_evidence_delta(
+                        &mut loaded_goal_drive_evidence,
+                        evidence_reset,
+                        evidence_add,
+                    );
                 }
-                // Diagnostic record for post-mortems; nothing to restore.
-                SessionMeta::TurnOutcome { .. } => {}
+                // Cancellation outcomes may be written between rollback and
+                // the legacy pause record. Other settlements break the
+                // cancellation signature.
+                SessionMeta::TurnOutcome {
+                    status,
+                    stop_reason,
+                    ..
+                } => {
+                    if status != hi_agent::TurnStatus::Cancelled
+                        && !matches!(
+                            stop_reason,
+                            hi_agent::TurnStopReason::Cancelled
+                                | hi_agent::TurnStopReason::TurnLimit
+                        )
+                    {
+                        legacy_plan_pause.clear_boundary();
+                    }
+                    if legacy_plan_pause.completed_user_turn_consumes_pause(status, stop_reason) {
+                        loaded_plan_drive_paused = false;
+                        loaded_plan_drive_resume_on_user_input = false;
+                        loaded_plan_drive_stall = 0;
+                        loaded_plan_drive_evidence.clear();
+                    }
+                }
                 SessionMeta::StateReplacement {
                     messages: replacement,
                     goal,
                     decisions,
                     plan,
                 } => {
+                    legacy_plan_pause.note_state_replacement(&messages, &replacement);
                     messages = replacement;
                     loaded_goal = goal;
                     loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
                     loaded_plan = plan;
+                    // A durable rewind replaces conversational/goal state, but
+                    // it does not start a new drive-evidence scope in the live
+                    // Agent. Preserve the ledger too so restart matches the
+                    // uninterrupted process. Explicit evidence reset deltas
+                    // remain the sole scope boundary.
                 }
             }
             continue;
@@ -911,9 +1298,11 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                 // last line from a crash mid-flush) rather than failing the
                 // entire resume. The session is still usable up to the last
                 // complete line; a truncated final line carries no real content.
+                legacy_plan_pause.invalidate();
                 continue;
             }
         };
+        legacy_plan_pause.note_message(&message);
         messages.push(message);
     }
     if loaded_plan
@@ -931,8 +1320,12 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         decisions: loaded_decisions,
         plan: loaded_plan,
         plan_drive_paused: loaded_plan_drive_paused,
+        plan_drive_resume_on_user_input: loaded_plan_drive_resume_on_user_input,
+        plan_approval_parked: loaded_plan_approval_parked,
         plan_drive_stall: loaded_plan_drive_stall,
         goal_drive_stall: loaded_goal_drive_stall,
+        plan_drive_evidence: loaded_plan_drive_evidence.into_iter().collect(),
+        goal_drive_evidence: loaded_goal_drive_evidence.into_iter().collect(),
     })
 }
 
@@ -959,13 +1352,21 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
     let mut loaded_plan = Vec::new();
     let mut loaded_name = None;
     let mut loaded_plan_drive_paused = false;
+    let mut loaded_plan_drive_resume_on_user_input = false;
+    let mut legacy_plan_pause = LegacyPlanPauseMigration::default();
+    let mut loaded_plan_approval_parked = false;
     let mut loaded_plan_drive_stall = 0;
     let mut loaded_goal_drive_stall = 0;
+    let mut loaded_plan_drive_evidence = BTreeSet::new();
+    let mut loaded_goal_drive_evidence = BTreeSet::new();
 
     for record in records {
         if record.record_type == "message" {
             if let Ok(message) = serde_json::from_str::<Message>(&record.payload_json) {
+                legacy_plan_pause.note_message(&message);
                 messages.push(message);
+            } else {
+                legacy_plan_pause.invalidate();
             }
             continue;
         }
@@ -973,6 +1374,7 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
         if let Ok(meta) = serde_json::from_str::<SessionMeta>(&record.payload_json) {
             match meta {
                 SessionMeta::Name { name } => {
+                    legacy_plan_pause.clear_boundary();
                     loaded_name = (!name.trim().is_empty()).then(|| name.trim().to_string());
                 }
                 SessionMeta::Usage {
@@ -999,40 +1401,108 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
                 SessionMeta::Compaction {
                     messages: compacted,
                 } => {
+                    legacy_plan_pause.clear_boundary();
                     messages = compacted;
                 }
                 SessionMeta::Goal { goal } => {
+                    legacy_plan_pause.clear_boundary();
                     loaded_goal = Some(goal);
                 }
                 SessionMeta::GoalCleared => {
+                    legacy_plan_pause.clear_boundary();
                     loaded_goal = None;
+                    loaded_goal_drive_evidence.clear();
                 }
                 SessionMeta::Decisions { decisions } => {
+                    legacy_plan_pause.clear_boundary();
                     loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
                 }
-                SessionMeta::Plan { steps } => loaded_plan = steps,
-                SessionMeta::PlanCleared => loaded_plan.clear(),
-                SessionMeta::PlanDrive { paused, stall } => {
+                SessionMeta::Plan { steps } => {
+                    legacy_plan_pause.clear_boundary();
+                    loaded_plan = steps;
+                }
+                SessionMeta::PlanCleared => {
+                    legacy_plan_pause.clear_boundary();
+                    loaded_plan.clear();
+                    loaded_plan_drive_evidence.clear();
+                }
+                SessionMeta::PlanDrive {
+                    paused,
+                    resume_on_user_input,
+                    stall,
+                    evidence_reset,
+                    evidence_add,
+                } => {
                     loaded_plan_drive_paused = paused;
+                    loaded_plan_drive_resume_on_user_input =
+                        legacy_plan_pause.resolve(paused, resume_on_user_input);
                     loaded_plan_drive_stall = stall;
+                    apply_drive_evidence_delta(
+                        &mut loaded_plan_drive_evidence,
+                        evidence_reset,
+                        evidence_add,
+                    );
                 }
-                SessionMeta::GoalDrive { stall } => {
+                SessionMeta::PlanApproval { parked } => {
+                    legacy_plan_pause.clear_boundary();
+                    loaded_plan_approval_parked = parked;
+                }
+                SessionMeta::GoalDrive {
+                    stall,
+                    evidence_reset,
+                    evidence_add,
+                } => {
+                    legacy_plan_pause.clear_boundary();
                     loaded_goal_drive_stall = stall;
+                    apply_drive_evidence_delta(
+                        &mut loaded_goal_drive_evidence,
+                        evidence_reset,
+                        evidence_add,
+                    );
                 }
-                // Diagnostic record for post-mortems; nothing to restore.
-                SessionMeta::TurnOutcome { .. } => {}
+                // Cancellation outcomes may be written between rollback and
+                // the legacy pause record. Other settlements break the
+                // cancellation signature.
+                SessionMeta::TurnOutcome {
+                    status,
+                    stop_reason,
+                    ..
+                } => {
+                    if status != hi_agent::TurnStatus::Cancelled
+                        && !matches!(
+                            stop_reason,
+                            hi_agent::TurnStopReason::Cancelled
+                                | hi_agent::TurnStopReason::TurnLimit
+                        )
+                    {
+                        legacy_plan_pause.clear_boundary();
+                    }
+                    if legacy_plan_pause.completed_user_turn_consumes_pause(status, stop_reason) {
+                        loaded_plan_drive_paused = false;
+                        loaded_plan_drive_resume_on_user_input = false;
+                        loaded_plan_drive_stall = 0;
+                        loaded_plan_drive_evidence.clear();
+                    }
+                }
                 SessionMeta::StateReplacement {
                     messages: replacement,
                     goal,
                     decisions,
                     plan,
                 } => {
+                    legacy_plan_pause.note_state_replacement(&messages, &replacement);
                     messages = replacement;
                     loaded_goal = goal;
                     loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
                     loaded_plan = plan;
+                    // Keep parity with the local JSONL loader above: state
+                    // replacement is not itself an evidence-scope reset.
                 }
             }
+        } else {
+            // Do not let an unknown or malformed record bridge a rollback to
+            // a later, unrelated manual pause.
+            legacy_plan_pause.invalidate();
         }
     }
 
@@ -1051,8 +1521,12 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
         decisions: loaded_decisions,
         plan: loaded_plan,
         plan_drive_paused: loaded_plan_drive_paused,
+        plan_drive_resume_on_user_input: loaded_plan_drive_resume_on_user_input,
+        plan_approval_parked: loaded_plan_approval_parked,
         plan_drive_stall: loaded_plan_drive_stall,
         goal_drive_stall: loaded_goal_drive_stall,
+        plan_drive_evidence: loaded_plan_drive_evidence.into_iter().collect(),
+        goal_drive_evidence: loaded_goal_drive_evidence.into_iter().collect(),
     })
 }
 ///
@@ -1093,19 +1567,24 @@ pub fn list_sessions() -> Result<()> {
     }
     entries.sort_by_key(|e| std::cmp::Reverse(e.1));
 
-    // Resolve display names in parallel — each session file is read and parsed
-    // independently, so this is embarrassingly parallel. With many sessions the
-    // sequential read dominated `--list-sessions` latency.
-    let titles: Vec<String> = std::thread::scope(|scope| {
-        let handles: Vec<_> = entries
-            .iter()
-            .map(|(path, _, _)| scope.spawn(move || session_display_name(path)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| "(no prompt yet)".into()))
-            .collect()
-    });
+    // Resolve display names concurrently, but cap the number of simultaneous
+    // record buffers. Spawning one reader per historical session can otherwise
+    // amplify a handful of large message records into an avoidable memory spike.
+    const TITLE_SCAN_CONCURRENCY: usize = 8;
+    let mut titles = Vec::with_capacity(entries.len());
+    for chunk in entries.chunks(TITLE_SCAN_CONCURRENCY) {
+        std::thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .map(|(path, _, _)| scope.spawn(move || session_display_name(path)))
+                .collect::<Vec<_>>();
+            titles.extend(
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap_or_else(|_| "(no prompt yet)".into())),
+            );
+        });
+    }
 
     let now = SystemTime::now();
     for ((path, modified, digest), title) in entries.iter().zip(titles.iter()) {
@@ -1146,8 +1625,10 @@ fn humanize(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        JsonlSession, LoadedSession, SessionMeta, cache_loaded_session, cwd_digest, load_history,
-        machine_id, session_display_name, session_title,
+        JsonlSession, LoadedSession, RemoteRecord, SessionMeta, apply_loaded_session,
+        cache_loaded_session, cwd_digest, load_history, load_history_from_records, machine_id,
+        session_display_name, session_goal_summary, session_line_count, session_path,
+        session_title,
     };
     use hi_agent::SessionSink;
     use hi_ai::{Message, Usage};
@@ -1181,6 +1662,135 @@ mod tests {
     }
 
     #[test]
+    fn explicit_session_ids_are_single_safe_path_components() {
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "nested/session",
+            r"..\escape",
+            "/absolute/session",
+            "session\0suffix",
+        ] {
+            assert!(
+                session_path(invalid).is_err(),
+                "unsafe session id unexpectedly accepted: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_count_uses_fixed_chunks_and_counts_an_unterminated_tail() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-line-count-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let body = format!("{}\nsmall\nunterminated", "x".repeat(192 * 1024));
+        std::fs::write(&path, body).unwrap();
+
+        assert_eq!(session_line_count(&path), 3);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn large_many_record_history_streams_and_preserves_replacement_semantics() {
+        use std::io::{BufWriter, Write};
+
+        const STALE_RECORDS: usize = 8_192;
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-streaming-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+        let padding = "x".repeat(512);
+        for index in 0..STALE_RECORDS {
+            serde_json::to_writer(
+                &mut writer,
+                &Message::assistant(vec![hi_ai::Content::Text(format!(
+                    "stale-{index}-{padding}"
+                ))]),
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+        assert!(std::fs::metadata(&path).unwrap().len() > 4 * 1024 * 1024);
+
+        let mut session = JsonlSession::new(path.clone());
+        session
+            .record_compaction(&[
+                Message::system("compacted system"),
+                Message::user("compacted prompt"),
+            ])
+            .unwrap();
+        session
+            .record(
+                &[Message::assistant(vec![hi_ai::Content::Text(
+                    "after compaction".into(),
+                )])],
+                Usage::default(),
+            )
+            .unwrap();
+        let goal = hi_agent::Goal::new("authoritative goal", vec!["keep going".into()]);
+        session
+            .record_state_replacement(
+                &[
+                    Message::system("replacement system"),
+                    Message::user("current prompt"),
+                ],
+                Some(&goal),
+                &hi_agent::DecisionLog::default(),
+                &[],
+            )
+            .unwrap();
+        session
+            .record(
+                &[Message::assistant(vec![hi_ai::Content::Text(
+                    "current answer".into(),
+                )])],
+                Usage {
+                    input_tokens: 11,
+                    output_tokens: 7,
+                    ..Usage::default()
+                },
+            )
+            .unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>(),
+            vec!["replacement system", "current prompt", "current answer"]
+        );
+        assert_eq!(loaded.usage.input_tokens, 11);
+        assert_eq!(
+            loaded.goal.as_ref().map(|goal| goal.objective.as_str()),
+            Some("authoritative goal")
+        );
+        let summary = session_goal_summary(&path).expect("replacement goal is authoritative");
+        assert!(summary.active);
+        assert_eq!((summary.done, summary.total), (0, 1));
+        assert_eq!(session_line_count(&path), STALE_RECORDS + 6);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn restored_session_cache_round_trips_complete_state() {
         let path = std::env::temp_dir().join(format!(
             "hi-session-restore-{}-{}.jsonl",
@@ -1203,8 +1813,12 @@ mod tests {
             decisions: hi_agent::DecisionLog::default(),
             plan: Vec::new(),
             plan_drive_paused: false,
+            plan_drive_resume_on_user_input: false,
+            plan_approval_parked: false,
             plan_drive_stall: 0,
             goal_drive_stall: 0,
+            plan_drive_evidence: vec!["a".repeat(64)],
+            goal_drive_evidence: vec!["b".repeat(64)],
         };
 
         cache_loaded_session(&path, &expected).expect("cache restored session");
@@ -1216,7 +1830,76 @@ mod tests {
         assert_eq!(loaded.usage.output_tokens, expected.usage.output_tokens);
         assert_eq!(loaded.checkpoint_refs, expected.checkpoint_refs);
         assert_eq!(loaded.name, expected.name);
+        assert_eq!(loaded.plan_drive_evidence, expected.plan_drive_evidence);
+        assert_eq!(loaded.goal_drive_evidence, expected.goal_drive_evidence);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn apply_loaded_session_replaces_live_drive_state_and_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-session-apply-loaded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = hi_agent::AgentConfig {
+            paths: hi_agent::AgentPaths {
+                workspace_root: root.clone(),
+                state_root: root.join("state"),
+            },
+            ..hi_agent::AgentConfig::default()
+        };
+        let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+            "http://127.0.0.1:1/v1".into(),
+            "unused".into(),
+        ));
+        let mut agent = hi_agent::Agent::new(provider, config).unwrap();
+        agent.restore_plan_drive(true, 9, vec!["c".repeat(64)]);
+        agent.restore_plan_approval_parked(true);
+        agent.restore_goal_drive(8, vec!["d".repeat(64)]);
+
+        let loaded = |paused, resume_on_user_input, plan_stall, goal_stall| LoadedSession {
+            messages: vec![Message::system("restored")],
+            usage: Usage::default(),
+            checkpoint_refs: Vec::new(),
+            name: None,
+            goal: None,
+            decisions: hi_agent::DecisionLog::default(),
+            plan: vec![hi_agent::PlanStep {
+                title: "continue restored work".into(),
+                status: hi_agent::PlanStatus::Pending,
+            }],
+            plan_drive_paused: paused,
+            plan_drive_resume_on_user_input: resume_on_user_input,
+            plan_approval_parked: false,
+            plan_drive_stall: plan_stall,
+            goal_drive_stall: goal_stall,
+            plan_drive_evidence: vec!["a".repeat(64)],
+            goal_drive_evidence: vec!["b".repeat(64)],
+        };
+
+        apply_loaded_session(&mut agent, loaded(false, false, 0, 0)).unwrap();
+        assert!(!agent.plan_drive_paused());
+        assert_eq!(agent.plan_drive_stall(), 0);
+        assert!(!agent.plan_approval_parked());
+        assert_eq!(agent.goal_drive_stall(), 0);
+
+        apply_loaded_session(&mut agent, loaded(true, true, 2, 3)).unwrap();
+        assert!(agent.plan_drive_paused());
+        assert_eq!(agent.plan_drive_stall(), 2);
+        assert_eq!(agent.goal_drive_stall(), 3);
+        assert!(
+            agent
+                .prepare_plan_drive_for_turn(hi_agent::DriveKind::User)
+                .unwrap()
+        );
+        assert!(!agent.plan_drive_paused());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1444,7 +2127,7 @@ fix the parser";
     }
 
     #[test]
-    fn jsonl_session_persists_turn_outcome_with_review_reason_and_resume_skips_it() {
+    fn jsonl_session_persists_canonical_turn_outcome_and_resume_skips_it() {
         let mut path = std::env::temp_dir();
         path.push(format!(
             "hi-session-turn-outcome-{}-{}.jsonl",
@@ -1459,10 +2142,10 @@ fix the parser";
             .record(&[Message::user("do the thing")], Usage::default())
             .unwrap();
         let outcome = hi_agent::TurnOutcome {
-            status: hi_agent::TurnStatus::Incomplete,
+            status: hi_agent::TurnStatus::Completed,
             verification: hi_agent::VerificationStatus::Passed,
             review: hi_agent::ReviewStatus::Unavailable,
-            stop_reason: hi_agent::TurnStopReason::Stalled,
+            stop_reason: hi_agent::TurnStopReason::StepLimit,
             changed_files: vec!["src/lib.rs".into()],
             verified_workspace_revision: None,
             effective_route: hi_agent::EffectiveModelRoute {
@@ -1484,13 +2167,37 @@ fix the parser";
             raw.contains("provider timed out during review"),
             "raw: {raw}"
         );
-        assert!(raw.contains("\"stop_reason\":\"stalled\""), "raw: {raw}");
+        assert!(raw.contains("\"status\":\"completed\""), "raw: {raw}");
+        assert!(raw.contains("\"stop_reason\":\"step_limit\""), "raw: {raw}");
+        assert!(!raw.contains("\"status\":\"incomplete\""), "raw: {raw}");
+        assert!(!raw.contains("\"stop_reason\":\"stalled\""), "raw: {raw}");
 
         // …and resume skips the record without disturbing the transcript.
         let loaded = load_history(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].text(), "do the thing");
+    }
+
+    #[test]
+    fn legacy_turn_outcome_names_remain_readable() {
+        let legacy = r#"{"type":"turn_outcome","ts":1,"status":"incomplete","verification":"passed","review":"unavailable","stop_reason":"stalled"}"#;
+        let parsed: SessionMeta = serde_json::from_str(legacy).unwrap();
+        let normalized = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            normalized.contains("\"stop_reason\":\"no_progress\""),
+            "legacy stalled records must normalize as no-progress, not as an execution cap: {normalized}"
+        );
+        let SessionMeta::TurnOutcome {
+            status,
+            stop_reason,
+            ..
+        } = parsed
+        else {
+            panic!("legacy record parsed as the wrong metadata variant");
+        };
+        assert_eq!(status, hi_agent::TurnStatus::Failed);
+        assert_eq!(stop_reason, hi_agent::TurnStopReason::NoProgress);
     }
 
     #[test]
@@ -1558,11 +2265,434 @@ fix the parser";
         session.record_plan_drive(true, 4).unwrap();
         let loaded = load_history(&path).unwrap();
         assert!(loaded.plan_drive_paused);
+        assert!(
+            !loaded.plan_drive_resume_on_user_input,
+            "ordinary record_plan_drive is a manual pause"
+        );
         assert_eq!(loaded.plan_drive_stall, 4);
         session.record_plan_drive(false, 0).unwrap();
         let loaded = load_history(&path).unwrap();
         assert!(!loaded.plan_drive_paused);
+        assert!(!loaded.plan_drive_resume_on_user_input);
         assert_eq!(loaded.plan_drive_stall, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bare_legacy_paused_plan_drive_remains_manual() {
+        use std::io::Write as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-plan-drive-legacy-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, r#"{{"type":"plan_drive","paused":true,"stall":0}}"#).unwrap();
+        file.flush().unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        assert!(loaded.plan_drive_paused);
+        assert!(
+            !loaded.plan_drive_resume_on_user_input,
+            "an ambiguous legacy pause must preserve manual pause intent"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_cancelled_plan_drive_rollback_migrates_to_interruption_pause() {
+        use std::io::Write as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-plan-drive-legacy-cancel-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        let kept = vec![Message::system("system"), Message::user("earlier work")];
+        let mut before_cancel = kept.clone();
+        before_cancel.push(Message::user(format!(
+            "context wrapper\n{}\nNext: keep working",
+            hi_agent::PLAN_DRIVE_PROMPT
+        )));
+        session.record(&before_cancel, Usage::default()).unwrap();
+        session
+            .record_state_replacement(&kept, None, &hi_agent::DecisionLog::default(), &[])
+            .unwrap();
+        session
+            .record(
+                &[],
+                Usage {
+                    input_tokens: 1,
+                    ..Usage::default()
+                },
+            )
+            .unwrap();
+        drop(session);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, r#"{{"type":"plan_drive","paused":true,"stall":0}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"plan_drive","paused":true,"stall":0,"evidence_reset":true}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        assert!(loaded.plan_drive_paused);
+        assert!(
+            loaded.plan_drive_resume_on_user_input,
+            "rollback-discarded synthetic plan work must resume on user input"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn remote_legacy_pause_migration_matches_local_loader() {
+        let kept = vec![Message::system("system"), Message::user("earlier work")];
+        let mut before_cancel = kept.clone();
+        before_cancel.push(Message::user(format!(
+            "context wrapper\n{}\nNext: keep working",
+            hi_agent::PLAN_DRIVE_PROMPT
+        )));
+        let records = vec![
+            RemoteRecord {
+                record_type: "message".into(),
+                payload_json: serde_json::to_string(&before_cancel[0]).unwrap(),
+            },
+            RemoteRecord {
+                record_type: "message".into(),
+                payload_json: serde_json::to_string(&before_cancel[1]).unwrap(),
+            },
+            RemoteRecord {
+                record_type: "message".into(),
+                payload_json: serde_json::to_string(&before_cancel[2]).unwrap(),
+            },
+            RemoteRecord {
+                record_type: "state_replacement".into(),
+                payload_json: serde_json::to_string(&SessionMeta::StateReplacement {
+                    messages: kept,
+                    goal: None,
+                    decisions: Vec::new(),
+                    plan: Vec::new(),
+                })
+                .unwrap(),
+            },
+            RemoteRecord {
+                record_type: "usage".into(),
+                payload_json: r#"{"type":"usage","input_tokens":1,"output_tokens":0}"#.into(),
+            },
+            RemoteRecord {
+                record_type: "plan_drive".into(),
+                payload_json: r#"{"type":"plan_drive","paused":true,"stall":0}"#.into(),
+            },
+            RemoteRecord {
+                record_type: "plan_drive".into(),
+                payload_json:
+                    r#"{"type":"plan_drive","paused":true,"stall":0,"evidence_reset":true}"#.into(),
+            },
+        ];
+
+        let loaded = load_history_from_records(&records).unwrap();
+        assert!(loaded.plan_drive_paused);
+        assert!(loaded.plan_drive_resume_on_user_input);
+
+        let mut broken_chain = records;
+        broken_chain.insert(
+            broken_chain.len() - 2,
+            RemoteRecord {
+                record_type: "message".into(),
+                payload_json: serde_json::to_string(&Message::user("unrelated work")).unwrap(),
+            },
+        );
+        let loaded = load_history_from_records(&broken_chain).unwrap();
+        assert!(loaded.plan_drive_paused);
+        assert!(!loaded.plan_drive_resume_on_user_input);
+    }
+
+    fn legacy_interruption_records() -> Vec<RemoteRecord> {
+        let kept = vec![Message::system("system"), Message::user("earlier work")];
+        let mut before_cancel = kept.clone();
+        before_cancel.push(Message::user(format!(
+            "context wrapper\n{}\nNext: keep working",
+            hi_agent::PLAN_DRIVE_PROMPT
+        )));
+        let mut records = before_cancel
+            .iter()
+            .map(|message| RemoteRecord {
+                record_type: "message".into(),
+                payload_json: serde_json::to_string(message).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        records.push(RemoteRecord {
+            record_type: "state_replacement".into(),
+            payload_json: serde_json::to_string(&SessionMeta::StateReplacement {
+                messages: kept,
+                goal: None,
+                decisions: Vec::new(),
+                plan: vec![hi_agent::PlanStep {
+                    title: "finish safely".into(),
+                    status: hi_agent::PlanStatus::Pending,
+                }],
+            })
+            .unwrap(),
+        });
+        // Deliberately omit `resume_on_user_input`: this is the old record the
+        // rollback signature above identifies as an interruption pause.
+        records.push(RemoteRecord {
+            record_type: "plan_drive".into(),
+            payload_json: r#"{"type":"plan_drive","paused":true,"stall":0}"#.into(),
+        });
+        records
+    }
+
+    fn turn_outcome_record(
+        status: hi_agent::TurnStatus,
+        stop_reason: hi_agent::TurnStopReason,
+    ) -> RemoteRecord {
+        RemoteRecord {
+            record_type: "turn_outcome".into(),
+            payload_json: serde_json::to_string(&SessionMeta::TurnOutcome {
+                ts: 1,
+                status,
+                verification: hi_agent::VerificationStatus::NotApplicable,
+                review: hi_agent::ReviewStatus::NotRequired,
+                stop_reason,
+                review_unavailable_reason: None,
+                review_same_model: false,
+            })
+            .unwrap(),
+        }
+    }
+
+    fn load_legacy_records_both(
+        records: &[RemoteRecord],
+        label: &str,
+    ) -> (LoadedSession, LoadedSession) {
+        use std::io::Write as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-legacy-user-resume-{label}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        for record in records {
+            writeln!(file, "{}", record.payload_json).unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+        let local = load_history(&path).unwrap();
+        let remote = load_history_from_records(records).unwrap();
+        let _ = std::fs::remove_file(path);
+        (local, remote)
+    }
+
+    #[test]
+    fn completed_legacy_user_turn_consumes_inferred_interruption_pause_locally_and_remotely() {
+        let mut records = legacy_interruption_records();
+        records.push(RemoteRecord {
+            record_type: "message".into(),
+            payload_json: serde_json::to_string(&Message::user("fix all of that")).unwrap(),
+        });
+        // Real user work may update the plan before its terminal outcome. Such
+        // metadata ends the adjacent legacy-record chain, not the active
+        // inferred interruption latch being consumed by this turn.
+        records.push(RemoteRecord {
+            record_type: "plan".into(),
+            payload_json: serde_json::to_string(&SessionMeta::Plan {
+                steps: vec![hi_agent::PlanStep {
+                    title: "finish safely".into(),
+                    status: hi_agent::PlanStatus::Done,
+                }],
+            })
+            .unwrap(),
+        });
+        records.push(turn_outcome_record(
+            hi_agent::TurnStatus::Completed,
+            hi_agent::TurnStopReason::NoApplicableVerification,
+        ));
+
+        let (local, remote) = load_legacy_records_both(&records, "completed");
+        for loaded in [&local, &remote] {
+            assert!(!loaded.plan_drive_paused);
+            assert!(!loaded.plan_drive_resume_on_user_input);
+            assert_eq!(loaded.plan_drive_stall, 0);
+            assert!(loaded.plan_drive_evidence.is_empty());
+        }
+    }
+
+    #[test]
+    fn unsuccessful_legacy_user_turn_keeps_inferred_interruption_pause() {
+        for (label, status, stop_reason) in [
+            (
+                "cancelled",
+                hi_agent::TurnStatus::Cancelled,
+                hi_agent::TurnStopReason::Cancelled,
+            ),
+            (
+                "failed",
+                hi_agent::TurnStatus::Failed,
+                hi_agent::TurnStopReason::VerificationFailed,
+            ),
+        ] {
+            let mut records = legacy_interruption_records();
+            records.push(RemoteRecord {
+                record_type: "message".into(),
+                payload_json: serde_json::to_string(&Message::user("try the repair")).unwrap(),
+            });
+            records.push(turn_outcome_record(status, stop_reason));
+
+            let (local, remote) = load_legacy_records_both(&records, label);
+            for loaded in [&local, &remote] {
+                assert!(loaded.plan_drive_paused, "{label}");
+                assert!(loaded.plan_drive_resume_on_user_input, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn completed_user_turn_does_not_consume_explicit_or_bare_manual_pause() {
+        let mut explicit = legacy_interruption_records();
+        explicit.last_mut().unwrap().payload_json =
+            serde_json::to_string(&SessionMeta::PlanDrive {
+                paused: true,
+                resume_on_user_input: Some(true),
+                stall: 0,
+                evidence_reset: false,
+                evidence_add: Vec::new(),
+            })
+            .unwrap();
+        explicit.push(RemoteRecord {
+            record_type: "message".into(),
+            payload_json: serde_json::to_string(&Message::user("continue explicitly")).unwrap(),
+        });
+        explicit.push(turn_outcome_record(
+            hi_agent::TurnStatus::Completed,
+            hi_agent::TurnStopReason::NoApplicableVerification,
+        ));
+        let (local, remote) = load_legacy_records_both(&explicit, "explicit");
+        for loaded in [&local, &remote] {
+            assert!(loaded.plan_drive_paused);
+            assert!(loaded.plan_drive_resume_on_user_input);
+        }
+
+        let mut manual = vec![RemoteRecord {
+            record_type: "plan_drive".into(),
+            payload_json: r#"{"type":"plan_drive","paused":true,"stall":0}"#.into(),
+        }];
+        manual.push(RemoteRecord {
+            record_type: "message".into(),
+            payload_json: serde_json::to_string(&Message::user("ordinary conversation")).unwrap(),
+        });
+        manual.push(turn_outcome_record(
+            hi_agent::TurnStatus::Completed,
+            hi_agent::TurnStopReason::NoApplicableVerification,
+        ));
+        let (local, remote) = load_legacy_records_both(&manual, "manual");
+        for loaded in [&local, &remote] {
+            assert!(loaded.plan_drive_paused);
+            assert!(!loaded.plan_drive_resume_on_user_input);
+        }
+    }
+
+    #[test]
+    fn synthetic_turn_and_user_role_nudges_do_not_consume_inferred_pause() {
+        let mut records = legacy_interruption_records();
+        records.push(RemoteRecord {
+            record_type: "message".into(),
+            payload_json: serde_json::to_string(&Message::user(format!(
+                "[hi:context]\nwrapped state\n{}\nNext: finish safely",
+                hi_agent::PLAN_DRIVE_PROMPT
+            )))
+            .unwrap(),
+        });
+        // Nudges are represented as user-role transcript messages. They belong
+        // to the already-classified synthetic turn and cannot turn it into a
+        // genuine user resume during legacy reconstruction.
+        records.push(RemoteRecord {
+            record_type: "message".into(),
+            payload_json: serde_json::to_string(&Message::user("[hi:nudge:continue] keep working"))
+                .unwrap(),
+        });
+        records.push(turn_outcome_record(
+            hi_agent::TurnStatus::Completed,
+            hi_agent::TurnStopReason::NoApplicableVerification,
+        ));
+
+        let (local, remote) = load_legacy_records_both(&records, "synthetic");
+        for loaded in [&local, &remote] {
+            assert!(loaded.plan_drive_paused);
+            assert!(loaded.plan_drive_resume_on_user_input);
+        }
+    }
+
+    #[test]
+    fn jsonl_session_round_trips_interruption_resume_policy() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-plan-drive-policy-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        session
+            .record_plan_drive_state_with_policy(true, 0, true, false, &[])
+            .unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        assert!(loaded.plan_drive_paused);
+        assert!(loaded.plan_drive_resume_on_user_input);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#""resume_on_user_input":true"#));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn jsonl_session_restores_plan_approval_separately_from_pause() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-plan-approval-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        session.record_plan_drive(true, 0).unwrap();
+        session.record_plan_approval_parked(true).unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        assert!(loaded.plan_drive_paused);
+        assert!(loaded.plan_approval_parked);
+
+        session.record_plan_approval_parked(false).unwrap();
+        let loaded = load_history(&path).unwrap();
+        assert!(
+            loaded.plan_drive_paused,
+            "unpark must not consume /plan pause"
+        );
+        assert!(!loaded.plan_approval_parked);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1583,6 +2713,66 @@ fix the parser";
         session.record_goal_drive(0).unwrap();
         let loaded = load_history(&path).unwrap();
         assert_eq!(loaded.goal_drive_stall, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn jsonl_session_replays_drive_evidence_deltas_and_scope_resets() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-drive-evidence-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+
+        session
+            .record_plan_drive_state(false, 0, true, std::slice::from_ref(&a))
+            .unwrap();
+        session
+            .record_plan_drive_state(false, 1, false, std::slice::from_ref(&b))
+            .unwrap();
+        session
+            .record_goal_drive_state(2, true, std::slice::from_ref(&b))
+            .unwrap();
+        let loaded = load_history(&path).unwrap();
+        assert_eq!(loaded.plan_drive_evidence, vec![a.clone(), b.clone()]);
+        assert_eq!(loaded.goal_drive_evidence, vec![b.clone()]);
+        assert_eq!(loaded.plan_drive_stall, 1);
+        assert_eq!(loaded.goal_drive_stall, 2);
+
+        // Cancellation/rollback persists a state replacement. It must not make
+        // already-credited evidence novel again after process restart.
+        session
+            .record_state_replacement(
+                &[Message::system("rewound")],
+                None,
+                &hi_agent::DecisionLog::default(),
+                &[],
+            )
+            .unwrap();
+        let loaded = load_history(&path).unwrap();
+        assert_eq!(loaded.plan_drive_evidence, vec![a.clone(), b.clone()]);
+        assert_eq!(loaded.goal_drive_evidence, vec![b.clone()]);
+
+        session
+            .record_plan_drive_state(false, 0, true, std::slice::from_ref(&c))
+            .unwrap();
+        session
+            .record_goal_drive_state(0, true, std::slice::from_ref(&c))
+            .unwrap();
+        let loaded = load_history(&path).unwrap();
+        assert_eq!(loaded.plan_drive_evidence, vec![c.clone()]);
+        assert_eq!(loaded.goal_drive_evidence, vec![c]);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"evidence_add\""));
+        assert!(raw.contains("\"evidence_reset\":true"));
         let _ = std::fs::remove_file(path);
     }
 

@@ -20,8 +20,6 @@ const PYCACHE_EXCLUDES: &[&str] = &[
     ":(exclude,glob)**/*.pyc",
     ":(exclude,glob)**/*.pyo",
 ];
-const VERIFY_TIMEOUT: Duration = Duration::from_secs(600);
-
 /// Serializes merges into the shared working tree. Two isolated runs going loud
 /// at once (e.g. two auto-fix loops) would otherwise `git apply` into the same
 /// files concurrently and interleave writes. A plain `std::sync::Mutex` (these
@@ -333,14 +331,63 @@ pub fn remove_cow_worktree(path: &Path) -> Result<()> {
 
 /// Ground-truth check: run the verify command inside the worktree.
 pub fn verify_passes(worktree: &Path, verify: &str) -> bool {
-    verify_passes_with_timeout(worktree, verify, VERIFY_TIMEOUT)
+    verify_passes_with_timeout_and_cancel(worktree, verify, crate::check_timeout(), None)
 }
 
-/// Run a worktree verification command with a hard deadline. Verification only
-/// needs an exit status, so stdout/stderr are discarded rather than collected
-/// without a bound. This is intentionally synchronous because the public
-/// worktree API is also used from blocking fleet workers.
-fn verify_passes_with_timeout(worktree: &Path, verify: &str, timeout: Duration) -> bool {
+/// Async owner for a potentially unbounded verification process.
+///
+/// The blocking worker polls an operation-local cancellation token. Its drop
+/// guard lives in this future, so dropping/cancelling the caller kills and
+/// reaps the verifier's complete process group instead of detaching a
+/// `spawn_blocking` worker that can run forever.
+pub async fn verify_passes_async(
+    worktree: &Path,
+    verify: &str,
+    parent_cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
+    let operation_cancel = parent_cancel
+        .map(tokio_util::sync::CancellationToken::child_token)
+        .unwrap_or_default();
+    let drop_guard = operation_cancel.clone().drop_guard();
+    let worker_cancel = operation_cancel.clone();
+    let worktree = worktree.to_path_buf();
+    let verify = verify.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        verify_passes_with_timeout_and_cancel(
+            &worktree,
+            &verify,
+            crate::check_timeout(),
+            Some(&worker_cancel),
+        )
+    })
+    .await
+    .unwrap_or(false);
+    let _ = drop_guard.disarm();
+    result
+}
+
+fn verification_timed_out(timeout: Option<Duration>, elapsed: Duration) -> bool {
+    timeout.is_some_and(|timeout| elapsed >= timeout)
+}
+
+/// Run a worktree verification command with an optional operator deadline.
+/// Verification only needs an exit status, so stdout/stderr are discarded.
+/// This is intentionally synchronous because the public worktree API is also
+/// used from blocking fleet workers.
+#[cfg(test)]
+fn verify_passes_with_timeout(worktree: &Path, verify: &str, timeout: Option<Duration>) -> bool {
+    verify_passes_with_timeout_and_cancel(worktree, verify, timeout, None)
+}
+
+fn verify_passes_with_timeout_and_cancel(
+    worktree: &Path,
+    verify: &str,
+    timeout: Option<Duration>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
+    if cancellation.is_some_and(|token| token.is_cancelled()) {
+        return false;
+    }
     crate::prepare_verify_workdir(worktree);
     let mut command = Command::new("sh");
     command
@@ -372,7 +419,10 @@ fn verify_passes_with_timeout(worktree: &Path, verify: &str, timeout: Duration) 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
-            Ok(None) if started.elapsed() < timeout => {
+            Ok(None)
+                if !verification_timed_out(timeout, started.elapsed())
+                    && cancellation.is_none_or(|token| !token.is_cancelled()) =>
+            {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Ok(None) | Err(_) => {
@@ -391,10 +441,53 @@ fn verify_passes_with_timeout(worktree: &Path, verify: &str, timeout: Duration) 
 /// Apply changes to an explicit destination repository root. This avoids any
 /// dependency on the process cwd and is the preferred runtime API.
 pub fn apply_changes_to(worktree: &Path, base: &str, destination_root: &Path) -> Result<bool> {
-    apply_changes_impl(worktree, base, destination_root)
+    apply_changes_impl_with_timeout_and_cancel(worktree, base, destination_root, None, None)
 }
 
-fn apply_changes_impl(worktree: &Path, base: &str, destination_root: &Path) -> Result<bool> {
+/// Async owner for a potentially unbounded worktree merge.
+///
+/// Dropping this future or cancelling `parent_cancel` wakes the blocking worker,
+/// kills the private `git apply` process group, and releases the global merge
+/// lock. Successful work remains unlimited by default.
+pub async fn apply_changes_to_async(
+    worktree: &Path,
+    base: &str,
+    destination_root: &Path,
+    parent_cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<bool> {
+    let operation_cancel = parent_cancel
+        .map(tokio_util::sync::CancellationToken::child_token)
+        .unwrap_or_default();
+    let drop_guard = operation_cancel.clone().drop_guard();
+    let worker_cancel = operation_cancel.clone();
+    let worktree = worktree.to_path_buf();
+    let base = base.to_string();
+    let destination_root = destination_root.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        apply_changes_impl_with_timeout_and_cancel(
+            &worktree,
+            &base,
+            &destination_root,
+            None,
+            Some(&worker_cancel),
+        )
+    })
+    .await
+    .context("worktree merge worker failed")?;
+    let _ = drop_guard.disarm();
+    result
+}
+
+fn apply_changes_impl_with_timeout_and_cancel(
+    worktree: &Path,
+    base: &str,
+    destination_root: &Path,
+    apply_timeout: Option<Duration>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<bool> {
+    if cancellation.is_some_and(|token| token.is_cancelled()) {
+        bail!("git apply cancelled before merge preparation");
+    }
     // Strip Python bytecode caches the child's own test runs left behind, and
     // exclude them from the staging/diff below: a firing (or the child's test
     // run) regenerates `__pycache__/*.pyc`, and because `checkpoint::create`
@@ -433,6 +526,9 @@ fn apply_changes_impl(worktree: &Path, base: &str, destination_root: &Path) -> R
     if diff.stdout.is_empty() {
         return Ok(false); // nothing changed
     }
+    if cancellation.is_some_and(|token| token.is_cancelled()) {
+        bail!("git apply cancelled before acquiring the merge lock");
+    }
 
     // Apply the patch in the main repo via stdin. Capture stderr so a failed
     // apply says *which file/hunk* conflicted — in the TUI the inherited stderr
@@ -441,52 +537,34 @@ fn apply_changes_impl(worktree: &Path, base: &str, destination_root: &Path) -> R
     // Serialize the real-tree apply (MERGE_LOCK) and run it from the repo root so
     // repo-root-relative patch paths resolve regardless of the launch cwd. The
     // guard is held until this function returns (through the write + wait below).
-    let _merge = MERGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _merge = acquire_merge_lock(cancellation)?;
     let mut apply = Command::new("git");
     apply.args(["apply", "--whitespace=nowarn"]);
     apply.current_dir(destination_root);
+    configure_private_process_group(&mut apply);
     let mut child = apply
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("spawning git apply")?;
-    let pid = child.id();
-    child
+    let write_result = child
         .stdin
         .take()
-        .context("git apply stdin")?
-        .write_all(&diff.stdout)
-        .context("writing patch to git apply")?;
-    // Bound wait so a stuck apply cannot hold MERGE_LOCK forever and serialize
-    // every subsequent fleet merge behind it. Wait on a helper thread so stderr
-    // is drained (avoiding a pipe-full deadlock) while we enforce the deadline.
-    const APPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let out = match rx.recv_timeout(APPLY_TIMEOUT) {
-        Ok(Ok(out)) => out,
-        Ok(Err(error)) => return Err(error).context("waiting for git apply"),
-        Err(_) => {
-            #[cfg(unix)]
-            {
-                // Best-effort kill; the waiter thread reaps the process.
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = pid;
-            }
-            let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
-            bail!(
-                "git apply timed out after {}s while holding the merge lock",
-                APPLY_TIMEOUT.as_secs()
-            );
-        }
-    };
+        .context("git apply stdin")
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(&diff.stdout)
+                .context("writing patch to git apply")
+        });
+    if let Err(error) = write_result {
+        terminate_sync_child_group(&mut child);
+        return Err(error);
+    }
+    // The normal merge path has no wall-clock ceiling: large patches and slow
+    // filesystems remain productive until `git apply` actually settles. The
+    // optional helper path retains a typed, process-group-cleaning deadline for
+    // callers/tests that explicitly opt into one.
+    let out = wait_for_apply(child, apply_timeout, cancellation)?;
     if !out.status.success() {
         let why = String::from_utf8_lossy(&out.stderr);
         let why = why.trim();
@@ -500,6 +578,105 @@ fn apply_changes_impl(worktree: &Path, base: &str, destination_root: &Path) -> R
         );
     }
     Ok(true)
+}
+
+fn acquire_merge_lock(
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<std::sync::MutexGuard<'static, ()>> {
+    loop {
+        match MERGE_LOCK.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if cancellation.is_some_and(|token| token.is_cancelled()) {
+                    bail!("git apply cancelled while waiting for the merge lock");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn configure_private_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+
+fn terminate_sync_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn wait_for_apply(
+    child: std::process::Child,
+    timeout: Option<Duration>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<std::process::Output> {
+    if timeout.is_none() && cancellation.is_none() {
+        return child.wait_with_output().context("waiting for git apply");
+    }
+
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let started = Instant::now();
+    loop {
+        let poll = timeout
+            .map(|deadline| deadline.saturating_sub(started.elapsed()))
+            .unwrap_or(Duration::from_millis(50))
+            .min(Duration::from_millis(50));
+        match rx.recv_timeout(poll) {
+            Ok(Ok(out)) => return Ok(out),
+            Ok(Err(error)) => return Err(error).context("waiting for git apply"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("git apply waiter disconnected before returning a result")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                if cancellation.is_some_and(|token| token.is_cancelled()) =>
+            {
+                kill_waited_apply_group(pid, &rx);
+                bail!("git apply cancelled while holding the merge lock");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                if timeout.is_some_and(|deadline| started.elapsed() >= deadline) =>
+            {
+                kill_waited_apply_group(pid, &rx);
+                bail!(
+                    "git apply timed out after {}s while holding the merge lock",
+                    timeout.unwrap_or_default().as_secs_f64()
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+        }
+    }
+}
+
+fn kill_waited_apply_group(
+    pid: u32,
+    rx: &std::sync::mpsc::Receiver<std::io::Result<std::process::Output>>,
+) {
+    #[cfg(unix)]
+    {
+        // The waiter thread owns/reaps the direct child. Kill its
+        // private group here so helpers spawned by git cannot survive.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
 }
 
 /// The files the worktree changed relative to `base` (staged first so new/deleted
@@ -626,6 +803,92 @@ mod tests {
     /// Serializes tests that mutate the process cwd (`apply_changes` targets the
     /// cwd), so they don't race under parallel execution.
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_wait_has_no_default_deadline_but_accepts_an_explicit_one() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 0.03; exit 0"]);
+        configure_private_process_group(&mut command);
+        let child = command
+            .spawn()
+            .expect("spawn default-unlimited apply stand-in");
+        let output = wait_for_apply(child, None, None).expect("unlimited apply wait completes");
+        assert!(output.status.success());
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+        configure_private_process_group(&mut command);
+        let child = command.spawn().expect("spawn timed apply stand-in");
+        let error = wait_for_apply(child, Some(Duration::from_millis(25)), None)
+            .expect_err("explicit apply deadline must fire");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_apply_wait_kills_the_private_process_group() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-apply-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let leaked = dir.join("leaked");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!("sleep 0.2; touch {}", leaked.to_string_lossy()),
+        ]);
+        configure_private_process_group(&mut command);
+        let child = command.spawn().expect("spawn cancellable apply stand-in");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let trigger = cancellation.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            trigger.cancel();
+        });
+
+        let error = wait_for_apply(child, None, Some(&cancellation))
+            .expect_err("cancelled apply wait must stop");
+        assert!(error.to_string().contains("cancelled"), "{error:#}");
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(!leaked.exists(), "cancelled apply left a live descendant");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_async_verification_kills_the_private_process_group() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-verify-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let leaked = dir.join("leaked");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let command = format!("sleep 0.2; touch {}", leaked.to_string_lossy());
+        let running = verify_passes_async(&dir, &command, Some(&cancellation));
+        tokio::pin!(running);
+        tokio::select! {
+            result = &mut running => panic!("verification exited before cancellation: {result}"),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => cancellation.cancel(),
+        }
+        assert!(!running.await, "cancelled verification cannot pass");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !leaked.exists(),
+            "cancelled verification left a live descendant"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Python bytecode caches left by a child's test runs must not enter the
     /// diff: they made `git apply` fail (binary) and polluted overlap sets.
@@ -996,16 +1259,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn verify_passes_has_a_deadline() {
+    fn verify_passes_preserves_an_explicit_deadline() {
         let dir = std::env::temp_dir().join(format!("hi-verify-timeout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(!verify_passes_with_timeout(
             &dir,
             "sleep 1",
-            Duration::from_millis(25)
+            Some(Duration::from_millis(25))
         ));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn merge_lock_wait_honors_cancellation() {
+        let held = MERGE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let error = acquire_merge_lock(Some(&cancellation))
+            .expect_err("a cancelled waiter must not block behind the merge lock");
+        assert!(error.to_string().contains("cancelled"), "{error:#}");
+        drop(held);
+    }
+
+    #[test]
+    fn unlimited_verification_never_expires_from_elapsed_time() {
+        assert!(!verification_timed_out(None, Duration::MAX));
+        assert!(verification_timed_out(
+            Some(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        ));
     }
 
     #[test]

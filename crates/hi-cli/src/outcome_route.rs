@@ -747,6 +747,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ordinary_default_stays_on_the_direct_unlimited_provider_route() {
+        assert_eq!(OutcomeMode::default(), OutcomeMode::Chat);
+        assert_eq!(OutcomeMode::parse("unknown"), OutcomeMode::Chat);
+        assert_eq!(OutcomeMode::parse("auto"), OutcomeMode::Auto);
+    }
+
+    #[test]
     fn auto_routes_cargo_mutation_and_keeps_qa_on_chat() {
         let qa = TaskContract::derive("what does this parser do?", VerificationMode::Auto);
         assert!(!should_submit_outcome(OutcomeMode::Auto, true, true, &qa));

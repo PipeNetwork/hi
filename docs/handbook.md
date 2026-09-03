@@ -119,11 +119,23 @@ OpenAI-compatible endpoints vary in how much of Chat Completions they implement.
 | `HI_GLOBAL_PROCESS_CONCURRENCY` | Shared cross-process cap per setup/model/verifier resource class | adaptive, 2–4 |
 | `HI_GLOBAL_DELEGATE_CONCURRENCY` | Delegate-specific global cap | 4 |
 | `HI_PARALLEL_DELEGATES` | Maximum delegates admitted in one agent tool wave | 4, max 16 |
-| `HI_DELEGATE_SESSION_LIMIT` | Delegate budget for one agent session | 4, max 16 |
+| `HI_DELEGATE_SESSION_LIMIT` | Optional positive per-turn delegate count cap | off (unlimited) |
 | `HI_BESTOF_VERIFY_CONCURRENCY` | Parallel best-of parent verification jobs | adaptive |
-| `HI_DELEGATE_QUEUE_TIMEOUT_SECS` | Maximum wait for delegate capacity | 600s |
-| `HI_DELEGATE_TIMEOUT_SECS` | Delegate child execution timeout | 600s |
-| `HI_VERIFIER_QUEUE_TIMEOUT_SECS` | Maximum wait for shared verifier capacity | 120s |
+| `HI_DELEGATE_QUEUE_TIMEOUT_SECS` | Optional delegate capacity wait timeout; unset or `0` waits until capacity or cancellation | off |
+| `HI_DELEGATE_TIMEOUT_SECS` | Optional delegate child execution timeout; unset or `0` allows continual execution | off |
+| `HI_BEST_OF_TIMEOUT_SECS` | Optional best-of candidate execution timeout; unset or `0` allows continual execution | off |
+| `HI_BEST_OF_QUEUE_TIMEOUT_SECS` | Optional best-of setup/model capacity wait timeout | off |
+| `HI_VERIFIER_QUEUE_TIMEOUT_SECS` | Optional shared verifier capacity wait timeout | off |
+| `HI_MERGE_QUEUE_TIMEOUT_SECS` | Optional exclusive destination-merge capacity wait timeout | off |
+| `HI_VERIFY_TIMEOUT_SECS` | Optional positive verification process timeout; unset or `0` allows continual execution | off |
+| `HI_BASH_TIMEOUT_SECS` | Optional positive foreground shell-command timeout; unset or `0` allows continual execution (slow commands may still be handed to the background registry) | off |
+| `HI_MCP_CONNECT_TIMEOUT_SECS` | Optional positive lazy MCP handshake timeout; unset or `0` waits until connection, failure, or turn cancellation | off |
+| `HI_MCP_TOOL_TIMEOUT_SECS` | Optional positive MCP `tools/call` timeout; unset or `0` allows continual execution until completion or turn cancellation | off |
+| `HI_MODEL_REQUEST_TIMEOUT_SECS` | Optional positive absolute deadline for one model HTTP request (including bounded retries/backoffs); unset or `0` allows continual execution | off |
+| `HI_RSI_WAIT_TIMEOUT_SECS` | Optional remote RSI run wait timeout; per-request HTTP transport timeouts remain active | off |
+| `HI_LOOP_TURN_TIMEOUT_SECS` | Optional `/loop` firing and auto-fix child timeout; also derives a child turn deadline | off |
+| `HI_LOOP_TRIGGER_TIMEOUT_SECS` | Optional positive on-change shell trigger timeout; unset or `0` allows continual execution | off |
+| `HI_HOOK_TIMEOUT_SECS` | Optional trusted lifecycle-hook process timeout; unset or `0` allows continual execution until completion or turn cancellation | off |
 | `HI_SCHEDULER_PRESET` | `conservative`, `balanced`, or `throughput` orchestration policy | balanced |
 | `HI_ADAPTIVE_SCHEDULER` | Set `0` to disable adaptive admission | on |
 | `HI_WARM_WORKERS` | Set `0` to disable warm worker reuse | on |
@@ -146,7 +158,7 @@ native acceptance links.
 
 ## Verification-in-the-loop
 
-The headline feature. After the model stops, `hi` automatically detects and runs a staged check pipeline. If a check fails, the output is fed back and the model repairs the work. The default is an initial check plus at most two repair/check cycles (`--max-verify-repairs 2`).
+The headline feature. After the model stops, `hi` automatically detects and runs a staged check pipeline. If a check fails, the output is fed back and the model repairs the work. Productive repair/check cycles continue until verification passes or a no-progress/fault circuit fires. Use `--max-verify-repairs N` only when an explicit finite cap is required.
 
 ```bash
 hi --verify "cargo test" "make the failing test pass"
@@ -156,17 +168,21 @@ hi "..."                   # auto-detects cargo check+test, go build+test,
 
 Automatic verification builds a **multi-stage pipeline** per project: `cargo check` then `cargo test`, `go build` then `go test`, `tsc` then `npm test` (when a tsconfig is present), `ruff check` then `pytest` (when ruff is configured), or `make test`. Repeat `--verify CMD` to replace detection with exact ordered stages. `--no-verify` produces an explicitly unverified outcome; a mutating one-shot still exits nonzero unless `--allow-unverified` is also given.
 
-Each turn has a default budget of 32 model rounds and 48 executed tools. This
-bounds failures that alternate between otherwise-valid recovery paths and
-therefore evade an individual repeat detector. `--max-steps N` (or
-`/config steps <n>`) overrides the model-round cap; `/config steps off`
-explicitly removes it. A capped turn gets one final tool-free round to report
-where it left the work, then still runs normal workspace verification and
-settlement. Each turn prints `[N in · N out · N total · k/k ctx]`.
+Model rounds are unlimited by default. `--max-steps N` (or `/config steps N`)
+installs an explicit per-turn cap; `/config steps auto` returns to the unlimited
+default and `/config steps off` is an equivalent explicit opt-out. A capped
+turn gets one final tool-free round to report where it left the work, then still
+runs normal workspace verification and settlement. Incomplete productive work
+settles as a typed failure at an explicit cap; a read-only turn with a usable
+wrap-up remains completed. State-aware repetition and no-progress guards remain
+active. Whole turns have no default deadline;
+`--turn-deadline SECS` installs an explicit soft settlement deadline. Each turn
+prints `[N in · N out · N total · k/k ctx]`.
 
-`--max-tool-calls N` overrides the separate hard execution budget. Parallel batches
-reserve the remaining budget before dispatch and return typed denials for the
-model-ordered suffix, so concurrency cannot overspend it.
+Tool executions are also unlimited by default. `--max-tool-calls N` installs an
+explicit independent cap. Parallel batches reserve the remaining budget before
+dispatch and return typed denials for the model-ordered suffix, so concurrency
+cannot overspend it.
 
 ## Best-of-N
 
@@ -263,8 +279,8 @@ drives a whole objective autonomously. Every row is its own resumable session. D
 ## Loops
 
 `/loop 30m check whether CI on main is green` — the same prompt, on a cadence. Intervals run
-from 60 seconds to days (`90s`, `30m`, `2h`, `1d`); loops auto-expire after 7 days and are
-cancellable by id (`/loop list`, `/loop cancel 3`). The shape is built for **watching things**:
+from 60 seconds to days (`90s`, `30m`, `2h`, `1d`); loops run until explicitly cancelled by id
+(`/loop list`, `/loop cancel 3`). The shape is built for **watching things**:
 CI logs, a canary deploy, a live service, a flaky test you're trying to catch in the act.
 
 Each firing is a full agent turn, not a dumb cron job: it resumes the loop's own session, so it
@@ -273,6 +289,11 @@ nothing changed — quiet firings land as a dim one-liner, real changes land lou
 ping when you're unfocused). Loops persist per project and re-arm when `hi` restarts (they fire
 while `hi` is running).
 
+`/loop trio <prompt>` is the transient plan→execute→review workflow: a planner drafts the approach,
+the session agent implements it, and a reviewer sends concrete objections back for another round.
+It has no round limit by default and continues until approval, cancellation, or a typed execution
+failure. Use `/loop trio --rounds N <prompt>` only when you want an explicit finite round cap.
+
 `/watch` opens a **full-screen dashboard of every active loop**: a live table with per-loop
 countdowns to the next firing, a spinner while one is checking, each loop's last result
 (dim `· nothing new` or a loud one-line change), and its **running token spend**. Select a loop
@@ -280,8 +301,8 @@ to peek its recent firing history; `f` fires the selected loop immediately, `p` 
 `c` cancels it, and `n` arms a new one from the same `<interval> <prompt>` box — all without
 leaving the screen. The loops keep firing in the background; Esc returns to the chat.
 
-**Cost guard.** Each firing is a full agent turn, so a fast loop adds up — a `60s` loop is ~10k
-turns over its 7-day life. Every loop tracks its cumulative token spend, and you can cap it:
+**Cost guard.** Each firing is a full agent turn, so a fast long-running loop adds up. Every loop
+tracks its cumulative token spend, and you can cap it:
 `/loop budget 3 500k` auto-**pauses** loop #3 once it has spent 500k tokens (it stays resumable —
 raise the budget or `/loop resume 3` to continue). Pause and resume any loop by hand with
 `/loop pause <id>` / `/loop resume <id>` (or `p` in `/watch`); a paused loop holds its place and
@@ -302,8 +323,10 @@ quietly defers to the next interval. And `/loop cost` shows a token-spend breakd
 **Triggers — a watcher that acts.** Attach a shell command that runs whenever a firing reports a
 real change: `/loop on 3 notify-send "CI is red"`. It runs via `sh -c` only on a *loud* firing
 (never on `NOTHING NEW` or an error), with the change summary in `$HI_LOOP_SUMMARY` (plus
-`$HI_LOOP_ID` / `$HI_LOOP_NAME`), a 60s timeout, and its outcome surfaced in the transcript and the
-`/watch` peek. Compose anything — desktop notifications, a webhook `curl`, a file touch, even
+`$HI_LOOP_ID` / `$HI_LOOP_NAME`), and its outcome surfaced in the transcript and the
+`/watch` peek. Triggers have no execution deadline by default; set a positive
+`HI_LOOP_TRIGGER_TIMEOUT_SECS` when you explicitly want one. Compose anything — desktop
+notifications, a webhook `curl`, a file touch, even
 another `hi -p "…"` to kick off a fix. `/loop on 3 off` clears it. (The command is yours and runs
 with your shell's privileges — treat it like a git hook.)
 
@@ -388,7 +411,8 @@ Slash commands (TUI or plain REPL):
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
 | `/goal [obj\|pause\|resume\|limit N\|team on\|off\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default); `team on` adds a skeptic reviewer that must approve each advance (needs `HI_SKEPTIC_MODEL`) |
-| `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed. `/loop list`, `/loop cancel <id>`, `/loop pause\|resume <id>`, `/loop budget <id> <count\|off>` (token cap → auto-pause), `/loop on <id> <cmd\|off>` (run a shell command on each change, `$HI_LOOP_SUMMARY` in env), `/loop fix <id> <on\|pr\|off>` (verify-gated auto-fix on a loud change — `on` merges, `pr` opens a PR), `/loop window <id> <9-17 [weekdays]\|off>` (local-time fire window), `/loop cost` (token-spend breakdown), `/loop review [interval]` (a PR-review watcher — reviews open PRs via `gh`); loops auto-expire after 7 days |
+| `/loop trio [--rounds N] <prompt>` | transient plan→execute→review workflow. It continues until approval by default; `--rounds N` opts into a finite revision cap. |
+| `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed, and the loop runs until cancelled. `/loop list`, `/loop cancel <id>`, `/loop pause\|resume <id>`, `/loop budget <id> <count\|off>` (token cap → auto-pause), `/loop on <id> <cmd\|off>` (run a shell command on each change, `$HI_LOOP_SUMMARY` in env), `/loop fix <id> <on\|pr\|off>` (verify-gated auto-fix on a loud change — `on` merges, `pr` opens a PR), `/loop window <id> <9-17 [weekdays]\|off>` (local-time fire window), `/loop cost` (token-spend breakdown), `/loop review [interval]` (a PR-review watcher — reviews open PRs via `gh`) |
 | `/watch` | full-screen live dashboard of all active loops: per-loop countdowns, firing spinners, last result, token spend, and recent history — with `f` fire-now, `p` pause, `c` cancel, `n` arm a new loop |
 | `/digest` (`/activity`) | what your loops have noticed, grouped by loop, with what's new since you last looked (a persisted, cross-restart feed of every loud change) |
 | `/inbox [allow\|deny <id>]` | parked confirms blocked on you (unattended/daemon). `/digest` is what changed; inbox is what needs a decision. `hi inbox` works from the shell |
@@ -448,8 +472,12 @@ an agent's plan before letting it act.
 `--report path.json`. Reports contain the typed turn outcome, verification
 stages, review status, typed tool results, actual provider/model route,
 turn/session usage, and exact file changes. Reports are written for failed and
-incomplete turns as well as successful ones; legacy report fields are no longer
-emitted. In particular, session token totals now live at
+blocked turns as well as successful ones; legacy report fields are no longer
+emitted. Historical `incomplete`/`stalled` outcome values remain readable as
+`failed`/`no_progress`, but new reports never emit the historical names.
+Explicit model-step or tool-call caps on unfinished productive work emit failed
+status with a typed limit reason; usable read-only wrap-ups may still complete
+at a cap. In particular, session token totals now live at
 `usage.session.total_tokens`, not the legacy top-level `total_tokens` field.
 
 **RSI candidate channel.** In the TUI, `/config rsi` shows readiness, candidate
@@ -473,7 +501,7 @@ all changes atomically. It never falls back to local execution. Use `/rsi list`,
 feedback alone never authorizes promotion. Internal/test deployments
 may still select a test gateway in `hi.toml`.
 
-**Outcome tasks (`POST /v1/tasks`).** Interactive `hi` classifies each user turn. In a Cargo workspace, an explicit mutation or a test-gated prompt is submitted as `code.change` with `cargo_test` and `cargo_clippy` (plus `review` when `--review always` or risk-on-mutation). Everything else stays on `/v1/chat/completions`. `--tasks` always submits; `--no-tasks` never does. `--rsi-managed` never calls `/v1/tasks`. If the Outcome API returns `tasks_unavailable`, 401/404, a missing key, or no RSI worker heartbeat, hi prints one line and continues on local chat (or `/v1/rsi/runs` when `--rsi` is on). `/rsi repair` posts remaining budget to `/v1/repairs`. `/rsi status` shows `contract_hash` after `POST /v1/receipts/verify`.
+**Outcome tasks (`POST /v1/tasks`).** Ordinary `hi` sessions stay on the direct provider route so they have no paid-task deadline or attempt ceiling. `--tasks` opts every turn into the bounded Outcome task contract; `[outcome] mode = "auto"` opts Cargo mutations and test-gated prompts into `code.change` with `cargo_test` and `cargo_clippy` (plus `review` when `--review always` or risk-on-mutation). `--no-tasks` forces direct chat. `--rsi-managed` never calls `/v1/tasks`. If the Outcome API returns `tasks_unavailable`, 401/404, a missing key, or no RSI worker heartbeat, hi prints one line and continues on local chat (or `/v1/rsi/runs` when `--rsi` is on). `/rsi repair` posts remaining budget to `/v1/repairs`. `/rsi status` shows `contract_hash` after `POST /v1/receipts/verify`.
 
 Laptop loopback (not evaluation-grade on macOS):
 

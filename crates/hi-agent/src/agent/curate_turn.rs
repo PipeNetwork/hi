@@ -5,7 +5,7 @@
 //! general technique — emits a `SKILL.md`, which we persist as a learned skill.
 //! The verifier is the gate, so a weak local model can't poison the playbook: a
 //! skill is only ever written for a turn the ground-truth check already accepted.
-//! The prompt biases hard toward silence, and a per-session cap bounds spam.
+//! The prompt biases hard toward silence; duplicate skill names are ignored.
 
 use std::sync::Arc;
 
@@ -16,10 +16,6 @@ use crate::compaction;
 use crate::skills::{self, skill_roots};
 use crate::transcript::repair_invalid_tool_call_arguments_in_messages;
 
-/// Cap on skills auto-curated per session, so a long run of verified turns can't
-/// flood `.hi/skills/` even if each one tempts a lesson.
-pub(crate) const MAX_AUTO_SKILLS_PER_SESSION: u32 = 3;
-
 /// Replay window (recent messages of the just-passed turn) handed to the curator.
 const CURATE_REPLAY_MAX: usize = 30;
 
@@ -28,13 +24,10 @@ impl crate::Agent {
     ///
     /// Best-effort: a provider/IO error is surfaced as a status, never fatal. The
     /// caller gates on the success signal (`last_verify == Some(true)` + changed
-    /// files), `config.memory.curate_skills`, and the per-session cap; this method also
-    /// re-checks the cap defensively. Like [`update_memory`](Self::update_memory)
-    /// it builds a throwaway message vec and does NOT record into session history.
+    /// files) and `config.memory.curate_skills`. Like
+    /// [`update_memory`](Self::update_memory), it builds a throwaway message vec and
+    /// does NOT record into session history.
     pub(crate) async fn curate_turn_end(&mut self, turn_start: usize, ui: &mut dyn Ui) {
-        if self.subagents.auto_skills_written >= MAX_AUTO_SKILLS_PER_SESSION {
-            return;
-        }
         // Just this turn's trajectory (user prompt → tool calls → results), with
         // bulky tool outputs elided — the curator needs the shape of what worked,
         // not the verbatim command output.
@@ -58,7 +51,13 @@ impl crate::Agent {
         compaction::elide_tool_outputs(&mut history, len);
         flatten_tool_history_for_chat_only(&mut history);
 
-        let existing = skills::learned_skills_context().unwrap_or_default();
+        // Resolve roots once for this workspace and reuse them for both the
+        // context read and the write. This keeps curation from consulting a
+        // mutable process-global override halfway through a turn.
+        let mut roots = skill_roots();
+        roots.project = self.workspace_root().join(".hi/skills");
+        roots.agents = self.workspace_root().join(".agents/skills");
+        let existing = skills::learned_skills_context_in(&roots).unwrap_or_default();
 
         let mut messages = Vec::with_capacity(history.len() + 2);
         messages.push(self.minimal_system_message());
@@ -99,10 +98,24 @@ impl crate::Agent {
             StreamEvent::Warning(text) => ui.top_status(&text),
             StreamEvent::Reasoning(_) => {}
             StreamEvent::WireAudit(_) => {}
+            StreamEvent::ToolCallDelta { .. } => {}
         };
-        let completion = match self.provider.stream(request, &mut sink).await {
-            Ok(completion) => completion,
-            Err(err) => {
+        let timeout = self.side_call_timeout();
+        let completion = match crate::agent::turn::await_side_call(
+            timeout,
+            self.provider.stream(request, &mut sink),
+        )
+        .await
+        {
+            Err(timeout) => {
+                ui.status(&format!(
+                    "(skill curation timed out after {:.1}s)",
+                    timeout.as_secs_f64()
+                ));
+                return;
+            }
+            Ok(Ok(completion)) => completion,
+            Ok(Err(err)) => {
                 self.add_side_error_usage(&err);
                 ui.status(&format!("(couldn't curate skill: {err})"));
                 return;
@@ -128,9 +141,6 @@ impl crate::Agent {
         // for `scope: global`; silently writing a cross-project instruction is
         // a durable prompt-poisoning boundary. Users can still promote a
         // reviewed skill explicitly.
-        let mut roots = skill_roots();
-        roots.project = self.workspace_root().join(".hi/skills");
-        roots.agents = self.workspace_root().join(".agents/skills");
         if skill.scope == "global" {
             ui.status("(automatic skill requested global scope; kept project-local)");
         }
@@ -142,7 +152,8 @@ impl crate::Agent {
             &skill.body,
         ) {
             Ok(Some(path)) => {
-                self.subagents.auto_skills_written += 1;
+                self.subagents.auto_skills_written =
+                    self.subagents.auto_skills_written.saturating_add(1);
                 ui.status(&format!("✓ curated skill → {}", path.display()));
             }
             Ok(None) => {} // a skill by this name already exists

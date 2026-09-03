@@ -104,6 +104,16 @@ impl Ui for JsonlProgressUi {
         });
         self.inner.tool_result(name, result);
     }
+    fn plan_result_id(
+        &mut self,
+        id: &str,
+        name: &str,
+        result: &str,
+        status: hi_tools::ToolStatus,
+        steps: &[hi_agent::PlanStep],
+    ) {
+        self.inner.plan_result_id(id, name, result, status, steps);
+    }
     fn confirm(&mut self, request: ConfirmationRequest) -> ConfirmationFuture<'_> {
         self.inner.confirm(request)
     }

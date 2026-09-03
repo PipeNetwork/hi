@@ -4,7 +4,7 @@
 //! [`intent`](super::intent) and [`implementation`](super::implementation)
 //! for evidence classification and tool-call inspection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use hi_ai::{Content, Message};
 
@@ -89,7 +89,6 @@ impl ImplementationTracker {
     ) {
         let validation_observed =
             validation_succeeded && implementation_tool_call_validates(name, arguments);
-
         // Some mutation-capable tools (notably `delegate`) report their exact
         // applied effects in the typed outcome rather than in display text.
         // Keep the typed effect authoritative so a successful delegated edit
@@ -124,9 +123,8 @@ pub(crate) enum EvidenceKind {
     FileRead,
 }
 
-/// Read-only discovery tools. The inspection-sprawl / round-cap guards must
-/// treat these as inspection — otherwise a `repo_map` in the round skipped the
-/// cap entirely (live: 45+ RSI model rounds mixing grep/read with repo_map).
+/// Read-only discovery tools. Explicit user inspection caps and the repeated-
+/// evidence guard treat these uniformly.
 pub(crate) fn is_read_only_inspection_tool(name: &str) -> bool {
     matches!(
         name,
@@ -134,8 +132,8 @@ pub(crate) fn is_read_only_inspection_tool(name: &str) -> bool {
     )
 }
 
-/// File-cap accounting: every read-only inspection except `list` costs one
-/// attempt. Listings still count toward the consecutive-round cap.
+/// Explicit-cap accounting: every read-only inspection except `list` costs one
+/// attempt.
 pub(crate) fn counts_against_file_inspection_cap(name: &str) -> bool {
     is_read_only_inspection_tool(name) && name != "list"
 }
@@ -158,22 +156,22 @@ pub(crate) struct EvidenceTracker {
     pub(crate) file_reads: u32,
     pub(crate) targeted_searches: u32,
     /// Read/search attempts, including typed failures such as an offset past
-    /// EOF. Failed probes still consume the inspection-sprawl budget.
+    /// EOF. Failed probes still consume an explicit user-supplied cap.
     /// `repo_map` / `explore` / `find_symbol` count as one attempt each.
     pub(crate) inspection_attempts: u32,
     pub(crate) security_unsafe_search: bool,
     pub(crate) security_execution_search: bool,
     pub(crate) security_secret_search: bool,
     pub(crate) grep_match_lines: u32,
-    pub(crate) inspected_paths: Vec<String>,
+    pub(crate) inspected_paths: VecDeque<String>,
     pub(crate) search_hit_snippets: Vec<String>,
     pub(crate) first_tool_kind: Option<EvidenceKind>,
     pub(crate) quality_repair_nudges: u32,
-    /// How many inspection-sprawl nudges have fired this turn. Incremented in
-    /// the turn loop when a read-only review turn keeps issuing read-only
-    /// inspections past the active intent-specific inspection cap without producing a
-    /// final answer. Once this exceeds [`MAX_INSPECTION_SPRAWL_NUDGES`] the
-    /// turn stops incomplete rather than fabricating a review.
+    /// How many inspection-cap nudges have fired this turn. This is incremented
+    /// only after a user-supplied cap is reached. Once it exceeds
+    /// [`MAX_INSPECTION_SPRAWL_NUDGES`] the turn settles with the evidence
+    /// already available rather than fabricating
+    /// a review.
     pub(crate) inspection_sprawl_nudges: u32,
     /// Consecutive executed model rounds whose every call was a read-only
     /// inspection tool. Reset when a mutating or unclassified tool runs.
@@ -194,30 +192,56 @@ pub(crate) struct EvidenceTracker {
     /// output. Mutating tools are never added here; ordinary bash still counts
     /// as potentially new, but a tightly recognized no-op/control bash command
     /// gets a signature so stop/quit/done loops are bounded.
-    pub(crate) seen_signatures: Vec<String>,
+    pub(crate) seen_signatures: VecDeque<String>,
+    pub(crate) seen_signature_set: HashSet<String>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) seen_signatures_dropped: u64,
     /// Paths whose latest successful `read` invited another page via the
     /// `read more with offset` footer. A later page of such a path is new
-    /// evidence until the read completes or [`MAX_PAGED_READS_PER_PATH`] hits.
-    pub(crate) truncated_read_paths: Vec<String>,
+    /// evidence until the read completes.
+    pub(crate) truncated_read_paths: VecDeque<String>,
     /// Paths that have already been returned in full this turn. A later
     /// limited slice must not re-open paging — live Flash followed a complete
     /// default read with `offset:70` and we treated that as a truncated file.
-    pub(crate) completed_read_paths: Vec<String>,
-    /// Successful `read` count per inspected path this turn.
-    pub(crate) read_pages: Vec<(String, u32)>,
+    pub(crate) completed_read_paths: VecDeque<String>,
 }
 
 impl EvidenceTracker {
+    const SIGNATURE_LIMIT: usize = 4_096;
+    const PATH_LIMIT: usize = 2_048;
+
+    pub(crate) fn has_seen_signature(&self, signature: &str) -> bool {
+        self.seen_signature_set.contains(signature)
+    }
+
+    fn record_signature(&mut self, signature: String) {
+        if !self.seen_signature_set.insert(signature.clone()) {
+            return;
+        }
+        if self.seen_signatures.len() >= Self::SIGNATURE_LIMIT
+            && let Some(evicted) = self.seen_signatures.pop_front()
+        {
+            self.seen_signature_set.remove(&evicted);
+            self.seen_signatures_dropped = self.seen_signatures_dropped.saturating_add(1);
+        }
+        self.seen_signatures.push_back(signature);
+    }
+
+    fn push_path(paths: &mut VecDeque<String>, path: String) {
+        if paths.len() >= Self::PATH_LIMIT {
+            paths.pop_front();
+        }
+        paths.push_back(path);
+    }
+
     pub(crate) fn record_success(&mut self, name: &str, arguments: &str, output: &str) {
         let evidence_kind = evidence_kind_for_tool(name, arguments);
         if counts_against_file_inspection_cap(name) {
             self.inspection_attempts = self.inspection_attempts.saturating_add(1);
         }
         if output.starts_with("Error:") {
-            if let Some(sig) = inspection_infrastructure_error_signature(name, output)
-                && !self.seen_signatures.iter().any(|s| s == &sig)
-            {
-                self.seen_signatures.push(sig);
+            if let Some(sig) = inspection_infrastructure_error_signature(name, output) {
+                self.record_signature(sig);
             }
             self.record_inspection_signature(name, arguments);
             return;
@@ -261,7 +285,7 @@ impl EvidenceTracker {
                         .iter()
                         .any(|existing| existing == &path)
                     {
-                        self.inspected_paths.push(path.clone());
+                        Self::push_path(&mut self.inspected_paths, path.clone());
                     }
                     self.record_read_page(&path, output);
                 }
@@ -284,7 +308,7 @@ impl EvidenceTracker {
     ///
     /// Extra pages of a **complete** file already read this turn do **not**
     /// count as new evidence — that walk used to burn hours on 100KB sources.
-    /// A later page of a still-truncated file does count (capped per path),
+    /// A later page of a still-truncated file does count,
     /// because the default tool-result budget often returns ~100 lines and
     /// the footer tells the model to `read more with offset N`.
     pub(crate) fn round_adds_evidence(&self, calls: &[(String, String, String)]) -> bool {
@@ -295,38 +319,30 @@ impl EvidenceTracker {
             match name.as_str() {
                 "read" => {
                     if let Some(sig) = inspection_signature(name, args)
-                        && self.seen_signatures.iter().any(|s| s == &sig)
+                        && self.has_seen_signature(&sig)
                     {
                         continue;
                     }
                     if let Some(path) = hi_tools::target_path(name, args)
                         && self.path_already_inspected(&path)
                     {
-                        if !self.path_read_is_complete(&path)
-                            && self.path_read_is_truncated(&path)
-                            && self.read_page_count(&path)
-                                < super::constants::MAX_PAGED_READS_PER_PATH
+                        if !self.path_read_is_complete(&path) && self.path_read_is_truncated(&path)
                         {
                             return true;
                         }
                         continue;
                     }
                     match inspection_signature(name, args) {
-                        Some(sig) if self.seen_signatures.iter().any(|s| s == &sig) => {}
+                        Some(sig) if self.has_seen_signature(&sig) => {}
                         _ => return true,
                     }
                 }
                 "list" | "grep" | "glob" | "bash_output" | "bash_kill" | "bash" => {
-                    if name == "grep"
-                        && self
-                            .seen_signatures
-                            .iter()
-                            .any(|s| s == "grep:error:unavailable")
-                    {
+                    if name == "grep" && self.has_seen_signature("grep:error:unavailable") {
                         continue;
                     }
                     match inspection_signature(name, args) {
-                        Some(sig) if self.seen_signatures.iter().any(|s| s == &sig) => {}
+                        Some(sig) if self.has_seen_signature(&sig) => {}
                         // A new signature, or arguments we cannot signature safely,
                         // should execute. The normal tool path will surface malformed
                         // arguments; the cycle guard must not hide them.
@@ -334,7 +350,7 @@ impl EvidenceTracker {
                     }
                 }
                 "explore" | "repo_map" | "find_symbol" => match inspection_signature(name, args) {
-                    Some(sig) if self.seen_signatures.iter().any(|s| s == &sig) => {}
+                    Some(sig) if self.has_seen_signature(&sig) => {}
                     _ => return true,
                 },
                 // Any mutating or unclassified tool counts as potentially new
@@ -375,32 +391,16 @@ impl EvidenceTracker {
             })
     }
 
-    fn read_page_count(&self, path: &str) -> u32 {
-        self.read_pages
-            .iter()
-            .find(|(seen, _)| paths_refer_to_same_file(seen, path))
-            .map(|(_, count)| *count)
-            .unwrap_or(0)
-    }
-
     fn record_read_page(&mut self, path: &str, output: &str) {
-        match self
-            .read_pages
-            .iter_mut()
-            .find(|(seen, _)| paths_refer_to_same_file(seen, path))
-        {
-            Some((_, count)) => *count = count.saturating_add(1),
-            None => self.read_pages.push((path.to_string(), 1)),
-        }
         if hi_tools::read_output_invites_paging(output) {
             if !self.path_read_is_complete(path) && !self.path_read_is_truncated(path) {
-                self.truncated_read_paths.push(path.to_string());
+                Self::push_path(&mut self.truncated_read_paths, path.to_string());
             }
         } else {
             self.truncated_read_paths
                 .retain(|seen| !paths_refer_to_same_file(seen, path));
             if !self.path_read_is_complete(path) {
-                self.completed_read_paths.push(path.to_string());
+                Self::push_path(&mut self.completed_read_paths, path.to_string());
             }
         }
     }
@@ -433,7 +433,7 @@ impl EvidenceTracker {
                     self.completed_read_paths
                         .retain(|seen| !paths_refer_to_same_file(seen, path));
                     if !self.path_read_is_truncated(path) {
-                        self.truncated_read_paths.push(path.clone());
+                        Self::push_path(&mut self.truncated_read_paths, path.clone());
                     }
                 }
             }
@@ -441,10 +441,8 @@ impl EvidenceTracker {
     }
 
     fn record_inspection_signature(&mut self, name: &str, arguments: &str) {
-        if let Some(sig) = inspection_signature(name, arguments)
-            && !self.seen_signatures.iter().any(|s| s == &sig)
-        {
-            self.seen_signatures.push(sig);
+        if let Some(sig) = inspection_signature(name, arguments) {
+            self.record_signature(sig);
         }
     }
 
@@ -461,8 +459,8 @@ impl EvidenceTracker {
         self.inspection_attempts
     }
 
-    /// Count this model round toward the consecutive inspection-only cap.
-    /// Empty rounds (chat-only wrap-up) are ignored.
+    /// Track consecutive inspection-only rounds for diagnostics. Empty rounds
+    /// (chat-only wrap-up) are ignored; this counter is not a default limit.
     pub(crate) fn record_inspection_round(&mut self, calls: &[(String, String, String)]) {
         if calls.is_empty() {
             return;
@@ -582,9 +580,9 @@ fn paths_refer_to_same_file(a: &str, b: &str) -> bool {
 /// call returns `None`; callers treat that as potentially new evidence so the
 /// normal tool execution path can report the argument error.
 ///
-/// [`EvidenceTracker::round_adds_evidence`] treats a new page of a still-
-/// truncated file as new evidence (capped per path). The offset stays in
-/// the signature so identical pages still fold.
+/// [`EvidenceTracker::round_adds_evidence`] treats every new page of a still-
+/// truncated file as new evidence. The offset stays in the signature so
+/// identical pages still fold without imposing an arbitrary page count.
 pub(crate) fn inspection_signature(name: &str, arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
     match name {
@@ -698,6 +696,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn evidence_cycle_diagnostics_are_bounded_without_blocking_new_inspections() {
+        let mut evidence = EvidenceTracker::default();
+        for index in 0..5_000 {
+            evidence.record_signature(format!("signature-{index}"));
+        }
+
+        assert_eq!(
+            evidence.seen_signatures.len(),
+            EvidenceTracker::SIGNATURE_LIMIT
+        );
+        assert_eq!(
+            evidence.seen_signature_set.len(),
+            EvidenceTracker::SIGNATURE_LIMIT
+        );
+        assert_eq!(evidence.seen_signatures_dropped, 904);
+        assert!(!evidence.has_seen_signature("signature-0"));
+        assert!(evidence.has_seen_signature("signature-4999"));
+
+        for index in 0..2_100 {
+            evidence.record_success(
+                "read",
+                &serde_json::json!({"path": format!("src/{index}.rs")}).to_string(),
+                "1\tcontents\n",
+            );
+        }
+        assert_eq!(evidence.inspected_paths.len(), EvidenceTracker::PATH_LIMIT);
+        assert_eq!(
+            evidence.completed_read_paths.len(),
+            EvidenceTracker::PATH_LIMIT
+        );
+        assert_eq!(
+            evidence.inspected_paths.front().map(String::as_str),
+            Some("src/52.rs")
+        );
+        assert_eq!(
+            evidence.inspected_paths.back().map(String::as_str),
+            Some("src/2099.rs")
+        );
+    }
+
+    #[test]
     fn successful_validation_is_recorded_without_a_mutation() {
         let mut tracker = ImplementationTracker::default();
         tracker.record_tool_result(
@@ -767,5 +806,27 @@ mod tests {
             )]),
             "an extra page of an elided file is new evidence"
         );
+    }
+
+    #[test]
+    fn truncated_file_paging_crosses_the_legacy_eight_page_boundary() {
+        let mut evidence = EvidenceTracker::default();
+        for page in 0..9 {
+            let offset = page * 100 + 1;
+            evidence.record_success(
+                "read",
+                &serde_json::json!({"path": "src/large.rs", "offset": offset}).to_string(),
+                &format!(
+                    "{offset}\tcontent\n— read more with offset {}",
+                    offset + 100
+                ),
+            );
+        }
+
+        assert!(evidence.round_adds_evidence(&[(
+            "next".into(),
+            "read".into(),
+            serde_json::json!({"path": "src/large.rs", "offset": 901}).to_string(),
+        )]));
     }
 }

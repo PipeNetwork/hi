@@ -6,9 +6,10 @@
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -24,28 +25,117 @@ use crate::candidate_merge::apply_candidate_and_reverify_cancellable;
 use crate::delegate_events;
 use crate::resource_governor::{self, ResourceClass};
 
-const DELEGATE_TIMEOUT_SECS: u64 = 600;
-const DELEGATE_QUEUE_TIMEOUT_SECS: u64 = 600;
+const DELEGATE_SETTLEMENT_GRACE_SECS: u64 = 60;
 const DEFAULT_GLOBAL_DELEGATE_CONCURRENCY: usize = 4;
 const MAX_GLOBAL_DELEGATE_CONCURRENCY: usize = 16;
 
 /// Cross-process delegate capacity lease. Atomic create-new slot files prevent
 /// independent `hi` processes from oversubscribing the provider/build machine.
-/// A lease is reclaimed only when its recorded PID is no longer alive.
+/// The unique owner token prevents an old guard from removing a replacement
+/// file after fault recovery.
+#[derive(Debug)]
 struct DelegateLease {
     path: PathBuf,
+    owner: String,
     _file: File,
 }
 
 impl Drop for DelegateLease {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        remove_delegate_lease_if_owner(&self.path, &self.owner, &self._file);
     }
+}
+
+fn delegate_owner_token() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn delegate_lease_record(owner: &str) -> String {
+    let birth = resource_governor::current_process_birth_identity().unwrap_or("unknown");
+    format!("owner={owner}\npid={}\nbirth={birth}\n", std::process::id())
+}
+
+fn delegate_lease_owner(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("owner=")
+                .map(str::trim)
+                .filter(|owner| !owner.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+fn remove_delegate_lease_if_owner(path: &Path, owner: &str, file: &File) {
+    if delegate_lease_owner(path).as_deref() == Some(owner)
+        && file_still_names_open_inode(path, file)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_delegate_file(file: &File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+    ) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_delegate_file(_file: &File) -> std::io::Result<bool> {
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn file_still_names_open_inode(path: &Path, file: &File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(open) = file.metadata() else {
+        return false;
+    };
+    let Ok(named) = std::fs::metadata(path) else {
+        return false;
+    };
+    open.dev() == named.dev() && open.ino() == named.ino()
+}
+
+#[cfg(not(unix))]
+fn file_still_names_open_inode(path: &Path, _file: &File) -> bool {
+    path.is_file()
+}
+
+/// Reclaim only while holding the old inode's exclusive advisory lock. Every
+/// v2 owner retains this lock for the lease lifetime, preventing two waiters
+/// from deciding an old path is stale and then unlinking a newly-created slot.
+fn reclaim_stale_delegate_lease(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+        return false;
+    };
+    if !matches!(try_lock_delegate_file(&file), Ok(true))
+        || !lease_is_stale(path)
+        || !file_still_names_open_inode(path, &file)
+    {
+        return false;
+    }
+    std::fs::remove_file(path).is_ok()
 }
 
 fn acquire_delegate_lease(
     state_root: &Path,
-    timeout: Duration,
+    timeout: Option<Duration>,
     stop: &dyn Fn() -> bool,
 ) -> Result<DelegateLease> {
     let limit = std::env::var("HI_GLOBAL_DELEGATE_CONCURRENCY")
@@ -53,6 +143,16 @@ fn acquire_delegate_lease(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_GLOBAL_DELEGATE_CONCURRENCY)
         .clamp(1, MAX_GLOBAL_DELEGATE_CONCURRENCY);
+    acquire_delegate_lease_with_limit(state_root, timeout, stop, limit)
+}
+
+fn acquire_delegate_lease_with_limit(
+    state_root: &Path,
+    timeout: Option<Duration>,
+    stop: &dyn Fn() -> bool,
+    limit: usize,
+) -> Result<DelegateLease> {
+    let limit = limit.clamp(1, MAX_GLOBAL_DELEGATE_CONCURRENCY);
     let lease_root = state_root.join("delegate-leases");
     std::fs::create_dir_all(&lease_root)
         .with_context(|| format!("creating delegate lease directory {}", lease_root.display()))?;
@@ -65,19 +165,36 @@ fn acquire_delegate_lease(
             let path = lease_root.join(format!("slot-{slot}.lease"));
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut file) => {
-                    use std::io::Write;
-                    writeln!(file, "{}", std::process::id())?;
-                    return Ok(DelegateLease { path, _file: file });
+                    let owner = delegate_owner_token();
+                    if !try_lock_delegate_file(&file)
+                        .context("locking delegate concurrency lease owner")?
+                    {
+                        anyhow::bail!("new delegate concurrency lease was already locked");
+                    }
+                    if let Err(error) = file
+                        .write_all(delegate_lease_record(&owner).as_bytes())
+                        .and_then(|()| file.sync_all())
+                    {
+                        // Only unlink a record that durably identifies this
+                        // guard. A partial/empty file is recovered after the
+                        // shared incomplete-record grace instead of risking
+                        // deletion of a replacement path.
+                        remove_delegate_lease_if_owner(&path, &owner, &file);
+                        return Err(error).context("recording delegate concurrency lease owner");
+                    }
+                    return Ok(DelegateLease {
+                        path,
+                        owner,
+                        _file: file,
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lease_is_stale(&path) {
-                        let _ = std::fs::remove_file(&path);
-                    }
+                    reclaim_stale_delegate_lease(&path);
                 }
                 Err(error) => return Err(error).context("acquiring delegate concurrency lease"),
             }
         }
-        if started.elapsed() >= timeout {
+        if queue_wait_timed_out(started.elapsed(), timeout) {
             anyhow::bail!("timed out waiting for a global delegate concurrency slot");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -85,25 +202,46 @@ fn acquire_delegate_lease(
 }
 
 fn lease_is_stale(path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
+    let text = std::fs::read_to_string(path).ok();
+    let Some(text) = text.as_deref() else {
+        return resource_governor::owner_record_is_stale(path, None, None);
     };
-    let Ok(pid) = text.trim().parse::<u32>() else {
-        return true;
-    };
-    #[cfg(unix)]
-    {
-        !std::path::Path::new("/proc").join(pid.to_string()).exists()
-            && std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .status()
-                .is_ok_and(|status| !status.success())
+
+    // v2 records are complete only when every field exists. This distinction
+    // matters when `create_new` succeeded but the owner write was interrupted:
+    // a partial PID must not masquerade as a live, permanent lease.
+    if text.lines().any(|line| line.starts_with("owner=")) {
+        let owner = text
+            .lines()
+            .find_map(|line| line.strip_prefix("owner=").map(str::trim))
+            .filter(|owner| !owner.is_empty());
+        let pid = text.lines().find_map(|line| {
+            line.strip_prefix("pid=")?
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|pid| *pid > 0)
+        });
+        let birth_field = text
+            .lines()
+            .find_map(|line| line.strip_prefix("birth=").map(str::trim))
+            .filter(|birth| !birth.is_empty());
+        if owner.is_none() || pid.is_none() || birth_field.is_none() {
+            return resource_governor::owner_record_is_stale(path, None, None);
+        }
+        let birth = birth_field.filter(|birth| *birth != "unknown");
+        return resource_governor::owner_record_is_stale(path, pid, birth);
     }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+
+    // Backward compatibility for the original single-PID record. The shared
+    // stale check compares file age with process uptime, so PID reuse cannot
+    // wedge an unlimited queue.
+    let legacy_pid = text
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid > 0);
+    resource_governor::owner_record_is_stale(path, legacy_pid, None)
 }
 
 pub struct CliDelegateRunner {
@@ -113,7 +251,13 @@ pub struct CliDelegateRunner {
     base_url: String,
     api_key: String,
     default_verify: Option<String>,
-    max_steps: Option<u32>,
+    /// `0` means no explicit cap; positive values are forwarded to children.
+    /// Atomic because `/config steps` can change it after this runner is
+    /// attached to the long-lived interactive Agent.
+    max_steps: AtomicU32,
+    /// `u64::MAX` means no explicit cap; every `u32` value (including a
+    /// managed zero budget) is forwarded losslessly to children.
+    max_tool_calls: AtomicU64,
     max_verify: u32,
     workspace_root: PathBuf,
     state_root: PathBuf,
@@ -130,6 +274,7 @@ impl CliDelegateRunner {
         api_key: String,
         default_verify: Option<String>,
         max_steps: Option<u32>,
+        max_tool_calls: Option<u32>,
         max_verify: u32,
         workspace_root: PathBuf,
         state_root: PathBuf,
@@ -157,17 +302,39 @@ impl CliDelegateRunner {
             base_url,
             api_key,
             default_verify,
-            max_steps,
+            max_steps: AtomicU32::new(max_steps.unwrap_or(0)),
+            max_tool_calls: AtomicU64::new(encode_optional_u32(max_tool_calls)),
             max_verify,
             workspace_root,
             state_root,
             counter: AtomicU32::new(0),
         })
     }
+
+    pub(crate) fn configured_max_steps(&self) -> Option<u32> {
+        match self.max_steps.load(Ordering::Relaxed) {
+            0 => None,
+            value => Some(value),
+        }
+    }
+
+    pub(crate) fn configured_max_tool_calls(&self) -> Option<u32> {
+        decode_optional_u32(self.max_tool_calls.load(Ordering::Relaxed))
+    }
 }
 
 #[async_trait]
 impl DelegateRunner for CliDelegateRunner {
+    fn set_max_steps(&self, max_steps: Option<u32>) {
+        self.max_steps
+            .store(max_steps.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    fn set_max_tool_calls(&self, max_tool_calls: Option<u32>) {
+        self.max_tool_calls
+            .store(encode_optional_u32(max_tool_calls), Ordering::Relaxed);
+    }
+
     async fn run_cancellable(
         &self,
         task: &str,
@@ -313,7 +480,8 @@ impl CliDelegateRunner {
         let idx = self.counter.fetch_add(1, Ordering::Relaxed);
         let exe = self.exe.clone();
         let (provider, model, base_url, api_key) = self.effective_route(route);
-        let max_steps = self.max_steps;
+        let max_steps = self.configured_max_steps();
+        let max_tool_calls = self.configured_max_tool_calls();
         let max_verify = self.max_verify;
         let task = task.to_string();
         let workspace_root = self.workspace_root.clone();
@@ -332,6 +500,7 @@ impl CliDelegateRunner {
                 &task,
                 &verify_cmd,
                 max_steps,
+                max_tool_calls,
                 max_verify,
                 &checkpoint,
                 idx,
@@ -363,6 +532,7 @@ fn run_blocking(
     task: &str,
     verify_cmd: &str,
     max_steps: Option<u32>,
+    max_tool_calls: Option<u32>,
     max_verify: u32,
     checkpoint: &str,
     idx: u32,
@@ -378,11 +548,9 @@ fn run_blocking(
     }
     let queue_started = Instant::now();
     report_progress(progress.as_deref(), "waiting for capacity");
-    let _lease = match acquire_delegate_lease(
-        state_root,
-        Duration::from_secs(delegate_queue_timeout_secs()),
-        &|| cancellation.is_cancelled(),
-    ) {
+    let _lease = match acquire_delegate_lease(state_root, delegate_queue_timeout(), &|| {
+        cancellation.is_cancelled()
+    }) {
         Ok(lease) => lease,
         Err(error) => {
             if let Some(out) = stop_if_cancelled(&cancellation, None, None) {
@@ -396,10 +564,10 @@ fn run_blocking(
     };
     let queue_wait_ms = queue_started.elapsed().as_millis();
     let setup_queue_started = Instant::now();
-    let setup_lease = match resource_governor::acquire_while(
+    let setup_lease = match resource_governor::acquire_while_optional(
         state_root,
         ResourceClass::Setup,
-        Duration::from_secs(delegate_queue_timeout_secs()),
+        delegate_queue_timeout(),
         &|| cancellation.is_cancelled(),
     ) {
         Ok(lease) => lease,
@@ -448,6 +616,7 @@ fn run_blocking(
     let events_path = artifact_dir.join("events.jsonl");
 
     let prompt = child_prompt(task, verify_cmd);
+    let child_timeout_secs = delegate_timeout_secs();
     let mut arguments = vec![
         OsString::from("--subagent"),
         OsString::from("--provider"),
@@ -461,13 +630,20 @@ fn run_blocking(
         OsString::from("0"),
         OsString::from("--verify"),
         OsString::from(verify_cmd),
-        OsString::from("--max-verify-repairs"),
-        OsString::from(max_verify.to_string()),
         OsString::from("--review"),
         OsString::from("always"),
         OsString::from("--report"),
         report_path.as_os_str().to_os_string(),
     ];
+    if max_verify != hi_agent::UNLIMITED_REPAIR_CYCLES {
+        arguments.push(OsString::from("--max-verify-repairs"));
+        arguments.push(OsString::from(max_verify.to_string()));
+    }
+    arguments.extend(delegate_child_budget_arguments(
+        max_steps,
+        max_tool_calls,
+        child_timeout_secs,
+    ));
     let mut event_tailer = None;
     if let Some(progress) = progress.clone()
         && std::fs::write(&events_path, []).is_ok()
@@ -475,10 +651,6 @@ fn run_blocking(
         arguments.push("--events-jsonl".into());
         arguments.push(events_path.as_os_str().into());
         event_tailer = delegate_events::start_event_tailer(events_path.clone(), progress);
-    }
-    if let Some(max_steps) = max_steps {
-        arguments.push("--max-steps".into());
-        arguments.push(max_steps.to_string().into());
     }
     arguments.push(prompt.into());
 
@@ -490,10 +662,10 @@ fn run_blocking(
         return out;
     }
     let model_queue_started = Instant::now();
-    let process_lease = match resource_governor::acquire_while(
+    let process_lease = match resource_governor::acquire_while_optional(
         state_root,
         ResourceClass::Model,
-        Duration::from_secs(delegate_queue_timeout_secs()),
+        delegate_queue_timeout(),
         &|| cancellation.is_cancelled(),
     ) {
         Ok(lease) => lease,
@@ -529,7 +701,7 @@ fn run_blocking(
                 state_root.join("build-cache/sccache").into_os_string(),
             ),
         ],
-        Duration::from_secs(delegate_timeout_secs()),
+        child_timeout_secs.map(Duration::from_secs),
         &log_path,
         Some(cancellation.clone()),
     );
@@ -658,20 +830,80 @@ fn delegate_artifacts_dir(state_root: &Path, idx: u32) -> PathBuf {
         .join(idx.to_string())
 }
 
-fn delegate_queue_timeout_secs() -> u64 {
-    std::env::var("HI_DELEGATE_QUEUE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|&seconds| seconds > 0)
-        .unwrap_or(DELEGATE_QUEUE_TIMEOUT_SECS)
+fn delegate_queue_timeout() -> Option<Duration> {
+    delegate_queue_timeout_secs_from_value(
+        std::env::var("HI_DELEGATE_QUEUE_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+    .map(Duration::from_secs)
 }
 
-fn delegate_timeout_secs() -> u64 {
-    std::env::var("HI_DELEGATE_TIMEOUT_SECS")
-        .ok()
+/// Resolve the opt-in delegate capacity wait. Unset, invalid, and zero wait
+/// until capacity arrives or cancellation is observed; a positive value is an
+/// explicit finite queue timeout.
+pub(crate) fn delegate_queue_timeout_secs_from_value(configured: Option<&str>) -> Option<u64> {
+    configured
         .and_then(|value| value.parse().ok())
         .filter(|&seconds| seconds > 0)
-        .unwrap_or(DELEGATE_TIMEOUT_SECS)
+}
+
+pub(crate) fn queue_wait_timed_out(elapsed: Duration, timeout: Option<Duration>) -> bool {
+    timeout.is_some_and(|timeout| elapsed >= timeout)
+}
+
+fn delegate_timeout_secs() -> Option<u64> {
+    let configured = std::env::var("HI_DELEGATE_TIMEOUT_SECS").ok();
+    delegate_timeout_secs_from_value(configured.as_deref())
+}
+
+/// Resolve the opt-in delegate wall-clock timeout. Unset, invalid, and zero
+/// values all mean unlimited. A positive value is used exactly as supplied.
+pub(crate) fn delegate_timeout_secs_from_value(configured: Option<&str>) -> Option<u64> {
+    configured
+        .and_then(|value| value.parse().ok())
+        .filter(|&seconds| seconds > 0)
+}
+
+/// Child soft budget plus explicit model-round/tool-call caps. This stays a pure argv
+/// builder so the parent/child boundary is regression-testable without spawning
+/// a real agent process.
+pub(crate) fn delegate_child_budget_arguments(
+    max_steps: Option<u32>,
+    max_tool_calls: Option<u32>,
+    outer_timeout_secs: Option<u64>,
+) -> Vec<OsString> {
+    let mut arguments = Vec::new();
+    // Leave enough time for the child to settle and write its typed report
+    // before an explicitly requested outer kill. A one-second opt-in has no
+    // useful earlier integer deadline, so it relies on the outer timeout.
+    if let Some(outer_timeout_secs) = outer_timeout_secs.filter(|seconds| *seconds > 1) {
+        let turn_deadline_secs = outer_timeout_secs
+            .saturating_sub(DELEGATE_SETTLEMENT_GRACE_SECS)
+            .max(1)
+            .min(outer_timeout_secs - 1);
+        arguments.push(OsString::from("--turn-deadline"));
+        arguments.push(OsString::from(turn_deadline_secs.to_string()));
+    }
+    if let Some(max_steps) = max_steps {
+        arguments.push(OsString::from("--max-steps"));
+        arguments.push(OsString::from(max_steps.to_string()));
+    }
+    if let Some(max_tool_calls) = max_tool_calls {
+        arguments.push(OsString::from("--max-tool-calls"));
+        arguments.push(OsString::from(max_tool_calls.to_string()));
+    }
+    arguments
+}
+
+const OPTIONAL_U32_NONE: u64 = u64::MAX;
+
+fn encode_optional_u32(value: Option<u32>) -> u64 {
+    value.map(u64::from).unwrap_or(OPTIONAL_U32_NONE)
+}
+
+fn decode_optional_u32(value: u64) -> Option<u32> {
+    (value != OPTIONAL_U32_NONE).then_some(value as u32)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -867,4 +1099,191 @@ fn child_prompt(task: &str, verify: &str) -> String {
         "Implement this self-contained subtask by editing files and running commands as needed. \
          Do not report completion until `{verify}` passes on the final revision.\n\nTask: {task}"
     )
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    fn lease_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "hi-delegate-lease-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_old_guard_does_not_remove_replacement_slot() {
+        let root = lease_dir("replacement");
+        let path = root.join("slot-0.lease");
+        let owner = delegate_owner_token();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(delegate_lease_record(&owner).as_bytes())
+            .unwrap();
+        let lease = DelegateLease {
+            path: path.clone(),
+            owner,
+            _file: file,
+        };
+
+        std::fs::remove_file(&path).unwrap();
+        let replacement_owner = delegate_owner_token();
+        std::fs::write(&path, delegate_lease_record(&replacement_owner)).unwrap();
+        drop(lease);
+
+        assert_eq!(
+            delegate_lease_owner(&path).as_deref(),
+            Some(replacement_owner.as_str())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_cannot_unlink_a_locked_active_slot() {
+        let root = lease_dir("locked-race");
+        let path = root.join("slot-0.lease");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        assert!(try_lock_delegate_file(&file).unwrap());
+        file.write_all(
+            format!("owner=stale\npid={}\nbirth=unreachable-owner\n", u32::MAX).as_bytes(),
+        )
+        .unwrap();
+
+        // Keep this test independent of an external `ps` lookup. Under a
+        // saturated process table that lookup may conservatively fail, which
+        // correctly leaves a live-PID record alone but is unrelated to the
+        // lock/inode race exercised here. This PID cannot name a supported
+        // process, so the unlocked record is deterministically stale.
+        assert!(lease_is_stale(&path));
+
+        assert!(!reclaim_stale_delegate_lease(&path));
+        assert!(path.exists());
+
+        drop(file);
+        // Acquisition retries reclamation on every queue pass. Assert the
+        // same eventual behavior here: Darwin can briefly continue reporting
+        // advisory-lock contention immediately after the owning descriptor is
+        // closed under heavy process pressure.
+        let reclaim_deadline = Instant::now() + Duration::from_secs(2);
+        while !reclaim_stale_delegate_lease(&path) && Instant::now() < reclaim_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_current_guard_removes_its_own_slot() {
+        let root = lease_dir("own");
+        let path = root.join("slot-0.lease");
+        let owner = delegate_owner_token();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(delegate_lease_record(&owner).as_bytes())
+            .unwrap();
+        let lease = DelegateLease {
+            path: path.clone(),
+            owner,
+            _file: file,
+        };
+
+        drop(lease);
+
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_delegate_slot_uses_conservative_fault_recovery_grace() {
+        let root = lease_dir("incomplete");
+        let path = root.join("slot-0.lease");
+        std::fs::write(&path, "owner=partially-written\n").unwrap();
+        assert!(!lease_is_stale(&path));
+
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        let old = std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH);
+        file.set_times(old).unwrap();
+        assert!(lease_is_stale(&path));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn delegate_slot_rejects_reused_live_pid_birth_identity() {
+        let root = lease_dir("pid-reuse");
+        let path = root.join("slot-0.lease");
+        std::fs::write(
+            &path,
+            format!(
+                "owner=forged\npid={}\nbirth=not-this-process\n",
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        assert!(lease_is_stale(&path));
+
+        let birth = resource_governor::current_process_birth_identity()
+            .expect("supported platforms expose process birth identity");
+        std::fs::write(
+            &path,
+            format!("owner=active\npid={}\nbirth={birth}\n", std::process::id()),
+        )
+        .unwrap();
+        assert!(!lease_is_stale(&path));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delegate_slot_wait_has_no_default_deadline_but_observes_cancellation() {
+        let root = lease_dir("unlimited-wait");
+        let held = acquire_delegate_lease_with_limit(&root, None, &|| false, 1).unwrap();
+        let started = Instant::now();
+        let error = acquire_delegate_lease_with_limit(
+            &root,
+            None,
+            &|| started.elapsed() >= Duration::from_millis(75),
+            1,
+        )
+        .expect_err("cancellation must stop an otherwise-unbounded capacity wait");
+
+        assert!(format!("{error:#}").contains("cancelled"));
+        assert!(started.elapsed() >= Duration::from_millis(75));
+        drop(held);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_delegate_slot_wait_timeout_is_enforced() {
+        let root = lease_dir("explicit-wait");
+        let held = acquire_delegate_lease_with_limit(&root, None, &|| false, 1).unwrap();
+        let started = Instant::now();
+        let error =
+            acquire_delegate_lease_with_limit(&root, Some(Duration::from_millis(75)), &|| false, 1)
+                .expect_err("an explicit capacity timeout must remain enforceable");
+
+        assert!(format!("{error:#}").contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(held);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

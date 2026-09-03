@@ -1,0 +1,86 @@
+schema_version = 1
+name = "validation-then-generic-recap"
+tags = ["curated", "generic-completion-guard-negative-control"]
+timeout_ms = 45000
+
+[[session.plan]]
+title = "Run the final verification"
+status = "pending"
+
+[[provider.steps]]
+id = "validation"
+[provider.steps.expect]
+body_contains = ["final verification"]
+[provider.steps.response]
+kind = "tool_call"
+name = "bash"
+arguments = { command = "true # validate" }
+
+[[provider.steps]]
+id = "generic-after-validation"
+[provider.steps.response]
+kind = "text"
+text = "Completed the requested action."
+
+[[provider.steps]]
+id = "generic-validation-retry"
+[provider.steps.expect]
+body_contains = ["actual result"]
+[provider.steps.response]
+kind = "text"
+text = "Completed the requested action."
+
+[[provider.steps]]
+id = "resumable-drive-held"
+[provider.steps.response]
+kind = "hold"
+gate = "stop-resumable-drive"
+
+[[actions]]
+kind = "wait_provider_request"
+count = 1
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_provider_request"
+count = 4
+timeout_ms = 15000
+
+[[actions]]
+kind = "capture_screen"
+name = "validation_preserved"
+
+[[actions]]
+kind = "send_key"
+key = "ctrl_c"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "cancelled" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "release_gate"
+gate = "stop-resumable-drive"
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/plan/incomplete" = true, "/data/next_drive/action" = "enqueue" }
+exact = 1
+
+[[assertions]]
+kind = "screen"
+snapshot = "validation_preserved"
+contains = ["Made concrete progress on the current step"]
+excludes = ["Completed the requested action."]
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

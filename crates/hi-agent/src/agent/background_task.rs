@@ -178,8 +178,8 @@ impl crate::Agent {
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
 
-        // Budget check — read-only kinds share the explore counter; write kinds
-        // share the delegate counter.
+        // Reserve accounting. Ordinary read-only and write work is unlimited;
+        // an explicit delegate quota can still deny a write reservation.
         let is_read_only = kind.is_read_only();
         let slot = if is_read_only {
             self.subagents
@@ -189,13 +189,15 @@ impl crate::Agent {
                 .try_begin_delegate(crate::agent::delegate_turn::delegate_turn_limit())
         };
         let Some(n) = slot else {
-            let max = if is_read_only {
-                crate::agent::explore_turn::MAX_EXPLORE_SUBAGENTS_PER_TURN
+            let message = if is_read_only {
+                format!("unable to reserve {subagent_type} subagent accounting")
             } else {
-                crate::agent::delegate_turn::delegate_turn_limit()
+                crate::agent::delegate_turn::delegate_limit_denial(
+                    crate::agent::delegate_turn::delegate_turn_limit(),
+                )
             };
             return bg_tool_outcome(
-                format!("task error: {subagent_type} subagent budget exhausted ({max} this turn)"),
+                format!("task error: {message}"),
                 hi_tools::ToolStatus::Denied,
             );
         };
@@ -288,9 +290,17 @@ impl crate::Agent {
                 } else {
                     self.subagents.release_delegate();
                 }
+                let status = if e
+                    .downcast_ref::<hi_tools::BackgroundTaskCapacityError>()
+                    .is_some()
+                {
+                    hi_tools::ToolStatus::Denied
+                } else {
+                    hi_tools::ToolStatus::Failed
+                };
                 return bg_tool_outcome(
                     format!("task error: failed to spawn background task: {e}"),
-                    hi_tools::ToolStatus::Failed,
+                    status,
                 );
             }
         };
@@ -548,11 +558,10 @@ impl crate::Agent {
             loop_limits: crate::AgentLoopLimits {
                 // Inherit the parent's step setting (off unless the operator
                 // capped the session). The old hard cap of 20 made every
-                // `cost: large` delegate end "Incomplete due to step limit" —
-                // work done, verification unrun, outcome branded Failed.
+                // `cost: large` delegate end at the step limit — work done,
+                // verification unrun, outcome branded Failed.
                 max_steps: self.config.loop_limits.max_steps,
                 max_parallel_tools: 2,
-                max_silent_continues: 0,
                 ..crate::AgentLoopLimits::default()
             },
             subagents: crate::AgentSubagents {
@@ -597,10 +606,11 @@ fn format_task_results(results: &[hi_tools::BackgroundTaskOutcome]) -> String {
     lines.join("\n")
 }
 
-const MAX_BG_CHILD_PROMPT_CHARS: usize = 2_000;
-
 fn readonly_child_prompt(kind: BgTaskKind, prompt: &str) -> String {
-    let prompt = clip_chars(prompt.trim(), MAX_BG_CHILD_PROMPT_CHARS);
+    // The model-authored assignment can contain requirements at the tail. Keep
+    // it whole and leave context fitting to the child agent instead of silently
+    // converting a large task into a different, shorter one.
+    let prompt = prompt.trim();
     match kind {
         BgTaskKind::Plan => format!(
             "You are a read-only software architect. Explore the codebase and design an \
@@ -614,14 +624,6 @@ fn readonly_child_prompt(kind: BgTaskKind, prompt: &str) -> String {
              specific files and locations supporting it.\n\nQuestion: {prompt}"
         ),
     }
-}
-
-fn clip_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
-    format!("{clipped}…")
 }
 
 /// Run a background read-only subagent (`explore` / `plan`) to completion.
@@ -669,7 +671,7 @@ async fn run_bg_readonly(
                 hi_tools::BackgroundTaskState::Cancelled,
                 format!("{kind_label} subagent was cancelled"),
             ),
-            _ => (
+            crate::TurnStatus::Failed => (
                 hi_tools::BackgroundTaskState::Failed,
                 child
                     .last_assistant_text()
@@ -745,7 +747,7 @@ async fn run_bg_general_purpose(
                 hi_tools::BackgroundTaskState::Cancelled,
                 format!("{kind_label} subagent was cancelled"),
             ),
-            _ => (
+            crate::TurnStatus::Failed => (
                 hi_tools::BackgroundTaskState::Failed,
                 child
                     .last_assistant_text()
@@ -822,14 +824,16 @@ mod format_tests {
     }
 
     #[test]
-    fn readonly_child_prompt_clips_a_huge_task() {
-        let prompt = super::readonly_child_prompt(BgTaskKind::Explore, &"TASK ".repeat(2_000));
-        assert!(
-            prompt.chars().count() < super::MAX_BG_CHILD_PROMPT_CHARS + 400,
-            "{}",
-            prompt.chars().count()
-        );
-        assert!(!prompt.contains(&"TASK ".repeat(500)));
+    fn readonly_child_prompts_preserve_requirements_past_the_old_boundary() {
+        let task = format!("{}FINAL REQUIREMENT", "TASK ".repeat(500));
+        for kind in [BgTaskKind::Explore, BgTaskKind::Plan] {
+            let prompt = super::readonly_child_prompt(kind, &task);
+            assert!(
+                prompt.contains(&task),
+                "{kind:?} lost part of its assignment"
+            );
+            assert!(prompt.ends_with("FINAL REQUIREMENT"));
+        }
     }
 
     #[test]

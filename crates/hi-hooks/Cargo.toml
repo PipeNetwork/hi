@@ -11,8 +11,13 @@ tokio.workspace = true
 regex.workspace = true
 toml.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+# Hook commands run in private Unix process groups so cancellation and timeout
+# cleanup can signal every descendant, not only the immediate shell.
+unsafe_code = "allow"

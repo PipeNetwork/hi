@@ -39,7 +39,6 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::dashboard_goal::{
     RowGoal, drive_action, leftover_step_title, next_drive_stall, parse_report,
-    should_retry_goal_turn,
 };
 use crate::input::InputLine;
 use crate::layout::{UiLayout, cursor_window, truncate_display};
@@ -51,9 +50,6 @@ use crate::{App, FleetLauncher, SPINNER};
 const TAIL_CAP: usize = 200;
 /// Max table rows shown before the list scrolls with the selection.
 const TABLE_ROWS: usize = 8;
-/// Per-row next-turn backlog while a child turn is running (same cap as the
-/// main session queue).
-const MAX_ROW_PENDING: usize = crate::MAX_PROMPT_QUEUE;
 
 /// A dispatched fleet agent: one row, one worktree, one session on disk.
 pub(crate) struct FleetRow {
@@ -252,8 +248,10 @@ pub(crate) struct WorkflowRun {
     pub(crate) outcome: Option<hi_workflow::WorkflowOutcome>,
     /// Log lines emitted by the workflow (phase markers, log messages).
     pub(crate) log: Vec<String>,
-    /// Total agent invocations admitted for this run.
-    pub(crate) agent_budget: u64,
+    /// Optional finite agent invocation quota. `None` keeps ordinary runs
+    /// productive until they complete, are cancelled, or hit an explicit
+    /// provider/tool policy.
+    pub(crate) agent_budget: Option<u64>,
     /// Agent invocations that have completed and been charged.
     pub(crate) agent_spent: u64,
     /// Agent invocations reserved by an upcoming `parallel()` call.
@@ -1450,13 +1448,12 @@ pub(crate) async fn handle_workflow_host_request(
                 .workflow_runs
                 .get(run_id)
                 .map(|run| hi_workflow::BudgetState {
-                    total: Some(run.agent_budget),
+                    total: run.agent_budget,
                     spent: run.agent_spent,
                     reserved: run.agent_reserved,
-                    remaining: Some(
-                        run.agent_budget
-                            .saturating_sub(run.agent_spent.saturating_add(run.agent_reserved)),
-                    ),
+                    remaining: run.agent_budget.map(|maximum| {
+                        maximum.saturating_sub(run.agent_spent.saturating_add(run.agent_reserved))
+                    }),
                 });
             let _ = reply.send(state.ok_or_else(|| {
                 hi_workflow::HostError::Failed("workflow run is no longer active".into())
@@ -1474,15 +1471,16 @@ pub(crate) async fn handle_workflow_host_request(
                         .agent_spent
                         .saturating_add(run.agent_reserved)
                         .saturating_add(count);
-                    if requested > run.agent_budget {
-                        Err(hi_workflow::HostError::AgentCallQuotaExceeded {
+                    if let Some(maximum) = run.agent_budget
+                        && requested > maximum
+                    {
+                        return Err(hi_workflow::HostError::AgentCallQuotaExceeded {
                             requested,
-                            maximum: run.agent_budget,
-                        })
-                    } else {
-                        run.agent_reserved += count;
-                        Ok(())
+                            maximum,
+                        });
                     }
+                    run.agent_reserved = run.agent_reserved.saturating_add(count);
+                    Ok(())
                 });
             let _ = reply.send(result);
         }
@@ -2026,14 +2024,6 @@ fn send_reply(
     row.drive_stall = 0; // a user reply resets the drive-park guard
     row.plan_drive_stall = 0;
     if row.state == RowState::Working {
-        if row.pending.len() >= MAX_ROW_PENDING {
-            row.push_line(format!(
-                "⚠ queue full ({}/{}) — finish or drop a pending prompt",
-                row.pending.len(),
-                MAX_ROW_PENDING
-            ));
-            return;
-        }
         row.push_line(format!("⧗ queued: {text}"));
         row.pending.push_back(text);
     } else if row.state != RowState::Closed {
@@ -2090,9 +2080,7 @@ fn start_turn(
             "--base-url",
             &launcher.base_url,
         ]);
-    if launcher.max_steps > 0 {
-        cmd.args(["--max-steps", &launcher.max_steps.to_string()]);
-    }
+    cmd.args(launcher.child_execution_cap_args());
     cmd.arg("--session-file").arg(&row.session);
     // Per-turn ground truth: tokens, verify, changed files, goal progress.
     cmd.arg("--report").arg(report_path(row));
@@ -2101,12 +2089,10 @@ fn start_turn(
         cmd.arg("--goal").arg(objective);
     }
     if let Some(v) = &launcher.verify {
-        cmd.args([
-            "--verify",
-            v,
-            "--max-verify-repairs",
-            &launcher.max_verify.to_string(),
-        ]);
+        cmd.args(["--verify", v]);
+        if launcher.max_verify != hi_agent::UNLIMITED_REPAIR_CYCLES {
+            cmd.args(["--max-verify-repairs", &launcher.max_verify.to_string()]);
+        }
     }
     cmd.arg(&prompt);
 
@@ -2167,7 +2153,7 @@ fn finish_turn(
     ok: bool,
     killed: bool,
     launcher: &FleetLauncher,
-    line_tx: &mpsc::UnboundedSender<(usize, String)>,
+    _line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) {
     let Some(row) = app.fleet.get_mut(idx) else {
@@ -2189,7 +2175,6 @@ fn finish_turn(
     let plan_step_before = leftover_step_title(row.leftover.as_deref()).map(str::to_owned);
     row.driving = false;
     row.plan_driving = false;
-    let mut retry_goal_turn = false;
     let report = std::fs::read_to_string(report_path(row))
         .ok()
         .and_then(|t| parse_report(&t));
@@ -2198,21 +2183,23 @@ fn finish_turn(
         if report.total_tokens > 0 {
             row.usage = report.total_tokens;
         }
-        row.drive_stall = if report
-            .goal
-            .as_ref()
-            .and_then(|goal| goal.drive.as_ref())
-            .is_some()
-        {
-            0
-        } else {
+        row.drive_stall = report.goal_drive_stall.unwrap_or_else(|| {
+            // Compatibility for reports from an older child binary. Current
+            // children persist and report Agent's exact evidence-ledger result.
+            let productive_evidence = hi_agent::plan_drive_made_progress(
+                None,
+                None,
+                &report.progress_events,
+                &report.changed_files,
+            );
             next_drive_stall(
                 was_driving,
                 &row.last_goal_json,
                 &report.goal_raw,
+                productive_evidence,
                 row.drive_stall,
             )
-        };
+        });
         let was_active = row.goal.as_ref().is_some_and(|g| g.active);
         row.last_goal_json = report.goal_raw;
         row.goal = report.goal;
@@ -2226,19 +2213,15 @@ fn finish_turn(
                 "⚠ goal progress disappeared — automatic drive paused; reply to resume".to_string(),
             );
         }
-        retry_goal_turn = should_retry_goal_turn(
-            was_driving,
-            report.outcome_status.as_deref(),
-            row.goal.as_ref(),
-        );
-        let made_progress = hi_agent::plan_drive_made_progress(
-            plan_step_before.as_deref(),
-            leftover_step_title(report.leftover.as_deref()),
-            &report.progress_events,
-            &report.changed_files,
-        );
-        row.plan_drive_stall =
-            hi_agent::next_plan_drive_stall(was_plan_driving, made_progress, row.plan_drive_stall);
+        row.plan_drive_stall = report.plan_drive_stall.unwrap_or_else(|| {
+            let made_progress = hi_agent::plan_drive_made_progress(
+                plan_step_before.as_deref(),
+                leftover_step_title(report.leftover.as_deref()),
+                &report.progress_events,
+                &report.changed_files,
+            );
+            hi_agent::next_plan_drive_stall(was_plan_driving, made_progress, row.plan_drive_stall)
+        });
         row.leftover = report.leftover;
         row.plan = report.plan;
         if was_active
@@ -2295,14 +2278,6 @@ fn finish_turn(
         return;
     }
     if !ok {
-        if retry_goal_turn {
-            row.state = RowState::Idle;
-            row.started = None;
-            row.activity.clear();
-            row.push_line("↻ goal turn incomplete — retrying the active sub-goal".to_string());
-            continue_row(app, idx, launcher, line_tx, in_flight);
-            return;
-        }
         row.state = RowState::Failed;
         row.started = None;
         row.activity.clear();
@@ -2343,23 +2318,18 @@ fn finish_turn(
     let base = row.base.clone();
     let verify = launcher.verify.clone();
     in_flight.push(Box::pin(async move {
-        let outcome = tokio::task::spawn_blocking(move || {
-            let changed = worktree::changed_files(&worktree_path, &base);
-            let verified = match &verify {
-                Some(v) if !changed.is_empty() => worktree::verify_passes(&worktree_path, v),
-                _ => true,
-            };
-            (changed, verified)
-        })
-        .await
-        .unwrap_or_else(|_| (Vec::new(), false));
-        (
-            idx,
-            RowDone::MergeCheck {
-                changed: outcome.0,
-                verified: outcome.1,
-            },
-        )
+        let check_path = worktree_path.clone();
+        let changed =
+            tokio::task::spawn_blocking(move || worktree::changed_files(&check_path, &base))
+                .await
+                .unwrap_or_default();
+        let verified = match &verify {
+            Some(verify) if !changed.is_empty() => {
+                worktree::verify_passes_async(&worktree_path, verify, None).await
+            }
+            _ => true,
+        };
+        (idx, RowDone::MergeCheck { changed, verified })
     }));
 }
 
@@ -2397,7 +2367,7 @@ struct WorkflowReplyCompletion {
 
 fn finish_workflow_agent(
     row: &mut FleetRow,
-    success: bool,
+    mut success: bool,
     summary: String,
 ) -> Option<WorkflowReplyCompletion> {
     row.workflow_reply.as_ref()?;
@@ -2408,31 +2378,33 @@ fn finish_workflow_agent(
         .unwrap_or_else(|| serde_json::json!({"summary": summary}));
     if let Some(schema) = &row.workflow_schema {
         output = coerce_structured_output(output);
-        // A successful turn whose reply doesn't match the declared schema gets
-        // exactly one corrective follow-up before the engine sees it. The
-        // prompt rides the row's pending queue; returning false lets the
-        // caller fall through to `continue_row`, which dispatches it.
-        if success
-            && !row.workflow_schema_retry_used
-            && let Err(error) = hi_workflow::validate_output_schema(&output, schema)
-        {
-            row.workflow_schema_retry_used = true;
-            row.workflow_status = Some(WorkflowJobStatus::Running);
-            row.push_line(format!(
-                "⚠ structured output rejected ({error}) — requesting corrected JSON"
-            ));
-            if row.pending.len() < MAX_ROW_PENDING {
+        if success && let Err(error) = hi_workflow::validate_output_schema(&output, schema) {
+            // A successful turn whose reply doesn't match the declared schema
+            // gets exactly one corrective follow-up before the engine sees it.
+            // The prompt rides the row's pending queue; returning `None` lets
+            // the caller fall through to `continue_row`, which dispatches it.
+            if !row.workflow_schema_retry_used {
+                row.workflow_schema_retry_used = true;
+                row.workflow_status = Some(WorkflowJobStatus::Running);
+                row.push_line(format!(
+                    "⚠ structured output rejected ({error}) — requesting corrected JSON"
+                ));
                 row.pending.push_back(format!(
                     "Your previous reply did not match the required output schema: {error}\n\n\
                      Respond again with ONLY a single JSON object matching the schema — \
                      no prose before or after it, no markdown code fences."
                 ));
-            } else {
-                row.push_line(format!(
-                    "⚠ schema retry not queued — row queue full ({MAX_ROW_PENDING})"
-                ));
+                return None;
             }
-            return None;
+
+            // The correction was still invalid. Never pass schema-invalid data
+            // to the workflow engine as a successful agent result merely because
+            // the protocol-repair guard was spent; terminate this child as a
+            // typed failure and preserve the rejected output for diagnostics.
+            success = false;
+            row.push_line(format!(
+                "✗ corrected structured output still rejected ({error})"
+            ));
         }
     }
     let reply = row.workflow_reply.take()?;
@@ -2597,19 +2569,15 @@ fn finish_merge_check(
         row.state = RowState::Working;
         row.activity = "merging…".to_string();
         in_flight.push(Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                if workflow_cancel
-                    .as_ref()
-                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-                {
-                    return Err("workflow cancelled before merge".into());
-                }
-                worktree::apply_changes_to(&worktree_path, &base, &destination)
-                    .map(|_| ())
-                    .map_err(|error| format!("{error:#}"))
-            })
+            let result = worktree::apply_changes_to_async(
+                &worktree_path,
+                &base,
+                &destination,
+                workflow_cancel.as_ref(),
+            )
             .await
-            .unwrap_or_else(|error| Err(format!("merge worker failed: {error}")));
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"));
             (
                 idx,
                 RowDone::MergeApply {
@@ -2724,15 +2692,10 @@ fn queue_post_merge_verify(
             );
         }
         let verify_ok = match &verify {
-            Some(v) => {
-                let root = workspace_root.clone();
-                let v = v.clone();
-                Some(
-                    tokio::task::spawn_blocking(move || worktree::verify_passes(&root, &v))
-                        .await
-                        .unwrap_or(false),
-                )
-            }
+            Some(verify) => Some(
+                worktree::verify_passes_async(&workspace_root, verify, workflow_cancel.as_ref())
+                    .await,
+            ),
             None => None,
         };
         let new_base = hi_tools::checkpoint::create(&workspace_root).await;
@@ -2963,25 +2926,21 @@ fn queue_force_merge(
     row.activity = "force merging…".to_string();
     row.attention = false;
     in_flight.push(Box::pin(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let changed = worktree::changed_files(&worktree_path, &base);
-            if changed.is_empty() {
-                return (changed, Ok(()));
-            }
-            let result = worktree::apply_changes_to(&worktree_path, &base, &destination)
+        let check_path = worktree_path.clone();
+        let check_base = base.clone();
+        let changed =
+            tokio::task::spawn_blocking(move || worktree::changed_files(&check_path, &check_base))
+                .await
+                .unwrap_or_default();
+        let result = if changed.is_empty() {
+            Ok(())
+        } else {
+            worktree::apply_changes_to_async(&worktree_path, &base, &destination, None)
+                .await
                 .map(|_| ())
-                .map_err(|error| format!("{error:#}"));
-            (changed, result)
-        })
-        .await
-        .unwrap_or_else(|error| (Vec::new(), Err(format!("merge worker failed: {error}"))));
-        (
-            idx,
-            RowDone::ForceMerge {
-                changed: result.0,
-                result: result.1,
-            },
-        )
+                .map_err(|error| format!("{error:#}"))
+        };
+        (idx, RowDone::ForceMerge { changed, result })
     }));
     None
 }
@@ -3851,7 +3810,8 @@ mod tests {
             api_key: String::new(),
             verify: None,
             max_verify: 1,
-            max_steps: 1,
+            max_steps: std::sync::atomic::AtomicU32::new(1),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(u64::MAX),
             session_path: Box::new(|| Ok(PathBuf::from("/tmp/test-session.jsonl"))),
             sessions: Box::new(Vec::new),
             resume_info: Box::new(|_| None),
@@ -3911,7 +3871,7 @@ mod tests {
                 phases: vec![],
                 current_phase: None,
                 agents: vec![],
-                agent_budget: budget,
+                agent_budget: Some(budget),
                 agents_used: 0,
                 agents_reserved: reserved,
                 elapsed_ms: 0,
@@ -3929,14 +3889,150 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             outcome: None,
             log: Vec::new(),
-            agent_budget: budget,
+            agent_budget: Some(budget),
             agent_spent: 0,
             agent_reserved: reserved,
-            manifest: hi_workflow::WorkflowRunManifest::new(run_id.into(), "test".into(), budget)
-                .unwrap(),
+            manifest: hi_workflow::WorkflowRunManifest::new(
+                run_id.into(),
+                "test".into(),
+                Some(budget),
+            )
+            .unwrap(),
             store: None,
             ownership: None,
         }
+    }
+
+    #[test]
+    fn working_row_queue_preserves_more_than_the_legacy_64_prompts_fifo() {
+        let mut app = crate::tests::test_app("openai", "gpt-4o");
+        app.fleet.push(row());
+        let launcher = test_fleet_launcher();
+        let (line_tx, _line_rx) = mpsc::unbounded_channel();
+        let mut in_flight = FuturesUnordered::new();
+
+        for index in 0..65 {
+            send_reply(
+                &mut app,
+                0,
+                format!("prompt-{index}"),
+                &launcher,
+                &line_tx,
+                &mut in_flight,
+            );
+        }
+
+        assert_eq!(app.fleet[0].pending.len(), 65);
+        assert_eq!(app.fleet[0].pending.front().unwrap(), "prompt-0");
+        assert_eq!(app.fleet[0].pending.back().unwrap(), "prompt-64");
+    }
+
+    #[test]
+    fn schema_correction_is_not_dropped_behind_a_large_row_queue() {
+        let mut workflow_row = row();
+        workflow_row.pending = (0..65).map(|index| format!("prompt-{index}")).collect();
+        workflow_row.workflow_schema = Some(serde_json::json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": { "answer": { "type": "string" } }
+        }));
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        workflow_row.workflow_reply = Some(reply_tx);
+
+        assert!(finish_workflow_agent(&mut workflow_row, true, "invalid".into()).is_none());
+        assert_eq!(workflow_row.pending.len(), 66);
+        assert!(
+            workflow_row
+                .pending
+                .back()
+                .unwrap()
+                .contains("ONLY a single JSON object")
+        );
+        assert!(workflow_row.workflow_reply.is_some());
+    }
+
+    #[tokio::test]
+    async fn repeated_schema_mismatch_is_delivered_as_a_failure() {
+        let mut workflow_row = row();
+        workflow_row.workflow_schema = Some(serde_json::json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": { "answer": { "type": "string" } }
+        }));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        workflow_row.workflow_reply = Some(reply_tx);
+
+        assert!(finish_workflow_agent(&mut workflow_row, true, "invalid".into()).is_none());
+        let completion = finish_workflow_agent(
+            &mut workflow_row,
+            true,
+            "still invalid after correction".into(),
+        )
+        .expect("the spent correction must settle the workflow child");
+
+        assert!(completion.delivered);
+        assert_eq!(
+            workflow_row.workflow_status,
+            Some(WorkflowJobStatus::Failed)
+        );
+        assert!(workflow_row.workflow_reply.is_none());
+        assert!(
+            workflow_row
+                .tail
+                .iter()
+                .any(|line| line.contains("still rejected"))
+        );
+        let result = reply_rx.await.unwrap().unwrap();
+        assert!(!result.success, "schema-invalid output escaped as success");
+        assert_eq!(
+            result.output,
+            serde_json::json!({"summary": "still invalid after correction"})
+        );
+    }
+
+    #[tokio::test]
+    async fn unlimited_workflow_budget_accepts_work_past_the_legacy_default() {
+        let mut app = crate::tests::test_app("openai", "gpt-4o");
+        let mut run = workflow_run("run-1", 1, 0);
+        run.agent_budget = None;
+        run.snapshot.agent_budget = None;
+        run.manifest.agent_budget = None;
+        run.agent_spent = 128;
+        app.workflow_runs.insert("run-1".into(), run);
+        let launcher = test_fleet_launcher();
+        let (line_tx, _line_rx) = mpsc::unbounded_channel();
+        let mut in_flight = FuturesUnordered::new();
+
+        let (query_tx, query_rx) = oneshot::channel();
+        handle_workflow_host_request(
+            &mut app,
+            "run-1",
+            hi_workflow::WorkflowHostRequest::BudgetQuery { reply: query_tx },
+            &launcher,
+            &line_tx,
+            &mut in_flight,
+        )
+        .await;
+        let state = query_rx.await.unwrap().unwrap();
+        assert_eq!(state.total, None);
+        assert_eq!(state.remaining, None);
+        assert_eq!(state.spent, 128);
+
+        let (reserve_tx, reserve_rx) = oneshot::channel();
+        handle_workflow_host_request(
+            &mut app,
+            "run-1",
+            hi_workflow::WorkflowHostRequest::ReserveAgentCalls {
+                count: 1,
+                reply: reserve_tx,
+            },
+            &launcher,
+            &line_tx,
+            &mut in_flight,
+        )
+        .await;
+        assert!(reserve_rx.await.unwrap().is_ok());
+        assert_eq!(app.workflow_runs["run-1"].agent_reserved, 1);
     }
 
     #[tokio::test]
@@ -4029,7 +4125,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = hi_workflow::WorkflowRunStore::new(dir.path());
         let manifest =
-            hi_workflow::WorkflowRunManifest::new("run-1".into(), "test".into(), 2).unwrap();
+            hi_workflow::WorkflowRunManifest::new("run-1".into(), "test".into(), Some(2)).unwrap();
         store
             .register(&manifest, "complete(1);", &serde_json::json!({}))
             .unwrap();

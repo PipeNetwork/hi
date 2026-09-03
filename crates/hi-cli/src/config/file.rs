@@ -683,11 +683,11 @@ fn merge_project_outcome(
         .as_ref()
         .and_then(|section| section.mode.as_deref())
         .map(outcome_mode_rank)
-        .unwrap_or(1); // OutcomeMode::Auto
+        .unwrap_or(0); // OutcomeMode::Chat (ordinary direct-provider default)
     let safe_mode = project
         .mode
         .as_deref()
-        .filter(|mode| outcome_mode_rank(mode) <= current_rank)
+        .filter(|mode| trusted || outcome_mode_rank(mode) <= current_rank)
         .map(str::to_string);
     if base.is_none() && safe_mode.is_none() && !trusted {
         return;
@@ -715,10 +715,12 @@ fn merge_project_outcome(
 }
 
 fn outcome_mode_rank(mode: &str) -> u8 {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "chat" => 0,
-        "tasks" => 2,
-        _ => 1,
+    // Derive trust ordering from the runtime parser so accepted aliases and
+    // fail-closed handling of unknown values cannot drift apart.
+    match hi_outcome::OutcomeMode::parse(mode) {
+        hi_outcome::OutcomeMode::Chat => 0,
+        hi_outcome::OutcomeMode::Auto => 1,
+        hi_outcome::OutcomeMode::Tasks => 2,
     }
 }
 

@@ -50,6 +50,7 @@ pub(crate) fn run_best_of(
         prompt,
         candidates: cli.best_of,
         max_steps: cli.max_steps,
+        max_tool_calls: cli.max_tool_calls,
         max_verify: quality_max_verify_repairs,
         workspace_root,
         state_root,

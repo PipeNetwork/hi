@@ -8,13 +8,15 @@ use std::collections::BTreeSet;
 use crate::agent::turn::fast_feedback::FastFeedbackState;
 use crate::agent::turn::progress::ProgressTracker;
 use crate::agent::turn::retry::{ReviewRepairState, TurnRetryState};
+use crate::agent::turn::speculation::SpeculationRegistry;
 use crate::domain::TurnControlFlags;
 use crate::steering::{
     EvidenceTracker, ImplementationIntent, ImplementationTracker, MutationRecovery, ReviewIntent,
-    ToolLoopGuardrail,
 };
 use crate::verify::{Snapshot, WorkspaceRepairVerifier};
-use crate::{ReviewStatus, TaskContract, ToolCallEntry, TurnPhaseLatencies};
+use crate::{ReviewStatus, TaskContract, TurnPhaseLatencies};
+
+use super::retention::ToolTimeline;
 
 /// All mutable state that lives for one `run_turn` invocation.
 pub(super) struct TurnState {
@@ -57,7 +59,6 @@ pub(super) struct TurnState {
     pub generic_completion_retries: u32,
     pub continue_total_nudges: u32,
     pub repeat_nudges: u32,
-    pub repeat_sampling_rounds: u32,
 
     // --- control / trackers ---
     pub flags: TurnControlFlags,
@@ -69,18 +70,22 @@ pub(super) struct TurnState {
     pub evidence: EvidenceTracker,
     pub implementation_tracker: ImplementationTracker,
     pub review_repair: ReviewRepairState,
-    pub tool_guardrail: ToolLoopGuardrail,
     pub empty_tui_needs_project: bool,
 
     // --- scheduler / tools ---
     pub sched_tool_calls: u32,
     pub sched_max_concurrent: u32,
     pub sched_serial_runs: u32,
-    pub tool_timeline: Vec<ToolCallEntry>,
+    pub tool_timeline: ToolTimeline,
     pub advertised_tool_names: BTreeSet<String>,
     pub tool_schema_tokens: u64,
-    pub prev_call_sig: Option<Vec<(String, String)>>,
-    pub prev_added_no_evidence: bool,
+    pub speculation_registry: SpeculationRegistry,
+    /// Remove `run_program` from the next request after one malformed or
+    /// rejected program, giving the model exactly one ordinary-tool recovery.
+    pub program_fallback_next: bool,
+    /// Prevent a provider that ignores the fallback tool catalog from
+    /// repeatedly re-entering the rejected program path.
+    pub program_fallback_used: bool,
     /// Keep the one-time DeepSeek strict-schema fallback active for the rest
     /// of this tool loop. Some gateways alternate between valid and malformed
     /// arguments when strict mode is re-enabled on the next request.
@@ -120,21 +125,15 @@ impl TurnState {
             generic_completion_retries: &mut self.generic_completion_retries,
             continue_total_nudges: &mut self.continue_total_nudges,
             repeat_nudges: &mut self.repeat_nudges,
-            repeat_sampling_rounds: &mut self.repeat_sampling_rounds,
             force_tools_next: &mut self.flags.force_tools_next,
             text_tool_fallback_next: &mut self.flags.text_tool_fallback_next,
             force_text_answer_next: &mut self.flags.force_text_answer_next,
-            force_no_progress_final_answer_next: &mut self
-                .flags
-                .force_no_progress_final_answer_next,
             suppress_bookkeeping_tools_next: &mut self.flags.suppress_bookkeeping_tools_next,
             made_tool_call: &mut self.flags.made_tool_call,
-            stalled_repeating: &mut self.flags.stalled_repeating,
-            stalled_unfinished: &mut self.flags.stalled_unfinished,
+            provider_exhausted: &mut self.flags.provider_exhausted,
             ended_at_cap: &mut self.flags.ended_at_cap,
             cap_wrap_up_requested: &mut self.flags.cap_wrap_up_requested,
-            review_wrap_up_requested: &mut self.flags.review_wrap_up_requested,
-            prev_added_no_evidence: &mut self.prev_added_no_evidence,
+            cap_kind: &mut self.flags.cap_kind,
             turn_start: &mut self.turn_start,
             context_generation_seen: &mut self.context_generation_seen,
             indexed_ledger_revision: &mut self.indexed_ledger_revision,
@@ -142,7 +141,6 @@ impl TurnState {
             sched_max_concurrent: &mut self.sched_max_concurrent,
             sched_serial_runs: &mut self.sched_serial_runs,
             tool_schema_tokens: &mut self.tool_schema_tokens,
-            prev_call_sig: &mut self.prev_call_sig,
             deepseek_strict_fallback_active: &mut self.deepseek_strict_fallback_active,
             retry_state: &mut self.retry_state,
             request_max_tokens_override: &mut self.request_max_tokens_override,
@@ -153,9 +151,11 @@ impl TurnState {
             evidence: &mut self.evidence,
             implementation_tracker: &mut self.implementation_tracker,
             review_repair: &mut self.review_repair,
-            tool_guardrail: &mut self.tool_guardrail,
             last_verify_attributions: &mut self.last_verify_attributions,
             tool_timeline: &mut self.tool_timeline,
+            speculation_registry: &self.speculation_registry,
+            program_fallback_next: &mut self.program_fallback_next,
+            program_fallback_used: &mut self.program_fallback_used,
             advertised_tool_names: &mut self.advertised_tool_names,
             turn_snapshot: &mut self.turn_snapshot,
             max_steps: self.max_steps,
@@ -173,5 +173,15 @@ impl TurnState {
             inspection_sprawl_intent: self.inspection_sprawl_intent,
             verifier: &self.verifier,
         }
+    }
+}
+
+impl Drop for TurnState {
+    fn drop(&mut self) {
+        // A turn can end through cancellation, disconnect, or an early
+        // provider error before the normal model-round cleanup runs.  The
+        // registry owns spawned shadow tasks, so make the turn boundary an
+        // unconditional final cancellation barrier as well.
+        self.speculation_registry.cancel_all();
     }
 }

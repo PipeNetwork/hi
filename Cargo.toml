@@ -41,7 +41,8 @@ version = "0.3.1"
 # use unsafe (mmap/alloc, libc kill, or test-only env set_var guards) opt out
 # with `[lints.rust] unsafe_code = "allow"` in their own Cargo.toml and a
 # comment naming the reason. Currently opted out: hi-cli, hi-eval, hi-tools,
-# hi-tui (real unsafe) and hi-agent, hi-ai (test-only).
+# hi-tui, hi-verifier, hi-race, and hi-agent (real process/platform work), plus
+# hi-ai (test-only).
 [workspace.lints.rust]
 unsafe_code = "deny"
 
@@ -74,6 +75,8 @@ rustyline = "18"
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 unicode-width = "0.2"
+portable-pty = "0.9"
+vt100 = "0.16"
 
 hi-ai = { version = "0.3.1", path = "crates/hi-ai" }
 hi-x402 = { version = "0.3.1", path = "crates/hi-x402" }
@@ -114,6 +117,8 @@ hi-test-utils = { version = "0.3.1", path = "crates/hi-test-utils" }
 hi-mcp = { version = "0.3.1", path = "crates/hi-mcp" }
 hi-browser = { version = "0.3.1", path = "crates/hi-browser" }
 hi-workflow = { version = "0.3.1", path = "crates/hi-workflow" }
+hi-engine-api = { version = "0.3.1", path = "crates/hi-engine-api" }
+hi-engine-host = { version = "0.3.1", path = "crates/hi-engine-host" }
 hi-events = { version = "0.3.1", path = "crates/hi-events" }
 hi-policy = { version = "0.3.1", path = "crates/hi-policy" }
 hi-control = { version = "0.3.1", path = "crates/hi-control" }
@@ -164,6 +169,7 @@ rand = "0.8"
 cc = "1"
 ansi-to-tui = "8"
 rhai = { version = "1.25", features = ["serde"] }
+wit-bindgen = "0.51"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 cpal = "0.18"
 whisper-rs = "0.16"

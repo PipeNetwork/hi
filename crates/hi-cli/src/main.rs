@@ -252,6 +252,11 @@ async fn run() -> Result<()> {
     }
 
     let cli = bootstrap::parse_and_validate_cli();
+    validate_tui_event_trace_request(
+        &cli,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )?;
     startup_trace!("cli parsed");
     // Install before any tool can run: with `--keep-background`, a completed
     // foreground command must not tree-kill the service it just detached.
@@ -361,6 +366,10 @@ async fn run() -> Result<()> {
         .as_ref()
         .map(|path| absolutize_path(path.as_path()))
         .transpose()?;
+    let report_max_steps =
+        std::cell::Cell::new(cli.max_steps.unwrap_or(hi_agent::MAX_MODEL_ROUNDS));
+    let report_max_tool_calls =
+        std::cell::Cell::new(cli.max_tool_calls.unwrap_or(hi_agent::MAX_TOOL_CALLS));
     // Any failure between here and a constructed agent still leaves a
     // structured report when `--report` was requested: a parent driving this
     // process treats a missing report file as an unexplained crash.
@@ -372,7 +381,8 @@ async fn run() -> Result<()> {
             provider_label(settings.provider),
             error,
             rsi,
-            cli.max_tool_calls.unwrap_or(hi_agent::MAX_TOOL_CALLS),
+            report_max_steps.get(),
+            report_max_tool_calls.get(),
         ) {
             eprintln!("\x1b[33mreport error: {report_error:#}\x1b[0m");
         }
@@ -449,17 +459,29 @@ async fn run() -> Result<()> {
     )
     .ok();
     startup_trace!("background ledger scan launched");
-    let rsi = RsiBootstrap::initialize(&cli, &file, prompt_input.as_deref())
-        .inspect_err(|error| report_init_failure(error, None))?;
+    let automatic_workflow_plan_path =
+        automatic_workflow_plan_path(&cli, &workspace_root, prompt_input.as_deref());
+    let rsi = RsiBootstrap::initialize(
+        &cli,
+        &file,
+        prompt_input.as_deref(),
+        automatic_workflow_plan_path.is_some(),
+    )
+    .inspect_err(|error| report_init_failure(error, None))?;
     startup_trace!("rsi bootstrap initialized");
     let rsi_requested = rsi.requested;
-    let quality = match config::resolve_quality(&cli, &workspace_root) {
+    let mut quality = match config::resolve_quality(&cli, &workspace_root) {
         Ok(quality) => quality,
         Err(err) => {
             eprintln!("{err:#}");
             std::process::exit(2);
         }
     };
+    quality.max_verify_repairs = rsi_bootstrap::effective_max_verify_repairs(
+        quality.max_verify_repairs,
+        quality.max_verify_repairs_explicit,
+        rsi.managed_runtime.as_ref(),
+    );
     startup_trace!("quality resolved");
     let verify_stages = quality.verification.resolved_stages(&workspace_root);
     startup_trace!("verify stages resolved");
@@ -575,12 +597,20 @@ async fn run() -> Result<()> {
     // reconfiguring the already-built agent.
     let live_metadata = startup_live_model_metadata();
     let max_tokens = effective_max_tokens_for_model(&settings, live_metadata.max_output_tokens);
+    let effective_max_steps =
+        rsi_bootstrap::effective_max_steps(cli.max_steps, rsi.managed_runtime.as_ref());
+    let effective_max_tool_calls =
+        rsi_bootstrap::effective_max_tool_calls(cli.max_tool_calls, rsi.managed_runtime.as_ref());
+    report_max_steps.set(effective_max_steps);
+    report_max_tool_calls.set(effective_max_tool_calls);
     rsi_bootstrap::bind_managed_effective(
         rsi.managed_runtime.as_ref(),
         &settings,
         quality.max_verify_repairs,
         quality.tool_set.label(),
         &cli,
+        effective_max_steps,
+        effective_max_tool_calls,
         max_tokens,
     )
     .inspect_err(|error| report_init_failure(error, None))?;
@@ -619,6 +649,8 @@ async fn run() -> Result<()> {
         provider.clone(),
         &live_metadata,
         max_tokens,
+        effective_max_steps,
+        effective_max_tool_calls,
         planner_model,
         skeptic_model.clone(),
         rsi_requested,
@@ -676,30 +708,33 @@ async fn run() -> Result<()> {
         .map(rsi_remote::load_managed_context)
         .transpose()?;
     agent.set_managed_rsi_context(managed_context);
-    // Attach the write-`delegate` subagent runner for any top-level agent (a
-    // subagent can't delegate), regardless of whether write subagents start on —
-    // so `/delegate on` can enable it at runtime. The tool stays gated by the
-    // `write_subagents` advertisement; the runner just needs to be ready. It spawns
-    // a `hi --subagent` child in an isolated worktree and applies only verified diffs.
-    let delegate_runner: Option<std::sync::Arc<dyn hi_agent::DelegateRunner>> = if !cli.subagent
-        && let Ok(exe) = std::env::current_exe()
-    {
-        let runner = delegate::CliDelegateRunner::new(
-            exe,
-            provider_label(settings.provider).to_string(),
-            settings.model.clone(),
-            settings.base_url.clone(),
-            settings.api_key.clone(),
-            pipeline_command(&verify_stages),
-            cli.max_steps,
-            quality.max_verify_repairs,
-            workspace_root.clone(),
-            state_root.clone(),
-        )?;
-        Some(std::sync::Arc::new(runner))
-    } else {
-        None
-    };
+    // Attach the external write-`delegate` runner for ordinary top-level agents,
+    // regardless of whether write subagents start on, so `/delegate on` can
+    // enable it at runtime. Managed RSI cannot use it: another process would not
+    // share the signed budget ledger or evidence trace. The tool stays gated by
+    // `write_subagents`; the runner spawns `hi --subagent` in an isolated worktree
+    // and applies only verified diffs.
+    let delegate_runner: Option<std::sync::Arc<dyn hi_agent::DelegateRunner>> =
+        if rsi_bootstrap::external_delegate_allowed(rsi_requested, cli.subagent)
+            && let Ok(exe) = std::env::current_exe()
+        {
+            let runner = delegate::CliDelegateRunner::new(
+                exe,
+                provider_label(settings.provider).to_string(),
+                settings.model.clone(),
+                settings.base_url.clone(),
+                settings.api_key.clone(),
+                pipeline_command(&verify_stages),
+                agent.max_steps_limit(),
+                agent.max_tool_calls_cap(),
+                quality.max_verify_repairs,
+                workspace_root.clone(),
+                state_root.clone(),
+            )?;
+            Some(std::sync::Arc::new(runner))
+        } else {
+            None
+        };
     if let Some(runner) = &delegate_runner {
         agent.set_delegate_runner(runner.clone());
     }
@@ -817,7 +852,13 @@ async fn run() -> Result<()> {
         api_key: settings.api_key.clone(),
         verify: pipeline_command(&verify_stages),
         max_verify: quality.max_verify_repairs,
-        max_steps: cli.max_steps.unwrap_or(0),
+        max_steps: std::sync::atomic::AtomicU32::new(agent.max_steps_limit().unwrap_or(0)),
+        max_tool_calls: std::sync::atomic::AtomicU64::new(
+            agent
+                .max_tool_calls_cap()
+                .map(u64::from)
+                .unwrap_or(u64::MAX),
+        ),
         session_path: Box::new(session::new_fleet_session_path),
         sessions: Box::new(|| {
             session::fleet_sessions()
@@ -955,16 +996,23 @@ async fn run() -> Result<()> {
         // Plain one-shot/headless checklist `plan.md` is the workflow runner's
         // job. Fleet `--session-file` children already have a worktree — they
         // ingest in-process below instead of nesting `workflow run`.
-        if let Some(plan_path) = hi_agent::one_shot_workflow_plan_path(
-            cli.session_file.is_some(),
-            agent.workspace_root(),
-            &prompt,
-            cli.goal.as_deref(),
-        ) {
+        if let Some(plan_path) = automatic_workflow_plan_path {
             let mut args = vec!["run".to_string(), plan_path];
             if !cli.verify.is_empty() {
                 args.push("--verify".into());
                 args.push(cli.verify.join(" && "));
+            }
+            if let Some(max_steps) = agent.max_steps_limit() {
+                args.push("--max-steps".into());
+                args.push(max_steps.to_string());
+            }
+            if let Some(max_tool_calls) = agent.max_tool_calls_cap() {
+                args.push("--max-tool-calls".into());
+                args.push(max_tool_calls.to_string());
+            }
+            if let Some(max_verify_repairs) = agent.max_verify_repairs_cap() {
+                args.push("--max-verify-repairs".into());
+                args.push(max_verify_repairs.to_string());
             }
             return workflow_cmd::run_workflow_cli(&args).await;
         }
@@ -1106,11 +1154,7 @@ async fn run() -> Result<()> {
                 && !cancellation_requested
             {
                 if kind == hi_agent::DriveKind::Goal {
-                    let made_progress = hi_agent::goal_drive_made_progress(
-                        goal_before.as_ref(),
-                        agent.structured_goal(),
-                        agent.last_changed_files(),
-                    );
+                    let made_progress = agent.goal_drive_turn_made_progress(goal_before.as_ref());
                     let progress = agent.note_goal_drive_progress(made_progress);
                     if !cli.quiet {
                         match progress {
@@ -1132,12 +1176,8 @@ async fn run() -> Result<()> {
                         }
                     }
                 } else if kind == hi_agent::DriveKind::Plan {
-                    let made_progress = hi_agent::plan_drive_made_progress(
-                        plan_step_before.as_deref(),
-                        agent.next_plan_step_title(),
-                        &agent.last_turn_telemetry().progress_events,
-                        agent.last_changed_files(),
-                    );
+                    let made_progress =
+                        agent.plan_drive_turn_made_progress(plan_step_before.as_deref());
                     agent.note_plan_drive_progress(made_progress);
                 }
                 if let Some(count) = agent.take_goal_requeue_notice()
@@ -1149,14 +1189,11 @@ async fn run() -> Result<()> {
                     );
                 }
                 if let Some(next) = agent.drive_decision(Some(outcome)).prompt() {
-                    let drive_limit = agent
-                        .structured_goal()
-                        .map(|goal| hi_agent::auto_budget_for(goal.sub_goals.len()))
-                        .unwrap_or(hi_agent::ONE_SHOT_DRIVE_TURN_LIMIT);
-                    if drive_turns >= drive_limit {
+                    let drive_limit = hi_agent::ONE_SHOT_DRIVE_TURN_LIMIT;
+                    if drive_limit != u32::MAX && drive_turns >= drive_limit {
                         break;
                     }
-                    drive_turns += 1;
+                    drive_turns = drive_turns.saturating_add(1);
                     current_prompt = next.to_string();
                     continue;
                 }
@@ -1311,6 +1348,12 @@ async fn run() -> Result<()> {
     // The full-screen TUI is the default interactive experience; fall back to
     // the plain REPL when not on a TTY, when --plain is set, or if it errors.
     if use_tui {
+        let tui_event_trace = cli
+            .tui_events_jsonl
+            .as_deref()
+            .map(hi_tui::TuiEventTrace::open)
+            .transpose()
+            .context("initializing --tui-events-jsonl")?;
         // TUI session switching replaces these handles at runtime. Keeping the
         // indirection here makes live events, per-turn flushes, and shutdown
         // flushing follow the newly selected session instead of the one that
@@ -1665,14 +1708,7 @@ async fn run() -> Result<()> {
                             None
                         };
 
-                        agent.apply_loaded_session(
-                            loaded.messages,
-                            loaded.usage,
-                            loaded.checkpoint_refs,
-                            loaded.goal,
-                            loaded.decisions,
-                            loaded.plan,
-                        )?;
+                        session::apply_loaded_session(agent, loaded)?;
 
                         if let Some((synced, next_handle, next_events)) = next_sync {
                             agent.set_session(Box::new(synced));
@@ -1848,6 +1884,7 @@ async fn run() -> Result<()> {
                 event_sink,
                 approval_store: approval_store.clone(),
                 fleet_launcher,
+                tui_event_trace,
                 remote_event_tap,
                 remote_flush_callback: tui_sync_flush_callback,
                 sync_config: tui_sync_config,
@@ -1889,6 +1926,9 @@ async fn run() -> Result<()> {
             }
             Err(err) => {
                 x402::clear_confirmer();
+                if cli.tui_events_jsonl.is_some() {
+                    return Err(err.context("interactive TUI trace session failed"));
+                }
                 eprintln!("\x1b[33mTUI error ({err:#}); falling back to plain mode\x1b[0m");
                 // A session switch may have replaced every sync handle while
                 // the TUI was running. Carry the active handles into fallback
@@ -1959,6 +1999,61 @@ async fn run() -> Result<()> {
     }
     finish_interactive_trace(rsi.observer.as_ref(), &agent)?;
     repl_result
+}
+
+fn validate_tui_event_trace_request(
+    cli: &config::Cli,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<()> {
+    if cli.tui_events_jsonl.is_none() {
+        return Ok(());
+    }
+    let headless_mode = cli.prompt.is_some()
+        || cli.plain
+        || cli.subagent
+        || cli.goal.is_some()
+        || cli.workflow.is_some()
+        || cli.list_sessions
+        || cli.show_config
+        || cli.loops_daemon
+        || cli.daemon
+        || cli.attach.is_some()
+        || cli.benchmark_orchestration
+        || cli.judge.is_some()
+        || cli.report.is_some()
+        || cli.eval_input.is_some()
+        || cli.eval_output.is_some()
+        || cli.quiet
+        || cli.skeptic_review;
+    if headless_mode || !stdin_is_tty || !stdout_is_tty {
+        anyhow::bail!("usage: --tui-events-jsonl is valid only for a full interactive TUI session");
+    }
+    Ok(())
+}
+
+fn automatic_workflow_plan_path(
+    cli: &config::Cli,
+    workspace_root: &std::path::Path,
+    prompt_input: Option<&str>,
+) -> Option<String> {
+    let prompt = prompt_input?;
+    let moa_prompt = match hi_agent::command::parse(prompt) {
+        Some(hi_agent::Command::Moa(argument)) => {
+            let argument = argument.trim();
+            if argument.is_empty() {
+                return None;
+            }
+            Some(argument.to_owned())
+        }
+        _ => None,
+    };
+    hi_agent::one_shot_workflow_plan_path(
+        cli.session_file.is_some(),
+        workspace_root,
+        moa_prompt.as_deref().unwrap_or(prompt),
+        cli.goal.as_deref(),
+    )
 }
 
 /// Describe an active hi-managed local profile without touching the network,

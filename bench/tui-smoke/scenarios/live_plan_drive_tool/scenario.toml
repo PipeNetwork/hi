@@ -1,0 +1,182 @@
+schema_version = 1
+name = "live-plan-drive-tool-canary"
+tags = ["live_extended"]
+timeout_ms = 600000
+
+[hi]
+args = ["--allow-unverified"]
+
+[[session.plan]]
+title = "Use the write tool, never bash or shell, to create live-plan-drive.txt containing exactly live plan drive complete with no trailing newline."
+status = "pending"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+timeout_ms = 240000
+
+# Approval decisions and tool UI events arrive on independent channels, so
+# their trace order is not a lifecycle contract. The final assertions require
+# exactly one of each without creating a forward-cursor race here.
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started", "/data/name" = "write" }
+timeout_ms = 240000
+
+[[actions]]
+kind = "wait_file"
+path = "live-plan-drive.txt"
+exists = true
+timeout_ms = 30000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled" }
+# The child turn deadline is 240s. Leave a 30s evidence-flush grace period
+# before the harness's independent 300s outer-turn watchdog.
+timeout_ms = 270000
+
+[[actions]]
+kind = "wait_quiescent"
+source = "events"
+quiet_ms = 750
+timeout_ms = 30000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started", "/data/name" = "write" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "write" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_result", "/data/name" = "write" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "update_plan" }
+at_least = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "update_plan" }
+at_most = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started", "/data/name" = "update_plan" }
+at_least = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started", "/data/name" = "update_plan" }
+at_most = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started" }
+at_least = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started" }
+at_most = 4
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call" }
+at_least = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call" }
+at_most = 4
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started", "/data/name" = "bash" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "bash" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "approval_shown" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "approval_decided", "/data/kind" = "file_edit", "/data/decision" = "auto_approved" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 1, "/data/plan/incomplete" = false, "/data/next_drive/action" = "idle" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/accepted" = true, "/response_status" = 200 }
+at_least = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "plan", "/data/pending" = 0 }
+at_least = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "plan", "/data/pending" = 0 }
+at_most = 2
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/type" = "plan_cleared" }
+exact = 1
+
+[[assertions]]
+kind = "file"
+path = "live-plan-drive.txt"
+exists = true
+equals = "live plan drive complete"
+
+[[assertions]]
+kind = "exit"
+code = 0

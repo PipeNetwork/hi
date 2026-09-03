@@ -1,6 +1,7 @@
 //! Per-session agent configuration and the layered-verification stage type.
 
 use hi_ai::{CompatMode, DeepSeekCompat, ReasoningEffort, ToolMode};
+use hi_engine_api::EngineMode;
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
@@ -58,7 +59,7 @@ impl VerificationMode {
 /// This gates [`crate::Agent::independent_review`] / [`crate::Agent::large_diff_review`]
 /// after a green workspace verify. It does **not** control Steer-phase
 /// **answer-repair** quality nudges ([`ReviewRepairBudgets`]) or the long-horizon
-/// **goal-skeptic** gate (`skeptic_fail_open`).
+/// **goal-skeptic** gate.
 ///
 /// Prefer the alias [`CompletionReviewPolicy`] in new code for clarity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +124,135 @@ pub enum ToolSet {
     Dynamic,
     Minimal,
     Full,
+}
+
+/// Negotiation policy for the native Rhai `run_program` capability.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProgramMode {
+    /// Advertise the capability only when the provider supports native tools.
+    Auto,
+    /// Never advertise or execute `run_program`.
+    #[default]
+    Off,
+}
+
+impl ProgramMode {
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+/// Per-session controls for program execution and speculative tool calling.
+#[derive(Clone, Debug)]
+pub struct AgentProgramConfig {
+    pub mode: ProgramMode,
+    pub speculative_ptc: bool,
+    pub max_speculative_calls: usize,
+    pub max_external_speculative_calls: usize,
+    pub external_ttl_seconds: u64,
+}
+
+/// Configuration for the optional hot-swappable decision engine. The native
+/// decision path remains the safe migration default; callers can opt into a
+/// validated component with `engine_mode = "wasm"` or `HI_ENGINE_MODE=wasm`.
+#[derive(Clone, Debug)]
+pub struct AgentEngineConfig {
+    pub mode: EngineMode,
+    pub module_path: Option<std::path::PathBuf>,
+    pub allow_unsigned: bool,
+    pub trusted_key_hex: Vec<String>,
+    pub watch: bool,
+    pub max_guest_fuel: u64,
+    pub max_guest_memory_bytes: usize,
+    pub max_guest_step_ms: u64,
+}
+
+impl Default for AgentEngineConfig {
+    fn default() -> Self {
+        let mode = std::env::var("HI_ENGINE_MODE")
+            .ok()
+            .and_then(|value| EngineMode::parse(&value))
+            .unwrap_or_default();
+        let module_path = std::env::var_os("HI_ENGINE_MODULE").map(std::path::PathBuf::from);
+        let allow_unsigned = std::env::var("HI_ENGINE_ALLOW_UNSIGNED")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+        let trusted_key_hex = std::env::var("HI_ENGINE_TRUSTED_KEYS")
+            .or_else(|_| std::env::var("HI_ENGINE_TRUSTED_KEY"))
+            .ok()
+            .into_iter()
+            .flat_map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let watch = std::env::var("HI_ENGINE_WATCH").ok().is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+        Self {
+            mode,
+            module_path,
+            allow_unsigned,
+            trusted_key_hex,
+            watch,
+            max_guest_fuel: hi_engine_host::DEFAULT_GUEST_FUEL,
+            max_guest_memory_bytes: hi_engine_host::DEFAULT_GUEST_MEMORY_BYTES,
+            max_guest_step_ms: hi_engine_host::DEFAULT_GUEST_STEP_TIMEOUT_MS,
+        }
+    }
+}
+
+impl Default for AgentProgramConfig {
+    fn default() -> Self {
+        Self {
+            // Keep the new nested execution path opt-in until its accounting
+            // and cancellation semantics have accumulated production soak.
+            mode: ProgramMode::Off,
+            speculative_ptc: false,
+            max_speculative_calls: 2,
+            max_external_speculative_calls: 1,
+            external_ttl_seconds: 30,
+        }
+    }
+}
+
+impl AgentProgramConfig {
+    /// Environment kill switches are intentionally narrow and supplemental to
+    /// the typed config, which lets operators disable the feature without
+    /// rebuilding a long-lived binary.
+    pub fn mode_enabled(&self) -> bool {
+        if std::env::var("HI_PROGRAM_MODE")
+            .ok()
+            .is_some_and(|value| value.eq_ignore_ascii_case("off"))
+        {
+            return false;
+        }
+        self.mode.is_enabled()
+    }
+
+    pub fn speculation_enabled(&self) -> bool {
+        self.speculative_ptc
+            && !std::env::var("HI_SPECULATIVE_PTC")
+                .ok()
+                .is_some_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off"
+                    )
+                })
+    }
 }
 
 impl ReviewPolicy {
@@ -334,6 +464,10 @@ pub struct AgentConfig {
     pub memory: AgentMemory,
     /// Explore/delegate/planner/skeptic subagent policy.
     pub subagents: AgentSubagents,
+    /// Native Rhai program negotiation and speculative execution controls.
+    pub program: AgentProgramConfig,
+    /// Native/WASM decision engine selection and module limits.
+    pub engine: AgentEngineConfig,
     /// Optional RSI control-plane hooks (interactive path stays thin).
     pub rsi: AgentRsi,
     /// Test-only owner for the temporary state root used by unit-test
@@ -346,6 +480,10 @@ pub struct AgentConfig {
     /// checkout while remaining inside the agent's workspace boundary.
     #[cfg(test)]
     pub(crate) _test_workspace_root: Option<std::sync::Arc<tempfile::TempDir>>,
+    /// Test-only explicit process policy. Tests must not mutate `HI_SANDBOX`
+    /// because Rust's process environment is shared by all parallel tests.
+    #[cfg(test)]
+    pub(crate) sandbox_policy: Option<hi_tools::sandbox::SandboxPolicy>,
     /// Per-session ceiling on how many turns the agent may run before it
     /// stops with [`crate::TurnStopReason::TurnLimit`]. `None` (the default)
     /// means **no limit** — the session runs until the user stops it. Set live
@@ -435,19 +573,23 @@ pub struct AgentGates {
     /// Automatic, explicit, or disabled deterministic verification.
     pub verification: VerificationMode,
     /// Repair/check cycles allowed after the initial verification check.
+    /// [`crate::UNLIMITED_REPAIR_CYCLES`] is the ordinary default.
     pub max_verify_repairs: u32,
     /// How many times an objected independent/large-diff review may re-enter
     /// Model for repair before the turn stalls as [`crate::ReviewStatus::Objected`].
-    /// `0` means the first objection is final (no repair cycle).
+    /// `0` means the first objection is final (no repair cycle), while
+    /// [`crate::UNLIMITED_REPAIR_CYCLES`] allows productive repairs until the
+    /// review passes or a no-progress/fault circuit fires.
     pub max_independent_review_repairs: u32,
     /// **Completion-review** policy ([`ReviewPolicy`] / [`CompletionReviewPolicy`]).
     /// Does not disable Steer answer-repair or goal-skeptic.
     pub review: ReviewPolicy,
     /// Permit a mutation turn to complete with `Unverified` status.
     pub allow_unverified: bool,
-    /// When true, a long-horizon skeptic timeout/error still lets the goal
-    /// advance (legacy fail-open). Default false: unavailable review blocks
-    /// goal progress; edits stay on disk for the next turn.
+    /// Legacy compatibility setting. Reviewer transport/protocol failures no
+    /// longer block deterministically verified productive goal work; they are
+    /// always recorded as unavailable diagnostics. Concrete reviewer objections
+    /// still block regardless of this value.
     pub skeptic_fail_open: bool,
     /// Permit mutation when no Git or internal checkpoint backend is available.
     pub allow_no_checkpoint: bool,
@@ -476,13 +618,13 @@ impl Default for AgentGates {
     fn default() -> Self {
         Self {
             verification: VerificationMode::Auto,
-            max_verify_repairs: 2,
-            max_independent_review_repairs: 1,
+            max_verify_repairs: crate::UNLIMITED_REPAIR_CYCLES,
+            max_independent_review_repairs: crate::UNLIMITED_REPAIR_CYCLES,
             review: ReviewPolicy::Risk,
             allow_unverified: false,
-            // Goal-skeptic transport may return Unavailable; product default is
-            // fail-closed (block goal advance). Independent-review Unavailable is
-            // recorded on TurnOutcome but does not re-enter Model.
+            // Retained for configuration/source compatibility. Review transports
+            // record Unavailable without re-entering Model or invalidating
+            // deterministic verification.
             skeptic_fail_open: false,
             allow_no_checkpoint: true,
             proactive_verify: false,
@@ -492,6 +634,36 @@ impl Default for AgentGates {
             lsp_mode: LspMode::Auto,
         }
     }
+}
+
+/// Human-readable form of a productive-repair limit. Keep the internal
+/// `u32::MAX` sentinel out of user-facing status and diagnostic text.
+pub(crate) fn repair_limit_label(limit: u32) -> String {
+    if limit == crate::UNLIMITED_REPAIR_CYCLES {
+        "unlimited".to_string()
+    } else {
+        limit.to_string()
+    }
+}
+
+/// Human-readable remaining productive repairs under `limit`.
+pub(crate) fn remaining_repairs_label(limit: u32, used: u32) -> String {
+    if limit == crate::UNLIMITED_REPAIR_CYCLES {
+        "unlimited".to_string()
+    } else {
+        limit.saturating_sub(used).to_string()
+    }
+}
+
+/// Whether another productive repair may run. The all-ones value is an
+/// unlimited sentinel, not a very large finite count, so a saturated usage
+/// counter must never make the ordinary default look exhausted.
+pub(crate) fn repair_available(limit: u32, used: u32) -> bool {
+    limit == crate::UNLIMITED_REPAIR_CYCLES || used < limit
+}
+
+pub(crate) fn repair_limit_reached(limit: u32, used: u32) -> bool {
+    !repair_available(limit, used)
 }
 
 /// Caps that bound a single turn's model/tool loops.
@@ -514,13 +686,14 @@ pub struct AgentLoopLimits {
     /// harness, wrapper timeout). Being killed at that deadline instead makes
     /// the result a lottery on whatever happened to be on disk mid-edit.
     pub turn_soft_deadline: Option<std::time::Duration>,
-    /// Cap on model calls per turn. The finite default is
-    /// [`MAX_MODEL_ROUNDS`]; `u32::MAX` means explicitly unlimited. Set via
-    /// `--max-steps`, `/config steps <n|auto|off>`, or an internal subagent
-    /// budget. A capped turn gets one tool-free wrap-up round, then proceeds
-    /// through normal workspace verification and settlement.
+    /// Cap on model calls per turn. [`MAX_MODEL_ROUNDS`] (`u32::MAX`) means
+    /// unlimited and is the ordinary default. Set a finite cap via
+    /// `--max-steps`, `/config steps <n>`, or an internal subagent budget. A
+    /// capped turn gets one tool-free wrap-up round, then proceeds through
+    /// normal workspace verification and settlement.
     pub max_steps: u32,
-    /// Hard cap on executed tool calls per turn. This is independent of the
+    /// Cap on executed tool calls per turn. [`MAX_TOOL_CALLS`] (`u32::MAX`)
+    /// means unlimited and is the ordinary default. This is independent of the
     /// model-call (`max_steps`) cap.
     pub max_tool_calls: u32,
     /// Max times one turn will nudge a model that re-issues the exact same tool
@@ -539,7 +712,9 @@ pub struct AgentLoopLimits {
     /// Default: [`MAX_EMPTY_RETRIES`].
     pub max_empty_retries: u32,
     /// Max times one turn will nudge the model to continue after its output was
-    /// truncated by the output token cap. Default: [`MAX_TRUNCATION_RETRIES`].
+    /// truncated by the output token cap. [`MAX_TRUNCATION_RETRIES`]
+    /// (`u32::MAX`) is the ordinary unlimited default; finite values are an
+    /// explicit integration policy.
     pub max_truncation_retries: u32,
     /// Max read-only tool calls to run concurrently within one round.
     /// Default: [`MAX_PARALLEL_TOOLS`].
@@ -552,6 +727,10 @@ pub struct AgentLoopLimits {
 impl Default for AgentLoopLimits {
     fn default() -> Self {
         Self {
+            // Ordinary productive work has no whole-turn wall-clock ceiling.
+            // Frontends and harnesses can still install explicit soft/hard
+            // deadlines; individual provider/tool operations retain their own
+            // fault-containment timeouts.
             turn_timeout: None,
             turn_soft_deadline: None,
             max_steps: MAX_MODEL_ROUNDS,
@@ -564,6 +743,33 @@ impl Default for AgentLoopLimits {
             max_parallel_tools: MAX_PARALLEL_TOOLS,
             review_repair: ReviewRepairBudgets::default(),
         }
+    }
+}
+
+impl AgentLoopLimits {
+    /// Whether an explicitly finite tool-execution cap has been reached.
+    /// `u32::MAX` is an unlimited sentinel, not a reachable cap.
+    pub(crate) fn tool_call_cap_reached(&self, calls: u32) -> bool {
+        self.max_tool_calls != u32::MAX && calls >= self.max_tool_calls
+    }
+
+    /// Remaining executable tools under the current cap. Preserve the
+    /// unlimited sentinel instead of turning it into a very large, decreasing
+    /// finite budget as calls accrue.
+    pub(crate) fn remaining_tool_calls(&self, calls: u32) -> u32 {
+        if self.max_tool_calls == u32::MAX {
+            u32::MAX
+        } else {
+            self.max_tool_calls.saturating_sub(calls)
+        }
+    }
+
+    /// Whether another valid output-truncation continuation is available.
+    /// Preserve `u32::MAX` as an unlimited sentinel even after the diagnostic
+    /// counter itself saturates; a direct `<` comparison would otherwise turn
+    /// saturation into a false cap.
+    pub(crate) fn truncation_retry_available(&self, retries: u32) -> bool {
+        self.max_truncation_retries == u32::MAX || retries < self.max_truncation_retries
     }
 }
 
@@ -678,6 +884,11 @@ pub struct AgentMemory {
     pub context_exclusions: Vec<String>,
     /// Whether the agent may curate/learn skills during the session.
     pub curate_skills: bool,
+    /// Read from and append to the durable failure-learning ledger. This is
+    /// independent from skill curation, but follows the session persistence
+    /// policy: `--no-memory` and `--no-save` turn it off together with the
+    /// other durable learning surfaces.
+    pub learning: bool,
     /// Whether the matching stack pack (rust-workspace / pytest-package /
     /// ts-monorepo) is auto-injected into the per-turn volatile context block.
     /// On by default in production; the test harness disables it so canned-
@@ -690,9 +901,9 @@ pub struct AgentMemory {
     /// for the interactive input bar (ghost text). Side call; off for
     /// subagents / plan mode / goal auto-drive regardless of this flag.
     pub suggest_next_prompt: bool,
-    /// Advertise `ask_user` (and honor it). Off for `--report` / `--eval-input`
-    /// so measured cells cannot pause for a human. The handler still fail-closes
-    /// if the model emits the name anyway.
+    /// Advertise `ask_user` (and honor it). This is opt-in: autonomous coding
+    /// must not park indefinitely on a clarification that it can resolve from
+    /// repository evidence or a safe default.
     pub offer_ask_user: bool,
     /// Advertise `search_tool` / `use_tool` (two gateway schemas, not each MCP
     /// tool's schema). Set only after at least one `.hi/mcp` server connects.
@@ -725,12 +936,13 @@ impl Default for AgentMemory {
             disabled_tools: Vec::new(),
             context_exclusions: Vec::new(),
             curate_skills: false,
+            learning: true,
             inject_stack_skill: true,
             inject_review_skill: true,
             // On by default for interactive coding; disable via profile / env /
             // `/config suggest off`.
             suggest_next_prompt: true,
-            offer_ask_user: true,
+            offer_ask_user: false,
             offer_mcp: false,
             offer_memory: false,
             offer_browser: true,
@@ -834,16 +1046,57 @@ mod tests {
     fn quality_defaults_are_safe_and_automatic() {
         let config = AgentConfig::default();
         assert_eq!(config.gates.verification, VerificationMode::Auto);
-        assert_eq!(config.gates.max_verify_repairs, 2);
-        assert_eq!(config.gates.max_independent_review_repairs, 1);
+        assert_eq!(
+            config.gates.max_verify_repairs,
+            crate::UNLIMITED_REPAIR_CYCLES
+        );
+        assert_eq!(
+            config.gates.max_independent_review_repairs,
+            crate::UNLIMITED_REPAIR_CYCLES
+        );
+        assert_eq!(
+            repair_limit_label(config.gates.max_verify_repairs),
+            "unlimited"
+        );
+        assert_eq!(
+            remaining_repairs_label(config.gates.max_verify_repairs, 42),
+            "unlimited"
+        );
+        assert!(repair_available(crate::UNLIMITED_REPAIR_CYCLES, u32::MAX));
+        assert!(!repair_limit_reached(
+            crate::UNLIMITED_REPAIR_CYCLES,
+            u32::MAX
+        ));
+        assert!(!repair_available(3, 3));
+        assert!(repair_limit_reached(3, 3));
         assert_eq!(config.gates.review, ReviewPolicy::Risk);
         assert_eq!(config.gates.lsp_mode, LspMode::Auto);
         assert_eq!(config.memory.tool_set, ToolSet::Dynamic);
-        assert_eq!(config.loop_limits.max_steps, MAX_MODEL_ROUNDS);
+        assert_eq!(config.loop_limits.max_steps, u32::MAX);
+        assert_eq!(config.loop_limits.max_tool_calls, u32::MAX);
+        assert_eq!(config.loop_limits.max_truncation_retries, u32::MAX);
+        assert_eq!(config.loop_limits.turn_soft_deadline, None);
+        assert_eq!(config.loop_limits.turn_timeout, None);
+        assert!(!config.loop_limits.tool_call_cap_reached(u32::MAX));
+        assert!(
+            config.loop_limits.truncation_retry_available(u32::MAX),
+            "a saturated diagnostic counter must not become a false unlimited cap"
+        );
+        assert_eq!(
+            config.loop_limits.remaining_tool_calls(48),
+            u32::MAX,
+            "ordinary tool execution is unlimited rather than a decreasing finite budget"
+        );
         assert!(!config.gates.allow_unverified);
         assert!(config.gates.allow_no_checkpoint);
         assert!(config.subagents.explore_subagents, "explore on by default");
         assert_eq!(config.subagents.write_subagents, WriteSubagentPolicy::Risk);
+        assert_eq!(config.program.mode, ProgramMode::Off);
+        assert!(!config.program.mode_enabled());
+        assert!(!config.program.speculation_enabled());
+        assert_eq!(config.program.max_speculative_calls, 2);
+        assert_eq!(config.program.max_external_speculative_calls, 1);
+        assert_eq!(config.program.external_ttl_seconds, 30);
         let budgets = &config.loop_limits.review_repair;
         assert_eq!(budgets.no_evidence, 4);
         assert_eq!(budgets.read_after_search, 2);
@@ -854,6 +1107,35 @@ mod tests {
         assert_eq!(budgets.limit_for_key("review_sprawl_force_answer"), 3);
         // Typos must not silently get budget 2 (old fail-open default).
         assert_eq!(budgets.limit_for_key("review_typo_mode"), 0);
+    }
+
+    #[test]
+    fn explicit_tool_call_cap_remains_finite() {
+        let mut limits = AgentLoopLimits {
+            max_tool_calls: 48,
+            ..AgentLoopLimits::default()
+        };
+
+        assert_eq!(limits.remaining_tool_calls(47), 1);
+        assert!(!limits.tool_call_cap_reached(47));
+        assert_eq!(limits.remaining_tool_calls(48), 0);
+        assert!(limits.tool_call_cap_reached(48));
+
+        limits.max_tool_calls = u32::MAX;
+        assert_eq!(limits.remaining_tool_calls(u32::MAX), u32::MAX);
+        assert!(!limits.tool_call_cap_reached(u32::MAX));
+    }
+
+    #[test]
+    fn explicit_truncation_retry_cap_remains_finite() {
+        let limits = AgentLoopLimits {
+            max_truncation_retries: 5,
+            ..AgentLoopLimits::default()
+        };
+
+        assert!(limits.truncation_retry_available(4));
+        assert!(!limits.truncation_retry_available(5));
+        assert!(!limits.truncation_retry_available(u32::MAX));
     }
 
     #[test]

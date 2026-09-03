@@ -15,13 +15,19 @@
 //! one small type instead of entangled with the main loop's locals and the
 //! `Agent`'s shared mutable fields.
 
-use hi_tools::run_check_in;
-
 use crate::config::VerifyStage;
 use crate::snapshot::{
     FileFingerprint, SnapshotCache, changed_files_between, workspace_snapshot_meta,
 };
 use crate::ui::Ui;
+
+const VERIFICATION_EXECUTION_LIMIT: usize = 256;
+const VERIFICATION_EXECUTION_HEAD: usize = 32;
+type VerificationExecutionLog = crate::diagnostic_retention::BoundedDiagnosticLog<
+    VerificationExecution,
+    VERIFICATION_EXECUTION_LIMIT,
+    VERIFICATION_EXECUTION_HEAD,
+>;
 
 /// One verification-stage execution retained as report evidence.
 ///
@@ -85,6 +91,10 @@ pub(crate) type Snapshot = std::collections::BTreeMap<String, FileFingerprint>;
 pub(crate) struct VerifyWorkspace<'a> {
     root: &'a std::path::Path,
     state_root: &'a std::path::Path,
+    /// The agent-owned runner. `None` is retained for small verifier unit
+    /// tests that construct this value directly; live turns always provide it
+    /// so verification uses the same sandbox policy as tool execution.
+    process_runner: Option<&'a hi_tools::ProcessRunner>,
     pre_turn_checkpoint: Option<&'a str>,
     lsp: &'a hi_lsp::LspManager,
     known_changed_files: Option<&'a [String]>,
@@ -106,6 +116,7 @@ impl<'a> VerifyWorkspace<'a> {
         Self {
             root,
             state_root,
+            process_runner: None,
             pre_turn_checkpoint,
             lsp,
             known_changed_files: None,
@@ -113,6 +124,14 @@ impl<'a> VerifyWorkspace<'a> {
             skip_affected_checks: None,
             skip_affected_tests: None,
         }
+    }
+
+    pub(crate) fn with_process_runner(
+        mut self,
+        process_runner: &'a hi_tools::ProcessRunner,
+    ) -> Self {
+        self.process_runner = Some(process_runner);
+        self
     }
 
     /// Use the content ledger's complete turn-relative change universe for
@@ -140,6 +159,56 @@ impl<'a> VerifyWorkspace<'a> {
         self.skip_affected_checks = Some(checks);
         self.skip_affected_tests = Some(tests);
         self
+    }
+}
+
+async fn run_check_for_workspace(
+    workspace: &VerifyWorkspace<'_>,
+    command: &str,
+    timeout: Option<std::time::Duration>,
+) -> anyhow::Result<hi_tools::ProcessExecution> {
+    match workspace.process_runner {
+        Some(runner) => {
+            hi_tools::run_check_in_with_runner_maybe_timeout(runner, command, timeout).await
+        }
+        None => {
+            let runner = verification_runner(workspace.root, None)?;
+            hi_tools::run_check_in_with_runner_maybe_timeout(&runner, command, timeout).await
+        }
+    }
+}
+
+async fn run_check_for_workspace_with_timeout(
+    workspace: &VerifyWorkspace<'_>,
+    command: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<hi_tools::ProcessExecution> {
+    match workspace.process_runner {
+        Some(runner) => hi_tools::run_check_in_with_runner_timeout(runner, command, timeout).await,
+        None => {
+            let runner = verification_runner(workspace.root, None)?;
+            hi_tools::run_check_in_with_runner_timeout(&runner, command, timeout).await
+        }
+    }
+}
+
+fn verification_runner(
+    root: &std::path::Path,
+    policy: Option<hi_tools::sandbox::SandboxPolicy>,
+) -> anyhow::Result<hi_tools::ProcessRunner> {
+    if let Some(policy) = policy {
+        return hi_tools::ProcessRunner::new_with_policy(root, policy);
+    }
+    // Direct verifier tests construct `VerifyWorkspace` without the live
+    // runtime. Keep those tests deterministic and independent of the host's
+    // default sandbox; real turns always pass their configured runner above.
+    #[cfg(test)]
+    {
+        hi_tools::ProcessRunner::new_with_policy(root, hi_tools::sandbox::SandboxPolicy::Off)
+    }
+    #[cfg(not(test))]
+    {
+        hi_tools::ProcessRunner::new(root)
     }
 }
 
@@ -193,7 +262,8 @@ pub(crate) struct WorkspaceRepairVerifier {
     stages: Vec<VerifyStage>,
     include_affected_packages: bool,
     last_effective_stages: Vec<VerifyStage>,
-    executions: Vec<VerificationExecution>,
+    executions: VerificationExecutionLog,
+    successful_test_stage: bool,
     stage_mutation_counts: std::collections::BTreeMap<String, u32>,
     /// Per-stage failure identity from the previous round — (distinct failure
     /// count, signature) — so repair feedback can say converging vs thrashing.
@@ -215,7 +285,8 @@ impl WorkspaceRepairVerifier {
             stages,
             include_affected_packages: false,
             last_effective_stages: Vec::new(),
-            executions: Vec::new(),
+            executions: VerificationExecutionLog::default(),
+            successful_test_stage: false,
             stage_mutation_counts: std::collections::BTreeMap::new(),
             previous_failures: std::collections::BTreeMap::new(),
             max_rounds,
@@ -248,7 +319,12 @@ impl WorkspaceRepairVerifier {
     /// verification's ordinary repair budget was zero. That repair must be
     /// followed by a fresh check of the resulting revision.
     pub(crate) fn allow_review_revalidation(&mut self) {
-        self.max_rounds = self.max_rounds.saturating_add(1);
+        if self.max_rounds != crate::UNLIMITED_REPAIR_CYCLES {
+            self.max_rounds = self
+                .max_rounds
+                .saturating_add(1)
+                .min(crate::UNLIMITED_REPAIR_CYCLES - 1);
+        }
     }
 
     pub(crate) fn stages_summary(&self) -> Option<String> {
@@ -269,7 +345,30 @@ impl WorkspaceRepairVerifier {
     /// Executed stage evidence in chronological order across all repair
     /// rounds. Skipped checks do not create synthetic execution records.
     pub(crate) fn executions(&self) -> &[VerificationExecution] {
-        &self.executions
+        self.executions.as_slice()
+    }
+
+    pub(crate) fn executions_dropped(&self) -> u64 {
+        self.executions.dropped()
+    }
+
+    pub(crate) fn execution_count(&self) -> u64 {
+        self.executions.total()
+    }
+
+    pub(crate) fn successful_test_stage(&self) -> bool {
+        self.successful_test_stage
+    }
+
+    fn record_execution(&mut self, execution: VerificationExecution) {
+        if execution.status == hi_tools::ToolStatus::Succeeded
+            && (execution.name.contains("test")
+                || execution.command.contains("test")
+                || execution.command.contains("pytest"))
+        {
+            self.successful_test_stage = true;
+        }
+        self.executions.push(execution);
     }
 
     /// Run one verification check against the current workspace snapshot,
@@ -289,7 +388,7 @@ impl WorkspaceRepairVerifier {
         ui: &mut dyn Ui,
     ) -> VerifyOutcome {
         if (self.stages.is_empty() && !self.include_affected_packages)
-            || self.round >= self.max_rounds
+            || crate::config::repair_limit_reached(self.max_rounds, self.round)
         {
             return VerifyOutcome::NotRun;
         }
@@ -299,14 +398,15 @@ impl WorkspaceRepairVerifier {
             let current = match snapshot_cache.get(workspace.root).await {
                 Ok(current) => current,
                 Err(error) => {
-                    self.round += 1;
+                    self.round = self.round.saturating_add(1);
                     let round = self.round;
                     let stage =
                         self.stages.first().cloned().unwrap_or_else(|| {
                             VerifyStage::new("auto", "affected package discovery")
                         });
-                    self.executions
-                        .push(VerificationExecution::infrastructure_failure(round, &stage));
+                    self.record_execution(VerificationExecution::infrastructure_failure(
+                        round, &stage,
+                    ));
                     return VerifyOutcome::InfrastructureError {
                         stage,
                         output: format!("workspace snapshot infrastructure failed: {error:#}"),
@@ -349,11 +449,10 @@ impl WorkspaceRepairVerifier {
         {
             Ok(stages) => stages,
             Err(error) => {
-                self.round += 1;
+                self.round = self.round.saturating_add(1);
                 let round = self.round;
                 let stage = VerifyStage::new("auto", "affected package discovery");
-                self.executions
-                    .push(VerificationExecution::infrastructure_failure(round, &stage));
+                self.record_execution(VerificationExecution::infrastructure_failure(round, &stage));
                 return VerifyOutcome::InfrastructureError {
                     stage,
                     output: format!("affected package discovery worker failed: {error}"),
@@ -383,7 +482,7 @@ impl WorkspaceRepairVerifier {
                 VerifyOutcome::NotRun
             };
         }
-        self.round += 1;
+        self.round = self.round.saturating_add(1);
         let round = self.round;
         let max_rounds = self.max_rounds;
 
@@ -425,7 +524,7 @@ impl WorkspaceRepairVerifier {
                 }
             }
             if !lsp_errors.is_empty() {
-                self.executions.push(VerificationExecution::lsp(
+                self.record_execution(VerificationExecution::lsp(
                     round,
                     hi_tools::ToolStatus::Failed,
                 ));
@@ -441,12 +540,12 @@ impl WorkspaceRepairVerifier {
                 };
             }
             if lsp_failed {
-                self.executions.push(VerificationExecution::lsp(
+                self.record_execution(VerificationExecution::lsp(
                     round,
                     hi_tools::ToolStatus::Failed,
                 ));
             } else if lsp_checked {
-                self.executions.push(VerificationExecution::lsp(
+                self.record_execution(VerificationExecution::lsp(
                     round,
                     hi_tools::ToolStatus::Succeeded,
                 ));
@@ -455,8 +554,10 @@ impl WorkspaceRepairVerifier {
 
         for stage in &stages {
             ui.status(&format!(
-                "verifying ({round}/{max_rounds}) · {}: {}",
-                stage.name, stage.command
+                "verifying ({round}/{}) · {}: {}",
+                crate::config::repair_limit_label(max_rounds),
+                stage.name,
+                stage.command
             ));
             // Stage-mutation detection: prefer the content ledger (already
             // reconciled before verify; the post-stage reconcile is cheap when
@@ -472,8 +573,9 @@ impl WorkspaceRepairVerifier {
                 match workspace_snapshot_meta(workspace.root).await {
                     Ok(snapshot) => Some(snapshot),
                     Err(error) => {
-                        self.executions
-                            .push(VerificationExecution::infrastructure_failure(round, stage));
+                        self.record_execution(VerificationExecution::infrastructure_failure(
+                            round, stage,
+                        ));
                         return VerifyOutcome::InfrastructureError {
                             stage: stage.clone(),
                             output: format!("pre-stage workspace snapshot failed: {error:#}"),
@@ -484,11 +586,19 @@ impl WorkspaceRepairVerifier {
             } else {
                 None
             };
-            let mut execution = match run_check_in(workspace.root, &stage.command).await {
+            let verification_timeout = hi_tools::check_timeout();
+            let mut execution = match run_check_for_workspace(
+                workspace,
+                &stage.command,
+                verification_timeout,
+            )
+            .await
+            {
                 Ok(execution) => execution,
                 Err(error) => {
-                    self.executions
-                        .push(VerificationExecution::infrastructure_failure(round, stage));
+                    self.record_execution(VerificationExecution::infrastructure_failure(
+                        round, stage,
+                    ));
                     return VerifyOutcome::InfrastructureError {
                         stage: stage.clone(),
                         output: format!("verification process infrastructure failed: {error:#}"),
@@ -496,8 +606,7 @@ impl WorkspaceRepairVerifier {
                     };
                 }
             };
-            self.executions
-                .push(VerificationExecution::shell(round, stage, &execution));
+            self.record_execution(VerificationExecution::shell(round, stage, &execution));
             if execution.status == hi_tools::ToolStatus::TimedOut {
                 // A cold target dir routinely needs more than one budget for
                 // its first build. One bounded retry with a doubled budget
@@ -509,17 +618,20 @@ impl WorkspaceRepairVerifier {
                     "verify stage `{}` timed out — one retry with a doubled budget (cold build?)",
                     stage.name
                 ));
-                execution = match hi_tools::run_check_in_with_timeout(
-                    workspace.root,
+                execution = match run_check_for_workspace_with_timeout(
+                    workspace,
                     &stage.command,
-                    hi_tools::check_timeout() * 2,
+                    verification_timeout
+                        .expect("TimedOut requires an explicitly configured verification timeout")
+                        .saturating_mul(2),
                 )
                 .await
                 {
                     Ok(execution) => execution,
                     Err(error) => {
-                        self.executions
-                            .push(VerificationExecution::infrastructure_failure(round, stage));
+                        self.record_execution(VerificationExecution::infrastructure_failure(
+                            round, stage,
+                        ));
                         return VerifyOutcome::InfrastructureError {
                             stage: stage.clone(),
                             output: format!(
@@ -529,8 +641,7 @@ impl WorkspaceRepairVerifier {
                         };
                     }
                 };
-                self.executions
-                    .push(VerificationExecution::shell(round, stage, &execution));
+                self.record_execution(VerificationExecution::shell(round, stage, &execution));
             }
             let stage_changes = if let Some(ledger) = ledger.as_ref() {
                 // Ledger path: reconcile (cheap via dir-stamp fast path when
@@ -560,8 +671,9 @@ impl WorkspaceRepairVerifier {
                 match reconciled {
                     Ok(Ok(paths)) => paths,
                     Ok(Err(error)) => {
-                        self.executions
-                            .push(VerificationExecution::infrastructure_failure(round, stage));
+                        self.record_execution(VerificationExecution::infrastructure_failure(
+                            round, stage,
+                        ));
                         return VerifyOutcome::InfrastructureError {
                             stage: stage.clone(),
                             output: format!("post-stage ledger reconcile failed: {error:#}"),
@@ -569,8 +681,9 @@ impl WorkspaceRepairVerifier {
                         };
                     }
                     Err(error) => {
-                        self.executions
-                            .push(VerificationExecution::infrastructure_failure(round, stage));
+                        self.record_execution(VerificationExecution::infrastructure_failure(
+                            round, stage,
+                        ));
                         return VerifyOutcome::InfrastructureError {
                             stage: stage.clone(),
                             output: format!("post-stage ledger worker failed: {error}"),
@@ -582,8 +695,9 @@ impl WorkspaceRepairVerifier {
                 let after_stage = match workspace_snapshot_meta(workspace.root).await {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
-                        self.executions
-                            .push(VerificationExecution::infrastructure_failure(round, stage));
+                        self.record_execution(VerificationExecution::infrastructure_failure(
+                            round, stage,
+                        ));
                         return VerifyOutcome::InfrastructureError {
                             stage: stage.clone(),
                             output: format!("post-stage workspace snapshot failed: {error:#}"),
@@ -640,15 +754,18 @@ impl WorkspaceRepairVerifier {
             // repair rounds re-running a command that cannot finish, and the
             // status line names the real problem.
             if execution.status == hi_tools::ToolStatus::TimedOut {
-                self.executions
-                    .push(VerificationExecution::infrastructure_failure(round, stage));
+                self.record_execution(VerificationExecution::infrastructure_failure(round, stage));
                 return VerifyOutcome::InfrastructureError {
                     stage: stage.clone(),
                     output: format!(
-                        "stage `{}` (`{}`) exceeded its time budget twice (including one retry at double the budget) and was killed, so this revision is unverified — this is not a code failure. Raise HI_VERIFY_TIMEOUT_SECS (default {}s), or narrow the stage to something that fits the budget (for example a package-local check instead of a whole-workspace test run).",
+                        "stage `{}` (`{}`) exceeded its configured time budget twice (including one retry at double the budget) and was killed, so this revision is unverified — this is not a code failure. Raise or unset HI_VERIFY_TIMEOUT_SECS (configured {}s), or narrow the stage to something that fits the budget (for example a package-local check instead of a whole-workspace test run).",
                         stage.name,
                         stage.command,
-                        hi_tools::check_timeout().as_secs(),
+                        verification_timeout
+                            .expect(
+                                "TimedOut requires an explicitly configured verification timeout"
+                            )
+                            .as_secs(),
                     ),
                     round,
                 };
@@ -669,7 +786,7 @@ impl WorkspaceRepairVerifier {
                         .insert(stage_key, (digest.failure_count, digest.signature.clone()));
                     output = format!("{}{note}\nFull stage output:\n{output}", digest.text);
                 }
-                if round == max_rounds {
+                if crate::config::repair_limit_reached(max_rounds, round) {
                     ui.status(&format!(
                         "attributing final verification failure · {}",
                         stage.name
@@ -685,11 +802,17 @@ impl WorkspaceRepairVerifier {
                         };
                     };
                     let command = stage.command.clone();
+                    let sandbox_policy = workspace
+                        .process_runner
+                        .map(hi_tools::ProcessRunner::sandbox_policy);
                     let baseline = hi_tools::checkpoint::with_isolated_checkpoint(
                         workspace.root,
                         checkpoint,
                         workspace.state_root,
-                        move |isolated| async move { run_check_in(&isolated, &command).await },
+                        move |isolated| async move {
+                            let runner = verification_runner(&isolated, sandbox_policy)?;
+                            hi_tools::run_check_in_with_runner(&runner, &command).await
+                        },
                     )
                     .await;
                     let baseline = match baseline {
@@ -708,6 +831,14 @@ impl WorkspaceRepairVerifier {
                         hi_tools::ToolStatus::Succeeded => output.push_str(
                             "\n\nPre-turn attribution: this stage passed in an isolated pre-turn workspace, so the current failure was not present at the turn baseline.",
                         ),
+                        hi_tools::ToolStatus::Failed
+                            if baseline_failure_is_infrastructure(&baseline) =>
+                        {
+                            output.push_str(
+                                "\n\nPre-turn attribution was inconclusive: the isolated baseline command was blocked by the execution environment, so this is not evidence that the project already failed before the turn. Baseline output:\n",
+                            );
+                            output.push_str(&bounded_baseline_output(&baseline.model_content()));
+                        }
                         hi_tools::ToolStatus::Failed => {
                             output.push_str(
                                 "\n\nPre-turn attribution: this stage also failed in an isolated pre-turn workspace; the project already failed this verification stage before the turn. Baseline output:\n",
@@ -1123,6 +1254,23 @@ fn bounded_baseline_output(output: &str) -> String {
     bounded
 }
 
+fn baseline_failure_is_infrastructure(outcome: &hi_tools::ProcessExecution) -> bool {
+    let text = outcome.model_content().to_ascii_lowercase();
+    outcome
+        .outcome
+        .exit_code
+        .is_some_and(|code| matches!(code, 126 | 127))
+        || [
+            "operation not permitted",
+            "permission denied",
+            "sandbox denied",
+            "failed to spawn",
+            "could not execute process",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
 fn verification_relevant_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
     // Test/build caches are written BY the verification stages themselves, so
@@ -1224,6 +1372,63 @@ mod tests {
         fn turn_end(&mut self, _: &str) {}
     }
 
+    #[test]
+    fn verification_execution_diagnostics_are_bounded_but_test_evidence_is_sticky() {
+        let mut verifier = WorkspaceRepairVerifier::new(Vec::new(), u32::MAX);
+        for index in 0..300_u32 {
+            verifier.record_execution(VerificationExecution {
+                round: index + 1,
+                name: if index == 100 {
+                    "unit-test".into()
+                } else {
+                    "check".into()
+                },
+                command: if index == 100 {
+                    "cargo test".into()
+                } else {
+                    "cargo check".into()
+                },
+                status: hi_tools::ToolStatus::Succeeded,
+                process: None,
+                truncation: None,
+            });
+        }
+
+        assert_eq!(verifier.executions().len(), VERIFICATION_EXECUTION_LIMIT);
+        assert_eq!(verifier.executions_dropped(), 44);
+        assert_eq!(verifier.execution_count(), 300);
+        assert!(
+            verifier.successful_test_stage(),
+            "the successful test was compacted from the middle but must remain correctness evidence"
+        );
+        assert_eq!(verifier.executions().first().unwrap().round, 1);
+        assert_eq!(verifier.executions().last().unwrap().round, 300);
+
+        let mut telemetry = crate::TurnTelemetry::default();
+        telemetry.replace_verification_diagnostics(
+            verifier.executions(),
+            verifier.executions_dropped(),
+            verifier.execution_count(),
+            verifier.successful_test_stage(),
+        );
+        assert_eq!(
+            telemetry.verification_executions,
+            verifier.executions(),
+            "immediate post-check telemetry retains the bounded execution trail"
+        );
+        assert_eq!(
+            telemetry
+                .diagnostic_retention
+                .verification_executions_dropped,
+            44
+        );
+        assert_eq!(
+            telemetry.diagnostic_retention.verification_executions_total,
+            300
+        );
+        assert!(telemetry.diagnostic_retention.successful_test_verification);
+    }
+
     fn roots(label: &str) -> (PathBuf, PathBuf, PathBuf) {
         static N: AtomicU64 = AtomicU64::new(0);
         let base = std::env::temp_dir().join(format!(
@@ -1243,6 +1448,60 @@ mod tests {
             hi_tools::checkpoint::CreateResult::Created(id) => id,
             other => panic!("checkpoint failed: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn saturated_unlimited_round_continues_without_final_attribution() {
+        let (base, root, state) = roots("unlimited-saturated-round");
+        std::fs::write(root.join("state.txt"), "changed\n").unwrap();
+        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
+        let changed = vec!["state.txt".to_string()];
+        let lsp = hi_lsp::LspManager::new(&root).unwrap();
+        let mut verifier = WorkspaceRepairVerifier::new(
+            vec![VerifyStage::new("test", "exit 7")],
+            crate::UNLIMITED_REPAIR_CYCLES,
+        );
+        verifier.round = u32::MAX;
+        let mut cache = SnapshotCache::default();
+        let mut ui = NullUi;
+
+        let outcome = verifier
+            .check(
+                &VerifyWorkspace::new(&root, &state, None, &lsp).with_changed_files(&changed),
+                &turn_snapshot,
+                &mut cache,
+                None,
+                &mut ui,
+            )
+            .await;
+
+        match outcome {
+            VerifyOutcome::Failed { output, round, .. } => {
+                assert_eq!(round, u32::MAX);
+                assert!(
+                    !output.contains("Pre-turn attribution"),
+                    "the unlimited sentinel must not be treated as the final repair round"
+                );
+            }
+            other => panic!("expected a productive verification attempt, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn sandbox_denial_is_not_treated_as_a_preexisting_code_failure() {
+        let execution = hi_tools::ProcessExecution {
+            status: hi_tools::ToolStatus::Failed,
+            outcome: hi_tools::ProcessOutcome {
+                exit_code: Some(1),
+                stdout_summary: String::new(),
+                stderr_summary: "cargo: Operation not permitted while creating target".into(),
+                duration_ms: 1,
+            },
+            truncation: hi_tools::TruncationState::Complete,
+        };
+
+        assert!(baseline_failure_is_infrastructure(&execution));
     }
 
     #[test]
@@ -2266,7 +2525,10 @@ mod tests {
                 &mut ui,
             )
             .await;
-        assert!(matches!(outcome, VerifyOutcome::Failed { round: 2, .. }));
+        assert!(
+            matches!(outcome, VerifyOutcome::Failed { round: 2, .. }),
+            "expected the late mutation to fail a fresh verification round, got {outcome:?}"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

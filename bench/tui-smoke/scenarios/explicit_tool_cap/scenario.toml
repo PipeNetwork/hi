@@ -1,0 +1,117 @@
+schema_version = 1
+name = "explicit-three-tool-call-cap"
+tags = ["curated", "pr"]
+timeout_ms = 30000
+
+[hi]
+# Product defaults are unlimited; this scenario proves the opt-in tool cap is
+# still enforced and is never mislabeled as a model-step limit.
+# The implementation preflight is the first executed tool. Two scripted writes
+# then consume calls two and three before the no-tools wrap-up request.
+args = ["--max-tool-calls=3", "--allow-unverified"]
+
+[[provider.steps]]
+id = "tool-capped-write-01"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "tool-capped-01.txt", content = "tool-capped write 01 complete\n" }
+
+[[provider.steps]]
+id = "tool-capped-write-02"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "tool-capped-02.txt", content = "tool-capped write 02 complete\n" }
+
+[[provider.steps]]
+id = "typed-tool-limit-wrap-up"
+[provider.steps.expect]
+json_equals = { "/tool_choice" = "none" }
+[provider.steps.response]
+kind = "text"
+text = "EXPLICIT_TOOL_CAP_WRAP_UP: two files completed; tool-capped-03.txt remains unfinished."
+
+[[actions]]
+kind = "send_line"
+text = "Create tool-capped-01.txt, tool-capped-02.txt, and tool-capped-03.txt in separate write calls, then report completion."
+
+[[actions]]
+kind = "wait_provider_request"
+count = 3
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/verification" = "not_applicable", "/data/outcome/stop_reason" = "tool_limit", "/data/outcome/changed_file_count" = 2, "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "none" }
+timeout_ms = 15000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 3
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "user" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started", "/data/name" = "write" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "write" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_result", "/data/name" = "write" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/step_limit/mode" = "unlimited", "/data/outcome/status" = "failed", "/data/outcome/verification" = "not_applicable", "/data/outcome/stop_reason" = "tool_limit", "/data/outcome/changed_file_count" = 2, "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "none" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/role" = "Assistant" }
+contains = { "/content/0/Text" = "EXPLICIT_TOOL_CAP_WRAP_UP" }
+exact = 1
+
+[[assertions]]
+kind = "file"
+path = "tool-capped-01.txt"
+exists = true
+equals = "tool-capped write 01 complete\n"
+
+[[assertions]]
+kind = "file"
+path = "tool-capped-02.txt"
+exists = true
+equals = "tool-capped write 02 complete\n"
+
+[[assertions]]
+kind = "file"
+path = "tool-capped-03.txt"
+exists = false
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

@@ -286,17 +286,12 @@ impl crate::App {
         let t = self.last_telemetry.as_ref();
         let tel = if let Some(t) = t {
             format!(
-                "telemetry: {} verify · {} retry · {} repeat · {} continue · {} trunc{} · cache {}s/{}b{}",
+                "telemetry: {} verify · {} retry · {} repeat · {} continue · {} trunc · cache {}s/{}b{}",
                 t.verify_rounds,
                 t.recovery_retries,
                 t.repeat_nudges,
                 t.continue_nudges,
                 t.truncation_retries,
-                if t.stalled_unfinished || t.stalled_repeating {
-                    " · stalled"
-                } else {
-                    ""
-                },
                 t.prefix_stable_rounds,
                 t.prefix_break_rounds,
                 if t.tool_prefix_break_rounds > 0 {
@@ -313,6 +308,15 @@ impl crate::App {
             lines.push(Line::styled(format!("phase: {phase}"), dim()));
         }
         if let Some(t) = self.last_telemetry.as_ref() {
+            let limit = match (t.hit_step_cap, t.hit_tool_cap) {
+                (true, true) => Some("limits: step + tool-call"),
+                (true, false) => Some("limit: step"),
+                (false, true) => Some("limit: tool-call"),
+                (false, false) => None,
+            };
+            if let Some(limit) = limit {
+                lines.push(Line::styled(limit.to_string(), dim()));
+            }
             lines.push(Line::styled(
                 format!(
                     "evidence: {} · reads {} · searches {} · listing_only {} · repair {}",

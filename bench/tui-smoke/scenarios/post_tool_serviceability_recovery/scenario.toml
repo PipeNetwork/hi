@@ -1,0 +1,91 @@
+schema_version = 1
+name = "post-tool-pipe-serviceability-recovery"
+tags = ["curated", "pr"]
+timeout_ms = 45000
+
+[hi]
+args = ["--allow-unverified"]
+
+[[provider.steps]]
+id = "write-landed"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "serviceability-proof.txt", content = "PIPE_SERVICEABILITY_RECOVERED" }
+
+[[provider.steps]]
+id = "empty-post-tool-recap"
+[provider.steps.response]
+kind = "raw_sse"
+body = "data: [DONE]\n\n"
+
+[[provider.steps]]
+id = "pipe-serviceability-blip"
+[provider.steps.response]
+kind = "raw_sse"
+body = "data: {\"error\":{\"message\":\"requested model is not currently serviceable\"}}\n\n"
+
+[[provider.steps]]
+id = "recovered-recap"
+[provider.steps.response]
+kind = "text"
+text = "Created serviceability-proof.txt with the requested content."
+
+[[actions]]
+kind = "send_line"
+text = "Use the write tool exactly once to create serviceability-proof.txt containing exactly PIPE_SERVICEABILITY_RECOVERED, then report the result."
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_result", "/data/name" = "write" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_provider_request"
+count = 4
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 1 }
+timeout_ms = 15000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 4
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "write" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 1 }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "provider_request", "/data/accepted" = true, "/data/response_status" = 200 }
+exact = 4
+
+[[assertions]]
+kind = "file"
+path = "serviceability-proof.txt"
+exists = true
+equals = "PIPE_SERVICEABILITY_RECOVERED"
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

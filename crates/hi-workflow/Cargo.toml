@@ -23,7 +23,7 @@ libc = { workspace = true }
 [dev-dependencies]
 anyhow.workspace = true
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 [[example]]
 name = "validate-workflow"

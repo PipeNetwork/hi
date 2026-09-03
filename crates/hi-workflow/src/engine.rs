@@ -6,10 +6,10 @@ use rhai::{Dynamic, EvalAltResult, Position};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::MAX_PARALLEL;
 use crate::host::{AgentOpts, HostError, WorkflowHostRequest};
 use crate::journal::{Journal, JournalError, request_hash};
 use crate::run::{PauseKind, WorkflowOutcome};
-use crate::{MAX_HOST_CALLS, MAX_PARALLEL};
 
 pub struct WorkflowRunParams {
     pub script: String,
@@ -17,11 +17,16 @@ pub struct WorkflowRunParams {
     pub journal: Journal,
     pub host_tx: mpsc::UnboundedSender<WorkflowHostRequest>,
     pub cancel: CancellationToken,
+    /// Explicit Rhai operation cap. Zero means unlimited; cancellation remains
+    /// active through the engine progress callback.
     pub max_ops: u64,
 }
 
 impl WorkflowRunParams {
-    pub const DEFAULT_MAX_OPS: u64 = 100_000_000;
+    /// Ordinary workflows have no implicit Rhai operation ceiling. Callers
+    /// that execute untrusted scripts may still provide an explicit finite
+    /// value; cancellation remains enforced independently by `on_progress`.
+    pub const DEFAULT_MAX_OPS: u64 = 0;
 }
 
 #[derive(Debug, Clone)]
@@ -60,11 +65,6 @@ impl Ctx {
                 "workflow host-call count overflowed".into(),
             ))
         })?;
-        if end > MAX_HOST_CALLS {
-            return Err(terminated(ControlToken::Fatal(format!(
-                "workflow exceeded the maximum of {MAX_HOST_CALLS} result-bearing host calls"
-            ))));
-        }
         let start = self.seq;
         self.seq = end;
         Ok(start..end)
@@ -95,9 +95,9 @@ enum PendingAgent {
 }
 
 const HOST_REPLY_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const HOST_CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const HOST_CLEANUP_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[derive(Debug, PartialEq, Eq)]
 enum HostReplyWaitError {
     Cancelled,
     Dropped,
@@ -105,11 +105,27 @@ enum HostReplyWaitError {
 }
 
 fn wait_for_host_reply<T>(
-    mut reply_rx: oneshot::Receiver<T>,
+    reply_rx: oneshot::Receiver<T>,
     cancel: &CancellationToken,
     timeout: Option<Duration>,
 ) -> Result<T, HostReplyWaitError> {
-    let deadline = timeout.and_then(|duration| Instant::now().checked_add(duration));
+    let started = Instant::now();
+    wait_for_host_reply_with(
+        reply_rx,
+        cancel,
+        timeout,
+        || started.elapsed(),
+        || std::thread::sleep(HOST_REPLY_POLL_INTERVAL),
+    )
+}
+
+fn wait_for_host_reply_with<T>(
+    mut reply_rx: oneshot::Receiver<T>,
+    cancel: &CancellationToken,
+    timeout: Option<Duration>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut wait: impl FnMut(),
+) -> Result<T, HostReplyWaitError> {
     loop {
         // Cancellation is deliberately biased over a reply that races with
         // shutdown: once the workflow owner asks to stop, no new host result
@@ -124,10 +140,10 @@ fn wait_for_host_reply<T>(
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if timeout.is_some_and(|deadline| elapsed() >= deadline) {
             return Err(HostReplyWaitError::TimedOut);
         }
-        std::thread::sleep(HOST_REPLY_POLL_INTERVAL);
+        wait();
     }
 }
 
@@ -332,11 +348,10 @@ fn host_call<T>(
         .send(build(reply_tx))
         .map_err(|_| terminated(ControlToken::Fatal("workflow host channel closed".into())))?;
 
-    // Agent calls are intentionally unbounded—they may represent long-running
-    // work—but every wait observes cancellation. Lightweight control/data
-    // bridge calls also fail closed if the host stays alive but unavailable.
-    let timeout = (kind != "spawn_agent").then_some(HOST_CONTROL_REPLY_TIMEOUT);
-    let reply = wait_for_script_reply(ctx, reply_rx, timeout)?;
+    // Every productive host call is allowed to run until it replies, drops its
+    // channel, or observes cancellation. Provider/tool transports retain their
+    // own explicit policies; the workflow engine adds no wall-clock ceiling.
+    let reply = wait_for_script_reply(ctx, reply_rx, None)?;
 
     let value = match reply {
         Ok(v) => to_result(v),
@@ -431,7 +446,7 @@ fn reserve_agent_calls(ctx: &Rc<RefCell<Ctx>>, count: usize) -> ScriptResult<()>
             reply: reply_tx,
         })
         .map_err(|_| terminated(ControlToken::Fatal("workflow host channel closed".into())))?;
-    match wait_for_script_reply(ctx, reply_rx, Some(HOST_CONTROL_REPLY_TIMEOUT))? {
+    match wait_for_script_reply(ctx, reply_rx, None)? {
         Ok(()) => Ok(()),
         Err(HostError::AgentCallQuotaExceeded { requested, maximum }) => {
             Err(terminated(ControlToken::Budget(format!(
@@ -472,7 +487,7 @@ fn release_agent_calls_with_timeout(ctx: &Rc<RefCell<Ctx>>, count: usize, timeou
 }
 
 fn release_agent_calls(ctx: &Rc<RefCell<Ctx>>, count: usize) {
-    release_agent_calls_with_timeout(ctx, count, HOST_CONTROL_REPLY_TIMEOUT);
+    release_agent_calls_with_timeout(ctx, count, HOST_CLEANUP_REPLY_TIMEOUT);
 }
 
 fn spawn_agent_call(ctx: &Rc<RefCell<Ctx>>, opts: AgentOpts) -> ScriptResult<Dynamic> {
@@ -1211,6 +1226,29 @@ mod tests {
     }
 
     #[test]
+    fn default_operations_are_unlimited_but_an_explicit_cap_still_applies() {
+        assert_eq!(WorkflowRunParams::DEFAULT_MAX_OPS, 0);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut p = params(
+            r#"
+            let meta = #{ name: "t", description: "d" };
+            let total = 0;
+            for i in 0..1000 { total += i; }
+            complete(total);
+            "#,
+            Journal::new(None),
+            tx,
+        );
+        p.max_ops = 10;
+        let outcome = run_workflow(p);
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Failed { error } if error.to_ascii_lowercase().contains("too many operations")),
+            "an explicit operation cap must remain effective: {outcome:?}"
+        );
+    }
+
+    #[test]
     fn cancellation_interrupts_a_host_that_never_replies() {
         let cancel = CancellationToken::new();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -1254,6 +1292,40 @@ mod tests {
     }
 
     #[test]
+    fn productive_host_wait_crosses_legacy_deadline_but_explicit_cleanup_deadlines_hold() {
+        fn virtual_wait(timeout: Option<Duration>) -> (Result<u8, HostReplyWaitError>, Duration) {
+            let cancel = CancellationToken::new();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let elapsed = std::cell::Cell::new(Duration::ZERO);
+            let mut reply_tx = Some(reply_tx);
+            let result = wait_for_host_reply_with(
+                reply_rx,
+                &cancel,
+                timeout,
+                || elapsed.get(),
+                || {
+                    let next = elapsed.get().saturating_add(Duration::from_secs(10));
+                    elapsed.set(next);
+                    if next > Duration::from_secs(30)
+                        && let Some(reply_tx) = reply_tx.take()
+                    {
+                        let _ = reply_tx.send(7);
+                    }
+                },
+            );
+            (result, elapsed.get())
+        }
+
+        let (unlimited, elapsed) = virtual_wait(None);
+        assert_eq!(unlimited, Ok(7));
+        assert!(elapsed > Duration::from_secs(30));
+
+        let (bounded, elapsed) = virtual_wait(Some(Duration::from_secs(30)));
+        assert_eq!(bounded, Err(HostReplyWaitError::TimedOut));
+        assert_eq!(elapsed, Duration::from_secs(30));
+    }
+
+    #[test]
     fn parallel_rejects_oversized_fanout_before_spawning() {
         let (tx, rx) = mpsc::unbounded_channel();
         let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1285,7 +1357,8 @@ mod tests {
     }
 
     #[test]
-    fn host_call_limit_is_non_catchable_and_prevents_sends() {
+    fn host_call_sequence_crosses_the_legacy_ten_thousand_ceiling() {
+        const CALLS: u64 = 10_001;
         let (tx, rx) = mpsc::unbounded_channel();
         let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let requests_in_host = requests.clone();
@@ -1302,7 +1375,7 @@ mod tests {
         });
         let mut journal = Journal::new(None);
         let hash = request_hash("budget", &serde_json::Value::Null);
-        for seq in 0..MAX_HOST_CALLS {
+        for seq in 0..CALLS {
             journal
                 .record(
                     seq,
@@ -1316,75 +1389,69 @@ mod tests {
             r#"
             let meta = #{{ name: "t", description: "d" }};
             for i in 0..{} {{ budget(); }}
-            try {{ budget(); }} catch (e) {{ complete("caught"); }}
-            complete("unreachable");
+            complete("done");
             "#,
-            MAX_HOST_CALLS
+            CALLS
         );
         let outcome = run_workflow(params(&script, journal, tx));
         drop(host);
-        match outcome {
-            WorkflowOutcome::Failed { error } => {
-                assert!(error.contains("maximum of"), "got: {error}");
-            }
-            other => panic!("expected Failed, got {other:?}"),
-        }
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Completed { .. }),
+            "productive host calls should not hit an arbitrary count ceiling: {outcome:?}"
+        );
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn parallel_setup_error_abandons_wedged_reply_and_releases_reservation() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+    fn host_call_sequence_still_rejects_integer_overflow() {
+        let (host_tx, _host_rx) = mpsc::unbounded_channel();
+        let mut ctx = Ctx {
+            host_tx,
+            cancel: CancellationToken::new(),
+            journal: Journal::new(None),
+            seq: u64::MAX,
+        };
+        let error = ctx
+            .next_seq()
+            .expect_err("the sequence must never wrap to zero");
+        assert!(matches!(
+            find_control_token(&error),
+            Some(ControlToken::Fatal(message)) if message.contains("host-call count overflowed")
+        ));
+        assert_eq!(ctx.seq, u64::MAX);
+    }
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let agents_used = std::sync::Arc::new(AtomicU64::new(0));
-        let mut held_replies = Vec::new();
-        let host = spawn_budget_tracking_host(rx, agents_used.clone(), move |req| {
-            if let WorkflowHostRequest::SpawnAgent { reply, .. } = req {
-                // Keep the first worker reply alive forever. The second
-                // next_seq fails before its worker is sent.
-                held_replies.push(reply);
-            }
+    #[test]
+    fn abandoning_parallel_setup_drops_reply_and_releases_reservation() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host = std::thread::spawn(move || {
+            let request = rx.blocking_recv().expect("release request");
+            let WorkflowHostRequest::ReleaseAgentCalls { count, reply } = request else {
+                panic!("expected reservation release")
+            };
+            assert_eq!(count, 1);
+            let _ = reply.send(Ok(()));
         });
-        let mut journal = Journal::new(None);
-        let hash = request_hash("budget", &serde_json::Value::Null);
-        for seq in 0..MAX_HOST_CALLS - 1 {
-            journal
-                .record(
-                    seq,
-                    "budget",
-                    hash.clone(),
-                    serde_json::json!({ "total": null, "spent": 0, "reserved": 0, "remaining": null }),
-                )
-                .unwrap();
-        }
-        let script = format!(
-            r#"
-            let meta = #{{ name: "t", description: "d" }};
-            for i in 0..{} {{ budget(); }}
-            parallel([#{{ prompt: "live" }}, #{{ prompt: "over-limit" }}]);
-            "#,
-            MAX_HOST_CALLS - 1
+        let ctx = Rc::new(RefCell::new(Ctx {
+            host_tx: tx,
+            cancel: CancellationToken::new(),
+            journal: Journal::new(None),
+            seq: 0,
+        }));
+        let (late_reply, reply_rx) = oneshot::channel();
+        let pending = vec![PendingAgent::Live {
+            seq: 0,
+            hash: "pending".into(),
+            reply_rx,
+        }];
+
+        abandon_parallel_setup(&ctx, pending, 1);
+
+        assert!(
+            late_reply.send(Ok(agent_result("too late"))).is_err(),
+            "abandoning setup must close pending worker replies"
         );
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let workflow = std::thread::spawn(move || {
-            let _ = done_tx.send(run_workflow(params(&script, journal, tx)));
-        });
-        let outcome = done_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("parallel setup failure must not drain a wedged worker reply");
-        match outcome {
-            WorkflowOutcome::Failed { error } => {
-                assert!(error.contains("maximum of"), "got: {error}");
-            }
-            other => panic!("expected Failed, got {other:?}"),
-        }
-        assert_eq!(
-            agents_used.load(Ordering::SeqCst),
-            0,
-            "an uncommitted parallel panel must release its full reservation"
-        );
-        workflow.join().unwrap();
+        drop(ctx);
         host.join().unwrap();
     }
 

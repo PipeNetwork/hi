@@ -1,0 +1,132 @@
+schema_version = 1
+name = "live-interrupted-plan-user-prompt-resumes"
+tags = ["live_extended", "resume-regression-live"]
+timeout_ms = 600000
+
+[hi]
+args = ["--allow-unverified"]
+
+# Begin with an explicit manual pause so startup is deterministic. The first
+# `/plan resume` starts plan work, Ctrl-C converts that into an interruption
+# latch, and the later real user turn must consume that latch transactionally.
+[session]
+plan_drive_paused = true
+plan_drive_resume_on_user_input = false
+
+[[session.plan]]
+title = "Keep this checklist unfinished for the live resume canary"
+status = "active"
+
+[[actions]]
+kind = "send_line"
+text = "/plan resume"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+timeout_ms = 240000
+
+[[actions]]
+kind = "send_key"
+key = "ctrl_c"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "drive_paused", "/data/kind" = "plan_drive" }
+timeout_ms = 30000
+
+[[actions]]
+kind = "restart"
+
+[[actions]]
+kind = "wait_event_absent"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+duration_ms = 1000
+
+[[actions]]
+kind = "send_line"
+text = "Without changing files or using tools, answer only: interrupted plan user resume complete."
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_started", "/data/origin" = "user", "/data/plan/paused" = false }
+timeout_ms = 30000
+
+[[actions]]
+kind = "capture_screen"
+name = "live_user_turn_started_without_pause"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/plan/paused" = false, "/data/next_drive/action" = "enqueue", "/data/next_drive/kind" = "plan_drive" }
+timeout_ms = 270000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive", "/data/plan/paused" = false }
+timeout_ms = 30000
+
+[[actions]]
+kind = "send_key"
+key = "ctrl_c"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "cancelled" }
+timeout_ms = 30000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ready" }
+exact = 2
+
+[[assertions]]
+kind = "record_sequence"
+source = "events"
+where_equals = { "/event" = "turn_started" }
+pointer = "/data/origin"
+values = ["plan_drive", "user", "plan_drive"]
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "user", "/data/plan/paused" = false }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/plan/paused" = false, "/data/next_drive/action" = "enqueue", "/data/next_drive/kind" = "plan_drive" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/type" = "plan_drive", "/paused" = true, "/resume_on_user_input" = true }
+at_least = 2
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/type" = "plan_drive", "/paused" = false, "/resume_on_user_input" = false }
+at_least = 2
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/accepted" = true, "/response_status" = 200 }
+at_least = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "approval_shown" }
+exact = 0
+
+[[assertions]]
+kind = "exit"
+code = 0

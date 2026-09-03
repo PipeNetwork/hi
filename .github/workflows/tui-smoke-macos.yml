@@ -1,0 +1,56 @@
+name: Weekly macOS TUI smoke
+
+on:
+  schedule:
+    - cron: "41 6 * * 6"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  HI_BIN: target/release/hi
+
+concurrency:
+  group: weekly-macos-tui-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: curated + deterministic faults
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release TUI smoke binaries
+        run: cargo build --release -p hi -p hi-smoke --no-default-features
+
+      - name: Validate TUI smoke scenarios
+        run: target/release/hi-smoke validate bench/tui-smoke
+
+      - name: Run curated scripted scenarios
+        run: >-
+          target/release/hi-smoke run bench/tui-smoke
+          --mode scripted
+          --tag curated
+          --artifacts artifacts/tui-smoke
+
+      - name: Run deterministic chaos campaign
+        run: >-
+          target/release/hi-smoke fuzz bench/tui-smoke
+          --seed-start 0
+          --seeds 50
+          --jobs 4
+          --artifacts artifacts/tui-smoke-fuzz
+
+      - name: Upload macOS TUI smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-smoke-macos-${{ github.run_id }}
+          path: |
+            artifacts/tui-smoke
+            artifacts/tui-smoke-fuzz
+          if-no-files-found: error
+          retention-days: 90

@@ -25,45 +25,19 @@ pub(super) const MAX_CAPACITY_RETRIES: u32 = 6;
 pub(super) const CAPACITY_RETRY_DELAYS: [u64; 6] = [2, 4, 8, 15, 30, 45];
 pub(super) const MAX_CAPACITY_RETRY_DELAY_SECS: u64 = 60;
 pub(super) const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
-pub(super) const INCOMPLETE_STATUS: &str = "turn stopped incomplete";
-
-/// UI status for a stall break, including leftover plan work when known.
-pub(super) fn incomplete_status(reason: &str) -> String {
-    let reason = reason.trim();
-    if reason.is_empty() {
-        INCOMPLETE_STATUS.to_string()
-    } else {
-        format!("{INCOMPLETE_STATUS} · {reason}")
-    }
-}
 
 impl crate::Agent {
-    /// Stall-break status that prefers leftover checklist copy over a reason key.
-    pub(super) fn incomplete_turn_status(&self, reason: &str) -> String {
-        match self.goals.leftover_work() {
-            Some(leftover) => format!("{INCOMPLETE_STATUS} · {leftover}"),
-            None => incomplete_status(reason),
-        }
-    }
-
-    /// After a stall budget is spent, keep the turn going instead of asking
-    /// the user to `/retry`. Returns true when the caller should continue
-    /// the Model→Tools loop.
-    pub(super) fn keep_working_after_stall(
+    /// Give a no-progress path one bounded chance to choose a different action.
+    /// Exhaustion is diagnostic only: callers settle or return a real provider /
+    /// verification failure, rather than inventing an "unfinished" turn state.
+    pub(super) fn try_no_progress_recovery(
         &mut self,
         progress: &mut ProgressTracker,
         force_tools_next: &mut bool,
-        stalled_unfinished: &mut bool,
-        stalled_repeating: &mut bool,
         continue_nudges: Option<&mut u32>,
         ui: &mut dyn Ui,
     ) -> bool {
         let signature = progress.last_event_signature();
-        // Only block a second keep-working when the model actually re-ran a
-        // tool with the stalled signature since the last recovery. Two
-        // consecutive text-only recap stalls share a stale tool signature
-        // (no tool ran between them), but the model did not re-issue the
-        // stalled action — so the second recovery must still fire.
         if progress.saw_tool_since_keep_working
             && progress.keep_working_blocked_signature.is_some()
             && progress.keep_working_blocked_signature == signature
@@ -71,27 +45,20 @@ impl crate::Agent {
         {
             return false;
         }
-        // A forced final-answer round already asked the model to stop using
-        // tools. Recovering with Required tools here re-opened the inspection
-        // loop until keep-working exhausted, and the turn ended with no
-        // user-visible text (live: models-endpoint 403 review).
-        if progress.forced_final_answer_attempts > 0 {
-            return false;
-        }
-        if !progress.try_keep_working(self.config.loop_limits.max_keep_working) {
+        if progress.forced_final_answer_attempts > 0
+            || !progress.try_keep_working(self.config.loop_limits.max_keep_working)
+        {
             return false;
         }
         progress.keep_working_blocked_signature = signature.clone();
         progress.saw_tool_since_keep_working = false;
-        *stalled_unfinished = false;
-        *stalled_repeating = false;
         *force_tools_next = true;
         if let Some(n) = continue_nudges {
             *n = n.saturating_add(1);
         }
         self.messages.push_nudge(
             NudgeKind::Continue,
-            keep_working_nudge(&progress.last_stall_reason, signature.as_deref()),
+            keep_working_nudge(&progress.last_no_progress_reason, signature.as_deref()),
         );
         let status = match self.goals.next_step_title() {
             Some(step) => format!("still working — {step}"),
@@ -102,13 +69,13 @@ impl crate::Agent {
     }
 }
 
-/// Keep-working nudge specialized with the stall reason and blocked signature.
-pub(super) fn keep_working_nudge(stall_reason: &str, signature: Option<&str>) -> String {
-    let reason = stall_reason.trim();
+/// Keep-working nudge specialized with the no-progress reason and blocked signature.
+pub(super) fn keep_working_nudge(no_progress_reason: &str, signature: Option<&str>) -> String {
+    let reason = no_progress_reason.trim();
     let mut out = if reason.is_empty() {
         KEEP_WORKING_NUDGE.to_string()
     } else {
-        format!("The previous approach stalled ({reason}). {KEEP_WORKING_NUDGE}")
+        format!("The previous approach made no progress ({reason}). {KEEP_WORKING_NUDGE}")
     };
     if let Some(signature) = signature.filter(|s| !s.is_empty()) {
         out.push_str(&format!(
@@ -173,10 +140,6 @@ pub(super) struct TurnRetryState {
     pub(super) request_too_large_compacted: bool,
     pub(super) request_too_large_retried: bool,
     pub(super) output_cap_retry_attempted: bool,
-    /// A single retry that raises an undersized budget after a reasoning-only
-    /// completion. Keep this separate from the normal empty-response budget so
-    /// a transient provider response cannot turn into an unbounded retry loop.
-    pub(super) empty_completion_headroom_retry_attempted: bool,
     /// One shared retry budget for quota rate limits, route outages, and
     /// transport failures. The routed API already exhausts its compatible
     /// provider ladder, so separate budgets multiply one logical turn into a
@@ -218,7 +181,6 @@ impl TurnRetryState {
         self.request_id = None;
         self.request_attempt = 0;
         self.output_cap_retry_attempted = false;
-        self.empty_completion_headroom_retry_attempted = false;
         self.provider_route_retries = 0;
         self.capacity_retries = 0;
     }
@@ -528,15 +490,5 @@ mod review_repair_budget_tests {
                 mode.key()
             );
         }
-    }
-
-    #[test]
-    fn keep_working_nudge_names_the_stall_and_bans_the_signature() {
-        let generic = keep_working_nudge("", None);
-        assert!(generic.contains("stalled"));
-        let specialized = keep_working_nudge("repeated read", Some("read:notes.txt"));
-        assert!(specialized.contains("repeated read"));
-        assert!(specialized.contains("read:notes.txt"));
-        assert!(specialized.contains("different class of action"));
     }
 }

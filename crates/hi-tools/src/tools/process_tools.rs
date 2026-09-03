@@ -11,16 +11,6 @@ use crate::{ProcessExecution, ProcessRunner, ToolOutcome};
 
 use super::{RuntimeResources, background_tool_outcome, mark_effect_inspection_failed};
 
-/// Default wall-clock limit for a single `bash` command, used when neither the
-/// caller nor `HI_BASH_TIMEOUT_SECS` overrides it. Generous enough for a real
-/// `cargo test`/build verify step, bounded so a genuine hang recovers on its own.
-pub(crate) const DEFAULT_BASH_TIMEOUT_SECS: u64 = 300;
-/// Hard ceiling on any per-command timeout (model- or env-supplied) so a bad
-/// value can't reintroduce an unbounded stall.
-pub(crate) const MAX_BASH_TIMEOUT_SECS: u64 = 3600;
-/// Default wall-clock limit for a single verification command (compile/test
-/// gate). Overridable via `HI_VERIFY_TIMEOUT_SECS`; sized to fit a real
-/// `cargo test`/build on a mid-size project rather than a toy check.
 const PYTHON_TUI_MARKERS: &[&str] = &[
     "from textual",
     "import textual",
@@ -48,34 +38,42 @@ const RUST_TUI_MARKERS: &[&str] = &[
 /// path read the entire file just to decide whether it looks like a TUI.
 const INTERACTIVE_SCAN_MAX_BYTES: u64 = 256 * 1024;
 
-/// Resolve the effective bash timeout: an explicit per-command request wins,
-/// else `HI_BASH_TIMEOUT_SECS`, else the default — always clamped to
-/// `[1, MAX_BASH_TIMEOUT_SECS]` so neither side can disable the guard.
-pub(crate) fn resolve_bash_timeout(requested: Option<u64>) -> Duration {
-    let secs = requested
-        .or_else(|| {
-            std::env::var("HI_BASH_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-        })
-        .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
-        .clamp(1, MAX_BASH_TIMEOUT_SECS);
-    Duration::from_secs(secs)
+/// Resolve an optional bash deadline. Ordinary commands have no implicit
+/// lifetime ceiling: they run until completion, explicit cancellation, or the
+/// foreground-to-background handoff below. A positive tool argument wins over
+/// `HI_BASH_TIMEOUT_SECS`; omitted, invalid, and zero values mean unlimited.
+pub(crate) fn resolve_bash_timeout(requested: Option<u64>) -> Option<Duration> {
+    let configured = std::env::var("HI_BASH_TIMEOUT_SECS").ok();
+    resolve_bash_timeout_from_values(requested, configured.as_deref())
+}
+
+pub(crate) fn resolve_bash_timeout_from_values(
+    requested: Option<u64>,
+    configured: Option<&str>,
+) -> Option<Duration> {
+    requested
+        .or_else(|| configured.and_then(|value| value.trim().parse().ok()))
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
 }
 
 /// Whether a foreground bash command that outlasts its budget is handed to the
-/// background (kept running, returns a handle) instead of being killed. On by
-/// default — losing a slow build or a mistakenly-foregrounded server to a kill
-/// is exactly the babysitting the agent must avoid; a backgrounded process is
-/// fully recoverable (poll or kill it). Disable with `HI_BASH_AUTO_BACKGROUND=0`.
+/// background (kept running, returns a handle) instead of being killed. This is
+/// deliberately opt-in: an ordinary finite build/test must stay attached to the
+/// active turn until it completes or the user cancels it. Enable with
+/// `HI_BASH_AUTO_BACKGROUND=1` when automatic handoff is desired.
 fn auto_background_enabled() -> bool {
-    !matches!(
-        std::env::var("HI_BASH_AUTO_BACKGROUND")
-            .ok()
-            .as_deref()
-            .map(str::trim),
-        Some("0") | Some("false") | Some("off")
-    )
+    let configured = std::env::var("HI_BASH_AUTO_BACKGROUND").ok();
+    auto_background_enabled_from_value(configured.as_deref())
+}
+
+pub(super) fn auto_background_enabled_from_value(configured: Option<&str>) -> bool {
+    configured.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// The foreground window before an auto-backgrounded command is handed off.
@@ -83,14 +81,16 @@ fn auto_background_enabled() -> bool {
 /// keeps running in the background. Set `HI_BASH_FOREGROUND_BUDGET_SECS` to
 /// override (use the full timeout value to restore the old block-until-done
 /// behaviour).
-fn resolve_foreground_budget(timeout: Duration) -> Duration {
-    match std::env::var("HI_BASH_FOREGROUND_BUDGET_SECS")
+fn resolve_foreground_budget(timeout: Option<Duration>) -> Duration {
+    let budget = match std::env::var("HI_BASH_FOREGROUND_BUDGET_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
     {
-        Some(secs) => Duration::from_secs(secs.clamp(1, MAX_BASH_TIMEOUT_SECS)).min(timeout),
-        None => Duration::from_secs(30).min(timeout),
-    }
+        Some(secs) => Duration::from_secs(secs),
+        None => Duration::from_secs(30),
+    };
+    timeout.map_or(budget, |deadline| budget.min(deadline))
 }
 
 /// Preserve colored subprocess output for the UI while keeping the model and
@@ -162,8 +162,8 @@ pub(crate) async fn run_bash_streaming_with_timeout(
 #[derive(Deserialize)]
 pub(super) struct BashArgs {
     pub command: String,
-    /// Optional per-command wall-clock limit in seconds. Omitted → the default
-    /// (or `HI_BASH_TIMEOUT_SECS`). Clamped to `[1, MAX_BASH_TIMEOUT_SECS]`.
+    /// Optional per-command wall-clock limit in seconds. Omitted or zero means
+    /// unlimited unless `HI_BASH_TIMEOUT_SECS` supplies a positive value.
     /// Ignored when `run_in_background` is set.
     #[serde(default)]
     pub timeout: Option<u64>,
@@ -183,6 +183,27 @@ pub(super) async fn run_bash_tool(
     args: BashArgs,
     on_line: &mut (dyn FnMut(&str) + Send),
 ) -> Result<ToolOutcome> {
+    run_bash_tool_with_auto_background(
+        root,
+        state_root,
+        resources,
+        args,
+        on_line,
+        auto_background_enabled(),
+    )
+    .await
+}
+
+/// Policy-injected implementation used by focused tests so they can exercise
+/// both branches without mutating the process-global environment.
+pub(super) async fn run_bash_tool_with_auto_background(
+    root: &Path,
+    state_root: &Path,
+    resources: RuntimeResources<'_>,
+    args: BashArgs,
+    on_line: &mut (dyn FnMut(&str) + Send),
+    auto_background: bool,
+) -> Result<ToolOutcome> {
     if let Some(reason) = crate::guard::blocked_op(&args.command) {
         let mut outcome = ToolOutcome::denied(format!(
             "⚠ refused: this command {reason}. The per-turn checkpoint can't undo it."
@@ -190,6 +211,19 @@ pub(super) async fn run_bash_tool(
         outcome.effects.mutation_attempted = true;
         return Ok(outcome);
     }
+    // Reuse the agent-owned runner whenever one was supplied. Constructing a
+    // fresh runner here would consult process-global `HI_SANDBOX` again and
+    // can make a command fail in a nested Seatbelt even though the owning
+    // agent deliberately selected `SandboxPolicy::Off` (or vice versa).
+    let owned_runner = resources
+        .process_runner
+        .is_none()
+        .then(|| ProcessRunner::new(root))
+        .transpose()?;
+    let runner = resources
+        .process_runner
+        .or(owned_runner.as_ref())
+        .expect("process runner is either borrowed or constructed above");
     // DeepSeek Flash prefers `cat`/`sed -n`/`head` for SPEC.md. Those dumps
     // go through the 5k bash condenser and lose the middle of the spec.
     // Workspace file dumps that fit the read cache become numbered `read`
@@ -209,9 +243,8 @@ pub(super) async fn run_bash_tool(
                 return Ok(outcome);
             }
         };
-        let runner = ProcessRunner::new(root)?;
         let id = resources.background.spawn_tracked(
-            &runner,
+            runner,
             &args.command,
             root,
             state_root,
@@ -246,8 +279,6 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop."
         return Ok(outcome);
     }
     let timeout = resolve_bash_timeout(args.timeout);
-    let runner = ProcessRunner::new(root)?;
-
     // Read-only inspection is common during orientation and verification
     // (`rg`, `git status`, `sed`, ...). Effect accounting for an opaque shell
     // command normally walks and hashes the whole workspace twice. For a
@@ -255,7 +286,7 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop."
     // work needed; the turn-level ledger still performs its normal boundary
     // reconciliation before settlement.
     if definitely_read_only_shell(&args.command) {
-        let execution = if auto_background_enabled() {
+        let execution = if auto_background {
             let budget = resolve_foreground_budget(timeout);
             match runner
                 .run_shell_adoptable(&args.command, budget, on_line)
@@ -294,7 +325,7 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
             }
         } else {
             runner
-                .run_shell_streaming(&args.command, timeout, on_line)
+                .run_shell_streaming_maybe_timeout(&args.command, timeout, on_line)
                 .await
         };
         let mut outcome = match execution {
@@ -321,7 +352,7 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
     // budget is adopted by the background registry (kept alive, handle
     // returned) instead of killed, so no work is lost. Falls back to the
     // classic kill-on-timeout path when disabled.
-    if auto_background_enabled() {
+    if auto_background {
         let budget = resolve_foreground_budget(timeout);
         let outcome = runner
             .run_shell_adoptable(&args.command, budget, on_line)
@@ -373,7 +404,7 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
     }
 
     let execution = runner
-        .run_shell_streaming(&args.command, timeout, on_line)
+        .run_shell_streaming_maybe_timeout(&args.command, timeout, on_line)
         .await;
     // A shell command can mutate any file (sed -i, codegen, git checkout, mv, a
     // formatter, …); a later `read` in the same turn must not serve stale cached

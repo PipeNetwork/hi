@@ -280,7 +280,13 @@ fn strip_chatml_tokens(text: &str) -> String {
 /// `display` if present, else the model-facing `content`.
 pub(crate) fn emit_tool_output(ui: &mut dyn Ui, id: &str, name: &str, output: &ToolOutcome) {
     if let Some(plan) = output.plan.as_deref() {
-        ui.plan(plan);
+        ui.plan_result_id(
+            id,
+            name,
+            output.display.as_deref().unwrap_or(&output.content),
+            output.status,
+            plan,
+        );
     } else {
         ui.tool_result_id(
             id,
@@ -320,7 +326,15 @@ pub(crate) fn tool_deps(calls: &[(String, String, String)]) -> Vec<Vec<usize>> {
     // Track, for each prior index, whether it was mutating and its target path.
     let mut prior: Vec<(bool, Option<String>)> = Vec::with_capacity(n);
     for (i, (_, name, arguments)) in calls.iter().enumerate() {
-        let mutating = if name == "bash" {
+        // `update_plan` is read-only with respect to the workspace, but it
+        // mutates live and durable agent state. Two updates are not
+        // commutative: applying them in scheduler completion order can let an
+        // older checklist overwrite (or clear) the model's later checklist.
+        // Treat it as ordering-mutating while retaining its read-only
+        // capability/permission classification everywhere else.
+        let mutating = if name == "update_plan" {
+            true
+        } else if name == "bash" {
             !matches!(
                 bash_command(arguments)
                     .map(|command| classify_bash_command(&command))
@@ -593,6 +607,14 @@ pub(crate) fn looks_like_continue(input: &str) -> bool {
         "do the rest",
         "do the remaining",
         "keep working",
+        "do it",
+        "do all of that",
+        "build that",
+        "build all of that",
+        "implement that",
+        "implement all of that",
+        "execute the plan",
+        "implement the plan",
     ];
     CONTINUE_PHRASES
         .iter()
@@ -867,6 +889,75 @@ pub(crate) fn recovery_telemetry(
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct PlanSettlementUi {
+        settlement: Option<(String, String, String, hi_tools::ToolStatus, Vec<PlanStep>)>,
+        visible_results: Vec<(String, String)>,
+    }
+
+    impl Ui for PlanSettlementUi {
+        fn assistant_text(&mut self, _: &str) {}
+        fn assistant_reasoning(&mut self, _: &str) {}
+        fn assistant_end(&mut self) {}
+        fn tool_call(&mut self, _: &str, _: &str) {}
+        fn tool_result(&mut self, name: &str, result: &str) {
+            self.visible_results
+                .push((name.to_string(), result.to_string()));
+        }
+        fn plan_result_id(
+            &mut self,
+            id: &str,
+            name: &str,
+            result: &str,
+            status: hi_tools::ToolStatus,
+            steps: &[PlanStep],
+        ) {
+            self.settlement = Some((
+                id.to_string(),
+                name.to_string(),
+                result.to_string(),
+                status,
+                steps.to_vec(),
+            ));
+        }
+        fn status(&mut self, _: &str) {}
+        fn turn_end(&mut self, _: &str) {}
+    }
+
+    #[test]
+    fn plan_output_uses_semantic_settlement_without_visible_result() {
+        let steps = vec![PlanStep {
+            title: "verify the harness".into(),
+            status: PlanStatus::Active,
+        }];
+        let output = ToolOutcome {
+            content: "Plan recorded: 0/1 done.".into(),
+            display: None,
+            plan: Some(steps.clone()),
+            status: hi_tools::ToolStatus::Succeeded,
+            process: None,
+            background: None,
+            effects: hi_tools::ToolEffects::default(),
+            truncation: hi_tools::TruncationState::Complete,
+            images: Vec::new(),
+        };
+        let mut ui = PlanSettlementUi::default();
+
+        emit_tool_output(&mut ui, "plan-call-1", "update_plan", &output);
+
+        assert_eq!(
+            ui.settlement,
+            Some((
+                "plan-call-1".into(),
+                "update_plan".into(),
+                output.content,
+                hi_tools::ToolStatus::Succeeded,
+                steps,
+            ))
+        );
+        assert!(ui.visible_results.is_empty());
+    }
+
     #[test]
     fn tool_deps_serializes_write_after_read_on_same_path() {
         // read a.rs then write a.rs: the write must wait for the read so the read
@@ -1081,6 +1172,10 @@ mod tests {
             "finish it",
             "do the rest",
             "keep working",
+            "do it",
+            "do all of that",
+            "build all of that",
+            "implement the plan",
             "  continue  ",
         ] {
             assert!(looks_like_continue(s), "should flag as continue: {s:?}");
@@ -1231,6 +1326,25 @@ mod tests {
             deps[1].contains(&0),
             "second write depends on first: {deps:?}"
         );
+    }
+
+    #[test]
+    fn tool_deps_serializes_plan_updates_in_emission_order() {
+        let calls = vec![
+            (
+                "p1".into(),
+                "update_plan".into(),
+                r#"{"steps":[{"title":"older","status":"done"}]}"#.into(),
+            ),
+            (
+                "p2".into(),
+                "update_plan".into(),
+                r#"{"steps":[{"title":"newer","status":"pending"}]}"#.into(),
+            ),
+        ];
+        let deps = tool_deps(&calls);
+        assert!(deps[0].is_empty());
+        assert_eq!(deps[1], vec![0], "later plan must apply last: {deps:?}");
     }
 
     #[test]

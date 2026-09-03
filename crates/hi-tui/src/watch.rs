@@ -443,7 +443,7 @@ pub(crate) fn benchmark_row(id: u64, now: u64) -> LoopWatchRow {
         interval_secs: 300,
         created_ms: now.saturating_sub(3_600_000),
         next_ms: now + 60_000,
-        expires_ms: now + 86_400_000,
+        expires_ms: None,
         firings: id,
         firing: id == 1,
         paused: false,
@@ -687,7 +687,15 @@ fn render_peek(
         th.chrome(UiTone::Info).body,
     ));
     let created_ago = fmt_left(now.saturating_sub(row.created_ms) / 1000);
-    let expires_in = fmt_left(row.expires_ms.saturating_sub(now) / 1000);
+    let lifetime = row
+        .expires_ms
+        .map(|expires| {
+            format!(
+                "expires in {}",
+                fmt_left(expires.saturating_sub(now) / 1000)
+            )
+        })
+        .unwrap_or_else(|| "runs until cancelled".to_string());
     let window = row
         .window
         .as_deref()
@@ -695,11 +703,11 @@ fn render_peek(
         .unwrap_or_default();
     lines.push(Line::styled(
         format!(
-            "every {} · {} firing(s) · started {} ago · expires in {}{}",
+            "every {} · {} firing(s) · started {} ago · {}{}",
             humanize_secs(row.interval_secs),
             row.firings,
             created_ago,
-            expires_in,
+            lifetime,
             window,
         ),
         dim(),
@@ -954,7 +962,7 @@ mod tests {
                 interval_secs: 1800,
                 created_ms: now.saturating_sub(3_600_000),
                 next_ms: now + 1_200_000,
-                expires_ms: now + 6 * 86_400_000,
+                expires_ms: Some(now + 6 * 86_400_000),
                 firings: 4,
                 firing: false,
                 paused: false,
@@ -990,7 +998,7 @@ mod tests {
                 interval_secs: 300,
                 created_ms: now,
                 next_ms: now + 60_000,
-                expires_ms: now + 7 * 86_400_000,
+                expires_ms: None,
                 firings: 1,
                 firing: true,
                 paused: false,
@@ -1061,7 +1069,7 @@ mod tests {
             interval_secs: 3600,
             created_ms: now,
             next_ms: now + 3_600_000,
-            expires_ms: now + 7 * 86_400_000,
+            expires_ms: None,
             firings: 2,
             firing: false,
             paused: true,
@@ -1147,7 +1155,7 @@ mod tests {
             interval_secs: 3600,
             created_ms: fixed_now.saturating_sub(90_000),
             next_ms: fixed_now + 90_000,
-            expires_ms: fixed_now + 86_400_000,
+            expires_ms: None,
             firings: 2,
             firing: false,
             paused: true,

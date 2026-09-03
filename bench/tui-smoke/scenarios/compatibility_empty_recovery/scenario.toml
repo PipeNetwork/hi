@@ -1,0 +1,95 @@
+schema_version = 1
+name = "compatibility-fallback-then-empty-recovery"
+tags = ["curated", "pr"]
+timeout_ms = 30000
+
+[[provider.steps]]
+id = "reject-max-tokens"
+[provider.steps.expect]
+json_equals = { "/max_tokens" = 8192 }
+[provider.steps.response]
+kind = "http_error"
+status = 400
+body = '{"error":{"message":"parameter max_tokens is not supported; use max_completion_tokens","code":"bad_request","retryable":false}}'
+
+[[provider.steps]]
+id = "fallback-empty"
+[provider.steps.expect]
+json_equals = { "/max_completion_tokens" = 8192 }
+[provider.steps.response]
+kind = "raw_sse"
+body = "data: [DONE]\n\n"
+
+[[provider.steps]]
+id = "cached-fallback-recovery"
+[provider.steps.expect]
+json_equals = { "/max_completion_tokens" = 8192 }
+[provider.steps.response]
+kind = "text"
+text = "COMPAT_EMPTY_RECOVERY_OK"
+
+[[actions]]
+kind = "send_line"
+text = "Reply with exactly COMPAT_EMPTY_RECOVERY_OK and do not use tools."
+
+[[actions]]
+kind = "wait_provider_request"
+count = 3
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 3
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST", "/headers/x-request-attempt" = "0" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST", "/headers/x-request-attempt" = "1" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "provider_request", "/data/request_attempt" = 1, "/data/compatibility_fallback" = "output_token_parameter", "/data/accepted" = true, "/data/response_status" = 200 }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "provider_request", "/data/request_attempt" = 2, "/data/output_token_parameter" = "max_completion_tokens", "/data/accepted" = true, "/data/response_status" = 200 }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/role" = "Assistant", "/content/0/Text" = "COMPAT_EMPTY_RECOVERY_OK" }
+exact = 1
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

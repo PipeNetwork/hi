@@ -22,8 +22,12 @@ impl HttpTransport {
         headers: HashMap<String, String>,
     ) -> Result<Self, McpError> {
         let headers = expand_http_headers(&headers);
-        // Same identity as PipeMcpClient so Pipe's trusted-hi discovery caps apply.
-        let client = hi_ai::agent_http_client_quick();
+        // Use the productive-stream client: `McpClient::invoke_tool` owns the
+        // optional `HI_MCP_TOOL_TIMEOUT_SECS` deadline, while connect/handshake
+        // is separately bounded by `ensure_connected`. The quick client has a
+        // default socket-read timeout and would silently reintroduce a finite
+        // ceiling for healthy long-running HTTP MCP tools.
+        let client = hi_ai::agent_http_client();
         Ok(Self {
             client,
             url: url.into(),

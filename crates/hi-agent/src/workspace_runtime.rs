@@ -46,6 +46,20 @@ impl WorkspaceRuntime {
         lsp_mode: LspMode,
         scan: Option<crate::change_ledger::BackgroundScan>,
     ) -> Result<Self> {
+        Self::new_with_scan_and_sandbox(root, state_root, lsp_mode, scan, None)
+    }
+
+    /// Like [`Self::new_with_scan`] with an optional caller-owned sandbox
+    /// policy. `None` preserves the normal `HI_SANDBOX` resolution used by
+    /// standalone callers; an explicit policy avoids process-global
+    /// environment reads for embedded agents and fixtures.
+    pub fn new_with_scan_and_sandbox(
+        root: impl AsRef<Path>,
+        state_root: impl AsRef<Path>,
+        lsp_mode: LspMode,
+        scan: Option<crate::change_ledger::BackgroundScan>,
+        sandbox_policy: Option<hi_tools::sandbox::SandboxPolicy>,
+    ) -> Result<Self> {
         let root = root.as_ref().canonicalize().with_context(|| {
             format!("canonicalizing workspace root {}", root.as_ref().display())
         })?;
@@ -70,7 +84,10 @@ impl WorkspaceRuntime {
         );
         hi_tools::recover_workspace_transactions(&root, &state_root)
             .context("recovering interrupted workspace transactions")?;
-        let process_runner = hi_tools::ProcessRunner::new(&root)?;
+        let process_runner = match sandbox_policy {
+            Some(policy) => hi_tools::ProcessRunner::new_with_policy(&root, policy)?,
+            None => hi_tools::ProcessRunner::new(&root)?,
+        };
         // In production, use a background scan (either a pre-started one passed
         // in by the caller, or one launched here). In tests, scan synchronously
         // so the initial snapshot is deterministic (tests write files

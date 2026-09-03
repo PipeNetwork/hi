@@ -72,8 +72,6 @@ fn turn_steer_summarizes_trajectory() {
         continue_nudges: 0,
         truncation_retries: 0,
         hit_step_cap: false,
-        stalled_unfinished: false,
-        stalled_repeating: false,
         verify_attributions: Vec::new(),
         tool_calls: 0,
         max_concurrent_batch: 0,
@@ -91,7 +89,8 @@ fn turn_steer_summarizes_trajectory() {
         "omits zero components: {steer}"
     );
 
-    // A stall is surfaced even with no rounds.
+    // Diagnostic no-progress bookkeeping alone does not manufacture a public
+    // steering/failure label.
     a.report.last_turn_telemetry = TurnTelemetry {
         verify_rounds: 0,
         recovery_retries: 0,
@@ -99,8 +98,7 @@ fn turn_steer_summarizes_trajectory() {
         continue_nudges: 0,
         truncation_retries: 0,
         hit_step_cap: false,
-        stalled_unfinished: true,
-        stalled_repeating: false,
+        no_progress_streak: 3,
         verify_attributions: Vec::new(),
         tool_calls: 0,
         max_concurrent_batch: 0,
@@ -108,8 +106,7 @@ fn turn_steer_summarizes_trajectory() {
         tool_timeline: Vec::new(),
         ..TurnTelemetry::default()
     };
-    let steer = a.turn_steer().expect("stall has a steer line");
-    assert!(steer.contains("stalled"), "stall flagged: {steer}");
+    assert_eq!(a.turn_steer(), None);
 }
 
 #[test]
@@ -173,12 +170,53 @@ async fn last_turn_usage_resets_each_turn() {
     assert_eq!(agent.totals().output_tokens, 2);
     assert_eq!(agent.last_turn_usage().input_tokens, 5);
     assert_eq!(agent.last_turn_usage().output_tokens, 2);
+    assert_eq!(agent.last_turn_telemetry().model_requests, 1);
+    assert_eq!(agent.last_turn_telemetry().requests.len(), 1);
+    agent
+        .report
+        .last_turn_telemetry
+        .requests
+        .push(crate::RequestCensus::default());
+    agent
+        .report
+        .last_turn_telemetry
+        .diagnostic_retention
+        .requests_dropped = 17;
+    agent
+        .report
+        .last_turn_telemetry
+        .wire_audit
+        .push(serde_json::json!({ "attempt": "old-turn" }));
+    agent
+        .report
+        .last_turn_telemetry
+        .diagnostic_retention
+        .wire_audit_dropped = 19;
 
     agent.run_turn("q2", &mut NullUi).await.unwrap();
     assert_eq!(agent.totals().input_tokens, 12);
     assert_eq!(agent.totals().output_tokens, 5);
     assert_eq!(agent.last_turn_usage().input_tokens, 7);
     assert_eq!(agent.last_turn_usage().output_tokens, 3);
+    assert_eq!(agent.last_turn_telemetry().model_requests, 1);
+    assert_eq!(agent.last_turn_telemetry().requests.len(), 1);
+    assert!(agent.last_turn_telemetry().wire_audit.is_empty());
+    assert_eq!(
+        agent
+            .last_turn_telemetry()
+            .diagnostic_retention
+            .requests_dropped,
+        0,
+        "request retention accounting must reset at each turn boundary"
+    );
+    assert_eq!(
+        agent
+            .last_turn_telemetry()
+            .diagnostic_retention
+            .wire_audit_dropped,
+        0,
+        "wire-audit retention accounting must reset at each turn boundary"
+    );
 }
 
 #[tokio::test]
@@ -394,7 +432,11 @@ async fn empty_response_gives_up_after_retries() {
     ];
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
-    agent.run_turn("hello", &mut ui).await.unwrap();
+    let error = agent.run_turn("hello", &mut ui).await.unwrap_err();
+    assert!(
+        error.to_string().contains("no response after retrying"),
+        "bounded empty-response failure should remain typed: {error:#}"
+    );
     assert!(
         ui.statuses.iter().any(|s| s.contains("after retrying")),
         "exhaustion should be surfaced, got: {:?}",

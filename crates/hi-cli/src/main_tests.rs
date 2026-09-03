@@ -1,5 +1,8 @@
-use super::{sync_session_enabled, top_level_error_code};
-use crate::config::{ProviderName, Settings};
+use super::{
+    automatic_workflow_plan_path, sync_session_enabled, top_level_error_code,
+    validate_tui_event_trace_request,
+};
+use crate::config::{Cli, ProviderName, Settings};
 use crate::landing::write_landing;
 use crate::project_context::{auto_memory_enabled, memory_context};
 use crate::provider::{
@@ -12,8 +15,86 @@ use crate::report::{
 use crate::review_target::review_target_dir_from_prompt_at;
 use anyhow::Result;
 use async_trait::async_trait;
+use clap::Parser;
 use hi_ai::{ChatRequest, CompatMode, Completion, Provider, ServedModel, StreamEvent, ToolMode};
 use std::path::PathBuf;
+
+#[test]
+fn tui_event_trace_accepts_only_the_full_interactive_frontend() {
+    let interactive =
+        Cli::try_parse_from(["hi", "--tui-events-jsonl", "/tmp/hi-tui-events-test.jsonl"]).unwrap();
+    validate_tui_event_trace_request(&interactive, true, true).unwrap();
+    assert!(validate_tui_event_trace_request(&interactive, false, true).is_err());
+
+    let explicit_session = Cli::try_parse_from([
+        "hi",
+        "--session-file",
+        "/tmp/hi-tui-session-test.jsonl",
+        "--tui-events-jsonl",
+        "/tmp/hi-tui-events-test.jsonl",
+    ])
+    .unwrap();
+    validate_tui_event_trace_request(&explicit_session, true, true).unwrap();
+
+    let plain = Cli::try_parse_from([
+        "hi",
+        "--plain",
+        "--tui-events-jsonl",
+        "/tmp/hi-tui-events-test.jsonl",
+    ])
+    .unwrap();
+    assert!(validate_tui_event_trace_request(&plain, true, true).is_err());
+
+    let one_shot = Cli::try_parse_from([
+        "hi",
+        "--tui-events-jsonl",
+        "/tmp/hi-tui-events-test.jsonl",
+        "fix it",
+    ])
+    .unwrap();
+    assert!(validate_tui_event_trace_request(&one_shot, true, true).is_err());
+}
+
+#[test]
+fn tui_event_trace_does_not_alias_delegate_progress_jsonl() {
+    let error = Cli::try_parse_from([
+        "hi",
+        "--events-jsonl",
+        "/tmp/delegate.jsonl",
+        "--tui-events-jsonl",
+        "/tmp/tui.jsonl",
+    ])
+    .unwrap_err();
+    assert!(error.to_string().contains("cannot be used with"));
+}
+
+#[test]
+fn automatic_workflow_detection_matches_plain_and_moa_plan_prompts() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("plan.md"), "- [ ] implement the parser\n").unwrap();
+    let workspace = root.path().canonicalize().unwrap();
+
+    let plain = Cli::try_parse_from(["hi", "implement plan.md"]).unwrap();
+    assert_eq!(
+        automatic_workflow_plan_path(&plain, &workspace, Some("implement plan.md")).as_deref(),
+        Some("plan.md")
+    );
+
+    let moa = Cli::try_parse_from(["hi", "/moa implement plan.md"]).unwrap();
+    assert_eq!(
+        automatic_workflow_plan_path(&moa, &workspace, Some("/moa implement plan.md")).as_deref(),
+        Some("plan.md")
+    );
+
+    let fleet = Cli::try_parse_from([
+        "hi",
+        "--session-file",
+        "/tmp/hi-fleet-session.jsonl",
+        "implement plan.md",
+    ])
+    .unwrap();
+    assert!(automatic_workflow_plan_path(&fleet, &workspace, Some("implement plan.md")).is_none());
+}
 
 #[test]
 fn optional_sync_storage_failure_keeps_the_local_session_running() {
@@ -156,7 +237,7 @@ fn one_shot_exit_codes_follow_v2_outcomes() {
     assert_eq!(
         one_shot_exit_code(
             &outcome(
-                hi_agent::TurnStatus::Incomplete,
+                hi_agent::TurnStatus::Failed,
                 hi_agent::VerificationStatus::Failed,
             ),
             false,
@@ -196,6 +277,28 @@ fn one_shot_exit_codes_follow_v2_outcomes() {
             true,
         ),
         1
+    );
+
+    let mut explicit_cap = outcome(
+        hi_agent::TurnStatus::Failed,
+        hi_agent::VerificationStatus::Passed,
+    );
+    explicit_cap.stop_reason = hi_agent::TurnStopReason::StepLimit;
+    assert_eq!(
+        one_shot_exit_code(&explicit_cap, false, false),
+        1,
+        "an explicit productive-work cap must not report successful completion"
+    );
+
+    let mut accepted_read_only_wrap_up = outcome(
+        hi_agent::TurnStatus::Completed,
+        hi_agent::VerificationStatus::NotApplicable,
+    );
+    accepted_read_only_wrap_up.stop_reason = hi_agent::TurnStopReason::ToolLimit;
+    assert_eq!(
+        one_shot_exit_code(&accepted_read_only_wrap_up, false, false),
+        0,
+        "a usable read-only cap wrap-up remains a completed answer"
     );
 }
 
@@ -328,6 +431,7 @@ fn initialization_failure_still_writes_a_v2_report() {
         "test-provider",
         &anyhow::anyhow!("state root denied"),
         None,
+        11,
         7,
     )
     .unwrap();
@@ -340,6 +444,8 @@ fn initialization_failure_still_writes_a_v2_report() {
     assert_eq!(report["changes"], serde_json::json!([]));
     assert_eq!(report["rsi"]["mode"], "off");
     assert_eq!(report["rsi"]["candidate_evidence"], true);
+    assert_eq!(report["telemetry"]["effective_max_steps"], 11);
+    assert_eq!(report["telemetry"]["effective_max_tool_calls"], 7);
 }
 
 #[test]

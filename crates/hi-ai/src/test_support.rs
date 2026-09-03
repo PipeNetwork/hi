@@ -2,6 +2,14 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+mod scripted;
+
+pub use scripted::{
+    ChatStep, JsonExpectation, RecordedRequest, RequestMatcher, ResponseChunk, ScriptedFailure,
+    ScriptedFailureKind, ScriptedOpenAiServer, ScriptedOpenAiServerBuilder, ScriptedResponse,
+    ScriptedServerError, ScriptedServerInspection, ScriptedToolCall, UnconsumedStep,
+};
+
 pub struct FakeOpenAiServer {
     url: String,
     bodies: Arc<Mutex<Vec<String>>>,

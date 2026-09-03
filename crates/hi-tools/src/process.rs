@@ -15,7 +15,7 @@ pub(crate) use execution::kill_group;
 #[cfg(test)]
 use execution::kill_process_group;
 pub use execution::{AdoptableOutcome, RunningChild, preserve_detached_descendants};
-use execution::{capture_child, capture_child_adoptable};
+use execution::{capture_child, capture_child_adoptable, capture_child_maybe_timeout};
 
 /// The structured result returned by [`ProcessRunner`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,6 +135,20 @@ pub struct ProcessRunner {
 
 impl ProcessRunner {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        let policy = crate::sandbox::SandboxPolicy::from_env().map_err(anyhow::Error::msg)?;
+        Self::new_with_policy(root, policy)
+    }
+
+    /// Construct a runner with an explicit sandbox policy.
+    ///
+    /// Embedded callers should use this when they already own configuration
+    /// state. Keeping the policy out of the process environment makes multiple
+    /// agents safe to construct concurrently and prevents test fixtures from
+    /// changing another runner's security settings.
+    pub fn new_with_policy(
+        root: impl AsRef<Path>,
+        policy: crate::sandbox::SandboxPolicy,
+    ) -> Result<Self> {
         let root = root.as_ref();
         let metadata = std::fs::metadata(root)
             .with_context(|| format!("reading workspace root {}", root.display()))?;
@@ -146,7 +160,6 @@ impl ProcessRunner {
         let root = root
             .canonicalize()
             .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
-        let policy = crate::sandbox::SandboxPolicy::from_env().map_err(anyhow::Error::msg)?;
         let cargo_home = workspace_cargo_home(&root, policy)
             .filter(|cargo_home| std::fs::create_dir_all(cargo_home).is_ok());
         let mut writable = vec![root.as_path()];
@@ -207,6 +220,18 @@ impl ProcessRunner {
             .await
     }
 
+    /// Run a shell command with an optional outer deadline. `None` leaves the
+    /// command active until it exits or the future is cancelled/dropped; the
+    /// process-group guard still reaps the command tree on cancellation.
+    pub async fn run_shell_maybe_timeout(
+        &self,
+        command: &str,
+        timeout: Option<Duration>,
+    ) -> Result<ProcessExecution> {
+        self.run_shell_streaming_maybe_timeout(command, timeout, &mut |_| {})
+            .await
+    }
+
     pub async fn run_shell_streaming(
         &self,
         command: &str,
@@ -216,6 +241,18 @@ impl ProcessRunner {
         let started = Instant::now();
         let child = self.spawn_shell(command)?;
         capture_child(child, timeout, on_line, started).await
+    }
+
+    /// Streaming variant of [`Self::run_shell_maybe_timeout`].
+    pub async fn run_shell_streaming_maybe_timeout(
+        &self,
+        command: &str,
+        timeout: Option<Duration>,
+        on_line: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<ProcessExecution> {
+        let started = Instant::now();
+        let child = self.spawn_shell(command)?;
+        capture_child_maybe_timeout(child, timeout, on_line, started).await
     }
 
     /// Run a shell command in the foreground up to `foreground_budget`; if it is
@@ -247,6 +284,25 @@ impl ProcessRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.run_program_maybe_timeout(program, args, Some(timeout))
+            .await
+    }
+
+    /// Run an executable directly with an optional outer deadline.
+    ///
+    /// `None` leaves productive work active until the program exits or the
+    /// returned future is cancelled. Cancellation still drops the process
+    /// group guard and removes the direct child and all of its descendants.
+    pub async fn run_program_maybe_timeout<I, S>(
+        &self,
+        program: impl AsRef<OsStr>,
+        args: I,
+        timeout: Option<Duration>,
+    ) -> Result<ProcessExecution>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let started = Instant::now();
         let (wrapped_program, wrapped_args) = self.sandbox.wrap_program(program.as_ref(), args);
         let mut command = Command::new(wrapped_program);
@@ -256,7 +312,7 @@ impl ProcessRunner {
             command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
         }
         let child = command.spawn().context("failed to spawn program")?;
-        capture_child(child, timeout, &mut |_| {}, started).await
+        capture_child_maybe_timeout(child, timeout, &mut |_| {}, started).await
     }
 
     /// Run a trusted executable directly with explicit environment overrides.
@@ -290,6 +346,37 @@ impl ProcessRunner {
         }
         let child = command.spawn().context("failed to spawn program")?;
         capture_child(child, timeout, &mut |_| {}, started).await
+    }
+
+    /// Run a trusted executable with explicit environment overrides and an
+    /// optional outer deadline. `None` leaves the process running until it
+    /// exits or the returned future is cancelled/dropped; the process-group
+    /// guard still removes the child and its descendants on cancellation.
+    pub async fn run_program_with_env_maybe_timeout<I, S, E, K, V>(
+        &self,
+        program: impl AsRef<OsStr>,
+        args: I,
+        environment: E,
+        timeout: Option<Duration>,
+    ) -> Result<ProcessExecution>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+        E: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        let started = Instant::now();
+        let (wrapped_program, wrapped_args) = self.sandbox.wrap_program(program.as_ref(), args);
+        let mut command = Command::new(wrapped_program);
+        command.args(wrapped_args);
+        self.configure(&mut command);
+        command.envs(environment);
+        if self.sandbox.is_enforced() {
+            command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
+        }
+        let child = command.spawn().context("failed to spawn program")?;
+        capture_child_maybe_timeout(child, timeout, &mut |_| {}, started).await
     }
 
     /// Spawn a long-lived direct child with piped stdin/stdout. This is the
@@ -422,6 +509,91 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, ToolStatus::TimedOut);
         assert_eq!(run.outcome.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn direct_program_deadline_is_optional_and_explicit() {
+        let runner = ProcessRunner::from_current_dir().unwrap();
+        let completed = tokio::time::timeout(
+            Duration::from_secs(2),
+            runner.run_program_maybe_timeout("sh", ["-c", "sleep 0.03; printf completed"], None),
+        )
+        .await
+        .expect("the unbounded direct program should complete normally")
+        .unwrap();
+        assert_eq!(completed.status, ToolStatus::Succeeded);
+        assert_eq!(completed.outcome.stdout_summary, "completed");
+
+        let timed_out = runner
+            .run_program_maybe_timeout("sh", ["-c", "sleep 1"], Some(Duration::from_millis(25)))
+            .await
+            .unwrap();
+        assert_eq!(timed_out.status, ToolStatus::TimedOut);
+        assert_eq!(timed_out.outcome.exit_code, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_an_unbounded_process_future_kills_its_group() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-process-unbounded-cancel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("leaked");
+        let runner = ProcessRunner::new(&root).unwrap();
+        let command = format!("sleep 0.15; touch {}", marker.display());
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                runner.run_shell_maybe_timeout(&command, None)
+            )
+            .await
+            .is_err(),
+            "the test must cancel the still-running unbounded process future"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !marker.exists(),
+            "dropping an unbounded verifier future must kill its process group"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_an_unbounded_direct_program_kills_its_group() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-process-unbounded-direct-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("leaked");
+        let runner = ProcessRunner::new(&root).unwrap();
+        let command = format!("sleep 0.15; touch {}", marker.display());
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                runner.run_program_maybe_timeout("sh", ["-c", command.as_str()], None)
+            )
+            .await
+            .is_err(),
+            "the test must cancel the still-running unbounded direct program"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !marker.exists(),
+            "dropping the direct-program future must kill its process group"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

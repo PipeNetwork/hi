@@ -104,11 +104,16 @@ pub struct BackgroundRegistry {
     /// the registry was empty at the time. Bounded FIFO so a model that
     /// guesses ids in a loop cannot grow this without bound.
     unknown_handles: Mutex<VecDeque<UnknownHandle>>,
+    /// Optional per-registry override used by embedded callers and tests. A
+    /// registry-local value keeps timing controls out of process-global
+    /// environment state.
+    poll_wait_base_secs: AtomicU64,
 }
 
 /// Cap on remembered unknown handles. Bounded so a guessing loop cannot grow
 /// memory; the agent only needs the most recent misses.
 const MAX_UNKNOWN_HANDLES: usize = 16;
+const POLL_WAIT_USE_ENV: u64 = u64::MAX;
 
 impl Default for BackgroundRegistry {
     fn default() -> Self {
@@ -117,6 +122,7 @@ impl Default for BackgroundRegistry {
             counter: AtomicU64::new(1),
             reserved_slots: AtomicUsize::new(0),
             unknown_handles: Mutex::new(VecDeque::new()),
+            poll_wait_base_secs: AtomicU64::new(POLL_WAIT_USE_ENV),
         }
     }
 }
@@ -130,9 +136,16 @@ struct EffectBaseline {
 struct BgInner {
     /// Full retained combined stdout+stderr (front-trimmed past `MAX_BG_BUFFER`).
     output: String,
-    /// Byte offset of output already returned by a poll; only newer bytes are
-    /// delivered next time.
-    read_offset: usize,
+    /// Exact number of bytes evicted from the front of `output`. Together with
+    /// `read_position`, this gives every byte an absolute stream position, so a
+    /// poll can report precisely how much unread output was lost when the ring
+    /// wrapped instead of silently rewinding a relative cursor.
+    dropped_bytes: u64,
+    /// Absolute byte position immediately after the output returned by the last
+    /// poll. Only newer bytes are delivered next time. This deliberately is not
+    /// clamped when the ring wraps: `dropped_bytes - read_position` is the exact
+    /// unread omission the next poll must surface.
+    read_position: u64,
     state: BgState,
     reaped: bool,
     /// Effects are sealed on the first observation after the process becomes
@@ -143,6 +156,22 @@ struct BgInner {
     /// — the quieter the process, the longer the next default poll parks.
     /// Reset whenever a poll delivers output.
     empty_polls: u32,
+}
+
+impl BgInner {
+    fn running(output: String) -> Self {
+        let mut inner = Self {
+            output,
+            dropped_bytes: 0,
+            read_position: 0,
+            state: BgState::Running,
+            reaped: false,
+            terminal_effects: None,
+            empty_polls: 0,
+        };
+        trim_output_to_cap(&mut inner);
+        inner
+    }
 }
 
 impl Drop for BackgroundRegistry {
@@ -273,14 +302,7 @@ impl BackgroundRegistry {
                     snapshot,
                 })
             }),
-            inner: Mutex::new(BgInner {
-                output: seed_output,
-                read_offset: 0,
-                state: BgState::Running,
-                reaped: false,
-                terminal_effects: None,
-                empty_polls: 0,
-            }),
+            inner: Mutex::new(BgInner::running(seed_output)),
             reaped: Notify::new(),
             changed: Notify::new(),
         });
@@ -333,14 +355,7 @@ impl BackgroundRegistry {
             pgid,
             origin: BgOrigin::Requested,
             effect_baseline: effect_baseline.map(Arc::new),
-            inner: Mutex::new(BgInner {
-                output: String::new(),
-                read_offset: 0,
-                state: BgState::Running,
-                reaped: false,
-                terminal_effects: None,
-                empty_polls: 0,
-            }),
+            inner: Mutex::new(BgInner::running(String::new())),
             reaped: Notify::new(),
             changed: Notify::new(),
         });
@@ -415,8 +430,24 @@ impl BackgroundRegistry {
             let inner = proc.inner.lock().unwrap();
             inner.empty_polls
         };
-        self.poll_wait_streaming(id, default_poll_wait_budget(empty_polls), on_line)
-            .await
+        let base_override_secs = match self.poll_wait_base_secs.load(Ordering::Acquire) {
+            POLL_WAIT_USE_ENV => None,
+            base => Some(base),
+        };
+        self.poll_wait_streaming(
+            id,
+            default_poll_wait_budget(empty_polls, base_override_secs),
+            on_line,
+        )
+        .await
+    }
+
+    /// Override the adaptive default wait for this registry. `None` restores
+    /// the standalone environment-based default. This is registry-local, so
+    /// changing one agent's polling policy cannot affect another agent.
+    pub fn set_poll_wait_base_secs(&self, base_secs: Option<u64>) {
+        self.poll_wait_base_secs
+            .store(base_secs.unwrap_or(POLL_WAIT_USE_ENV), Ordering::Release);
     }
 
     /// Like [`poll`](Self::poll), but blocks up to `wait` until the process
@@ -440,27 +471,26 @@ impl BackgroundRegistry {
         let proc = lookup(self, id)?;
         let mut streamed = {
             let inner = proc.inner.lock().unwrap();
-            inner.read_offset
+            inner.read_position
         };
         let deadline = tokio::time::Instant::now() + wait;
         loop {
             let notified = proc.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let (fresh, done) = {
+            let (omitted, fresh, end, done) = {
                 let inner = proc.inner.lock().unwrap();
-                let fresh = if inner.output.len() > streamed {
-                    inner.output[streamed..].to_string()
-                } else {
-                    String::new()
-                };
-                if !fresh.is_empty() {
-                    streamed = inner.output.len();
-                }
-                let done = inner.output.len() > inner.read_offset
+                let (omitted, fresh, end) = output_since(&inner, streamed);
+                let done = output_end(&inner) > inner.read_position
                     || !matches!(inner.state, BgState::Running);
-                (fresh, done)
+                (omitted, fresh, end, done)
             };
+            if omitted > 0 {
+                on_line(&output_omission_marker(omitted));
+            }
+            if omitted > 0 || !fresh.is_empty() {
+                streamed = end;
+            }
             if !fresh.is_empty() {
                 emit_stream_chunk(on_line, &fresh);
             }
@@ -474,9 +504,12 @@ impl BackgroundRegistry {
         }
         {
             let inner = proc.inner.lock().unwrap();
-            if inner.output.len() > streamed {
-                let fresh = inner.output[streamed..].to_string();
+            let (omitted, fresh, _) = output_since(&inner, streamed);
+            if omitted > 0 || !fresh.is_empty() {
                 drop(inner);
+                if omitted > 0 {
+                    on_line(&output_omission_marker(omitted));
+                }
                 emit_stream_chunk(on_line, &fresh);
             }
         }
@@ -661,13 +694,20 @@ fn should_seal_terminal_effects(inner: &BgInner, terminal_before_snapshot: bool)
 /// costs at most a handful of model rounds per hour instead of one every few
 /// seconds; short enough that an Esc/interrupt (checked between tool
 /// completions) stays responsive. An explicit `wait_secs` bypasses this;
-/// `HI_BG_POLL_WAIT_BASE_SECS` rescales it (0 restores instant polls — used
-/// by tests that exercise the instant-poll steering paths).
-fn default_poll_wait_budget(empty_polls: u32) -> std::time::Duration {
+/// `HI_BG_POLL_WAIT_BASE_SECS` rescales it for standalone callers; embedded
+/// callers should prefer [`BackgroundRegistry::set_poll_wait_base_secs`] so
+/// timing state stays local to one registry.
+fn default_poll_wait_budget(
+    empty_polls: u32,
+    base_override_secs: Option<u64>,
+) -> std::time::Duration {
     const CAP_SECS: u64 = 240;
-    let base = std::env::var("HI_BG_POLL_WAIT_BASE_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+    let base = base_override_secs
+        .or_else(|| {
+            std::env::var("HI_BG_POLL_WAIT_BASE_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+        })
         .unwrap_or(15);
     if base == 0 {
         return std::time::Duration::ZERO;
@@ -688,12 +728,23 @@ pub(crate) fn poll(id: &str) -> Result<String> {
 fn poll_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
     let proc = lookup(registry, id)?;
     let mut inner = proc.inner.lock().unwrap();
-    let fresh = inner.output[inner.read_offset..].to_string();
-    inner.read_offset = inner.output.len();
+    let (omitted, retained_fresh, end) = output_since(&inner, inner.read_position);
+    inner.read_position = end;
+    let delivered = omitted > 0 || !retained_fresh.is_empty();
+    let fresh = if omitted > 0 {
+        let marker = output_omission_marker(omitted);
+        if retained_fresh.is_empty() {
+            marker
+        } else {
+            format!("{marker}\n{retained_fresh}")
+        }
+    } else {
+        retained_fresh
+    };
     // Escalation state for the adaptive default wait: consecutive polls that
     // came back empty while running mean the process is quiet, so the next
     // defaulted poll should park longer before reporting "no new output".
-    if fresh.is_empty() && matches!(inner.state, BgState::Running) {
+    if !delivered && matches!(inner.state, BgState::Running) {
         inner.empty_polls = inner.empty_polls.saturating_add(1);
     } else {
         inner.empty_polls = 0;
@@ -702,7 +753,7 @@ fn poll_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
     // handle payloads. The model still gets the stable `id=` for tool calls.
     let title = proc.title.as_str();
     let status = match inner.state {
-        BgState::Running if fresh.is_empty() => {
+        BgState::Running if !delivered => {
             format!("[{id} · {title}: still running — no new output]")
         }
         BgState::Running => format!("[{id} · {title}: still running]"),
@@ -716,7 +767,7 @@ fn poll_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
     // Idle running polls must stay a one-line status. Re-echoing the full
     // command on every empty poll makes the UI look like a hung loop,
     // especially for multi-line scripts that were auto-backgrounded.
-    Ok(if fresh.is_empty() {
+    Ok(if !delivered {
         match inner.state {
             BgState::Running => status,
             // Terminal and drained: a bare status line here reads as "result
@@ -737,6 +788,31 @@ fn poll_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
     } else {
         format!("{status}\n{fresh}")
     })
+}
+
+/// Absolute byte position immediately after the retained output.
+fn output_end(inner: &BgInner) -> u64 {
+    inner
+        .dropped_bytes
+        .saturating_add(inner.output.len() as u64)
+}
+
+/// Return output newer than an absolute stream position, plus the exact number
+/// of unread bytes that fell out of the bounded ring before they could be read.
+/// All stored positions land on UTF-8 boundaries because appends contain valid
+/// strings and front trimming uses [`char_boundary_at_or_after`].
+fn output_since(inner: &BgInner, position: u64) -> (u64, String, u64) {
+    let end = output_end(inner);
+    let omitted = inner.dropped_bytes.saturating_sub(position);
+    let retained_position = position.max(inner.dropped_bytes).min(end);
+    let offset = retained_position.saturating_sub(inner.dropped_bytes) as usize;
+    (omitted, inner.output[offset..].to_string(), end)
+}
+
+fn output_omission_marker(omitted: u64) -> String {
+    format!(
+        "… [background output omitted: {omitted} unread bytes exceeded the {MAX_BG_BUFFER}-byte retention limit] …"
+    )
 }
 
 /// The last chunk of a finished process's output, for restating on drained
@@ -1094,14 +1170,21 @@ fn append_output(proc: &BgProc, bytes: &[u8]) {
     let mut inner = proc.inner.lock().unwrap();
     inner.output.push_str(line.trim_end_matches(['\r', '\n']));
     inner.output.push('\n');
+    trim_output_to_cap(&mut inner);
+    drop(inner);
+    proc.changed.notify_waiters();
+}
+
+/// Enforce the retained-output cap while preserving an absolute byte origin.
+/// The read position is intentionally left untouched: if unread bytes are
+/// evicted, the next poll can compute and report the exact missing span.
+fn trim_output_to_cap(inner: &mut BgInner) {
     if inner.output.len() > MAX_BG_BUFFER {
         let overflow = inner.output.len() - MAX_BG_BUFFER;
         let cut = char_boundary_at_or_after(&inner.output, overflow);
         inner.output.drain(..cut);
-        inner.read_offset = inner.read_offset.saturating_sub(cut);
+        inner.dropped_bytes = inner.dropped_bytes.saturating_add(cut as u64);
     }
-    drop(inner);
-    proc.changed.notify_waiters();
 }
 
 /// Smallest valid UTF-8 char boundary at or after `idx` (so `drain(..idx)` is
@@ -1125,7 +1208,8 @@ mod tests {
     fn running_effect_snapshot_is_not_sealed_when_process_exits_during_scan() {
         let inner = BgInner {
             output: String::new(),
-            read_offset: 0,
+            dropped_bytes: 0,
+            read_position: 0,
             state: BgState::Exited(Some(0)),
             reaped: true,
             terminal_effects: None,
@@ -1404,20 +1488,32 @@ mod tests {
 
     #[test]
     fn default_wait_budget_escalates_and_caps() {
-        // SAFETY: single-threaded test scope; the var is read per call.
-        unsafe { std::env::remove_var("HI_BG_POLL_WAIT_BASE_SECS") };
-        assert_eq!(default_poll_wait_budget(0), Duration::from_secs(15));
-        assert_eq!(default_poll_wait_budget(1), Duration::from_secs(30));
-        assert_eq!(default_poll_wait_budget(2), Duration::from_secs(60));
-        assert_eq!(default_poll_wait_budget(4), Duration::from_secs(240));
         assert_eq!(
-            default_poll_wait_budget(63),
+            default_poll_wait_budget(0, Some(15)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            default_poll_wait_budget(1, Some(15)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            default_poll_wait_budget(2, Some(15)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            default_poll_wait_budget(4, Some(15)),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            default_poll_wait_budget(63, Some(15)),
             Duration::from_secs(240),
             "cap holds for arbitrary streaks"
         );
-        unsafe { std::env::set_var("HI_BG_POLL_WAIT_BASE_SECS", "0") };
-        assert_eq!(default_poll_wait_budget(3), Duration::ZERO, "0 = instant");
-        unsafe { std::env::remove_var("HI_BG_POLL_WAIT_BASE_SECS") };
+        assert_eq!(
+            default_poll_wait_budget(3, Some(0)),
+            Duration::ZERO,
+            "0 = instant"
+        );
     }
 
     #[tokio::test]
@@ -1622,5 +1718,104 @@ mod tests {
         assert_eq!(char_boundary_at_or_after(s, 2), 5);
         assert_eq!(char_boundary_at_or_after(s, 1), 1);
         assert_eq!(char_boundary_at_or_after(s, 99), s.len());
+    }
+
+    fn registry_with_retained_output(output: String) -> (BackgroundRegistry, String) {
+        let registry = BackgroundRegistry::default();
+        let id = "overflow-test_1".to_string();
+        let proc = Arc::new(BgProc {
+            command: "overflow-test".to_string(),
+            title: "overflow-test".to_string(),
+            pgid: None,
+            origin: BgOrigin::Requested,
+            effect_baseline: None,
+            inner: Mutex::new(BgInner::running(output)),
+            reaped: Notify::new(),
+            changed: Notify::new(),
+        });
+        registry.processes.lock().unwrap().insert(id.clone(), proc);
+        (registry, id)
+    }
+
+    #[test]
+    fn overflow_reports_exact_unread_bytes_once() {
+        let excess = 37usize;
+        let output = format!("{}{}", "d".repeat(excess), "r".repeat(MAX_BG_BUFFER));
+        let (registry, id) = registry_with_retained_output(output);
+
+        let first = registry.poll(&id).unwrap();
+        assert!(
+            first.contains(&format!("{excess} unread bytes")),
+            "first poll must name the exact unavailable span: {first:?}"
+        );
+        assert!(first.ends_with(&"r".repeat(MAX_BG_BUFFER)));
+
+        let second = registry.poll(&id).unwrap();
+        assert!(
+            !second.contains("background output omitted"),
+            "an acknowledged omission must not repeat: {second:?}"
+        );
+        assert!(second.contains("still running — no new output"));
+    }
+
+    #[test]
+    fn overflow_counts_only_unread_bytes() {
+        let mut inner = BgInner::running("a".repeat(MAX_BG_BUFFER));
+        inner.read_position = output_end(&inner);
+        inner.output.push_str(&"b".repeat(73));
+        trim_output_to_cap(&mut inner);
+
+        let (omitted, fresh, end) = output_since(&inner, inner.read_position);
+        assert_eq!(
+            omitted, 0,
+            "evicting already-delivered bytes is not data loss"
+        );
+        assert_eq!(fresh, "b".repeat(73));
+        assert_eq!(end, MAX_BG_BUFFER as u64 + 73);
+    }
+
+    #[test]
+    fn overflow_preserves_utf8_and_reports_actual_boundary_cut() {
+        // The nominal two-byte overflow lands inside the leading four-byte
+        // scalar. The ring must discard the whole scalar and report four bytes.
+        let output = format!("😀{}", "x".repeat(MAX_BG_BUFFER - 2));
+        assert_eq!(output.len(), MAX_BG_BUFFER + 2);
+        let (registry, id) = registry_with_retained_output(output);
+
+        let first = registry.poll(&id).unwrap();
+        assert!(first.contains("4 unread bytes"), "got: {first:?}");
+        assert!(first.ends_with(&"x".repeat(MAX_BG_BUFFER - 2)));
+    }
+
+    #[tokio::test]
+    async fn streaming_poll_surfaces_overflow_to_callback_and_result() {
+        let excess = 19usize;
+        let output = format!("{}{}", "d".repeat(excess), "r".repeat(MAX_BG_BUFFER));
+        let (registry, id) = registry_with_retained_output(output);
+        let mut streamed = Vec::new();
+
+        let result = registry
+            .poll_wait_streaming(&id, Duration::ZERO, &mut |line| {
+                streamed.push(line.to_string());
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            streamed
+                .iter()
+                .any(|line| line.contains(&format!("{excess} unread bytes"))),
+            "live view must disclose overflow: {streamed:?}"
+        );
+        assert!(
+            result.contains(&format!("{excess} unread bytes")),
+            "model-facing poll result must disclose overflow: {result:?}"
+        );
+        assert!(
+            !registry
+                .poll(&id)
+                .unwrap()
+                .contains("background output omitted")
+        );
     }
 }

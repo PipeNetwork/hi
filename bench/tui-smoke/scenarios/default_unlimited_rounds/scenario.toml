@@ -1,0 +1,471 @@
+schema_version = 1
+name = "default-unlimited-model-and-tool-rounds"
+tags = ["curated", "pr"]
+# This case intentionally performs 50 sequential model/tool/checkpoint cycles.
+# Leave enough observation headroom for a loaded CI host; the action still
+# proves every round completed and is not an execution budget for `hi`.
+timeout_ms = 240000
+
+[hi]
+# The product default is intentionally uncapped. Verification is disabled by
+# the harness so this case measures only model rounds and the 50 scripted writes.
+# Fifty sequential calls deliberately crosses both historical defaults: 32 model
+# rounds and 48 executed tools.
+args = ["--allow-unverified"]
+# Most scripted cases use the harness's explicit 30-second child deadline for
+# fast fault containment. Disable it here so the regression actually exercises
+# Hi's ordinary no-deadline default; the 240-second scenario timeout remains an
+# external observer/cleanup boundary, not a product execution limit.
+turn_deadline_secs = 0
+# Keep a bounded external watchdog with enough room for the 180-second request
+# observation plus settlement/cleanup. It never changes Hi's turn semantics.
+outer_turn_kill_secs = 210
+
+[[provider.steps]]
+id = "productive-write-01"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-01.txt", content = "round 01 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-02"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-02.txt", content = "round 02 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-03"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-03.txt", content = "round 03 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-04"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-04.txt", content = "round 04 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-05"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-05.txt", content = "round 05 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-06"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-06.txt", content = "round 06 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-07"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-07.txt", content = "round 07 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-08"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-08.txt", content = "round 08 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-09"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-09.txt", content = "round 09 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-10"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-10.txt", content = "round 10 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-11"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-11.txt", content = "round 11 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-12"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-12.txt", content = "round 12 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-13"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-13.txt", content = "round 13 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-14"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-14.txt", content = "round 14 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-15"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-15.txt", content = "round 15 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-16"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-16.txt", content = "round 16 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-17"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-17.txt", content = "round 17 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-18"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-18.txt", content = "round 18 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-19"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-19.txt", content = "round 19 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-20"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-20.txt", content = "round 20 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-21"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-21.txt", content = "round 21 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-22"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-22.txt", content = "round 22 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-23"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-23.txt", content = "round 23 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-24"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-24.txt", content = "round 24 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-25"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-25.txt", content = "round 25 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-26"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-26.txt", content = "round 26 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-27"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-27.txt", content = "round 27 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-28"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-28.txt", content = "round 28 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-29"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-29.txt", content = "round 29 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-30"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-30.txt", content = "round 30 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-31"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-31.txt", content = "round 31 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-32"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-32.txt", content = "round 32 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-33"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-33.txt", content = "round 33 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-34"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-34.txt", content = "round 34 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-35"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-35.txt", content = "round 35 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-36"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-36.txt", content = "round 36 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-37"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-37.txt", content = "round 37 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-38"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-38.txt", content = "round 38 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-39"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-39.txt", content = "round 39 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-40"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-40.txt", content = "round 40 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-41"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-41.txt", content = "round 41 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-42"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-42.txt", content = "round 42 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-43"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-43.txt", content = "round 43 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-44"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-44.txt", content = "round 44 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-45"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-45.txt", content = "round 45 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-46"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-46.txt", content = "round 46 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-47"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-47.txt", content = "round 47 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-48"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-48.txt", content = "round 48 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-49"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-49.txt", content = "round 49 complete\n" }
+
+[[provider.steps]]
+id = "productive-write-50"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "round-50.txt", content = "round 50 complete\n" }
+
+[[provider.steps]]
+id = "final-after-round-50"
+[provider.steps.expect]
+body_contains = ["round-50.txt"]
+[provider.steps.response]
+kind = "text"
+text = "DEFAULT_UNLIMITED_ROUNDS_COMPLETE"
+
+[[actions]]
+kind = "send_line"
+text = "Create 50 small proof files named round-01.txt through round-50.txt, one write call at a time, then report completion."
+
+[[actions]]
+kind = "wait_provider_request"
+count = 51
+timeout_ms = 180000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/verification" = "not_applicable", "/data/outcome/stop_reason" = "no_applicable_verification", "/data/outcome/changed_file_count" = 50, "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "none" }
+timeout_ms = 30000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 51
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "user" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started", "/data/name" = "write" }
+exact = 50
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "write" }
+exact = 50
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_result", "/data/name" = "write" }
+exact = 50
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/step_limit/mode" = "unlimited", "/data/outcome/status" = "completed", "/data/outcome/verification" = "not_applicable", "/data/outcome/stop_reason" = "no_applicable_verification", "/data/outcome/changed_file_count" = 50, "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "none" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "drive_parked" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/role" = "Assistant" }
+contains = { "/content/0/Text" = "DEFAULT_UNLIMITED_ROUNDS_COMPLETE" }
+exact = 1
+
+[[assertions]]
+kind = "file"
+path = "round-01.txt"
+exists = true
+equals = "round 01 complete\n"
+
+[[assertions]]
+kind = "file"
+path = "round-17.txt"
+exists = true
+equals = "round 17 complete\n"
+
+[[assertions]]
+kind = "file"
+path = "round-50.txt"
+exists = true
+equals = "round 50 complete\n"
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

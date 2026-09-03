@@ -1,0 +1,83 @@
+schema_version = 1
+name = "session-restart-restores-plan-drive"
+tags = ["curated", "pr", "fuzz_state_template"]
+timeout_ms = 30000
+
+[session]
+plan_drive_paused = true
+plan_drive_stall = 1
+
+[[session.plan]]
+title = "Durable active smoke step"
+status = "active"
+
+[[session.plan]]
+title = "Durable pending smoke step"
+status = "pending"
+
+[[actions]]
+kind = "send_line"
+text = "/plan status"
+
+[[actions]]
+kind = "wait_quiescent"
+source = "events"
+quiet_ms = 250
+timeout_ms = 3000
+
+[[actions]]
+kind = "restart"
+
+[[actions]]
+kind = "send_line"
+text = "/plan status"
+
+[[actions]]
+kind = "wait_quiescent"
+source = "events"
+quiet_ms = 250
+timeout_ms = 3000
+
+[[actions]]
+kind = "capture_screen"
+name = "restored"
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ready" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/type" = "plan", "/steps/0/title" = "Durable active smoke step", "/steps/1/title" = "Durable pending smoke step", "/steps/1/status" = "Pending" }
+at_least = 1
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/type" = "plan_drive", "/paused" = true, "/stall" = 1 }
+at_least = 1
+
+# `session_ended` is emitted from live Agent state, once by each process.  Two
+# matching records prove the second process actually restored active + pending
+# plan shape, pause state, and stall count; assertions over the seed JSONL alone
+# would be a false positive if restore silently dropped one of those fields.
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "session_ended", "/data/plan/active" = 1, "/data/plan/pending" = 1, "/data/plan/paused" = true, "/data/plan/stall" = 1 }
+exact = 2
+
+[[assertions]]
+kind = "screen"
+snapshot = "restored"
+contains = ["Durable active smoke step", "Durable pending smoke step", "plan drive: paused"]
+
+[[assertions]]
+kind = "exit"
+code = 0

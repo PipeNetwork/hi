@@ -36,19 +36,14 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 16;
 const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
-/// Idle read timeout for streaming LLM responses (chunks can be sparse during
-/// long generations). Non-stream metadata/tool calls use
-/// [`agent_http_client_quick`] instead.
-const DEFAULT_READ_TIMEOUT_SECS: u64 = 360;
-/// xAI grok-4.6 reasoning can sit silent before the first token; their SDK
-/// examples use a 3600s timeout. Used only by [`agent_http_client_xai`].
-const DEFAULT_XAI_READ_TIMEOUT_SECS: u64 = 3_600;
-/// Idle window for the xAI Responses stream. Longer than the shared 240s
-/// default so a thinking gap is not mistaken for a dead connection.
-const DEFAULT_XAI_STREAM_IDLE_SECS: u64 = 3_600;
+/// Read timeout retained for bounded non-streaming transfers such as
+/// Hugging Face metadata and model-file downloads.
+const DEFAULT_TRANSFER_READ_TIMEOUT_SECS: u64 = 360;
 /// Connect/read budget for non-streaming agent HTTP (auth, /models, MCP, search).
 const DEFAULT_QUICK_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_QUICK_READ_TIMEOUT_SECS: u64 = 60;
+/// Maximum for bounded metadata/auth/connect policy knobs. Productive model
+/// requests do not inherit this value.
 const MAX_HTTP_TIMEOUT_SECS: u64 = 3_600;
 const DEFAULT_MODEL_DISCOVERY_DEADLINE_SECS: u64 = 30;
 const DEFAULT_AUTH_REFRESH_DEADLINE_SECS: u64 = 30;
@@ -56,14 +51,22 @@ const DEFAULT_AUTH_REFRESH_DEADLINE_SECS: u64 = 30;
 /// One absolute deadline shared by every phase of an HTTP operation.
 #[derive(Clone, Copy, Debug)]
 pub struct OperationBudget {
-    deadline: Instant,
+    deadline: Option<Instant>,
 }
 
 impl OperationBudget {
     pub fn new(duration: Duration) -> Self {
         Self {
-            deadline: Instant::now() + duration,
+            // An unrepresentable duration must never wrap or turn into an
+            // accidental short deadline. Treat it as effectively unlimited.
+            deadline: Instant::now().checked_add(duration),
         }
+    }
+
+    /// No absolute operation deadline. Connection establishment and retry
+    /// count/backoff remain independently bounded by their own policies.
+    pub const fn unlimited() -> Self {
+        Self { deadline: None }
     }
 
     pub async fn run<T>(
@@ -71,12 +74,15 @@ impl OperationBudget {
         context: impl FnOnce() -> String,
         future: impl std::future::Future<Output = T>,
     ) -> Result<T> {
-        match tokio::time::timeout_at(self.deadline, future).await {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                hi_observability::record(hi_observability::ReliabilityEvent::HttpDeadline);
-                Err(error).with_context(context)
-            }
+        match self.deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, future).await {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    hi_observability::record(hi_observability::ReliabilityEvent::HttpDeadline);
+                    Err(error).with_context(context)
+                }
+            },
+            None => Ok(future.await),
         }
     }
 }
@@ -314,19 +320,19 @@ where
 /// default `Client::new()` does pool internally, but this sets explicit
 /// limits and keep-alive so long sessions reuse connections reliably.
 ///
-/// Prefer [`agent_http_client_quick`] for non-streaming calls so a stuck peer
-/// cannot sit on the 360s streaming read timeout.
+/// Prefer [`agent_http_client_quick`] for non-streaming calls so those bounded
+/// operations retain a finite read deadline.
 pub fn agent_http_client() -> reqwest::Client {
     agent_http_client_for_socket(None)
 }
 
-/// Streaming client for the xAI Responses adapter. Read timeout defaults to
-/// 3600s (xAI's published reasoning-model budget) instead of the shared 360s.
+/// Streaming client for the xAI Responses adapter. Like other productive model
+/// streams, it has no read deadline unless explicitly configured.
 pub(crate) fn agent_http_client_xai() -> reqwest::Client {
     build_agent_http_client(
         None,
         http_timeout_secs("HI_HTTP_CONNECT_TIMEOUT_SECS", DEFAULT_CONNECT_TIMEOUT_SECS),
-        http_timeout_secs("HI_HTTP_READ_TIMEOUT_SECS", DEFAULT_XAI_READ_TIMEOUT_SECS),
+        model_stream_read_timeout(),
     )
 }
 
@@ -339,10 +345,23 @@ pub fn agent_http_client_quick() -> reqwest::Client {
             "HI_HTTP_QUICK_CONNECT_TIMEOUT_SECS",
             DEFAULT_QUICK_CONNECT_TIMEOUT_SECS,
         ),
-        http_timeout_secs(
+        Some(Duration::from_secs(http_timeout_secs(
             "HI_HTTP_QUICK_READ_TIMEOUT_SECS",
             DEFAULT_QUICK_READ_TIMEOUT_SECS,
-        ),
+        ))),
+    )
+}
+
+/// Agent client for non-model-stream transfers that retain the historical
+/// finite socket-read deadline.
+pub(crate) fn agent_http_client_bounded() -> reqwest::Client {
+    build_agent_http_client(
+        None,
+        http_timeout_secs("HI_HTTP_CONNECT_TIMEOUT_SECS", DEFAULT_CONNECT_TIMEOUT_SECS),
+        Some(Duration::from_secs(http_timeout_secs(
+            "HI_HTTP_READ_TIMEOUT_SECS",
+            DEFAULT_TRANSFER_READ_TIMEOUT_SECS,
+        ))),
     )
 }
 
@@ -353,14 +372,14 @@ pub fn agent_http_client_for_socket(socket: Option<&std::path::Path>) -> reqwest
     build_agent_http_client(
         socket,
         http_timeout_secs("HI_HTTP_CONNECT_TIMEOUT_SECS", DEFAULT_CONNECT_TIMEOUT_SECS),
-        http_timeout_secs("HI_HTTP_READ_TIMEOUT_SECS", DEFAULT_READ_TIMEOUT_SECS),
+        model_stream_read_timeout(),
     )
 }
 
 fn build_agent_http_client(
     socket: Option<&std::path::Path>,
     connect_timeout_secs: u64,
-    read_timeout_secs: u64,
+    read_timeout: Option<Duration>,
 ) -> reqwest::Client {
     // Identify hi to upstream HTTP services. `User-Agent` is the standard
     // channel; the `AI_AGENT` header mirrors the env-var convention the shell
@@ -382,7 +401,6 @@ fn build_agent_http_client(
         // (host, port, or scheme); same-origin path/version redirects still work.
         .redirect(credential_redirect_policy())
         .connect_timeout(Duration::from_secs(connect_timeout_secs))
-        .read_timeout(Duration::from_secs(read_timeout_secs))
         .pool_idle_timeout(Some(Duration::from_secs(http_timeout_secs(
             "HI_HTTP_POOL_IDLE_TIMEOUT_SECS",
             DEFAULT_POOL_IDLE_TIMEOUT_SECS,
@@ -397,13 +415,34 @@ fn build_agent_http_client(
             "HI_HTTP_TCP_KEEPALIVE_SECS",
             DEFAULT_TCP_KEEPALIVE_SECS,
         ))));
+    if let Some(read_timeout) = read_timeout {
+        builder = builder.read_timeout(read_timeout);
+    }
     #[cfg(unix)]
     if let Some(socket) = socket {
         builder = builder.unix_socket(socket);
     }
     builder
         .build()
-        .unwrap_or_else(|_| timed_http_client_fallback(connect_timeout_secs, read_timeout_secs))
+        .unwrap_or_else(|_| agent_http_client_fallback(connect_timeout_secs, read_timeout))
+}
+
+/// Minimal fallback for agent clients. Unlike [`timed_http_client_fallback`],
+/// this preserves an absent productive-stream read deadline rather than
+/// silently turning a builder fault into an ordinary-work ceiling.
+fn agent_http_client_fallback(
+    connect_timeout_secs: u64,
+    read_timeout: Option<Duration>,
+) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .redirect(credential_redirect_policy())
+        .connect_timeout(Duration::from_secs(connect_timeout_secs.max(1)));
+    if let Some(read_timeout) = read_timeout {
+        builder = builder.read_timeout(read_timeout);
+    }
+    builder
+        .build()
+        .expect("failed to build fallback reqwest Client")
 }
 
 /// Last-resort client that still carries timeouts — never fall back to an
@@ -483,6 +522,36 @@ fn http_timeout_secs(var_name: &str, default_secs: u64) -> u64 {
         .unwrap_or(default_secs)
 }
 
+fn opt_in_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    let seconds = value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)?;
+    Some(Duration::from_secs(seconds))
+}
+
+fn instant_representable_timeout(timeout: Option<Duration>) -> Option<Duration> {
+    timeout.filter(|timeout| std::time::Instant::now().checked_add(*timeout).is_some())
+}
+
+/// Optional socket-read watchdog for productive model streams. Quick and
+/// non-streaming clients intentionally use their separate finite defaults.
+fn model_stream_read_timeout() -> Option<Duration> {
+    let configured = std::env::var("HI_HTTP_READ_TIMEOUT_SECS").ok();
+    instant_representable_timeout(opt_in_timeout_from_value(configured.as_deref()))
+}
+
+/// Optional absolute deadline for one productive model HTTP request,
+/// including bounded transport retries and their backoffs. Unset/zero keeps
+/// the request active until completion or turn cancellation.
+fn model_request_timeout() -> Option<Duration> {
+    let configured = std::env::var("HI_MODEL_REQUEST_TIMEOUT_SECS").ok();
+    model_request_timeout_from_value(configured.as_deref())
+}
+
+fn model_request_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    instant_representable_timeout(opt_in_timeout_from_value(value))
+}
+
 fn http_env_usize(var_name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(var_name)
         .ok()
@@ -496,15 +565,16 @@ fn http_env_usize(var_name: &str, default: usize, min: usize, max: usize) -> usi
 /// client — a substitute client would discard its transport configuration
 /// (Unix-socket pinning, default headers, timeout profile).
 pub async fn send_with_retry(builder: RequestBuilder) -> Result<Response> {
-    send_with_retry_deadline(
-        builder,
-        OperationBudget::new(Duration::from_secs(MAX_HTTP_TIMEOUT_SECS)),
-    )
-    .await
+    let budget = model_request_timeout()
+        .map(OperationBudget::new)
+        .unwrap_or_else(OperationBudget::unlimited);
+    send_with_retry_deadline(builder, budget).await
 }
 
 /// Send with retries while charging attempts, backoffs, and the fresh HTTP/1
-/// escape attempt to one absolute operation deadline.
+/// escape attempt to one shared operation budget. The ordinary model path
+/// supplies an unlimited budget; auth/metadata callers may supply a finite
+/// deadline explicitly.
 pub async fn send_with_retry_deadline(
     builder: RequestBuilder,
     budget: OperationBudget,
@@ -660,6 +730,37 @@ mod tests {
             Duration::from_secs(30)
         );
         assert!(auth_refresh_deadline() <= Duration::from_secs(MAX_HTTP_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn productive_model_request_deadline_is_opt_in_and_not_legacy_clamped() {
+        assert_eq!(model_request_timeout_from_value(None), None);
+        assert_eq!(model_request_timeout_from_value(Some("0")), None);
+        assert_eq!(model_request_timeout_from_value(Some("invalid")), None);
+        assert_eq!(
+            model_request_timeout_from_value(Some("7201")),
+            Some(Duration::from_secs(7201)),
+            "explicit model deadlines may exceed the former one-hour default"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unlimited_operation_budget_survives_the_legacy_one_hour_boundary() {
+        let operation = OperationBudget::unlimited().run(
+            || "must not be evaluated without a deadline".to_string(),
+            std::future::pending::<()>(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(MAX_HTTP_TIMEOUT_SECS + 1), operation)
+                .await
+                .is_err(),
+            "default productive request budget must remain pending past one hour"
+        );
+    }
+
+    #[test]
+    fn unrepresentable_operation_duration_never_wraps_into_a_false_cap() {
+        assert!(OperationBudget::new(Duration::MAX).deadline.is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1075,57 +1176,51 @@ impl std::error::Error for StreamGuardError {
     }
 }
 
-/// Abort a provider byte stream that has gone silent instead of blocking on it
-/// forever. A healthy stream always has bytes flowing (data or SSE keepalive
-/// comments); a connection that died without a FIN — a laptop sleeping
-/// mid-request, a NAT timeout, a half-open TCP — goes quiet indefinitely, and
-/// the consumer otherwise blocks on the next chunk forever (observed: a
-/// 13-hour zombie one-shot after macOS slept mid-stream). The idle error
-/// surfaces through the normal stream-error path, which the retry layer
-/// already treats as transient.
+/// Optionally abort a provider byte stream that has gone silent. With `None`,
+/// productive reasoning/prefill may remain quiet indefinitely and cancellation
+/// owns termination. With `Some`, a connection that died without a FIN — a
+/// laptop sleeping mid-request, a NAT timeout, a half-open TCP — yields a typed
+/// idle error through the normal transient stream-error path.
 ///
 /// Sleep needs no special clock-jump detection: macOS/Linux monotonic clocks
 /// pause during sleep, so the idle window simply resumes counting on wake and
 /// fires within one window of the machine waking.
 pub fn idle_guard<B, S>(
     stream: S,
-    idle_window: std::time::Duration,
+    idle_window: Option<std::time::Duration>,
 ) -> impl Stream<Item = Result<B, StreamGuardError>>
 where
     S: Stream<Item = Result<B, reqwest::Error>> + Unpin,
 {
     futures_util::stream::unfold(Some(stream), move |state| async move {
         let mut stream = state?;
-        match tokio::time::timeout(idle_window, stream.next()).await {
+        let next = match idle_window {
+            Some(idle_window) => tokio::time::timeout(idle_window, stream.next())
+                .await
+                .map_err(|_| idle_window),
+            None => Ok(stream.next().await),
+        };
+        match next {
             Ok(Some(item)) => Some((item.map_err(StreamGuardError::Transport), Some(stream))),
             Ok(None) => None,
             // One idle error, then end: the connection is presumed dead, so
             // polling it again would only block for another window.
-            Err(_) => Some((Err(StreamGuardError::Idle(idle_window)), None)),
+            Err(idle_window) => Some((Err(StreamGuardError::Idle(idle_window)), None)),
         }
     })
 }
 
-/// The idle window for [`idle_guard`]: `HI_STREAM_IDLE_TIMEOUT_SECS`, default
-/// 240s — generous enough for providers with long silent thinking gaps, small
-/// enough that a dead connection is abandoned in minutes rather than forever.
-pub fn stream_idle_window() -> std::time::Duration {
-    stream_idle_window_or(240)
+/// Optional idle watchdog for provider byte streams. Productive model streams
+/// are unlimited by default; a positive `HI_STREAM_IDLE_TIMEOUT_SECS` opts in.
+pub fn stream_idle_window() -> Option<std::time::Duration> {
+    let configured = std::env::var("HI_STREAM_IDLE_TIMEOUT_SECS").ok();
+    instant_representable_timeout(opt_in_timeout_from_value(configured.as_deref()))
 }
 
-/// Idle window for the xAI Responses adapter. Defaults to 3600s so grok-4.6
-/// thinking is not cut off; `HI_STREAM_IDLE_TIMEOUT_SECS` still overrides.
-pub(crate) fn xai_stream_idle_window() -> std::time::Duration {
-    stream_idle_window_or(DEFAULT_XAI_STREAM_IDLE_SECS)
-}
-
-fn stream_idle_window_or(default_secs: u64) -> std::time::Duration {
-    let secs = std::env::var("HI_STREAM_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value >= 30)
-        .unwrap_or(default_secs);
-    std::time::Duration::from_secs(secs)
+/// xAI shares the same explicit opt-in idle policy. Reasoning silence is
+/// ordinary productive work and receives no provider-specific default cap.
+pub(crate) fn xai_stream_idle_window() -> Option<std::time::Duration> {
+    stream_idle_window()
 }
 
 #[cfg(test)]
@@ -1136,7 +1231,10 @@ mod idle_guard_tests {
     #[tokio::test(start_paused = true)]
     async fn silent_stream_yields_idle_error_then_ends() {
         let silent = futures_util::stream::pending::<Result<Vec<u8>, reqwest::Error>>();
-        let mut guarded = Box::pin(idle_guard(silent, std::time::Duration::from_secs(240)));
+        let mut guarded = Box::pin(idle_guard(
+            silent,
+            Some(std::time::Duration::from_secs(240)),
+        ));
         let first = guarded.next().await;
         assert!(
             matches!(first, Some(Err(StreamGuardError::Idle(_)))),
@@ -1151,9 +1249,38 @@ mod idle_guard_tests {
             Ok::<Vec<u8>, reqwest::Error>(b"a".to_vec()),
             Ok(b"b".to_vec()),
         ]);
-        let guarded = idle_guard(items, std::time::Duration::from_secs(240));
+        let guarded = idle_guard(items, Some(std::time::Duration::from_secs(240)));
         let collected: Vec<_> = guarded.collect().await;
         assert_eq!(collected.len(), 2);
         assert!(collected.iter().all(Result::is_ok));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_stream_has_no_implicit_idle_deadline() {
+        let silent = futures_util::stream::pending::<Result<Vec<u8>, reqwest::Error>>();
+        let mut guarded = Box::pin(idle_guard(silent, None));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3_601), guarded.next())
+                .await
+                .is_err(),
+            "an unconfigured stream must remain pending beyond the former longest default"
+        );
+    }
+
+    #[test]
+    fn model_stream_timeouts_are_positive_explicit_opt_ins() {
+        assert_eq!(opt_in_timeout_from_value(None), None);
+        assert_eq!(opt_in_timeout_from_value(Some("0")), None);
+        assert_eq!(opt_in_timeout_from_value(Some("invalid")), None);
+        assert_eq!(
+            opt_in_timeout_from_value(Some("17")),
+            Some(std::time::Duration::from_secs(17))
+        );
+        assert_eq!(
+            opt_in_timeout_from_value(Some("86400")),
+            Some(std::time::Duration::from_secs(86_400)),
+            "explicit productive-stream deadlines are not clamped"
+        );
     }
 }

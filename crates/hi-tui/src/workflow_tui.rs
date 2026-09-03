@@ -134,6 +134,12 @@ fn stored_snapshot(run: hi_workflow::StoredWorkflowRun) -> hi_workflow::Workflow
     }
 }
 
+fn agent_budget_label(agent_budget: Option<u64>) -> String {
+    agent_budget
+        .map(|budget| budget.to_string())
+        .unwrap_or_else(|| "unlimited".to_owned())
+}
+
 fn open_workflow_overlay(app: &mut App) {
     let mut runs = runtime_manager()
         .and_then(|manager| manager.list().map_err(anyhow::Error::from))
@@ -158,7 +164,7 @@ fn status_label(status: hi_workflow::WorkflowRunStatus) -> &'static str {
         Active => "running",
         UserPaused => "paused",
         BackOffPaused => "backoff",
-        NoProgressPaused => "stalled",
+        NoProgressPaused => "paused — no progress",
         InfraPaused => "infra paused",
         Blocked => "blocked",
         BudgetLimited => "budget",
@@ -199,13 +205,14 @@ pub(crate) fn overlay_lines(overlay: &WorkflowOverlay) -> Vec<Line<'static>> {
                 } else {
                     " "
                 };
+                let agent_budget = agent_budget_label(run.agent_budget);
                 let text = format!(
-                    "{marker} {:<12} {:<20} {:<18} {:>2}/{:<2}   {:>7}",
+                    "{marker} {:<12} {:<20} {:<18} {:>2}/{:<9}   {:>7}",
                     status_label(run.status),
                     run.workflow_name,
                     run.current_phase.as_deref().unwrap_or("—"),
                     run.agents_used + run.agents_reserved,
-                    run.agent_budget,
+                    agent_budget,
                     elapsed(run.elapsed_ms)
                 );
                 let style = if index == overlay.selected {
@@ -258,7 +265,9 @@ pub(crate) fn overlay_lines(overlay: &WorkflowOverlay) -> Vec<Line<'static>> {
                 lines.push(Line::styled(
                     format!(
                         "Agents · {} used + {} reserved / {} budget",
-                        run.agents_used, run.agents_reserved, run.agent_budget
+                        run.agents_used,
+                        run.agents_reserved,
+                        agent_budget_label(run.agent_budget)
                     ),
                     accent(),
                 ));
@@ -390,7 +399,14 @@ pub(crate) async fn start_workflow_run(app: &mut App, arg: &str) -> anyhow::Resu
 /// spawned as a detached child so the session stays interactive. The child
 /// checkpoints under the state root and survives this TUI exiting; `status`
 /// tails its log and `stop` terminates it.
-pub(crate) fn handle_plan_workflow(app: &mut App, rest: &str, exe: &Path) {
+pub(crate) fn handle_plan_workflow(
+    app: &mut App,
+    rest: &str,
+    exe: &Path,
+    max_steps: Option<u32>,
+    max_tool_calls: Option<u32>,
+    max_verify_repairs: Option<u32>,
+) {
     let error = |app: &mut App, text: String| {
         app.push(Line::styled(
             text,
@@ -404,7 +420,7 @@ pub(crate) fn handle_plan_workflow(app: &mut App, rest: &str, exe: &Path) {
         None | Some("help") => {
             for line in [
                 "/workflow plan — build a plan.md of objectives with the workflow engine",
-                "  /workflow plan <plan.md> [--verify CMD] [--parallel N] [--dry-run]",
+                "  /workflow plan <plan.md> [--verify CMD] [--parallel N] [--max-steps N] [--max-tool-calls N] [--max-verify-repairs N] [--dry-run]",
                 "  /workflow plan resume <plan.md>   continue the latest sealed checkpoint",
                 "  /workflow plan status             child liveness + recent output",
                 "  /workflow plan stop               terminate the running child",
@@ -491,6 +507,12 @@ pub(crate) fn handle_plan_workflow(app: &mut App, rest: &str, exe: &Path) {
                 arguments.push(first.into());
             }
             arguments.extend(parts.map(str::to_owned));
+            append_inherited_execution_caps(
+                &mut arguments,
+                max_steps,
+                max_tool_calls,
+                max_verify_repairs,
+            );
             let plan_label = arguments[2].clone();
             if !resume && !Path::new(&plan_label).is_file() {
                 error(app, format!("plan file not found: {plan_label}"));
@@ -542,7 +564,7 @@ pub(crate) fn handle_plan_workflow(app: &mut App, rest: &str, exe: &Path) {
                         }],
                         current_phase: Some("Execute plan".into()),
                         agents: vec![],
-                        agent_budget: 0,
+                        agent_budget: None,
                         agents_used: 0,
                         agents_reserved: 0,
                         elapsed_ms: 0,
@@ -564,6 +586,31 @@ pub(crate) fn handle_plan_workflow(app: &mut App, rest: &str, exe: &Path) {
                 Err(err) => error(app, format!("failed to start workflow child: {err}")),
             }
         }
+    }
+}
+
+fn append_inherited_execution_caps(
+    arguments: &mut Vec<String>,
+    max_steps: Option<u32>,
+    max_tool_calls: Option<u32>,
+    max_verify_repairs: Option<u32>,
+) {
+    let has_steps = arguments.iter().any(|argument| argument == "--max-steps");
+    let has_tools = arguments
+        .iter()
+        .any(|argument| argument == "--max-tool-calls");
+    let has_verify_repairs = arguments
+        .iter()
+        .any(|argument| argument == "--max-verify-repairs");
+    for argument in crate::child_execution_cap_args(
+        if has_steps { None } else { max_steps },
+        if has_tools { None } else { max_tool_calls },
+    ) {
+        arguments.push(argument.to_string_lossy().into_owned());
+    }
+    if !has_verify_repairs && let Some(max_verify_repairs) = max_verify_repairs {
+        arguments.push("--max-verify-repairs".into());
+        arguments.push(max_verify_repairs.to_string());
     }
 }
 
@@ -670,7 +717,9 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
                     app.push(Line::styled(
                         format!(
                             "  status: {:?}  agents: {}/{}",
-                            m.status, m.agent_spent, m.agent_budget
+                            m.status,
+                            m.agent_spent,
+                            agent_budget_label(m.agent_budget)
                         ),
                         dim(),
                     ));
@@ -841,7 +890,7 @@ mod tests {
                 tokens_used: 1200,
                 duration_ms: 5000,
             }],
-            agent_budget: 8,
+            agent_budget: Some(8),
             agents_used: 2,
             agents_reserved: 1,
             elapsed_ms: 65000,
@@ -871,6 +920,76 @@ mod tests {
     }
 
     #[test]
+    fn no_progress_pause_has_a_neutral_label() {
+        assert_eq!(
+            status_label(hi_workflow::WorkflowRunStatus::NoProgressPaused),
+            "paused — no progress"
+        );
+    }
+
+    #[test]
+    fn plan_workflow_children_inherit_caps_without_overriding_explicit_flags() {
+        let mut inherited = vec!["workflow".into(), "run".into(), "plan.md".into()];
+        append_inherited_execution_caps(&mut inherited, Some(7), Some(0), Some(2));
+        assert_eq!(
+            inherited,
+            [
+                "workflow",
+                "run",
+                "plan.md",
+                "--max-steps",
+                "7",
+                "--max-tool-calls",
+                "0",
+                "--max-verify-repairs",
+                "2",
+            ]
+        );
+
+        let mut explicit = vec![
+            "workflow".into(),
+            "run".into(),
+            "plan.md".into(),
+            "--max-steps".into(),
+            "11".into(),
+            "--max-tool-calls".into(),
+            "13".into(),
+            "--max-verify-repairs".into(),
+            "3".into(),
+        ];
+        append_inherited_execution_caps(&mut explicit, Some(7), Some(0), Some(2));
+        assert_eq!(
+            explicit
+                .iter()
+                .filter(|argument| argument.as_str() == "--max-steps")
+                .count(),
+            1
+        );
+        assert_eq!(
+            explicit
+                .iter()
+                .filter(|argument| argument.as_str() == "--max-tool-calls")
+                .count(),
+            1
+        );
+        assert!(
+            explicit
+                .windows(2)
+                .any(|pair| pair == ["--max-steps", "11"])
+        );
+        assert!(
+            explicit
+                .windows(2)
+                .any(|pair| pair == ["--max-tool-calls", "13"])
+        );
+        assert!(
+            explicit
+                .windows(2)
+                .any(|pair| pair == ["--max-verify-repairs", "3"])
+        );
+    }
+
+    #[test]
     fn list_and_detail_render_multi_run_fields() {
         let mut overlay =
             WorkflowOverlay::new(vec![snapshot(hi_workflow::WorkflowRunStatus::Active)]);
@@ -890,6 +1009,19 @@ mod tests {
         ] {
             assert!(detail.contains(expected), "missing {expected}: {detail}");
         }
+    }
+
+    #[test]
+    fn unlimited_budget_is_rendered_explicitly() {
+        let mut run = snapshot(hi_workflow::WorkflowRunStatus::Active);
+        run.agent_budget = None;
+        let mut overlay = WorkflowOverlay::new(vec![run]);
+        let list = text(overlay_lines(&overlay));
+        assert!(list.contains("3/unlimited"), "{list}");
+
+        overlay.view = WorkflowOverlayView::Detail;
+        let detail = text(overlay_lines(&overlay));
+        assert!(detail.contains("unlimited budget"), "{detail}");
     }
 
     #[test]

@@ -1,10 +1,12 @@
+use std::cell::RefCell;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use sha2::Digest as _;
 
+/// Per-segment (and therefore per-record) resource limit, not a journal lifetime limit.
 pub const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
-pub const MAX_JOURNAL_ENTRIES: usize = crate::MAX_HOST_CALLS as usize;
+const SEGMENT_SUFFIX: &str = ".segment-";
 #[cfg(unix)]
 const PRIVATE_DIR_MODE: u32 = 0o700;
 #[cfg(unix)]
@@ -28,8 +30,8 @@ pub enum JournalError {
     #[error("journal restore rejected (limit {limit}): {reason}")]
     UnsafeRestore { limit: u64, reason: String },
     #[error(
-        "journal full: appending seq {seq} would exceed the {limit}-byte cap \
-         that restore enforces, which would strand the run unresumable"
+        "journal record at seq {seq} exceeds the {limit}-byte per-record limit; the journal has no \
+         lifetime size limit"
     )]
     Full { seq: u64, limit: u64 },
     #[error("journal is not dense at entry {index}: expected sequence {expected}, found {actual}")]
@@ -45,11 +47,38 @@ pub enum JournalError {
     Divergence { seq: u64, kind: String },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct JournalSegment {
+    path: PathBuf,
+    start_seq: u64,
+    entry_count: u64,
+    bytes: u64,
+    identity: std::fs::Metadata,
+}
+
+#[derive(Debug)]
+struct CachedSegment {
+    index: usize,
+    entries: Vec<JournalEntry>,
+}
+
+#[derive(Debug)]
 pub struct Journal {
+    // Entries are retained directly only for deliberately non-persistent journals. Persistent
+    // journals replay from a single bounded segment cache instead of retaining the whole run.
     entries: Vec<JournalEntry>,
     path: Option<PathBuf>,
-    bytes: u64,
+    segments: Vec<JournalSegment>,
+    entry_count: u64,
+    agent_reservations: u64,
+    segment_limit: u64,
+    cache: RefCell<Option<CachedSegment>>,
+}
+
+impl Default for Journal {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl Journal {
@@ -57,109 +86,78 @@ impl Journal {
         Self {
             entries: Vec::new(),
             path,
-            bytes: 0,
+            segments: Vec::new(),
+            entry_count: 0,
+            agent_reservations: 0,
+            segment_limit: MAX_JOURNAL_BYTES,
+            cache: RefCell::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_segment_limit(path: Option<PathBuf>, segment_limit: u64) -> Self {
+        assert!(segment_limit > 0);
+        Self {
+            segment_limit,
+            ..Self::new(path)
         }
     }
 
     pub fn load(path: PathBuf) -> Result<Self, JournalError> {
-        let (content, identity) = match read_journal_bounded(&path) {
-            Ok((content, identity)) => (content, Some(identity)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                return Err(JournalError::UnsafeRestore {
-                    limit: MAX_JOURNAL_BYTES,
-                    reason: error.to_string(),
-                });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let mut entries = Vec::new();
-        let mut offset = 0usize;
+        let paths = discover_segments(&path).map_err(map_restore_error)?;
+        let mut segments = Vec::with_capacity(paths.len());
+        let mut entry_count = 0u64;
+        let mut agent_reservations = 0u64;
         let mut line_number = 0usize;
-        let mut bytes = content.len() as u64;
-        while offset < content.len() {
-            line_number += 1;
-            let Some(relative_newline) = content[offset..].iter().position(|byte| *byte == b'\n')
-            else {
-                let tail = &content[offset..];
-                if tail.iter().all(u8::is_ascii_whitespace) {
-                    truncate_tail(&path, offset as u64, identity.as_ref())?;
-                    bytes = offset as u64;
-                    break;
-                }
-                match serde_json::from_slice::<JournalEntry>(tail) {
-                    Ok(entry) => {
-                        if entries.len() >= MAX_JOURNAL_ENTRIES {
-                            return Err(JournalError::UnsafeRestore {
-                                limit: MAX_JOURNAL_ENTRIES as u64,
-                                reason: "too many journal entries".into(),
-                            });
-                        }
-                        validate_sequence(&entries, &entry)?;
-                        entries.push(entry);
-                        terminate_line(&path, identity.as_ref())?;
-                        bytes = bytes.saturating_add(1);
+        let last = paths.len().saturating_sub(1);
+        for (index, segment_path) in paths.into_iter().enumerate() {
+            let summary = load_segment(&segment_path, entry_count, &mut line_number, index == last)
+                .map_err(|error| match error {
+                    JournalError::Io(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        map_restore_error(error)
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            line = line_number,
-                            %error,
-                            "truncating torn workflow journal tail"
-                        );
-                        truncate_tail(&path, offset as u64, identity.as_ref())?;
-                        bytes = offset as u64;
-                    }
-                }
-                break;
-            };
-            let end = offset + relative_newline;
-            let line = &content[offset..end];
-            offset = end + 1;
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            let entry = serde_json::from_slice::<JournalEntry>(line).map_err(|error| {
-                JournalError::Parse {
-                    line: line_number,
-                    error: error.to_string(),
-                }
-            })?;
-            if entries.len() >= MAX_JOURNAL_ENTRIES {
-                return Err(JournalError::UnsafeRestore {
-                    limit: MAX_JOURNAL_ENTRIES as u64,
-                    reason: "too many journal entries".into(),
-                });
-            }
-            validate_sequence(&entries, &entry)?;
-            entries.push(entry);
+                    other => other,
+                })?;
+            segments.push(JournalSegment {
+                path: segment_path,
+                start_seq: entry_count,
+                entry_count: summary.entry_count,
+                bytes: summary.bytes,
+                identity: summary.identity,
+            });
+            entry_count = entry_count
+                .checked_add(summary.entry_count)
+                .ok_or_else(|| JournalError::UnsafeRestore {
+                    limit: u64::MAX,
+                    reason: "journal sequence count overflow".into(),
+                })?;
+            agent_reservations = agent_reservations.saturating_add(summary.agent_reservations);
         }
         Ok(Self {
-            entries,
+            entries: Vec::new(),
             path: Some(path),
-            bytes,
+            segments,
+            entry_count,
+            agent_reservations,
+            segment_limit: MAX_JOURNAL_BYTES,
+            cache: RefCell::new(None),
         })
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        usize::try_from(self.entry_count).unwrap_or(usize::MAX)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entry_count == 0
     }
 
     pub fn agent_reservation_count(&self) -> u64 {
-        u64::try_from(
-            self.entries
-                .iter()
-                .filter(|entry| entry.kind == "spawn_agent")
-                .count(),
-        )
-        .unwrap_or(u64::MAX)
+        self.agent_reservations
     }
 
     pub fn covers(&self, seq: u64) -> bool {
-        usize::try_from(seq).is_ok_and(|seq| seq < self.entries.len())
+        seq < self.entry_count
     }
 
     pub fn replay(
@@ -168,19 +166,39 @@ impl Journal {
         kind: &str,
         req_hash: &str,
     ) -> Result<Option<serde_json::Value>, JournalError> {
-        let Some(entry) = usize::try_from(seq)
-            .ok()
-            .and_then(|seq| self.entries.get(seq))
-        else {
+        if !self.covers(seq) {
             return Ok(None);
-        };
-        if entry.seq != seq || entry.kind != kind || entry.req_hash != req_hash {
-            return Err(JournalError::Divergence {
-                seq,
-                kind: kind.to_string(),
+        }
+        if self.path.is_none() {
+            return replay_entry(&self.entries[seq as usize], seq, kind, req_hash);
+        }
+        let segment_index = self.segments.partition_point(|segment| {
+            segment.start_seq.saturating_add(segment.entry_count) <= seq
+        });
+        let segment = self
+            .segments
+            .get(segment_index)
+            .ok_or_else(|| JournalError::Sequence {
+                index: usize::try_from(seq).unwrap_or(usize::MAX),
+                expected: seq,
+                actual: self.entry_count,
+            })?;
+        let needs_load = self
+            .cache
+            .borrow()
+            .as_ref()
+            .is_none_or(|cache| cache.index != segment_index);
+        if needs_load {
+            let entries = read_segment_entries(segment)?;
+            *self.cache.borrow_mut() = Some(CachedSegment {
+                index: segment_index,
+                entries,
             });
         }
-        Ok(Some(entry.result.clone()))
+        let cache = self.cache.borrow();
+        let entry = &cache.as_ref().expect("segment cache was populated").entries
+            [usize::try_from(seq - segment.start_seq).unwrap()];
+        replay_entry(entry, seq, kind, req_hash)
     }
 
     pub fn record(
@@ -200,27 +218,299 @@ impl Journal {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
         };
-        validate_sequence(&self.entries, &entry)?;
+        validate_sequence(self.entry_count, &entry)?;
         let mut line = serde_json::to_string(&entry)
             .map_err(|error| JournalError::Io(std::io::Error::other(error)))?;
         line.push('\n');
-        if self.bytes.saturating_add(line.len() as u64) > MAX_JOURNAL_BYTES {
+        let line_len = line.len() as u64;
+        if line_len > self.segment_limit {
             return Err(JournalError::Full {
                 seq,
-                limit: MAX_JOURNAL_BYTES,
+                limit: self.segment_limit,
             });
         }
-        if let Some(path) = &self.path {
-            append_line(path, &line)?;
+        if let Some(base_path) = &self.path {
+            let rotate = self
+                .segments
+                .last()
+                .is_some_and(|segment| segment.bytes.saturating_add(line_len) > self.segment_limit);
+            let segment_index = if rotate {
+                self.segments.len()
+            } else {
+                self.segments.len().saturating_sub(1)
+            };
+            let target = if self.segments.is_empty() || rotate {
+                segment_path(base_path, segment_index)?
+            } else {
+                self.segments[segment_index].path.clone()
+            };
+            let expected = if self.segments.is_empty() || rotate {
+                None
+            } else {
+                Some(&self.segments[segment_index].identity)
+            };
+            let metadata = append_line(&target, &line, expected)?;
+            if self.segments.is_empty() || rotate {
+                self.segments.push(JournalSegment {
+                    path: target,
+                    start_seq: seq,
+                    entry_count: 1,
+                    bytes: line_len,
+                    identity: metadata,
+                });
+            } else {
+                let segment = &mut self.segments[segment_index];
+                segment.entry_count += 1;
+                segment.bytes += line_len;
+                segment.identity = metadata;
+            }
+            *self.cache.get_mut() = None;
+        } else {
+            self.entries.push(entry);
         }
-        self.bytes = self.bytes.saturating_add(line.len() as u64);
-        self.entries.push(entry);
+        self.entry_count += 1;
+        if kind == "spawn_agent" {
+            self.agent_reservations = self.agent_reservations.saturating_add(1);
+        }
         Ok(())
     }
 }
 
-fn read_journal_bounded(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Metadata)> {
-    let (file, metadata) = open_existing_journal(path, false, None)?;
+fn replay_entry(
+    entry: &JournalEntry,
+    seq: u64,
+    kind: &str,
+    req_hash: &str,
+) -> Result<Option<serde_json::Value>, JournalError> {
+    if entry.seq != seq || entry.kind != kind || entry.req_hash != req_hash {
+        return Err(JournalError::Divergence {
+            seq,
+            kind: kind.to_string(),
+        });
+    }
+    Ok(Some(entry.result.clone()))
+}
+
+struct SegmentSummary {
+    entry_count: u64,
+    agent_reservations: u64,
+    bytes: u64,
+    identity: std::fs::Metadata,
+}
+
+fn map_restore_error(error: std::io::Error) -> JournalError {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        JournalError::UnsafeRestore {
+            limit: MAX_JOURNAL_BYTES,
+            reason: error.to_string(),
+        }
+    } else {
+        JournalError::Io(error)
+    }
+}
+
+fn discover_segments(base: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let Some(file_name) = base.file_name().and_then(|name| name.to_str()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("journal path has no UTF-8 file name: {}", base.display()),
+        ));
+    };
+    let parent = base.parent().filter(|path| !path.as_os_str().is_empty());
+    let base_exists = match std::fs::symlink_metadata(base) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let Some(parent) = parent else {
+        return Ok(if base_exists {
+            vec![base.to_path_buf()]
+        } else {
+            Vec::new()
+        });
+    };
+    let parent_metadata = match std::fs::symlink_metadata(parent) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !base_exists => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("journal parent is not a directory: {}", parent.display()),
+        ));
+    }
+    let prefix = format!("{file_name}{SEGMENT_SUFFIX}");
+    let mut indexed = Vec::new();
+    for item in std::fs::read_dir(parent)? {
+        let item = item?;
+        let name = item.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if suffix.len() != 16 || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let index = suffix.parse::<usize>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid journal segment index {suffix}: {error}"),
+            )
+        })?;
+        if index == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "journal segment zero must use the legacy base file name",
+            ));
+        }
+        indexed.push((index, item.path()));
+    }
+    indexed.sort_unstable_by_key(|(index, _)| *index);
+    if !indexed.is_empty() && !base_exists {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "journal continuation exists without its base segment",
+        ));
+    }
+    for (expected, (actual, _)) in (1..).zip(&indexed) {
+        if expected != *actual {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("journal segment gap: expected {expected}, found {actual}"),
+            ));
+        }
+    }
+    let mut paths = Vec::with_capacity(indexed.len() + usize::from(base_exists));
+    if base_exists {
+        paths.push(base.to_path_buf());
+    }
+    paths.extend(indexed.into_iter().map(|(_, path)| path));
+    Ok(paths)
+}
+
+fn segment_path(base: &Path, index: usize) -> std::io::Result<PathBuf> {
+    if index == 0 {
+        return Ok(base.to_path_buf());
+    }
+    let Some(file_name) = base.file_name().and_then(|name| name.to_str()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("journal path has no UTF-8 file name: {}", base.display()),
+        ));
+    };
+    Ok(base.with_file_name(format!("{file_name}{SEGMENT_SUFFIX}{index:016}")))
+}
+
+fn load_segment(
+    path: &Path,
+    start_seq: u64,
+    line_number: &mut usize,
+    is_final: bool,
+) -> Result<SegmentSummary, JournalError> {
+    let (content, mut identity) = read_segment_bounded(path, None)?;
+    let mut offset = 0usize;
+    let mut entry_count = 0u64;
+    let mut agent_reservations = 0u64;
+    let mut bytes = content.len() as u64;
+    while offset < content.len() {
+        *line_number = line_number.saturating_add(1);
+        let Some(relative_newline) = content[offset..].iter().position(|byte| *byte == b'\n')
+        else {
+            if !is_final {
+                return Err(JournalError::Parse {
+                    line: *line_number,
+                    error: "unterminated line in a non-final journal segment".into(),
+                });
+            }
+            let tail = &content[offset..];
+            if tail.iter().all(u8::is_ascii_whitespace) {
+                truncate_tail(path, offset as u64, Some(&identity))?;
+                bytes = offset as u64;
+            } else {
+                match serde_json::from_slice::<JournalEntry>(tail) {
+                    Ok(entry) => {
+                        validate_sequence(start_seq + entry_count, &entry)?;
+                        if entry.kind == "spawn_agent" {
+                            agent_reservations = agent_reservations.saturating_add(1);
+                        }
+                        entry_count += 1;
+                        terminate_line(path, Some(&identity))?;
+                        bytes += 1;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            line = *line_number,
+                            %error,
+                            "truncating torn workflow journal tail"
+                        );
+                        truncate_tail(path, offset as u64, Some(&identity))?;
+                        bytes = offset as u64;
+                    }
+                }
+            }
+            identity = open_existing_journal(path, false, None)?.1;
+            break;
+        };
+        let end = offset + relative_newline;
+        let line = &content[offset..end];
+        offset = end + 1;
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let entry =
+            serde_json::from_slice::<JournalEntry>(line).map_err(|error| JournalError::Parse {
+                line: *line_number,
+                error: error.to_string(),
+            })?;
+        validate_sequence(start_seq + entry_count, &entry)?;
+        if entry.kind == "spawn_agent" {
+            agent_reservations = agent_reservations.saturating_add(1);
+        }
+        entry_count += 1;
+    }
+    Ok(SegmentSummary {
+        entry_count,
+        agent_reservations,
+        bytes,
+        identity,
+    })
+}
+
+fn read_segment_entries(segment: &JournalSegment) -> Result<Vec<JournalEntry>, JournalError> {
+    let (content, metadata) = read_segment_bounded(&segment.path, Some(&segment.identity))?;
+    if metadata.len() != segment.bytes || content.len() as u64 != segment.bytes {
+        return Err(JournalError::Io(invalid_journal_file(&segment.path)));
+    }
+    let capacity = usize::try_from(segment.entry_count)
+        .unwrap_or(content.len())
+        .min(content.len());
+    let mut entries = Vec::with_capacity(capacity);
+    for line in content.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let entry = serde_json::from_slice::<JournalEntry>(line).map_err(|error| {
+            JournalError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })?;
+        validate_sequence(segment.start_seq + entries.len() as u64, &entry)?;
+        entries.push(entry);
+    }
+    if entries.len() as u64 != segment.entry_count {
+        return Err(JournalError::Io(invalid_journal_file(&segment.path)));
+    }
+    Ok(entries)
+}
+
+fn read_segment_bounded(
+    path: &Path,
+    expected: Option<&std::fs::Metadata>,
+) -> std::io::Result<(Vec<u8>, std::fs::Metadata)> {
+    let (file, metadata) = open_existing_journal(path, false, expected)?;
     if metadata.len() > MAX_JOURNAL_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -239,11 +529,10 @@ fn read_journal_bounded(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Metad
     Ok((content, metadata))
 }
 
-fn validate_sequence(entries: &[JournalEntry], entry: &JournalEntry) -> Result<(), JournalError> {
-    let expected = entries.len() as u64;
+fn validate_sequence(expected: u64, entry: &JournalEntry) -> Result<(), JournalError> {
     if entry.seq != expected {
         return Err(JournalError::Sequence {
-            index: entries.len(),
+            index: usize::try_from(expected).unwrap_or(usize::MAX),
             expected,
             actual: entry.seq,
         });
@@ -267,7 +556,11 @@ fn terminate_line(path: &Path, expected: Option<&std::fs::Metadata>) -> std::io:
     file.sync_data()
 }
 
-fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+fn append_line(
+    path: &Path,
+    line: &str,
+    expected: Option<&std::fs::Metadata>,
+) -> std::io::Result<std::fs::Metadata> {
     ensure_journal_parent(path)?;
     let before = match std::fs::symlink_metadata(path) {
         Ok(metadata) => Some(metadata),
@@ -276,7 +569,7 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     };
     let mut options = std::fs::OpenOptions::new();
     options.append(true);
-    if before.is_none() {
+    if expected.is_none() {
         options.create_new(true);
     }
     #[cfg(unix)]
@@ -286,9 +579,11 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
             .mode(PRIVATE_FILE_MODE)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    if before
-        .as_ref()
-        .is_some_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+    if before.as_ref().is_some_and(|metadata| {
+        metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || expected.is_none_or(|expected| !same_file(expected, metadata))
+    }) || (before.is_none() && expected.is_some())
     {
         return Err(invalid_journal_file(path));
     }
@@ -298,12 +593,50 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
         || before
             .as_ref()
             .is_some_and(|before| !same_file(before, &opened))
+        || expected.is_some_and(|expected| !same_file(expected, &opened))
     {
         return Err(invalid_journal_file(path));
     }
     tighten_private_file(&file)?;
     file.write_all(line.as_bytes())?;
-    file.sync_data()
+    file.sync_data()?;
+    let metadata = file.metadata()?;
+    if expected.is_none() {
+        sync_parent_dir(path)?;
+    }
+    Ok(metadata)
+}
+
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    let before = std::fs::symlink_metadata(parent)?;
+    if before.file_type().is_symlink() || !before.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("journal parent is not a directory: {}", parent.display()),
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY);
+    }
+    let directory = options.open(parent)?;
+    let opened = directory.metadata()?;
+    if !opened.is_dir() || !same_file(&before, &opened) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "journal parent is not a stable directory: {}",
+                parent.display()
+            ),
+        ));
+    }
+    directory.sync_data()
 }
 
 fn open_existing_journal(
@@ -472,6 +805,31 @@ mod tests {
     }
 
     #[test]
+    fn restore_accepts_more_than_the_legacy_ten_thousand_entries() {
+        const ENTRIES: usize = 10_001;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut content = String::new();
+        for seq in 0..ENTRIES {
+            let entry = JournalEntry {
+                seq: seq as u64,
+                kind: "budget".into(),
+                req_hash: "hash".into(),
+                result: serde_json::Value::Null,
+                at_ms: 0,
+            };
+            content.push_str(&serde_json::to_string(&entry).unwrap());
+            content.push('\n');
+        }
+        std::fs::write(&path, content).unwrap();
+
+        let restored = Journal::load(path).unwrap();
+
+        assert_eq!(restored.len(), ENTRIES);
+        assert!(restored.covers(ENTRIES as u64 - 1));
+    }
+
+    #[test]
     fn divergence_on_hash_mismatch() {
         let mut journal = Journal::new(None);
         journal
@@ -569,6 +927,47 @@ mod tests {
         assert!(journal.is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_symlinked_continuation_segment() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let target = dir.path().join("target.jsonl");
+        std::fs::write(
+            &path,
+            b"{\"seq\":0,\"kind\":\"log\",\"req_hash\":\"x\",\"result\":null,\"at_ms\":1}\n",
+        )
+        .unwrap();
+        std::fs::write(&target, b"").unwrap();
+        symlink(&target, segment_path(&path, 1).unwrap()).unwrap();
+
+        assert!(matches!(
+            Journal::load(path),
+            Err(JournalError::UnsafeRestore { .. })
+        ));
+    }
+
+    #[test]
+    fn preplanted_next_segment_blocks_rotation_without_advancing_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut journal = Journal::with_segment_limit(Some(path.clone()), 128);
+        journal
+            .record(0, "log", "x".into(), serde_json::Value::Null)
+            .unwrap();
+        let continuation = segment_path(&path, 1).unwrap();
+        std::fs::write(&continuation, b"do not append").unwrap();
+
+        assert!(matches!(
+            journal.record(1, "log", "y".into(), serde_json::Value::Null),
+            Err(JournalError::Io(_))
+        ));
+        assert_eq!(journal.len(), 1);
+        assert_eq!(std::fs::read(continuation).unwrap(), b"do not append");
+    }
+
     #[test]
     fn load_rejects_oversize_journal_before_reading() {
         let dir = tempfile::tempdir().unwrap();
@@ -582,18 +981,85 @@ mod tests {
     }
 
     #[test]
-    fn record_refuses_to_grow_past_the_restore_cap() {
-        let mut journal = Journal::new(None);
-        let big = "x".repeat(MAX_JOURNAL_BYTES as usize + 1);
+    fn record_refuses_an_individual_record_over_the_segment_limit() {
+        let mut journal = Journal::with_segment_limit(None, 128);
         let hash = request_hash("spawn_agent", &serde_json::json!({}));
         let err = journal
-            .record(0, "spawn_agent", hash.clone(), serde_json::json!(big))
+            .record(
+                0,
+                "spawn_agent",
+                hash.clone(),
+                serde_json::json!("x".repeat(128)),
+            )
             .unwrap_err();
         assert!(matches!(err, JournalError::Full { seq: 0, .. }), "{err}");
         journal
             .record(0, "spawn_agent", hash, serde_json::json!({"ok": true}))
             .unwrap();
         assert_eq!(journal.len(), 1);
+    }
+
+    #[test]
+    fn rotates_without_a_lifetime_cap_and_replays_across_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut journal = Journal::with_segment_limit(Some(path.clone()), 160);
+        let mut hashes = Vec::new();
+        for seq in 0..6 {
+            let hash = request_hash("log", &serde_json::json!({"seq": seq}));
+            journal
+                .record(seq, "log", hash.clone(), serde_json::json!({"seq": seq}))
+                .unwrap();
+            hashes.push(hash);
+        }
+        assert!(
+            journal.segments.len() > 1,
+            "test must cross a segment boundary"
+        );
+        assert_eq!(journal.len(), 6);
+        assert!(segment_path(&path, 1).unwrap().is_file());
+
+        let loaded = Journal::load(path).unwrap();
+        assert_eq!(loaded.len(), 6);
+        assert!(loaded.segments.len() > 1);
+        for (seq, hash) in hashes.iter().enumerate() {
+            assert_eq!(
+                loaded.replay(seq as u64, "log", hash).unwrap(),
+                Some(serde_json::json!({"seq": seq}))
+            );
+        }
+    }
+
+    #[test]
+    fn torn_tail_in_final_segment_is_recovered_after_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut journal = Journal::with_segment_limit(Some(path.clone()), 160);
+        for seq in 0..4 {
+            journal
+                .record(seq, "log", format!("hash-{seq}"), serde_json::json!(seq))
+                .unwrap();
+        }
+        assert!(
+            journal.segments.len() > 1,
+            "test must cross a segment boundary"
+        );
+        let final_path = journal.segments.last().unwrap().path.clone();
+        let good_len = std::fs::metadata(&final_path).unwrap().len();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&final_path)
+            .unwrap();
+        file.write_all(b"{\"seq\":4,\"kind\"").unwrap();
+        file.sync_data().unwrap();
+
+        let loaded = Journal::load(path).unwrap();
+        assert_eq!(loaded.len(), 4);
+        assert_eq!(std::fs::metadata(final_path).unwrap().len(), good_len);
+        assert_eq!(
+            loaded.replay(3, "log", "hash-3").unwrap(),
+            Some(serde_json::json!(3))
+        );
     }
 
     #[test]

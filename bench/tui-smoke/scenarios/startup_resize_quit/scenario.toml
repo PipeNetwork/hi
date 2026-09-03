@@ -1,0 +1,48 @@
+schema_version = 1
+name = "startup-resize-quit"
+tags = ["curated", "pr"]
+timeout_ms = 30000
+
+[terminal]
+cols = 120
+rows = 36
+
+[[actions]]
+kind = "resize"
+cols = 100
+rows = 30
+
+[[actions]]
+kind = "capture_screen"
+name = "resized"
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ready", "/schema_version" = 1 }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "resized", "/data/width" = 100, "/data/height" = 30 }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "session_ended", "/data/queue_depth" = 0 }
+exact = 1
+
+[[assertions]]
+kind = "record_sequence"
+source = "events"
+pointer = "/event"
+values = ["ready", "resized", "session_ended"]
+
+[[assertions]]
+kind = "exit"
+code = 0

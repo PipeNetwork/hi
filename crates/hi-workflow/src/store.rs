@@ -9,7 +9,6 @@ pub const MAX_RUN_ID_LEN: usize = 96;
 pub const MAX_SCRIPT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ARGS_BYTES: usize = 1024 * 1024;
 pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
-pub const MAX_RESTORED_RUNS: usize = 256;
 static REGISTER_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static WRITE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 #[cfg(unix)]
@@ -49,7 +48,10 @@ pub struct WorkflowRunManifest {
     pub engine: WorkflowEngineKind,
     pub status: StoredRunStatus,
     pub current_phase: Option<String>,
-    pub agent_budget: u64,
+    /// Optional finite agent-call quota. Missing/null manifests are unlimited;
+    /// existing numeric manifests deserialize as `Some(limit)`.
+    #[serde(default)]
+    pub agent_budget: Option<u64>,
     pub agent_spent: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -67,7 +69,7 @@ impl WorkflowRunManifest {
     pub fn new(
         run_id: String,
         workflow_name: String,
-        agent_budget: u64,
+        agent_budget: Option<u64>,
     ) -> Result<Self, StoreError> {
         validate_run_id(&run_id)?;
         let now = now_ms();
@@ -335,7 +337,6 @@ impl WorkflowRunStore {
                 .cmp(&a.manifest.updated_at_ms)
                 .then_with(|| a.manifest.run_id.cmp(&b.manifest.run_id))
         });
-        runs.truncate(MAX_RESTORED_RUNS);
         Ok(runs)
     }
 
@@ -738,7 +739,8 @@ mod tests {
     fn list_ignores_tombstoned_runs() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let manifest = WorkflowRunManifest::new("cleared-run".into(), "test".into(), 8).unwrap();
+        let manifest =
+            WorkflowRunManifest::new("cleared-run".into(), "test".into(), Some(8)).unwrap();
         store
             .register(&manifest, "complete(1);", &serde_json::json!({}))
             .unwrap();
@@ -751,7 +753,8 @@ mod tests {
     fn load_is_pure_and_recovery_persists_interruption() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let manifest = WorkflowRunManifest::new("run-1".into(), "review".into(), 128).unwrap();
+        let manifest =
+            WorkflowRunManifest::new("run-1".into(), "review".into(), Some(128)).unwrap();
         store
             .register(&manifest, "complete(args);", &serde_json::json!({"x": 1}))
             .unwrap();
@@ -768,10 +771,26 @@ mod tests {
     }
 
     #[test]
+    fn manifest_budget_is_backward_compatible_and_defaults_to_unlimited() {
+        let manifest =
+            WorkflowRunManifest::new("run-compat".into(), "review".into(), None).unwrap();
+        let mut encoded = serde_json::to_value(&manifest).unwrap();
+
+        encoded["agent_budget"] = serde_json::json!(128);
+        let legacy_numeric: WorkflowRunManifest = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(legacy_numeric.agent_budget, Some(128));
+
+        encoded.as_object_mut().unwrap().remove("agent_budget");
+        let missing: WorkflowRunManifest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(missing.agent_budget, None);
+    }
+
+    #[test]
     fn persist_replaces_an_existing_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let mut manifest = WorkflowRunManifest::new("replace".into(), "first".into(), 8).unwrap();
+        let mut manifest =
+            WorkflowRunManifest::new("replace".into(), "first".into(), Some(8)).unwrap();
         store
             .register(&manifest, "complete(1);", &serde_json::json!({}))
             .unwrap();
@@ -787,7 +806,7 @@ mod tests {
     fn run_ownership_is_exclusive_and_released_with_the_guard() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let manifest = WorkflowRunManifest::new("owned".into(), "test".into(), 8).unwrap();
+        let manifest = WorkflowRunManifest::new("owned".into(), "test".into(), Some(8)).unwrap();
         store
             .register(&manifest, "complete(1);", &serde_json::json!({}))
             .unwrap();
@@ -802,7 +821,8 @@ mod tests {
     fn recovery_preserves_paused_runs_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let mut manifest = WorkflowRunManifest::new("paused".into(), "review".into(), 8).unwrap();
+        let mut manifest =
+            WorkflowRunManifest::new("paused".into(), "review".into(), Some(8)).unwrap();
         manifest.finish(WorkflowOutcome::Paused {
             kind: crate::PauseKind::User,
             message: "waiting".into(),
@@ -837,7 +857,8 @@ mod tests {
     fn preserves_terminal_status_and_deletes() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let mut manifest = WorkflowRunManifest::new("done".into(), "review".into(), 8).unwrap();
+        let mut manifest =
+            WorkflowRunManifest::new("done".into(), "review".into(), Some(8)).unwrap();
         manifest.finish(WorkflowOutcome::Completed {
             result: serde_json::json!({"ok": true}),
         });
@@ -856,7 +877,7 @@ mod tests {
     fn registration_is_no_clobber() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let manifest = WorkflowRunManifest::new("same".into(), "first".into(), 8).unwrap();
+        let manifest = WorkflowRunManifest::new("same".into(), "first".into(), Some(8)).unwrap();
         store
             .register(
                 &manifest,
@@ -894,7 +915,8 @@ mod tests {
         let store = WorkflowRunStore::new(dir.path());
         assert!(matches!(store.load("linked"), Err(StoreError::Symlink(_))));
 
-        let manifest = WorkflowRunManifest::new("artifact".into(), "review".into(), 8).unwrap();
+        let manifest =
+            WorkflowRunManifest::new("artifact".into(), "review".into(), Some(8)).unwrap();
         store
             .register(&manifest, "complete(1);", &serde_json::json!({}))
             .unwrap();
@@ -916,7 +938,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let manifest = WorkflowRunManifest::new("private".into(), "review".into(), 8).unwrap();
+        let manifest =
+            WorkflowRunManifest::new("private".into(), "review".into(), Some(8)).unwrap();
         store
             .register(
                 &manifest,
@@ -952,7 +975,8 @@ mod tests {
         let outside = dir.path().join("outside");
         std::fs::write(&outside, b"do not overwrite").unwrap();
         let store = WorkflowRunStore::new(dir.path().join("runs"));
-        let mut manifest = WorkflowRunManifest::new("safe".into(), "review".into(), 8).unwrap();
+        let mut manifest =
+            WorkflowRunManifest::new("safe".into(), "review".into(), Some(8)).unwrap();
         store
             .register(&manifest, "complete(1);", &serde_json::json!({}))
             .unwrap();
@@ -978,31 +1002,42 @@ mod tests {
     }
 
     #[test]
-    fn list_sorts_before_applying_cap() {
+    fn list_and_recovery_include_runs_older_than_the_legacy_cap() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        for index in 0..=MAX_RESTORED_RUNS {
+        const RUNS: usize = 257;
+        for index in 0..RUNS {
             let id = format!("run-{index:03}");
-            let mut manifest = WorkflowRunManifest::new(id, "review".into(), 8).unwrap();
+            let mut manifest = WorkflowRunManifest::new(id, "review".into(), Some(8)).unwrap();
+            if index != 0 {
+                manifest.status = StoredRunStatus::Completed;
+            }
             manifest.updated_at_ms = index as u64;
             store
                 .register(&manifest, "complete(1);", &serde_json::json!({}))
                 .unwrap();
         }
         let listed = store.list().unwrap();
-        assert_eq!(listed.len(), MAX_RESTORED_RUNS);
+        assert_eq!(listed.len(), RUNS);
         assert_eq!(
             listed.first().unwrap().manifest.run_id,
-            format!("run-{:03}", MAX_RESTORED_RUNS)
+            format!("run-{:03}", RUNS - 1)
         );
-        assert_eq!(listed.last().unwrap().manifest.run_id, "run-001");
+        assert_eq!(listed.last().unwrap().manifest.run_id, "run-000");
+
+        let manager = crate::WorkflowRuntimeManager::new(store.clone());
+        let recovered = manager.recover_interrupted().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].manifest.run_id, "run-000");
+        assert_eq!(recovered[0].manifest.status, StoredRunStatus::Interrupted);
     }
 
     #[test]
     fn rejects_unknown_manifest_version() {
         let dir = tempfile::tempdir().unwrap();
         let store = WorkflowRunStore::new(dir.path());
-        let mut manifest = WorkflowRunManifest::new("run".into(), "review".into(), 8).unwrap();
+        let mut manifest =
+            WorkflowRunManifest::new("run".into(), "review".into(), Some(8)).unwrap();
         manifest.version += 1;
         assert!(matches!(
             store.persist(&manifest),

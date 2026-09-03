@@ -1,5 +1,33 @@
 use super::common::*;
 use super::*;
+use hi_ai::{ChatRequest, Provider, StreamEvent};
+
+struct HangAfterTwoCalls {
+    path: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for HangAfterTwoCalls {
+    async fn stream(
+        &self,
+        _request: ChatRequest,
+        _sink: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> anyhow::Result<Completion> {
+        match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => Ok(write_completion(&self.path)),
+            1 => Ok(completion(
+                vec![Content::Text(
+                    "[answer retry: generic completion placeholder rejected; provide the actual result]"
+                        .into(),
+                )],
+                1,
+                1,
+            )),
+            _ => std::future::pending().await,
+        }
+    }
+}
 
 #[tokio::test]
 async fn does_not_nudge_a_plain_answer() {
@@ -37,7 +65,14 @@ async fn finalizes_with_a_recap_when_files_changed() {
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
-        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(
+            vec![Content::Text(
+                "[answer retry: generic completion placeholder rejected; provide the actual result]"
+                    .into(),
+            )],
+            1,
+            1,
+        ),
         completion(
             vec![Content::Text(
                 "## Summary\n- Created the file.\n\nRun `cargo test`.".into(),
@@ -59,7 +94,7 @@ async fn finalizes_with_a_recap_when_files_changed() {
 
     let m = agent.messages();
     // The finalize nudge + recap are stripped from history. The last message
-    // is the assistant's "done" from the turn work, not the recap.
+    // is the assistant's private repair marker from the turn work, not the recap.
     let last = m.last().expect("history is non-empty");
     assert_eq!(last.role, Role::Assistant);
     assert!(
@@ -102,7 +137,14 @@ async fn finalize_recap_is_emitted_to_the_ui() {
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
-        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(
+            vec![Content::Text(
+                "[answer retry: generic completion placeholder rejected; provide the actual result]"
+                    .into(),
+            )],
+            1,
+            1,
+        ),
         completion(
             vec![Content::Text("## Summary\n- Created the file.".into())],
             3,
@@ -119,6 +161,97 @@ async fn finalize_recap_is_emitted_to_the_ui() {
         "recap text should be emitted to the UI, got assistant: {:?}",
         ui.assistant
     );
+}
+
+#[tokio::test]
+async fn hanging_finalize_cannot_hold_a_settled_turn_working() {
+    let workspace = IsolatedWorkspace::new("hanging-finalize");
+    let mut cfg = workspace.config();
+    cfg.memory.finalize = true;
+    let path = workspace.path("changed.rs").to_string_lossy().to_string();
+    let provider = std::sync::Arc::new(HangAfterTwoCalls {
+        path,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut agent = Agent::new(provider.clone(), cfg).unwrap();
+    agent.side_call_timeout = Some(std::time::Duration::from_millis(25));
+    let mut ui = RecUi::default();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent.run_turn("make a file", &mut ui),
+    )
+    .await
+    .expect("a hanging recap must be bounded")
+    .expect("the primary turn should still settle normally");
+
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.verification, VerificationStatus::Unverified);
+    assert_eq!(
+        outcome.stop_reason,
+        crate::TurnStopReason::VerificationUnavailable
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("final summary timed out")),
+        "the skipped optional recap should be explained once: {:?}",
+        ui.statuses
+    );
+    assert_eq!(
+        provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the primary tool call, answer, and bounded recap call should run"
+    );
+}
+
+#[tokio::test]
+async fn generic_answer_completes_without_a_synthetic_failure_status() {
+    let workspace = IsolatedWorkspace::new("generic-terminal-closeout");
+    let mut cfg = workspace.config();
+    cfg.memory.finalize = true;
+    let generic = || {
+        completion(
+            vec![Content::Text("Completed the requested action.".into())],
+            1,
+            1,
+        )
+    };
+    let provider = StreamingCanned(std::sync::Mutex::new(vec![
+        echo_call(),
+        generic(),
+        generic(),
+        generic(),
+    ]));
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn(
+            "inspect the workspace and report the concrete result",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
+    assert!(
+        ui.assistant.contains("Completed the requested action"),
+        "the model's answer should remain visible: {}",
+        ui.assistant
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("incomplete") || status.contains("stalled")),
+        "generic answers must not manufacture legacy failure status: {:?}",
+        ui.statuses
+    );
+    assert!(ui.turn_end.is_some(), "the turn emitted its terminal event");
 }
 
 #[tokio::test]
@@ -229,16 +362,16 @@ async fn does_not_finalize_a_plain_answer() {
 }
 
 #[tokio::test]
-async fn finalizes_a_tool_turn_that_produced_no_answer() {
-    // Live: tools ran, the wrap-up round had no text, keep-working used to
-    // re-enable tools, and finalize skipped because no files changed — the
-    // user saw nothing. Close-out finalize must still fire.
+async fn answerless_tool_turn_returns_provider_error_without_finalizing() {
+    // Tools ran and the normal empty-response retry path still produced no
+    // answer. Close-out finalize must still fire without synthetic
+    // keep-working rounds.
     let mut cfg = config();
     cfg.memory.finalize = true;
-    cfg.loop_limits.max_keep_working = 8;
     let mut responses = vec![echo_call()];
-    for _ in 0..(config().loop_limits.max_repeat_nudges + 1) {
-        responses.push(echo_call());
+    let empty_attempts = cfg.loop_limits.max_empty_retries + 1;
+    for _ in 0..empty_attempts {
+        responses.push(completion(Vec::new(), 1, 0));
     }
     responses.push(completion(
         vec![Content::Text(
@@ -249,47 +382,43 @@ async fn finalizes_a_tool_turn_that_produced_no_answer() {
     ));
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
-    agent.run_turn("check it", &mut ui).await.unwrap();
+    let error = agent.run_turn("check it", &mut ui).await.unwrap_err();
     assert!(
-        ui.assistant.contains("## Summary"),
-        "empty tool turn must still recap: assistant={:?} statuses={:?}",
-        ui.assistant,
-        ui.statuses
+        error.to_string().contains("model returned no response"),
+        "unexpected error: {error:#}"
     );
     assert!(
-        !ui.statuses.iter().any(|s| s.contains("still working")),
-        "keep-working must not undo the forced wrap-up: {:?}",
-        ui.statuses
+        !ui.assistant.contains("## Summary"),
+        "provider failure must not run the success recap: {:?}",
+        ui.assistant
     );
 }
 
 #[tokio::test]
-async fn empty_closeout_cannot_turn_an_answerless_tool_turn_into_success() {
+async fn empty_recap_response_cannot_hide_an_answerless_provider_failure() {
     let workspace = IsolatedWorkspace::new("empty-closeout");
     let mut cfg = workspace.config();
     cfg.memory.finalize = true;
-    cfg.loop_limits.max_keep_working = 8;
-    let repeat_budget = cfg.loop_limits.max_repeat_nudges;
     let mut responses = vec![echo_call()];
-    for _ in 0..(repeat_budget + 1) {
-        responses.push(echo_call());
+    let empty_attempts = cfg.loop_limits.max_empty_retries + 1;
+    for _ in 0..empty_attempts {
+        responses.push(completion(Vec::new(), 3, 0));
     }
     // The final item is consumed by the ChatOnly recap side call.
     responses.push(completion(Vec::new(), 3, 0));
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
 
-    let outcome = agent.run_turn("check it", &mut ui).await.unwrap();
+    let error = agent.run_turn("check it", &mut ui).await.unwrap_err();
 
-    assert_eq!(outcome.status, TurnStatus::Incomplete);
-    assert_eq!(outcome.stop_reason, TurnStopReason::Stalled);
-    assert!(outcome.changed_files.is_empty());
     assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("without a user-facing answer")),
-        "missing closeout should be explicit: {:?}",
-        ui.statuses
+        error.to_string().contains("model returned no response"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        ui.assistant.trim().is_empty(),
+        "provider failure must not be presented as a completed answer: {:?}",
+        ui.assistant
     );
 }
 

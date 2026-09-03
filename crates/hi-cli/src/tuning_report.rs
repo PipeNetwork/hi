@@ -67,7 +67,7 @@ pub(crate) fn sweep(sessions_dir: &Path, state_root: &Path) -> TuningSignals {
         // marker into a ToolResult, and the sweep counted those as live
         // repair-loop events (6 "unstructured verify failures" that were
         // mostly the agent reading its own code).
-        let mut stalled = 0usize;
+        let mut no_progress = 0usize;
         for line in text.lines() {
             if !line.contains("Verification stage `")
                 && !line.contains("No progress since the previous repair attempt")
@@ -99,7 +99,7 @@ pub(crate) fn sweep(sessions_dir: &Path, state_root: &Path) -> TuningSignals {
                 }
             }
             if content.contains("No progress since the previous repair attempt") {
-                stalled += 1;
+                no_progress += 1;
             }
             if content.contains("— the last change introduced new breakage") {
                 signals.regressions += 1;
@@ -108,8 +108,8 @@ pub(crate) fn sweep(sessions_dir: &Path, state_root: &Path) -> TuningSignals {
                 signals.impact_notes += 1;
             }
         }
-        signals.no_progress += stalled;
-        if stalled > 0 {
+        signals.no_progress += no_progress;
+        if no_progress > 0 {
             signals.thrashing_sessions.push(path.clone());
         }
     }

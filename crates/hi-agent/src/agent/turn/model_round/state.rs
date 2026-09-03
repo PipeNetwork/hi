@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashSet};
 use hi_ai::Content;
 
 use crate::steering::{
-    EvidenceTracker, ImplementationIntent, ImplementationTracker, ReviewIntent, ToolLoopGuardrail,
+    EvidenceTracker, ImplementationIntent, ImplementationTracker, ReviewIntent,
     is_read_only_inspection_tool,
 };
 use crate::verify::WorkspaceRepairVerifier;
@@ -47,10 +47,10 @@ pub(super) fn merge_tool_call_channel(previous: &str, current: &str) -> String {
 
 /// Collapse duplicate read-only calls emitted in one model response.
 ///
-/// The cross-round repetition guard cannot catch a model that puts the same
-/// inspection call into a single tool batch multiple times. Executing those
-/// copies wastes work and can make the transcript look like the agent is
-/// stuck in a loop. Mutating and otherwise stateful calls are left untouched.
+/// A single response can contain the same inspection call more than once.
+/// Executing those copies wastes work and can make the transcript look like
+/// the agent is stuck in a loop. Mutating and otherwise stateful calls are
+/// left untouched.
 pub(super) fn collapse_duplicate_inspection_calls(
     content: &mut Vec<Content>,
     calls: Vec<(String, String, String)>,
@@ -107,17 +107,13 @@ pub(in crate::agent::turn) struct ModelRoundState<'a> {
     pub generic_completion_retries: &'a mut u32,
     pub continue_total_nudges: &'a mut u32,
     pub repeat_nudges: &'a mut u32,
-    pub repeat_sampling_rounds: &'a mut u32,
     pub force_tools_next: &'a mut bool,
     pub text_tool_fallback_next: &'a mut bool,
     pub force_text_answer_next: &'a mut bool,
-    pub force_no_progress_final_answer_next: &'a mut bool,
     pub suppress_bookkeeping_tools_next: &'a mut bool,
-    pub prev_added_no_evidence: &'a mut bool,
     pub made_tool_call: &'a mut bool,
+    pub provider_exhausted: &'a mut bool,
     pub turn_start: &'a mut usize,
-    pub stalled_repeating: &'a mut bool,
-    pub stalled_unfinished: &'a mut bool,
     pub context_generation_seen: &'a mut u64,
     pub indexed_ledger_revision: &'a mut u64,
     pub sched_tool_calls: &'a mut u32,
@@ -126,8 +122,7 @@ pub(in crate::agent::turn) struct ModelRoundState<'a> {
     pub tool_schema_tokens: &'a mut u64,
     pub ended_at_cap: &'a mut bool,
     pub cap_wrap_up_requested: &'a mut bool,
-    pub review_wrap_up_requested: &'a mut bool,
-    pub prev_call_sig: &'a mut Option<Vec<(String, String)>>,
+    pub cap_kind: &'a mut Option<crate::domain::TurnCapKind>,
     pub deepseek_strict_fallback_active: &'a mut bool,
     pub retry_state: &'a mut TurnRetryState,
     pub request_max_tokens_override: &'a mut Option<u32>,
@@ -138,9 +133,11 @@ pub(in crate::agent::turn) struct ModelRoundState<'a> {
     pub evidence: &'a mut EvidenceTracker,
     pub implementation_tracker: &'a mut ImplementationTracker,
     pub review_repair: &'a mut ReviewRepairState,
-    pub tool_guardrail: &'a mut ToolLoopGuardrail,
     pub last_verify_attributions: &'a mut Vec<hi_tools::Attribution>,
-    pub tool_timeline: &'a mut Vec<crate::ToolCallEntry>,
+    pub tool_timeline: &'a mut super::super::retention::ToolTimeline,
+    pub speculation_registry: &'a super::super::speculation::SpeculationRegistry,
+    pub program_fallback_next: &'a mut bool,
+    pub program_fallback_used: &'a mut bool,
     pub advertised_tool_names: &'a mut BTreeSet<String>,
     pub turn_snapshot: &'a mut Option<crate::verify::Snapshot>,
     pub max_steps: u32,

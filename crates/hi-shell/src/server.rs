@@ -281,11 +281,11 @@ impl acp::Agent for HiShell {
         .await;
         match result {
             Ok(outcome) => {
-                if let Some(status) = stop_status(outcome.stop_reason) {
+                if let Some(status) = stop_status(&outcome) {
                     ui.status(status);
                 }
                 ui.flush().await?;
-                Ok(acp::PromptResponse::new(stop_reason(outcome.stop_reason)))
+                Ok(acp::PromptResponse::new(stop_reason(&outcome)))
             }
             Err(error) => {
                 let delivery = ui.flush().await;
@@ -473,24 +473,45 @@ fn prompt_text(blocks: &[acp::ContentBlock]) -> acp::Result<String> {
     Ok(text.join("\n"))
 }
 
-fn stop_reason(reason: hi_agent::TurnStopReason) -> acp::StopReason {
-    match reason {
-        hi_agent::TurnStopReason::Cancelled => acp::StopReason::Cancelled,
-        hi_agent::TurnStopReason::StepLimit | hi_agent::TurnStopReason::TimeLimit => {
-            acp::StopReason::MaxTokens
+fn stop_reason(outcome: &hi_agent::TurnOutcome) -> acp::StopReason {
+    match (outcome.status, outcome.stop_reason) {
+        (hi_agent::TurnStatus::Cancelled, _) => acp::StopReason::Cancelled,
+        (
+            hi_agent::TurnStatus::Completed,
+            hi_agent::TurnStopReason::StepLimit | hi_agent::TurnStopReason::TimeLimit,
+        ) => acp::StopReason::MaxTokens,
+        (hi_agent::TurnStatus::Completed, hi_agent::TurnStopReason::ToolLimit) => {
+            acp::StopReason::MaxTurnRequests
         }
         _ => acp::StopReason::EndTurn,
     }
 }
 
-fn stop_status(reason: hi_agent::TurnStopReason) -> Option<&'static str> {
-    match reason {
+fn stop_status(outcome: &hi_agent::TurnOutcome) -> Option<&'static str> {
+    if outcome.verification == hi_agent::VerificationStatus::InfrastructureError {
+        return Some("verification infrastructure failure");
+    }
+    if outcome.verification == hi_agent::VerificationStatus::Failed {
+        return Some("verification failed");
+    }
+    if outcome.status == hi_agent::TurnStatus::Failed
+        && matches!(
+            outcome.stop_reason,
+            hi_agent::TurnStopReason::StepLimit
+                | hi_agent::TurnStopReason::ToolLimit
+                | hi_agent::TurnStopReason::TimeLimit
+                | hi_agent::TurnStopReason::TurnLimit
+        )
+    {
+        return Some("the turn failed");
+    }
+    match outcome.stop_reason {
         hi_agent::TurnStopReason::VerificationUnavailable => Some("verification unavailable"),
         hi_agent::TurnStopReason::VerificationFailed => Some("verification failed"),
         hi_agent::TurnStopReason::VerificationUnstable => Some("verification was unstable"),
         hi_agent::TurnStopReason::ReviewObjected => Some("independent review objected"),
         hi_agent::TurnStopReason::ToolModeDenied => Some("required tool use was denied"),
-        hi_agent::TurnStopReason::Stalled => Some("the turn stalled"),
+        hi_agent::TurnStopReason::ToolLimit => Some("tool-call limit reached"),
         hi_agent::TurnStopReason::InfrastructureFailure => Some("the turn failed internally"),
         _ => None,
     }
@@ -757,6 +778,28 @@ pub async fn serve_stdio(config: ShellConfig) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn outcome(
+        status: hi_agent::TurnStatus,
+        verification: hi_agent::VerificationStatus,
+        reason: hi_agent::TurnStopReason,
+    ) -> hi_agent::TurnOutcome {
+        hi_agent::TurnOutcome {
+            status,
+            verification,
+            review: hi_agent::ReviewStatus::NotRequired,
+            stop_reason: reason,
+            changed_files: Vec::new(),
+            verified_workspace_revision: None,
+            effective_route: hi_agent::EffectiveModelRoute {
+                provider: None,
+                model: "test".into(),
+            },
+            review_same_model: false,
+            leftover: None,
+            plan_leftover: None,
+        }
+    }
+
     #[test]
     fn prompt_text_rejects_empty_and_unsupported_content() {
         assert!(prompt_text(&[]).is_err());
@@ -783,17 +826,47 @@ mod tests {
     #[test]
     fn stop_reasons_do_not_report_turn_limit_as_user_cancellation() {
         assert_eq!(
-            stop_reason(hi_agent::TurnStopReason::Cancelled),
+            stop_reason(&outcome(
+                hi_agent::TurnStatus::Cancelled,
+                hi_agent::VerificationStatus::NotApplicable,
+                hi_agent::TurnStopReason::Cancelled,
+            )),
             acp::StopReason::Cancelled
         );
         assert_eq!(
-            stop_reason(hi_agent::TurnStopReason::StepLimit),
+            stop_reason(&outcome(
+                hi_agent::TurnStatus::Completed,
+                hi_agent::VerificationStatus::NotApplicable,
+                hi_agent::TurnStopReason::StepLimit,
+            )),
             acp::StopReason::MaxTokens
         );
+        let tool_limited = outcome(
+            hi_agent::TurnStatus::Completed,
+            hi_agent::VerificationStatus::NotApplicable,
+            hi_agent::TurnStopReason::ToolLimit,
+        );
+        assert_eq!(stop_reason(&tool_limited), acp::StopReason::MaxTurnRequests);
+        assert_eq!(stop_status(&tool_limited), Some("tool-call limit reached"));
         assert_eq!(
-            stop_reason(hi_agent::TurnStopReason::TurnLimit),
+            stop_reason(&outcome(
+                hi_agent::TurnStatus::Completed,
+                hi_agent::VerificationStatus::NotApplicable,
+                hi_agent::TurnStopReason::TurnLimit,
+            )),
             acp::StopReason::EndTurn
         );
+    }
+
+    #[test]
+    fn failed_verification_outranks_a_legacy_limit_reason() {
+        let outcome = outcome(
+            hi_agent::TurnStatus::Failed,
+            hi_agent::VerificationStatus::Failed,
+            hi_agent::TurnStopReason::StepLimit,
+        );
+        assert_eq!(stop_reason(&outcome), acp::StopReason::EndTurn);
+        assert_eq!(stop_status(&outcome), Some("verification failed"));
     }
 
     #[test]

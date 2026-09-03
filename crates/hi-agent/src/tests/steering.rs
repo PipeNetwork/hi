@@ -1,8 +1,7 @@
 use super::common::*;
 use super::*;
 use crate::steering::{
-    INSPECTION_ONLY_ROUND_CAP, MAX_PAGED_READS_PER_PATH, REVIEW_INSPECTION_CAP, ReviewRepairMode,
-    counts_against_file_inspection_cap, explicit_read_only_inspection_cap,
+    ReviewRepairMode, counts_against_file_inspection_cap, explicit_read_only_inspection_cap,
     inspection_sprawl_exhausted, is_read_only_inspection_tool, read_only_inspection_cap,
     read_only_preflight_initial_calls_in, read_only_turn_prompt, repair_nudge_with_required_next,
     should_nudge_inspection_sprawl,
@@ -100,7 +99,7 @@ fn explicit_controls_classify_as_read_only_intents() {
 }
 
 #[test]
-fn read_only_inspection_cap_uses_one_default() {
+fn read_only_inspection_has_no_default_count_ceiling() {
     for intent in [
         ReviewIntent::Review,
         ReviewIntent::Status,
@@ -110,8 +109,8 @@ fn read_only_inspection_cap_uses_one_default() {
     ] {
         assert_eq!(
             read_only_inspection_cap("review codebase", intent),
-            REVIEW_INSPECTION_CAP,
-            "default cap for {intent:?}"
+            None,
+            "ordinary {intent:?} must remain unlimited"
         );
     }
 }
@@ -283,26 +282,29 @@ fn read_only_inspection_cap_respects_explicit_prompt_limit() {
             "Security review. Use at most 4 file inspections.",
             ReviewIntent::Security
         ),
-        4
+        Some(4)
     );
     assert_eq!(
         read_only_inspection_cap(
             "Security review. Use at most 40 file inspections.",
             ReviewIntent::Security
         ),
-        40
+        Some(40)
     );
     let prompt = read_only_turn_prompt(
         "Review this codebase. Use at most 4 file inspections.",
         ReviewIntent::Review,
     );
-    assert!(prompt.contains("Active inspection cap: at most 4 file reads/searches"));
+    assert!(prompt.contains("explicitly requested an inspection cap: at most 4"));
 }
 
 #[test]
-fn bounded_exact_reviews_get_a_small_default_inspection_cap() {
+fn bounded_exact_reviews_get_guidance_without_a_hidden_count_cap() {
     let prompt = "Review only crates/hi-ai/src/openai/request.rs and crates/hi-ai/src/openai/stream.rs for one concrete bug. Do not edit files.";
-    assert_eq!(read_only_inspection_cap(prompt, ReviewIntent::Review), 4);
+    assert_eq!(read_only_inspection_cap(prompt, ReviewIntent::Review), None);
+    let guarded = read_only_turn_prompt(prompt, ReviewIntent::Review);
+    assert!(guarded.contains("No automatic inspection-count ceiling applies"));
+    assert!(guarded.contains("bounded exact-file review"));
 }
 
 #[test]
@@ -312,7 +314,7 @@ fn read_only_inspection_cap_respects_explicit_user_cap() {
             "review codebase. Use at most 4 file inspections.",
             ReviewIntent::Review,
         ),
-        4
+        Some(4)
     );
 }
 
@@ -372,17 +374,18 @@ fn repo_map_round_cannot_dodge_inspection_sprawl() {
 }
 
 #[test]
-fn inspection_only_round_cap_bounds_open_ended_inspect_loops() {
+fn distinct_inspection_rounds_do_not_hit_a_hidden_count_cap() {
     let evidence = EvidenceTracker {
-        inspection_only_rounds: INSPECTION_ONLY_ROUND_CAP,
+        inspection_only_rounds: 1_000,
+        inspection_attempts: 1_000,
         ..Default::default()
     };
     let calls = vec![("c".into(), "read".into(), r#"{"path":"src/lib.rs"}"#.into())];
-    assert!(should_nudge_inspection_sprawl(
+    assert!(!should_nudge_inspection_sprawl(
         None, true, &evidence, &calls, None,
     ));
-    assert!(!should_nudge_inspection_sprawl(
-        None, false, &evidence, &calls, None,
+    assert!(!inspection_sprawl_exhausted(
+        None, true, &evidence, &calls, None,
     ));
 }
 
@@ -762,7 +765,9 @@ async fn text_tool_fallback_retries_narration_and_executes_the_next_call() {
             1,
         ),
     ];
-    let mut agent = agent(responses, workspace.config());
+    let mut cfg = workspace.config();
+    cfg.gates.allow_unverified = true;
+    let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
 
     let outcome = agent
@@ -778,15 +783,16 @@ async fn text_tool_fallback_retries_narration_and_executes_the_next_call() {
         "missing fallback retry status: {:?}",
         ui.statuses
     );
-    assert!(!agent.last_turn_telemetry().stalled_unfinished);
+    assert_eq!(agent.last_turn_telemetry().no_progress_streak, 0);
 }
 
 #[tokio::test]
-async fn stalled_implementation_does_not_finalize_with_stale_recap() {
+async fn no_progress_implementation_can_finalize_without_a_synthetic_failure() {
     let path = temp_file("implementation-no-finalize");
     let path_string = path.to_string_lossy().to_string();
     let mut cfg = config();
     cfg.memory.finalize = true;
+    cfg.gates.allow_unverified = true;
     let responses = vec![
         write_completion(&path_string),
         completion(vec![Content::Text("Implemented it.".into())], 1, 1),
@@ -795,22 +801,30 @@ async fn stalled_implementation_does_not_finalize_with_stale_recap() {
     ];
     let mut agent = agent(responses, cfg);
     let mut ui = RecordingUi::default();
-    agent
+    let outcome = agent
         .run_turn("/build a small CLI project tracker", &mut ui)
         .await
         .unwrap();
     let _ = std::fs::remove_file(&path);
 
     assert!(
-        !agent
+        agent
             .messages()
             .last()
             .unwrap()
             .text()
             .contains("Final recap"),
-        "stalled implementation should not finalize with a recap"
+        "normal settlement may emit its configured recap"
     );
-    assert!(agent.last_turn_telemetry().stalled_unfinished);
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationUnavailable);
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("incomplete") || status.contains("stalled")),
+        "normal settlement must not emit a legacy failure label: {:?}",
+        ui.statuses
+    );
 }
 
 #[tokio::test]
@@ -839,15 +853,21 @@ async fn scaffold_only_implementation_gets_source_edit_nudge() {
         ui.statuses
     );
     assert!(
-        !agent
+        agent
             .messages()
             .last()
             .unwrap()
             .text()
             .contains("Final recap"),
-        "stalled implementation should not finalize with a recap"
+        "normal settlement may emit its configured recap"
     );
-    assert!(agent.last_turn_telemetry().stalled_unfinished);
+    assert!(
+        !agent
+            .last_turn_telemetry()
+            .last_no_progress_reason
+            .contains("stalled"),
+        "internal no-progress bookkeeping must not expose the removed stall state"
+    );
 }
 
 #[tokio::test]
@@ -1099,188 +1119,6 @@ fn concrete_review_accepts_concise_cited_answers_with_limits() {
 }
 
 #[test]
-fn round_adds_evidence_detects_re_reads_and_re_searches() {
-    let mut evidence = EvidenceTracker::default();
-    // Record one read and one grep.
-    evidence.record_success("read", r#"{"path":"src/lib.rs"}"#, "fn main() {}\n");
-    evidence.record_success(
-        "grep",
-        r#"{"pattern":"unwrap","glob":"*.rs"}"#,
-        "src/lib.rs:1: x.unwrap()\n",
-    );
-    evidence.record_success("bash_kill", r#"{"id":"sh_1"}"#, "[sh_1] already killed");
-
-    let call = |name: &str, args: &str| (String::new(), name.to_string(), args.to_string());
-
-    // Re-reading the same file adds no new evidence.
-    assert!(
-        !evidence.round_adds_evidence(&[call("read", r#"{"path":"src/lib.rs"}"#)]),
-        "re-read of an inspected path adds no evidence"
-    );
-    assert!(
-        !evidence.round_adds_evidence(&[call("read", r#"{"path":"src/lib.rs","offset":241}"#)]),
-        "a new read page from an inspected path adds no evidence"
-    );
-    assert!(
-        !evidence.round_adds_evidence(&[call(
-            "read",
-            r#"{"path":"/workspace/src/lib.rs","offset":480}"#
-        )]),
-        "an absolute path to an inspected relative file adds no evidence"
-    );
-    // Re-running the same grep adds no new evidence.
-    assert!(
-        !evidence.round_adds_evidence(&[call("grep", r#"{"pattern":"unwrap","glob":"*.rs"}"#)]),
-        "re-run of a seen grep adds no evidence"
-    );
-    assert!(
-        evidence.round_adds_evidence(&[call(
-            "grep",
-            r#"{"pattern":"unwrap","glob":"*.rs","context":2}"#
-        )]),
-        "grep with new context adds evidence"
-    );
-    assert!(
-        evidence.round_adds_evidence(&[call("read", r#"{"path":"/workspace/other/lib.rs"}"#)]),
-        "a different directory is still new evidence"
-    );
-    assert!(
-        evidence.round_adds_evidence(&[call("read", r#"{"path":"src/main.rs"}"#)]),
-        "read of a new path adds evidence"
-    );
-    // A new grep pattern adds evidence.
-    assert!(
-        evidence.round_adds_evidence(&[call("grep", r#"{"pattern":"panic","glob":"*.rs"}"#)]),
-        "a new grep pattern adds evidence"
-    );
-    assert!(
-        !evidence.round_adds_evidence(&[call("bash_kill", r#"{"id":"sh_1"}"#)]),
-        "reusing a known-terminal background kill handle adds no evidence"
-    );
-    assert!(
-        evidence.round_adds_evidence(&[call("bash_kill", r#"{"id":"sh_2"}"#)]),
-        "a first kill attempt for a new background handle should execute"
-    );
-    // A mix of re-read and new read adds evidence (the new one).
-    assert!(
-        evidence.round_adds_evidence(&[
-            call("read", r#"{"path":"src/lib.rs"}"#),
-            call("read", r#"{"path":"src/main.rs"}"#),
-        ]),
-        "a mix of re-read and new read adds evidence"
-    );
-    // A mutating tool always adds evidence.
-    assert!(
-        evidence.round_adds_evidence(&[call("write", r#"{"path":"x","content":"y"}"#)]),
-        "a mutating tool adds evidence"
-    );
-    // An empty round is treated as adding evidence (not a cycle).
-    assert!(
-        evidence.round_adds_evidence(&[]),
-        "empty round is not a cycle"
-    );
-    assert!(
-        evidence.round_adds_evidence(&[call("read", r#"{"path":42}"#)]),
-        "un-signable read calls should execute and surface their tool error"
-    );
-}
-
-#[test]
-fn failed_ripgrep_execvp_collapses_further_greps() {
-    let mut evidence = EvidenceTracker::default();
-    evidence.record_success(
-        "grep",
-        r#"{"pattern":"403","path":"crates/hi-tui"}"#,
-        "Error: sandbox-exec: execvp() of 'rg' failed: No such file or directory",
-    );
-    let call = |pattern: &str| {
-        (
-            String::new(),
-            "grep".into(),
-            format!(r#"{{"pattern":"{pattern}"}}"#),
-        )
-    };
-    assert!(
-        !evidence.round_adds_evidence(&[call("startup_notice")]),
-        "a later grep after rg is missing is not new evidence"
-    );
-}
-
-#[test]
-fn extra_read_pages_of_inspected_file_are_not_new_evidence() {
-    let mut evidence = EvidenceTracker::default();
-    evidence.record_success("read", r#"{"path":"lib.rs"}"#, "fn x() {}\n");
-    let call = |args: &str| (String::new(), "read".to_string(), args.to_string());
-    assert!(
-        !evidence.round_adds_evidence(&[call(r#"{"path":"lib.rs","offset":40}"#)]),
-        "paging the same bare filename adds no evidence"
-    );
-    assert!(
-        evidence.round_adds_evidence(&[call(r#"{"path":"/workspace/src/lib.rs"}"#)]),
-        "a nested lib.rs is not the same file as a bare lib.rs"
-    );
-}
-
-#[test]
-fn extra_read_pages_of_truncated_file_are_new_evidence() {
-    let mut evidence = EvidenceTracker::default();
-    evidence.record_success(
-        "read",
-        r#"{"path":"src/lib.rs"}"#,
-        "   1\tfn start() {}\n… showing lines 1-113 of 800 — read more with offset 114",
-    );
-    let call = |args: &str| (String::new(), "read".to_string(), args.to_string());
-    assert!(
-        evidence.round_adds_evidence(&[call(r#"{"path":"src/lib.rs","offset":114}"#)]),
-        "the next page of a truncated file is new evidence"
-    );
-    assert!(
-        !evidence.round_adds_evidence(&[call(r#"{"path":"src/lib.rs"}"#)]),
-        "repeating the first page is still not new evidence"
-    );
-
-    evidence.record_success(
-        "read",
-        r#"{"path":"src/lib.rs","offset":114}"#,
-        " 114\tfn mid() {}\n… showing lines 114-232 of 800 — read more with offset 233",
-    );
-    assert!(
-        evidence.round_adds_evidence(&[call(r#"{"path":"src/lib.rs","offset":233,"limit":40}"#)]),
-        "a later page of a still-truncated file remains new evidence"
-    );
-
-    evidence.record_success(
-        "read",
-        r#"{"path":"src/lib.rs","offset":233,"limit":40}"#,
-        " 233\tfn end() {}\n",
-    );
-    assert!(
-        !evidence.round_adds_evidence(&[call(r#"{"path":"src/lib.rs","offset":300}"#)]),
-        "paging after a complete read adds no evidence"
-    );
-}
-
-#[test]
-fn truncated_file_page_budget_eventually_stops_counting() {
-    let mut evidence = EvidenceTracker::default();
-    let mut offset = 1u32;
-    for _ in 0..MAX_PAGED_READS_PER_PATH {
-        let args = format!(r#"{{"path":"big.rs","offset":{offset}}}"#);
-        evidence.record_success(
-            "read",
-            &args,
-            "line\n… showing lines 1-2 of 9999 — read more with offset 3",
-        );
-        offset += 100;
-    }
-    let next = format!(r#"{{"path":"big.rs","offset":{offset}}}"#);
-    assert!(
-        !evidence.round_adds_evidence(&[(String::new(), "read".to_string(), next)]),
-        "the per-path page budget must still bound a truncated-file walk"
-    );
-}
-
-#[test]
 fn guessed_background_handle_is_steered_without_user_facing_status() {
     // The registry records a handle named while it was empty as *guessed*:
     // nothing has ever run under it, so the model invented it. The steer
@@ -1377,26 +1215,6 @@ fn inspection_signature_is_stable_and_tool_specific() {
 }
 
 #[test]
-fn repeated_compound_bash_inspections_add_no_new_evidence() {
-    let first =
-        r#"{"command":"for f in blog_posts/txt/*.txt; do head -2 \"$f\"; done | sed -n '1,20p'"}"#;
-    let second =
-        r#"{"command":"for f in blog_posts/txt/*.txt; do head -2 \"$f\"; done | sed -n '20,40p'"}"#;
-    let calls = |id: &str, arguments: &str| {
-        vec![(id.to_string(), "bash".to_string(), arguments.to_string())]
-    };
-    let mut evidence = EvidenceTracker::default();
-
-    assert!(evidence.round_adds_evidence(&calls("a1", first)));
-    evidence.record_success("bash", first, "page one");
-    assert!(evidence.round_adds_evidence(&calls("b1", second)));
-    evidence.record_success("bash", second, "page two");
-
-    assert!(!evidence.round_adds_evidence(&calls("a2", first)));
-    assert!(!evidence.round_adds_evidence(&calls("b2", second)));
-}
-
-#[test]
 fn search_hit_snippets_keep_late_high_signal_matches() {
     let inspected_path = temp_file("repair-search-ranking");
     std::fs::write(
@@ -1435,6 +1253,13 @@ fn search_hit_snippets_keep_late_high_signal_matches() {
 
 #[tokio::test]
 async fn security_review_prompts_advertise_only_read_only_tools() {
+    let manifest = temp_workspace_path("Cargo.toml");
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let manifest_path = manifest.to_string_lossy().to_string();
     let responses = vec![
         completion(
             vec![Content::Text(
@@ -1447,15 +1272,15 @@ async fn security_review_prompts_advertise_only_read_only_tools() {
             vec![Content::ToolCall {
                 id: "read".into(),
                 name: "read".into(),
-                arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                arguments: serde_json::json!({"path": manifest_path}).to_string(),
             }],
             1,
             1,
         ),
         completion(
-            vec![Content::Text(
-                "Findings:\n- Cargo.toml was inspected as security review context.\n\nLimits:\n- Limited to inspected evidence.".into(),
-            )],
+            vec![Content::Text(format!(
+                "Findings:\n- {manifest_path} was inspected as security review context.\n\nLimits:\n- Limited to inspected evidence."
+            ))],
             1,
             1,
         ),
@@ -1550,6 +1375,9 @@ async fn discuss_only_security_review_blocks_mutating_tool_call_execution() {
 
 #[tokio::test]
 async fn listing_only_review_final_gets_deepen_review_nudge() {
+    let manifest = temp_workspace_path("Cargo.toml");
+    std::fs::write(&manifest, "[workspace]\nmembers = []\n").unwrap();
+    let manifest_path = manifest.to_string_lossy().to_string();
     let responses = vec![
         completion(
             vec![Content::ToolCall {
@@ -1571,15 +1399,15 @@ async fn listing_only_review_final_gets_deepen_review_nudge() {
             vec![Content::ToolCall {
                 id: "read".into(),
                 name: "read".into(),
-                arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                arguments: serde_json::json!({"path": manifest_path}).to_string(),
             }],
             1,
             1,
         ),
         completion(
-            vec![Content::Text(
-                "Findings:\n- Cargo.toml defines the workspace members and gives concrete status context for this review.".into(),
-            )],
+            vec![Content::Text(format!(
+                "Findings:\n- {manifest_path} defines the workspace members and gives concrete status context for this review."
+            ))],
             1,
             1,
         ),
@@ -1799,6 +1627,10 @@ async fn read_only_review_text_final_without_evidence_gets_inspection_nudge() {
 
 #[tokio::test]
 async fn read_only_status_preflight_seeds_first_request_with_evidence() {
+    let manifest = temp_workspace_path("Cargo.toml");
+    let readme = temp_workspace_path("README.md");
+    std::fs::write(&manifest, "[workspace]\nmembers = []\n").unwrap();
+    std::fs::write(&readme, "# Fixture\n").unwrap();
     let mut cfg = config();
     cfg.gates.read_only_preflight = true;
     let (mut agent, requests) = scripted_agent(
@@ -1953,7 +1785,7 @@ fn security_preflight_is_code_scoped_and_bounded() {
 }
 
 #[tokio::test]
-async fn read_only_review_no_evidence_repair_exhaustion_stops_incomplete() {
+async fn read_only_review_no_evidence_repair_settles_with_the_available_answer() {
     let responses = vec![
         completion(
             vec![Content::Text(
@@ -1994,7 +1826,7 @@ async fn read_only_review_no_evidence_repair_exhaustion_stops_incomplete() {
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    agent
+    let outcome = agent
         .run_turn(
             "review for security issues or unsafe unwraps. then disucss only",
             &mut ui,
@@ -2003,8 +1835,9 @@ async fn read_only_review_no_evidence_repair_exhaustion_stops_incomplete() {
         .unwrap();
 
     assert!(
-        ui.assistant.trim().is_empty(),
-        "guardrail should not emit canned assistant text: {}",
+        ui.assistant
+            .contains("Not enough evidence to review without inspecting files."),
+        "the bounded repair should preserve the available model answer: {}",
         ui.assistant
     );
     assert!(
@@ -2015,10 +1848,16 @@ async fn read_only_review_no_evidence_repair_exhaustion_stops_incomplete() {
         ui.statuses
     );
     let telemetry = agent.last_turn_telemetry();
+    assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(telemetry.quality_repair_nudges, 4);
     assert_eq!(telemetry.discovery_depth, "none");
-    assert_eq!(telemetry.last_stall_reason, "review_no_evidence_exhausted");
-    assert!(telemetry.stalled_unfinished);
+    assert!(
+        !ui.statuses.iter().any(|status| {
+            status.contains("incomplete") || status.to_ascii_lowercase().contains("stalled")
+        }),
+        "bounded review repair must not manufacture a legacy terminal state: {:?}",
+        ui.statuses
+    );
 }
 
 #[tokio::test]
@@ -2079,12 +1918,13 @@ async fn listing_only_review_gets_full_budget_after_no_evidence_repair() {
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    agent
+    let outcome = agent
         .run_turn("/status codebase state", &mut ui)
         .await
         .unwrap();
 
     let telemetry = agent.last_turn_telemetry();
+    assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(telemetry.quality_repair_nudges, 5);
     assert_eq!(telemetry.review_repair_counts["review_no_evidence"], 1);
     assert_eq!(telemetry.review_repair_counts["review_listing_only"], 4);
@@ -2092,8 +1932,7 @@ async fn listing_only_review_gets_full_budget_after_no_evidence_repair() {
         telemetry.review_repair_exhaustion_reason,
         "review_listing_only_exhausted"
     );
-    assert_eq!(telemetry.last_stall_reason, "review_listing_only_exhausted");
-    assert!(telemetry.stalled_unfinished);
+    assert!(ui.assistant.contains("healthy and organized"));
 }
 
 fn provider_request_text(requests: &[Vec<Message>], index: usize) -> String {
@@ -2169,7 +2008,7 @@ fn assert_successful_repair_telemetry(
     assert_eq!(telemetry.review_repair_exhaustion_reason, "");
     assert!(!telemetry.review_repair_stopped_by_exhaustion);
     assert!(!telemetry.hit_step_cap);
-    assert!(!telemetry.stalled_unfinished);
+    assert_eq!(telemetry.no_progress_streak, 0);
 }
 
 #[tokio::test]
@@ -2492,6 +2331,9 @@ async fn deterministic_review_repair_matrix_compacts_drafts_and_reports_counts()
 
 #[tokio::test]
 async fn rejected_text_only_review_draft_is_compacted_in_repair_context() {
+    let manifest = temp_workspace_path("Cargo.toml");
+    std::fs::write(&manifest, "[workspace]\nmembers = []\n").unwrap();
+    let manifest_path = manifest.to_string_lossy().to_string();
     let responses = vec![
         ProviderStep::Completion(completion(
             vec![Content::Text(
@@ -2504,14 +2346,15 @@ async fn rejected_text_only_review_draft_is_compacted_in_repair_context() {
             vec![Content::ToolCall {
                 id: "read".into(),
                 name: "read".into(),
-                arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                arguments: serde_json::json!({"path": manifest_path}).to_string(),
             }],
             1,
             1,
         )),
         ProviderStep::Completion(completion(
-            vec![Content::Text(
-                "Status:\n- Based on the inspected Cargo.toml, the workspace manifest was reviewed.\n\nEvidence:\n- Cargo.toml was read.\n\nRisks/Validation:\n- Limited to inspected evidence.".into(),
+        vec![Content::Text(
+                "Status:\n- Based on the inspected Cargo.toml, the workspace manifest was reviewed.\n\nEvidence:\n- Cargo.toml was read.\n\nRisks/Validation:\n- Limited to inspected evidence."
+                    .to_string(),
             )],
             1,
             1,
@@ -2619,13 +2462,13 @@ async fn read_only_review_repair_template_final_is_not_accepted() {
         "old repair template must not be surfaced: {}",
         ui.assistant
     );
-    assert!(!agent.last_turn_telemetry().stalled_unfinished);
+    assert_eq!(agent.last_turn_telemetry().no_progress_streak, 0);
     assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 1);
     let _ = std::fs::remove_file(inspected_path);
 }
 
 #[tokio::test]
-async fn read_only_review_never_accepts_a_completion_placeholder_as_findings() {
+async fn repeated_completion_placeholder_settles_without_a_synthetic_failure() {
     let inspected_path = temp_file("repair-exhaustion-evidence");
     std::fs::write(&inspected_path, "pub fn value() -> i32 { 1 }\n").unwrap();
     let inspected = inspected_path.to_string_lossy().to_string();
@@ -2683,14 +2526,18 @@ async fn read_only_review_never_accepts_a_completion_placeholder_as_findings() {
 
     let telemetry = agent.last_turn_telemetry();
     assert_eq!(telemetry.quality_repair_nudges, 4);
-    // Concrete-answer budget exhaustion must fail closed for a pure completion
-    // placeholder. It is not a format-weak but usable review answer.
-    assert_eq!(outcome.status, TurnStatus::Incomplete);
-    assert!(telemetry.stalled_unfinished);
+    assert_eq!(outcome.status, TurnStatus::Completed);
     assert!(
-        !ui.assistant.contains("Completed the requested action"),
-        "rejected placeholder leaked into the UI: {}",
+        ui.assistant.contains("Completed the requested action"),
+        "the available user-visible answer should be preserved: {}",
         ui.assistant
+    );
+    assert!(
+        !ui.statuses.iter().any(|status| {
+            status.contains("incomplete") || status.to_ascii_lowercase().contains("stalled")
+        }),
+        "generic answers must not manufacture a legacy terminal state: {:?}",
+        ui.statuses
     );
     let _ = std::fs::remove_file(inspected_path);
 }
@@ -2789,8 +2636,8 @@ async fn read_only_review_generic_insufficient_after_read_reports_evidence() {
         ui.statuses
     );
     let telemetry = agent.last_turn_telemetry();
-    assert_eq!(telemetry.last_stall_reason, "");
-    assert!(!telemetry.stalled_unfinished);
+    assert_eq!(telemetry.last_no_progress_reason, "");
+    assert_eq!(telemetry.no_progress_streak, 0);
     assert_eq!(
         telemetry.review_repair_counts["review_inspected_disclaimer"],
         4
@@ -2887,7 +2734,7 @@ async fn read_only_review_generic_insufficient_after_read_gets_summary_repair() 
     );
     let telemetry = agent.last_turn_telemetry();
     assert_eq!(telemetry.quality_repair_nudges, 1);
-    assert!(!telemetry.stalled_unfinished);
+    assert_eq!(telemetry.no_progress_streak, 0);
     let modes = modes.lock().unwrap();
     assert_eq!(
         modes.last(),
@@ -2968,7 +2815,7 @@ async fn inspected_disclaimer_chat_attempts_do_not_share_unrelated_repair_budget
         telemetry.review_repair_counts
     );
     assert_eq!(telemetry.quality_repair_nudges, 3);
-    assert!(!telemetry.stalled_unfinished);
+    assert_eq!(telemetry.no_progress_streak, 0);
     let modes = modes.lock().unwrap();
     assert_eq!(
         modes.as_slice(),
@@ -2985,7 +2832,7 @@ async fn inspected_disclaimer_chat_attempts_do_not_share_unrelated_repair_budget
 }
 
 #[tokio::test]
-async fn read_only_review_repeat_exhaustion_reports_inspected_evidence() {
+async fn read_only_review_repeat_exhaustion_without_an_answer_returns_an_error() {
     let inspected_path = temp_file("repeat-exhaustion-evidence");
     std::fs::write(
         &inspected_path,
@@ -2998,7 +2845,7 @@ async fn read_only_review_repeat_exhaustion_reports_inspected_evidence() {
         "glob": "*.rs",
     })
     .to_string();
-    let responses = vec![
+    let mut responses = vec![
         completion(
             vec![Content::ToolCall {
                 id: "read".into(),
@@ -3039,39 +2886,41 @@ async fn read_only_review_repeat_exhaustion_reports_inspected_evidence() {
             vec![Content::ToolCall {
                 id: "grep4".into(),
                 name: "grep".into(),
-                arguments: grep_args,
+                arguments: grep_args.clone(),
             }],
             1,
             1,
         ),
     ];
+    for retry in 0..config().loop_limits.max_empty_retries {
+        responses.push(completion(
+            vec![Content::ToolCall {
+                id: format!("grep-final-retry-{retry}"),
+                name: "grep".into(),
+                arguments: grep_args.clone(),
+            }],
+            1,
+            1,
+        ));
+    }
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    agent
+    let error = agent
         .run_turn(
             "review for security issues or unsafe unwraps. then disucss only",
             &mut ui,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
     assert!(
-        ui.assistant.trim().is_empty(),
-        "guardrail should not emit canned assistant text: {}",
-        ui.assistant
+        error
+            .to_string()
+            .contains("model returned no usable final answer after bounded recovery"),
+        "unexpected bounded-recovery error: {error:#}"
     );
-    assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("turn stopped incomplete")),
-        "expected forced final recovery to stop incomplete: {:?}",
-        ui.statuses
-    );
-    let telemetry = agent.last_turn_telemetry();
-    assert_eq!(telemetry.repeat_nudges, 2);
-    assert_eq!(telemetry.forced_final_answer_attempts, 1);
-    assert!(telemetry.stalled_unfinished);
+    assert!(ui.assistant.is_empty());
     let _ = std::fs::remove_file(inspected_path);
 }
 
@@ -3152,13 +3001,14 @@ async fn gap_review_search_match_blocks_no_gap_overclaim() {
         ui.statuses
     );
     assert!(
-        ui.assistant.trim().is_empty(),
-        "guardrail should not emit canned assistant text: {}",
+        ui.assistant
+            .contains("could not complete this request after repeated attempts made no progress"),
+        "contradicted review claims should end with an honest closeout: {}",
         ui.assistant
     );
     let telemetry = agent.last_turn_telemetry();
     assert!(telemetry.quality_repair_nudges >= 1);
-    assert!(telemetry.stalled_unfinished);
+    assert!(telemetry.no_progress_streak > 0);
     let _ = std::fs::remove_file(inspected_path);
 }
 
@@ -3356,7 +3206,7 @@ async fn security_review_overbroad_all_clear_gets_scope_nudge() {
 }
 
 #[tokio::test]
-async fn read_only_review_repeated_search_without_read_stops_incomplete() {
+async fn read_only_review_repeated_search_without_an_answer_returns_an_error() {
     let grep_call = || {
         completion(
             vec![Content::ToolCall {
@@ -3372,17 +3222,20 @@ async fn read_only_review_repeated_search_without_read_stops_incomplete() {
             1,
         )
     };
-    let responses = vec![grep_call(), grep_call(), grep_call(), grep_call()];
+    let mut responses = vec![grep_call(), grep_call(), grep_call(), grep_call()];
+    for _ in 0..config().loop_limits.max_empty_retries {
+        responses.push(grep_call());
+    }
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    agent
+    let error = agent
         .run_turn(
             "review for security issues or unsafe unwraps. then disucss only",
             &mut ui,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
     assert!(
         ui.statuses
@@ -3392,11 +3245,12 @@ async fn read_only_review_repeated_search_without_read_stops_incomplete() {
         ui.statuses
     );
     assert!(
-        ui.assistant.trim().is_empty(),
-        "guardrail should not emit canned assistant text: {}",
-        ui.assistant
+        error
+            .to_string()
+            .contains("model returned no usable final answer after bounded recovery"),
+        "unexpected bounded-recovery error: {error:#}"
     );
-    assert!(agent.last_turn_telemetry().stalled_unfinished);
+    assert!(ui.assistant.is_empty());
 }
 
 #[tokio::test]
@@ -3476,7 +3330,7 @@ async fn read_only_review_search_then_generic_final_requires_file_read() {
 }
 
 #[tokio::test]
-async fn listing_only_review_repair_exhaustion_stops_incomplete() {
+async fn listing_only_review_repair_exhaustion_settles_with_the_available_answer() {
     let responses = vec![
         completion(
             vec![Content::ToolCall {
@@ -3527,14 +3381,15 @@ async fn listing_only_review_repair_exhaustion_stops_incomplete() {
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    agent
+    let outcome = agent
         .run_turn("/status codebase state", &mut ui)
         .await
         .unwrap();
 
     assert!(
-        ui.assistant.trim().is_empty(),
-        "guardrail should not emit canned assistant text: {}",
+        ui.assistant
+            .contains("The repository looks healthy and organized."),
+        "bounded repair should preserve the available model answer: {}",
         ui.assistant
     );
     assert!(
@@ -3545,9 +3400,14 @@ async fn listing_only_review_repair_exhaustion_stops_incomplete() {
         ui.statuses
     );
     let telemetry = agent.last_turn_telemetry();
+    assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(telemetry.quality_repair_nudges, 4);
     assert!(telemetry.listing_only);
-    assert_eq!(telemetry.last_stall_reason, "review_listing_only_exhausted");
-    assert!(telemetry.stalled_unfinished);
-    assert!(agent.usage_summary(agent.totals()).contains("stalled"));
+    assert!(
+        !ui.statuses.iter().any(|status| {
+            status.contains("incomplete") || status.to_ascii_lowercase().contains("stalled")
+        }),
+        "bounded review repair must not manufacture a legacy terminal state: {:?}",
+        ui.statuses
+    );
 }

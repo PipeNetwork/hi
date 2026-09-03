@@ -36,13 +36,21 @@ pub fn validate_script(
     script: &str,
     args: Option<serde_json::Value>,
 ) -> Result<ValidationReport, ValidationError> {
-    validate_script_with_agent_budget(script, args, crate::DEFAULT_AGENT_BUDGET)
+    validate_script_with_optional_agent_budget(script, args, crate::DEFAULT_AGENT_BUDGET)
 }
 
 pub fn validate_script_with_agent_budget(
     script: &str,
     args: Option<serde_json::Value>,
     agent_budget: u64,
+) -> Result<ValidationReport, ValidationError> {
+    validate_script_with_optional_agent_budget(script, args, Some(agent_budget))
+}
+
+fn validate_script_with_optional_agent_budget(
+    script: &str,
+    args: Option<serde_json::Value>,
+    agent_budget: Option<u64>,
 ) -> Result<ValidationReport, ValidationError> {
     let meta = extract_meta(script)?;
 
@@ -54,10 +62,12 @@ pub fn validate_script_with_agent_budget(
             match req {
                 R::ReserveAgentCalls { count, reply } => {
                     let requested = agent_calls.saturating_add(count);
-                    if requested > agent_budget {
+                    if let Some(maximum) = agent_budget
+                        && requested > maximum
+                    {
                         let _ = reply.send(Err(crate::HostError::AgentCallQuotaExceeded {
                             requested,
-                            maximum: agent_budget,
+                            maximum,
                         }));
                     } else {
                         agent_calls = requested;
@@ -91,10 +101,10 @@ pub fn validate_script_with_agent_budget(
                 }
                 R::BudgetQuery { reply } => {
                     let _ = reply.send(Ok(BudgetState {
-                        total: None,
-                        spent: 0,
+                        total: agent_budget,
+                        spent: agent_calls,
                         reserved: 0,
-                        remaining: None,
+                        remaining: agent_budget.map(|maximum| maximum.saturating_sub(agent_calls)),
                     }));
                 }
                 R::RenderTemplate { reply, .. } => {
@@ -244,6 +254,13 @@ mod tests {
         let error = validate_script(&script, None).unwrap_err().to_string();
         assert!(error.contains("parallel() accepts at most"), "got: {error}");
 
+        let script = r#"
+            let meta = #{ name: "t", description: "d" };
+            for i in 0..129 { agent("job"); }
+        "#;
+        validate_script(script, None)
+            .expect("ordinary validation should not inherit the legacy 128-agent quota");
+
         let script = format!(
             r#"
             let meta = #{{ name: "t", description: "d" }};
@@ -252,15 +269,13 @@ mod tests {
             parallel(jobs);
             agent("synthesize");
             "#,
-            crate::DEFAULT_AGENT_BUDGET
+            128
         );
-        let error = validate_script(&script, None).unwrap_err().to_string();
+        let error = validate_script_with_agent_budget(&script, None, 128)
+            .unwrap_err()
+            .to_string();
         assert!(
-            error.contains(&format!(
-                "agent budget exceeded: requested {}, maximum {}",
-                crate::DEFAULT_AGENT_BUDGET + 1,
-                crate::DEFAULT_AGENT_BUDGET
-            )),
+            error.contains("agent budget exceeded: requested 129, maximum 128"),
             "got: {error}"
         );
     }

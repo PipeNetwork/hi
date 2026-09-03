@@ -1,0 +1,89 @@
+schema_version = 1
+name = "plan-approval-approve"
+tags = ["curated", "fuzz_state_template"]
+timeout_ms = 45000
+
+[[provider.steps]]
+id = "draft-plan"
+[provider.steps.response]
+kind = "tool_call"
+name = "update_plan"
+arguments = { steps = [{ title = "Implement the approved step", status = "pending" }] }
+
+[[provider.steps]]
+id = "draft-plan-answer"
+[provider.steps.response]
+kind = "text"
+text = "The implementation plan is ready for approval."
+
+[[provider.steps]]
+id = "approved-drive-held"
+[provider.steps.response]
+kind = "hold"
+gate = "approved-drive"
+
+[[actions]]
+kind = "send_line"
+text = "/plan implement the approved step"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/plan/mode" = true, "/data/plan/incomplete" = true }
+timeout_ms = 10000
+
+[[actions]]
+kind = "send_line"
+text = "/plan off"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "approval_shown", "/data/kind" = "plan" }
+timeout_ms = 5000
+
+[[actions]]
+kind = "send_key"
+key = "tab"
+
+[[actions]]
+kind = "send_key"
+key = "enter"
+
+[[actions]]
+kind = "wait_provider_request"
+count = 3
+timeout_ms = 10000
+
+[[actions]]
+kind = "send_key"
+key = "ctrl_c"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "cancelled" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "release_gate"
+gate = "approved-drive"
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "approval_decided", "/data/kind" = "plan", "/data/decision" = "approved" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+exact = 1
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

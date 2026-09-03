@@ -288,12 +288,7 @@ async fn block_step_sets_a_step_aside_without_spending_its_retry_budget() {
 }
 
 #[tokio::test]
-async fn drive_parks_when_it_abandons_steps_without_ever_completing_one() {
-    // The 12-hour failure mode: every sub-goal exhausted its budget and was
-    // skipped, so the cursor kept advancing with `done=0`. From `/goal status`
-    // and the exported plan that is indistinguishable from progress, and the
-    // run walked the checklist for hours. Once a second step is abandoned with
-    // nothing ever completed, the drive must park instead.
+async fn failed_verification_does_not_abandon_goal_under_unlimited_default() {
     let workspace = IsolatedWorkspace::new("goal-thrashing-parks");
     let changed = workspace.path("changed.rs");
     let mut cfg = workspace.config();
@@ -312,37 +307,24 @@ async fn drive_parks_when_it_abandons_steps_without_ever_completing_one() {
         vec!["step one".into(), "step two".into(), "step three".into()],
     );
     goal.team = false;
-    // Enter the turn one failure short of exhausting step one, with a step
-    // already abandoned — so a single turn reaches the second skip.
-    goal.sub_goals[0].attempts = DEFAULT_SUBGOAL_RETRIES;
-    goal.consecutive_skips = 1;
     agent.set_structured_goal(Some(goal)).unwrap();
     let mut ui = RecUi::default();
 
     agent.run_turn("go", &mut ui).await.unwrap();
 
     let goal = agent.structured_goal().unwrap();
-    assert_eq!(goal.completed_count(), 0, "nothing ever completed");
-    assert_eq!(goal.consecutive_skips, 2);
-    assert!(
-        goal.is_paused(),
-        "the drive must stop rather than walk the rest of the plan"
-    );
-    assert_eq!(goal.pause_reason, GoalPauseReason::Stall);
-    assert!(
-        !goal.should_auto_drive(),
-        "a parked goal must not keep driving"
-    );
+    assert_eq!(goal.completed_count(), 0);
+    assert_eq!(goal.active_index(), Some(0));
+    assert_eq!(goal.sub_goals[0].attempts, 1);
+    assert_eq!(goal.sub_goals[0].status, GoalStatus::Active);
+    assert!(goal.should_auto_drive());
     assert!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("abandoned with none completed")),
-        "the reason must be visible, not silent: {:?}",
+            .any(|s| s.contains("will retry next turn")),
+        "the unlimited-default retry must be visible: {:?}",
         ui.statuses
     );
-    // The export is refreshed with the durable record, not left to an explicit
-    // `/goal export` — a stale plan file is how 12 hours of "progress" went
-    // unnoticed. It must exist and agree with the goal.
     let exported = std::fs::read_to_string(workspace.path(".hi/goal-plan.md"))
         .expect("goal-plan.md written alongside the durable goal");
     assert!(
@@ -350,8 +332,8 @@ async fn drive_parks_when_it_abandons_steps_without_ever_completing_one() {
         "export must show nothing completed: {exported}"
     );
     assert!(
-        exported.contains("steps abandoned in a row without a completion: 2"),
-        "export must surface the thrashing counter: {exported}"
+        exported.contains("attempts: 1"),
+        "export must surface the retained retry history: {exported}"
     );
 }
 
@@ -555,8 +537,8 @@ async fn exact_plan_goal_continuation_uses_real_context_and_implementation_guard
     );
     assert_eq!(
         agent.last_turn_telemetry().effective_max_steps,
-        crate::MAX_MODEL_ROUNDS,
-        "implementation intent uses the uniform default step cap"
+        u32::MAX,
+        "implementation intent does not add a default step cap"
     );
     assert_eq!(
         agent

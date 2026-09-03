@@ -1,0 +1,39 @@
+schema_version = 1
+name = "state-aware-fuzz-template"
+tags = ["fuzz_template"]
+timeout_ms = 45000
+
+[terminal]
+cols = 120
+rows = 40
+
+[[provider.steps]]
+id = "template-answer"
+[provider.steps.response]
+kind = "text"
+text = "The deterministic fuzz template completed."
+
+[[actions]]
+kind = "send_line"
+text = "Run the deterministic fuzz template."
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ready" }
+exact = 1
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

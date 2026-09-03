@@ -1,0 +1,111 @@
+schema_version = 1
+name = "mutation-then-generic-recap"
+tags = ["curated", "pr", "generic-completion-guard-negative-control"]
+timeout_ms = 45000
+
+[workspace]
+fixture = "fixture"
+git = "clean"
+
+[hi]
+# This case is about preserving a real mutation when only the model's recap is
+# unusable. The separate validation scenario owns deterministic check evidence.
+args = ["--allow-unverified"]
+
+[[session.plan]]
+title = "Persist follow graph"
+status = "pending"
+
+[[session.plan]]
+title = "Run final verification"
+status = "pending"
+
+[[provider.steps]]
+id = "land-mutation"
+[provider.steps.expect]
+body_contains = ["Persist follow graph"]
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "src/main.rs", content = "fn main() { println!(\"smoke\"); }\n" }
+
+[[provider.steps]]
+id = "generic-after-mutation"
+[provider.steps.response]
+kind = "text"
+text = "Completed the requested action."
+
+[[provider.steps]]
+id = "generic-recap-retry"
+[provider.steps.expect]
+body_contains = ["actual result"]
+[provider.steps.response]
+kind = "text"
+text = "Completed the requested action."
+
+[[provider.steps]]
+id = "next-drive-held"
+[provider.steps.response]
+kind = "hold"
+gate = "stop-next-drive"
+
+[[actions]]
+kind = "wait_provider_request"
+count = 1
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_provider_request"
+count = 4
+timeout_ms = 15000
+
+[[actions]]
+kind = "capture_screen"
+name = "progress_preserved"
+
+[[actions]]
+kind = "send_key"
+key = "ctrl_c"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "cancelled" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "release_gate"
+gate = "stop-next-drive"
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "file"
+path = "src/main.rs"
+exists = true
+contains = "println!(\"smoke\")"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 1, "/data/plan/incomplete" = true, "/data/next_drive/action" = "enqueue" }
+exact = 1
+
+[[assertions]]
+kind = "screen"
+snapshot = "progress_preserved"
+contains = ["Made concrete progress on the current step"]
+excludes = ["Completed the requested action."]
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

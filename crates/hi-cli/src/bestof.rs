@@ -23,7 +23,6 @@ use crate::candidate_gate::{
 };
 use crate::candidate_merge::{MergeTimings, apply_candidate_and_reverify};
 
-const CANDIDATE_TIMEOUT_SECS: u64 = 900;
 const MAX_VERIFY_CONCURRENCY: usize = 8;
 
 pub(crate) fn effective_judge(
@@ -50,6 +49,7 @@ pub struct BestOf<'a> {
     pub prompt: &'a str,
     pub candidates: u32,
     pub max_steps: Option<u32>,
+    pub max_tool_calls: Option<u32>,
     pub max_verify: u32,
     pub workspace_root: &'a Path,
     pub state_root: &'a Path,
@@ -281,10 +281,11 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                 let workspace_relative = &workspace_relative;
                 let snapshot = &workspace_snapshot;
                 scope.spawn(move || -> Result<(u32, PathBuf, f32, String)> {
-                    let _setup_lease = crate::resource_governor::acquire(
+                    let _setup_lease = crate::resource_governor::acquire_while_optional(
                         state_root,
                         crate::resource_governor::ResourceClass::Setup,
-                        Duration::from_secs(120),
+                        best_of_queue_timeout(),
+                        &|| false,
                     )?;
                     let temperature = temperature_for(index, opts.candidates);
                     let worktree = hi_tools::worktree::worktree_path("bestof", index);
@@ -337,6 +338,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
             let research_id = research_id.clone();
             let snippet_block = snippet_block.clone();
             let max_steps = opts.max_steps;
+            let max_tool_calls = opts.max_tool_calls;
             let max_verify = opts.max_verify;
             let candidate_state_root = state_root.clone();
             let configured_target = opts
@@ -388,6 +390,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                         prompt: &prompt,
                         candidates: 0,
                         max_steps,
+                        max_tool_calls,
                         max_verify,
                         workspace_root: &worktree,
                         state_root: &candidate_state_root,
@@ -402,10 +405,11 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                         snippet_block,
                     };
                     let model_queue_started = Instant::now();
-                    let model_lease = crate::resource_governor::acquire(
+                    let model_lease = crate::resource_governor::acquire_while_optional(
                         &candidate_state_root,
                         crate::resource_governor::ResourceClass::Model,
-                        Duration::from_secs(120),
+                        best_of_queue_timeout(),
+                        &|| false,
                     );
                     let model_queue_ms = model_queue_started.elapsed().as_millis();
                     let mut result = match model_lease {
@@ -871,11 +875,13 @@ fn run_candidate(
         OsString::from(opts.base_url),
         OsString::from("--temperature"),
         OsString::from(temperature.to_string()),
-        OsString::from("--max-verify-repairs"),
-        OsString::from(opts.max_verify.to_string()),
         OsString::from("--report"),
         report_path.as_os_str().to_os_string(),
     ];
+    if opts.max_verify != hi_agent::UNLIMITED_REPAIR_CYCLES {
+        arguments.push(OsString::from("--max-verify-repairs"));
+        arguments.push(OsString::from(opts.max_verify.to_string()));
+    }
     if uses_model_judge(opts) {
         arguments.push("--no-verify".into());
         arguments.push("--allow-unverified".into());
@@ -887,10 +893,7 @@ fn run_candidate(
         arguments.push("--review".into());
         arguments.push("always".into());
     }
-    if let Some(max_steps) = opts.max_steps {
-        arguments.push("--max-steps".into());
-        arguments.push(max_steps.to_string().into());
-    }
+    append_execution_cap_arguments(&mut arguments, opts.max_steps, opts.max_tool_calls);
     arguments.push(opts.prompt.into());
 
     let mut environment = vec![
@@ -915,13 +918,14 @@ fn run_candidate(
             environment.push(("PIPENETWORK_API_BASE".into(), config.origin.clone().into()));
         }
     }
-    let process = match crate::child_process::run(
+    let process = match crate::child_process::run_maybe_cancelled(
         worktree,
         opts.exe,
         arguments,
         environment,
-        Duration::from_secs(candidate_timeout_secs()),
+        best_of_candidate_timeout(),
         log_path,
+        None,
     ) {
         Ok(process) => process,
         Err(error) => {
@@ -1022,12 +1026,37 @@ fn run_candidate(
     }
 }
 
-fn candidate_timeout_secs() -> u64 {
-    std::env::var("HI_BEST_OF_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+fn append_execution_cap_arguments(
+    arguments: &mut Vec<OsString>,
+    max_steps: Option<u32>,
+    max_tool_calls: Option<u32>,
+) {
+    if let Some(max_steps) = max_steps {
+        arguments.push("--max-steps".into());
+        arguments.push(max_steps.to_string().into());
+    }
+    if let Some(max_tool_calls) = max_tool_calls {
+        arguments.push("--max-tool-calls".into());
+        arguments.push(max_tool_calls.to_string().into());
+    }
+}
+
+fn positive_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
-        .unwrap_or(CANDIDATE_TIMEOUT_SECS)
+        .map(Duration::from_secs)
+        .filter(|timeout| Instant::now().checked_add(*timeout).is_some())
+}
+
+fn best_of_candidate_timeout() -> Option<Duration> {
+    let configured = std::env::var("HI_BEST_OF_TIMEOUT_SECS").ok();
+    positive_timeout_from_value(configured.as_deref())
+}
+
+fn best_of_queue_timeout() -> Option<Duration> {
+    let configured = std::env::var("HI_BEST_OF_QUEUE_TIMEOUT_SECS").ok();
+    positive_timeout_from_value(configured.as_deref())
 }
 
 fn configured_verify_concurrency(value: Option<&str>, default: usize) -> usize {
@@ -1263,6 +1292,7 @@ mod tests {
             prompt: "do the thing",
             candidates: 1,
             max_steps: Some(1),
+            max_tool_calls: Some(0),
             max_verify: 1,
             workspace_root: Path::new("/"),
             state_root: Path::new("/tmp"),
@@ -1286,6 +1316,17 @@ mod tests {
     }
 
     #[test]
+    fn best_of_wall_clock_limits_are_explicit_opt_ins() {
+        assert_eq!(positive_timeout_from_value(None), None);
+        assert_eq!(positive_timeout_from_value(Some("0")), None);
+        assert_eq!(positive_timeout_from_value(Some("invalid")), None);
+        assert_eq!(
+            positive_timeout_from_value(Some("17")),
+            Some(Duration::from_secs(17))
+        );
+    }
+
+    #[test]
     fn run_candidate_rejects_nonzero_exit_even_without_a_report() {
         let exe = Path::new("/bin/false");
         if !exe.exists() {
@@ -1301,6 +1342,25 @@ mod tests {
         assert!(log.exists(), "candidate log must be persisted");
         let _ = std::fs::remove_file(report);
         let _ = std::fs::remove_file(log);
+    }
+
+    #[test]
+    fn candidate_arguments_preserve_both_explicit_caps_including_zero_tools() {
+        let mut arguments = Vec::new();
+        append_execution_cap_arguments(&mut arguments, Some(7), Some(0));
+        let arguments = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(arguments, ["--max-steps", "7", "--max-tool-calls", "0"]);
+
+        arguments_for_unlimited_caps_are_empty();
+    }
+
+    fn arguments_for_unlimited_caps_are_empty() {
+        let mut arguments = Vec::new();
+        append_execution_cap_arguments(&mut arguments, None, None);
+        assert!(arguments.is_empty());
     }
 
     #[test]

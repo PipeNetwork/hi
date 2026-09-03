@@ -1,0 +1,154 @@
+name: Nightly TUI smoke
+
+on:
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  HI_BIN: target/release/hi
+
+concurrency:
+  group: nightly-tui-smoke
+  cancel-in-progress: false
+
+jobs:
+  scripted:
+    name: deterministic fault campaign
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      HI_PIPE_WRAP: ${{ github.workspace }}/target/pipe-wrap/x86_64-unknown-linux-gnu/pipe-wrap
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Linux sandbox helper
+        run: tools/build-pipe-wrap.sh
+
+      - name: Build release TUI smoke binaries
+        run: cargo build --release -p hi -p hi-smoke --no-default-features
+
+      - name: Validate TUI smoke scenarios
+        run: target/release/hi-smoke validate bench/tui-smoke
+
+      - name: Run deterministic chaos campaign
+        run: >-
+          target/release/hi-smoke fuzz bench/tui-smoke
+          --seed-start 0
+          --seeds 250
+          --jobs 4
+          --artifacts artifacts/tui-smoke-fuzz
+
+      - name: Upload deterministic TUI smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-smoke-nightly-scripted-${{ github.run_id }}
+          path: artifacts/tui-smoke-fuzz
+          if-no-files-found: error
+          retention-days: 90
+
+  live-canaries:
+    name: live-model canaries
+    needs: scripted
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      HI_PIPE_WRAP: ${{ github.workspace }}/target/pipe-wrap/x86_64-unknown-linux-gnu/pipe-wrap
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Linux sandbox helper
+        run: tools/build-pipe-wrap.sh
+
+      - name: Build release TUI smoke binaries
+        run: cargo build --release -p hi -p hi-smoke --no-default-features
+
+      - name: Validate TUI smoke scenarios
+        run: target/release/hi-smoke validate bench/tui-smoke
+
+      - name: Restore live-baseline observation state
+        id: live-observation-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: artifacts/tui-smoke-live/observation-state.json
+          key: tui-live-observation-v1-${{ runner.os }}-${{ hashFiles('eval-baseline/tui-live.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            tui-live-observation-v1-${{ runner.os }}-${{ hashFiles('eval-baseline/tui-live.json') }}-
+
+      # Scenarios tagged `live` are the three small model-backed canaries.
+      # One `run` invocation executes each matching scenario exactly once.
+      - name: Run live-model TUI canaries
+        id: live-canaries
+        env:
+          HI_PROVIDER: ${{ vars.HI_EVAL_PROVIDER || 'pipenetwork' }}
+          HI_MODEL: ${{ vars.HI_EVAL_MODEL }}
+          HI_API_KEY: ${{ secrets.HI_EVAL_API_KEY }}
+          HI_BASE_URL: ${{ vars.HI_EVAL_BASE_URL }}
+        run: >-
+          target/release/hi-smoke run bench/tui-smoke
+          --mode live
+          --tag live
+          --artifacts artifacts/tui-smoke-live
+
+      # Exercise the higher-cost interactive paths separately so their results
+      # cannot silently change the three-case observation baseline.
+      - name: Run extended live TUI regressions
+        id: live-extended
+        if: always()
+        env:
+          HI_PROVIDER: ${{ vars.HI_EVAL_PROVIDER || 'pipenetwork' }}
+          HI_MODEL: ${{ vars.HI_EVAL_MODEL }}
+          HI_API_KEY: ${{ secrets.HI_EVAL_API_KEY }}
+          HI_BASE_URL: ${{ vars.HI_EVAL_BASE_URL }}
+        run: >-
+          target/release/hi-smoke run bench/tui-smoke
+          --mode live
+          --tag live_extended
+          --artifacts artifacts/tui-smoke-live-extended
+
+      - name: Evaluate live-only baseline
+        id: live-baseline
+        # A successful nightly observation means the deterministic campaign
+        # (required by `needs`) and both live invocations all passed. A partial
+        # nightly must never advance the seven-run review window.
+        if: always() && steps.live-canaries.outcome == 'success' && steps.live-extended.outcome == 'success'
+        run: >-
+          target/release/hi-smoke check-live-baseline
+          artifacts/tui-smoke-live/summary.json
+          eval-baseline/tui-live.json
+          --observation-state artifacts/tui-smoke-live/observation-state.json
+          --nightly-run-id ${{ github.run_id }}
+
+      # Keep this separate from deterministic results: live scenario rates are
+      # observed independently and are never averaged into other eval scores.
+      - name: Upload live TUI canary evidence
+        id: live-evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-smoke-nightly-live-${{ github.run_id }}
+          path: |
+            artifacts/tui-smoke-live
+            artifacts/tui-smoke-live-extended
+          if-no-files-found: error
+          retention-days: 90
+
+      # The seventh successful observation intentionally fails the evaluation
+      # pending explicit baseline review, so save state even on that failure.
+      # An artifact-upload failure does not count as a successful nightly.
+      - name: Save live-baseline observation state
+        if: always() && steps.live-baseline.outcome != 'skipped' && steps.live-evidence.outcome == 'success' && steps.live-observation-cache.outputs.cache-hit != 'true' && hashFiles('artifacts/tui-smoke-live/observation-state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: artifacts/tui-smoke-live/observation-state.json
+          key: tui-live-observation-v1-${{ runner.os }}-${{ hashFiles('eval-baseline/tui-live.json') }}-${{ github.run_id }}-${{ github.run_attempt }}

@@ -24,7 +24,7 @@ use reqwest::header;
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::{Value, json};
 
-use crate::provider::{Provider, ProviderError, ProviderErrorKind};
+use crate::provider::{Provider, ProviderCapabilities, ProviderError, ProviderErrorKind};
 use crate::token::{StaticToken, TokenSource};
 use crate::types::{
     ChatRequest, CompatMode, Completion, Content, OutputTokenParameter, RateLimitBucket,
@@ -145,6 +145,13 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calls: true,
+            streamed_tool_call_deltas: true,
+        }
+    }
+
     async fn stream(
         &self,
         mut request: ChatRequest,
@@ -258,9 +265,9 @@ impl Provider for OpenAiProvider {
                 ))));
                 let rate_limits = rate_limits_from_headers(response.headers());
                 // `debug_tap` optionally echoes the raw wire bytes when
-                // HI_DEBUG_STREAM is set; `idle_guard` aborts a connection
-                // that went silent instead of blocking forever. Reduce the
-                // stream to provider-agnostic SSE data strings.
+                // HI_DEBUG_STREAM is set; `idle_guard` applies the optional
+                // operator silence deadline. Reduce the stream to
+                // provider-agnostic SSE data strings.
                 let stream = crate::http::idle_guard(
                     crate::http::debug_tap(response.bytes_stream()),
                     crate::http::stream_idle_window(),
@@ -689,7 +696,11 @@ fn wire_audit(
             .get("tool_choice")
             .and_then(Value::as_str)
             .map(str::to_string),
-        request_attempt: index as u32 + 1,
+        // `ChatRequest::retry_attempt` is zero-based; the audit is a
+        // human-facing one-based ordinal for the logical request replay.  A
+        // compatibility-shape fallback is still the same logical replay and
+        // is identified separately by `compatibility_fallback`.
+        request_attempt: request.retry_attempt.saturating_add(1),
         compatibility_fallback: compatibility_fallback(attempt, index),
         accepted,
         request_body: Some(body.clone()),
@@ -946,19 +957,23 @@ mod tests {
                 audits.push(audit);
             }
         };
-        provider
-            .stream(request(vec![], Default::default()), &mut sink)
-            .await
-            .unwrap();
+        let mut req = request(vec![], Default::default());
+        req.retry_attempt = 2;
+        provider.stream(req, &mut sink).await.unwrap();
         assert_eq!(audits.len(), 2);
         assert!(!audits[0].accepted);
-        assert_eq!(audits[0].request_attempt, 1);
+        assert_eq!(audits[0].request_attempt, 3);
         assert_eq!(audits[0].compatibility_fallback, None);
         assert!(audits[1].accepted);
-        assert_eq!(audits[1].request_attempt, 2);
+        assert_eq!(audits[1].request_attempt, 3);
         assert_eq!(
             audits[1].compatibility_fallback.as_deref(),
             Some("stream_usage")
+        );
+        assert_eq!(
+            server.request_attempts(),
+            vec![Some("2".to_string()), Some("2".to_string())],
+            "wire-shape fallback stays on the same logical recovery attempt"
         );
         assert_eq!(audits[1].response_status, Some(200));
         assert!(

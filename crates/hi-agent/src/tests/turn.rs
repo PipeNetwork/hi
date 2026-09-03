@@ -3,6 +3,55 @@ use super::*;
 
 struct FailingCheckpointSession;
 
+struct ImmediateAuditProvider {
+    ui_observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl hi_ai::Provider for ImmediateAuditProvider {
+    async fn stream(
+        &self,
+        _request: hi_ai::ChatRequest,
+        sink: &mut (dyn FnMut(hi_ai::StreamEvent) + Send),
+    ) -> anyhow::Result<hi_ai::Completion> {
+        sink(hi_ai::StreamEvent::WireAudit(Box::new(hi_ai::WireAudit {
+            provider: "test".into(),
+            accepted: true,
+            response_status: Some(200),
+            request_body: Some(serde_json::json!({"secret": "never persist"})),
+            ..hi_ai::WireAudit::default()
+        })));
+        assert!(
+            self.ui_observed.load(std::sync::atomic::Ordering::Acquire),
+            "the provider callback must synchronously reach the UI before the stream returns"
+        );
+        Ok(completion(
+            vec![hi_ai::Content::Text("provider audit delivered".into())],
+            1,
+            1,
+        ))
+    }
+}
+
+struct ImmediateAuditUi {
+    observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Ui for ImmediateAuditUi {
+    fn provider_request(&mut self, audit: &hi_ai::WireAudit) {
+        assert_eq!(audit.response_status, Some(200));
+        self.observed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    fn assistant_text(&mut self, _: &str) {}
+    fn assistant_reasoning(&mut self, _: &str) {}
+    fn assistant_end(&mut self) {}
+    fn tool_call(&mut self, _: &str, _: &str) {}
+    fn tool_result(&mut self, _: &str, _: &str) {}
+    fn status(&mut self, _: &str) {}
+    fn turn_end(&mut self, _: &str) {}
+}
+
 struct InterruptFirstStartedToolUi {
     interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     target: &'static str,
@@ -51,6 +100,25 @@ impl SessionSink for FailingCheckpointSession {
     fn record_checkpoints(&mut self, _refs: &[String]) -> anyhow::Result<()> {
         Err(anyhow::anyhow!("disk full"))
     }
+}
+
+#[tokio::test]
+async fn provider_wire_audit_reaches_ui_inside_the_stream_callback() {
+    let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = ImmediateAuditProvider {
+        ui_observed: observed.clone(),
+    };
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
+    let mut ui = ImmediateAuditUi {
+        observed: observed.clone(),
+    };
+
+    agent
+        .run_turn("exercise the provider", &mut ui)
+        .await
+        .unwrap();
+
+    assert!(observed.load(std::sync::atomic::Ordering::Acquire));
 }
 
 #[test]
@@ -278,7 +346,7 @@ async fn tools_unavailable_fast_path_resets_state_and_shows_message() {
     agent.report.last_compat_fallbacks = vec!["compat fallback".to_string()];
     agent.report.last_turn_telemetry = TurnTelemetry {
         repeat_nudges: 7,
-        stalled_unfinished: true,
+        no_progress_streak: 7,
         tool_calls: 3,
         ..TurnTelemetry::default()
     };
@@ -288,7 +356,7 @@ async fn tools_unavailable_fast_path_resets_state_and_shows_message() {
     }];
     agent
         .messages_mut()
-        .push(Message::user("[hi:nudge:repeat] stale nudge 1"));
+        .push(Message::user("[hi:nudge:continue] stale nudge 1"));
     agent
         .messages_mut()
         .push(Message::user("[hi:nudge:continue] stale nudge 2"));
@@ -309,7 +377,14 @@ async fn tools_unavailable_fast_path_resets_state_and_shows_message() {
     assert_eq!(agent.last_verify(), None);
     assert!(agent.last_changed_files().is_empty());
     assert!(agent.last_compat_fallbacks().is_empty());
-    assert_eq!(agent.last_turn_telemetry(), &TurnTelemetry::default());
+    assert_eq!(
+        agent.last_turn_telemetry(),
+        &TurnTelemetry {
+            effective_max_steps: u32::MAX,
+            ..TurnTelemetry::default()
+        },
+        "an early rejection must retain the unlimited model-round setting"
+    );
     assert_eq!(agent.goals.last_plan[0].title, "stale step");
     agent.messages.validate_for_provider().unwrap();
     assert!(
@@ -501,192 +576,6 @@ async fn resume_repairs_consecutive_user_messages_before_request() {
 }
 
 #[tokio::test]
-async fn nudges_when_model_repeats_the_same_command() {
-    // The model runs a command, then re-issues the *exact same* call next
-    // round. The repetition guard nudges it to act on the output instead of
-    // re-running, and the model then finishes. One repeat-nudge, no
-    // "stuck repeating" notice.
-    let responses = vec![
-        echo_call(),
-        echo_call(), // exact repeat → nudged
-        completion(vec![Content::Text("Done. Run cargo test.".into())], 1, 1),
-    ];
-    let mut agent = agent(responses, config());
-    let mut ui = RecUi::default();
-    agent.run_turn("check it", &mut ui).await.unwrap();
-    assert_eq!(
-        ui.statuses
-            .iter()
-            .filter(|s| s.contains("re-ran the same command"))
-            .count(),
-        1,
-        "exactly one repeat-nudge, got: {:?}",
-        ui.statuses
-    );
-    assert!(
-        !ui.statuses.iter().any(|s| s.contains("kept re-running")),
-        "no stuck-repeating notice once it moved on, got: {:?}",
-        ui.statuses
-    );
-    assert!(ui.turn_end.is_some(), "turn completed");
-}
-
-#[tokio::test]
-async fn repeated_plan_repost_gets_synthetic_result_and_plan_nudge() {
-    // Regression: a weak model re-posted an identical `update_plan` call right
-    // after its first one. The repeat guard used to strip the call from the
-    // transcript (leaving only the "Provider-invisible assistant content"
-    // placeholder) and send the generic "you just ran that exact command"
-    // nudge — the model concluded its tool calls weren't being executed and
-    // gave up without ever exploring. The skipped call must now stay in the
-    // transcript paired with a synthetic result that says why it was skipped,
-    // and the nudge must name the actual problem (unchanged plan re-post).
-    let plan_args = serde_json::json!({
-        "steps": [{"title": "Explore project structure", "status": "active"}]
-    })
-    .to_string();
-    let plan_call = |id: &str| {
-        completion(
-            vec![Content::ToolCall {
-                id: id.into(),
-                name: "update_plan".into(),
-                arguments: plan_args.clone(),
-            }],
-            1,
-            1,
-        )
-    };
-    let responses = vec![
-        plan_call("plan-1"),
-        plan_call("plan-2"), // byte-identical re-post → skipped with synthetic result
-        completion(
-            vec![Content::ToolCall {
-                id: "plan-3".into(),
-                name: "update_plan".into(),
-                arguments: serde_json::json!({
-                    "steps": [{"title": "Explore project structure", "status": "done"}]
-                })
-                .to_string(),
-            }],
-            1,
-            1,
-        ),
-        completion(vec![Content::Text("It is a small CLI.".into())], 1, 1),
-    ];
-    let mut agent = agent(responses, config());
-    let mut ui = RecUi::default();
-    agent.run_turn("check it", &mut ui).await.unwrap();
-
-    assert_eq!(
-        ui.statuses
-            .iter()
-            .filter(|s| s.contains("re-posted an unchanged plan"))
-            .count(),
-        1,
-        "plan re-post gets its own nudge, got: {:?}",
-        ui.statuses
-    );
-    let skipped_result = agent.messages().iter().find_map(|m| {
-        m.content.iter().find_map(|c| match c {
-            Content::ToolResult { call_id, output } if call_id == "plan-2" => Some(output.clone()),
-            _ => None,
-        })
-    });
-    let skipped_result = skipped_result.expect("skipped plan re-post has a synthetic tool result");
-    assert!(
-        skipped_result.contains("not executed") && skipped_result.contains("update_plan"),
-        "synthetic result explains the skip: {skipped_result}"
-    );
-    assert!(
-        !agent
-            .messages()
-            .iter()
-            .any(|m| m.text().contains("Provider-invisible assistant content")),
-        "skipped calls must not degrade to the provider-invisible placeholder"
-    );
-    assert!(
-        ui.turn_end.is_some(),
-        "model recovered and finished the turn"
-    );
-    agent.messages.validate_for_provider().unwrap();
-}
-
-#[tokio::test]
-async fn plan_repost_nudge_withholds_update_plan_for_one_round() {
-    // After a plan-repost nudge, the next request must not offer the
-    // update_plan tool at all: the plan-fixated model observed live kept
-    // re-posting the plan through every nudge, so for one round it is forced
-    // to pick a tool that does real work. The round after that, update_plan
-    // is available again (legitimate status updates must still work).
-    let plan_args = serde_json::json!({
-        "steps": [{"title": "Explore project structure", "status": "active"}]
-    })
-    .to_string();
-    let plan_call = |id: &str| {
-        completion(
-            vec![Content::ToolCall {
-                id: id.into(),
-                name: "update_plan".into(),
-                arguments: plan_args.clone(),
-            }],
-            1,
-            1,
-        )
-    };
-    let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let provider = RecordRequests {
-        responses: Mutex::new(vec![
-            plan_call("plan-1"),
-            plan_call("plan-2"), // identical re-post → nudged, tool withheld
-            echo_call(),         // real work in the withheld round
-            completion(
-                vec![Content::ToolCall {
-                    id: "plan-3".into(),
-                    name: "update_plan".into(),
-                    arguments: serde_json::json!({
-                        "steps": [{"title": "Explore project structure", "status": "done"}]
-                    })
-                    .to_string(),
-                }],
-                1,
-                1,
-            ),
-            completion(vec![Content::Text("It is a small CLI.".into())], 1, 1),
-        ]),
-        tool_names: tool_names.clone(),
-        modes: std::sync::Arc::new(Mutex::new(Vec::new())),
-    };
-    let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
-    let mut ui = RecUi::default();
-    agent.run_turn("check it", &mut ui).await.unwrap();
-
-    let tool_names = tool_names.lock().unwrap();
-    assert!(
-        tool_names.len() >= 4,
-        "expected at least four requests, got {}",
-        tool_names.len()
-    );
-    assert!(
-        tool_names[1].iter().any(|name| name == "update_plan"),
-        "update_plan offered before the nudge: {:?}",
-        tool_names[1]
-    );
-    assert!(
-        !tool_names[2]
-            .iter()
-            .any(|name| hi_tools::is_coordination(name)),
-        "all bookkeeping tools withheld for the round after the plan-repost nudge: {:?}",
-        tool_names[2]
-    );
-    assert!(
-        tool_names[3].iter().any(|name| name == "update_plan"),
-        "update_plan restored after the withheld round: {:?}",
-        tool_names[3]
-    );
-    agent.messages.validate_for_provider().unwrap();
-}
-
-#[tokio::test]
 async fn comprehension_question_gets_repository_context() {
     // Regression: "what does this program do" matched no marker in
     // `task_needs_repository_context`, so the turn ran with NO task context
@@ -789,62 +678,6 @@ async fn targeted_named_mutation_skips_repository_context_index() {
 }
 
 #[tokio::test]
-async fn repeated_decision_repost_gets_bookkeeping_nudge() {
-    // The bookkeeping-repost handling covers the whole coordination family:
-    // when only update_plan was withheld, the plan-fixated model slid to
-    // repeating record_decision instead (observed live). A repeated identical
-    // record_decision gets the bookkeeping synthetic result and nudge.
-    let decision_args = serde_json::json!({
-        "summary": "Explore repo first",
-        "rationale": "Need context",
-        "files": ["."]
-    })
-    .to_string();
-    let decision_call = |id: &str| {
-        completion(
-            vec![Content::ToolCall {
-                id: id.into(),
-                name: "record_decision".into(),
-                arguments: decision_args.clone(),
-            }],
-            1,
-            1,
-        )
-    };
-    let responses = vec![
-        decision_call("dec-1"),
-        decision_call("dec-2"), // identical re-post → bookkeeping nudge
-        echo_call(),
-        completion(vec![Content::Text("It is a small CLI.".into())], 1, 1),
-    ];
-    let mut agent = agent(responses, config());
-    let mut ui = RecUi::default();
-    agent.run_turn("check it", &mut ui).await.unwrap();
-
-    assert_eq!(
-        ui.statuses
-            .iter()
-            .filter(|s| s.contains("repeated bookkeeping calls"))
-            .count(),
-        1,
-        "decision re-post gets the bookkeeping nudge, got: {:?}",
-        ui.statuses
-    );
-    let skipped_result = agent.messages().iter().find_map(|m| {
-        m.content.iter().find_map(|c| match c {
-            Content::ToolResult { call_id, output } if call_id == "dec-2" => Some(output.clone()),
-            _ => None,
-        })
-    });
-    let skipped_result = skipped_result.expect("skipped decision re-post has a synthetic result");
-    assert!(
-        skipped_result.contains("not executed") && skipped_result.contains("bookkeeping"),
-        "synthetic result explains the skip: {skipped_result}"
-    );
-    agent.messages.validate_for_provider().unwrap();
-}
-
-#[tokio::test]
 async fn bookkeeping_only_stall_on_mutation_turn_gets_implementation_repair() {
     // Live stall: an implementation turn burned the entire repeat budget on
     // identical update_plan re-posts without ever inspecting or editing. The
@@ -853,7 +686,7 @@ async fn bookkeeping_only_stall_on_mutation_turn_gets_implementation_repair() {
     // through to "incomplete · stalled" with zero file changes — exactly the
     // "I started that fix but didn't land the edit" failure. After the fix the
     // turn must convert the stall into an edit nudge, then accept a write and
-    // finish without branding the turn stalled_repeating.
+    // finish without manufacturing a synthetic failure state.
     let workspace = IsolatedWorkspace::new("turn-bookkeeping-impl-repair");
     let plan_args = serde_json::json!({
         "steps": [
@@ -920,14 +753,7 @@ async fn bookkeeping_only_stall_on_mutation_turn_gets_implementation_repair() {
         "model must be allowed to land the write after the repair nudge"
     );
     let tel = agent.last_turn_telemetry();
-    assert!(
-        !tel.stalled_repeating,
-        "repair handoff clears the sticky stalled_repeating flag"
-    );
-    assert!(
-        !tel.stalled_unfinished,
-        "successful write must not leave the turn unfinished"
-    );
+    assert_eq!(tel.no_progress_streak, 0);
     agent.messages.validate_for_provider().unwrap();
 }
 
@@ -992,8 +818,6 @@ async fn wait_poll_with_changing_output_is_not_repeat_nudged() {
         "no repeat nudges while the poll output changes: {:?}",
         ui.statuses
     );
-    assert!(!agent.last_turn_telemetry().stalled_repeating);
-    assert!(!agent.last_turn_telemetry().stalled_unfinished);
 }
 
 #[tokio::test]
@@ -1040,25 +864,31 @@ async fn wait_poll_with_static_output_gets_diagnose_nudge() {
         "static poll output is nudged once: {:?}",
         ui.statuses
     );
-    assert!(
-        !agent.last_turn_telemetry().stalled_repeating,
-        "model moved on after the nudge, so the turn is not stalled"
-    );
+    assert_eq!(agent.last_turn_telemetry().no_progress_streak, 0);
 }
 
 #[tokio::test]
-async fn gives_up_with_notice_after_repeat_cap() {
+async fn repeated_tool_calls_return_a_bounded_provider_error() {
     // The model re-issues the exact same command every round, through the
-    // whole repeat-nudge budget: bounded nudges, then one chat-only final
-    // answer recovery attempt. If the model still emits tools, the turn stops
-    // incomplete instead of running to the step cap.
+    // whole repeat-nudge budget: bounded nudges, then a chat-only final-answer
+    // recovery. Contentless responses retry under that same policy. If the
+    // model still emits tools through the empty-response budget, the turn
+    // returns a real unusable-answer error instead of manufacturing a terminal
+    // state.
     let mut responses = vec![echo_call()];
     for _ in 0..(config().loop_limits.max_repeat_nudges + 1) {
         responses.push(echo_call()); // exact repeat each round
     }
+    for _ in 0..config().loop_limits.max_empty_retries {
+        responses.push(echo_call()); // contentless while calls are forbidden
+    }
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
-    agent.run_turn("check it", &mut ui).await.unwrap();
+    let error = agent.run_turn("check it", &mut ui).await.unwrap_err();
+    assert!(
+        error.to_string().contains("no usable final answer"),
+        "unexpected error: {error:#}"
+    );
     assert_eq!(
         ui.statuses
             .iter()
@@ -1069,13 +899,12 @@ async fn gives_up_with_notice_after_repeat_cap() {
         ui.statuses
     );
     assert!(
-        ui.statuses
+        !ui.statuses
             .iter()
-            .any(|s| s.contains("turn stopped incomplete")),
-        "incomplete notice after forced final recovery, got: {:?}",
+            .any(|status| status.contains("incomplete") || status.contains("stalled")),
+        "bounded recovery must not emit a synthetic legacy outcome: {:?}",
         ui.statuses
     );
-    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 1);
     agent.messages.validate_for_provider().unwrap();
     assert!(
         agent
@@ -1093,7 +922,7 @@ async fn gives_up_with_notice_after_repeat_cap() {
 }
 
 #[tokio::test]
-async fn gives_up_when_bash_only_cycles_through_stop_words() {
+async fn bash_stop_word_cycle_settles_as_typed_no_progress() {
     let mut cfg = config();
     cfg.loop_limits.max_repeat_nudges = 1;
     let responses = vec![
@@ -1105,7 +934,7 @@ async fn gives_up_when_bash_only_cycles_through_stop_words() {
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
 
-    agent.run_turn("stop when complete", &mut ui).await.unwrap();
+    let outcome = agent.run_turn("stop when complete", &mut ui).await.unwrap();
 
     assert_eq!(
         ui.tool_results.len(),
@@ -1120,11 +949,13 @@ async fn gives_up_when_bash_only_cycles_through_stop_words() {
         "expected no-op bash loop nudge/status, got: {:?}",
         ui.statuses
     );
+    assert_eq!(outcome.status, crate::TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, crate::TurnStopReason::NoProgress);
     assert!(
-        ui.statuses
+        !ui.statuses
             .iter()
-            .any(|status| status.contains("turn stopped incomplete")),
-        "guard should stop the turn without waiting for max_steps: {:?}",
+            .any(|status| status.contains("incomplete") || status.contains("stalled")),
+        "the no-progress guard must not manufacture a legacy outcome: {:?}",
         ui.statuses
     );
     assert!(
@@ -1135,8 +966,13 @@ async fn gives_up_when_bash_only_cycles_through_stop_words() {
         ui.statuses
     );
     assert_eq!(agent.last_turn_telemetry().repeat_nudges, 1);
-    assert!(agent.last_turn_telemetry().stalled_unfinished);
-    assert!(ui.assistant.trim().is_empty());
+    assert!(agent.last_turn_telemetry().no_progress_streak > 0);
+    assert!(
+        ui.assistant
+            .contains("could not complete this request after repeated attempts made no progress"),
+        "the bounded no-op loop should emit an honest terminal closeout: {}",
+        ui.assistant
+    );
     agent.messages.validate_for_provider().unwrap();
 }
 
@@ -1164,6 +1000,49 @@ async fn useful_distinct_bash_commands_are_not_no_progress_bounded() {
         ui.statuses
     );
     assert_eq!(agent.messages().last().unwrap().text(), "done");
+}
+
+struct RecordScriptedModes {
+    scripted: ScriptedProvider,
+    modes: std::sync::Arc<Mutex<Vec<ToolMode>>>,
+}
+
+#[async_trait::async_trait]
+impl hi_ai::Provider for RecordScriptedModes {
+    async fn stream(
+        &self,
+        request: hi_ai::ChatRequest,
+        sink: &mut (dyn FnMut(hi_ai::StreamEvent) + Send),
+    ) -> anyhow::Result<hi_ai::Completion> {
+        self.modes.lock().unwrap().push(request.profile.tool_mode);
+        hi_ai::Provider::stream(&self.scripted, request, sink).await
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn scripted_agent_recording_tool_modes(
+    steps: Vec<ProviderStep>,
+    cfg: AgentConfig,
+) -> (
+    Agent,
+    std::sync::Arc<Mutex<Vec<Vec<Message>>>>,
+    std::sync::Arc<Mutex<Vec<ToolMode>>>,
+) {
+    let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordScriptedModes {
+        scripted: ScriptedProvider {
+            steps: Mutex::new(steps),
+            requests: requests.clone(),
+            max_tokens: None,
+        },
+        modes: modes.clone(),
+    };
+    (
+        Agent::new(std::sync::Arc::new(provider), cfg).unwrap(),
+        requests,
+        modes,
+    )
 }
 
 #[tokio::test]
@@ -1203,6 +1082,302 @@ async fn repeated_no_progress_nudges_force_one_chat_only_final_answer() {
         modes.lock().unwrap().last(),
         Some(&ToolMode::ChatOnly),
         "the recovery attempt should be chat-only"
+    );
+}
+
+#[tokio::test]
+async fn forced_final_malformed_retry_stays_chat_only_without_continue_nudge() {
+    let mut cfg = config();
+    cfg.loop_limits.max_repeat_nudges = 2;
+    cfg.loop_limits.max_empty_retries = 1;
+    let steps = vec![
+        ProviderStep::Completion(bash_completion("echo stop")),
+        ProviderStep::Completion(bash_completion("echo quit")),
+        ProviderStep::Completion(bash_completion("echo exit")),
+        ProviderStep::Completion(bash_completion("echo done")),
+        ProviderStep::Error(hi_ai::ProviderErrorKind::MalformedStream),
+        ProviderStep::Completion(completion(
+            vec![Content::Text(
+                "Stopped after the available no-op output.".into(),
+            )],
+            1,
+            1,
+        )),
+    ];
+    let (mut agent, requests, modes) = scripted_agent_recording_tool_modes(steps, cfg);
+    let mut ui = RecUi::default();
+
+    agent.run_turn("stop when complete", &mut ui).await.unwrap();
+
+    let modes = modes.lock().unwrap();
+    assert_eq!(
+        &modes[modes.len() - 2..],
+        &[ToolMode::ChatOnly, ToolMode::ChatOnly],
+        "the malformed forced-final request must retry under the same tool-free policy: {modes:?}"
+    );
+    drop(modes);
+    let requests = requests.lock().unwrap();
+    let forced_user_text = requests[requests.len() - 2]
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let retry_user_text = requests[requests.len() - 1]
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        retry_user_text.contains("Stop using tools now"),
+        "forced-final instruction was lost on retry: {retry_user_text}"
+    );
+    assert_eq!(
+        forced_user_text, retry_user_text,
+        "a malformed forced-final response must not append a conflicting continuation nudge"
+    );
+    assert!(
+        !retry_user_text.contains("previous model response after the tool results was empty"),
+        "the tool-continuation nudge contradicted the forced-final instruction: {retry_user_text}"
+    );
+    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 2);
+}
+
+#[tokio::test]
+async fn forced_final_contentless_retry_stays_chat_only() {
+    let mut cfg = config();
+    cfg.loop_limits.max_repeat_nudges = 2;
+    cfg.loop_limits.max_empty_retries = 1;
+    let steps = vec![
+        ProviderStep::Completion(bash_completion("echo stop")),
+        ProviderStep::Completion(bash_completion("echo quit")),
+        ProviderStep::Completion(bash_completion("echo exit")),
+        ProviderStep::Completion(bash_completion("echo done")),
+        ProviderStep::Completion(completion(Vec::new(), 1, 0)),
+        ProviderStep::Completion(completion(
+            vec![Content::Text(
+                "Stopped after the available no-op output.".into(),
+            )],
+            1,
+            1,
+        )),
+    ];
+    let (mut agent, requests, modes) = scripted_agent_recording_tool_modes(steps, cfg);
+
+    agent
+        .run_turn("stop when complete", &mut NullUi)
+        .await
+        .unwrap();
+
+    let modes = modes.lock().unwrap();
+    assert_eq!(
+        &modes[modes.len() - 2..],
+        &[ToolMode::ChatOnly, ToolMode::ChatOnly],
+        "a contentless forced-final completion must retry tool-free: {modes:?}"
+    );
+    drop(modes);
+    let requests = requests.lock().unwrap();
+    let retry_user_text = requests
+        .last()
+        .unwrap()
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(retry_user_text.contains("Stop using tools now"));
+    assert!(
+        !retry_user_text.contains("previous model response after the tool results was empty"),
+        "contentless retry appended tool guidance: {retry_user_text}"
+    );
+    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 2);
+}
+
+#[tokio::test]
+async fn forced_final_tool_protocol_retry_keeps_only_the_stop_tools_instruction() {
+    let mut cfg = config();
+    cfg.loop_limits.max_repeat_nudges = 2;
+    let steps = vec![
+        ProviderStep::Completion(bash_completion("echo stop")),
+        ProviderStep::Completion(bash_completion("echo quit")),
+        ProviderStep::Completion(bash_completion("echo exit")),
+        ProviderStep::Completion(bash_completion("echo done")),
+        ProviderStep::Error(hi_ai::ProviderErrorKind::ToolProtocol),
+        ProviderStep::Completion(completion(
+            vec![Content::Text(
+                "Stopped after the available no-op output.".into(),
+            )],
+            1,
+            1,
+        )),
+    ];
+    let (mut agent, requests, modes) = scripted_agent_recording_tool_modes(steps, cfg);
+
+    agent
+        .run_turn("stop when complete", &mut NullUi)
+        .await
+        .unwrap();
+
+    let modes = modes.lock().unwrap();
+    assert_eq!(
+        &modes[modes.len() - 2..],
+        &[ToolMode::ChatOnly, ToolMode::ChatOnly],
+        "an invalid forced-final tool turn must retry tool-free: {modes:?}"
+    );
+    drop(modes);
+    let requests = requests.lock().unwrap();
+    let forced_user_text = requests[requests.len() - 2]
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let retry_user_text = requests[requests.len() - 1]
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(retry_user_text.contains("Stop using tools now"));
+    assert_eq!(
+        forced_user_text, retry_user_text,
+        "tool-protocol recovery must not append tool-use guidance to a forced final"
+    );
+    assert!(
+        !retry_user_text.contains("only available tool names"),
+        "forced-final retry received contradictory tool guidance: {retry_user_text}"
+    );
+}
+
+#[tokio::test]
+async fn forced_final_survives_provider_context_compaction_and_drop() {
+    let mut cfg = config();
+    cfg.loop_limits.max_repeat_nudges = 2;
+    let steps = vec![
+        ProviderStep::Completion(bash_completion("echo stop")),
+        ProviderStep::Completion(bash_completion("echo quit")),
+        ProviderStep::Completion(bash_completion("echo exit")),
+        ProviderStep::Completion(bash_completion("echo done")),
+        ProviderStep::RequestTooLarge,
+        ProviderStep::RequestTooLarge,
+        ProviderStep::Completion(completion(
+            vec![Content::Text(
+                "Stopped after the available no-op output.".into(),
+            )],
+            1,
+            1,
+        )),
+    ];
+    let (mut agent, requests, modes) = scripted_agent_recording_tool_modes(steps, cfg);
+    agent.messages_mut().push(Message::user("older task"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text(
+            "Older task recap.".into(),
+        )]));
+
+    agent
+        .run_turn("stop when complete", &mut NullUi)
+        .await
+        .unwrap();
+
+    let modes = modes.lock().unwrap();
+    assert_eq!(
+        &modes[modes.len() - 3..],
+        &[ToolMode::ChatOnly, ToolMode::ChatOnly, ToolMode::ChatOnly],
+        "both context-recovery requests must retain the forced-final policy: {modes:?}"
+    );
+    drop(modes);
+    let requests = requests.lock().unwrap();
+    let retry_user_text = requests
+        .last()
+        .unwrap()
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        retry_user_text.contains("Earlier conversation context was omitted"),
+        "fixture must exercise the destructive context-drop retry: {retry_user_text}"
+    );
+    assert!(
+        retry_user_text.contains("Stop using tools now"),
+        "context drop lost the sticky forced-final instruction: {retry_user_text}"
+    );
+}
+
+#[tokio::test]
+async fn plan_drive_expected_mutation_repeat_never_forces_chat_only() {
+    let workspace = IsolatedWorkspace::new("plan-drive-repeat-remains-tool-capable");
+    std::fs::write(workspace.path("source.rs"), "fn vote() {}\n").unwrap();
+    let source = workspace.path("source.rs").to_string_lossy().to_string();
+    let changed = workspace.path("changed.rs").to_string_lossy().to_string();
+    let read = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "read-source".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": source}).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let done = completion(
+        vec![Content::ToolCall {
+            id: "plan-done".into(),
+            name: "update_plan".into(),
+            arguments: serde_json::json!({
+                "steps": [{"title": "persist vote transaction code", "status": "done"}]
+            })
+            .to_string(),
+        }],
+        1,
+        1,
+    );
+    let mut cfg = workspace.config();
+    cfg.gates.allow_unverified = true;
+    cfg.loop_limits.max_repeat_nudges = 2;
+    let responses = vec![
+        read(),
+        read(),
+        read(),
+        read(),
+        write_completion(&changed),
+        done,
+        completion(
+            vec![Content::Text("Implemented the plan step.".into())],
+            1,
+            1,
+        ),
+    ];
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordToolModes {
+        responses: Mutex::new(responses),
+        modes: modes.clone(),
+    };
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    agent.restore_plan(vec![hi_tools::PlanStep {
+        title: "persist vote transaction code".into(),
+        status: hi_tools::PlanStatus::Pending,
+    }]);
+
+    agent
+        .run_turn(crate::PLAN_DRIVE_PROMPT, &mut NullUi)
+        .await
+        .unwrap();
+
+    assert!(std::path::Path::new(&changed).exists());
+    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 0);
+    assert!(
+        modes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|mode| *mode != ToolMode::ChatOnly),
+        "an implementation plan-drive must stay tool-capable through repeat recovery"
     );
 }
 
@@ -1577,7 +1752,7 @@ async fn implementation_preflight_consumes_its_interrupt_instead_of_cancelling_n
         }),
         "the following write must execute normally: {timeline:?}"
     );
-    assert!(!agent.last_turn_telemetry().stalled_unfinished);
+    assert_eq!(agent.last_turn_telemetry().no_progress_streak, 0);
 }
 
 #[tokio::test]
@@ -1636,7 +1811,7 @@ async fn late_preflight_interrupt_signal_cannot_cancel_the_models_next_tool() {
                 entry.tool == "write" && entry.status == hi_tools::ToolStatus::Succeeded
             })
     );
-    assert!(!agent.last_turn_telemetry().stalled_unfinished);
+    assert_eq!(agent.last_turn_telemetry().no_progress_streak, 0);
 }
 
 #[tokio::test]
@@ -1889,10 +2064,9 @@ async fn repeated_successful_background_output_poll_is_not_repeat_nudged() {
 async fn idle_background_output_tight_poll_reports_active_work() {
     // This test exercises the instant-poll steering path; disable the
     // adaptive watcher wait so defaulted polls return immediately.
-    // SAFETY: nextest isolates each test in its own process.
-    unsafe { std::env::set_var("HI_BG_POLL_WAIT_BASE_SECS", "0") };
     let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
     let mut agent = Agent::new(provider.clone(), config()).unwrap();
+    agent.runtime.background().set_poll_wait_base_secs(Some(0));
     let id = agent
         .runtime
         .background()
@@ -1955,12 +2129,11 @@ async fn idle_background_output_tight_poll_reports_active_work() {
 async fn idle_background_poll_budget_exhaustion_reports_progress_without_stalling() {
     // This test exercises the instant-poll steering path; disable the
     // adaptive watcher wait so defaulted polls return immediately.
-    // SAFETY: nextest isolates each test in its own process.
-    unsafe { std::env::set_var("HI_BG_POLL_WAIT_BASE_SECS", "0") };
     let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
     let mut cfg = config();
     cfg.loop_limits.max_repeat_nudges = 1;
     let mut agent = Agent::new(provider.clone(), cfg).unwrap();
+    agent.runtime.background().set_poll_wait_base_secs(Some(0));
     let id = agent
         .runtime
         .background()
@@ -1998,15 +2171,10 @@ async fn idle_background_poll_budget_exhaustion_reports_progress_without_stallin
     let _ = agent.runtime.background().kill(&id);
     assert_ne!(
         outcome.stop_reason,
-        crate::TurnStopReason::Stalled,
+        crate::TurnStopReason::InfrastructureFailure,
         "statuses={:?}; telemetry={:?}",
         ui.statuses,
         agent.last_turn_telemetry()
-    );
-    assert!(!agent.last_turn_telemetry().stalled_repeating);
-    assert!(
-        !agent.last_turn_telemetry().stalled_unfinished,
-        "a live background process must not mark the turn stalled"
     );
     assert!(
         ui.statuses
@@ -2089,13 +2257,11 @@ async fn waiting_on_live_background_with_fresh_output_ends_with_status_report() 
     let _ = agent.runtime.background().kill(&id);
     assert_ne!(
         outcome.stop_reason,
-        crate::TurnStopReason::Stalled,
+        crate::TurnStopReason::InfrastructureFailure,
         "statuses={:?}; telemetry={:?}",
         ui.statuses,
         agent.last_turn_telemetry()
     );
-    assert!(!agent.last_turn_telemetry().stalled_repeating);
-    assert!(!agent.last_turn_telemetry().stalled_unfinished);
     assert!(
         ui.statuses
             .iter()
@@ -2342,7 +2508,7 @@ async fn nudges_when_model_cycles_missing_background_kills() {
 }
 
 #[tokio::test]
-async fn missing_background_output_after_prior_mutation_stalls_instead_of_looping() {
+async fn missing_background_output_after_prior_mutation_returns_a_bounded_error() {
     let path = temp_file("missing-bg-after-mutation");
     let p = path.to_string_lossy().to_string();
     let bash_output = |id: &str| {
@@ -2368,10 +2534,20 @@ async fn missing_background_output_after_prior_mutation_stalls_instead_of_loopin
             "sh_missing_2"
         }));
     }
+    for _ in 0..config().loop_limits.max_empty_retries {
+        responses.push(bash_output("sh_missing_1"));
+    }
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    agent.run_turn("fix the harness", &mut ui).await.unwrap();
+    let error = agent
+        .run_turn("fix the harness", &mut ui)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("no usable final answer"),
+        "unexpected error: {error:#}"
+    );
 
     assert_eq!(
         ui.statuses
@@ -2383,13 +2559,12 @@ async fn missing_background_output_after_prior_mutation_stalls_instead_of_loopin
         ui.statuses
     );
     assert!(
-        ui.statuses
+        !ui.statuses
             .iter()
-            .any(|s| s.contains("turn stopped incomplete")),
-        "expected forced final recovery to stop incomplete, got: {:?}",
+            .any(|status| status.contains("incomplete") || status.contains("stalled")),
+        "bounded recovery must not emit a synthetic legacy outcome: {:?}",
         ui.statuses
     );
-    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 1);
     let bash_output_results = ui
         .tool_results
         .iter()
@@ -2404,7 +2579,7 @@ async fn missing_background_output_after_prior_mutation_stalls_instead_of_loopin
 }
 
 #[tokio::test]
-async fn missing_background_kill_after_prior_mutation_stalls_instead_of_looping() {
+async fn missing_background_kill_after_prior_mutation_returns_a_bounded_error() {
     let path = temp_file("missing-bg-kill-after-mutation");
     let p = path.to_string_lossy().to_string();
     let bash_kill = |id: &str| {
@@ -2430,10 +2605,20 @@ async fn missing_background_kill_after_prior_mutation_stalls_instead_of_looping(
             "sh_missing_2"
         }));
     }
+    for _ in 0..config().loop_limits.max_empty_retries {
+        responses.push(bash_kill("sh_missing_1"));
+    }
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    agent.run_turn("fix the harness", &mut ui).await.unwrap();
+    let error = agent
+        .run_turn("fix the harness", &mut ui)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("no usable final answer"),
+        "unexpected error: {error:#}"
+    );
 
     assert_eq!(
         ui.statuses
@@ -2445,13 +2630,12 @@ async fn missing_background_kill_after_prior_mutation_stalls_instead_of_looping(
         ui.statuses
     );
     assert!(
-        ui.statuses
+        !ui.statuses
             .iter()
-            .any(|s| s.contains("turn stopped incomplete")),
-        "expected forced final recovery to stop incomplete, got: {:?}",
+            .any(|status| status.contains("incomplete") || status.contains("stalled")),
+        "bounded recovery must not emit a synthetic legacy outcome: {:?}",
         ui.statuses
     );
-    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 1);
     let bash_kill_results = ui
         .tool_results
         .iter()
@@ -2466,13 +2650,13 @@ async fn missing_background_kill_after_prior_mutation_stalls_instead_of_looping(
 }
 
 #[tokio::test]
-async fn implementation_re_read_exhaustion_reports_incomplete_not_stuck_repeating() {
+async fn implementation_re_read_exhaustion_settles_as_typed_no_progress() {
     // An implementation task where the model reads a file, then keeps
     // re-reading it through the repeat budget and then ignores the
     // implementation repair nudges — the "explore forever, never edit" failure
-    // mode. The turn should end with the implementation-incomplete message (so
-    // the user knows no edit was made), NOT the generic "stuck repeating"
-    // notice or a forced chat-only final answer.
+    // mode. This is semantic repetition rather than a productive-work count;
+    // it must settle as typed no-progress so an autonomous drive cannot
+    // immediately restart the same useless cycle.
     let path = temp_file("impl-reread-exhaust");
     std::fs::write(&path, "fn parse() {}\n").unwrap();
     let p = path.to_string_lossy().to_string();
@@ -2497,23 +2681,30 @@ async fn implementation_re_read_exhaustion_reports_incomplete_not_stuck_repeatin
     }
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
-    agent
+    let outcome = agent
         .run_turn("/build parser implementation", &mut ui)
         .await
         .unwrap();
+    assert_eq!(outcome.status, crate::TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, crate::TurnStopReason::NoProgress);
     assert!(
-        ui.statuses
+        !ui.statuses
             .iter()
-            .any(|s| s.contains("turn stopped incomplete")),
-        "expected implementation repair exhaustion to stop incomplete, got: {:?}",
+            .any(|status| status.contains("incomplete") || status.contains("stalled")),
+        "implementation repair exhaustion must not emit a legacy outcome: {:?}",
         ui.statuses
     );
     assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 0);
-    assert!(
+    assert_eq!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("repeating without editing")),
-        "expected implementation-specific repair nudge, got: {:?}",
+            .filter(|status| {
+                status.contains("re-read files it already inspected")
+                    || status.contains("re-ran the same command")
+            })
+            .count(),
+        config().loop_limits.max_repeat_nudges as usize,
+        "implementation repeat nudges stay bounded: {:?}",
         ui.statuses
     );
     assert!(
@@ -2522,8 +2713,9 @@ async fn implementation_re_read_exhaustion_reports_incomplete_not_stuck_repeatin
         ui.statuses
     );
     assert!(
-        ui.assistant.trim().is_empty(),
-        "guardrail should not emit canned assistant text, got: {}",
+        ui.assistant
+            .contains("could not complete this request after repeated attempts made no progress"),
+        "implementation exhaustion should emit an honest terminal closeout: {}",
         ui.assistant
     );
     let _ = std::fs::remove_file(path);
@@ -2881,8 +3073,9 @@ async fn implementation_repeat_exhaustion_repairs_to_edit_instead_of_forced_fina
         "expected implementation repeat repair status: {:?}",
         ui.statuses
     );
-    assert!(
-        !agent.last_turn_telemetry().stalled_unfinished,
+    assert_eq!(
+        agent.last_turn_telemetry().no_progress_streak,
+        0,
         "turn should recover by editing and validating, statuses: {:?}",
         ui.statuses
     );
@@ -3283,9 +3476,12 @@ async fn stale_nudge_stripped_before_next_turn() {
     for _ in 0..(config().loop_limits.max_repeat_nudges + 1) {
         responses.push(echo_call());
     }
+    for _ in 0..config().loop_limits.max_empty_retries {
+        responses.push(echo_call());
+    }
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
-    agent.run_turn("check it", &mut ui).await.unwrap();
+    let _ = agent.run_turn("check it", &mut ui).await;
 
     // After the turn, the last message should NOT be a nudge (user message
     // with a [hi:nudge:...] marker). It should be the assistant's text or
@@ -3318,16 +3514,28 @@ async fn next_prompt_does_not_fold_into_stale_nudge() {
     for _ in 0..(config().loop_limits.max_repeat_nudges + 1) {
         responses.push(echo_call());
     }
+    for _ in 0..config().loop_limits.max_empty_retries {
+        responses.push(echo_call());
+    }
     // Second turn: a clean text response.
-    responses.push(completion(vec![Content::Text("ok".into())], 1, 1));
+    responses.push(completion(
+        vec![Content::Text(
+            "The answer to the second task is four.".into(),
+        )],
+        1,
+        1,
+    ));
 
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
-    agent.run_turn("first task", &mut ui).await.unwrap();
+    let _ = agent.run_turn("first task", &mut ui).await;
 
     // Second turn — should start clean, not folded into a nudge.
     let mut ui2 = RecUi::default();
-    agent.run_turn("second task", &mut ui2).await.unwrap();
+    agent
+        .run_turn("second task: what is two plus two?", &mut ui2)
+        .await
+        .unwrap();
 
     let msgs = agent.messages();
     // Find the last user message — it should be "second task", not a
@@ -3443,13 +3651,20 @@ async fn finished_recap_after_tool_use_ends_without_incomplete_warning() {
     // whole silent-continue budget and stopped on the warning.
     let mut cfg = config();
     cfg.loop_limits.max_silent_continues = 3;
+    let cargo_toml = temp_workspace_path("Cargo.toml");
+    std::fs::write(
+        cargo_toml.as_ref(),
+        "[package]\nname = \"hi-agent-test\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let cargo_path = cargo_toml.to_string_lossy().to_string();
     let responses = vec![
         // Reads a file (actively working).
         completion(
             vec![Content::ToolCall {
                 id: "r1".into(),
                 name: "read".into(),
-                arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                arguments: serde_json::json!({"path": cargo_path}).to_string(),
             }],
             1,
             1,
@@ -3523,18 +3738,33 @@ async fn batched_read_only_tools_run_and_preserve_order() {
     // One round emits two read-only calls; both run (concurrently) and their
     // results are recorded back in call order. Reads resolve against the
     // crate dir (cargo sets cwd to the manifest dir).
+    let cargo_toml = temp_workspace_path("Cargo.toml");
+    std::fs::write(
+        cargo_toml.as_ref(),
+        "[package]\nname = \"hi-agent\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let lib_rs = temp_workspace_path("src/lib.rs");
+    std::fs::create_dir_all(lib_rs.parent().unwrap()).unwrap();
+    std::fs::write(
+        lib_rs.as_ref(),
+        "//! The agent loop coordinates one turn.\npub fn run() {}\n",
+    )
+    .unwrap();
+    let cargo_path = cargo_toml.to_string_lossy().to_string();
+    let lib_path = lib_rs.to_string_lossy().to_string();
     let responses = vec![
         completion(
             vec![
                 Content::ToolCall {
                     id: "1".into(),
                     name: "read".into(),
-                    arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                    arguments: serde_json::json!({"path": cargo_path}).to_string(),
                 },
                 Content::ToolCall {
                     id: "2".into(),
                     name: "read".into(),
-                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                    arguments: serde_json::json!({"path": lib_path}).to_string(),
                 },
             ],
             5,
@@ -3563,7 +3793,7 @@ async fn batched_read_only_tools_run_and_preserve_order() {
         // The file's top-of-module doc comment — stable in the kept head even
         // after the per-result cap clips this (large) file's middle.
         outputs[1].contains("The agent loop"),
-        "second result is lib.rs"
+        "second result is lib.rs: {outputs:?}"
     );
 }
 
@@ -3680,9 +3910,8 @@ async fn step_cap_folds_wrap_up_nudge_after_recovery_nudge() {
 }
 
 #[tokio::test]
-async fn uniform_default_step_cap_and_configured_cap_are_honored() {
-    // The intent-aware caps (80/120/200) are gone. Every ordinary turn gets
-    // one uniform safety budget unless the user explicitly overrides it.
+async fn unlimited_default_and_configured_step_cap_are_honored() {
+    // Ordinary turns are unlimited unless the user explicitly sets a cap.
     let mut first_agent = agent(
         vec![completion(vec![Content::Text("done".into())], 4, 2)],
         config(),
@@ -3693,8 +3922,8 @@ async fn uniform_default_step_cap_and_configured_cap_are_honored() {
 
     assert_eq!(
         first_agent.last_turn_telemetry().effective_max_steps,
-        crate::MAX_MODEL_ROUNDS,
-        "plain turns use the uniform default cap"
+        u32::MAX,
+        "plain turns have no default model-round cap"
     );
 
     let inspected_path = temp_file("dynamic-read-only-steps");
@@ -3730,8 +3959,8 @@ async fn uniform_default_step_cap_and_configured_cap_are_honored() {
 
     assert_eq!(
         read_only_agent.last_turn_telemetry().effective_max_steps,
-        crate::MAX_MODEL_ROUNDS,
-        "intent classification must not change the uniform cap"
+        u32::MAX,
+        "intent classification must not introduce a cap"
     );
     let _ = std::fs::remove_file(inspected_path);
 
@@ -3748,11 +3977,151 @@ async fn uniform_default_step_cap_and_configured_cap_are_honored() {
     assert_eq!(second_agent.last_turn_telemetry().effective_max_steps, 7);
 }
 
+#[test]
+fn automatic_step_setting_restores_unlimited_default() {
+    let mut agent = agent(Vec::new(), config());
+
+    assert_eq!(agent.max_steps_setting(), "off");
+    agent.set_max_steps_limit(Some(7));
+    assert_eq!(agent.max_steps_setting(), "7");
+    agent.set_max_steps_auto();
+    assert_eq!(agent.max_steps_setting(), "off");
+}
+
+#[test]
+fn config_snapshot_renders_effective_tool_call_limit() {
+    let unlimited = agent(Vec::new(), config());
+    assert_eq!(unlimited.max_tool_calls_setting(), "off");
+    assert_eq!(unlimited.config_snapshot().max_tool_calls, "off");
+
+    let mut capped = config();
+    capped.loop_limits.max_tool_calls = 17;
+    let capped = agent(Vec::new(), capped);
+    assert_eq!(capped.max_tool_calls_setting(), "17");
+    assert_eq!(capped.config_snapshot().max_tool_calls, "17");
+}
+
+#[tokio::test]
+async fn default_turn_crosses_legacy_32_round_boundary_without_step_cap() {
+    const PRODUCTIVE_ROUNDS: u32 = 33;
+
+    let workspace = IsolatedWorkspace::new("unlimited-model-rounds");
+    let mut responses = Vec::new();
+    for round in 0..PRODUCTIVE_ROUNDS {
+        let path = workspace.path(format!("artifact-{round}.txt"));
+        responses.push(completion(
+            vec![Content::ToolCall {
+                id: format!("write-{round}"),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": path,
+                    "content": format!("round {round}\n"),
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        ));
+    }
+    responses.push(completion(
+        vec![Content::Text(
+            "Implemented all 33 requested artifacts.".into(),
+        )],
+        1,
+        1,
+    ));
+
+    let mut cfg = workspace.config();
+    // This regression isolates the model-round budget. Verification policy is
+    // covered separately and must not turn these intentional fixture writes
+    // into an unrelated unverified-work failure.
+    cfg.gates.allow_unverified = true;
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn(
+            "Create all 33 requested artifact files, then report completion.",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, crate::TurnStatus::Completed);
+    assert_eq!(ui.tool_results.len(), PRODUCTIVE_ROUNDS as usize);
+    assert_eq!(agent.last_turn_telemetry().effective_max_steps, u32::MAX);
+    assert!(!agent.last_turn_telemetry().hit_step_cap);
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("reached step limit")),
+        "the former 32-round default must not stop productive work: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn default_turn_crosses_legacy_48_tool_boundary_without_tool_cap() {
+    const PRODUCTIVE_TOOLS: u32 = 49;
+
+    let workspace = IsolatedWorkspace::new("unlimited-tool-calls");
+    let mut responses = Vec::new();
+    for round in 0..PRODUCTIVE_TOOLS {
+        let path = workspace.path(format!("tool-artifact-{round}.txt"));
+        responses.push(completion(
+            vec![Content::ToolCall {
+                id: format!("write-{round}"),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": path,
+                    "content": format!("tool {round}\n"),
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        ));
+    }
+    responses.push(completion(
+        vec![Content::Text(
+            "Implemented all 49 requested artifacts.".into(),
+        )],
+        1,
+        1,
+    ));
+
+    let mut cfg = workspace.config();
+    cfg.gates.allow_unverified = true;
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn(
+            "Create all 49 requested artifact files, then report completion.",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, crate::TurnStatus::Completed);
+    assert_eq!(ui.tool_results.len(), PRODUCTIVE_TOOLS as usize);
+    assert_eq!(agent.max_tool_calls_limit(), u32::MAX);
+    assert!(!agent.last_turn_telemetry().hit_step_cap);
+    assert!(!agent.last_turn_telemetry().hit_tool_cap);
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("reached tool-call limit")),
+        "the former 48-tool default must not stop productive work: {:?}",
+        ui.statuses
+    );
+}
+
 #[tokio::test]
 async fn capped_turn_gets_one_tool_free_wrap_up_round() {
     // Hitting a configured step cap no longer kills the turn mid-flight: the
     // model gets exactly one chat-only round to report where it left the work,
-    // and the turn still ends Incomplete · StepLimit.
+    // and the incomplete turn settles as Failed with a StepLimit diagnostic.
     let mut cfg = config();
     cfg.loop_limits.max_steps = 1;
     let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -3774,8 +4143,10 @@ async fn capped_turn_gets_one_tool_free_wrap_up_round() {
 
     let outcome = agent.run_turn("run the checks", &mut ui).await.unwrap();
 
+    assert_eq!(outcome.status, crate::TurnStatus::Failed);
     assert_eq!(outcome.stop_reason, crate::TurnStopReason::StepLimit);
     assert!(agent.last_turn_telemetry().hit_step_cap);
+    assert!(!agent.last_turn_telemetry().hit_tool_cap);
     assert!(
         ui.assistant.contains("remaining verification"),
         "the wrap-up answer must reach the user: {}",
@@ -3794,6 +4165,107 @@ async fn capped_turn_gets_one_tool_free_wrap_up_round() {
         "the wrap-up round must be chat-only"
     );
     agent.messages.validate_for_provider().unwrap();
+}
+
+#[tokio::test]
+async fn disabled_learning_neither_loads_nor_appends_failure_findings() {
+    let workspace = IsolatedWorkspace::new("disabled-failure-learning");
+    let ledger = workspace.path(".hi/state/learning/findings.jsonl");
+    std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let finding = crate::learning::Finding {
+        ts: now,
+        session_id: None,
+        turn: None,
+        status: TurnStatus::Failed,
+        stop_reason: TurnStopReason::StepLimit,
+        verification: VerificationStatus::NotApplicable,
+        review: ReviewStatus::NotRequired,
+        review_unavailable_reason: None,
+        last_no_progress_reason: String::new(),
+        changed_files: 0,
+        model: "test".into(),
+        hint_active: None,
+        failure_shape: None,
+    };
+    crate::learning::append_finding(&workspace.path(".hi/state"), &finding);
+    crate::learning::append_finding(&workspace.path(".hi/state"), &finding);
+    let before = std::fs::read(&ledger).unwrap();
+
+    let mut cfg = workspace.config();
+    cfg.memory.learning = false;
+    cfg.loop_limits.max_steps = 1;
+    let mut agent = agent(
+        vec![
+            bash_completion("echo working"),
+            completion(
+                vec![Content::Text("The configured cap stopped the turn.".into())],
+                1,
+                1,
+            ),
+        ],
+        cfg,
+    );
+    agent.refresh_memory_context("run the checks");
+    assert!(
+        agent.task.active_hint_shape.is_none(),
+        "disabled learning must not activate a finding-derived steering hint"
+    );
+    assert!(
+        agent
+            .task
+            .memory_context
+            .as_deref()
+            .is_none_or(|context| !context.contains("Recent harness findings")),
+        "disabled learning leaked finding-derived context: {:?}",
+        agent.task.memory_context
+    );
+
+    let outcome = agent.run_turn("run the checks", &mut NullUi).await.unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::StepLimit);
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        before,
+        "disabled learning appended a failed-turn finding"
+    );
+}
+
+#[tokio::test]
+async fn simultaneous_step_and_tool_caps_report_both_with_step_precedence() {
+    let mut cfg = config();
+    cfg.loop_limits.max_steps = 1;
+    cfg.loop_limits.max_tool_calls = 1;
+    let mut agent = agent(
+        vec![
+            bash_completion("echo working"),
+            completion(
+                vec![Content::Text("Stopped at both configured limits.".into())],
+                1,
+                1,
+            ),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+
+    let outcome = agent.run_turn("run one check", &mut ui).await.unwrap();
+
+    assert_eq!(outcome.status, crate::TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, crate::TurnStopReason::StepLimit);
+    assert!(agent.last_turn_telemetry().hit_step_cap);
+    assert!(agent.last_turn_telemetry().hit_tool_cap);
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("step and tool-call limits")),
+        "simultaneous limits should be visible: {:?}",
+        ui.statuses
+    );
 }
 
 #[tokio::test]
@@ -3819,6 +4291,7 @@ async fn capped_mutating_turn_still_runs_workspace_verification() {
 
     let outcome = agent.run_turn("create result.txt", &mut ui).await.unwrap();
 
+    assert_eq!(outcome.status, TurnStatus::Failed);
     assert_eq!(outcome.stop_reason, TurnStopReason::StepLimit);
     assert!(agent.last_turn_telemetry().hit_step_cap);
     assert!(
@@ -3894,6 +4367,7 @@ async fn capped_turn_wrap_up_round_is_granted_only_once() {
 
     let outcome = agent.run_turn("run the checks", &mut ui).await.unwrap();
 
+    assert_eq!(outcome.status, crate::TurnStatus::Failed);
     assert_eq!(outcome.stop_reason, crate::TurnStopReason::StepLimit);
     assert_eq!(
         ui.tool_results.len(),
@@ -3906,16 +4380,10 @@ async fn capped_turn_wrap_up_round_is_granted_only_once() {
 
 #[tokio::test]
 async fn read_only_review_sprawl_is_bounded() {
-    // The "inspection sprawl" failure mode: a read-only review turn reads many
-    // *distinct* files (each a new inspection signature, so the repeat/cycle
-    // guard never fires) without ever producing findings. Without the sprawl
-    // guard this churns until max_steps. The guard should nudge once past the
-    // threshold, then force the next model round to answer without tools.
-    //
-    // The effective cap is task-scaled and project-size-ceilinged. With no
-    // explicit cap and an unknown project size (temp dir), the ceiling is
-    // generous (120). We use an explicit cap to keep the test deterministic
-    // across scaling changes.
+    // An explicit user-supplied inspection cap remains authoritative. Once the
+    // model reaches it, the guard nudges for an answer and then forces the next
+    // model round to answer without tools. Ordinary reviews have no such count
+    // ceiling and are covered separately below.
     let explicit_cap = 8u32;
     let n_files = (explicit_cap + 1) as usize;
     let fixtures: Vec<TempTestPath> = (0..n_files)
@@ -4004,6 +4472,74 @@ async fn read_only_review_sprawl_is_bounded() {
     for p in &paths {
         let _ = std::fs::remove_file(p);
     }
+}
+
+#[tokio::test]
+async fn read_only_review_crosses_legacy_inspection_count_with_new_evidence() {
+    const DISTINCT_READS: usize = 33;
+    let fixtures: Vec<TempTestPath> = (0..DISTINCT_READS)
+        .map(|i| {
+            let path = temp_file(&format!("unlimited-review-{i}"));
+            std::fs::write(&path, format!("distinct evidence {i}\n")).unwrap();
+            path
+        })
+        .collect();
+    let paths: Vec<String> = fixtures
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    let mut responses = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            completion(
+                vec![Content::ToolCall {
+                    id: format!("read-{index}"),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": path}).to_string(),
+                }],
+                1,
+                1,
+            )
+        })
+        .collect::<Vec<_>>();
+    responses.push(completion(
+        vec![Content::Text(format!(
+            "Findings:\n- {}: all 33 distinct evidence files were inspected.\n\nLimits:\n- Findings are limited to the requested review.",
+            paths[0]
+        ))],
+        1,
+        1,
+    ));
+
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    let outcome = agent
+        .run_turn("review codebase and discuss status", &mut ui)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
+    assert_eq!(
+        agent.last_turn_telemetry().file_reads,
+        DISTINCT_READS as u32,
+        "statuses={:?}; assistant={:?}",
+        ui.statuses,
+        agent.last_assistant_text(),
+    );
+    assert!(
+        ui.statuses.iter().all(|status| {
+            !status.contains("inspection cap")
+                && !status.contains("inspection sprawl")
+                && !status.contains("without answering")
+        }),
+        "distinct new evidence must not hit a hidden inspection count: {:?}",
+        ui.statuses
+    );
 }
 
 #[tokio::test]
@@ -4216,23 +4752,29 @@ async fn keep_working_does_not_reopen_inspection_after_sprawl_wrap_up() {
     cfg.loop_limits.max_empty_retries = 0;
     let mut agent = Agent::new(std::sync::Arc::new(Canned(Mutex::new(responses))), cfg).unwrap();
     let mut ui = RecUi::default();
-    agent
+    let error = agent
         .run_turn(
             "review codebase and discuss status. Use at most 4 file inspections.",
             &mut ui,
         )
         .await
-        .unwrap();
+        .unwrap_err();
     assert!(
-        ui.statuses
-            .iter()
-            .any(|s| s.contains("turn stopped incomplete") || s.contains("no response")),
-        "expected wrap-up to stop rather than keep-working, got: {:?}",
-        ui.statuses
+        error.to_string().contains("no response after retrying"),
+        "unexpected error: {error:#}"
     );
     assert!(
-        agent.last_turn_telemetry().forced_final_answer_attempts >= 1,
-        "chat-only sprawl wrap-up must count as a forced final attempt"
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("incomplete") || status.contains("stalled")),
+        "wrap-up exhaustion must not emit a synthetic legacy outcome: {:?}",
+        ui.statuses
+    );
+    assert_eq!(
+        ui.tool_results.len(),
+        explicit_cap as usize,
+        "the chat-only wrap-up tool call must not execute or reopen inspection: {:?}",
+        ui.tool_results
     );
     for p in &paths {
         let _ = std::fs::remove_file(p);
@@ -4461,6 +5003,52 @@ fn review_turn_injects_code_review_skill_and_skips_stack_pack() {
     assert!(
         !block.contains("# Active stack skill"),
         "review turn must not follow rust-workspace: {block}"
+    );
+}
+
+#[test]
+fn tool_free_response_turn_injects_no_review_or_stack_skill() {
+    let workspace = IsolatedWorkspace::new("tool-free-no-auto-skill");
+    std::fs::write(workspace.path("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let mut cfg = workspace.config();
+    cfg.memory.inject_stack_skill = true;
+    cfg.memory.inject_review_skill = true;
+    let mut agent = agent(vec![], cfg);
+    let prompt =
+        "Without changing files or using tools, answer only: live read-only canary complete.";
+    let contract = crate::TaskContract::derive(prompt, crate::VerificationMode::Disabled);
+    agent
+        .task
+        .set_task(Some(prompt.to_string()), Some(contract));
+
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(
+        !block.contains("# Active review skill"),
+        "tool-free response must not inherit code-review instructions: {block}"
+    );
+    assert!(
+        !block.contains("# Active stack skill"),
+        "tool-free response must not inherit coding stack instructions: {block}"
+    );
+}
+
+#[test]
+fn explicit_review_with_tools_still_injects_code_review_skill() {
+    let workspace = IsolatedWorkspace::new("explicit-review-keeps-skill");
+    let mut cfg = workspace.config();
+    cfg.memory.inject_review_skill = true;
+    let mut agent = agent(vec![], cfg);
+    let prompt =
+        "Without changing files, review the codebase using tools and report concrete findings.";
+    let contract = crate::TaskContract::derive(prompt, crate::VerificationMode::Disabled);
+    agent
+        .task
+        .set_task(Some(prompt.to_string()), Some(contract));
+
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(
+        block.contains("# Active review skill (`code-review`)"),
+        "legitimate review turns must retain the review procedure: {block}"
     );
 }
 
@@ -5058,4 +5646,120 @@ async fn btw_read_only_tool_loop_answers_from_inspection() {
         "expected side completion(s) for the /btw question; got {} requests",
         reqs.len()
     );
+}
+
+struct NativeProgramProvider {
+    responses: Mutex<Vec<Completion>>,
+}
+
+#[async_trait::async_trait]
+impl hi_ai::Provider for NativeProgramProvider {
+    async fn stream(
+        &self,
+        _request: hi_ai::ChatRequest,
+        _sink: &mut (dyn FnMut(hi_ai::StreamEvent) + Send),
+    ) -> anyhow::Result<Completion> {
+        pop_canned_completion(&self.responses, "NativeProgramProvider")
+    }
+
+    fn capabilities(&self) -> hi_ai::ProviderCapabilities {
+        hi_ai::ProviderCapabilities {
+            native_tool_calls: true,
+            streamed_tool_call_deltas: false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SlowProgramConfirmationUi {
+    confirmations: usize,
+    tool_results: Vec<(String, String)>,
+    confirmation_started: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl Ui for SlowProgramConfirmationUi {
+    fn assistant_text(&mut self, _: &str) {}
+    fn assistant_reasoning(&mut self, _: &str) {}
+    fn assistant_end(&mut self) {}
+
+    fn confirm(&mut self, _: crate::ConfirmationRequest) -> crate::ConfirmationFuture<'_> {
+        self.confirmations += 1;
+        let confirmation_started = self.confirmation_started.clone();
+        Box::pin(async move {
+            confirmation_started.notify_one();
+            tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+            crate::ConfirmationResult::Rejected
+        })
+    }
+
+    fn tool_call(&mut self, _: &str, _: &str) {}
+
+    fn tool_result(&mut self, name: &str, result: &str) {
+        self.tool_results
+            .push((name.to_string(), result.to_string()));
+    }
+
+    fn status(&mut self, _: &str) {}
+    fn turn_end(&mut self, _: &str) {}
+}
+
+#[tokio::test(start_paused = true)]
+async fn productive_program_host_waits_past_the_legacy_total_deadline() {
+    let mut cfg = config();
+    cfg.program.mode = crate::ProgramMode::Auto;
+    cfg.gates.confirm_edits = true;
+    let provider = NativeProgramProvider {
+        responses: Mutex::new(vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "program".into(),
+                    name: "run_program".into(),
+                    arguments: serde_json::json!({
+                        "source": r#"tool("web_fetch", #{url: "https://example.invalid"}); "finished""#
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "The workflow program completed after the host decision.".into(),
+                )],
+                1,
+                1,
+            ),
+        ]),
+    };
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    agent.set_permission_mode(crate::PermissionMode::Ask);
+    let confirmation_started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut ui = SlowProgramConfirmationUi {
+        confirmation_started: confirmation_started.clone(),
+        ..SlowProgramConfirmationUi::default()
+    };
+
+    let outcome = {
+        let turn = agent.run_turn("run the workflow", &mut ui);
+        tokio::pin!(turn);
+        tokio::select! {
+            () = confirmation_started.notified() => {}
+            result = &mut turn => panic!("turn settled before the delayed host decision: {result:?}"),
+        }
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        turn.await.unwrap()
+    };
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(ui.confirmations, 1);
+    let program_result = ui
+        .tool_results
+        .iter()
+        .find(|(name, _)| name == "run_program")
+        .expect("program result was emitted");
+    assert!(
+        program_result.1.contains(r#""status":"succeeded""#),
+        "a slow host decision must not fail the whole program: {program_result:?}"
+    );
+    assert!(!program_result.1.contains("total time budget"));
 }

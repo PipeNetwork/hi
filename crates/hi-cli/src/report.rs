@@ -79,6 +79,7 @@ pub(crate) fn write_initialization_failure_report(
     provider: &str,
     error: &anyhow::Error,
     rsi: Option<&TraceSummary>,
+    effective_max_steps: u32,
     effective_max_tool_calls: u32,
 ) -> Result<()> {
     let outcome =
@@ -109,7 +110,7 @@ pub(crate) fn write_initialization_failure_report(
         },
         "compat_fallbacks": [],
         "telemetry": {
-            "effective_max_steps": 0,
+            "effective_max_steps": effective_max_steps,
             "effective_max_tool_calls": effective_max_tool_calls,
             "tool_calls": 0,
         },
@@ -276,7 +277,9 @@ pub(crate) fn finish_turn_trace(
         serde_json::to_value(agent.last_verification_executions())?
     } else {
         serde_json::json!({
-            "count": agent.last_verification_executions().len(),
+            "count": agent.last_turn_telemetry().diagnostic_retention.verification_executions_total,
+            "retained_count": agent.last_verification_executions().len(),
+            "dropped_count": agent.last_turn_telemetry().diagnostic_retention.verification_executions_dropped,
             "statuses": agent.last_verification_executions()
                 .iter()
                 .map(|execution| format!("{:?}", execution.status))
@@ -432,6 +435,7 @@ pub(crate) fn write_report(
         "reasoning_signature_replayed": tel.reasoning_signature_replayed,
         "reasoning_fallback": tel.reasoning_fallback,
         "wire_audit": tel.wire_audit,
+        "wire_audit_dropped": tel.diagnostic_retention.wire_audit_dropped,
     });
     let telemetry = serde_json::json!({
         "effective_max_steps": tel.effective_max_steps,
@@ -444,16 +448,17 @@ pub(crate) fn write_report(
         "no_progress_streak": tel.no_progress_streak,
         "forced_final_answer_attempts": tel.forced_final_answer_attempts,
         "last_progress_reason": tel.last_progress_reason,
-        "last_stall_reason": tel.last_stall_reason,
+        "last_no_progress_reason": tel.last_no_progress_reason,
         "hit_step_cap": tel.hit_step_cap,
-        "stalled_unfinished": tel.stalled_unfinished,
-        "stalled_repeating": tel.stalled_repeating,
+        "hit_tool_cap": tel.hit_tool_cap,
         "verify_attributions": tel.verify_attributions,
         "tool_calls": tel.tool_calls,
         "max_concurrent_batch": tel.max_concurrent_batch,
         "serial_runs": tel.serial_runs,
         "tool_timeline": tel.tool_timeline,
         "progress_events": tel.progress_events,
+        "plan_drive_stall": agent.plan_drive_stall(),
+        "goal_drive_stall": agent.goal_drive_stall(),
         "file_reads": tel.file_reads,
         "targeted_searches": tel.targeted_searches,
         "listing_only": tel.listing_only,
@@ -469,6 +474,7 @@ pub(crate) fn write_report(
         "advertised_tools": tel.advertised_tools,
         "tool_schema_tokens": tel.tool_schema_tokens,
         "stopped_by_step_cap": tel.hit_step_cap,
+        "stopped_by_tool_cap": tel.hit_tool_cap,
         "prefix_stable_rounds": tel.prefix_stable_rounds,
         "prefix_break_rounds": tel.prefix_break_rounds,
         "tool_prefix_break_rounds": tel.tool_prefix_break_rounds,
@@ -485,6 +491,8 @@ pub(crate) fn write_report(
         "refusal_source": tel.refusal_source,
         "requests": tel.requests,
         "compaction": tel.compaction,
+        "diagnostic_retention": tel.diagnostic_retention,
+        "ledger_events_dropped": agent.ledger_events_dropped(),
     });
     let planned_stages = agent
         .resolved_verification_stages()

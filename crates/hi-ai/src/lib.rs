@@ -60,12 +60,13 @@ pub use moa::{
 };
 pub use openai::OpenAiProvider;
 pub use provider::{
-    CODING_AGENT_MIN_OUTPUT_TOKENS, KeyCheck, OutputCapError, Provider, ProviderError,
-    ProviderErrorKind, ServedModel, effective_coding_agent_max_tokens, is_billing_or_quota_text,
-    is_http_auth_rejection, is_pipenetwork_coding_route, provider_error_affects_health,
-    provider_error_is_fallback_eligible, provider_error_is_temporary_overload, provider_error_kind,
-    provider_error_retryable, provider_error_usage, provider_output_cap_error,
-    provider_retry_after_seconds, provider_route_error_is_retryable,
+    CODING_AGENT_MIN_OUTPUT_TOKENS, KeyCheck, OutputCapError, Provider, ProviderCapabilities,
+    ProviderError, ProviderErrorKind, ServedModel, effective_coding_agent_max_tokens,
+    is_billing_or_quota_text, is_http_auth_rejection, is_pipenetwork_coding_route,
+    provider_error_affects_health, provider_error_is_fallback_eligible,
+    provider_error_is_temporary_overload, provider_error_kind, provider_error_retryable,
+    provider_error_usage, provider_output_cap_error, provider_retry_after_seconds,
+    provider_route_error_is_retryable,
 };
 pub use token::{PersistableToken, StaticToken, TokenSource};
 pub use tool_validation::{

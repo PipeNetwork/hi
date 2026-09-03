@@ -14,7 +14,7 @@
 //! agent identity the shell path sets via the `AI_AGENT` env var.
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -23,10 +23,26 @@ use serde_json::json;
 use crate::ToolOutcome;
 use crate::condense::truncate;
 
-/// Bound DNS and HTTP so a blackholed host cannot stall a tool turn forever.
+/// DNS and connection establishment are fault boundaries. Once connected, a
+/// healthy fetch/search/redirect response has no default lifetime ceiling and
+/// stays attached until completion or caller cancellation. Operators can opt
+/// into an absolute response deadline with `HI_WEB_REQUEST_TIMEOUT_SECS`.
 const WEB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const WEB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const WEB_REQUEST_TIMEOUT_ENV: &str = "HI_WEB_REQUEST_TIMEOUT_SECS";
+
+fn web_request_timeout() -> Option<Duration> {
+    let configured = std::env::var(WEB_REQUEST_TIMEOUT_ENV).ok();
+    positive_timeout_from_value(configured.as_deref())
+}
+
+fn positive_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .filter(|timeout| Instant::now().checked_add(*timeout).is_some())
+}
 
 // ---------------------------------------------------------------------------
 // SSRF protection
@@ -175,15 +191,18 @@ fn resolve_host_addrs_sync(host: &str) -> Result<Vec<SocketAddr>> {
 /// a public URL that 302s to an internal address is still blocked. Used by
 /// `web_fetch` (and available for any in-process HTTP fetch).
 fn ssrf_safe_client() -> reqwest::Client {
+    ssrf_safe_client_with_timeout(web_request_timeout())
+}
+
+fn ssrf_safe_client_with_timeout(request_timeout: Option<Duration>) -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
     if let Ok(value) = reqwest::header::HeaderValue::from_str("hi") {
         headers.insert("AI_AGENT", value);
     }
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .user_agent(format!("hi/{}", env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
         .connect_timeout(WEB_CONNECT_TIMEOUT)
-        .timeout(WEB_REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             // Re-validate the redirect destination. If it's private, stop
             // following and surface an error rather than fetching it.
@@ -194,15 +213,13 @@ fn ssrf_safe_client() -> reqwest::Client {
                 return attempt.error(err);
             }
             attempt.follow()
-        }))
+        }));
+    if let Some(timeout) = request_timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder
         .build()
-        .unwrap_or_else(|_| {
-            reqwest::Client::builder()
-                .connect_timeout(WEB_CONNECT_TIMEOUT)
-                .timeout(WEB_REQUEST_TIMEOUT)
-                .build()
-                .expect("failed to build timed reqwest Client")
-        })
+        .expect("failed to build guarded reqwest Client")
 }
 
 /// Follow `url`'s redirect chain in-process, re-validating every hop against
@@ -225,7 +242,6 @@ pub(crate) async fn resolve_download_redirects(url: &str) -> Result<String> {
     // the redirect policy fail the request, which surfaces here as an error.
     let resp = ssrf_safe_client()
         .get(url)
-        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("resolving download URL: {e}"))?;
@@ -879,9 +895,18 @@ fn clip(s: &str, max: usize) -> String {
     format!("{}…", s[..end].trim_end())
 }
 
-/// A reqwest client with the shared agent identity and short non-stream timeouts.
+/// A reqwest client with the shared agent identity, bounded connection setup,
+/// and no default response deadline. `HI_WEB_REQUEST_TIMEOUT_SECS` can add an
+/// operator-selected absolute bound per request.
 fn http_client() -> reqwest::Client {
-    hi_ai::agent_http_client_quick()
+    hi_ai::agent_http_client()
+}
+
+fn with_web_request_timeout(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match web_request_timeout() {
+        Some(timeout) => builder.timeout(timeout),
+        None => builder,
+    }
 }
 
 /// Read a non-empty env var.
@@ -921,14 +946,16 @@ fn search_provider() -> SearchProvider {
 /// Brave Search API (`https://api.search.brave.com/res/v1/web/search`).
 async fn brave_search(key: &str, query: &str, count: usize) -> Result<Vec<SearchResult>> {
     let url = "https://api.search.brave.com/res/v1/web/search";
-    let resp = http_client()
-        .get(url)
-        .header("X-Subscription-Token", key)
-        .header("Accept", "application/json")
-        .query(&[("q", query), ("count", &count.to_string())])
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Brave search request failed: {e}"))?;
+    let resp = with_web_request_timeout(
+        http_client()
+            .get(url)
+            .header("X-Subscription-Token", key)
+            .header("Accept", "application/json")
+            .query(&[("q", query), ("count", &count.to_string())]),
+    )
+    .send()
+    .await
+    .map_err(|e| anyhow::anyhow!("Brave search request failed: {e}"))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -983,13 +1010,15 @@ async fn tavily_search(key: &str, query: &str, max_results: usize) -> Result<Vec
         "query": query,
         "max_results": max_results,
     });
-    let resp = http_client()
-        .post(url)
-        .header("Accept", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Tavily search request failed: {e}"))?;
+    let resp = with_web_request_timeout(
+        http_client()
+            .post(url)
+            .header("Accept", "application/json")
+            .json(&body),
+    )
+    .send()
+    .await
+    .map_err(|e| anyhow::anyhow!("Tavily search request failed: {e}"))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -1033,8 +1062,64 @@ async fn tavily_search(key: &str, query: &str, max_results: usize) -> Result<Vec
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    async fn delayed_response_server(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
+            tokio::time::sleep(delay).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        });
+        (format!("http://{address}/slow"), server)
+    }
+
+    #[test]
+    fn productive_web_request_timeout_is_opt_in() {
+        assert_eq!(positive_timeout_from_value(None), None);
+        assert_eq!(positive_timeout_from_value(Some("")), None);
+        assert_eq!(positive_timeout_from_value(Some("invalid")), None);
+        assert_eq!(positive_timeout_from_value(Some("0")), None);
+        assert_eq!(
+            positive_timeout_from_value(Some(" 11 ")),
+            Some(Duration::from_secs(11))
+        );
+        assert_eq!(
+            positive_timeout_from_value(Some(&u64::MAX.to_string())),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn unlimited_web_response_wait_is_cancellable_and_explicitly_boundable() {
+        let (url, server) = delayed_response_server(Duration::from_millis(60)).await;
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(10),
+            ssrf_safe_client_with_timeout(None).get(&url).send(),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "an unlimited response wait should remain pending until caller cancellation"
+        );
+        server.await.unwrap();
+
+        let (url, server) = delayed_response_server(Duration::from_millis(60)).await;
+        let error = ssrf_safe_client_with_timeout(Some(Duration::from_millis(10)))
+            .get(&url)
+            .send()
+            .await
+            .expect_err("an explicit web timeout must still fire");
+        assert!(error.is_timeout(), "unexpected error: {error:#}");
+        server.await.unwrap();
+    }
 
     #[test]
     fn huggingface_downloads_use_a_single_segment() {

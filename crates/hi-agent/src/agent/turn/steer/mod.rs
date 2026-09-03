@@ -15,6 +15,7 @@ mod review;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RoundControl {
     Continue,
-    /// `true` means step-cap; `false` means natural end / stalled end of tools loop.
+    /// `true` means a configured model/tool work cap fired; `false` means a
+    /// natural or otherwise bounded end of the tools loop.
     BreakInner(bool),
 }

@@ -383,6 +383,9 @@ impl crate::App {
             self.event_log.drain(..excess);
         }
         match event {
+            // Wire evidence is consumed by the structured event tap before
+            // `App::apply`; it must never become transcript or debug content.
+            UiEvent::ProviderRequest { .. } => {}
             UiEvent::Text { text } => {
                 self.event_log
                     .push(format!("assistant_text {} chars", text.len()));
@@ -391,7 +394,12 @@ impl crate::App {
                 // block before the answer starts.
                 self.flush_reasoning();
                 self.current_assistant.push_str(&text);
-                self.stream(Style::default(), true, &text);
+                if !should_buffer_generic_completion_prefix(&self.current_assistant) {
+                    let unstreamed =
+                        self.current_assistant[self.current_assistant_streamed_bytes..].to_string();
+                    self.stream(Style::default(), true, &unstreamed);
+                    self.current_assistant_streamed_bytes = self.current_assistant.len();
+                }
             }
             UiEvent::BtwQuestion { question } => {
                 self.event_log
@@ -477,12 +485,21 @@ impl crate::App {
                 self.last_turn_event = Some(TurnEventKind::AssistantEnd);
                 self.turn_rounds = self.turn_rounds.saturating_add(1);
                 self.flush_reasoning();
+                let generic = generic_completion_guards_enabled()
+                    && hi_agent::answer_is_generic_completion_placeholder(&self.current_assistant);
+                if !generic && self.current_assistant_streamed_bytes < self.current_assistant.len()
+                {
+                    let unstreamed =
+                        self.current_assistant[self.current_assistant_streamed_bytes..].to_string();
+                    self.stream(Style::default(), true, &unstreamed);
+                }
                 self.flush_pending();
                 self.assistant_message_open = false;
-                if !self.current_assistant.trim().is_empty() {
+                if !generic && !self.current_assistant.trim().is_empty() {
                     self.last_assistant = self.current_assistant.trim().to_string();
                 }
                 self.current_assistant.clear();
+                self.current_assistant_streamed_bytes = 0;
                 // Fences don't span messages; reset so a stray ``` can't bleed
                 // code styling into the next response.
                 self.code_lang = None;
@@ -1179,6 +1196,40 @@ impl crate::App {
     }
 }
 
+const fn generic_completion_guards_enabled() -> bool {
+    !cfg!(feature = "smoke-negative-control-disable-generic-completion-guards")
+}
+
+fn should_buffer_generic_completion_prefix(content: &str) -> bool {
+    generic_completion_guards_enabled() && could_be_generic_completion_prefix(content)
+}
+
+fn could_be_generic_completion_prefix(content: &str) -> bool {
+    let normalized = content
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    [
+        "completed the requested action",
+        "the requested action is complete",
+        "the requested action has been completed",
+        "the requested task is complete",
+        "the requested task has been completed",
+    ]
+    .iter()
+    .any(|candidate| candidate.starts_with(&normalized))
+}
+
 /// Compact tool-arg detail for the BTW pane timeline (path/pattern/command).
 fn btw_tool_detail(name: &str, arguments: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
@@ -1214,4 +1265,19 @@ fn is_legacy_subagent_status(text: &str) -> bool {
             || text.starts_with("↳ task:")
             || text.starts_with("↳ plan:")
             || text.starts_with("↳ general-purpose:"))
+}
+
+#[cfg(test)]
+mod generic_completion_negative_control_tests {
+    use super::*;
+
+    #[test]
+    fn feature_controls_only_the_transcript_buffer_guard() {
+        let placeholder = "Completed the requested action.";
+        assert!(could_be_generic_completion_prefix(placeholder));
+        assert_eq!(
+            should_buffer_generic_completion_prefix(placeholder),
+            generic_completion_guards_enabled()
+        );
+    }
 }

@@ -47,7 +47,7 @@ fn workflow_snapshot(
         }],
         current_phase: Some("Research".into()),
         agents: vec![],
-        agent_budget: 8,
+        agent_budget: Some(8),
         agents_used: 2,
         agents_reserved: 0,
         elapsed_ms: 1200,
@@ -589,9 +589,9 @@ async fn sessions_host_on_uses_controller_and_drains_remote_queue() {
 }
 
 #[tokio::test]
-async fn remote_drain_respects_prompt_queue_cap() {
+async fn remote_drain_preserves_prompts_beyond_64_items() {
     let mut app = test_app("openai", "gpt-4o");
-    for i in 0..crate::MAX_PROMPT_QUEUE {
+    for i in 0..96 {
         assert!(app.try_enqueue_prompt(format!("local-{i}")));
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -599,15 +599,15 @@ async fn remote_drain_respects_prompt_queue_cap() {
     tx.send("remote-overflow-2".into()).unwrap();
     app.remote_input_rx = Some(rx);
 
-    assert!(
-        !app.drain_remote_input(),
-        "full queue should not report work to run"
+    assert!(app.drain_remote_input());
+    assert_eq!(app.queue.len(), 98);
+    assert_eq!(
+        app.queue.get(96).map(String::as_str),
+        Some("remote-overflow-1")
     );
-    assert_eq!(app.queue.len(), crate::MAX_PROMPT_QUEUE);
-    assert!(!app.queue.iter().any(|p| p.starts_with("remote-")));
-    assert!(
-        app.transcript_text().contains("queue full"),
-        "rejected remote prompts should be visible"
+    assert_eq!(
+        app.queue.get(97).map(String::as_str),
+        Some("remote-overflow-2")
     );
 }
 
@@ -1183,7 +1183,7 @@ async fn bare_team_role_opens_picker_and_selection_starts_setup() {
 }
 
 #[tokio::test]
-async fn config_command_sets_disables_and_restores_automatic_step_limit() {
+async fn config_command_sets_disables_and_restores_unlimited_default() {
     let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
         "http://127.0.0.1:1/v1".into(),
         "test".into(),
@@ -1192,8 +1192,15 @@ async fn config_command_sets_disables_and_restores_automatic_step_limit() {
     let mut app = test_app("openai", "gpt-4o");
     assert_eq!(
         agent.max_steps_setting(),
-        "32",
-        "finite automatic cap by default"
+        "off",
+        "the automatic default has no model-round cap"
+    );
+    app.handle_command(&mut agent, hi_agent::Command::Config("show".into()))
+        .await;
+    assert!(
+        app.transcript_text().contains("tool-calls:      off"),
+        "default tool-call cap should be visibly disabled: {}",
+        app.transcript_text()
     );
 
     app.handle_command(&mut agent, hi_agent::Command::Config("steps 350".into()))
@@ -1208,8 +1215,32 @@ async fn config_command_sets_disables_and_restores_automatic_step_limit() {
         .await;
     app.handle_command(&mut agent, hi_agent::Command::Config("steps auto".into()))
         .await;
-    assert_eq!(agent.max_steps_setting(), "32", "auto restores the default");
-    assert!(app.transcript_text().contains("step limit → 32 (automatic"));
+    assert_eq!(
+        agent.max_steps_setting(),
+        "off",
+        "auto restores the default"
+    );
+    assert!(
+        app.transcript_text()
+            .contains("step limit → unlimited (automatic default")
+    );
+
+    let mut capped_config = hi_agent::AgentConfig::default();
+    capped_config.loop_limits.max_tool_calls = 17;
+    let capped_provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut capped_agent = hi_agent::Agent::new(capped_provider, capped_config).unwrap();
+    let mut capped_app = test_app("openai", "gpt-4o");
+    capped_app
+        .handle_command(&mut capped_agent, hi_agent::Command::Config("show".into()))
+        .await;
+    assert!(
+        capped_app.transcript_text().contains("tool-calls:      17"),
+        "finite effective caps should be visible: {}",
+        capped_app.transcript_text()
+    );
 }
 
 #[test]
@@ -2280,10 +2311,9 @@ fn ctrl_question_toggles_the_observability_panel() {
         no_progress_streak: 0,
         forced_final_answer_attempts: 0,
         last_progress_reason: "accepted final answer".to_string(),
-        last_stall_reason: String::new(),
+        last_no_progress_reason: String::new(),
         hit_step_cap: false,
-        stalled_unfinished: false,
-        stalled_repeating: false,
+        hit_tool_cap: false,
         verify_attributions: Vec::new(),
         verification_executions: Vec::new(),
         tool_calls: 7,
@@ -3702,7 +3732,7 @@ fn usage_summary_content_cannot_override_typed_outcome() {
         summary: noisy.into(),
     });
     app.note_turn_outcome(&turn_outcome(
-        hi_agent::TurnStatus::Incomplete,
+        hi_agent::TurnStatus::Completed,
         hi_agent::VerificationStatus::Unverified,
         hi_agent::ReviewStatus::Unavailable,
         hi_agent::TurnStopReason::VerificationUnavailable,
@@ -3714,7 +3744,7 @@ fn usage_summary_content_cannot_override_typed_outcome() {
         !transcript.contains("user prompt estimate"),
         "usage stays out of the pane: {transcript}"
     );
-    assert!(transcript.contains("⚠ incomplete · checks did not settle"));
+    assert!(transcript.contains("⚠ stopped · checks did not settle"));
     assert!(!transcript.contains("✓ done"));
 }
 
@@ -3730,7 +3760,7 @@ fn unverified_completed_mutation_is_warning_not_done() {
 
     assert_eq!(
         app.last_turn_state,
-        TurnState::Warning("checks did not settle".to_string())
+        TurnState::Warning("stopped · checks did not settle".to_string())
     );
     assert!(!app.transcript_text().contains("✓ done"));
 }
@@ -3749,60 +3779,99 @@ fn deterministic_pass_survives_review_unavailability() {
 }
 
 #[test]
-fn stalled_turn_with_deterministic_pass_is_successful() {
-    // A repeat/no-progress guard can fire after the edit is made, but the
-    // final deterministic check is authoritative for the settled workspace.
+fn step_limit_with_deterministic_pass_is_stopped_not_done() {
     let mut app = test_app("openai", "gpt-4o");
     app.note_turn_outcome(&turn_outcome(
         hi_agent::TurnStatus::Completed,
         hi_agent::VerificationStatus::Passed,
         hi_agent::ReviewStatus::Unavailable,
-        hi_agent::TurnStopReason::Stalled,
-    ));
-
-    assert_eq!(app.last_turn_state, TurnState::Done("verified".to_string()));
-    assert!(app.transcript_text().contains("✓ done · verified"));
-    assert!(!app.transcript_text().contains("review unavailable"));
-}
-
-#[test]
-fn legacy_incomplete_green_outcome_renders_as_stalled() {
-    // Defense in depth for a caller that still supplies the old contradictory
-    // combination: Incomplete must never render as a successful turn.
-    let mut app = test_app("openai", "gpt-4o");
-    app.note_turn_outcome(&turn_outcome(
-        hi_agent::TurnStatus::Incomplete,
-        hi_agent::VerificationStatus::Passed,
-        hi_agent::ReviewStatus::Unavailable,
-        hi_agent::TurnStopReason::Stalled,
+        hi_agent::TurnStopReason::StepLimit,
     ));
 
     assert_eq!(
         app.last_turn_state,
-        TurnState::Warning("incomplete · stalled".to_string())
+        TurnState::Warning("stopped · step limit reached".to_string())
+    );
+    assert!(
+        app.transcript_text()
+            .contains("⚠ stopped · step limit reached")
+    );
+    assert!(!app.transcript_text().contains("✓ done"));
+}
+
+#[test]
+fn tool_limit_is_named_without_masquerading_as_a_step_limit() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Completed,
+        hi_agent::VerificationStatus::NotApplicable,
+        hi_agent::ReviewStatus::NotRequired,
+        hi_agent::TurnStopReason::ToolLimit,
+    ));
+
+    assert_eq!(
+        app.last_turn_state,
+        TurnState::Warning("stopped · tool-call limit reached".to_string())
+    );
+    assert_eq!(app.status, "warning · stopped · tool-call limit reached");
+    assert!(!app.transcript_text().contains("step limit"));
+}
+
+#[test]
+fn failed_outcome_with_a_passed_check_still_renders_as_failure() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Failed,
+        hi_agent::VerificationStatus::Passed,
+        hi_agent::ReviewStatus::Unavailable,
+        hi_agent::TurnStopReason::VerificationFailed,
+    ));
+
+    assert_eq!(
+        app.last_turn_state,
+        TurnState::Failed("verification failed".to_string())
     );
     let transcript = app.transcript_text();
-    assert!(transcript.contains("⚠ incomplete · stalled"));
+    assert!(transcript.contains("✗ failed · verification failed"));
     assert!(!transcript.contains("✓ done"));
 }
 
 #[test]
-fn no_change_stall_cannot_render_done_despite_baseline_pass() {
+fn failed_verification_outranks_a_legacy_limit_reason() {
     let mut app = test_app("openai", "gpt-4o");
-    let mut outcome = turn_outcome(
-        hi_agent::TurnStatus::Completed,
-        hi_agent::VerificationStatus::Passed,
-        hi_agent::ReviewStatus::Unavailable,
-        hi_agent::TurnStopReason::Stalled,
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Failed,
+        hi_agent::VerificationStatus::Failed,
+        hi_agent::ReviewStatus::NotRequired,
+        hi_agent::TurnStopReason::StepLimit,
+    ));
+
+    assert_eq!(
+        app.last_turn_state,
+        TurnState::Failed("verification failed".to_string())
     );
-    outcome.changed_files.clear();
+    assert!(app.status.starts_with("failed ·"), "{}", app.status);
+}
+
+#[test]
+fn turn_limit_is_a_neutral_stop() {
+    let mut app = test_app("openai", "gpt-4o");
+    let outcome = turn_outcome(
+        hi_agent::TurnStatus::Completed,
+        hi_agent::VerificationStatus::NotApplicable,
+        hi_agent::ReviewStatus::NotRequired,
+        hi_agent::TurnStopReason::TurnLimit,
+    );
     app.note_turn_outcome(&outcome);
 
     assert_eq!(
         app.last_turn_state,
-        TurnState::Warning("stalled".to_string())
+        TurnState::Warning("stopped · turn limit reached".to_string())
     );
-    assert!(app.transcript_text().contains("⚠ stalled"));
+    assert!(
+        app.transcript_text()
+            .contains("⚠ stopped · turn limit reached")
+    );
     assert!(!app.transcript_text().contains("✓ done"));
 }
 
@@ -3810,7 +3879,7 @@ fn no_change_stall_cannot_render_done_despite_baseline_pass() {
 fn review_objection_cannot_render_done() {
     let mut app = test_app("openai", "gpt-4o");
     app.note_turn_outcome(&turn_outcome(
-        hi_agent::TurnStatus::Incomplete,
+        hi_agent::TurnStatus::Failed,
         hi_agent::VerificationStatus::Passed,
         hi_agent::ReviewStatus::Objected,
         hi_agent::TurnStopReason::ReviewObjected,
@@ -3818,7 +3887,7 @@ fn review_objection_cannot_render_done() {
 
     assert_eq!(
         app.last_turn_state,
-        TurnState::Warning("incomplete · review objected".to_string())
+        TurnState::Failed("review objected".to_string())
     );
     assert!(!app.transcript_text().contains("✓ done"));
 }
@@ -3835,15 +3904,13 @@ fn verification_infrastructure_failure_is_failed() {
 
     assert_eq!(
         app.last_turn_state,
-        TurnState::Failed("infrastructure failure".to_string())
+        TurnState::Failed("verification infrastructure failure".to_string())
     );
-    // Internal state stays Failed for reports/eval, but the jargon banner is
-    // not shown in the user-facing transcript.
     assert!(
-        !app.transcript_text().contains("✗ failed"),
-        "infrastructure failure must not print a user-facing failure banner"
+        app.transcript_text()
+            .contains("✗ failed · verification infrastructure failure"),
+        "a genuine infrastructure failure must be visible"
     );
-    assert!(!app.transcript_text().contains("infrastructure failure"));
 }
 
 #[test]
@@ -4100,7 +4167,7 @@ fn btw_overlay_renders_above_the_prompt() {
 }
 
 #[test]
-fn typed_incomplete_outcome_is_visible_after_tool_output_without_usage() {
+fn typed_failed_outcome_is_visible_after_tool_output_without_usage() {
     let mut app = test_app("openai", "gpt-4o");
     app.apply(UiEvent::ToolCall {
         name: "edit".into(),
@@ -4111,17 +4178,17 @@ fn typed_incomplete_outcome_is_visible_after_tool_output_without_usage() {
         result: "19 additions, 3 deletions".into(),
     });
     app.note_turn_outcome(&turn_outcome(
-        hi_agent::TurnStatus::Incomplete,
+        hi_agent::TurnStatus::Failed,
         hi_agent::VerificationStatus::Unverified,
         hi_agent::ReviewStatus::NotRequired,
-        hi_agent::TurnStopReason::Stalled,
+        hi_agent::TurnStopReason::VerificationUnavailable,
     ));
 
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("incomplete · stalled")),
+            .any(|line| line.contains("failed · checks did not settle")),
         "transcript: {lines:?}"
     );
     assert!(
@@ -4130,24 +4197,21 @@ fn typed_incomplete_outcome_is_visible_after_tool_output_without_usage() {
             .any(|line| line.contains("degraded in-session")),
         "transcript: {lines:?}"
     );
-    assert_eq!(app.status, "warning · incomplete · stalled");
+    assert_eq!(app.status, "failed · checks did not settle");
 }
 
 #[test]
-fn leftover_plan_replaces_stalled_incomplete_banner() {
+fn leftover_plan_does_not_hide_a_limit_stop_reason() {
     let mut app = test_app("openai", "gpt-4o");
     let mut outcome = turn_outcome(
-        hi_agent::TurnStatus::Incomplete,
-        hi_agent::VerificationStatus::Unverified,
+        hi_agent::TurnStatus::Completed,
+        hi_agent::VerificationStatus::NotApplicable,
         hi_agent::ReviewStatus::NotRequired,
-        hi_agent::TurnStopReason::Stalled,
+        hi_agent::TurnStopReason::StepLimit,
     );
     outcome.leftover = Some("3/9 remaining — wire the scheduler".into());
     app.note_turn_outcome(&outcome);
-    assert_eq!(
-        app.status,
-        "warning · incomplete · 3/9 remaining — wire the scheduler"
-    );
+    assert_eq!(app.status, "warning · stopped · step limit reached");
 }
 
 #[test]
@@ -4495,19 +4559,14 @@ fn nested_deepseek_wire_profile_status_is_not_user_visible() {
 }
 
 #[test]
-fn internal_steering_statuses_are_humanized_in_the_transcript() {
+fn invalid_tool_statuses_are_humanized_in_the_transcript() {
     let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::Status {
-        text: "turn stopped incomplete · repeat_no_op_bash".into(),
-    });
     app.apply(UiEvent::Status {
         text: "⚠ the model kept emitting invalid tool turns — ending the turn; /retry or continue to resume".into(),
     });
 
     let text = app.transcript_text();
-    assert!(text.contains("unfinished work"));
     assert!(text.contains("tool calls were invalid"));
-    assert!(!text.contains("repeat_no_op_bash"));
     assert!(!text.contains("the model kept"));
     assert!(!text.contains("/retry"));
 }
@@ -4817,7 +4876,7 @@ fn repeated_assistant_narration_is_printed_once_across_rounds() {
 }
 
 #[test]
-fn repeated_generic_completion_ack_is_shown_once_per_turn() {
+fn generic_completion_ack_is_hidden_until_a_truthful_result_arrives() {
     let mut app = test_app("openai", "gpt-4o");
     app.set_working(true);
 
@@ -4828,12 +4887,10 @@ fn repeated_generic_completion_ack_is_shown_once_per_turn() {
         app.apply(UiEvent::AssistantEnd);
     }
 
-    assert_eq!(
-        app.transcript_text()
-            .matches("Completed the requested action.")
-            .count(),
-        1,
-        "generic completion acknowledgements should not repeat per retry round: {}",
+    assert!(
+        !app.transcript_text()
+            .contains("Completed the requested action."),
+        "generic completion acknowledgements are rejected model output, not a user-facing result: {}",
         app.transcript_text()
     );
 
@@ -4843,11 +4900,10 @@ fn repeated_generic_completion_ack_is_shown_once_per_turn() {
     app.apply(UiEvent::Text {
         text: "Completed the requested action.\n".into(),
     });
-    assert_eq!(
-        app.transcript_text()
-            .matches("Completed the requested action.")
-            .count(),
-        2
+    app.apply(UiEvent::AssistantEnd);
+    assert!(
+        !app.transcript_text()
+            .contains("Completed the requested action.")
     );
 
     // Do not hide a more informative completion sentence merely because it
@@ -4861,6 +4917,18 @@ fn repeated_generic_completion_ack_is_shown_once_per_turn() {
             .count(),
         1
     );
+}
+
+#[test]
+fn fragmented_generic_completion_ack_never_flashes_into_the_transcript() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    for chunk in ["Completed ", "the requested ", "action.\n"] {
+        app.apply(UiEvent::Text { text: chunk.into() });
+        assert!(!app.transcript_text().contains("Completed"));
+    }
+    app.apply(UiEvent::AssistantEnd);
+    assert!(!app.transcript_text().contains("Completed"));
 }
 
 #[test]
@@ -5830,6 +5898,13 @@ fn uievent_serializes_and_deserializes_roundtrip() {
 
     // Every variant must round-trip through serde JSON.
     let cases = vec![
+        UiEvent::ProviderRequest {
+            audit: serde_json::json!({
+                "provider": "openai_compatible",
+                "accepted": true,
+                "response_status": 200,
+            }),
+        },
         UiEvent::Text {
             text: "hello".to_string(),
         },
@@ -6318,45 +6393,31 @@ fn queue_select_reorder_and_remove() {
 }
 
 #[test]
-fn prompt_queue_rejects_past_cap() {
+fn prompt_queue_preserves_more_than_64_fifo_items() {
     let mut app = test_app("openai", "gpt-4o");
-    for i in 0..crate::MAX_PROMPT_QUEUE {
+    for i in 0..128 {
         assert!(
             app.try_enqueue_prompt(format!("p{i}")),
-            "enqueue {i} should fit under the cap"
+            "enqueue {i} should preserve accepted work"
         );
     }
-    assert_eq!(app.queue.len(), crate::MAX_PROMPT_QUEUE);
-    assert!(
-        !app.try_enqueue_prompt("overflow"),
-        "cap must reject further enqueues"
-    );
-    assert_eq!(app.queue.len(), crate::MAX_PROMPT_QUEUE);
+    assert!(app.enqueue_prompt("p128"));
+    assert_eq!(app.queue.len(), 129);
     assert_eq!(app.queue.front().map(String::as_str), Some("p0"));
-    assert!(!app.enqueue_prompt("also-overflow"));
-    assert!(
-        app.transcript_text().contains("prompt queue full"),
-        "interactive enqueue should surface a warning"
-    );
+    assert_eq!(app.queue.back().map(String::as_str), Some("p128"));
 }
 
 #[test]
-fn enqueue_prompt_front_evicts_newest_when_full() {
+fn enqueue_prompt_front_preserves_every_existing_item_beyond_64() {
     let mut app = test_app("openai", "gpt-4o");
-    for i in 0..crate::MAX_PROMPT_QUEUE {
+    for i in 0..96 {
         assert!(app.try_enqueue_prompt(format!("p{i}")));
     }
     assert!(app.enqueue_prompt_front("priority"));
-    assert_eq!(app.queue.len(), crate::MAX_PROMPT_QUEUE);
+    assert_eq!(app.queue.len(), 97);
     assert_eq!(app.queue.front().map(String::as_str), Some("priority"));
-    // Newest tail dropped to make room; oldest non-priority remains next.
     assert_eq!(app.queue.get(1).map(String::as_str), Some("p0"));
-    assert!(
-        !app.queue
-            .iter()
-            .any(|p| p == &format!("p{}", crate::MAX_PROMPT_QUEUE - 1)),
-        "newest should be evicted"
-    );
+    assert_eq!(app.queue.back().map(String::as_str), Some("p95"));
 }
 
 #[test]
@@ -6563,7 +6624,7 @@ fn tutorial_overlay_renders_centered_content() {
 }
 
 #[test]
-fn header_shows_ctx_not_settings() {
+fn header_shows_ctx_and_reasoning() {
     let mut app = test_app("openai", "gpt-4o");
     app.density = Density::Compact;
     app.context_used = 38_000;
@@ -6577,10 +6638,8 @@ fn header_shows_ctx_not_settings() {
         "context chip missing: {screen}"
     );
     assert!(
-        !screen.contains("compact")
-            && !screen.contains("out:fold")
-            && !screen.contains("reasoning"),
-        "settings chips should stay off the header: {screen}"
+        screen.contains("reasoning: off"),
+        "reasoning chip missing: {screen}"
     );
 }
 
@@ -7258,7 +7317,8 @@ fn plan_approval_esc_parks_and_turn_status_unparks() {
         &mut app,
         &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
     );
-    assert_eq!(outcome, crate::plan_approval::PlanApprovalOutcome::Continue);
+    assert_eq!(outcome, crate::plan_approval::PlanApprovalOutcome::Park);
+    app.park_plan_approval_local();
     assert!(!app.plan_approval_capturing());
     assert!(app.plan_approval.as_ref().is_some_and(|c| c.parked));
 

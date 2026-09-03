@@ -21,6 +21,13 @@ use tokio::sync::mpsc;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiEvent {
+    /// Credential-free scalar evidence for one concrete provider attempt.
+    /// This event is diagnostic-only: the TUI traces it but never renders it.
+    /// `ChannelUi` sanitizes the typed audit before it enters this serializable
+    /// event channel, so remote relays cannot receive a request body.
+    ProviderRequest {
+        audit: serde_json::Value,
+    },
     Text {
         text: String,
     },
@@ -230,6 +237,32 @@ impl ChannelUi {
         ));
     }
 
+    fn terminal_tool_event(&self, id: &str, name: &str, status: hi_tools::ToolStatus) {
+        let (kind, verb, state) = match status {
+            hi_tools::ToolStatus::Succeeded => (
+                hi_events::EventKind::ToolCompleted,
+                hi_events::ActivityVerb::Complete,
+                hi_events::ActivityState::Succeeded,
+            ),
+            hi_tools::ToolStatus::TimedOut => (
+                hi_events::EventKind::ToolTimedOut,
+                hi_events::ActivityVerb::Fail,
+                hi_events::ActivityState::TimedOut,
+            ),
+            hi_tools::ToolStatus::Denied => (
+                hi_events::EventKind::ToolDenied,
+                hi_events::ActivityVerb::Deny,
+                hi_events::ActivityState::Denied,
+            ),
+            _ => (
+                hi_events::EventKind::ToolCompleted,
+                hi_events::ActivityVerb::Fail,
+                hi_events::ActivityState::Failed,
+            ),
+        };
+        self.tool_event(kind, verb, state, id, name);
+    }
+
     fn approval_request(
         &self,
         request: &ConfirmationRequest,
@@ -351,6 +384,12 @@ impl Ui for ChannelUi {
     fn semantic_event(&mut self, event: hi_events::RunEvent) {
         self.semantic(event);
     }
+    fn provider_request(&mut self, audit: &hi_ai::WireAudit) {
+        let value = serde_json::to_value(audit).unwrap_or_default();
+        self.send(UiEvent::ProviderRequest {
+            audit: crate::tui_event_trace::provider_request_summary(&value),
+        });
+    }
     fn assistant_text(&mut self, text: &str) {
         self.send(UiEvent::Text {
             text: text.to_string(),
@@ -422,32 +461,23 @@ impl Ui for ChannelUi {
         });
     }
     fn tool_result_id(&mut self, id: &str, name: &str, result: &str, status: hi_tools::ToolStatus) {
-        let (kind, verb, state) = match status {
-            hi_tools::ToolStatus::Succeeded => (
-                hi_events::EventKind::ToolCompleted,
-                hi_events::ActivityVerb::Complete,
-                hi_events::ActivityState::Succeeded,
-            ),
-            hi_tools::ToolStatus::TimedOut => (
-                hi_events::EventKind::ToolTimedOut,
-                hi_events::ActivityVerb::Fail,
-                hi_events::ActivityState::TimedOut,
-            ),
-            hi_tools::ToolStatus::Denied => (
-                hi_events::EventKind::ToolDenied,
-                hi_events::ActivityVerb::Deny,
-                hi_events::ActivityState::Denied,
-            ),
-            _ => (
-                hi_events::EventKind::ToolCompleted,
-                hi_events::ActivityVerb::Fail,
-                hi_events::ActivityState::Failed,
-            ),
-        };
-        self.tool_event(kind, verb, state, id, name);
+        self.terminal_tool_event(id, name, status);
         self.send(UiEvent::ToolResult {
             name: name.to_string(),
             result: result.to_string(),
+        });
+    }
+    fn plan_result_id(
+        &mut self,
+        id: &str,
+        name: &str,
+        _result: &str,
+        status: hi_tools::ToolStatus,
+        steps: &[PlanStep],
+    ) {
+        self.terminal_tool_event(id, name, status);
+        self.send(UiEvent::Plan {
+            steps: steps.to_vec(),
         });
     }
     fn tool_result(&mut self, name: &str, result: &str) {
@@ -685,9 +715,24 @@ impl Drop for Restore {
 mod tests {
     use super::*;
     use hi_events::{
-        ActivityObject, ActivityState, ActivityVerb, EventContext, EventKind, RunEvent,
-        SemanticActivity,
+        ActivityObject, ActivityState, ActivityVerb, EventContext, EventError, EventKind,
+        EventReceipt, EventSink, RunEvent, SemanticActivity,
     };
+
+    #[derive(Default)]
+    struct RecordingEventSink(std::sync::Mutex<Vec<RunEvent>>);
+
+    impl EventSink for RecordingEventSink {
+        fn publish(&self, event: RunEvent) -> std::result::Result<EventReceipt, EventError> {
+            let event_id = event.event_id.clone();
+            let mut events = self.0.lock().unwrap();
+            events.push(event);
+            Ok(EventReceipt {
+                event_id,
+                sequence: events.len() as u64,
+            })
+        }
+    }
 
     fn event(kind: EventKind, title: &str) -> RunEvent {
         RunEvent::new(
@@ -730,5 +775,46 @@ mod tests {
             .is_none()
         );
         assert!(canonical_to_ui_event(&event(EventKind::RunCompleted, "Run finished")).is_none());
+    }
+
+    #[test]
+    fn plan_result_closes_semantic_tool_without_visible_result_row() {
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let (confirmations, _confirmation_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingEventSink::default());
+        let mut ui = ChannelUi {
+            tx,
+            confirmations,
+            event_sink: Some(sink.clone()),
+            approval_store: None,
+        };
+        let steps = vec![PlanStep {
+            title: "verify the harness".into(),
+            status: hi_agent::PlanStatus::Active,
+        }];
+
+        ui.plan_result_id(
+            "plan-call-1",
+            "update_plan",
+            "Plan recorded: 0/1 done.",
+            hi_tools::ToolStatus::Succeeded,
+            &steps,
+        );
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(UiEvent::Plan { steps: received }) if received == steps
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let semantic = sink.0.lock().unwrap();
+        assert_eq!(semantic.len(), 1);
+        assert_eq!(semantic[0].kind, EventKind::ToolCompleted);
+        assert_eq!(semantic[0].activity.object, ActivityObject::Tool);
+        assert_eq!(semantic[0].activity.state, ActivityState::Succeeded);
+        assert_eq!(semantic[0].activity.group_key, "tool:plan-call-1");
+        assert_eq!(semantic[0].activity.title, "update_plan");
     }
 }

@@ -27,31 +27,12 @@ fn child_runtime() -> Result<&'static tokio::runtime::Runtime> {
     Ok(CHILD_RUNTIME.get().expect("child runtime initialized"))
 }
 
-pub(crate) fn run(
-    workspace_root: &Path,
-    executable: &Path,
-    arguments: Vec<OsString>,
-    environment: Vec<(OsString, OsString)>,
-    timeout: Duration,
-    log_path: &Path,
-) -> Result<hi_tools::ProcessExecution> {
-    run_maybe_cancelled(
-        workspace_root,
-        executable,
-        arguments,
-        environment,
-        timeout,
-        log_path,
-        None,
-    )
-}
-
 pub(crate) fn run_maybe_cancelled(
     workspace_root: &Path,
     executable: &Path,
     arguments: Vec<OsString>,
     environment: Vec<(OsString, OsString)>,
-    timeout: Duration,
+    timeout: Option<Duration>,
     log_path: &Path,
     cancellation: Option<hi_agent::TurnCancellation>,
 ) -> Result<hi_tools::ProcessExecution> {
@@ -62,15 +43,16 @@ pub(crate) fn run_maybe_cancelled(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating child log directory {}", parent.display()))?;
     }
-    // Establish the durable artifact before launch. The bounded result replaces
-    // it after completion, including typed timeout/failure information.
+    // Establish the durable artifact before launch. The typed result replaces
+    // it after completion, including timeout/failure information when present.
     std::fs::write(&log_path, [])
         .with_context(|| format!("creating child log {}", log_path.display()))?;
 
     let execution = child_runtime()?.block_on(async move {
         let runner = hi_tools::ProcessRunner::new(&workspace_root)?;
         let started = Instant::now();
-        let run = runner.run_program_with_env(executable, arguments, environment, timeout);
+        let run =
+            runner.run_program_with_env_maybe_timeout(executable, arguments, environment, timeout);
         match cancellation {
             Some(cancel) => {
                 tokio::select! {
@@ -150,7 +132,7 @@ mod tests {
             Path::new("/bin/sleep"),
             vec![OsString::from("30")],
             Vec::new(),
-            Duration::from_secs(10),
+            None,
             &dir.join("child.log"),
             Some(cancel),
         )

@@ -1,9 +1,7 @@
 //! Auto-record durable coding facts after a green verified turn.
 
 use crate::Ui;
-use crate::coding_memory::{
-    CodingFactInput, MAX_CODING_FACTS_PER_SESSION, extract_coding_facts, merge_facts_into_memory,
-};
+use crate::coding_memory::{CodingFactInput, extract_coding_facts, merge_facts_into_memory};
 use crate::memory::memory_file_at;
 
 impl crate::Agent {
@@ -11,9 +9,6 @@ impl crate::Agent {
     /// coding facts (verify command, package ownership, stack, test gate) into
     /// the session decision log and project memory. Best-effort, no model call.
     pub(crate) fn record_coding_facts_turn_end(&mut self, ui: &mut dyn Ui) {
-        if self.subagents.coding_facts_written >= MAX_CODING_FACTS_PER_SESSION {
-            return;
-        }
         if !self.report.verify.passed() || self.workspace.last_changed_files.is_empty() {
             return;
         }
@@ -33,24 +28,10 @@ impl crate::Agent {
             return;
         }
 
-        // Room under the session cap.
-        let budget = MAX_CODING_FACTS_PER_SESSION
-            .saturating_sub(self.subagents.coding_facts_written) as usize;
-        let facts: Vec<_> = facts.into_iter().take(budget).collect();
-        if facts.is_empty() {
-            return;
-        }
-
         let mut next = self.decisions.clone();
-        let before = next.entries().len();
         for fact in &facts {
             next.record(fact.clone());
         }
-        let recorded = next.entries().len().saturating_sub(before).max(
-            // record() may replace duplicates — still count attempted facts toward the cap
-            // so a sticky summary can't spam every turn.
-            facts.len().min(1),
-        );
         if let Some(session) = self.session.as_mut()
             && let Err(err) = session.record_decisions(&next)
         {
@@ -61,7 +42,7 @@ impl crate::Agent {
         self.subagents.coding_facts_written = self
             .subagents
             .coding_facts_written
-            .saturating_add(facts.len() as u32);
+            .saturating_add(u32::try_from(facts.len()).unwrap_or(u32::MAX));
         self.refresh_system_message();
 
         // Project memory merge is best-effort and independent of the decision log.
@@ -91,6 +72,5 @@ impl crate::Agent {
         let task = self.task.last_task_prompt.clone().unwrap_or_default();
         self.refresh_memory_context(&task);
         self.refresh_system_message();
-        let _ = recorded;
     }
 }

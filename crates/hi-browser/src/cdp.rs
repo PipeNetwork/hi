@@ -3,7 +3,7 @@
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -23,6 +23,25 @@ const MAX_CDP_DISCOVERY_BYTES: usize = 64 * 1024;
 const MAX_INTERCEPTED_HEADERS_BYTES: usize = 128 * 1024;
 const MAX_INTERCEPTED_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_INTERCEPTED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const CDP_COMMAND_TIMEOUT_ENV: &str = "HI_BROWSER_CDP_TIMEOUT_SECS";
+const GUARDED_FETCH_TIMEOUT_ENV: &str = "HI_BROWSER_FETCH_TIMEOUT_SECS";
+
+/// Resolve an operator-selected productive browser deadline. Normal browser
+/// commands and guarded responses stay attached until they complete, fail, or
+/// their calling turn is cancelled. A positive environment value opts into a
+/// deadline; unset, invalid, zero, and unrepresentable values mean unlimited.
+fn configured_timeout(name: &str) -> Option<Duration> {
+    let configured = std::env::var(name).ok();
+    positive_timeout_from_value(configured.as_deref())
+}
+
+fn positive_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .filter(|timeout| Instant::now().checked_add(*timeout).is_some())
+}
 
 pub async fn run(
     mode: &str,
@@ -334,13 +353,20 @@ impl CdpConn {
 
     async fn call(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<Value> {
         let id = self.send_command(session, method, params).await?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = configured_timeout(CDP_COMMAND_TIMEOUT_ENV)
+            .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                bail!("CDP {method} timed out");
-            }
-            let value = self.read_value(deadline - now).await?;
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        bail!("CDP {method} timed out");
+                    }
+                    Some(deadline - now)
+                }
+                None => None,
+            };
+            let value = self.read_value(remaining).await?;
             if value.get("id").and_then(Value::as_u64) == Some(id) {
                 if let Some(err) = value.get("error") {
                     bail!("CDP {method}: {err}");
@@ -370,16 +396,21 @@ impl CdpConn {
         Ok(id)
     }
 
-    async fn read_value(&mut self, duration: Duration) -> Result<Value> {
-        let deadline = tokio::time::Instant::now() + duration;
+    async fn read_value(&mut self, timeout: Option<Duration>) -> Result<Value> {
+        let deadline = timeout.map(|duration| tokio::time::Instant::now() + duration);
         loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                bail!("timed out waiting for a CDP frame");
-            }
-            let next = tokio::time::timeout(deadline - now, self.read.next())
-                .await
-                .map_err(|_| anyhow::anyhow!("timed out waiting for a CDP frame"))?;
+            let next = match deadline {
+                Some(deadline) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        bail!("timed out waiting for a CDP frame");
+                    }
+                    tokio::time::timeout(deadline - now, self.read.next())
+                        .await
+                        .map_err(|_| anyhow::anyhow!("timed out waiting for a CDP frame"))?
+                }
+                None => self.read.next().await,
+            };
             let Some(frame) = next else {
                 bail!("CDP websocket closed");
             };
@@ -406,12 +437,7 @@ impl CdpConn {
             if now >= deadline {
                 return Ok(());
             }
-            match tokio::time::timeout(
-                deadline - now,
-                self.read_value(Duration::from_secs(24 * 60 * 60)),
-            )
-            .await
-            {
+            match tokio::time::timeout(deadline - now, self.read_value(None)).await {
                 Ok(Ok(value)) => self.handle_message(&value).await?,
                 Ok(Err(err)) => return Err(err),
                 Err(_) => return Ok(()),
@@ -505,6 +531,19 @@ struct GuardedResponse {
 }
 
 async fn guarded_fetch(request: &Value, policy: BrowserPolicy) -> Result<GuardedResponse> {
+    guarded_fetch_with_timeout(
+        request,
+        policy,
+        configured_timeout(GUARDED_FETCH_TIMEOUT_ENV),
+    )
+    .await
+}
+
+async fn guarded_fetch_with_timeout(
+    request: &Value,
+    policy: BrowserPolicy,
+    timeout: Option<Duration>,
+) -> Result<GuardedResponse> {
     let raw_url = request
         .get("url")
         .and_then(Value::as_str)
@@ -527,8 +566,10 @@ async fn guarded_fetch(request: &Value, policy: BrowserPolicy) -> Result<Guarded
 
     let mut builder = reqwest::Client::builder()
         .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20));
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
     if matches!(url.host(), Some(Host::Domain(_))) {
         builder = builder.resolve_to_addrs(&host, &pinned_addrs);
     }
@@ -845,7 +886,105 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct NoopMessageSink;
+
+    impl Sink<Message> for NoopMessageSink {
+        type Error = WsError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn pending_cdp() -> CdpConn {
+        CdpConn {
+            write: Box::new(NoopMessageSink),
+            read: Box::new(futures_util::stream::pending()),
+            next_id: 1,
+            policy: BrowserPolicy::default(),
+            main_session: None,
+        }
+    }
+
+    #[test]
+    fn productive_browser_timeouts_are_opt_in() {
+        assert_eq!(positive_timeout_from_value(None), None);
+        assert_eq!(positive_timeout_from_value(Some("")), None);
+        assert_eq!(positive_timeout_from_value(Some("invalid")), None);
+        assert_eq!(positive_timeout_from_value(Some("0")), None);
+        assert_eq!(
+            positive_timeout_from_value(Some(" 7 ")),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            positive_timeout_from_value(Some(&u64::MAX.to_string())),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn unlimited_cdp_wait_remains_cancellable_and_explicit_timeout_fires() {
+        let mut cdp = pending_cdp();
+        let cancelled = tokio::time::timeout(Duration::from_millis(15), cdp.read_value(None)).await;
+        assert!(
+            cancelled.is_err(),
+            "an unlimited read should remain pending until its caller cancels it"
+        );
+
+        let error = cdp
+            .read_value(Some(Duration::from_millis(10)))
+            .await
+            .expect_err("an explicit timeout must still bound the read");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+    }
+
+    #[test]
+    fn ax_state_keeps_actionable_nodes_beyond_the_old_boundary() {
+        let nodes: Vec<Value> = (0..180)
+            .flat_map(|index| {
+                [
+                    json!({
+                        "role": {"value": "InlineTextBox"},
+                        "name": {"value": format!("ignored-{index}")}
+                    }),
+                    json!({
+                        "role": {"value": "button"},
+                        "name": {"value": format!("action-{index}")}
+                    }),
+                ]
+            })
+            .collect();
+        let flattened = flatten_ax(&json!({"nodes": nodes}));
+
+        assert_eq!(flattened.len(), 180);
+        assert_eq!(flattened[179].name.as_deref(), Some("action-179"));
+        assert!(resolve_point(&flattened, &ClickTarget::Index(179)).is_ok());
+    }
 
     #[test]
     fn cdp_endpoint_must_be_a_literal_loopback_browser_socket() {
@@ -1087,9 +1226,6 @@ fn flatten_ax(tree: &Value) -> Vec<AxNode> {
             x: 8.0,
             y: 8.0 + (out.len() as f64) * 12.0,
         });
-        if out.len() >= 80 {
-            break;
-        }
     }
     out
 }

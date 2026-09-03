@@ -143,14 +143,67 @@ async fn verify_failure_exhausts_retries() {
         completion(vec![Content::Text("attempt 3".into())], 1, 1),
     ];
     let mut agent = agent(responses, cfg);
-    agent.run_turn("x", &mut NullUi).await.unwrap();
+    let outcome = agent.run_turn("x", &mut NullUi).await.unwrap();
     assert_eq!(agent.last_verify(), Some(false));
     assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
-    assert!(agent.last_turn_telemetry().stalled_unfinished);
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationFailed);
 }
 
 #[tokio::test]
-async fn verify_failure_exhaustion_does_not_finalize_as_done() {
+async fn default_verification_repairs_continue_past_two_productive_cycles() {
+    let workspace = IsolatedWorkspace::new("verify-unlimited-default");
+    let mut cfg = workspace.config();
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
+        "test",
+        "test \"$(cat changed.rs)\" = 3",
+    )]);
+    cfg.gates.max_verify_repairs = AgentGates::default().max_verify_repairs;
+    assert_eq!(cfg.gates.max_verify_repairs, crate::UNLIMITED_REPAIR_CYCLES);
+
+    let responses = vec![
+        write_content_completion("changed.rs", "0\n"),
+        completion(vec![Content::Text("initial attempt".into())], 1, 1),
+        write_content_completion("changed.rs", "1\n"),
+        completion(vec![Content::Text("repair one".into())], 1, 1),
+        write_content_completion("changed.rs", "2\n"),
+        completion(vec![Content::Text("repair two".into())], 1, 1),
+        write_content_completion("changed.rs", "3\n"),
+        completion(vec![Content::Text("repair three".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn("make changed.rs pass its verification gate", &mut ui)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(agent.last_verify(), Some(true));
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 4);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path("changed.rs")).unwrap(),
+        "3\n"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("verifying (4/unlimited)")),
+        "unlimited repair status should remain human-readable: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .all(|status| !status.contains("4294967295")),
+        "the unlimited sentinel must not leak into UI text: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn verify_failure_remains_failed_without_a_duplicate_recap() {
     let workspace = IsolatedWorkspace::new("verify-no-finalize");
     let mut cfg = workspace.config();
     cfg.memory.finalize = true;
@@ -163,23 +216,19 @@ async fn verify_failure_exhaustion_does_not_finalize_as_done() {
         write_completion(&p),
         completion(vec![Content::Text("attempt 1".into())], 1, 1),
         completion(vec![Content::Text("attempt 2".into())], 1, 1),
-        // Would be consumed by finalize_turn if failed verification were
-        // incorrectly treated as a completed turn.
         completion(
-            vec![Content::Text("FINALIZE RECAP SHOULD NOT RUN".into())],
+            vec![Content::Text("FINALIZE RECAP DESCRIBES FAILURE".into())],
             1,
             1,
         ),
     ];
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
-    agent.run_turn("x", &mut ui).await.unwrap();
+    let outcome = agent.run_turn("x", &mut ui).await.unwrap();
 
     assert_eq!(agent.last_verify(), Some(false));
-    assert!(
-        agent.last_turn_telemetry().stalled_unfinished,
-        "failed verification exhaustion should be an unfinished turn"
-    );
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationFailed);
     assert!(
         ui.statuses
             .iter()
@@ -188,8 +237,8 @@ async fn verify_failure_exhaustion_does_not_finalize_as_done() {
         ui.statuses
     );
     assert!(
-        !ui.assistant.contains("FINALIZE RECAP SHOULD NOT RUN"),
-        "failed verification must not trigger finalization, assistant was: {}",
+        !ui.assistant.contains("FINALIZE RECAP DESCRIBES FAILURE"),
+        "a visible failed answer must not trigger a duplicate recap request: {}",
         ui.assistant
     );
 }
@@ -506,7 +555,7 @@ async fn proactive_verify_replays_a_successful_check_to_the_model() {
                 )
             })
         }),
-        "successful fast check must be replayed in the next tool result"
+        "successful fast check must be replayed in the next tool result: {second_request:?}"
     );
 }
 

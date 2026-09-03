@@ -35,8 +35,8 @@ impl HelpSection {
 
 /// Canonical everyday commands, in the order `/help` and an empty Ctrl-K list them.
 pub const CORE_COMMANDS: &[&str] = &[
-    "verify", "undo", "retry", "diff", "sessions", "status", "config", "compact", "copy", "files",
-    "doctor", "clear", "exit", "help",
+    "verify", "undo", "retry", "diff", "sessions", "status", "config", "engine", "compact", "copy",
+    "files", "doctor", "clear", "exit", "help",
 ];
 
 const PROJECT_COMMANDS: &[&str] = &[

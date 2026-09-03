@@ -4,16 +4,15 @@ use serde::{Deserialize, Serialize};
 
 /// Whether the agent satisfied the turn's completion contract.
 ///
-/// A deterministic pass on a settled, changed workspace is authoritative for
-/// a normal mutation turn. A stalled no-change turn remains incomplete because
-/// baseline checks cannot prove that the requested action happened.
+/// Normal completion is distinct from a blocked/cancelled turn and from a
+/// failure. Legacy `incomplete` records deserialize as [`Self::Failed`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
     Completed,
-    Incomplete,
     Blocked,
     Cancelled,
+    #[serde(alias = "Incomplete", alias = "incomplete", alias = "Failed")]
     Failed,
 }
 
@@ -31,8 +30,8 @@ pub enum VerificationStatus {
 /// **Completion-review / goal-skeptic** state for the turn.
 ///
 /// Combined from independent/large-diff review and long-horizon skeptic via
-/// `combined_review_status`. Steer-phase answer-repair exhaustion does **not**
-/// set this field (it stalls as `TurnStopReason::Stalled` instead).
+/// `combined_review_status`. Steer-phase answer repair does **not** set this
+/// field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewStatus {
@@ -57,7 +56,15 @@ pub enum TurnStopReason {
     /// Goal skeptic escalated/skipped; turn may still Complete with a scar.
     ReviewEscalated,
     ToolModeDenied,
+    /// A productive/fault-recovery loop stopped because it produced no new
+    /// evidence. Kept distinct from user-configured execution limits.
+    #[serde(alias = "Stalled", alias = "stalled")]
+    NoProgress,
+    #[serde(alias = "StepLimit")]
     StepLimit,
+    /// An explicitly configured finite per-turn tool-execution ceiling was
+    /// reached. The ordinary default is unlimited.
+    ToolLimit,
     /// The turn's soft wall-clock budget expired, so it stopped starting new
     /// work and settled early. Distinct from [`Self::StepLimit`] (model-call
     /// ceiling) and from a hard `turn_timeout`, which settles nothing.
@@ -65,7 +72,6 @@ pub enum TurnStopReason {
     /// Per-session turn limit (`/turns <n>`) reached before this turn started.
     /// Distinct from [`Self::StepLimit`], which is the per-turn model-call cap.
     TurnLimit,
-    Stalled,
     Cancelled,
     InfrastructureFailure,
 }
@@ -135,14 +141,22 @@ impl TurnOutcome {
     /// Process exit code for one-shot CLI runs.
     ///
     /// - `0` completed + passed / N/A (or unverified when allowed)
-    /// - `1` incomplete / blocked / verify failed / unverified
-    /// - `3` failed / infrastructure error
+    /// - `1` blocked / non-infrastructure failure / verify failed / unverified
+    /// - `3` infrastructure error
     /// - `130` cancelled
     pub fn exit_code(&self, allow_unverified: bool) -> i32 {
         match self.status {
             TurnStatus::Cancelled => 130,
-            TurnStatus::Failed => 3,
-            TurnStatus::Incomplete | TurnStatus::Blocked => 1,
+            TurnStatus::Failed => {
+                if self.verification == VerificationStatus::InfrastructureError
+                    || self.stop_reason == TurnStopReason::InfrastructureFailure
+                {
+                    3
+                } else {
+                    1
+                }
+            }
+            TurnStatus::Blocked => 1,
             TurnStatus::Completed => match self.verification {
                 VerificationStatus::Passed | VerificationStatus::NotApplicable => 0,
                 VerificationStatus::Unverified if allow_unverified => 0,
@@ -153,17 +167,107 @@ impl TurnOutcome {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        EffectiveModelRoute, ReviewStatus, TurnOutcome, TurnStatus, TurnStopReason,
+        VerificationStatus,
+    };
+
+    fn outcome(
+        status: TurnStatus,
+        verification: VerificationStatus,
+        stop_reason: TurnStopReason,
+    ) -> TurnOutcome {
+        TurnOutcome {
+            status,
+            verification,
+            review: ReviewStatus::NotRequired,
+            stop_reason,
+            changed_files: Vec::new(),
+            verified_workspace_revision: None,
+            effective_route: EffectiveModelRoute {
+                provider: None,
+                model: "test".into(),
+            },
+            review_same_model: false,
+            leftover: None,
+            plan_leftover: None,
+        }
+    }
+
+    #[test]
+    fn legacy_incomplete_status_deserializes_as_failed_without_re_emitting_it() {
+        for legacy in [r#""incomplete""#, r#""Incomplete""#] {
+            let status: TurnStatus = serde_json::from_str(legacy).unwrap();
+            assert_eq!(status, TurnStatus::Failed);
+            assert_eq!(serde_json::to_string(&status).unwrap(), r#""failed""#);
+        }
+    }
+
+    #[test]
+    fn legacy_stalled_reason_deserializes_as_no_progress_without_becoming_a_limit() {
+        for legacy in [r#""stalled""#, r#""Stalled""#] {
+            let reason: TurnStopReason = serde_json::from_str(legacy).unwrap();
+            assert_eq!(reason, TurnStopReason::NoProgress);
+            assert_eq!(serde_json::to_string(&reason).unwrap(), r#""no_progress""#);
+        }
+    }
+
+    #[test]
+    fn tool_limit_has_a_distinct_stable_wire_value() {
+        let encoded = serde_json::to_string(&TurnStopReason::ToolLimit).unwrap();
+        assert_eq!(encoded, r#""tool_limit""#);
+        assert_eq!(
+            serde_json::from_str::<TurnStopReason>(&encoded).unwrap(),
+            TurnStopReason::ToolLimit
+        );
+
+        // Historical records remain unambiguous and readable.
+        assert_eq!(
+            serde_json::from_str::<TurnStopReason>(r#""step_limit""#).unwrap(),
+            TurnStopReason::StepLimit
+        );
+    }
+
+    #[test]
+    fn failed_exit_codes_distinguish_contract_failure_from_infrastructure() {
+        assert_eq!(
+            outcome(
+                TurnStatus::Failed,
+                VerificationStatus::Passed,
+                TurnStopReason::StepLimit,
+            )
+            .exit_code(false),
+            1
+        );
+        assert_eq!(
+            outcome(
+                TurnStatus::Failed,
+                VerificationStatus::InfrastructureError,
+                TurnStopReason::InfrastructureFailure,
+            )
+            .exit_code(false),
+            3
+        );
+    }
+}
+
 /// How session state was handled before [`crate::Agent::cleanup_turn`] on cancel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionRollback {
     /// Frontend already rewound transcript/goals/plan; agent must not truncate again.
     AlreadyApplied,
-    /// Agent should undo new checkpoints (if any) and truncate to the turn message start.
-    AgentOwned { checkpoint_count_before: usize },
+    /// Agent should undo a checkpoint created by this turn (if any), restore the
+    /// exact bounded checkpoint stack from before the turn, and truncate to the
+    /// turn message start. Comparing the stack identity rather than only its
+    /// length matters once retention is full: pushing a new checkpoint evicts
+    /// the oldest entry and leaves the length unchanged.
+    AgentOwned { checkpoint_refs_before: Vec<String> },
 }
 
 /// Abnormal turn teardown requested by a frontend (not used on successful `run_turn`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnCleanupKind {
     /// User interrupt / dropped turn future.
     Cancel { session: SessionRollback },

@@ -75,7 +75,9 @@ rate at the end of the job.
 - **Architecture**: the uploaded binary must match the task images. Harbor on
   Apple Silicon uses aarch64 images by default; build accordingly.
 - **Timeouts**: Terminal-Bench tasks carry their own generous agent timeouts;
-  hi's dynamic step caps apply within them. Use `--timeout-multiplier` on
-  `harbor run` for slow models.
+  hi does not add a default whole-turn deadline or model-round cap. Pass
+  `--turn-deadline` or `--max-steps` explicitly when a particular campaign
+  needs an inner settlement bound. Use `--timeout-multiplier` on `harbor run`
+  for slow models.
 - **Cost**: the full dataset is hundreds of agent turns. Always run `sample`
   first and extrapolate spend before `full`.

@@ -1,0 +1,9 @@
+package hi:engine@1.0.0;
+
+/// The component has no host imports. All effects are requested as validated
+/// actions returned from `step`, which keeps the guest unable to bypass the
+/// native substrate.
+world engine {
+  export step: func(input-json: string) -> string;
+  export serialize-state: func() -> list<u8>;
+}

@@ -5,12 +5,6 @@
 use super::common::*;
 use super::*;
 
-// `curate_turn_end` writes through `skills::skill_roots()`, which reads the
-// process-global `HI_GLOBAL_SKILLS_DIR`. Serialize the env-mutating tests (async,
-// so a tokio mutex — held across the `.await` while the env must stay set).
-static ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
-
 fn unique_dir(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "hi-curate-{tag}-{}-{}",
@@ -22,13 +16,7 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
     ))
 }
 
-fn verified_turn_agent(
-    response: &str,
-    workspace: &std::path::Path,
-    global_skills_dir: &std::path::Path,
-) -> Agent {
-    // SAFETY: serialized by ENV_LOCK; no concurrent reader depends on the default.
-    unsafe { std::env::set_var("HI_GLOBAL_SKILLS_DIR", global_skills_dir) };
+fn verified_turn_agent(response: &str, workspace: &std::path::Path) -> Agent {
     let mut cfg = config();
     cfg.paths.workspace_root = workspace.to_path_buf();
     cfg.paths.state_root = workspace.join(".hi/state");
@@ -54,11 +42,8 @@ fn verified_turn_agent(
 
 #[tokio::test]
 async fn curate_writes_skill_from_verified_turn() {
-    let _guard = ENV_LOCK.lock().await;
     let dir = unique_dir("write");
-    let global = unique_dir("write-global");
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&global);
     std::fs::create_dir_all(&dir).unwrap();
 
     let response = "Here is a reusable technique:\n\n\
@@ -69,7 +54,7 @@ async fn curate_writes_skill_from_verified_turn() {
          ---\n\
          # Reproduce Before Fixing\n\n\
          Write a failing test that captures the bug, then fix until it passes.";
-    let mut agent = verified_turn_agent(response, &dir, &global);
+    let mut agent = verified_turn_agent(response, &dir);
 
     let mut ui = NullUi;
     agent.curate_turn_end(0, &mut ui).await;
@@ -88,27 +73,17 @@ async fn curate_writes_skill_from_verified_turn() {
     let body = std::fs::read_to_string(&written).unwrap();
     assert!(body.contains("name: Reproduce Before Fixing"));
     assert!(body.contains("scope: project"));
-    assert!(
-        !global.exists(),
-        "model-requested global scope must not write cross-project state"
-    );
-
-    // SAFETY: serialized by ENV_LOCK.
-    unsafe { std::env::remove_var("HI_GLOBAL_SKILLS_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn curate_stays_silent_when_model_declines() {
-    let _guard = ENV_LOCK.lock().await;
     let dir = unique_dir("silent");
-    let global = unique_dir("silent-global");
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&global);
     std::fs::create_dir_all(&dir).unwrap();
 
     // No frontmatter in the response → the silence path: nothing is written.
-    let mut agent = verified_turn_agent("No reusable, general technique here.", &dir, &global);
+    let mut agent = verified_turn_agent("No reusable, general technique here.", &dir);
 
     let mut ui = NullUi;
     agent.curate_turn_end(0, &mut ui).await;
@@ -123,38 +98,33 @@ async fn curate_stays_silent_when_model_declines() {
         .unwrap_or(true);
     assert!(empty, "no skill dir should be created on the silence path");
 
-    // SAFETY: serialized by ENV_LOCK.
-    unsafe { std::env::remove_var("HI_GLOBAL_SKILLS_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
-async fn curate_respects_session_cap() {
-    let _guard = ENV_LOCK.lock().await;
-    let dir = unique_dir("cap");
-    let global = unique_dir("cap-global");
+async fn curate_continues_after_the_previous_session_cap() {
+    let dir = unique_dir("past-old-cap");
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&global);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let mut agent = verified_turn_agent("unused", &dir, &global);
-    // Already at the cap: the model is never consulted and nothing is written.
-    agent.subagents.auto_skills_written = crate::agent::MAX_AUTO_SKILLS_PER_SESSION;
+    let response = "---\n\
+        name: Preserve Long Plans\n\
+        description: Keep every distinct plan item until it is settled.\n\
+        scope: project\n\
+        ---\n\
+        # Preserve Long Plans\n\n\
+        Do not discard later objectives merely because earlier work was lengthy.";
+    let mut agent = verified_turn_agent(response, &dir);
+    agent.subagents.auto_skills_written = 3;
 
     let mut ui = NullUi;
     agent.curate_turn_end(0, &mut ui).await;
 
-    assert_eq!(
-        agent.subagents.auto_skills_written,
-        crate::agent::MAX_AUTO_SKILLS_PER_SESSION
+    assert_eq!(agent.subagents.auto_skills_written, 4);
+    assert!(
+        dir.join(".hi/skills/preserve-long-plans/SKILL.md").exists(),
+        "curation must not stop solely because three earlier skills were written"
     );
-    let skills = dir.join(".hi/skills");
-    let empty = std::fs::read_dir(&skills)
-        .map(|mut d| d.next().is_none())
-        .unwrap_or(true);
-    assert!(empty, "capped session must write no further skills");
 
-    // SAFETY: serialized by ENV_LOCK.
-    unsafe { std::env::remove_var("HI_GLOBAL_SKILLS_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }

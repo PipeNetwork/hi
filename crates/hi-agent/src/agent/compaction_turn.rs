@@ -117,6 +117,11 @@ impl crate::Agent {
 
     /// Reclaim context using a specific strategy (e.g. `/compact <kind>`).
     pub async fn compact_with(&mut self, kind: CompactionKind, ui: &mut dyn Ui) -> Result<()> {
+        // Compaction runs between user turns. Remove ephemeral mode/review/
+        // implementation controls first so a summary cannot fossilize an old
+        // PLAN MODE restriction after the user exits it.
+        self.messages.strip_previous_turn_blocks();
+        self.persisted = self.persisted.min(self.messages.len());
         match kind {
             CompactionKind::Summarize => self.compact_summarize(ui).await,
             CompactionKind::Hybrid { keep_recent } => self.compact_hybrid(keep_recent, ui).await,
@@ -552,8 +557,7 @@ impl crate::Agent {
 
         self.report
             .last_turn_telemetry
-            .compaction
-            .push(crate::CompactionEvent {
+            .record_compaction(crate::CompactionEvent {
                 freed_chars: freed as u64,
                 keep_recent: self.config.memory.in_turn_keep_tool_results,
             });
@@ -615,10 +619,26 @@ impl crate::Agent {
             StreamEvent::Warning(text) => ui.top_status(&text),
             StreamEvent::Reasoning(_) => {}
             StreamEvent::WireAudit(_) => {}
+            StreamEvent::ToolCallDelta { .. } => {}
         };
-        let completion = match self.provider.stream(request, &mut sink).await {
-            Ok(completion) => completion,
-            Err(err) => {
+        let timeout = self.side_call_timeout();
+        let completion = match crate::agent::turn::await_side_call(
+            timeout,
+            self.provider.stream(request, &mut sink),
+        )
+        .await
+        {
+            Err(timeout) => {
+                ui.assistant_end();
+                ui.status(&format!(
+                    "compaction summary timed out after {:.1}s; keeping the existing history",
+                    timeout.as_secs_f64()
+                ));
+                let _ = self.persist();
+                return Ok(None);
+            }
+            Ok(Ok(completion)) => completion,
+            Ok(Err(err)) => {
                 // Summarize is a side call — don't let its request size clobber
                 // the main conversation's `context_used` gauge.
                 self.add_side_error_usage(&err);

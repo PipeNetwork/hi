@@ -57,10 +57,10 @@ pub(crate) fn apply_candidate_and_reverify_cancellable(
             .is_some_and(hi_agent::TurnCancellation::is_cancelled)
     };
     let merge_queue_started = Instant::now();
-    let _merge_lease = match resource_governor::acquire_while(
+    let _merge_lease = match resource_governor::acquire_while_optional(
         state_root,
         ResourceClass::Merge,
-        Duration::from_secs(120),
+        queue_timeout("HI_MERGE_QUEUE_TIMEOUT_SECS"),
         &stop,
     ) {
         Ok(lease) => lease,
@@ -95,16 +95,10 @@ pub(crate) fn apply_candidate_and_reverify_cancellable(
         }
     };
 
-    let verifier_timeout = Duration::from_secs(
-        std::env::var("HI_VERIFIER_QUEUE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|&seconds| seconds > 0)
-            .unwrap_or(120),
-    );
+    let verifier_timeout = queue_timeout("HI_VERIFIER_QUEUE_TIMEOUT_SECS");
     let apply_ms = apply_started.elapsed().as_millis();
     let verifier_queue_started = Instant::now();
-    let _verifier_lease = match resource_governor::acquire_while(
+    let _verifier_lease = match resource_governor::acquire_while_optional(
         state_root,
         ResourceClass::Verifier,
         verifier_timeout,
@@ -179,6 +173,18 @@ pub(crate) fn apply_candidate_and_reverify_cancellable(
     let rollback =
         restore_checkpoint_sealed_sync(destination, &pre_apply, &post_verify, state_root);
     Err(combine_rollback_error(reason, rollback))
+}
+
+fn queue_timeout(name: &str) -> Option<Duration> {
+    let configured = std::env::var(name).ok();
+    queue_timeout_from_value(configured.as_deref())
+}
+
+fn queue_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
 }
 
 fn combine_rollback_error(error: anyhow::Error, rollback: Result<usize>) -> anyhow::Error {
@@ -456,4 +462,20 @@ fn same_checkpoint_tree(root: &Path, left: &str, right: &str) -> Result<bool> {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
     Ok(tree(root, left)? == tree(root, right)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_capacity_waits_are_unlimited_by_default() {
+        assert_eq!(queue_timeout_from_value(None), None);
+        assert_eq!(queue_timeout_from_value(Some("0")), None);
+        assert_eq!(queue_timeout_from_value(Some("invalid")), None);
+        assert_eq!(
+            queue_timeout_from_value(Some("7")),
+            Some(Duration::from_secs(7))
+        );
+    }
 }

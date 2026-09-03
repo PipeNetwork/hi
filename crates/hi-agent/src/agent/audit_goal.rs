@@ -1,11 +1,11 @@
-//! The goal completion audit: one bounded side-call that runs when a
+//! The goal completion audit: one auxiliary side-call that runs when a
 //! long-horizon goal is about to finish, comparing the "done" claim against the
 //! objective's referenced documents and the actual repository contents. The
 //! production failure this closes: a goal driven from a large plan document was
 //! marked complete with a fraction of the plan built — every per-turn gate saw a
 //! green build, and nothing ever asked "is the *plan* delivered?". Missing work
 //! is appended to the goal as new pending sub-goals so the drive continues;
-//! modeled on the other bounded side-calls ([`decompose_goal`], the skeptic):
+//! modeled on the other auxiliary side-calls ([`decompose_goal`], the skeptic):
 //! chat-only, usage booked, no history recorded, fail-open.
 //!
 //! [`decompose_goal`]: crate::Agent::decompose_goal
@@ -18,14 +18,6 @@ use crate::Ui;
 use crate::agent::plan_goal::{PlannerInput, drop_meta_milestones, parse_sub_goals, planner_input};
 use crate::goal::GoalStatus;
 
-/// Runaway guard on audit rounds — NOT the working bound. The audit loop's
-/// real terminator is convergence: `Goal::append_missing` dedupes against
-/// every existing sub-goal, so an auditor repeating itself appends nothing and
-/// the goal finishes. This cap only stops a pathological auditor that invents
-/// endless *novel* work, so it is sized generously.
-pub(crate) const MAX_AUDIT_ROUNDS: u32 = 10;
-/// Ceiling on milestones appended per audit round.
-const MAX_APPENDED_PER_AUDIT: usize = 10;
 /// Bounds on the repository listing shown to the auditor. Wide enough that a
 /// real project lists whole — a truncated listing makes absent components
 /// (`kernels/`, `runtime/`) indistinguishable from unlisted ones.
@@ -66,24 +58,16 @@ pub(crate) enum AuditVerdict {
 
 impl crate::Agent {
     /// Gate a goal that has just reached `Done`: run the completion audit and,
-    /// when it finds missing deliverables (within the audit-round budget),
-    /// append them as pending sub-goals — reactivating the goal so the drive
-    /// continues. Fail-open on an unavailable auditor. The caller persists the
-    /// goal afterwards.
+    /// when it finds missing deliverables, append them as pending sub-goals —
+    /// reactivating the goal so the drive continues. Repeated findings converge
+    /// through `Goal::append_missing` deduplication; novel required work is not
+    /// discarded because an arbitrary round count was reached. Fail-open on an
+    /// unavailable auditor. The caller persists the goal afterwards.
     pub(crate) async fn audit_goal_completion(&mut self, ui: &mut dyn Ui) {
         let Some(goal) = self.goals.structured.as_ref() else {
             return;
         };
         if goal.status != GoalStatus::Done {
-            return;
-        }
-        if goal.audit_rounds >= MAX_AUDIT_ROUNDS {
-            // Budget already spent reopening this goal; let this completion
-            // stand without another call.
-            if let Some(goal) = self.goals.structured.as_mut() {
-                goal.objective_complete = true;
-                goal.push_event("audit", "max audit rounds — accepting completion");
-            }
             return;
         }
         let goal_snapshot = goal.clone();
@@ -110,7 +94,7 @@ impl crate::Agent {
                     );
                     ui.status(&format!(
                         "🔎 completion audit found {appended} missing milestone(s) — \
-                         continuing (audit round {rounds}/{MAX_AUDIT_ROUNDS}): {}",
+                         continuing (audit round {rounds}): {}",
                         items.first().map(String::as_str).unwrap_or("")
                     ));
                 } else {
@@ -187,9 +171,21 @@ impl crate::Agent {
                 text.push_str(&t);
             }
         };
-        let completion = match self.provider.stream(request, &mut sink).await {
-            Ok(completion) => completion,
-            Err(err) => {
+        let timeout = self.side_call_timeout();
+        let completion = match crate::agent::turn::await_side_call(
+            timeout,
+            self.provider.stream(request, &mut sink),
+        )
+        .await
+        {
+            Err(timeout) => {
+                return AuditVerdict::Unavailable(format!(
+                    "auditor timed out after {:.1}s",
+                    timeout.as_secs_f64()
+                ));
+            }
+            Ok(Ok(completion)) => completion,
+            Ok(Err(err)) => {
                 self.add_side_error_usage(&err);
                 return AuditVerdict::Unavailable(format!("{err:#}"));
             }
@@ -300,8 +296,10 @@ fn parse_audit_verdict(text: &str) -> AuditVerdict {
     if first.to_ascii_lowercase().starts_with("complete") {
         return AuditVerdict::Complete;
     }
-    let mut items = drop_meta_milestones(parse_sub_goals(text));
-    items.truncate(MAX_APPENDED_PER_AUDIT);
+    // The response is already bounded by the provider token/byte budget. Keep
+    // every normalized actionable finding so required work cannot disappear
+    // merely because the auditor found more than an arbitrary item count.
+    let items = drop_meta_milestones(parse_sub_goals(text));
     if items.is_empty() {
         AuditVerdict::Unavailable("auditor produced no actionable milestones".to_string())
     } else {
@@ -339,14 +337,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_list_is_capped() {
+    fn missing_list_preserves_every_actionable_finding() {
         let many = (0..30)
             .map(|i| format!("Implement component {i}"))
             .collect::<Vec<_>>()
             .join("\n");
         match parse_audit_verdict(&many) {
             AuditVerdict::Missing(items) => {
-                assert!(items.len() <= MAX_APPENDED_PER_AUDIT)
+                assert_eq!(items.len(), 30);
+                assert_eq!(
+                    items.first().map(String::as_str),
+                    Some("Implement component 0")
+                );
+                assert_eq!(
+                    items.last().map(String::as_str),
+                    Some("Implement component 29")
+                );
             }
             _ => panic!("expected Missing"),
         }

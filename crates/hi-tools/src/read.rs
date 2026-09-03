@@ -213,7 +213,27 @@ async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) -> Result<Str
 }
 
 /// Run the `grep` tool against `arguments` (already-parsed JSON).
+#[cfg(test)]
 pub(crate) async fn run_grep(root: &std::path::Path, arguments: &str) -> Result<ToolOutcome> {
+    run_grep_with_runner_maybe_timeout(root, None, arguments, None).await
+}
+
+/// Like [`run_grep`] with a caller-owned process runner for the ripgrep fast
+/// path. The fallback remains entirely in-process.
+pub(crate) async fn run_grep_with_runner(
+    root: &std::path::Path,
+    process_runner: Option<&crate::ProcessRunner>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    run_grep_with_runner_maybe_timeout(root, process_runner, arguments, None).await
+}
+
+async fn run_grep_with_runner_maybe_timeout(
+    root: &std::path::Path,
+    process_runner: Option<&crate::ProcessRunner>,
+    arguments: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<ToolOutcome> {
     let args: GrepArgs = crate::tools::parse(arguments)?;
     let pattern = &args.pattern;
     let path = args.path.as_deref().unwrap_or(".");
@@ -257,9 +277,15 @@ pub(crate) async fn run_grep(root: &std::path::Path, arguments: &str) -> Result<
         // and verification. `rg --max-count` caps matches per file, not the
         // total output, so `Command::output()` could still retain gigabytes
         // before the final model-content truncation.
-        let runner = ProcessRunner::new(root)?;
+        let owned_runner = process_runner
+            .is_none()
+            .then(|| ProcessRunner::new(root))
+            .transpose()?;
+        let runner = process_runner
+            .or(owned_runner.as_ref())
+            .expect("grep runner is either borrowed or constructed above");
         let output = runner
-            .run_program("rg", &cmd_args, std::time::Duration::from_secs(60))
+            .run_program_maybe_timeout("rg", &cmd_args, timeout)
             .await;
         match output {
             Ok(execution) if execution.status == ToolStatus::Succeeded => {
@@ -413,7 +439,8 @@ mod tests {
     use super::{
         DEFAULT_READ_LIMIT, MAX_GREP_FILE_BYTES, MAX_READ_FILE_BYTES, format_read, is_binary,
         looks_like_numbered_read, read_output_budget, result_char_budget,
-        ripgrep_binary_unavailable, run_grep_fallback_sync, run_list_sync, run_read,
+        ripgrep_binary_unavailable, run_grep_fallback_sync, run_grep_with_runner_maybe_timeout,
+        run_list_sync, run_read,
     };
 
     #[test]
@@ -756,6 +783,50 @@ mod tests {
             "{searched}"
         );
         assert!(!searched.contains(".cargo-home"), "{searched}");
+    }
+
+    #[tokio::test]
+    async fn ripgrep_deadline_is_absent_by_default_and_explicit_when_requested() {
+        if std::process::Command::new("rg")
+            .arg("--version")
+            .output()
+            .map(|output| !output.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping: rg not on PATH");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "hi-grep-deadline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("source.txt"), "find-this-symbol\n").unwrap();
+
+        let output = run_grep_with_runner_maybe_timeout(
+            &root,
+            None,
+            r#"{"pattern":"find-this-symbol"}"#,
+            None,
+        )
+        .await
+        .expect("default-unlimited ripgrep should complete");
+        assert!(output.content.contains("find-this-symbol"), "{output:?}");
+
+        let error = run_grep_with_runner_maybe_timeout(
+            &root,
+            None,
+            r#"{"pattern":"find-this-symbol"}"#,
+            Some(std::time::Duration::ZERO),
+        )
+        .await
+        .expect_err("an explicit zero-duration deadline must fire");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

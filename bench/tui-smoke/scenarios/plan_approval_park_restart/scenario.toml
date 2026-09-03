@@ -1,0 +1,95 @@
+schema_version = 1
+name = "plan-approval-park-restart"
+tags = ["curated", "fuzz_state_template"]
+timeout_ms = 45000
+
+[[provider.steps]]
+id = "draft-plan"
+[provider.steps.response]
+kind = "tool_call"
+name = "update_plan"
+arguments = { steps = [{ title = "Persist the parked step", status = "pending" }] }
+
+[[provider.steps]]
+id = "draft-plan-answer"
+[provider.steps.response]
+kind = "text"
+text = "The plan can be parked safely."
+
+[[actions]]
+kind = "send_line"
+text = "/plan persist the parked step"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/plan/incomplete" = true }
+timeout_ms = 10000
+
+[[actions]]
+kind = "send_line"
+text = "/plan off"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "approval_shown" }
+timeout_ms = 5000
+
+[[actions]]
+kind = "send_key"
+key = "escape"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "approval_decided", "/data/decision" = "parked" }
+timeout_ms = 5000
+
+[[actions]]
+kind = "restart"
+
+[[actions]]
+kind = "send_line"
+text = "/view-plan"
+
+[[actions]]
+kind = "wait_quiescent"
+source = "events"
+quiet_ms = 300
+timeout_ms = 5000
+
+[[actions]]
+kind = "send_key"
+key = "escape"
+
+[[actions]]
+kind = "wait_quiescent"
+source = "events"
+quiet_ms = 300
+timeout_ms = 5000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ready" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "approval_shown", "/data/kind" = "plan" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "approval_decided", "/data/decision" = "parked" }
+exact = 2
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

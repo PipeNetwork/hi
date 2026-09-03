@@ -30,10 +30,6 @@ use crate::types::{
     file_utf16_to_character, parse_hover, parse_locations,
 };
 
-/// Maximum number of synced-document hashes to retain. Beyond this the map
-/// is cleared (see `synced` field doc).
-const SYNCED_CAP: usize = 256;
-
 /// Status of the LSP subsystem, for `/lsp status`.
 #[derive(Clone, Debug)]
 pub struct ServerStatus {
@@ -54,12 +50,11 @@ pub struct LspManager {
     /// until the next query triggers a respawn via `is_alive()`. Acceptable
     /// for a status display; `status()` (async) is authoritative.
     running: StdMutex<HashMap<Language, bool>>,
-    /// Content hash of the last text synced per URI, so we skip redundant
-    /// `didChange` notifications when a query re-reads an unchanged file.
-    /// Capped at `SYNCED_CAP` entries; on overflow the whole map is cleared
-    /// (the hashes are only a dedup optimization — clearing forces a one-time
-    /// re-sync of open files, which is correct, and prevents unbounded growth
-    /// in a long session touching many files).
+    /// Exact content hash of the last text synced per URI, so we skip redundant
+    /// `didChange` notifications when a query re-reads an unchanged file. The
+    /// entry lives until the document closes or its server restarts. Evicting
+    /// live entries loses whether a URI is already open and can incorrectly
+    /// send a second `didOpen` during a long session.
     synced: StdMutex<HashMap<String, u64>>,
     /// Test/fake-LSP overlay: when a path is present, diagnostics skip the
     /// real language server (so write/edit tests do not spawn rust-analyzer).
@@ -70,6 +65,13 @@ pub struct LspManager {
 struct InjectedDiagnostics {
     delay: Duration,
     state: DiagnosticState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncDisposition {
+    Unchanged,
+    DidOpen,
+    DidChange,
 }
 
 impl LspManager {
@@ -337,27 +339,11 @@ impl LspManager {
         let lang = self.ensure_for_path(&path).await?;
         let uri = path_to_uri(&path);
         let hash = fxhash(text);
-        let already_open;
-        {
-            let mut synced = lock_recover(&self.synced);
-            already_open = synced.contains_key(&uri);
-            if already_open && synced.get(&uri).copied() == Some(hash) {
-                return Ok(()); // unchanged — skip the didChange
-            }
-            if already_open {
-                // New text for an already-open doc: clear stale pushed
-                // diagnostics so stale errors don't linger after the server
-                // re-publishes (or publishes nothing) for the new content.
-                // The didChange below triggers a fresh publishDiagnostics.
-            }
-            if !already_open && synced.len() >= SYNCED_CAP {
-                // Cap reached: clear the dedup map. Open files will re-sync
-                // on their next query (a one-time cost), preventing unbounded
-                // growth in a long session.
-                synced.clear();
-            }
-            synced.insert(uri.clone(), hash);
-        }
+        let already_open = match self.record_synced_hash(uri.clone(), hash) {
+            SyncDisposition::Unchanged => return Ok(()),
+            SyncDisposition::DidOpen => false,
+            SyncDisposition::DidChange => true,
+        };
         // Clone the Arc handle and drop the servers lock before the
         // didChange/didOpen round-trip (which can take up to the drain
         // timeout), so a sync for one language doesn't block queries for
@@ -408,6 +394,21 @@ impl LspManager {
             Err(retry_err) => {
                 lock_recover(&self.synced).remove(&uri);
                 Err(retry_err)
+            }
+        }
+    }
+
+    fn record_synced_hash(&self, uri: String, hash: u64) -> SyncDisposition {
+        let mut synced = lock_recover(&self.synced);
+        match synced.get(&uri).copied() {
+            Some(previous) if previous == hash => SyncDisposition::Unchanged,
+            Some(_) => {
+                synced.insert(uri, hash);
+                SyncDisposition::DidChange
+            }
+            None => {
+                synced.insert(uri, hash);
+                SyncDisposition::DidOpen
             }
         }
     }
@@ -483,23 +484,24 @@ impl LspManager {
             return diagnostic_state_from_items(path, version, &pushed.items);
         }
 
-        // Give push-only servers a bounded opportunity to publish an explicit
-        // empty/nonempty result for this version.
-        if client.drain_notifications(Duration::from_secs(10)).await
-            == crate::client::DrainOutcome::Dead
-        {
-            return DiagnosticState::Failed {
-                document_version: Some(version),
-                error: "LSP server closed the stream".into(),
-            };
-        }
-        if let Some(pushed) = client.get_pushed_diagnostics(uri)
-            && publication_matches_document(&pushed, version)
-        {
-            return diagnostic_state_from_items(path, version, &pushed.items);
-        }
-
         if !client.supports_pull_diagnostics() {
+            // Push-only servers must publish an explicit empty or non-empty
+            // result for the current document generation. This is productive
+            // language-server work, so it has no default deadline; a positive
+            // HI_LSP_TIMEOUT_SECS remains an operator-selected bound.
+            if client.wait_for_current_diagnostics(uri, version).await
+                == crate::client::DrainOutcome::Dead
+            {
+                return DiagnosticState::Failed {
+                    document_version: Some(version),
+                    error: "LSP server closed the stream".into(),
+                };
+            }
+            if let Some(pushed) = client.get_pushed_diagnostics(uri)
+                && publication_matches_document(&pushed, version)
+            {
+                return diagnostic_state_from_items(path, version, &pushed.items);
+            }
             let reason = match client.get_pushed_diagnostics(uri) {
                 Some(pushed) if pushed.version.is_none() && version > 0 => {
                     "server published unversioned diagnostics after didChange; freshness cannot be confirmed and diagnostic pull is unsupported"
@@ -815,6 +817,31 @@ fn fxhash(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synced_document_state_is_exact_beyond_the_old_boundary() {
+        let manager = LspManager::new(PathBuf::from("/tmp")).unwrap();
+        for index in 0..320 {
+            assert_eq!(
+                manager.record_synced_hash(format!("file:///tmp/file-{index}.rs"), index),
+                SyncDisposition::DidOpen
+            );
+        }
+
+        let synced = lock_recover(&manager.synced);
+        assert_eq!(synced.len(), 320);
+        assert_eq!(synced.get("file:///tmp/file-0.rs"), Some(&0));
+        assert_eq!(synced.get("file:///tmp/file-319.rs"), Some(&319));
+        drop(synced);
+        assert_eq!(
+            manager.record_synced_hash("file:///tmp/file-0.rs".into(), 0),
+            SyncDisposition::Unchanged
+        );
+        assert_eq!(
+            manager.record_synced_hash("file:///tmp/file-0.rs".into(), 999),
+            SyncDisposition::DidChange
+        );
+    }
 
     #[tokio::test]
     async fn closing_deleted_document_removes_it_from_workspace_diagnostics() {

@@ -48,7 +48,7 @@ pub use serve::{
     McpStdioHandler, dispatch_line, handle_message, hi_serve_tools, serve_stdio, serve_stdio_io,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -57,6 +57,42 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+/// Optional operator-selected deadline for one MCP `tools/call` request.
+/// Unset, invalid, or zero leaves productive tool work attached until it
+/// completes or the calling turn is cancelled.
+const MCP_TOOL_TIMEOUT_ENV: &str = "HI_MCP_TOOL_TIMEOUT_SECS";
+/// Optional operator-selected deadline for a lazy MCP server handshake.
+/// Ordinary first use waits until connection, failure, or turn cancellation.
+const MCP_CONNECT_TIMEOUT_ENV: &str = "HI_MCP_CONNECT_TIMEOUT_SECS";
+
+fn configured_tool_call_timeout() -> Option<Duration> {
+    std::env::var(MCP_TOOL_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| parse_positive_timeout_secs(&raw))
+}
+
+fn configured_connect_timeout() -> Option<Duration> {
+    std::env::var(MCP_CONNECT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| parse_positive_timeout_secs(&raw))
+}
+
+fn parse_positive_timeout_secs(raw: &str) -> Option<Duration> {
+    let timeout = raw
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)?;
+    representable_timeout(Some(timeout))
+}
+
+fn representable_timeout(timeout: Option<Duration>) -> Option<Duration> {
+    timeout
+        .filter(|duration| !duration.is_zero())
+        .filter(|duration| std::time::Instant::now().checked_add(*duration).is_some())
+}
 
 /// Errors from the MCP client.
 #[derive(Debug, Error)]
@@ -185,6 +221,14 @@ pub struct McpTool {
 impl McpTool {
     /// Convert an MCP tool into hi's shared admission/host descriptor.
     pub fn descriptor(&self, server_name: &str) -> hi_tools::descriptors::ToolDescriptor {
+        self.descriptor_with_timeout(server_name, None)
+    }
+
+    fn descriptor_with_timeout(
+        &self,
+        server_name: &str,
+        timeout: Option<Duration>,
+    ) -> hi_tools::descriptors::ToolDescriptor {
         hi_tools::descriptors::ToolDescriptor {
             name: format!("mcp::{server_name}::{}", self.name),
             input_schema: self.input_schema.clone(),
@@ -192,7 +236,9 @@ impl McpTool {
             required_capabilities: [format!("mcp:{server_name}")].into_iter().collect(),
             side_effect: hi_tools::descriptors::SideEffect::Process,
             maximum_output_bytes: 2 * 1024 * 1024,
-            timeout_ms: 120_000,
+            timeout_ms: timeout
+                .map(|duration| duration.as_millis().clamp(1, u128::from(u64::MAX)) as u64)
+                .unwrap_or(0),
             replayable: false,
         }
     }
@@ -435,6 +481,8 @@ pub struct McpClient {
     process_runner: Option<std::sync::Arc<hi_tools::ProcessRunner>>,
     policy: AgentToolPolicy,
     workspace_root: Option<PathBuf>,
+    tool_call_timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
 }
 
 impl McpClient {
@@ -453,6 +501,8 @@ impl McpClient {
             process_runner,
             policy: AgentToolPolicy::new(),
             workspace_root: std::env::current_dir().ok(),
+            tool_call_timeout: configured_tool_call_timeout(),
+            connect_timeout: configured_connect_timeout(),
         }
     }
 
@@ -464,7 +514,29 @@ impl McpClient {
             process_runner: Some(std::sync::Arc::new(runner)),
             policy: AgentToolPolicy::new(),
             workspace_root,
+            tool_call_timeout: configured_tool_call_timeout(),
+            connect_timeout: configured_connect_timeout(),
         }
+    }
+
+    /// Override the optional MCP tool-call deadline.
+    ///
+    /// `None` (and a zero duration) leaves the call active until completion or
+    /// cancellation. Ordinary clients default to `None`; the
+    /// `HI_MCP_TOOL_TIMEOUT_SECS` environment variable opts into a positive
+    /// deadline.
+    #[must_use]
+    pub fn with_tool_call_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.tool_call_timeout = representable_timeout(timeout);
+        self
+    }
+
+    /// Override the optional lazy-connect deadline. `None` and zero keep a
+    /// healthy cold-starting server attached until completion or cancellation.
+    #[must_use]
+    pub fn with_connect_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.connect_timeout = representable_timeout(timeout);
+        self
     }
 
     pub fn workspace_root(&self) -> Option<&Path> {
@@ -539,7 +611,7 @@ impl McpClient {
             enabled: true,
             blocked_reason: None,
         });
-        self.ensure_connected(&name, Duration::from_secs(30)).await
+        self.ensure_connected_with_policy(&name).await
     }
 
     /// Wait up to `grace` for a registered server to handshake. Fail-fast with
@@ -560,10 +632,21 @@ impl McpClient {
         }
     }
 
+    /// Connect under the ordinary client policy. No deadline is installed by
+    /// default; `HI_MCP_CONNECT_TIMEOUT_SECS` or the builder supplies the only
+    /// finite deadline. This policy is shared by eager, reconnect, and lazy
+    /// tool paths so a healthy slow handshake is never cut off accidentally.
+    async fn ensure_connected_with_policy(&mut self, name: &str) -> Result<(), McpError> {
+        match self.connect_timeout {
+            Some(timeout) => self.ensure_connected(name, timeout).await,
+            None => self.connect_inner(name).await,
+        }
+    }
+
     /// Force a new handshake (bumps generation so a stale close cannot clobber it).
     pub async fn reconnect(&mut self, name: &str) -> Result<(), McpError> {
         self.disconnect_transport(name).await;
-        self.ensure_connected(name, Duration::from_secs(8)).await
+        self.ensure_connected_with_policy(name).await
     }
 
     /// Enable or disable a registered server. Blocked import names cannot be
@@ -649,7 +732,7 @@ impl McpClient {
                 .and_then(|capabilities| capabilities.get("tools"))
                 .is_some()
             {
-                list_tools_from_result(transport.request("tools/list", None).await?)?
+                list_all_tools(transport.as_mut()).await?
             } else {
                 Vec::new()
             };
@@ -766,7 +849,7 @@ impl McpClient {
         Ok(self
             .list_tools(name)?
             .iter()
-            .map(|tool| tool.descriptor(name))
+            .map(|tool| tool.descriptor_with_timeout(name, self.tool_call_timeout))
             .collect())
     }
 
@@ -777,8 +860,6 @@ impl McpClient {
             .map(|s| s.resources.as_slice())
             .ok_or_else(|| McpError::ServerNotFound(name.to_string()))
     }
-
-    pub const LAZY_CONNECT_GRACE: Duration = Duration::from_secs(2);
 
     /// Workspace `/mcp` status table.
     pub fn status_table(&self) -> String {
@@ -978,18 +1059,13 @@ impl McpClient {
         if let Some(reason) = self.policy.deny_reason(source, server_name, tool_name) {
             return Err(McpError::ToolInvocation(reason));
         }
-        if let Err(err) = self
-            .ensure_connected(server_name, Self::LAZY_CONNECT_GRACE)
-            .await
-        {
+        if let Err(err) = self.ensure_connected_with_policy(server_name).await {
             let auto = self
                 .servers
                 .get(server_name)
                 .is_some_and(|s| s.config.auto_reconnect && s.enabled);
             if auto {
-                let _ = self
-                    .ensure_connected(server_name, Self::LAZY_CONNECT_GRACE)
-                    .await;
+                let _ = self.ensure_connected_with_policy(server_name).await;
             }
             if self
                 .servers
@@ -1022,20 +1098,65 @@ impl McpClient {
                 ))
             })?;
         validate_arguments(&schema, &arguments)?;
-        let transport = server.transport.as_mut().ok_or_else(|| {
+        // Own the transport while the request is in flight. If the calling
+        // turn is cancelled and this future is dropped, the transport is
+        // dropped too: HTTP work is aborted and a stdio server's kill-on-drop
+        // child is reaped instead of leaving an orphaned request/response that
+        // could corrupt the next JSON-RPC exchange.
+        let mut transport = server.transport.take().ok_or_else(|| {
             McpError::NotConnected(format!(
                 "server '{server_name}' is not connected. Try `/mcp {server_name} reconnect`"
             ))
         })?;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            transport.request(
-                "tools/call",
-                Some(serde_json::json!({"name": tool_name, "arguments": arguments})),
-            ),
-        )
-        .await
-        .map_err(|_| McpError::ToolInvocation("MCP tool call timed out".into()))??;
+        let params = Some(serde_json::json!({
+            "name": tool_name,
+            "arguments": arguments
+        }));
+        let request = transport.request("tools/call", params);
+        let response = match self.tool_call_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, request).await {
+                Ok(response) => response,
+                Err(_) => {
+                    let message = format!(
+                        "MCP tool call timed out after {} ms ({MCP_TOOL_TIMEOUT_ENV})",
+                        timeout.as_millis()
+                    );
+                    if let Some(server) = self.servers.get_mut(server_name) {
+                        server.status = ServerStatus::Failed;
+                        server.last_error = Some(message.clone());
+                    }
+                    // Do not restore a timed-out transport. A late stdio
+                    // response would otherwise poison the next request id.
+                    drop(transport);
+                    return Err(McpError::ToolInvocation(message));
+                }
+            },
+            None => request.await,
+        };
+        let result = match response {
+            Ok(result) => {
+                let server = self
+                    .servers
+                    .get_mut(server_name)
+                    .ok_or_else(|| McpError::ServerNotFound(server_name.to_string()))?;
+                server.transport = Some(transport);
+                result
+            }
+            Err(error) => {
+                // A JSON-RPC error response and an authentication response are
+                // complete frames, so the transport remains synchronized.
+                // Framing/transport failures are not reusable.
+                if matches!(error, McpError::Server(_) | McpError::Auth(_)) {
+                    if let Some(server) = self.servers.get_mut(server_name) {
+                        server.transport = Some(transport);
+                    }
+                } else if let Some(server) = self.servers.get_mut(server_name) {
+                    server.status = ServerStatus::Failed;
+                    server.last_error = Some(error.to_string());
+                }
+                return Err(error);
+            }
+        };
         let result = tool_result_from_value(&result);
         if result.content.len() > 2 * 1024 * 1024 {
             return Err(McpError::ToolInvocation(
@@ -1089,7 +1210,10 @@ impl McpClient {
 /// One newline-delimited JSON-RPC frame. A hostile or buggy MCP server can
 /// emit a gigabyte line; `BufReader::lines()` would retain it all.
 const MAX_RPC_LINE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_MCP_TOOLS: usize = 128;
+/// Bound the aggregate decoded catalog rather than silently dropping tools by
+/// count. This is a hostile-server memory guard; exceeding it is an explicit
+/// connection error, never a partial catalog that makes valid tools look absent.
+const MAX_MCP_TOOL_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MCP_TOOL_DESCRIPTION_CHARS: usize = 2_000;
 const MAX_MCP_RESOURCE_CHARS: usize = 64 * 1024;
 
@@ -1136,9 +1260,6 @@ fn list_tools_from_result(value: serde_json::Value) -> Result<Vec<McpTool>, McpE
         .cloned()
         .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
     let mut tools: Vec<McpTool> = serde_json::from_value(tools)?;
-    if tools.len() > MAX_MCP_TOOLS {
-        tools.truncate(MAX_MCP_TOOLS);
-    }
     for tool in &mut tools {
         if tool.description.chars().count() > MAX_MCP_TOOL_DESCRIPTION_CHARS {
             tool.description = tool
@@ -1148,6 +1269,47 @@ fn list_tools_from_result(value: serde_json::Value) -> Result<Vec<McpTool>, McpE
                 .collect::<String>()
                 + "…";
         }
+    }
+    Ok(tools)
+}
+
+async fn list_all_tools(transport: &mut dyn McpTransportTrait) -> Result<Vec<McpTool>, McpError> {
+    let mut tools = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let mut catalog_bytes = 0usize;
+    loop {
+        let params = cursor
+            .as_ref()
+            .map(|cursor| serde_json::json!({"cursor": cursor}));
+        let page = transport.request("tools/list", params).await?;
+        catalog_bytes = catalog_bytes.saturating_add(serde_json::to_vec(&page)?.len());
+        if catalog_bytes > MAX_MCP_TOOL_CATALOG_BYTES {
+            return Err(McpError::Transport(format!(
+                "MCP tool catalog exceeds {} MiB",
+                MAX_MCP_TOOL_CATALOG_BYTES / (1024 * 1024)
+            )));
+        }
+        let next_cursor = match page.get("nextCursor") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) if value.trim().is_empty() => None,
+            Some(serde_json::Value::String(value)) => Some(value.clone()),
+            Some(_) => {
+                return Err(McpError::Transport(
+                    "MCP tools/list nextCursor must be a string".into(),
+                ));
+            }
+        };
+        tools.extend(list_tools_from_result(page)?);
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err(McpError::Transport(format!(
+                "MCP tools/list pagination cursor repeated: {next_cursor:?}"
+            )));
+        }
+        cursor = Some(next_cursor);
     }
     Ok(tools)
 }
@@ -1559,6 +1721,128 @@ pub fn merge_allowlist_into_server_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::sync::Semaphore;
+
+    struct GatedToolTransport {
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct PagedCatalogTransport {
+        pages: std::collections::VecDeque<serde_json::Value>,
+        requested_cursors: Vec<Option<String>>,
+    }
+
+    #[async_trait]
+    impl McpTransportTrait for PagedCatalogTransport {
+        async fn request(
+            &mut self,
+            method: &str,
+            params: Option<serde_json::Value>,
+        ) -> Result<serde_json::Value, McpError> {
+            assert_eq!(method, "tools/list");
+            self.requested_cursors.push(
+                params
+                    .as_ref()
+                    .and_then(|value| value.get("cursor"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            );
+            self.pages
+                .pop_front()
+                .ok_or_else(|| McpError::Transport("unexpected tools/list request".into()))
+        }
+
+        async fn notify(
+            &mut self,
+            _method: &str,
+            _params: Option<serde_json::Value>,
+        ) -> Result<(), McpError> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), McpError> {
+            Ok(())
+        }
+    }
+
+    impl Drop for GatedToolTransport {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl McpTransportTrait for GatedToolTransport {
+        async fn request(
+            &mut self,
+            method: &str,
+            _params: Option<serde_json::Value>,
+        ) -> Result<serde_json::Value, McpError> {
+            assert_eq!(method, "tools/call");
+            self.started.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("release semaphore open")
+                .forget();
+            Ok(serde_json::json!({
+                "content": [{"type": "text", "text": "ok"}]
+            }))
+        }
+
+        async fn notify(
+            &mut self,
+            _method: &str,
+            _params: Option<serde_json::Value>,
+        ) -> Result<(), McpError> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), McpError> {
+            Ok(())
+        }
+    }
+
+    fn client_with_gated_tool(
+        timeout: Option<Duration>,
+    ) -> (McpClient, Arc<Semaphore>, Arc<Semaphore>, Arc<AtomicBool>) {
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut client = McpClient::new().with_tool_call_timeout(timeout);
+        client.servers.insert(
+            "test".into(),
+            McpServer {
+                config: McpServerConfig::http("test", "https://example.test/mcp"),
+                status: ServerStatus::Connected,
+                server_name: Some("test".into()),
+                server_version: Some("1".into()),
+                tools: vec![McpTool {
+                    name: "slow".into(),
+                    description: "waits on a deterministic gate".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }],
+                resources: Vec::new(),
+                source: McpConfigSource::Hi,
+                enabled: true,
+                blocked_reason: None,
+                last_error: None,
+                generation: 1,
+                transport: Some(Box::new(GatedToolTransport {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                    dropped: Arc::clone(&dropped),
+                })),
+            },
+        );
+        (client, started, release, dropped)
+    }
 
     fn fake_server_config() -> McpServerConfig {
         // A tiny newline-framed JSON-RPC server keeps transport tests
@@ -1573,6 +1857,21 @@ mod tests {
             "esac\ndone"
         );
         McpServerConfig::stdio("test", "sh", &["-c", script])
+    }
+
+    fn delayed_fake_server_config(delay_seconds: &str) -> McpServerConfig {
+        let script = format!(
+            "sleep {delay_seconds}\n{}",
+            concat!(
+                "while IFS= read -r line; do\n",
+                "case \"$line\" in\n",
+                "*'\"method\":\"initialize\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"fake\",\"version\":\"1\"},\"capabilities\":{\"tools\":{}}}}\\n' ;;\n",
+                "*'\"method\":\"tools/list\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"echo input\",\"inputSchema\":{\"type\":\"object\"}}]}}\\n' ;;\n",
+                "*'\"method\":\"tools/call\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\\n' ;;\n",
+                "esac\ndone"
+            )
+        );
+        McpServerConfig::stdio("slow", "sh", &["-c", &script])
     }
 
     #[test]
@@ -1704,6 +2003,134 @@ mod tests {
         assert!(!result.is_error);
     }
 
+    #[test]
+    fn mcp_tool_timeout_configuration_uses_an_unlimited_zero_sentinel() {
+        assert_eq!(parse_positive_timeout_secs(""), None);
+        assert_eq!(parse_positive_timeout_secs("garbage"), None);
+        assert_eq!(parse_positive_timeout_secs("0"), None);
+        assert_eq!(parse_positive_timeout_secs(&u64::MAX.to_string()), None);
+        assert_eq!(
+            parse_positive_timeout_secs(" 9 "),
+            Some(Duration::from_secs(9))
+        );
+        assert_eq!(
+            McpClient::new()
+                .with_tool_call_timeout(Some(Duration::MAX))
+                .tool_call_timeout,
+            None,
+            "an unrepresentable explicit duration must not wrap into a false cap"
+        );
+        let client = McpClient::new().with_connect_timeout(None);
+        assert_eq!(client.connect_timeout, None);
+        assert_eq!(
+            client
+                .with_connect_timeout(Some(Duration::MAX))
+                .connect_timeout,
+            None
+        );
+
+        let tool = McpTool {
+            name: "slow".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        assert_eq!(tool.descriptor("test").timeout_ms, 0);
+        assert_eq!(
+            tool.descriptor_with_timeout("test", Some(Duration::from_millis(17)))
+                .timeout_ms,
+            17
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_call_has_no_default_deadline() {
+        let (mut client, started, release, _dropped) = client_with_gated_tool(None);
+        assert_eq!(client.tool_call_timeout, None);
+        assert_eq!(client.tool_descriptors("test").unwrap()[0].timeout_ms, 0);
+
+        let mut call = tokio::spawn(async move {
+            client
+                .invoke_tool("test", "slow", serde_json::json!({}))
+                .await
+        });
+        started
+            .acquire()
+            .await
+            .expect("call reaches transport")
+            .forget();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut call)
+                .await
+                .is_err(),
+            "an unreleased default call must remain active"
+        );
+        release.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("released call finishes")
+            .expect("call task joins")
+            .expect("tool succeeds");
+        assert_eq!(result.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn explicit_mcp_tool_timeout_aborts_and_discards_transport() {
+        let (mut client, started, _release, dropped) =
+            client_with_gated_tool(Some(Duration::from_millis(10)));
+        assert_eq!(client.tool_descriptors("test").unwrap()[0].timeout_ms, 10);
+
+        let call = tokio::spawn(async move {
+            client
+                .invoke_tool("test", "slow", serde_json::json!({}))
+                .await
+        });
+        started
+            .acquire()
+            .await
+            .expect("call reaches transport")
+            .forget();
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("configured deadline fires")
+            .expect("call task joins")
+            .expect_err("held call must time out");
+        assert!(error.to_string().contains(MCP_TOOL_TIMEOUT_ENV), "{error}");
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelling_mcp_tool_call_drops_in_flight_transport() {
+        let (client, started, _release, dropped) = client_with_gated_tool(None);
+        let client = Arc::new(tokio::sync::Mutex::new(client));
+        let invoking = Arc::clone(&client);
+        let call = tokio::spawn(async move {
+            invoking
+                .lock()
+                .await
+                .invoke_tool("test", "slow", serde_json::json!({}))
+                .await
+        });
+        started
+            .acquire()
+            .await
+            .expect("call reaches transport")
+            .forget();
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            client
+                .lock()
+                .await
+                .servers
+                .get("test")
+                .expect("server retained")
+                .transport
+                .is_none(),
+            "a cancelled request must not restore a desynchronized transport"
+        );
+    }
+
     #[tokio::test]
     async fn client_check_liveness() {
         let mut client = McpClient::new();
@@ -1747,7 +2174,7 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_caps_count_and_description() {
+    fn list_tools_retains_every_entry_and_bounds_descriptions() {
         let tools: Vec<serde_json::Value> = (0..200)
             .map(|i| {
                 serde_json::json!({
@@ -1758,12 +2185,57 @@ mod tests {
             })
             .collect();
         let listed = list_tools_from_result(serde_json::json!({"tools": tools})).unwrap();
-        assert_eq!(listed.len(), MAX_MCP_TOOLS);
+        assert_eq!(listed.len(), 200);
         assert!(
             listed
                 .iter()
                 .all(|tool| tool.description.chars().count() <= MAX_MCP_TOOL_DESCRIPTION_CHARS)
         );
+    }
+
+    #[tokio::test]
+    async fn paginated_tool_catalog_retains_more_than_128_tools() {
+        let tool = |index: usize| {
+            serde_json::json!({
+                "name": format!("tool-{index}"),
+                "description": format!("tool {index}"),
+                "inputSchema": {"type": "object"}
+            })
+        };
+        let mut transport = PagedCatalogTransport {
+            pages: [
+                serde_json::json!({
+                    "tools": (0..100).map(tool).collect::<Vec<_>>(),
+                    "nextCursor": "page-2"
+                }),
+                serde_json::json!({
+                    "tools": (100..175).map(tool).collect::<Vec<_>>()
+                }),
+            ]
+            .into(),
+            requested_cursors: Vec::new(),
+        };
+        let tools = list_all_tools(&mut transport).await.unwrap();
+        assert_eq!(tools.len(), 175);
+        assert_eq!(tools[174].name, "tool-174");
+        assert_eq!(
+            transport.requested_cursors,
+            vec![None, Some("page-2".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn paginated_tool_catalog_rejects_cursor_cycles() {
+        let mut transport = PagedCatalogTransport {
+            pages: [
+                serde_json::json!({"tools": [], "nextCursor": "again"}),
+                serde_json::json!({"tools": [], "nextCursor": "again"}),
+            ]
+            .into(),
+            requested_cursors: Vec::new(),
+        };
+        let error = list_all_tools(&mut transport).await.unwrap_err();
+        assert!(error.to_string().contains("cursor repeated"), "{error}");
     }
 
     #[test]
@@ -1988,8 +2460,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lazy_connect_fail_fast_on_dead_server() {
-        let mut client = McpClient::new();
+    async fn explicit_lazy_connect_timeout_fails_fast_on_dead_server() {
+        let mut client =
+            McpClient::new().with_connect_timeout(Some(std::time::Duration::from_millis(20)));
         client.register(DiscoveredMcpServer {
             config: McpServerConfig::stdio("slow", "sleep", &["30"]),
             source: McpConfigSource::Hi,
@@ -2003,13 +2476,69 @@ mod tests {
             .unwrap_err();
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(6),
+            elapsed < std::time::Duration::from_secs(2),
             "lazy connect waited too long: {elapsed:?}"
         );
         let msg = err.to_string();
         assert!(
             msg.contains("reconnect") || msg.contains("not connected"),
             "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_lazy_connect_waits_for_a_healthy_slow_server() {
+        let mut client = McpClient::new().with_connect_timeout(None);
+        client.register(DiscoveredMcpServer {
+            config: delayed_fake_server_config("0.05"),
+            source: McpConfigSource::Hi,
+            enabled: true,
+            blocked_reason: None,
+        });
+        let result = client
+            .invoke_tool("slow", "echo", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result.content, "ok");
+        assert_eq!(client.connect_timeout, None);
+    }
+
+    #[tokio::test]
+    async fn eager_connect_uses_the_optional_connect_policy() {
+        let mut unlimited = McpClient::new().with_connect_timeout(None);
+        unlimited
+            .connect(delayed_fake_server_config("0.05"))
+            .await
+            .expect("default eager connect waits for a healthy slow server");
+
+        let mut finite =
+            McpClient::new().with_connect_timeout(Some(std::time::Duration::from_millis(10)));
+        let error = finite
+            .connect(delayed_fake_server_config("0.05"))
+            .await
+            .expect_err("explicit eager-connect timeout must remain enforceable");
+        assert!(
+            error.to_string().contains("did not connect in time"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_uses_the_optional_connect_policy() {
+        let mut client = McpClient::new().with_connect_timeout(None);
+        client.connect(fake_server_config()).await.unwrap();
+        client.connect_timeout = Some(std::time::Duration::from_millis(10));
+        let mut delayed = delayed_fake_server_config("0.05");
+        delayed.name = "test".into();
+        client.servers.get_mut("test").unwrap().config = delayed;
+
+        let error = client
+            .reconnect("test")
+            .await
+            .expect_err("explicit reconnect timeout must remain enforceable");
+        assert!(
+            error.to_string().contains("did not connect in time"),
+            "{error}"
         );
     }
 

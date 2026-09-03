@@ -1,0 +1,43 @@
+schema_version = 1
+name = "simple-text-turn"
+tags = ["curated", "pr"]
+timeout_ms = 30000
+
+[[provider.steps]]
+id = "answer"
+[provider.steps.expect]
+body_contains = ["smoke response"]
+[provider.steps.response]
+kind = "text"
+text = "The interactive smoke response completed successfully."
+
+[[actions]]
+kind = "send_line"
+text = "Give one short smoke response."
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "user" }
+exact = 1
+
+[[assertions]]
+kind = "record_sequence"
+source = "events"
+pointer = "/event"
+values = ["ready", "turn_started", "turn_settled", "session_ended"]
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

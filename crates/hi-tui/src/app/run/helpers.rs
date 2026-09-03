@@ -113,6 +113,7 @@ pub(super) enum ChordPipeline {
     /// Shift-Tab: cycle ask / plan / always-approve.
     CycleSessionMode,
     PlanApprove,
+    PlanPark,
     PlanRequestChanges,
     PlanQuit,
 }
@@ -192,6 +193,7 @@ pub(super) fn run_chord_pipeline(app: &mut App, key: &KeyEvent) -> Option<ChordP
     if app.plan_approval_capturing() {
         return Some(match crate::plan_approval::handle_key(app, key) {
             crate::plan_approval::PlanApprovalOutcome::Continue => ChordPipeline::Continue,
+            crate::plan_approval::PlanApprovalOutcome::Park => ChordPipeline::PlanPark,
             crate::plan_approval::PlanApprovalOutcome::Approve => ChordPipeline::PlanApprove,
             crate::plan_approval::PlanApprovalOutcome::RequestChanges => {
                 ChordPipeline::PlanRequestChanges

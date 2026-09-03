@@ -40,15 +40,13 @@ impl crate::Agent {
         force_tools_next: &mut bool,
         force_text_answer_next: &mut bool,
         text_tool_fallback_next: &mut bool,
-        stalled_repeating: &mut bool,
-        stalled_unfinished: &mut bool,
         buffered_assistant_text: &mut String,
         buffer_read_only_review_text: bool,
         _steps: u32,
         ui: &mut dyn Ui,
-    ) -> RoundControl {
+    ) -> anyhow::Result<RoundControl> {
         self.set_turn_phase(TurnPhase::Steer);
-        let budgets = &self.config.loop_limits.review_repair;
+        let budgets = self.config.loop_limits.review_repair.clone();
         // Text but no tool call (the content-less case was handled
         // above). Silently re-prompt the model to continue — no
         // status line, no steer counter, no visible nudge.
@@ -68,7 +66,13 @@ impl crate::Agent {
             .structured
             .as_ref()
             .is_some_and(crate::goal::Goal::should_auto_drive);
-        let plan_incomplete = self.goals.plan_incomplete() || leftover_goal;
+        // Plan mode is deliberately a planning-only turn. Pending checklist
+        // items are the successful output of that turn, not evidence that the
+        // turn is unfinished. Feeding PLAN_CONTINUE_NUDGE here creates an
+        // impossible instruction cycle ("do the work" while mutating tools are
+        // unavailable) and invites the model to self-certify every step as
+        // done just to escape the loop.
+        let plan_incomplete = !self.plan_mode && (self.goals.plan_incomplete() || leftover_goal);
         // Prefer a goal-aware continue when leftover Goal work is why the
         // turn is unfinished — the model's `update_plan` checklist may already
         // look complete.
@@ -97,22 +101,20 @@ impl crate::Agent {
             }
             self.messages
                 .push_assistant(std::mem::take(completion_content));
-            *stalled_repeating = false;
-            *stalled_unfinished = false;
             progress_tracker.no_progress_streak = 0;
-            progress_tracker.last_stall_reason.clear();
+            progress_tracker.last_no_progress_reason.clear();
             progress_tracker.record(ProgressKind::Weak, AWAITING_BACKGROUND_REASON, None);
             ui.status("background work continues; ending the turn with the status report");
-            return RoundControl::BreakInner(false);
+            return Ok(RoundControl::BreakInner(false));
         }
         if let Some(intent) = read_only_intent
             && plan_incomplete
         {
             if evidence.inspection_sprawl_nudges > 0 {
                 let sprawl_mode = crate::steering::AnswerRepairMode::SprawlForceAnswer;
-                if review_repair.has_budget(sprawl_mode, budgets) {
+                if review_repair.has_budget(sprawl_mode, &budgets) {
                     assert!(
-                        review_repair.spend(sprawl_mode, evidence, budgets),
+                        review_repair.spend(sprawl_mode, evidence, &budgets),
                         "sprawl force-answer spend must succeed after has_budget"
                     );
                     *continue_total_nudges += 1;
@@ -130,7 +132,7 @@ impl crate::Agent {
                             summarize_inspected_evidence_nudge(intent, evidence),
                         ),
                     );
-                    return RoundControl::Continue;
+                    return Ok(RoundControl::Continue);
                 }
 
                 // Budget spent: accept a non-empty forced answer instead of stalling.
@@ -156,32 +158,26 @@ impl crate::Agent {
                     }
                     self.messages
                         .push_assistant(std::mem::take(completion_content));
-                    *stalled_repeating = false;
-                    *stalled_unfinished = false;
                     progress_tracker.no_progress_streak = 0;
-                    progress_tracker.last_stall_reason.clear();
+                    progress_tracker.last_no_progress_reason.clear();
                     progress_tracker.record_final_answer();
                     ui.status("review sprawl force-answer budget spent; accepting the last answer");
-                    return RoundControl::BreakInner(false);
+                    return Ok(RoundControl::BreakInner(false));
                 } else {
-                    if self.keep_working_after_stall(
+                    if self.try_no_progress_recovery(
                         progress_tracker,
                         force_tools_next,
-                        stalled_unfinished,
-                        stalled_repeating,
                         Some(continue_total_nudges),
                         ui,
                     ) {
                         self.messages
                             .push_assistant(std::mem::take(completion_content));
-                        return RoundControl::Continue;
+                        return Ok(RoundControl::Continue);
                     }
-                    *stalled_unfinished = true;
                     let reason = review_repair.exhausted(sprawl_mode);
                     progress_tracker.record(ProgressKind::None, reason, None);
                     let _ = intent;
-                    ui.status(&self.incomplete_turn_status(reason));
-                    return RoundControl::BreakInner(false);
+                    return Ok(RoundControl::BreakInner(false));
                 }
             }
 
@@ -193,7 +189,7 @@ impl crate::Agent {
                 *force_tools_next = true;
                 self.messages
                     .push_nudge(NudgeKind::Continue, continue_nudge);
-                return RoundControl::Continue;
+                return Ok(RoundControl::Continue);
             }
         }
         // Table-driven implementation completeness (order = IMPLEMENTATION_COMPLETENESS_CASCADE).
@@ -250,27 +246,23 @@ impl crate::Agent {
                     self.messages
                         .push_assistant(std::mem::take(completion_content));
                     self.messages.push_nudge(NudgeKind::Continue, nudge_body);
-                    return RoundControl::Continue;
+                    return Ok(RoundControl::Continue);
                 }
                 Some(super::impl_cascade::ImplementationCascadeAction::Exhausted { status }) => {
-                    if self.keep_working_after_stall(
+                    if self.try_no_progress_recovery(
                         progress_tracker,
                         force_tools_next,
-                        stalled_unfinished,
-                        stalled_repeating,
                         Some(continue_total_nudges),
                         ui,
                     ) {
                         self.messages
                             .push_assistant(std::mem::take(completion_content));
-                        return RoundControl::Continue;
+                        return Ok(RoundControl::Continue);
                     }
-                    *stalled_unfinished = true;
                     ui.nudge(status);
-                    ui.status(
-                        &self.incomplete_turn_status("implementation_completeness_exhausted"),
-                    );
-                    return RoundControl::BreakInner(false);
+                    // A bounded heuristic may challenge the answer, but it is
+                    // not a terminal correctness oracle. Accept the best text
+                    // below and let deterministic verification decide.
                 }
                 None => {}
             }
@@ -281,7 +273,7 @@ impl crate::Agent {
             evidence,
             assistant_text,
             review_repair,
-            budgets,
+            &budgets,
         ) {
             Some(super::cascade::QualityCascadeAction::Repair {
                 mode,
@@ -291,7 +283,7 @@ impl crate::Agent {
                 force_text,
             }) => {
                 assert!(
-                    review_repair.spend(mode, evidence, budgets),
+                    review_repair.spend(mode, evidence, &budgets),
                     "answer-repair spend must succeed after cascade has_budget for {}",
                     mode.key()
                 );
@@ -304,43 +296,71 @@ impl crate::Agent {
                     NudgeKind::Continue,
                     repair_nudge_with_required_next(mode, nudge_body),
                 );
-                return RoundControl::Continue;
+                return Ok(RoundControl::Continue);
             }
             Some(super::cascade::QualityCascadeAction::Exhausted { mode, status }) => {
-                if self.keep_working_after_stall(
+                if self.try_no_progress_recovery(
                     progress_tracker,
                     force_tools_next,
-                    stalled_unfinished,
-                    stalled_repeating,
                     Some(continue_total_nudges),
                     ui,
                 ) {
                     self.messages
                         .push_assistant(std::mem::take(completion_content));
-                    return RoundControl::Continue;
+                    return Ok(RoundControl::Continue);
                 }
-                *stalled_unfinished = true;
                 let reason = review_repair.exhausted(mode);
                 progress_tracker.record(ProgressKind::None, reason, None);
                 ui.nudge(&status);
-                ui.status(&self.incomplete_turn_status(reason));
-                return RoundControl::BreakInner(false);
+                if matches!(mode, crate::steering::AnswerRepairMode::GapSearchOverclaim) {
+                    // A contradiction between search evidence and the model's
+                    // final claim is different from a merely format-weak
+                    // answer. Never surface the overclaim as the result after
+                    // its bounded repair budget is spent. Review text is
+                    // buffered for read-only turns, so replacing it here keeps
+                    // the user-visible answer honest and single-owned.
+                    self.emit_deterministic_closeout(ui);
+                    return Ok(RoundControl::BreakInner(false));
+                }
+                // Repair exhaustion is advisory. Preserve and return the
+                // model's answer instead of manufacturing a failed turn.
             }
             None => {}
         }
         // A syntactically valid but content-free completion claim is never a
         // user answer. Give ordinary Q&A and already-satisfied implementation
-        // turns one compact retry; if the provider repeats the same canned
-        // phrase, stop incomplete instead of presenting a false success. Review
-        // turns normally reach this only after their evidence-specific repair
-        // cascade has declined to act.
-        if crate::steering::answer_is_generic_completion_placeholder(assistant_text)
+        // turns one compact retry. If the provider repeats the same canned
+        // phrase, return the available response; this heuristic must not create
+        // a synthetic turn failure.
+        if crate::steering::generic_completion_guards_enabled()
+            && crate::steering::answer_is_generic_completion_placeholder(assistant_text)
             && !self
                 .task
                 .last_task_prompt
                 .as_deref()
                 .is_some_and(crate::task_contract::prompt_requests_exact_text_response)
         {
+            // The implementation cascade has already challenged a no-op
+            // twice. A third model request can only produce another canned
+            // completion (and used to consume the provider's next response),
+            // so settle with one truthful deterministic answer instead of
+            // extending the turn or displaying the same phrase again.
+            let no_change_recovery_exhausted = implementation_tracker.no_change_nudges >= 2
+                && !implementation_tracker.mutation_seen
+                && (expected_mutation || implementation_intent.is_some());
+            if no_change_recovery_exhausted {
+                const NO_CHANGE_FALLBACK: &str =
+                    "No file changes were made; the requested implementation was not applied.";
+                if buffer_read_only_review_text || !*force_text_answer_next {
+                    self.emit_assistant_text(ui, NO_CHANGE_FALLBACK);
+                    ui.assistant_end();
+                }
+                self.messages
+                    .push_assistant(vec![Content::Text(NO_CHANGE_FALLBACK.into())]);
+                progress_tracker.record_final_answer();
+                ui.status("no file changes were made; ending the turn without another retry");
+                return Ok(RoundControl::BreakInner(false));
+            }
             const MAX_GENERIC_COMPLETION_RETRIES: u32 = 1;
             if *generic_completion_retries < MAX_GENERIC_COMPLETION_RETRIES {
                 *generic_completion_retries += 1;
@@ -362,17 +382,47 @@ impl crate::Agent {
                 ui.nudge(
                     "model returned only a completion placeholder; requesting the actual result",
                 );
-                return RoundControl::Continue;
+                return Ok(RoundControl::Continue);
             }
 
-            self.messages.push_assistant(vec![Content::Text(
-                "[answer rejected: generic completion placeholder repeated]".into(),
-            )]);
-            *stalled_unfinished = true;
             progress_tracker.record(ProgressKind::None, "generic_completion_placeholder", None);
-            ui.nudge("model repeated a completion placeholder without providing a result");
-            ui.status(&self.incomplete_turn_status("generic_completion_placeholder"));
-            return RoundControl::BreakInner(false);
+            if plan_incomplete {
+                if implementation_tracker.mutation_seen || implementation_tracker.validation_seen {
+                    // The model failed only at summarizing a productive turn.
+                    // Keep the landed edits and let turn-end verification plus
+                    // the next plan drive own the remaining checklist; treating
+                    // this as a provider failure discards real progress from the
+                    // frontend's control flow and stops auto-drive at N/M done.
+                    const PARTIAL_PROGRESS_FALLBACK: &str = "Made concrete progress on the current step; the remaining plan is still pending.";
+                    self.emit_assistant_text(ui, PARTIAL_PROGRESS_FALLBACK);
+                    ui.assistant_end();
+                    self.messages
+                        .push_assistant(vec![Content::Text(PARTIAL_PROGRESS_FALLBACK.into())]);
+                    progress_tracker.record(
+                        ProgressKind::Weak,
+                        "generic completion after plan progress",
+                        None,
+                    );
+                    ui.status(
+                        "model summary was unusable; keeping the completed work and continuing the plan",
+                    );
+                    return Ok(RoundControl::BreakInner(false));
+                }
+                // A repeated canned completion is not a usable result for an
+                // unchanged unfinished checklist. Accepting it as a successful
+                // turn makes the frontend enqueue the same synthetic drive
+                // again until the cross-turn stall guard parks it. Preserve
+                // the durable plan, but fail this bounded provider attempt now
+                // so the frontend stops auto-driving and reports the real cause.
+                self.messages.push_assistant(vec![Content::Text(
+                    "[answer rejected: generic completion placeholder repeated]".into(),
+                )]);
+                ui.nudge("model repeated a generic completion response without advancing the plan");
+                return Err(anyhow::anyhow!(
+                    "model returned no usable final answer for the unfinished plan after bounded recovery"
+                ));
+            }
+            ui.nudge("model repeated a generic completion response; returning the available text");
         }
         if buffer_read_only_review_text {
             let text_to_emit = if buffered_assistant_text.is_empty() {
@@ -388,10 +438,8 @@ impl crate::Agent {
         if plan_incomplete && *silent_continues < self.config.loop_limits.max_silent_continues {
             // A real final answer after a forced no-progress recovery resolves
             // pending unfinished state from the preceding tool round.
-            *stalled_repeating = false;
-            *stalled_unfinished = false;
             progress_tracker.no_progress_streak = 0;
-            progress_tracker.last_stall_reason.clear();
+            progress_tracker.last_no_progress_reason.clear();
             *silent_continues += 1;
             *continue_total_nudges += 1;
             // Force the next round to actually call a tool, so the
@@ -402,37 +450,30 @@ impl crate::Agent {
             // continue leftover drive work rather than recap and stop.
             self.messages
                 .push_nudge(NudgeKind::Continue, continue_nudge);
-            return RoundControl::Continue;
+            return Ok(RoundControl::Continue);
         }
-        // Stall budgets spent: keep working in-turn instead of asking the
-        // user to `/retry`. If that recovery is also spent, settle without
-        // a retry prompt.
+        // Once the plan-continuation budget is spent, try one different action.
+        // If that is also spent, settle and leave the remaining plan durable for
+        // the next drive turn.
         if plan_incomplete {
-            if self.keep_working_after_stall(
+            if self.try_no_progress_recovery(
                 progress_tracker,
                 force_tools_next,
-                stalled_unfinished,
-                stalled_repeating,
                 Some(continue_total_nudges),
                 ui,
             ) {
-                return RoundControl::Continue;
+                return Ok(RoundControl::Continue);
             }
             progress_tracker.record(
                 ProgressKind::Weak,
-                "structured plan remains incomplete",
+                "structured plan has remaining steps",
                 None,
             );
-            if *silent_continues > 0 {
-                ui.status(&self.incomplete_turn_status("plan_incomplete_without_progress"));
-            }
         } else {
-            *stalled_repeating = false;
-            *stalled_unfinished = false;
             progress_tracker.no_progress_streak = 0;
-            progress_tracker.last_stall_reason.clear();
+            progress_tracker.last_no_progress_reason.clear();
             progress_tracker.record_final_answer();
         }
-        RoundControl::BreakInner(false)
+        Ok(RoundControl::BreakInner(false))
     }
 }

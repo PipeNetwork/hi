@@ -17,7 +17,16 @@ use super::helpers::rate_limit_summary;
 
 fn text_is_user_visible_answer(text: &str) -> bool {
     let trimmed = text.trim();
-    !trimmed.is_empty() && trimmed != PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER
+    !trimmed.is_empty()
+        && trimmed != PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER
+        && ![
+            "[answer retry:",
+            "[answer rejected:",
+            "[review retry:",
+            "[plain-text tool retry:",
+        ]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
 }
 
 pub(super) fn turn_has_visible_assistant_text(messages: &[Message], turn_start: usize) -> bool {
@@ -80,30 +89,38 @@ impl crate::Agent {
         };
 
         let mut recap = String::new();
+        // Buffer the side-call response until it has passed the same answer
+        // checks as a normal model response. Streaming a canned completion
+        // claim here would briefly show the exact text the main loop rejected.
         let mut sink = |event: StreamEvent| match event {
-            StreamEvent::Text(text) => {
-                recap.push_str(&text);
-                ui.assistant_text(&text);
-            }
+            StreamEvent::Text(text) => recap.push_str(&text),
             StreamEvent::Status(text) => ui.status(&text),
             StreamEvent::Warning(text) => ui.top_status(&text),
             StreamEvent::Reasoning(_) => {}
             StreamEvent::WireAudit(_) => {}
+            StreamEvent::ToolCallDelta { .. } => {}
         };
-        let completion = match self.provider.stream(request, &mut sink).await {
-            Ok(completion) => completion,
-            Err(err) => {
-                // Finalize is a side call — book its error usage without resetting
-                // the main conversation's `context_used` gauge.
-                self.add_side_error_usage(&err);
-                self.emit_usage(ui);
-                // Flush any partially-streamed recap text before the status
-                // line, so it isn't left dangling in the UI's pending buffer.
-                ui.assistant_end();
-                ui.status(&format!("(couldn't generate the final summary: {err})"));
-                return false;
-            }
-        };
+        let timeout = self.side_call_timeout();
+        let completion =
+            match super::await_side_call(timeout, self.provider.stream(request, &mut sink)).await {
+                Err(timeout) => {
+                    // A recap is optional and the main turn has already settled.
+                    ui.status(&format!(
+                        "(final summary timed out after {:.1}s; turn already completed)",
+                        timeout.as_secs_f64()
+                    ));
+                    return false;
+                }
+                Ok(Ok(completion)) => completion,
+                Ok(Err(err)) => {
+                    // Finalize is a side call — book its error usage without resetting
+                    // the main conversation's `context_used` gauge.
+                    self.add_side_error_usage(&err);
+                    self.emit_usage(ui);
+                    ui.status(&format!("(couldn't generate the final summary: {err})"));
+                    return false;
+                }
+            };
 
         // Side call: spend counts, but its small request must not clobber the
         // main conversation's context gauge (see add_side_usage).
@@ -111,30 +128,69 @@ impl crate::Agent {
         self.emit_usage(ui);
 
         // Fall back to the final content if the provider didn't stream text.
-        // Emit it through the UI before assistant_end so the user actually sees
-        // the recap — without this, a provider that returns text only in the
-        // completion object (not via stream deltas) would have its summary
-        // recorded in history but never displayed, so the turn appears to end
-        // without its closing message.
         if recap.trim().is_empty() {
             for c in &completion.content {
                 if let Content::Text(t) = c {
                     recap.push_str(t);
-                    ui.assistant_text(t);
                 }
             }
         }
-        ui.assistant_end();
-
-        if recap.trim().is_empty() {
-            return false; // nothing to record
+        if !text_is_user_visible_answer(&recap) {
+            if !recap.trim().is_empty() {
+                ui.status("(final summary was unusable; using a deterministic closeout)");
+            }
+            return false;
         }
+
+        ui.assistant_text(&recap);
+        ui.assistant_end();
         // Record both the synthetic request and the recap so roles alternate.
         // The recap is a text-only assistant message (no tool calls).
         self.messages
             .push_nudge(NudgeKind::Finalize, FINALIZE_PROMPT);
         self.messages.push_assistant(vec![Content::Text(recap)]);
         true
+    }
+
+    /// Always leave a settled turn with a concrete terminal message, even when
+    /// the model-side recap timed out or returned another canned placeholder.
+    /// This path makes no completion claim that verification cannot support.
+    pub(super) fn emit_deterministic_closeout(&mut self, ui: &mut dyn Ui) {
+        let closeout = if self.report.verify.failed() {
+            "I stopped after the latest verification failed. I left the current changes in place for inspection instead of repeating the same repair; the failing check is shown above."
+        } else if self.report.verify.passed() {
+            "The code changes are in place and verification passed. The model did not produce a usable summary, so I closed the turn with this verified status instead of leaving it running."
+        } else if !self.workspace.last_changed_files.is_empty() {
+            "I stopped before the current changes could be verified. I left them in place for inspection instead of continuing without evidence."
+        } else {
+            "I could not complete this request after repeated attempts made no progress. I stopped instead of continuing to repeat the same steps; the last diagnostic is shown above."
+        };
+        ui.assistant_text(closeout);
+        ui.assistant_end();
+
+        // Persist the terminal answer too. When the last assistant entry is a
+        // private repair marker, replace it rather than appending an adjacent
+        // assistant turn; otherwise use the transcript's provider-safe append.
+        let replaced_private_marker = self
+            .messages
+            .mutate_slice()
+            .last_mut()
+            .filter(|message| message.role == hi_ai::Role::Assistant)
+            .filter(|message| {
+                message.content.iter().all(|content| match content {
+                    Content::Text(text) => !text_is_user_visible_answer(text),
+                    Content::Thinking { .. } => true,
+                    _ => false,
+                })
+            })
+            .map(|message| {
+                message.content = vec![Content::Text(closeout.to_string())];
+            })
+            .is_some();
+        if !replaced_private_marker {
+            self.messages
+                .push_assistant(vec![Content::Text(closeout.to_string())]);
+        }
     }
 
     /// Format the completed-turn usage marker with explicitly scoped metrics.
@@ -202,7 +258,7 @@ impl crate::Agent {
 
     /// A terse per-turn steering summary for the usage line, or `None` when the
     /// turn was clean (no extra rounds of any kind, no stall). Format:
-    /// `steer: 2 verify · 1 retry · stalled` — components omitted when zero.
+    /// `steer: 2 verify · 1 retry · tool-repair` — components omitted when zero.
     pub(crate) fn turn_steer(&self) -> Option<String> {
         let t = &self.report.last_turn_telemetry;
         let mut parts: Vec<String> = Vec::new();
@@ -213,7 +269,7 @@ impl crate::Agent {
             parts.push(format!("{} retry", t.recovery_retries));
         }
         if t.repeat_nudges > 0 {
-            parts.push(format!("{} repeat", t.repeat_nudges));
+            parts.push(format!("{} tool-repair", t.repeat_nudges));
         }
         if t.continue_nudges > 0 {
             parts.push(format!("{} continue", t.continue_nudges));
@@ -223,9 +279,6 @@ impl crate::Agent {
         }
         if t.truncation_retries > 0 {
             parts.push(format!("{} trunc", t.truncation_retries));
-        }
-        if t.stalled_unfinished || t.stalled_repeating {
-            parts.push("stalled".to_string());
         }
         if parts.is_empty() {
             None
@@ -246,6 +299,7 @@ impl crate::Agent {
                 .iter()
                 .filter(|tool| {
                     hi_tools::is_read_only(&tool.name)
+                        || tool.name == "run_program"
                         || (tool.name == "explore" && !self.config.subagents.is_subagent)
                 })
                 .cloned()
@@ -316,13 +370,11 @@ pub(super) fn classify_turn_outcome(
     last_verify: Option<bool>,
     changed_files: &[String],
     turn_had_mutation: bool,
-    no_check_executed: bool,
+    no_applicable_check: bool,
     independent_review_status: crate::ReviewStatus,
     skeptic_last_status: Option<crate::SkepticStatus>,
     ended_at_cap: bool,
     ended_at_deadline: bool,
-    stalled_unfinished: bool,
-    stalled_repeating: bool,
     allow_unverified: bool,
 ) -> (
     crate::TurnStatus,
@@ -334,8 +386,8 @@ pub(super) fn classify_turn_outcome(
     use crate::verify::is_prose_only_path;
     use crate::{ReviewStatus, TurnStatus, TurnStopReason, VerificationStatus};
 
-    // `no_check_executed` covers disabled verify, empty auto pipeline, and
-    // prose-only turns: there were no applicable checks. `Unverified` is for
+    // `no_applicable_check` is computed at settle from the verification mode,
+    // obligation state, and model-run validation evidence. `Unverified` is for
     // "checks should have settled but did not" (see call-site comment in loop_).
     //
     // Deliberately NOT escalated to `Unverified` for code no stage exercised.
@@ -343,9 +395,9 @@ pub(super) fn classify_turn_outcome(
     // to run such code itself, but a model-run bash command is not a
     // verification *stage* — `verification_executions` stays empty either way.
     // Classifying that as Unverified would be unsatisfiable: even a model that
-    // complied and showed passing output would still report Incomplete, in
-    // every repo without a detected pipeline. Evidence the model produced is
-    // surfaced through the nudge and transcript, not by reclassifying the turn.
+    // complied and showed passing output would still fail in every repo without
+    // a detected pipeline. Evidence the model produced is surfaced through the
+    // nudge and transcript, not by reclassifying the turn.
     let verification = if verification_infrastructure_error {
         VerificationStatus::InfrastructureError
     } else if last_verify == Some(true) {
@@ -353,7 +405,7 @@ pub(super) fn classify_turn_outcome(
     } else if last_verify == Some(false) {
         VerificationStatus::Failed
     } else if (changed_files.is_empty() && !turn_had_mutation)
-        || no_check_executed
+        || no_applicable_check
         || (!changed_files.is_empty() && changed_files.iter().all(|path| is_prose_only_path(path)))
     {
         VerificationStatus::NotApplicable
@@ -369,53 +421,27 @@ pub(super) fn classify_turn_outcome(
         None => ReviewStatus::NotRequired,
     };
     let review = combined_review_status(independent_review_status, skeptic_review);
-    // A stall is only ever declared by the mid-loop repair machinery (the
-    // no-change/quality cascades and obligation nudges set the stall flags
-    // after actually challenging the model and exhausting their budgets).
-    // The lexical `expected_mutation` guess alone must never brand a
-    // finished tool-using answer "incomplete · stalled" here: for a
-    // discussion prompt misread as a mutation request, that overrules the
-    // model's informed judgment with weaker information.
-    //
-    // Review Escalated does not Incomplete the turn: the goal path already
-    // skipped the step with a scar and continues the run.
-    // A review objection only turns the turn Incomplete when deterministic
-    // verification actually FAILED. With green checks (Passed) the reviewer is
-    // a weaker signal than the evidence it disputes, and with NotApplicable
-    // (prose-only or no-check changes) there is no deterministic evidence to
-    // overrule either — so an objection that survives its repair budget
-    // completes the turn with the objection recorded as a scar (status
-    // ReviewObjected on a Completed turn), mirroring the Escalated rule below.
-    // Observed: a reviewer hallucinated version "0" from "0.1.0" and stalled a
-    // turn whose tests all passed; a reviewer also stalled a prose-only turn
-    // where no checks could run at all.
-    let objection_overrides = review == ReviewStatus::Objected
-        && !matches!(
-            verification,
-            VerificationStatus::Passed | VerificationStatus::NotApplicable
-        );
-    // Running out of wall clock does not by itself make the work incomplete:
-    // a turn that finished and verified with seconds to spare is Completed.
-    // It only reports Incomplete through the same conditions as any other
-    // turn (unverified mutation, failed checks, exhausted repair), with the
-    // stop reason recording *why* it stopped early.
-    // A deterministic pass is authoritative only when the turn left a real
-    // project change. A no-change turn that exhausted its steering budget or
-    // never produced a user-facing answer is still incomplete: green baseline
-    // checks cannot prove that the requested action happened.
-    let stalled = stalled_unfinished || stalled_repeating;
-    let status = if verification_infrastructure_error {
-        TurnStatus::Failed
-    } else if verification == VerificationStatus::Passed && (!stalled || !changed_files.is_empty())
-    {
-        TurnStatus::Completed
-    } else if ended_at_cap
-        || stalled
+    // Review Escalated does not fail the turn: the goal path already skipped
+    // the step with a scar and continues the run.
+    // A deterministic pass is the only evidence strong enough to overrule a
+    // review objection. NotApplicable supplies no counter-evidence, so an
+    // objection there remains a real failure.
+    // Observed: a reviewer hallucinated version "0" from "0.1.0" and objected
+    // to a turn whose tests all passed; a reviewer also objected to a prose-only
+    // turn where no checks could run at all.
+    let objection_overrides =
+        review == ReviewStatus::Objected && verification != VerificationStatus::Passed;
+    // Heuristic repair exhaustion is intentionally absent here. A normal turn
+    // either settles or reports a typed failure. An explicit productive-work
+    // cap is a failure unless the caller deliberately excludes an accepted
+    // read-only wrap-up from `ended_at_cap`.
+    let status = if verification_infrastructure_error
         || verification == VerificationStatus::Failed
         || objection_overrides
         || (verification == VerificationStatus::Unverified && !allow_unverified)
+        || ended_at_cap
     {
-        TurnStatus::Incomplete
+        TurnStatus::Failed
     } else {
         TurnStatus::Completed
     };
@@ -423,16 +449,19 @@ pub(super) fn classify_turn_outcome(
         TurnStopReason::InfrastructureFailure
     } else if verification_unstable {
         TurnStopReason::VerificationUnstable
+    } else if verification == VerificationStatus::Failed {
+        TurnStopReason::VerificationFailed
+    } else if review == ReviewStatus::Objected {
+        TurnStopReason::ReviewObjected
+    } else if verification == VerificationStatus::Unverified && !allow_unverified {
+        // Preserve the reason for the actual failure. A coincident work limit
+        // is diagnostic, but must not make a failed unverified turn look like
+        // a normal bounded settlement to consumers.
+        TurnStopReason::VerificationUnavailable
     } else if ended_at_cap {
         TurnStopReason::StepLimit
     } else if ended_at_deadline {
         TurnStopReason::TimeLimit
-    } else if review == ReviewStatus::Objected {
-        TurnStopReason::ReviewObjected
-    } else if verification == VerificationStatus::Failed {
-        TurnStopReason::VerificationFailed
-    } else if stalled_unfinished || stalled_repeating {
-        TurnStopReason::Stalled
     } else if verification == VerificationStatus::Unverified {
         TurnStopReason::VerificationUnavailable
     } else if verification == VerificationStatus::NotApplicable {
@@ -447,8 +476,34 @@ pub(super) fn classify_turn_outcome(
 
 #[cfg(test)]
 mod classify_tests {
-    use super::classify_turn_outcome;
+    use super::{classify_turn_outcome, turn_has_visible_assistant_text};
     use crate::{ReviewStatus, TurnStatus, TurnStopReason, VerificationStatus};
+    use hi_ai::{Content, Message};
+
+    #[test]
+    fn private_repair_markers_are_not_user_visible_answers() {
+        for marker in [
+            "[answer retry: generic completion placeholder rejected; provide the actual result]",
+            "[answer rejected: generic completion placeholder repeated]",
+            "[review retry: reason=no_evidence; required_next=read]",
+            "[plain-text tool retry: no executable tool call was emitted]",
+            crate::transcript::PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER,
+        ] {
+            let messages = vec![Message::assistant(vec![Content::Text(marker.into())])];
+            assert!(
+                !turn_has_visible_assistant_text(&messages, 0),
+                "private/canned marker was counted as a user answer: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn concrete_assistant_text_is_user_visible() {
+        let messages = vec![Message::assistant(vec![Content::Text(
+            "Implemented SQLite persistence; cargo test passes.".into(),
+        )])];
+        assert!(turn_has_visible_assistant_text(&messages, 0));
+    }
 
     #[test]
     fn completed_when_verify_passed() {
@@ -464,8 +519,6 @@ mod classify_tests {
             false,
             false,
             false,
-            false,
-            false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::Passed);
@@ -474,10 +527,9 @@ mod classify_tests {
     }
 
     #[test]
-    fn unchallenged_no_change_turn_completes() {
-        // A finished answer with no file changes and no exhausted repair
-        // cascade (no stall flags) completes — the stall verdict belongs to
-        // the mid-loop challenge machinery, never to prompt classification.
+    fn no_change_turn_completes() {
+        // A finished answer with no file changes completes without inventing
+        // a synthetic failure state.
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
@@ -490,8 +542,6 @@ mod classify_tests {
             false,
             false,
             false,
-            false,
-            false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::NotApplicable);
@@ -499,7 +549,7 @@ mod classify_tests {
     }
 
     #[test]
-    fn exhausted_challenge_stalls() {
+    fn exhausted_heuristic_challenge_does_not_change_the_public_outcome() {
         let (status, _, _, stop) = classify_turn_outcome(
             false,
             false,
@@ -511,16 +561,14 @@ mod classify_tests {
             None,
             false,
             false,
-            true,
-            false,
             false,
         );
-        assert_eq!(status, TurnStatus::Incomplete);
-        assert_eq!(stop, TurnStopReason::Stalled);
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(stop, TurnStopReason::NoApplicableVerification);
     }
 
     #[test]
-    fn incomplete_when_unverified_and_not_allowed() {
+    fn failed_when_unverified_and_not_allowed() {
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
@@ -533,10 +581,8 @@ mod classify_tests {
             false,
             false,
             false,
-            false,
-            false,
         );
-        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(status, TurnStatus::Failed);
         assert_eq!(verification, VerificationStatus::Unverified);
         assert_eq!(stop, TurnStopReason::VerificationUnavailable);
     }
@@ -555,8 +601,6 @@ mod classify_tests {
             false,
             false,
             false,
-            false,
-            false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::NotApplicable);
@@ -564,19 +608,17 @@ mod classify_tests {
     }
 
     #[test]
-    fn mutation_with_no_check_executed_is_not_applicable() {
-        // Empty/disabled pipeline: no stages ran → NotApplicable, not Unverified.
+    fn mutation_with_no_applicable_check_is_not_applicable() {
+        // The caller found no applicable verification obligation.
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
             None,
             &["src/lib.rs".into()],
             true,
-            true, // no_check_executed
+            true, // no_applicable_check
             ReviewStatus::NotRequired,
             None,
-            false,
-            false,
             false,
             false,
             false,
@@ -589,7 +631,7 @@ mod classify_tests {
     /// Completion-review transport failure is soft: green verify + IR Unavailable
     /// still completes. Goal skeptic Unavailable is fail-closed at goal advance;
     /// when folded into the public outcome it remains visible but does not alone
-    /// mark the turn Incomplete (only Objected does).
+    /// mark the turn Failed (only Objected does).
     #[test]
     fn independent_review_unavailable_still_completes() {
         let (status, verification, review, stop) = classify_turn_outcome(
@@ -604,8 +646,6 @@ mod classify_tests {
             false,
             false,
             false,
-            false,
-            false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::Passed);
@@ -614,11 +654,9 @@ mod classify_tests {
     }
 
     #[test]
-    fn deterministic_pass_overrules_a_steering_stall() {
-        // The model can hit a repeat/no-progress guard after making the edit,
-        // while the final workspace verifier still proves the settled tree is
-        // green. That is a successful turn with diagnostic stall telemetry,
-        // not an incomplete mutation.
+    fn deterministic_pass_is_authoritative_over_heuristic_repair_state() {
+        // The final workspace verifier proves the settled tree is green;
+        // heuristic repair bookkeeping cannot override that evidence.
         let (status, verification, review, stop) = classify_turn_outcome(
             false,
             false,
@@ -630,18 +668,16 @@ mod classify_tests {
             None,
             false,
             false,
-            true,
-            false,
             false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::Passed);
         assert_eq!(review, ReviewStatus::Unavailable);
-        assert_eq!(stop, TurnStopReason::Stalled);
+        assert_eq!(stop, TurnStopReason::Completed);
     }
 
     #[test]
-    fn baseline_pass_cannot_complete_a_stalled_no_change_turn() {
+    fn baseline_pass_completes_a_no_change_turn() {
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
@@ -653,13 +689,11 @@ mod classify_tests {
             None,
             false,
             false,
-            true,
-            false,
             false,
         );
-        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::Passed);
-        assert_eq!(stop, TurnStopReason::Stalled);
+        assert_eq!(stop, TurnStopReason::Completed);
     }
 
     #[test]
@@ -673,8 +707,6 @@ mod classify_tests {
             false,
             ReviewStatus::NotRequired,
             Some(crate::SkepticStatus::Unavailable),
-            false,
-            false,
             false,
             false,
             false,
@@ -697,8 +729,6 @@ mod classify_tests {
             false,
             ReviewStatus::NotRequired,
             Some(crate::SkepticStatus::Escalated),
-            false,
-            false,
             false,
             false,
             false,
@@ -727,8 +757,6 @@ mod classify_tests {
             false,
             false,
             false,
-            false,
-            false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(review, ReviewStatus::Objected);
@@ -752,8 +780,6 @@ mod classify_tests {
             false,
             true,
             false,
-            false,
-            false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::Passed);
@@ -761,9 +787,9 @@ mod classify_tests {
     }
 
     #[test]
-    fn deadline_with_unverified_mutation_is_incomplete() {
+    fn deadline_with_unverified_mutation_reports_verification_failure() {
         // Ran out of time mid-work: the mutation never got green checks, so
-        // the turn is Incomplete — and TimeLimit says why it stopped.
+        // the missing verification remains the public failure reason.
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
@@ -776,17 +802,35 @@ mod classify_tests {
             false,
             true,
             false,
+        );
+        assert_eq!(status, TurnStatus::Failed);
+        assert_eq!(verification, VerificationStatus::Unverified);
+        assert_eq!(stop, TurnStopReason::VerificationUnavailable);
+    }
+
+    #[test]
+    fn step_limit_with_unverified_mutation_reports_verification_failure() {
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            None,
+            true,
             false,
             false,
         );
-        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(status, TurnStatus::Failed);
         assert_eq!(verification, VerificationStatus::Unverified);
-        assert_eq!(stop, TurnStopReason::TimeLimit);
+        assert_eq!(stop, TurnStopReason::VerificationUnavailable);
     }
 
     #[test]
     fn step_limit_outranks_deadline_when_both_fire() {
-        let (_, _, _, stop) = classify_turn_outcome(
+        let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
             Some(true),
@@ -798,16 +842,16 @@ mod classify_tests {
             true,
             true,
             false,
-            false,
-            false,
         );
+        assert_eq!(status, TurnStatus::Failed);
+        assert_eq!(verification, VerificationStatus::Passed);
         assert_eq!(stop, TurnStopReason::StepLimit);
     }
 
     #[test]
     fn objection_without_green_verification_keeps_teeth() {
         // No deterministic pass to outrank the reviewer — an exhausted
-        // objection still marks the turn Incomplete.
+        // objection still marks the turn Failed.
         let (status, _, review, stop) = classify_turn_outcome(
             false,
             false,
@@ -819,40 +863,31 @@ mod classify_tests {
             None,
             false,
             false,
-            false,
-            false,
             true,
         );
-        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(status, TurnStatus::Failed);
         assert_eq!(review, ReviewStatus::Objected);
         assert_eq!(stop, TurnStopReason::ReviewObjected);
     }
 
     #[test]
-    fn objection_with_not_applicable_verification_completes() {
-        // No deterministic checks ran (e.g. prose-only or no detected pipeline),
-        // so verification is NotApplicable. A reviewer objection that survives
-        // its repair budget should not stall the turn — there is no deterministic
-        // evidence to overrule the reviewer, but also none to corroborate it.
-        // The objection rides along as a scar on a Completed turn, mirroring the
-        // green-checks rule. Observed: a reviewer stalled a prose-only turn
-        // where no checks could run at all.
+    fn objection_with_not_applicable_verification_fails() {
+        // No deterministic checks ran, so there is no proof strong enough to
+        // overrule the review objection.
         let (status, _, review, stop) = classify_turn_outcome(
             false,
             false,
             None,
             &["README.md".into()],
             true,
-            true, // no_check_executed → NotApplicable
+            true, // no_applicable_check → NotApplicable
             ReviewStatus::Objected,
             None,
             false,
             false,
             false,
-            false,
-            false,
         );
-        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(status, TurnStatus::Failed);
         assert_eq!(review, ReviewStatus::Objected);
         assert_eq!(stop, TurnStopReason::ReviewObjected);
     }

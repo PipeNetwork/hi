@@ -77,6 +77,12 @@ pub enum AgentEventKind {
         message: String,
         guidance: String,
     },
+    /// The durable journal subscriber fell behind the live broadcast stream.
+    /// `next_sequence` is the first live event available after the gap.
+    JournalGap {
+        dropped_events: u64,
+        next_sequence: u64,
+    },
     Nudge {
         text: String,
     },
@@ -106,6 +112,7 @@ impl AgentEventKind {
                 | Self::ChangedFiles { .. }
                 | Self::TurnCompleted { .. }
                 | Self::Error { .. }
+                | Self::JournalGap { .. }
                 | Self::Sandbox { .. }
                 | Self::Forked { .. }
         )
@@ -303,12 +310,7 @@ impl SessionDriver {
             events: events.clone(),
         };
         if let Some(journal) = journal {
-            let mut stream = EventStream(events.subscribe());
-            tokio::spawn(async move {
-                while let Ok(event) = stream.recv().await {
-                    let _ = journal.record(&event);
-                }
-            });
+            tokio::spawn(persist_journal_events(events.subscribe(), journal));
         }
         // Agent is Send but intentionally not Sync: a SessionSink may contain
         // a mutable file handle. Run the owner on a dedicated Tokio worker so
@@ -332,6 +334,38 @@ impl SessionDriver {
         self.join
             .await
             .map_err(|error| anyhow!("session driver panicked: {error}"))
+    }
+}
+
+async fn persist_journal_events(
+    mut events: broadcast::Receiver<AgentEvent>,
+    journal: Arc<EventJournal>,
+) {
+    let mut dropped_events = 0_u64;
+    loop {
+        match events.recv().await {
+            Ok(event) => {
+                if dropped_events > 0 {
+                    let gap = AgentEvent {
+                        session_id: event.session_id.clone(),
+                        turn_id: None,
+                        sequence: event.sequence.saturating_sub(dropped_events),
+                        timestamp_ms: event.timestamp_ms,
+                        kind: AgentEventKind::JournalGap {
+                            dropped_events,
+                            next_sequence: event.sequence,
+                        },
+                    };
+                    let _ = journal.record(&gap);
+                    dropped_events = 0;
+                }
+                let _ = journal.record(&event);
+            }
+            Err(broadcast::error::RecvError::Lagged(count)) => {
+                dropped_events = dropped_events.saturating_add(count);
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
     }
 }
 
@@ -650,6 +684,25 @@ impl Ui for EventUi {
         });
         self.inner.tool_result_id(id, name, result, status);
     }
+    fn plan_result_id(
+        &mut self,
+        id: &str,
+        name: &str,
+        result: &str,
+        status: hi_tools::ToolStatus,
+        steps: &[hi_tools::PlanStep],
+    ) {
+        self.emit(AgentEventKind::ToolResult {
+            id: id.into(),
+            name: name.into(),
+            result: redact(result),
+            status: format!("{status:?}"),
+        });
+        self.emit(AgentEventKind::PlanChanged {
+            steps: steps.to_vec(),
+        });
+        self.inner.plan_result_id(id, name, result, status, steps);
+    }
     fn status(&mut self, text: &str) {
         self.emit(AgentEventKind::Status { text: redact(text) });
         self.inner.status(text);
@@ -829,6 +882,52 @@ mod tests {
                 .unwrap()
                 .contains("[REDACTED]")
         );
+    }
+
+    #[tokio::test]
+    async fn durable_journal_records_lag_and_continues_with_retained_events() {
+        let root = std::env::temp_dir().join(format!("hi-agent-journal-lag-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("events.jsonl");
+        let journal = Arc::new(EventJournal::open(&path).unwrap());
+        let (events, _) = broadcast::channel(256);
+        let receiver = events.subscribe();
+
+        for sequence in 0..300_u64 {
+            events
+                .send(AgentEvent {
+                    session_id: "lag-test".into(),
+                    turn_id: Some("turn-1".into()),
+                    sequence,
+                    timestamp_ms: u128::from(sequence),
+                    kind: AgentEventKind::TurnStarted {
+                        input: format!("event-{sequence}"),
+                    },
+                })
+                .unwrap();
+        }
+        drop(events);
+
+        persist_journal_events(receiver, journal.clone()).await;
+        let recorded = EventJournal::load(&path).unwrap();
+
+        assert_eq!(recorded.len(), 257, "one gap plus 256 retained events");
+        assert!(matches!(
+            recorded[0].kind,
+            AgentEventKind::JournalGap {
+                dropped_events: 44,
+                next_sequence: 44,
+            }
+        ));
+        assert_eq!(recorded[1].sequence, 44);
+        assert_eq!(recorded.last().unwrap().sequence, 299);
+        assert!(matches!(
+            &recorded.last().unwrap().kind,
+            AgentEventKind::TurnStarted { input } if input == "event-299"
+        ));
+
+        drop(journal);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -1,0 +1,160 @@
+schema_version = 1
+name = "queued-user-precedes-drive"
+tags = ["curated"]
+timeout_ms = 60000
+
+[[session.plan]]
+title = "Land the first change"
+status = "pending"
+
+[[session.plan]]
+title = "Finish remaining work"
+status = "pending"
+
+[[provider.steps]]
+id = "gated-mutation"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "queued.txt", content = "first turn landed\n" }
+gate = "first-model-call"
+
+[[provider.steps]]
+id = "generic-after-queued-mutation"
+[provider.steps.response]
+kind = "text"
+text = "Completed the requested action."
+
+[[provider.steps]]
+id = "generic-queued-retry"
+[provider.steps.response]
+kind = "text"
+text = "Completed the requested action."
+
+[[provider.steps]]
+id = "queued-user-mutation"
+[provider.steps.expect]
+body_contains = ["queued user request ran first"]
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "user-turn.txt", content = "queued user request ran first\n" }
+
+[[provider.steps]]
+id = "generic-after-user-mutation"
+[provider.steps.response]
+kind = "text"
+text = "Completed the requested action."
+
+[[provider.steps]]
+id = "generic-user-retry"
+[provider.steps.response]
+kind = "text"
+text = "Completed the requested action."
+
+[[provider.steps]]
+id = "drive-after-user-held"
+[provider.steps.response]
+kind = "hold"
+gate = "stop-final-drive"
+
+[[actions]]
+kind = "wait_provider_request"
+count = 1
+timeout_ms = 10000
+
+[[actions]]
+kind = "send_line"
+text = "Create user-turn.txt containing queued user request ran first."
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "prompt_queued", "/data/origin" = "user" }
+timeout_ms = 5000
+
+[[actions]]
+kind = "release_gate"
+gate = "first-model-call"
+
+[[actions]]
+kind = "wait_provider_request"
+count = 7
+timeout_ms = 20000
+
+[[actions]]
+kind = "send_key"
+key = "ctrl_c"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "cancelled" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "release_gate"
+gate = "stop-final-drive"
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "prompt_queued", "/data/origin" = "user" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "prompt_dequeued", "/data/origin" = "user" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+exact = 2
+
+[[assertions]]
+kind = "record_sequence"
+source = "events"
+pointer = "/event"
+values = ["turn_started", "prompt_queued", "turn_settled", "prompt_dequeued", "turn_started", "provider_request", "turn_settled", "turn_started"]
+
+[[assertions]]
+kind = "record_sequence"
+source = "events"
+where_equals = { "/event" = "turn_started" }
+pointer = "/data/origin"
+values = ["plan_drive", "user", "plan_drive"]
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "user" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+contains = { "/body" = "queued user request ran first" }
+at_least = 1
+
+[[assertions]]
+kind = "file"
+path = "queued.txt"
+exists = true
+contains = "first turn landed"
+
+[[assertions]]
+kind = "file"
+path = "user-turn.txt"
+exists = true
+contains = "queued user request ran first"
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

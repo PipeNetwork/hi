@@ -48,23 +48,17 @@ pub(super) fn append_tool_images(
 
 /// Outcomes and counters produced by one Tools-phase batch.
 pub(in crate::agent::turn) struct ToolBatchOutcome {
+    pub(in crate::agent::turn) calls: Vec<(String, String, String)>,
+    pub(in crate::agent::turn) read_only_intent: Option<crate::steering::ReviewIntent>,
     pub(in crate::agent::turn) hash_guard_applies: bool,
     pub(in crate::agent::turn) hashable_idempotent_results: usize,
     pub(in crate::agent::turn) repeated_idempotent_results: usize,
-    /// How many results were `bash_output` polls of a still-running process —
-    /// with or without new output. A live progress bar produces fresh bytes on
-    /// every poll, so waiting-detection keys on the process lifecycle instead
-    /// of output novelty.
+    /// Results that polled a still-running process, independent of output
+    /// novelty (progress bars otherwise defeat waiting detection).
     pub(in crate::agent::turn) running_background_poll_results: usize,
-    /// How many running-process polls delivered failure diagnostics (compiler
-    /// errors, test failures, panics) in their fresh output. Those rounds are
-    /// new work arriving, not waiting — they reset the wait-streak so the
-    /// model can act on the evidence.
+    /// Running polls that delivered actionable failure diagnostics.
     pub(in crate::agent::turn) actionable_poll_results: usize,
-    /// How many calls in this batch were wait-flavored: background polls, plan
-    /// bookkeeping, or non-mutating non-validating shell probes (log tails,
-    /// size checks). A batch of only these while a process runs is a turn
-    /// waiting on external work, not making progress toward the plan.
+    /// Calls compatible with a round that is only waiting on background work.
     pub(in crate::agent::turn) wait_flavored_results: usize,
     pub(in crate::agent::turn) tool_progress_labels: Vec<ToolProgressLabel>,
     pub(in crate::agent::turn) plan_changed_this_batch: bool,
@@ -75,8 +69,10 @@ pub(in crate::agent::turn) struct ToolBatchOutcome {
     /// repeat nudge.
     pub(in crate::agent::turn) protocol_validation_errors: Vec<(String, String)>,
     /// Background handles named by the model this batch that the registry has
-    /// never seen, most recent first. Lets the turn loop tell a guessed id
-    /// (never real) from a pruned one (a real process was forgotten at
-    /// capacity) and steer the model accordingly.
+    /// never seen, most recent first.
     pub(in crate::agent::turn) unknown_background_handles: Vec<hi_tools::UnknownBackgroundHandle>,
+    /// The one ordinary-tool recovery was already consumed and a second
+    /// rejected program was received. The turn loop must use its typed error
+    /// path instead of allowing an unbounded program/fallback cycle.
+    pub(in crate::agent::turn) program_fallback_exhausted: bool,
 }

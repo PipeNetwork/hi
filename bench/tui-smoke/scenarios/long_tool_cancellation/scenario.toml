@@ -1,0 +1,60 @@
+schema_version = 1
+name = "long-tool-cancellation"
+tags = ["curated", "pr", "fuzz_state_template"]
+timeout_ms = 45000
+
+[workspace]
+fixture = "fixture"
+
+[[provider.steps]]
+id = "long-tool"
+[provider.steps.response]
+kind = "tool_call"
+name = "bash"
+arguments = { command = "sh slow.sh", timeout = 60 }
+
+[[actions]]
+kind = "send_line"
+text = "Run the long smoke command now."
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started", "/data/name" = "bash" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_process"
+command_contains = "sleep"
+at_least = 1
+timeout_ms = 10000
+
+[[actions]]
+kind = "send_key"
+key = "ctrl_c"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "cancelled", "/data/outcome/stop_reason" = "cancelled" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_started", "/data/name" = "bash" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "cancelled" }
+exact = 1
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

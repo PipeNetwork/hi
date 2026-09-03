@@ -1,0 +1,23 @@
+[package]
+name = "hi-engine-host"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+hi-engine-api.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+wasmtime = { version = "39", default-features = false, features = ["cranelift", "runtime", "component-model", "pooling-allocator"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

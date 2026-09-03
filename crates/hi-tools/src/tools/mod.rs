@@ -22,14 +22,14 @@ pub(crate) use process_tools::kill_group;
 use process_tools::{BashArgs, run_bash_tool};
 
 pub use crate::catalog::{
-    MINIMAL_TOOL_SPECS, PROTECTED_TOOLS, TOOL_CATALOG, TOOL_SPECS, ToolAdmission, ToolCapability,
-    ToolMetadata, ask_user_tool_spec, browser_exec_tool_spec, delegate_tool_spec,
-    explore_tool_spec, get_task_output_tool_spec, is_coordination, is_filesystem_mutating,
-    is_known_tool, is_read_only, kill_task_tool_spec, memory_forget_tool_spec,
-    memory_get_tool_spec, memory_search_tool_spec, memory_update_tool_spec, new_context_tool_spec,
-    research_read_tool_spec, research_tool_spec, search_tool_tool_spec, skill_tool_spec,
-    target_path, target_paths, task_tool_spec, tool_metadata, use_tool_tool_spec,
-    wait_tasks_tool_spec,
+    MINIMAL_TOOL_SPECS, PROTECTED_TOOLS, SpeculationClass, TOOL_CATALOG, TOOL_SPECS, ToolAdmission,
+    ToolCapability, ToolCostClass, ToolMetadata, ask_user_tool_spec, browser_exec_tool_spec,
+    delegate_tool_spec, explore_tool_spec, get_task_output_tool_spec, is_coordination,
+    is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec,
+    memory_forget_tool_spec, memory_get_tool_spec, memory_search_tool_spec,
+    memory_update_tool_spec, new_context_tool_spec, research_read_tool_spec, research_tool_spec,
+    run_program_tool_spec, search_tool_tool_spec, skill_tool_spec, speculation_class, target_path,
+    target_paths, task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
 };
 
 use mutations::run_prepared_mutation;
@@ -39,23 +39,25 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::condense::condense;
-use crate::read::{run_glob, run_grep, run_list, run_read};
+use crate::read::{run_glob, run_grep_with_runner, run_list, run_read};
 use crate::{PlanStatus, PlanStep, ProcessRunner, ToolEffects, ToolOutcome};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 600;
-const GIT_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// The effective verification timeout: `HI_VERIFY_TIMEOUT_SECS` if set to a
-/// positive integer, else [`DEFAULT_CHECK_TIMEOUT_SECS`].
-pub fn check_timeout() -> Duration {
-    let secs = std::env::var("HI_VERIFY_TIMEOUT_SECS")
-        .ok()
+pub(crate) fn check_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    value
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_CHECK_TIMEOUT_SECS);
-    Duration::from_secs(secs)
+        .map(Duration::from_secs)
+        .filter(|timeout| std::time::Instant::now().checked_add(*timeout).is_some())
+}
+
+/// Optional verification wall-clock cap. A positive
+/// `HI_VERIFY_TIMEOUT_SECS` opts in; unset, invalid, or zero leaves productive
+/// verification active until completion or caller cancellation.
+pub fn check_timeout() -> Option<Duration> {
+    let configured = std::env::var("HI_VERIFY_TIMEOUT_SECS").ok();
+    check_timeout_from_value(configured.as_deref())
 }
 const MAX_UNTRACKED_DIFF_ENTRIES: usize = 200;
 const MAX_CREATED_DIFF_FILE_BYTES: usize = 16 * 1024;
@@ -64,7 +66,20 @@ pub async fn run_check_in(
     root: &std::path::Path,
     command: &str,
 ) -> Result<crate::ProcessExecution> {
-    run_check_in_with_timeout(root, command, check_timeout()).await
+    let runner = ProcessRunner::new(root)?;
+    run_check_in_with_runner(&runner, command).await
+}
+
+/// Run a verification command through an already-configured process runner.
+///
+/// Embedded agents must use this variant so verification inherits the
+/// workspace's explicit sandbox policy instead of re-reading the process
+/// environment and silently selecting a different runner.
+pub async fn run_check_in_with_runner(
+    runner: &ProcessRunner,
+    command: &str,
+) -> Result<crate::ProcessExecution> {
+    run_check_in_with_runner_maybe_timeout(runner, command, check_timeout()).await
 }
 
 /// [`run_check_in`] with an explicit budget. Verification uses this for its
@@ -75,15 +90,37 @@ pub async fn run_check_in_with_timeout(
     command: &str,
     timeout: std::time::Duration,
 ) -> Result<crate::ProcessExecution> {
+    let runner = ProcessRunner::new(root)?;
+    run_check_in_with_runner_timeout(&runner, command, timeout).await
+}
+
+/// [`run_check_in_with_timeout`] using the caller's configured process runner.
+pub async fn run_check_in_with_runner_timeout(
+    runner: &ProcessRunner,
+    command: &str,
+    timeout: std::time::Duration,
+) -> Result<crate::ProcessExecution> {
+    run_check_in_with_runner_maybe_timeout(runner, command, Some(timeout)).await
+}
+
+/// Run a verification command with an optional operator deadline.
+///
+/// `None` keeps productive work alive until completion or caller
+/// cancellation; dropping the future still kills the entire process group.
+pub async fn run_check_in_with_runner_maybe_timeout(
+    runner: &ProcessRunner,
+    command: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<crate::ProcessExecution> {
     // `__pycache__` cleanup only matters for Python. Cargo/go/npm stages would
     // otherwise pay a full-tree walk before every verify command — and that walk
     // runs on the agent future the TUI co-polls, so it freezes the UI.
     if command_needs_pycache_cleanup(command) {
-        let root_for_cleanup = root.to_path_buf();
+        let root_for_cleanup = runner.root().to_path_buf();
         let _ =
             tokio::task::spawn_blocking(move || prepare_verify_workdir(&root_for_cleanup)).await;
     }
-    ProcessRunner::new(root)?.run_shell(command, timeout).await
+    runner.run_shell_maybe_timeout(command, timeout).await
 }
 
 fn command_needs_pycache_cleanup(command: &str) -> bool {
@@ -218,13 +255,32 @@ pub fn fast_check_for(path: &str) -> Option<&'static str> {
 /// shell command. The boolean is authoritative; the text is bounded diagnostic
 /// context for the model/UI.
 pub async fn run_fast_check_in(root: &Path, check: &str, path: &Path) -> (bool, String) {
+    run_fast_check_in_maybe_timeout(root, check, path, check_timeout()).await
+}
+
+async fn run_fast_check_in_maybe_timeout(
+    root: &Path,
+    check: &str,
+    path: &Path,
+    timeout: Option<Duration>,
+) -> (bool, String) {
     use std::ffi::OsString;
 
     let path_arg = path.as_os_str().to_os_string();
     let (program, args): (&str, Vec<OsString>) = match check {
         "python3 -m py_compile" => (
+            // `py_compile` writes bytecode even when
+            // PYTHONDONTWRITEBYTECODE is set. Compile the source in memory
+            // instead so a fast check cannot mutate a cache outside the
+            // workspace or fail under a read-only macOS Python cache.
             "python3",
-            vec![OsString::from("-m"), OsString::from("py_compile"), path_arg],
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    "import pathlib,sys; compile(pathlib.Path(sys.argv[1]).read_text(), sys.argv[1], 'exec')",
+                ),
+                path_arg,
+            ],
         ),
         "gofmt -l" => ("gofmt", vec![OsString::from("-l"), path_arg]),
         "ruby -c" => ("ruby", vec![OsString::from("-c"), path_arg]),
@@ -239,7 +295,7 @@ pub async fn run_fast_check_in(root: &Path, check: &str, path: &Path) -> (bool, 
         Err(error) => return (false, format!("fast-check runner failed: {error:#}")),
     };
     match runner
-        .run_program(program, &args, Duration::from_secs(60))
+        .run_program_maybe_timeout(program, &args, timeout)
         .await
     {
         Ok(execution) => (
@@ -680,8 +736,16 @@ async fn unstage_paths(root: &Path, paths: &[String]) {
 }
 
 async fn run_git_operation(root: &Path, args: Vec<String>) -> Result<crate::ProcessExecution> {
+    run_git_operation_maybe_timeout(root, args, None).await
+}
+
+async fn run_git_operation_maybe_timeout(
+    root: &Path,
+    args: Vec<String>,
+    timeout: Option<Duration>,
+) -> Result<crate::ProcessExecution> {
     ProcessRunner::new(root)?
-        .run_program("git", args, GIT_OPERATION_TIMEOUT)
+        .run_program_maybe_timeout("git", args, timeout)
         .await
 }
 
@@ -698,6 +762,9 @@ async fn run_git_read(root: &Path, color: bool, args: &[&str]) -> Result<crate::
 /// so the model sees them and can recover, rather than aborting the turn.
 #[derive(Clone, Copy)]
 pub(super) struct RuntimeResources<'a> {
+    /// The live agent supplies its already-resolved runner here. Compatibility
+    /// entry points leave it unset and retain environment-based construction.
+    pub(super) process_runner: Option<&'a ProcessRunner>,
     pub(super) lsp: &'a std::sync::Arc<hi_lsp::LspManager>,
     pub(super) background: &'a crate::BackgroundRegistry,
     pub(super) read_cache: &'a std::sync::Mutex<crate::ReadCache>,
@@ -738,6 +805,7 @@ pub(crate) async fn execute_in(root: &Path, name: &str, arguments: &str) -> Tool
         &root,
         &state,
         RuntimeResources {
+            process_runner: None,
             lsp: &lsp,
             background: &background,
             read_cache: &read_cache,
@@ -814,6 +882,45 @@ pub async fn execute_in_runtime_shared_with(
         root,
         state_root,
         RuntimeResources {
+            process_runner: None,
+            lsp,
+            background,
+            read_cache,
+            repo_map: repo_map.as_ref(),
+            repo_map_arc: Some(repo_map),
+            mcp,
+            memory,
+            skill: None,
+            hunk_tracker: None,
+        },
+        name,
+        arguments,
+    )
+    .await
+}
+
+/// Like [`execute_in_runtime_shared_with`] but uses the caller's already
+/// configured process runner. Live agents use this path so shell tools and
+/// verification cannot silently resolve different sandbox policies.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_in_runtime_shared_with_runner(
+    runner: &ProcessRunner,
+    root: &Path,
+    state_root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    background: &crate::BackgroundRegistry,
+    read_cache: &std::sync::Mutex<crate::ReadCache>,
+    repo_map: &std::sync::Arc<std::sync::Mutex<crate::RepoMapCache>>,
+    mcp: Option<&dyn external::McpBackend>,
+    memory: Option<&dyn external::MemoryBackend>,
+    name: &str,
+    arguments: &str,
+) -> ToolOutcome {
+    execute_in_impl(
+        root,
+        state_root,
+        RuntimeResources {
+            process_runner: Some(runner),
             lsp,
             background,
             read_cache,
@@ -872,6 +979,7 @@ pub async fn execute_in_runtime_with_hunks(
         root,
         state_root,
         RuntimeResources {
+            process_runner: None,
             lsp,
             background,
             read_cache,
@@ -925,6 +1033,43 @@ pub async fn execute_streaming_in_runtime(
         root,
         state_root,
         RuntimeResources {
+            process_runner: None,
+            lsp,
+            background,
+            read_cache,
+            repo_map,
+            repo_map_arc: None,
+            mcp: None,
+            memory: None,
+            skill: None,
+            hunk_tracker: None,
+        },
+        name,
+        arguments,
+        on_line,
+    )
+    .await
+}
+
+/// Streaming counterpart to [`execute_in_runtime_shared_with_runner`].
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_streaming_in_runtime_with_runner(
+    runner: &ProcessRunner,
+    root: &Path,
+    state_root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    background: &crate::BackgroundRegistry,
+    read_cache: &std::sync::Mutex<crate::ReadCache>,
+    repo_map: &std::sync::Mutex<crate::RepoMapCache>,
+    name: &str,
+    arguments: &str,
+    on_line: &mut (dyn FnMut(&str) + Send),
+) -> ToolOutcome {
+    execute_streaming_in_impl(
+        root,
+        state_root,
+        RuntimeResources {
+            process_runner: Some(runner),
             lsp,
             background,
             read_cache,
@@ -1046,16 +1191,13 @@ async fn run(
             if args.steps.is_empty() {
                 bail!("update_plan needs at least one step");
             }
-            // Titles ride in leftover-plan steering and the structured goal.
-            // An unbounded list (or novel-length titles) is a session-wide
-            // token bomb even though the tool result itself is one line.
-            const MAX_PLAN_STEPS: usize = 128;
+            // Titles ride in leftover-plan steering and the structured goal, so
+            // bound each title's payload. Preserve every submitted step: silently
+            // dropping the tail can make a long-running plan settle early.
             const MAX_PLAN_TITLE_CHARS: usize = 160;
-            let omitted = args.steps.len().saturating_sub(MAX_PLAN_STEPS);
             let steps: Vec<PlanStep> = args
                 .steps
                 .into_iter()
-                .take(MAX_PLAN_STEPS)
                 .map(|s| PlanStep {
                     title: clip_plan_title(&s.title, MAX_PLAN_TITLE_CHARS),
                     status: PlanStatus::parse(&s.status),
@@ -1065,10 +1207,7 @@ async fn run(
                 .iter()
                 .filter(|s| s.status == PlanStatus::Done)
                 .count();
-            let mut content = format!("Plan recorded: {done}/{} done.", steps.len());
-            if omitted > 0 {
-                content.push_str(&format!(" ({omitted} extra step(s) omitted)"));
-            }
+            let content = format!("Plan recorded: {done}/{} done.", steps.len());
             Ok(ToolOutcome::planned(content, steps))
         }
         "write" | "edit" | "multi_edit" | "apply_patch" => {
@@ -1128,7 +1267,7 @@ async fn run(
             ))
         }
         "glob" => run_glob(root, arguments).await,
-        "grep" => run_grep(root, arguments).await,
+        "grep" => run_grep_with_runner(root, resources.process_runner, arguments).await,
         "diagnostics" => run_lsp_diagnostics(root, resources.lsp, arguments).await,
         "definition" => run_lsp_definition(root, resources.lsp, arguments).await,
         "references" => run_lsp_references(root, resources.lsp, arguments).await,
@@ -1518,17 +1657,70 @@ pub(crate) fn parse<T: for<'de> Deserialize<'de>>(arguments: &str) -> Result<T> 
 mod tests {
     use super::mutations::is_retryable_edit_miss;
     use super::process_tools::{
-        foreground_interactive_command_reason, foreground_interactive_command_reason_at,
-        run_bash_streaming_with_timeout,
+        BashArgs, auto_background_enabled_from_value, foreground_interactive_command_reason,
+        foreground_interactive_command_reason_at, run_bash_streaming_with_timeout,
+        run_bash_tool_with_auto_background,
     };
     use super::{
-        MAX_WRITE_OVERWRITE_BYTES, TOOL_SPECS, commit_in, execute_in, fast_check_for,
-        fast_check_passed, redact_tool_output, render_untracked_files,
-        render_untracked_files_with_contents, run_check_in, working_tree_diff_plain_in,
+        MAX_WRITE_OVERWRITE_BYTES, RuntimeResources, TOOL_SPECS, check_timeout_from_value,
+        commit_in, execute_in, fast_check_for, fast_check_passed, redact_tool_output,
+        render_untracked_files, render_untracked_files_with_contents, run_check_in,
+        run_fast_check_in_maybe_timeout, run_git_operation_maybe_timeout,
+        working_tree_diff_plain_in,
     };
     use crate::edit::{apply_edit, sh_quote};
     use crate::paths::cache_key;
     use std::time::Duration;
+
+    #[test]
+    fn verification_timeout_is_an_explicit_positive_opt_in() {
+        assert_eq!(check_timeout_from_value(None), None);
+        assert_eq!(check_timeout_from_value(Some("0")), None);
+        assert_eq!(check_timeout_from_value(Some("invalid")), None);
+        assert_eq!(
+            check_timeout_from_value(Some("11")),
+            Some(Duration::from_secs(11))
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_check_has_no_default_deadline_but_accepts_an_explicit_one() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|output| !output.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "hi-fast-check-deadline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("valid.py");
+        std::fs::write(&path, "answer = 42\n").unwrap();
+
+        let (passed, output) =
+            run_fast_check_in_maybe_timeout(&dir, "python3 -m py_compile", &path, None).await;
+        assert!(passed, "default-unlimited fast check failed: {output}");
+
+        let (passed, output) = run_fast_check_in_maybe_timeout(
+            &dir,
+            "python3 -m py_compile",
+            &path,
+            Some(Duration::ZERO),
+        )
+        .await;
+        assert!(!passed, "an explicit zero-duration deadline must fire");
+        assert!(output.contains("timed out"), "{output}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn diff_untracked_files_are_collapsed_and_capped() {
@@ -1622,6 +1814,38 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "git {args:?} failed");
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_git_deadline_is_optional_and_explicit() {
+        let dir = init_commit_test_repo();
+        let completed = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_git_operation_maybe_timeout(
+                &dir,
+                vec![
+                    "-c".into(),
+                    "alias.pause=!sleep 0.05".into(),
+                    "pause".into(),
+                ],
+                None,
+            ),
+        )
+        .await
+        .expect("default-unlimited git operation should complete")
+        .unwrap();
+        assert_eq!(completed.status, crate::ToolStatus::Succeeded);
+
+        let timed_out = run_git_operation_maybe_timeout(
+            &dir,
+            vec!["-c".into(), "alias.pause=!sleep 1".into(), "pause".into()],
+            Some(Duration::from_millis(25)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(timed_out.status, crate::ToolStatus::TimedOut);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1921,8 +2145,23 @@ mod tests {
         assert_eq!(execution.model_content(), "hi");
     }
 
-    /// Auto-background-on-timeout: a foreground command still running at its
-    /// budget is moved to the background (handle returned) instead of killed.
+    #[test]
+    fn bash_auto_background_is_an_explicit_opt_in() {
+        assert!(!auto_background_enabled_from_value(None));
+        assert!(!auto_background_enabled_from_value(Some("")));
+        assert!(!auto_background_enabled_from_value(Some("0")));
+        assert!(!auto_background_enabled_from_value(Some("false")));
+        assert!(!auto_background_enabled_from_value(Some("unexpected")));
+        assert!(auto_background_enabled_from_value(Some("1")));
+        assert!(auto_background_enabled_from_value(Some(" true ")));
+        assert!(auto_background_enabled_from_value(Some("YES")));
+        assert!(auto_background_enabled_from_value(Some("on")));
+    }
+
+    /// Explicit auto-background-on-timeout: a foreground command still running
+    /// at its budget is moved to the background (handle returned) instead of
+    /// killed. Injecting policy keeps this deterministic and avoids mutating the
+    /// process-global environment while other tests execute.
     /// A unique, isolated `(root, state)` pair under the system temp dir. Auto-
     /// background tests must NOT share `CARGO_MANIFEST_DIR` as the workspace root
     /// — the effect-snapshot walk of one test would race another test's
@@ -1946,24 +2185,39 @@ mod tests {
     // child, making the handoff timing flaky under CI load. A dedicated worker
     // thread lets the timer fire independently of the process I/O.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bash_moves_to_background_on_timeout_instead_of_killing() {
+    async fn explicitly_enabled_bash_auto_backgrounds_instead_of_killing() {
         let (root, state) = isolated_ws("bg");
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root).unwrap());
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
+        let runner = crate::ProcessRunner::new(&root).unwrap();
         // timeout:1 → foreground budget is 1s; a 600s sleep outlasts it.
-        let outcome = crate::execute_in_runtime(
+        let outcome = run_bash_tool_with_auto_background(
             &root,
             &state,
-            &lsp,
-            &background,
-            &cache,
-            &repo_map,
-            "bash",
-            r#"{"command":"sleep 600","timeout":1}"#,
+            RuntimeResources {
+                process_runner: Some(&runner),
+                lsp: &lsp,
+                background: &background,
+                read_cache: &cache,
+                repo_map: &repo_map,
+                repo_map_arc: None,
+                mcp: None,
+                memory: None,
+                skill: None,
+                hunk_tracker: None,
+            },
+            BashArgs {
+                command: "sleep 600".into(),
+                timeout: Some(1),
+                run_in_background: false,
+            },
+            &mut |_| {},
+            true,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             outcome.content.contains("continued as")
                 || outcome.content.contains("still running after"),
@@ -2586,24 +2840,25 @@ mod tests {
     }
 
     #[test]
-    fn bash_timeout_resolution_and_clamping() {
-        use super::process_tools::{
-            DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS, resolve_bash_timeout,
-        };
-        // Explicit request wins and is honored.
-        assert_eq!(resolve_bash_timeout(Some(42)).as_secs(), 42);
-        // Absurd values clamp to the ceiling, not unbounded.
+    fn bash_timeout_resolution_has_no_implicit_or_maximum_ceiling() {
+        use super::process_tools::resolve_bash_timeout_from_values;
+        assert_eq!(resolve_bash_timeout_from_values(None, None), None);
+        assert_eq!(resolve_bash_timeout_from_values(None, Some("0")), None);
         assert_eq!(
-            resolve_bash_timeout(Some(u64::MAX)).as_secs(),
-            MAX_BASH_TIMEOUT_SECS
+            resolve_bash_timeout_from_values(None, Some("invalid")),
+            None
         );
-        // Zero clamps up to 1 so the guard is never disabled.
-        assert_eq!(resolve_bash_timeout(Some(0)).as_secs(), 1);
-        // No request → the default (env not set in this test).
         assert_eq!(
-            resolve_bash_timeout(None).as_secs(),
-            DEFAULT_BASH_TIMEOUT_SECS
+            resolve_bash_timeout_from_values(None, Some("86400")).map(|value| value.as_secs()),
+            Some(86_400)
         );
+        // Explicit positive requests are honored without a one-hour clamp.
+        assert_eq!(
+            resolve_bash_timeout_from_values(Some(86_400), Some("1")).map(|value| value.as_secs()),
+            Some(86_400)
+        );
+        // Zero explicitly selects the same continual mode as omission.
+        assert_eq!(resolve_bash_timeout_from_values(Some(0), Some("1")), None);
     }
 
     #[test]

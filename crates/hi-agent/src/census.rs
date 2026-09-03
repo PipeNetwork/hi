@@ -137,4 +137,54 @@ mod tests {
         assert_eq!(census.max_tool_result_chars, 20_000);
         assert_eq!(census.user_messages, 1);
     }
+
+    #[test]
+    fn turn_request_census_is_bounded_and_counts_dropped_middle_records() {
+        let mut telemetry = crate::TurnTelemetry::default();
+        for index in 0..300_u64 {
+            telemetry.record_request_census(RequestCensus {
+                input_tokens_est: index,
+                ..RequestCensus::default()
+            });
+        }
+
+        assert_eq!(telemetry.requests.len(), 256);
+        assert_eq!(
+            telemetry.diagnostic_retention.requests_dropped, 44,
+            "productive requests continue; only diagnostic middle rows are omitted"
+        );
+        assert_eq!(telemetry.requests.first().unwrap().input_tokens_est, 0);
+        assert_eq!(telemetry.requests.last().unwrap().input_tokens_est, 299);
+    }
+
+    #[test]
+    fn turn_wire_audit_keeps_the_first_attempts_and_terminal_provider_evidence() {
+        let mut telemetry = crate::TurnTelemetry::default();
+        for index in 0..100_u64 {
+            telemetry.record_wire_audit(serde_json::json!({ "attempt": index }));
+        }
+
+        assert_eq!(telemetry.wire_audit.len(), 32);
+        assert_eq!(telemetry.diagnostic_retention.wire_audit_dropped, 68);
+        assert_eq!(telemetry.wire_audit[0]["attempt"], 0);
+        assert_eq!(telemetry.wire_audit[7]["attempt"], 7);
+        assert_eq!(telemetry.wire_audit[8]["attempt"], 76);
+        assert_eq!(telemetry.wire_audit.last().unwrap()["attempt"], 99);
+    }
+
+    #[test]
+    fn turn_compaction_diagnostics_are_bounded() {
+        let mut telemetry = crate::TurnTelemetry::default();
+        for index in 0..200 {
+            telemetry.record_compaction(CompactionEvent {
+                freed_chars: index,
+                keep_recent: 8,
+            });
+        }
+
+        assert_eq!(telemetry.compaction.len(), 128);
+        assert_eq!(telemetry.diagnostic_retention.compaction_events_dropped, 72);
+        assert_eq!(telemetry.compaction.first().unwrap().freed_chars, 0);
+        assert_eq!(telemetry.compaction.last().unwrap().freed_chars, 199);
+    }
 }

@@ -82,6 +82,7 @@ impl crate::Agent {
             pre_turn_checkpoint.as_deref(),
             &lsp,
         )
+        .with_process_runner(self.runtime.process_runner())
         .with_changed_files(&ledger_touched_files)
         .with_mutation_seen(ledger_mutation_seen)
         .with_skippable_affected(&skip_checks, &skip_tests);

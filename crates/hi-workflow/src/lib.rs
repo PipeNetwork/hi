@@ -3,6 +3,7 @@ pub mod engine;
 pub mod host;
 pub mod journal;
 pub mod meta;
+pub mod program;
 pub mod registry;
 pub mod run;
 pub mod runtime;
@@ -20,9 +21,9 @@ pub const MAX_PHASE_TITLE_LEN: usize = 128;
 pub const MAX_PHASE_DETAIL_LEN: usize = 1_024;
 pub const MAX_WORKFLOW_TRIGGERS: usize = 16;
 pub const MAX_PARALLEL: usize = 1_024;
-pub const DEFAULT_AGENT_BUDGET: u64 = 128;
-pub const MAX_AGENT_BUDGET: u64 = 1_024;
-pub const MAX_HOST_CALLS: u64 = 10_000;
+/// Ordinary workflow runs have no agent-call quota. Callers may opt into a
+/// finite budget by supplying `Some(limit)` when starting a run.
+pub const DEFAULT_AGENT_BUDGET: Option<u64> = None;
 
 pub(crate) fn with_rhai_hint(msg: String) -> String {
     let hint = if msg.contains("Expression exceeds maximum complexity") {
@@ -52,6 +53,10 @@ pub use engine::{WorkflowRunParams, run_workflow};
 pub use host::{AgentOpts, AgentResult, BudgetState, HostError, WorkflowHostRequest};
 pub use journal::{Journal, JournalEntry, JournalError};
 pub use meta::{MetaError, PhaseMeta, WorkflowMeta, extract_meta};
+pub use program::{
+    MAX_PROGRAM_SOURCE_BYTES, ProgramCall, ProgramHostRequest, ProgramOutcome, ProgramRunParams,
+    ProgramToolResult, extract_partial_program_source, extract_safe_literal_calls, run_program,
+};
 pub use registry::{
     MAX_WORKFLOW_SOURCE_BYTES, RegisteredWorkflow, RegistryError, WorkflowRegistry, WorkflowSource,
     save_project_workflow, user_workflows_dir, valid_workflow_name,

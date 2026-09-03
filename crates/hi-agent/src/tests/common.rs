@@ -7,30 +7,40 @@ use hi_ai::{
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, Weak};
 
-thread_local! {
-    static TEST_WORKSPACE: RefCell<Option<Weak<tempfile::TempDir>>> = const { RefCell::new(None) };
-}
-
 fn test_workspace() -> Arc<tempfile::TempDir> {
+    // libtest reuses worker threads, and a background task can briefly retain
+    // an older fixture after its test returns. Keying the weak lease by the
+    // current test name prevents that late owner from making a later test
+    // observe the old workspace.
+    let test_name = std::thread::current()
+        .name()
+        .unwrap_or("unnamed-test")
+        .to_string();
     TEST_WORKSPACE.with(|slot| {
-        let existing = slot.borrow().as_ref().and_then(Weak::upgrade);
-        if let Some(existing) = existing {
+        let mut slot = slot.borrow_mut();
+        if let Some((owner, workspace)) = slot.as_ref()
+            && owner == &test_name
+            && let Some(existing) = workspace.upgrade()
+        {
             return existing;
         }
-
         let workspace = Arc::new(
             tempfile::Builder::new()
                 .prefix("hi-agent-workspace-")
                 .tempdir()
                 .expect("create temporary test workspace"),
         );
-        *slot.borrow_mut() = Some(Arc::downgrade(&workspace));
+        *slot = Some((test_name, Arc::downgrade(&workspace)));
         workspace
     })
 }
 
-fn current_test_workspace() -> Option<Arc<tempfile::TempDir>> {
-    TEST_WORKSPACE.with(|slot| slot.borrow().as_ref().and_then(Weak::upgrade))
+// Keep path fixtures and the agent created later in the same test on one
+// temporary workspace, while the weak reference lets the whole fixture drop
+// when the test's last owner disappears. Each libtest worker has its own slot,
+// so parallel tests remain isolated.
+thread_local! {
+    static TEST_WORKSPACE: RefCell<Option<(String, Weak<tempfile::TempDir>)>> = const { RefCell::new(None) };
 }
 
 /// A provider that returns canned completions in order.
@@ -151,6 +161,9 @@ impl Provider for RecordRequests {
 
 pub(crate) enum ProviderStep {
     Completion(Completion),
+    /// Complete successfully after a deterministic delay. Used to prove that
+    /// agent-side policy does not impose an implicit short deadline.
+    DelayedCompletion(std::time::Duration, Completion),
     RequestTooLarge,
     /// Fail this round with a provider error of the given kind.
     Error(ProviderErrorKind),
@@ -178,15 +191,22 @@ impl Provider for ScriptedProvider {
         if let Some(max_tokens) = &self.max_tokens {
             max_tokens.lock().unwrap().push(request.max_tokens);
         }
-        let mut steps = self.steps.lock().unwrap();
-        if steps.is_empty() {
-            anyhow::bail!(
-                "ScriptedProvider exhausted: test scripted fewer steps than the agent requested \
+        let step = {
+            let mut steps = self.steps.lock().unwrap();
+            if steps.is_empty() {
+                anyhow::bail!(
+                    "ScriptedProvider exhausted: test scripted fewer steps than the agent requested \
 (often an extra repair/nudge round from a failed bash/validation step under parallel load)"
-            );
-        }
-        match steps.remove(0) {
+                );
+            }
+            steps.remove(0)
+        };
+        match step {
             ProviderStep::Completion(completion) => Ok(completion),
+            ProviderStep::DelayedCompletion(delay, completion) => {
+                tokio::time::sleep(delay).await;
+                Ok(completion)
+            }
             ProviderStep::RequestTooLarge => Err(ProviderError::new(
                 ProviderErrorKind::RequestTooLarge,
                 "API error 400 Bad Request: chat input exceeds the maximum allowed size",
@@ -259,24 +279,20 @@ impl Ui for RecordingUi {
 }
 
 pub(crate) fn config() -> AgentConfig {
-    // ProcessRunner shells honor HI_SANDBOX (workspace by default). Some CI /
-    // agent environments reject macOS sandbox-exec (exit 71), which makes every
-    // verify stage and many bash tools fail. Tests only need a functional shell.
-    unsafe {
-        std::env::set_var("HI_SANDBOX", "off");
-    }
+    // ProcessRunner shells may reject macOS sandbox-exec in this test host
+    // (exit 71). Pass the policy directly to the runtime; mutating the
+    // process-wide environment here races with parallel tests and can abort.
     let state_guard = tempfile::Builder::new()
         .prefix("hi-agent-state-")
         .tempdir()
         .expect("create temporary agent state root");
     let state_root = state_guard.path().to_path_buf();
-    let test_workspace_root = current_test_workspace();
+    let test_workspace_root = Some(test_workspace());
     let workspace_root = test_workspace_root
         .as_ref()
-        .map(|root| root.path().to_path_buf())
-        .unwrap_or_else(|| {
-            std::env::current_dir().expect("test working directory should be available")
-        });
+        .expect("test workspace should exist")
+        .path()
+        .to_path_buf();
     AgentConfig {
         paths: crate::AgentPaths {
             workspace_root,
@@ -292,6 +308,10 @@ pub(crate) fn config() -> AgentConfig {
         gates: crate::AgentGates {
             max_verify_repairs: 1,
             verification: crate::VerificationMode::Disabled,
+            // The common canned-agent fixture does not exercise language
+            // servers. Keep them off so a long single-process test run cannot
+            // accumulate native LSP children; focused LSP tests opt in.
+            lsp_mode: crate::LspMode::Off,
             // Most canned-provider tests assert specific nudge behavior before
             // any deterministic context is added. Preflight has dedicated tests.
             read_only_preflight: false,
@@ -327,6 +347,7 @@ pub(crate) fn config() -> AgentConfig {
         },
         test_state_root: Some(std::sync::Arc::new(state_guard)),
         _test_workspace_root: test_workspace_root,
+        sandbox_policy: Some(hi_tools::sandbox::SandboxPolicy::Off),
         subagents: crate::AgentSubagents {
             // Tests that need explore/delegate opt in; keep the base config quiet so
             // canned tool lists stay predictable.
@@ -521,6 +542,17 @@ pub(crate) fn temp_file(tag: &str) -> TempTestPath {
     }
 }
 
+/// A deterministic path beneath the same RAII-owned workspace used by
+/// [`config`]. This is useful when a test exercises repository conventions
+/// such as `Cargo.toml` or `README.md` discovery.
+pub(crate) fn temp_workspace_path(name: &str) -> TempTestPath {
+    let workspace = test_workspace();
+    TempTestPath {
+        _workspace: workspace.clone(),
+        path: workspace.path().join(name),
+    }
+}
+
 #[test]
 fn test_file_fixture_is_outside_repository_and_removed_with_its_owner() {
     let repository = std::env::current_dir().unwrap();
@@ -593,6 +625,7 @@ pub(crate) struct RecUi {
     pub(crate) tool_results: Vec<(String, String)>,
     pub(crate) plans: Vec<Vec<PlanStep>>,
     pub(crate) ask_user_questions: Vec<String>,
+    pub(crate) pending_ask_user: bool,
 }
 impl Ui for RecUi {
     fn assistant_text(&mut self, t: &str) {
@@ -642,7 +675,11 @@ impl Ui for RecUi {
     }
     fn ask_user(&mut self, question: &str, _options: &[String]) -> crate::AskUserFuture<'_> {
         self.ask_user_questions.push(question.to_string());
-        Box::pin(async { crate::AskUserResult::Unavailable })
+        if self.pending_ask_user {
+            Box::pin(std::future::pending())
+        } else {
+            Box::pin(async { crate::AskUserResult::Unavailable })
+        }
     }
 }
 

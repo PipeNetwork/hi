@@ -375,7 +375,7 @@ mod tests {
             name: name.into(),
             program: program.into(),
             arguments: vec![],
-            timeout: Duration::from_secs(30),
+            timeout: Some(Duration::from_secs(30)),
             required: true,
             inherit_environment: false,
         }

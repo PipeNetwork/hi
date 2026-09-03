@@ -40,6 +40,162 @@ fn goal_test_provider() -> std::sync::Arc<dyn hi_ai::Provider> {
     ))
 }
 
+#[test]
+fn dirty_session_face_survives_refresh_until_it_reaches_agent() {
+    let (_root, config) = goal_test_config("dirty-session-face");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    agent.set_plan_mode(true);
+    let mut app = test_app("custom", "test-model");
+    app.plan_mode = false;
+    app.permission_mode = hi_agent::PermissionMode::Always;
+    app.session_face_dirty = true;
+
+    app.refresh_goal(&agent);
+
+    assert!(!app.plan_mode, "refresh must preserve the pending UI mode");
+    assert!(app.session_face_dirty);
+    assert!(agent.plan_mode(), "the Agent has not received it yet");
+
+    app.push_session_face(&mut agent);
+
+    assert!(!agent.plan_mode());
+    assert_eq!(agent.permission_mode(), hi_agent::PermissionMode::Always);
+    assert!(!app.session_face_dirty);
+}
+
+#[test]
+fn interrupted_plan_pause_is_cleared_in_app_before_user_turn_render() {
+    let (_root, config) = goal_test_config("pre-render-interruption-resume");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    agent.restore_plan(vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }]);
+    agent.restore_plan_drive_with_policy(true, true, 0, Vec::new());
+    let mut app = test_app("custom", "test-model");
+    app.refresh_goal(&agent);
+    assert!(app.plan_drive_paused);
+
+    assert!(
+        agent
+            .prepare_plan_drive_for_turn(hi_agent::DriveKind::User)
+            .unwrap()
+    );
+    app.refresh_goal(&agent);
+
+    assert!(!agent.plan_drive_paused());
+    assert!(!app.plan_drive_paused);
+    assert!(matches!(
+        app.last_drive,
+        hi_agent::DriveAction::Enqueue(hi_agent::DriveKind::Plan)
+    ));
+}
+
+#[test]
+fn unrelated_session_face_change_preserves_interruption_resume_policy() {
+    let (_root, config) = goal_test_config("face-change-preserves-interruption-resume");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    agent.restore_plan(vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }]);
+    agent.restore_plan_drive_with_policy(true, true, 0, Vec::new());
+    let mut app = test_app("custom", "test-model");
+    app.refresh_goal(&agent);
+
+    app.cycle_session_face();
+    app.push_session_face(&mut agent);
+
+    assert!(agent.plan_drive_paused());
+    assert!(
+        agent
+            .prepare_plan_drive_for_turn(hi_agent::DriveKind::User)
+            .unwrap()
+    );
+    assert!(!agent.plan_drive_paused());
+}
+
+#[test]
+fn explicit_plan_turn_clears_parked_badge_before_render() {
+    let (_root, config) = goal_test_config("pre-render-parked-resume");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    agent.restore_plan(vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }]);
+    agent.restore_plan_drive_with_policy(
+        false,
+        false,
+        hi_agent::PLAN_DRIVE_STALL_LIMIT,
+        Vec::new(),
+    );
+    let mut app = test_app("custom", "test-model");
+    app.refresh_goal(&agent);
+    assert!(matches!(
+        app.last_drive,
+        hi_agent::DriveAction::Idle {
+            reason: hi_agent::DriveIdleReason::PlanParked
+        }
+    ));
+
+    assert!(
+        agent
+            .prepare_plan_drive_for_turn(hi_agent::DriveKind::Plan)
+            .unwrap()
+    );
+    app.refresh_goal(&agent);
+
+    assert_eq!(agent.plan_drive_stall(), 0);
+    assert!(matches!(
+        app.last_drive,
+        hi_agent::DriveAction::Enqueue(hi_agent::DriveKind::Plan)
+    ));
+}
+
+#[tokio::test]
+async fn parked_plan_approval_restores_and_view_plan_unparks_once() {
+    let (_root, config) = goal_test_config("restore-parked-plan-approval");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    agent.restore_plan(vec![hi_agent::PlanStep {
+        title: "wire the scheduler".into(),
+        status: hi_agent::PlanStatus::Pending,
+    }]);
+    agent.restore_plan_drive_with_policy(true, false, 0, Vec::new());
+    agent.restore_plan_approval_parked(true);
+    let mut app = test_app("custom", "test-model");
+
+    app.refresh_goal(&agent);
+
+    assert!(app.plan_approval.as_ref().is_some_and(|card| card.parked));
+    assert!(!app.plan_approval_capturing());
+    assert!(matches!(
+        agent.drive_decision(None),
+        hi_agent::DriveAction::Idle {
+            reason: hi_agent::DriveIdleReason::PlanApprovalParked
+        }
+    ));
+    app.maybe_queue_drive(&agent, None);
+    assert!(
+        app.queue.is_empty(),
+        "restart must not auto-drive parked work"
+    );
+
+    app.handle_command(&mut agent, hi_agent::Command::ViewPlan)
+        .await;
+
+    assert!(app.plan_approval_capturing());
+    assert!(!agent.plan_approval_parked());
+    assert!(
+        agent.plan_drive_paused(),
+        "/view-plan must preserve /plan pause"
+    );
+
+    app.handle_command(&mut agent, hi_agent::Command::ViewPlan)
+        .await;
+    assert!(!agent.plan_approval_parked(), "a second view is a no-op");
+    assert!(agent.plan_drive_paused());
+}
+
 #[tokio::test]
 async fn exact_plan_document_goal_becomes_structured_and_starts_driving() {
     const LINE: &str = "/goal review the plan.md document and fully build this";
@@ -169,12 +325,12 @@ fn resumed_active_goal_is_queued_without_displacing_user_input() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-fn incomplete_plan_outcome() -> hi_agent::TurnOutcome {
+fn pending_plan_outcome() -> hi_agent::TurnOutcome {
     hi_agent::TurnOutcome {
-        status: hi_agent::TurnStatus::Incomplete,
-        verification: hi_agent::VerificationStatus::Unverified,
+        status: hi_agent::TurnStatus::Completed,
+        verification: hi_agent::VerificationStatus::NotApplicable,
         review: hi_agent::ReviewStatus::NotRequired,
-        stop_reason: hi_agent::TurnStopReason::Stalled,
+        stop_reason: hi_agent::TurnStopReason::NoApplicableVerification,
         changed_files: Vec::new(),
         verified_workspace_revision: None,
         effective_route: hi_agent::EffectiveModelRoute {
@@ -188,7 +344,7 @@ fn incomplete_plan_outcome() -> hi_agent::TurnOutcome {
 }
 
 #[test]
-fn incomplete_plan_enqueues_plan_drive() {
+fn pending_plan_enqueues_plan_drive() {
     let (root, config) = goal_test_config("plan-drive");
     let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
     agent.restore_plan(vec![hi_agent::PlanStep {
@@ -196,7 +352,7 @@ fn incomplete_plan_enqueues_plan_drive() {
         status: hi_agent::PlanStatus::Pending,
     }]);
     let mut app = test_app("custom", "test-model");
-    let outcome = incomplete_plan_outcome();
+    let outcome = pending_plan_outcome();
 
     app.maybe_queue_drive(&agent, Some(&outcome));
     assert_eq!(
@@ -227,7 +383,7 @@ fn goal_drive_wins_over_plan_drive() {
         status: hi_agent::PlanStatus::Pending,
     }]);
     let mut app = test_app("custom", "test-model");
-    let outcome = incomplete_plan_outcome();
+    let outcome = pending_plan_outcome();
     app.maybe_queue_goal_drive(&agent);
     app.maybe_queue_drive(&agent, Some(&outcome));
     assert_eq!(app.queue.len(), 1);
@@ -246,7 +402,7 @@ fn completed_leftover_still_enqueues_plan_drive() {
         status: hi_agent::PlanStatus::Pending,
     }]);
     let mut app = test_app("custom", "test-model");
-    let mut outcome = incomplete_plan_outcome();
+    let mut outcome = pending_plan_outcome();
     outcome.status = hi_agent::TurnStatus::Completed;
     outcome.stop_reason = hi_agent::TurnStopReason::Completed;
     app.maybe_queue_drive(&agent, Some(&outcome));
@@ -269,7 +425,7 @@ fn plan_pause_stops_enqueue_and_resume_restarts() {
         status: hi_agent::PlanStatus::Pending,
     }]);
     let mut app = test_app("custom", "test-model");
-    let outcome = incomplete_plan_outcome();
+    let outcome = pending_plan_outcome();
 
     let pause =
         hi_agent::handle_session_command(&mut agent, &hi_agent::Command::Plan("pause".into()), &[])

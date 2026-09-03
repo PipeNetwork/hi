@@ -7,10 +7,11 @@
 //! reply exactly `NOTHING NEW` when nothing meaningful changed; quiet firings
 //! render as a dim one-liner while changes render loud (plus a terminal ping).
 //!
-//! Loops auto-expire 7 days after creation, are cancellable by id, persist to
-//! a per-project `loops.json`, and re-arm when the TUI restarts (they only
-//! fire while `hi` is running). The manager is one background task — it never
-//! touches the `Agent`; results drain into the transcript on UI ticks.
+//! Loops run until explicitly cancelled, persist to a per-project `loops.json`,
+//! and re-arm when the TUI restarts (they only fire while `hi` is running).
+//! Legacy automatic expiries are removed on load. The manager is one background
+//! task — it never touches the `Agent`; results drain into the transcript on UI
+//! ticks.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -19,19 +20,25 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::FleetLauncher;
 
-/// Loops expire this long after creation.
-pub(crate) const LOOP_TTL_SECS: u64 = 7 * 86_400;
-/// A single firing is killed after this long (a watcher turn should be quick).
-const FIRING_TIMEOUT_SECS: u64 = 300;
-/// An on-change trigger command is killed after this long.
-const TRIGGER_TIMEOUT_SECS: u64 = 60;
-/// An auto-fix attempt (a full write-capable agent run) is killed after this.
-const FIX_TIMEOUT_SECS: u64 = 600;
+/// Leave a child enough time to verify and persist after an explicitly
+/// configured soft turn deadline. Ordinary loop work has no wall-clock cap.
+const CHILD_SETTLEMENT_GRACE_SECS: u64 = 60;
+/// Once the direct child exits, a descendant that inherited stdout must not
+/// strand the loop manager forever. This only bounds pipe cleanup, not work.
+const CHILD_PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// Bound retained one-shot child output while continually draining it.
+const FIRING_OUTPUT_CAP: usize = 256 * 1024;
+/// Once a trigger process group is stopped, allow already-buffered diagnostic
+/// output a brief drain before dropping its pipes.
+const TRIGGER_PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// Bound retained trigger evidence while continuously draining both pipes.
+const TRIGGER_EVIDENCE_CAP: usize = 16 * 1024;
 /// Max simultaneously-armed loops per project.
 const MAX_LOOPS: usize = 8;
 /// Outside its fire window, a loop re-checks at least this often — rather than
@@ -49,7 +56,10 @@ pub(crate) struct LoopSpec {
     pub(crate) interval_secs: u64,
     /// Unix millis.
     pub(crate) created_ms: u64,
-    pub(crate) expires_ms: u64,
+    /// Optional Unix-millis expiry. New loops and migrated legacy loops are
+    /// unlimited. Kept optional for forwards-compatible persisted state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_ms: Option<u64>,
     pub(crate) next_ms: u64,
     /// The loop's session file (each firing resumes it).
     pub(crate) session: PathBuf,
@@ -177,7 +187,7 @@ pub(crate) struct LoopWatchRow {
     pub(crate) interval_secs: u64,
     pub(crate) created_ms: u64,
     pub(crate) next_ms: u64,
-    pub(crate) expires_ms: u64,
+    pub(crate) expires_ms: Option<u64>,
     pub(crate) firings: u64,
     /// A firing is currently in flight.
     pub(crate) firing: bool,
@@ -299,6 +309,10 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn loop_expired(spec: &LoopSpec, now: u64) -> bool {
+    spec.expires_ms.is_some_and(|expires| expires <= now)
 }
 
 /// The next fire time (unix ms) after a fire decision. Inside the window (or when
@@ -515,11 +529,18 @@ async fn manager(
     let event_sink = event_sink.as_deref();
     // Reach-you notifications for loud events (opt-in via env; no-op otherwise).
     let notify = crate::notify::NotifyConfig::from_env();
+    // Every trigger gets a child token. The drop guard also cancels them when
+    // the manager future is dropped/aborted, not just when ctl closes cleanly.
+    let manager_cancel = CancellationToken::new();
+    let _manager_cancel_guard = manager_cancel.clone().drop_guard();
+    let mut firing_cancellations: HashMap<u64, CancellationToken> = HashMap::new();
+    let mut trigger_cancellations: HashMap<u64, CancellationToken> = HashMap::new();
+    let mut fix_cancellations: HashMap<u64, CancellationToken> = HashMap::new();
     let mut runtime: HashMap<u64, LoopRuntime> = HashMap::new();
     let mut state = load(loops_file.as_deref());
     let now = now_ms();
     let before = state.loops.len();
-    state.loops.retain(|l| l.expires_ms > now);
+    state.loops.retain(|loop_| !loop_expired(loop_, now));
     if before > state.loops.len() {
         pending.lock().unwrap().push((
             format!(
@@ -557,21 +578,31 @@ async fn manager(
 
     loop {
         let now = now_ms();
-        // Expire + fire due loops (respecting a small concurrency cap).
+        // Fire due loops while respecting a small concurrency cap. `load`
+        // removes the automatic expiry written by older versions.
         let mut fired = false;
         state.loops.retain(|l| {
-            if l.expires_ms <= now {
+            if loop_expired(l, now) {
+                if let Some(cancel) = firing_cancellations.remove(&l.id) {
+                    cancel.cancel();
+                }
+                if let Some(cancel) = trigger_cancellations.remove(&l.id) {
+                    cancel.cancel();
+                }
+                if let Some(cancel) = fix_cancellations.remove(&l.id) {
+                    cancel.cancel();
+                }
                 record(
                     activity,
                     event_sink,
                     l.id,
                     &format!("loop#{} {}", l.id, l.name()),
-                    "expired after 7 days",
+                    "expired",
                 );
-                pending.lock().unwrap().push((
-                    format!("⟳ loop#{} ({}) expired after 7 days", l.id, l.name()),
-                    true,
-                ));
+                pending
+                    .lock()
+                    .unwrap()
+                    .push((format!("⟳ loop#{} ({}) expired", l.id, l.name()), true));
                 fired = true;
                 false
             } else {
@@ -605,8 +636,10 @@ async fn manager(
                 let launcher = launcher.clone();
                 let spec_snapshot = spec.clone();
                 let done = done_tx.clone();
+                let cancel = manager_cancel.child_token();
+                firing_cancellations.insert(spec.id, cancel.clone());
                 tokio::spawn(async move {
-                    let result = run_firing(&launcher, &spec_snapshot).await;
+                    let result = run_firing(&launcher, &spec_snapshot, cancel).await;
                     let _ = done.send((spec_snapshot.id, result));
                 });
             }
@@ -616,17 +649,20 @@ async fn manager(
         }
         publish(&state, &mut runtime, &snapshot);
 
-        // Sleep until the next due time (capped so ctl/expiry stay responsive).
-        // A paused loop never fires, so only its expiry can wake us — otherwise
-        // its stale `next_ms` would pin the sleep to the 250ms floor and spin.
+        // Sleep until the next due time (capped so controls stay responsive).
+        // A paused, unlimited loop contributes no due time; otherwise its stale
+        // `next_ms` would pin the sleep to the 250ms floor and spin.
         let next_due = state
             .loops
             .iter()
-            .map(|l| {
+            .filter_map(|l| {
                 if l.paused {
                     l.expires_ms
                 } else {
-                    l.next_ms.min(l.expires_ms)
+                    Some(
+                        l.expires_ms
+                            .map_or(l.next_ms, |expires| l.next_ms.min(expires)),
+                    )
                 }
             })
             .min()
@@ -650,7 +686,7 @@ async fn manager(
                                         prompt,
                                         interval_secs: secs,
                                         created_ms: now,
-                                        expires_ms: now + LOOP_TTL_SECS * 1000,
+                                        expires_ms: None,
                                         // First firing right away.
                                         next_ms: now,
                                         session,
@@ -677,6 +713,15 @@ async fn manager(
                         state.loops.retain(|l| l.id != id);
                         let removed = state.loops.len() < before;
                         if removed {
+                            if let Some(cancel) = firing_cancellations.remove(&id) {
+                                cancel.cancel();
+                            }
+                            if let Some(cancel) = trigger_cancellations.remove(&id) {
+                                cancel.cancel();
+                            }
+                            if let Some(cancel) = fix_cancellations.remove(&id) {
+                                cancel.cancel();
+                            }
                             save(loops_file.as_deref(), &state);
                         }
                         let _ = reply.send(removed);
@@ -746,6 +791,11 @@ async fn manager(
                         for l in &mut state.loops {
                             if l.id == id {
                                 l.trigger = cmd.clone();
+                                // A changed/cleared command supersedes any
+                                // currently-running invocation for this loop.
+                                if let Some(cancel) = trigger_cancellations.remove(&id) {
+                                    cancel.cancel();
+                                }
                                 ok = true;
                             }
                         }
@@ -797,6 +847,10 @@ async fn manager(
             }
             Some((id, result)) = done_rx.recv() => {
                 in_flight = in_flight.saturating_sub(1);
+                firing_cancellations.remove(&id);
+                if !state.loops.iter().any(|loop_| loop_.id == id) {
+                    continue;
+                }
                 let name = state
                     .loops
                     .iter()
@@ -902,8 +956,12 @@ async fn manager(
                 {
                     let trig = trig_tx.clone();
                     let (name, summary) = (name.clone(), summary.clone());
+                    let cancel = trigger_cancellations
+                        .entry(id)
+                        .or_insert_with(|| manager_cancel.child_token())
+                        .clone();
                     tokio::spawn(async move {
-                        let outcome = run_trigger(&cmd, id, &name, &summary).await;
+                        let outcome = run_trigger(&cmd, id, &name, &summary, cancel).await;
                         let _ = trig.send((id, outcome));
                     });
                 }
@@ -924,8 +982,10 @@ async fn manager(
                     let launcher = launcher.clone();
                     let fix = fix_tx.clone();
                     let summary = summary.clone();
+                    let cancel = manager_cancel.child_token();
+                    fix_cancellations.insert(id, cancel.clone());
                     tokio::spawn(async move {
-                        let (line, loud) = run_fix(&launcher, &spec, &summary).await;
+                        let (line, loud) = run_fix(&launcher, &spec, &summary, cancel).await;
                         let _ = fix.send((spec.id, line, loud));
                     });
                 }
@@ -950,6 +1010,11 @@ async fn manager(
                 publish(&state, &mut runtime, &snapshot);
             }
             Some((id, outcome)) = trig_rx.recv() => {
+                // Cancellation/expiry can race the trigger result. Do not
+                // resurrect dashboard runtime for a loop that no longer exists.
+                if !state.loops.iter().any(|loop_| loop_.id == id) {
+                    continue;
+                }
                 let name = state
                     .loops
                     .iter()
@@ -965,6 +1030,10 @@ async fn manager(
                 publish(&state, &mut runtime, &snapshot);
             }
             Some((id, outcome, loud)) = fix_rx.recv() => {
+                fix_cancellations.remove(&id);
+                if !state.loops.iter().any(|loop_| loop_.id == id) {
+                    continue;
+                }
                 let name = state
                     .loops
                     .iter()
@@ -1020,71 +1089,135 @@ fn is_decoration_line(line: &str) -> bool {
 /// One firing: a fleet-style child run in the real cwd, resuming the loop's
 /// session. Returns the child's final reply line as the summary, plus the
 /// session-cumulative token total read back from its `--report`.
-async fn run_firing(launcher: &FleetLauncher, spec: &LoopSpec) -> Result<FiringOutcome, String> {
+fn loop_turn_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .filter(|timeout| std::time::Instant::now().checked_add(*timeout).is_some())
+}
+
+fn loop_turn_timeout() -> Option<Duration> {
+    let configured = std::env::var("HI_LOOP_TURN_TIMEOUT_SECS").ok();
+    loop_turn_timeout_from_value(configured.as_deref())
+}
+
+fn child_turn_deadline_secs(outer_timeout: Option<Duration>) -> Option<u64> {
+    outer_timeout.map(|timeout| {
+        timeout
+            .as_secs()
+            .saturating_sub(CHILD_SETTLEMENT_GRACE_SECS)
+            .max(1)
+    })
+}
+
+fn loop_child_command(
+    launcher: &FleetLauncher,
+    outer_timeout: Option<Duration>,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(&launcher.exe);
+    cmd.env("HI_API_KEY", &launcher.api_key).args([
+        "--provider",
+        &launcher.provider,
+        "--model",
+        &launcher.model,
+        "--base-url",
+        &launcher.base_url,
+    ]);
+    if let Some(turn_deadline_secs) = child_turn_deadline_secs(outer_timeout) {
+        cmd.args(["--turn-deadline", &turn_deadline_secs.to_string()]);
+    }
+    // Do not install private loop-specific caps: ordinary children inherit
+    // hi's unlimited defaults, while the user's explicit caps are preserved.
+    cmd.args(launcher.child_execution_cap_args());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd
+}
+
+fn append_fix_verification_args(cmd: &mut tokio::process::Command, launcher: &FleetLauncher) {
+    if let Some(verify) = &launcher.verify {
+        cmd.args(["--verify", verify]);
+        if let Some(max_verify_repairs) = launcher.model_verify_repair_limit() {
+            cmd.args(["--max-verify-repairs", &max_verify_repairs.to_string()]);
+        }
+    }
+}
+
+async fn drain_firing_tail(mut stdout: impl AsyncRead + Unpin) -> Vec<String> {
+    let mut evidence = VecDeque::with_capacity(FIRING_OUTPUT_CAP);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match stdout.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                evidence.extend(&chunk[..read]);
+                while evidence.len() > FIRING_OUTPUT_CAP {
+                    evidence.pop_front();
+                }
+            }
+        }
+    }
+    let evidence: Vec<u8> = evidence.into_iter().collect();
+    let text = String::from_utf8_lossy(&evidence);
+    let mut tail = VecDeque::with_capacity(50);
+    for line in text.lines() {
+        let line = crate::dashboard::strip_ansi_line(line);
+        let line = line.trim_end();
+        if !line.trim().is_empty() {
+            tail.push_back(line.to_string());
+            if tail.len() > 50 {
+                tail.pop_front();
+            }
+        }
+    }
+    tail.into_iter().collect()
+}
+
+async fn run_firing(
+    launcher: &FleetLauncher,
+    spec: &LoopSpec,
+    cancellation: CancellationToken,
+) -> Result<FiringOutcome, String> {
     // One report file per loop, alongside its session, overwritten each firing.
     let report_path = spec.session.with_extension("report.json");
-    let mut cmd = tokio::process::Command::new(&launcher.exe);
-    cmd.env("HI_API_KEY", &launcher.api_key)
-        .stdin(Stdio::null())
+    let turn_timeout = loop_turn_timeout();
+    let mut cmd = loop_child_command(launcher, turn_timeout);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .args([
-            "--provider",
-            &launcher.provider,
-            "--model",
-            &launcher.model,
-            "--base-url",
-            &launcher.base_url,
-            "--max-steps",
-            "30",
-        ]);
+        .kill_on_drop(true);
     cmd.arg("--session-file").arg(&spec.session);
     cmd.env("HI_LOOP_ID", spec.id.to_string());
     cmd.arg("--report").arg(&report_path);
     cmd.arg(wrapper_prompt(spec));
 
     let mut child = cmd.spawn().map_err(|e| format!("couldn't launch: {e}"))?;
-    let mut tail: Vec<String> = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        let mut lines = BufReader::new(stdout).lines();
-        let read = async {
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = crate::dashboard::strip_ansi_line(&line);
-                let line = line.trim_end();
-                if !line.trim().is_empty() {
-                    tail.push(line.to_string());
-                    if tail.len() > 50 {
-                        tail.remove(0);
-                    }
-                }
-            }
-        };
-        // Read output with the firing timeout; on timeout, kill the child.
-        if tokio::time::timeout(Duration::from_secs(FIRING_TIMEOUT_SECS), read)
-            .await
-            .is_err()
-        {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(format!("timed out after {FIRING_TIMEOUT_SECS}s"));
-        }
+    let mut process_group = ChildProcessGroup::for_child(&child);
+    let mut stdout_read = tokio::spawn(drain_firing_tail(
+        child.stdout.take().expect("piped loop child stdout"),
+    ));
+    let waited = wait_loop_child(&mut child, turn_timeout, &cancellation).await;
+    process_group.kill_now();
+    if !matches!(waited, ChildWait::Exited(_)) {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(CHILD_PIPE_DRAIN_GRACE, child.wait()).await;
     }
-    // Bound the post-stdout wait too (like `run_fix` does): a child that
-    // closes stdout but wedges before exiting would otherwise hang this firing
-    // forever — leaving `firing` stuck true (that loop never fires again) and
-    // leaking its `in_flight` slot for the life of the process.
-    let status =
-        match tokio::time::timeout(Duration::from_secs(FIRING_TIMEOUT_SECS), child.wait()).await {
-            Ok(status) => status.map_err(|e| format!("wait failed: {e}"))?,
-            Err(_) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return Err(format!(
-                    "child closed stdout but didn't exit within {FIRING_TIMEOUT_SECS}s"
-                ));
-            }
-        };
+    let tail = match tokio::time::timeout(CHILD_PIPE_DRAIN_GRACE, &mut stdout_read).await {
+        Ok(Ok(tail)) => tail,
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            stdout_read.abort();
+            Vec::new()
+        }
+    };
+    let status = match waited {
+        ChildWait::Exited(status) => status.map_err(|e| format!("wait failed: {e}"))?,
+        ChildWait::TimedOut(timeout) => {
+            return Err(format!("timed out after {}s", timeout.as_secs()));
+        }
+        ChildWait::Cancelled => return Err("cancelled".to_string()),
+    };
     if !status.success() {
         return Err(format!(
             "agent run failed ({}): {}",
@@ -1127,9 +1260,135 @@ fn read_report_tokens(path: &std::path::Path) -> u64 {
 
 /// Run a loop's on-change trigger via `sh -c`, passing the loop id/name and the
 /// firing's summary in the environment. Returns a compact outcome line — one of
-/// `ok`, `ok: <stdout>`, `exit N: <stderr>`, `timed out …`, or `failed …` — so
-/// the transcript and `/watch` can show whether the response actually ran.
-async fn run_trigger(cmd: &str, id: u64, name: &str, summary: &str) -> String {
+/// `ok`, `ok: <stdout>`, `exit N: <stderr>`, `cancelled`, `timed out …`, or
+/// `failed …` — so the transcript and `/watch` can show whether the response
+/// actually ran.
+fn trigger_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .filter(|timeout| std::time::Instant::now().checked_add(*timeout).is_some())
+}
+
+fn trigger_timeout() -> Option<Duration> {
+    let configured = std::env::var("HI_LOOP_TRIGGER_TIMEOUT_SECS").ok();
+    trigger_timeout_from_value(configured.as_deref())
+}
+
+/// Drain an entire pipe while retaining only a small diagnostic prefix. Using
+/// chunked reads avoids `lines()` allocating an unbounded buffer for a hostile
+/// or accidental megabyte-long line.
+async fn drain_trigger_pipe(mut pipe: impl AsyncRead + Unpin) -> Vec<u8> {
+    let mut evidence = Vec::with_capacity(TRIGGER_EVIDENCE_CAP);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => return evidence,
+            Ok(read) => {
+                let keep = read.min(TRIGGER_EVIDENCE_CAP.saturating_sub(evidence.len()));
+                evidence.extend_from_slice(&chunk[..keep]);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct ChildProcessGroup {
+    pgid: Option<i32>,
+}
+
+#[cfg(unix)]
+impl ChildProcessGroup {
+    fn for_child(child: &tokio::process::Child) -> Self {
+        Self {
+            pgid: child.id().map(|pid| pid as i32),
+        }
+    }
+
+    fn kill_now(&mut self) {
+        let Some(pgid) = self.pgid.take() else {
+            return;
+        };
+        // SAFETY: a negative pid addresses the private process group created
+        // below. A process that already exited simply produces an OS error.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildProcessGroup {
+    fn drop(&mut self) {
+        self.kill_now();
+    }
+}
+
+#[cfg(not(unix))]
+struct ChildProcessGroup;
+
+#[cfg(not(unix))]
+impl ChildProcessGroup {
+    fn for_child(_child: &tokio::process::Child) -> Self {
+        Self
+    }
+
+    fn kill_now(&mut self) {}
+}
+
+enum ChildWait {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    TimedOut(Duration),
+    Cancelled,
+}
+
+async fn wait_loop_child(
+    child: &mut tokio::process::Child,
+    timeout: Option<Duration>,
+    cancellation: &CancellationToken,
+) -> ChildWait {
+    let wait = child.wait();
+    tokio::pin!(wait);
+    match timeout {
+        Some(limit) => {
+            let deadline = tokio::time::sleep(limit);
+            tokio::pin!(deadline);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => ChildWait::Cancelled,
+                status = &mut wait => ChildWait::Exited(status),
+                _ = &mut deadline => ChildWait::TimedOut(limit),
+            }
+        }
+        None => {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => ChildWait::Cancelled,
+                status = &mut wait => ChildWait::Exited(status),
+            }
+        }
+    }
+}
+
+async fn run_trigger(
+    cmd: &str,
+    id: u64,
+    name: &str,
+    summary: &str,
+    cancellation: CancellationToken,
+) -> String {
+    run_trigger_with_timeout(cmd, id, name, summary, cancellation, trigger_timeout()).await
+}
+
+async fn run_trigger_with_timeout(
+    cmd: &str,
+    id: u64,
+    name: &str,
+    summary: &str,
+    cancellation: CancellationToken,
+    timeout: Option<Duration>,
+) -> String {
     let mut c = tokio::process::Command::new("sh");
     c.arg("-c")
         .arg(cmd)
@@ -1140,6 +1399,47 @@ async fn run_trigger(cmd: &str, id: u64, name: &str, summary: &str) -> String {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        c.process_group(0);
+    }
+    let mut child = match c.spawn() {
+        Ok(child) => child,
+        Err(error) => return format!("failed to run: {error}"),
+    };
+    // The guard is deliberately never defused: even a successful shell can
+    // leave a background descendant holding a pipe. It also protects task
+    // abort/runtime shutdown paths where cooperative cancellation cannot run.
+    let mut process_group = ChildProcessGroup::for_child(&child);
+    let mut stdout_read = tokio::spawn(drain_trigger_pipe(
+        child.stdout.take().expect("piped trigger stdout"),
+    ));
+    let mut stderr_read = tokio::spawn(drain_trigger_pipe(
+        child.stderr.take().expect("piped trigger stderr"),
+    ));
+
+    let waited = wait_loop_child(&mut child, timeout, &cancellation).await;
+
+    // Stop the entire tree for timeout/cancel and also clean up any descendant
+    // leaked by a shell that exited successfully. Then bound only pipe/reap
+    // cleanup; this is not an execution deadline.
+    process_group.kill_now();
+    if !matches!(waited, ChildWait::Exited(_)) {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(TRIGGER_PIPE_DRAIN_GRACE, child.wait()).await;
+    }
+    let drained = tokio::time::timeout(TRIGGER_PIPE_DRAIN_GRACE, async {
+        tokio::join!(&mut stdout_read, &mut stderr_read)
+    })
+    .await;
+    let (stdout, stderr) = match drained {
+        Ok((stdout, stderr)) => (stdout.unwrap_or_default(), stderr.unwrap_or_default()),
+        Err(_) => {
+            stdout_read.abort();
+            stderr_read.abort();
+            (Vec::new(), Vec::new())
+        }
+    };
     let first_line = |bytes: &[u8]| {
         String::from_utf8_lossy(bytes)
             .lines()
@@ -1147,26 +1447,27 @@ async fn run_trigger(cmd: &str, id: u64, name: &str, summary: &str) -> String {
             .map(|l| truncate(l.trim(), 100))
             .unwrap_or_default()
     };
-    match tokio::time::timeout(Duration::from_secs(TRIGGER_TIMEOUT_SECS), c.output()).await {
-        Ok(Ok(out)) if out.status.success() => {
-            let head = first_line(&out.stdout);
+    match waited {
+        ChildWait::Exited(Ok(status)) if status.success() => {
+            let head = first_line(&stdout);
             if head.is_empty() {
                 "ok".to_string()
             } else {
                 format!("ok: {head}")
             }
         }
-        Ok(Ok(out)) => {
-            let code = out.status.code().unwrap_or(-1);
-            let err = first_line(&out.stderr);
+        ChildWait::Exited(Ok(status)) => {
+            let code = status.code().unwrap_or(-1);
+            let err = first_line(&stderr);
             if err.is_empty() {
                 format!("exit {code}")
             } else {
                 format!("exit {code}: {err}")
             }
         }
-        Ok(Err(e)) => format!("failed to run: {e}"),
-        Err(_) => format!("timed out after {TRIGGER_TIMEOUT_SECS}s"),
+        ChildWait::Exited(Err(error)) => format!("failed to wait: {error}"),
+        ChildWait::TimedOut(limit) => format!("timed out after {}s", limit.as_secs()),
+        ChildWait::Cancelled => "cancelled".to_string(),
     }
 }
 
@@ -1232,19 +1533,21 @@ fn fix_prompt(spec: &LoopSpec, summary: &str) -> String {
 /// for the transcript. The verify gate ([`decide_fix`]) is the safety boundary:
 /// an unverified change is never applied.
 /// After a verified fix merges into the working tree, re-verify the *real* tree
-/// — which may have drifted during the ≤900s fix (a user edit, another loop's
+/// — which may have drifted while the fix ran (a user edit, another loop's
 /// merge) — as ground truth. The worktree verify only proved the fix good against
 /// `base`; this closes the gap where the merged *combination* was never checked.
 /// On failure we surface it loudly (no auto-revert — the user decides whether to
 /// keep or `/undo`).
-fn merged_outcome(
+async fn merged_outcome(
     root: &std::path::Path,
     verify: Option<&str>,
     changed: &[String],
+    cancellation: Option<&CancellationToken>,
 ) -> (String, bool) {
-    let combined_ok = verify
-        .map(|v| hi_tools::worktree::verify_passes(root, v))
-        .unwrap_or(true);
+    let combined_ok = match verify {
+        Some(verify) => hi_tools::worktree::verify_passes_async(root, verify, cancellation).await,
+        None => true,
+    };
     if combined_ok {
         (
             format!(
@@ -1266,9 +1569,26 @@ fn merged_outcome(
     }
 }
 
-async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (String, bool) {
+async fn cleanup_loop_fix(root: &std::path::Path, worktree: &std::path::Path) {
+    let cleanup_root = root.to_path_buf();
+    let cleanup_worktree = worktree.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        hi_tools::worktree::cleanup(&cleanup_root, std::slice::from_ref(&cleanup_worktree));
+    })
+    .await;
+}
+
+async fn run_fix(
+    launcher: &FleetLauncher,
+    spec: &LoopSpec,
+    summary: &str,
+    cancellation: CancellationToken,
+) -> (String, bool) {
     use hi_tools::worktree;
 
+    if cancellation.is_cancelled() {
+        return ("cancelled".into(), false);
+    }
     let root = launcher.workspace_root.clone();
     let in_git = {
         let root = root.clone();
@@ -1276,6 +1596,9 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
             .await
             .unwrap_or(false)
     };
+    if cancellation.is_cancelled() {
+        return ("cancelled".into(), false);
+    }
     if !in_git {
         return ("skipped — not a git repository".into(), false);
     }
@@ -1283,6 +1606,9 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
         Some(b) => b,
         None => return ("skipped — couldn't snapshot the working tree".into(), true),
     };
+    if cancellation.is_cancelled() {
+        return ("cancelled".into(), false);
+    }
     let wt = std::env::temp_dir().join(format!(
         "hi-loopfix-{}-{}-{}",
         std::process::id(),
@@ -1306,69 +1632,68 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
     } {
         return (format!("skipped — worktree setup failed: {e}"), true);
     }
+    if cancellation.is_cancelled() {
+        cleanup_loop_fix(&root, &wt).await;
+        return ("cancelled".into(), false);
+    }
 
     // A write-capable child agent runs the fix in the worktree, self-verifying
     // via `--verify` if the session has one.
-    let mut cmd = tokio::process::Command::new(&launcher.exe);
+    let turn_timeout = loop_turn_timeout();
+    let mut cmd = loop_child_command(launcher, turn_timeout);
     cmd.current_dir(&wt)
-        .env("HI_API_KEY", &launcher.api_key)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .args([
-            "--provider",
-            &launcher.provider,
-            "--model",
-            &launcher.model,
-            "--base-url",
-            &launcher.base_url,
-            "--max-steps",
-            "40",
-        ]);
-    if let Some(v) = &launcher.verify {
-        cmd.arg("--verify").arg(v);
-    }
+        .kill_on_drop(true);
+    append_fix_verification_args(&mut cmd, launcher);
     cmd.arg(fix_prompt(spec, summary));
 
     let completed = match cmd.spawn() {
         Ok(mut child) => {
-            match tokio::time::timeout(Duration::from_secs(FIX_TIMEOUT_SECS), child.wait()).await {
-                Ok(Ok(status)) => status.success(),
-                _ => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    false
-                }
+            let mut process_group = ChildProcessGroup::for_child(&child);
+            let waited = wait_loop_child(&mut child, turn_timeout, &cancellation).await;
+            process_group.kill_now();
+            if !matches!(waited, ChildWait::Exited(_)) {
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(CHILD_PIPE_DRAIN_GRACE, child.wait()).await;
+            }
+            match waited {
+                ChildWait::Exited(Ok(status)) => status.success(),
+                ChildWait::Exited(Err(_)) | ChildWait::TimedOut(_) | ChildWait::Cancelled => false,
             }
         }
         Err(e) => {
-            let cleanup_root = root.clone();
-            let cleanup_wt = wt.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                worktree::cleanup(&cleanup_root, std::slice::from_ref(&cleanup_wt));
-            })
-            .await;
+            cleanup_loop_fix(&root, &wt).await;
             return (format!("skipped — couldn't launch the fixer: {e}"), true);
         }
     };
+    if cancellation.is_cancelled() {
+        cleanup_loop_fix(&root, &wt).await;
+        return ("cancelled".into(), false);
+    }
 
     let has_verify = launcher.verify.is_some();
     // Ground-truth re-verify of the final worktree state before any merge.
-    let verify_path = launcher.verify.clone();
     let wt_for_check = wt.clone();
     let base_for_check = base.clone();
-    let (changed, verified) = tokio::task::spawn_blocking(move || {
-        let changed = worktree::changed_files(&wt_for_check, &base_for_check);
-        let verified = completed
-            && !changed.is_empty()
-            && verify_path
-                .as_deref()
-                .is_some_and(|verify| worktree::verify_passes(&wt_for_check, verify));
-        (changed, verified)
+    let changed = tokio::task::spawn_blocking(move || {
+        worktree::changed_files(&wt_for_check, &base_for_check)
     })
     .await
-    .unwrap_or_else(|_| (Vec::new(), false));
+    .unwrap_or_default();
+    let verified = if completed && !changed.is_empty() {
+        match launcher.verify.as_deref() {
+            Some(verify) => worktree::verify_passes_async(&wt, verify, Some(&cancellation)).await,
+            None => false,
+        }
+    } else {
+        false
+    };
+    if cancellation.is_cancelled() {
+        cleanup_loop_fix(&root, &wt).await;
+        return ("cancelled".into(), false);
+    }
 
     let result = match decide_fix(true, completed, changed.len(), has_verify, verified) {
         // PR mode: land the verified fix as a reviewable branch + PR.
@@ -1387,32 +1712,19 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
         // re-verify the merged real tree (see merged_outcome — the base may have
         // drifted during the fix).
         FixDecision::Merge => {
-            let wt_for_apply = wt.clone();
-            let base_for_apply = base.clone();
-            let root_for_apply = root.to_path_buf();
-            let applied = tokio::task::spawn_blocking(move || {
-                worktree::apply_changes_to(&wt_for_apply, &base_for_apply, &root_for_apply)
-            })
-            .await;
+            let applied =
+                worktree::apply_changes_to_async(&wt, &base, &root, Some(&cancellation)).await;
             match applied {
-                Ok(Ok(_)) => {
-                    let root_for_verify = root.to_path_buf();
-                    let verify = launcher.verify.clone();
-                    let changed_for_verify = changed.clone();
-                    tokio::task::spawn_blocking(move || {
-                        merged_outcome(&root_for_verify, verify.as_deref(), &changed_for_verify)
-                    })
+                Ok(_) => {
+                    merged_outcome(
+                        &root,
+                        launcher.verify.as_deref(),
+                        &changed,
+                        Some(&cancellation),
+                    )
                     .await
-                    .unwrap_or_else(|_| {
-                        (
-                            "⚠ merged changes but the post-merge verification worker failed"
-                                .to_string(),
-                            true,
-                        )
-                    })
                 }
-                Ok(Err(e)) => (format!("verified but merge failed: {e}"), true),
-                Err(error) => (format!("verified but merge worker failed: {error}"), true),
+                Err(error) => (format!("verified but merge failed: {error}"), true),
             }
         }
         FixDecision::NoChanges => ("made no changes".into(), false),
@@ -1422,12 +1734,7 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
         ),
         FixDecision::NotGitRepo => ("skipped — not a git repository".into(), false),
     };
-    let cleanup_root = root.clone();
-    let cleanup_wt = wt.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        worktree::cleanup(&cleanup_root, std::slice::from_ref(&cleanup_wt));
-    })
-    .await;
+    cleanup_loop_fix(&root, &wt).await;
     result
 }
 
@@ -1499,8 +1806,23 @@ fn load(path: Option<&std::path::Path>) -> LoopsFile {
     let Ok(text) = std::fs::read_to_string(path) else {
         return LoopsFile::default(); // no file yet — a fresh project
     };
-    match serde_json::from_str(&text) {
-        Ok(state) => state,
+    match serde_json::from_str::<LoopsFile>(&text) {
+        Ok(mut state) => {
+            // Older releases assigned every loop an automatic seven-day
+            // `expires_ms`; there was no user-facing way to request a finite
+            // lifetime. Migrate before the manager can prune an already-expired
+            // record, and persist via the same atomic sibling-rename as normal
+            // loop updates so the deadline cannot return after restart.
+            let migrated = state.loops.iter_mut().fold(false, |migrated, loop_| {
+                let had_legacy_expiry = loop_.expires_ms.is_some();
+                loop_.expires_ms = None;
+                migrated || had_legacy_expiry
+            });
+            if migrated {
+                save(Some(path), &state);
+            }
+            state
+        }
         Err(_) => {
             // A corrupt/truncated loops.json would otherwise be silently replaced
             // by an empty set — losing every persisted loop. Preserve it aside so
@@ -1587,7 +1909,7 @@ mod tests {
             prompt: "check whether the CI pipeline on main is green".into(),
             interval_secs: 1800,
             created_ms: 0,
-            expires_ms: LOOP_TTL_SECS * 1000,
+            expires_ms: None,
             next_ms: 0,
             session: PathBuf::from("/tmp/loop.jsonl"),
             firings: 0,
@@ -1599,6 +1921,323 @@ mod tests {
             fix_pr: false,
             schedule: None,
         }
+    }
+
+    fn command_launcher(max_steps: u32, max_tool_calls: Option<u32>) -> FleetLauncher {
+        FleetLauncher {
+            exe: PathBuf::from("hi"),
+            workspace_root: PathBuf::from("/tmp"),
+            provider: "pipenetwork".into(),
+            model: "pipe/test".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key: "test-key".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: std::sync::atomic::AtomicU32::new(max_steps),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(
+                max_tool_calls.map(u64::from).unwrap_or(u64::MAX),
+            ),
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused-loop.jsonl"))),
+            loops_file: None,
+        }
+    }
+
+    #[test]
+    fn loop_children_have_no_hidden_work_cap_but_preserve_explicit_caps() {
+        let uncapped = loop_child_command(&command_launcher(0, None), None);
+        let uncapped_args: Vec<_> = uncapped
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !uncapped_args.iter().any(|arg| arg == "--max-steps"),
+            "an omitted top-level cap must stay omitted: {uncapped_args:?}"
+        );
+        assert!(
+            !uncapped_args.iter().any(|arg| arg == "30" || arg == "40"),
+            "legacy private loop caps must not be injected: {uncapped_args:?}"
+        );
+        assert!(
+            !uncapped_args.iter().any(|arg| arg == "--turn-deadline"),
+            "ordinary loop work must not receive a hidden wall-clock deadline: {uncapped_args:?}"
+        );
+
+        let capped_launcher = command_launcher(7, Some(0));
+        let timeout = Some(Duration::from_secs(600));
+        let capped = loop_child_command(&capped_launcher, timeout);
+        let capped_args: Vec<_> = capped
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            capped_args
+                .windows(2)
+                .any(|pair| pair == ["--max-steps", "7"]),
+            "the user's explicit cap must propagate: {capped_args:?}"
+        );
+        assert!(
+            capped_args
+                .windows(2)
+                .any(|pair| pair == ["--max-tool-calls", "0"]),
+            "an explicit zero tool cap must propagate losslessly: {capped_args:?}"
+        );
+        let fix_deadline = child_turn_deadline_secs(timeout).unwrap().to_string();
+        assert!(
+            capped_args
+                .windows(2)
+                .any(|pair| pair[0] == "--turn-deadline" && pair[1] == fix_deadline),
+            "the Agent must settle before the fix's outer kill: {capped_args:?}"
+        );
+
+        capped_launcher.set_model_step_limit(None);
+        capped_launcher.set_model_tool_call_limit(None);
+        let cleared_args = loop_child_command(&capped_launcher, None)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            !cleared_args.iter().any(|arg| arg == "--max-steps"),
+            "turning the runtime cap off must uncap later children: {cleared_args:?}"
+        );
+        assert!(
+            !cleared_args.iter().any(|arg| arg == "--max-tool-calls"),
+            "turning the runtime tool cap off must uncap later children: {cleared_args:?}"
+        );
+
+        capped_launcher.set_model_step_limit(Some(9));
+        capped_launcher.set_model_tool_call_limit(Some(13));
+        let reset_args = loop_child_command(&capped_launcher, None)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            reset_args
+                .windows(2)
+                .any(|pair| pair == ["--max-steps", "9"]),
+            "a runtime opt-in cap must govern later children: {reset_args:?}"
+        );
+        assert!(
+            reset_args
+                .windows(2)
+                .any(|pair| pair == ["--max-tool-calls", "13"]),
+            "a runtime opt-in tool cap must govern later children: {reset_args:?}"
+        );
+    }
+
+    #[test]
+    fn loop_turn_timeout_is_explicit_and_child_deadline_precedes_it() {
+        assert_eq!(loop_turn_timeout_from_value(None), None);
+        assert_eq!(loop_turn_timeout_from_value(Some("0")), None);
+        assert_eq!(loop_turn_timeout_from_value(Some("invalid")), None);
+        assert_eq!(
+            loop_turn_timeout_from_value(Some("600")),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            child_turn_deadline_secs(Some(Duration::from_secs(300))),
+            Some(240)
+        );
+        assert_eq!(
+            child_turn_deadline_secs(Some(Duration::from_secs(30))),
+            Some(1)
+        );
+        assert_eq!(child_turn_deadline_secs(None), None);
+    }
+
+    #[test]
+    fn trigger_timeout_is_explicit_and_zero_means_unlimited() {
+        assert_eq!(trigger_timeout_from_value(None), None);
+        assert_eq!(trigger_timeout_from_value(Some("")), None);
+        assert_eq!(trigger_timeout_from_value(Some("0")), None);
+        assert_eq!(trigger_timeout_from_value(Some("invalid")), None);
+        assert_eq!(
+            trigger_timeout_from_value(Some("60")),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trigger_without_timeout_can_run_past_a_short_deadline() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_trigger_with_timeout(
+                "sleep 1; printf 'finished\\n'",
+                1,
+                "long trigger",
+                "change",
+                CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("unlimited trigger should complete normally");
+        assert_eq!(result, "ok: finished");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_trigger_timeout_is_enforced() {
+        let started = std::time::Instant::now();
+        let result = run_trigger_with_timeout(
+            "sleep 30",
+            1,
+            "timed trigger",
+            "change",
+            CancellationToken::new(),
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+        assert_eq!(result, "timed out after 1s");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "explicit timeout did not settle promptly"
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_is_live(pid: i32) -> bool {
+        // SAFETY: signal 0 performs a liveness check without delivering a
+        // signal. The pid came from the test's own child process.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_exits(pid: i32) {
+        for _ in 0..100 {
+            if !process_is_live(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("trigger descendant {pid} is still live");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_trigger_kills_its_descendant_group() {
+        let dir = test_dir("trigger-cancel");
+        let pid_file = dir.join("descendant.pid");
+        let command = format!(
+            "sleep 30 & child=$!; printf '%s\\n' \"$child\" > {}; wait \"$child\"",
+            pid_file.display()
+        );
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            run_trigger_with_timeout(
+                &command,
+                1,
+                "cancel trigger",
+                "change",
+                task_cancellation,
+                None,
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("trigger recorded descendant pid")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(process_is_live(pid), "descendant started");
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("cancelled trigger settled")
+            .expect("trigger task did not panic");
+        assert_eq!(result, "cancelled");
+        assert_process_exits(pid).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trigger_drains_noisy_output_and_cleans_leaked_descendant() {
+        let dir = test_dir("trigger-noisy");
+        let pid_file = dir.join("descendant.pid");
+        let command = format!(
+            "printf 'headline\\n'; yes x | head -c 1048576; sleep 30 & child=$!; \
+             printf '%s\\n' \"$child\" > {}",
+            pid_file.display()
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_trigger_with_timeout(
+                &command,
+                1,
+                "noisy trigger",
+                "change",
+                CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("large output must be continuously drained");
+        assert_eq!(result, "ok: headline");
+        assert!(
+            result.len() <= 104,
+            "trigger evidence escaped its display cap: {} bytes",
+            result.len()
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("trigger recorded leaked descendant pid")
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_exits(pid).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn loop_fix_preserves_only_an_explicit_verification_repair_cap() {
+        let mut launcher = command_launcher(0, None);
+        launcher.verify = Some("cargo test".into());
+        launcher.max_verify = hi_agent::UNLIMITED_REPAIR_CYCLES;
+        let mut unlimited = tokio::process::Command::new("hi");
+        append_fix_verification_args(&mut unlimited, &launcher);
+        let unlimited = unlimited
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            unlimited
+                .windows(2)
+                .any(|pair| pair == ["--verify", "cargo test"])
+        );
+        assert!(
+            !unlimited
+                .iter()
+                .any(|argument| argument == "--max-verify-repairs")
+        );
+
+        launcher.max_verify = 0;
+        let mut capped = tokio::process::Command::new("hi");
+        append_fix_verification_args(&mut capped, &launcher);
+        let capped = capped
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            capped
+                .windows(2)
+                .any(|pair| pair == ["--max-verify-repairs", "0"])
+        );
     }
 
     #[test]
@@ -1845,8 +2484,44 @@ mod tests {
         let loaded = load(Some(&path));
         assert_eq!(loaded.loops.len(), 1);
         assert_eq!(loaded.loops[0].prompt, spec().prompt);
+        assert_eq!(loaded.loops[0].expires_ms, None);
         assert_eq!(loaded.next_id, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_legacy_loop_is_migrated_before_pruning_and_stays_unlimited() {
+        let unlimited = serde_json::to_string(&spec()).unwrap();
+        assert!(
+            !unlimited.contains("expires_ms"),
+            "new unlimited loops should not persist a synthetic deadline: {unlimited}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loops.json");
+        let mut value = serde_json::to_value(LoopsFile {
+            loops: vec![spec()],
+            next_id: 2,
+        })
+        .unwrap();
+        value["loops"][0]["expires_ms"] = serde_json::json!(1_u64);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let migrated = load(Some(&path));
+        assert_eq!(migrated.loops.len(), 1, "expired loop must survive load");
+        assert_eq!(migrated.loops[0].expires_ms, None);
+        assert!(!loop_expired(&migrated.loops[0], u64::MAX));
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            persisted["loops"][0].get("expires_ms").is_none(),
+            "migration must atomically persist the unlimited lifetime: {persisted}"
+        );
+        let reloaded = load(Some(&path));
+        assert_eq!(reloaded.loops.len(), 1);
+        assert_eq!(reloaded.loops[0].expires_ms, None);
+        assert!(!loop_expired(&reloaded.loops[0], u64::MAX));
     }
 
     #[test]
@@ -1936,7 +2611,8 @@ mod tests {
             api_key: "k".into(),
             verify: None,
             max_verify: 0,
-            max_steps: 30,
+            max_steps: std::sync::atomic::AtomicU32::new(30),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(u64::MAX),
             session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
             sessions: Box::new(Vec::new),
             resume_info: Box::new(|_| None),
@@ -1956,6 +2632,7 @@ mod tests {
             })
             .unwrap();
         let spec = rx.await.unwrap().unwrap();
+        assert_eq!(spec.expires_ms, None, "new loops run until cancelled");
         let id = spec.id;
 
         // First firing completes and is recorded in the snapshot.
@@ -2011,6 +2688,19 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    fn descendant_stub(dir: &std::path::Path, name: &str, pid_file: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        let script = format!(
+            "#!/bin/sh\nsleep 30 & child=$!\nprintf '%s\\n' \"$child\" > {}\nwait \"$child\"\n",
+            pid_file.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     /// Unique temp dir per test invocation (pid alone collides under parallel cargo).
     fn test_dir(label: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2047,7 +2737,8 @@ mod tests {
             api_key: "k".into(),
             verify: None,
             max_verify: 0,
-            max_steps: 30,
+            max_steps: std::sync::atomic::AtomicU32::new(30),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(u64::MAX),
             session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
             sessions: Box::new(Vec::new),
             resume_info: Box::new(|_| None),
@@ -2155,6 +2846,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_loop_stops_firing_descendants_without_resurrection() {
+        let dir = test_dir("cancel-firing");
+        let pid_file = dir.join("firing-descendant.pid");
+        let exe = descendant_stub(&dir, "firing.sh", &pid_file);
+        let sess = dir.join("loop.jsonl");
+        let launcher = FleetLauncher {
+            exe,
+            workspace_root: dir.clone(),
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: std::sync::atomic::AtomicU32::new(0),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(u64::MAX),
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(move || Ok(sess.clone())),
+            loops_file: None,
+        };
+        let handle = start(Arc::new(launcher), None, None);
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 3600,
+                prompt: "long firing".into(),
+                reply: tx,
+            })
+            .unwrap();
+        let id = rx.await.unwrap().unwrap().id;
+        for _ in 0..100 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("firing recorded descendant pid")
+            .trim()
+            .parse()
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::Cancel { id, reply: tx }).unwrap();
+        assert!(rx.await.unwrap());
+        assert_process_exits(pid).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            handle.snapshot.lock().unwrap().is_empty(),
+            "late cancellation result must not recreate a removed loop"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_manager_stops_firing_descendants() {
+        let dir = test_dir("drop-firing");
+        let pid_file = dir.join("firing-descendant.pid");
+        let exe = descendant_stub(&dir, "firing.sh", &pid_file);
+        let sess = dir.join("loop.jsonl");
+        let launcher = FleetLauncher {
+            exe,
+            workspace_root: dir.clone(),
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: std::sync::atomic::AtomicU32::new(0),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(u64::MAX),
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(move || Ok(sess.clone())),
+            loops_file: None,
+        };
+        let handle = start(Arc::new(launcher), None, None);
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 3600,
+                prompt: "long firing".into(),
+                reply: tx,
+            })
+            .unwrap();
+        rx.await.unwrap().unwrap();
+        for _ in 0..100 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("firing recorded descendant pid")
+            .trim()
+            .parse()
+            .unwrap();
+        drop(handle);
+        assert_process_exits(pid).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A stub `hi` that writes a `--report` with a fixed token total, so firings
     /// exercise the cost-tracking + budget path. Returns the script path.
     fn report_stub(dir: &std::path::Path, tokens: u64) -> PathBuf {
@@ -2186,7 +2986,8 @@ mod tests {
             api_key: "k".into(),
             verify: None,
             max_verify: 0,
-            max_steps: 30,
+            max_steps: std::sync::atomic::AtomicU32::new(30),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(u64::MAX),
             session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
             sessions: Box::new(Vec::new),
             resume_info: Box::new(|_| None),
@@ -2291,7 +3092,8 @@ mod tests {
             api_key: "k".into(),
             verify: None,
             max_verify: 0,
-            max_steps: 30,
+            max_steps: std::sync::atomic::AtomicU32::new(30),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(u64::MAX),
             session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
             sessions: Box::new(Vec::new),
             resume_info: Box::new(|_| None),
@@ -2407,7 +3209,8 @@ mod tests {
             api_key: "k".into(),
             verify: None,
             max_verify: 0,
-            max_steps: 30,
+            max_steps: std::sync::atomic::AtomicU32::new(30),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(u64::MAX),
             session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
             sessions: Box::new(Vec::new),
             resume_info: Box::new(|_| None),
@@ -2506,7 +3309,8 @@ mod tests {
             api_key: "k".into(),
             verify: None,
             max_verify: 0,
-            max_steps: 30,
+            max_steps: std::sync::atomic::AtomicU32::new(30),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(u64::MAX),
             session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
             sessions: Box::new(Vec::new),
             resume_info: Box::new(|_| None),
@@ -2601,7 +3405,8 @@ mod tests {
             api_key: "k".into(),
             verify: None,
             max_verify: 0,
-            max_steps: 30,
+            max_steps: std::sync::atomic::AtomicU32::new(30),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(u64::MAX),
             session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
             sessions: Box::new(Vec::new),
             resume_info: Box::new(|_| None),
@@ -2670,7 +3475,8 @@ mod tests {
             api_key: "k".into(),
             verify: verify.map(str::to_string),
             max_verify: 0,
-            max_steps: 40,
+            max_steps: std::sync::atomic::AtomicU32::new(40),
+            max_tool_calls: std::sync::atomic::AtomicU64::new(u64::MAX),
             session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
             sessions: Box::new(Vec::new),
             resume_info: Box::new(|_| None),
@@ -2709,8 +3515,8 @@ mod tests {
         s2.id = 2;
         let fail = fix_launcher(&dir, fixer_stub(&dir, "fail.sh", "bad.txt"), Some("false"));
 
-        let merged = run_fix(&pass, &s, "something broke").await;
-        let rejected = run_fix(&fail, &s2, "something else broke").await;
+        let merged = run_fix(&pass, &s, "something broke", CancellationToken::new()).await;
+        let rejected = run_fix(&fail, &s2, "something else broke", CancellationToken::new()).await;
 
         assert!(
             merged.0.contains("merged"),
@@ -2734,19 +3540,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn merged_outcome_reflects_the_real_tree_verify() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_fix_stops_child_descendants_and_never_merges() {
+        let dir = test_dir("cancel-fix");
+        init_git_repo(&dir);
+        let pid_file = dir.join("fix-descendant.pid");
+        let exe = descendant_stub(&dir, "fixer-wait.sh", &pid_file);
+        let launcher = fix_launcher(&dir, exe, Some("true"));
+        let mut loop_spec = spec();
+        loop_spec.id = 91;
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            run_fix(&launcher, &loop_spec, "wait forever", task_cancellation).await
+        });
+        for _ in 0..250 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("fixer recorded descendant pid")
+            .trim()
+            .parse()
+            .unwrap();
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancelled fixer settled")
+            .expect("fixer task did not panic");
+        assert_eq!(result, ("cancelled".to_string(), false));
+        assert_process_exits(pid).await;
+        assert!(
+            !dir.join("fixed.txt").exists(),
+            "cancelled fix must not merge a change"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn merged_outcome_reflects_the_real_tree_verify() {
         let dir = std::env::temp_dir().join(format!("hi-merged-outcome-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         // Combined tree passes verify → normal success line.
-        let ok = merged_outcome(&dir, Some("true"), &["a.rs".to_string()]);
+        let ok = merged_outcome(&dir, Some("true"), &["a.rs".to_string()], None).await;
         // Combined tree FAILS verify (the base drifted under the fix) → a loud
         // warning, not a false "merged" success.
-        let bad = merged_outcome(&dir, Some("false"), &["a.rs".to_string()]);
+        let bad = merged_outcome(&dir, Some("false"), &["a.rs".to_string()], None).await;
         // No verify command → nothing to re-check; trust the merge.
-        let none = merged_outcome(&dir, None, &["a.rs".to_string()]);
+        let none = merged_outcome(&dir, None, &["a.rs".to_string()], None).await;
 
         assert!(ok.0.contains("merged") && !ok.0.contains('⚠'), "{}", ok.0);
         assert!(

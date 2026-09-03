@@ -1,6 +1,6 @@
 --- 120x24 ---
 
-  /workspace                                                                                            sandbox │ undo
+  /workspace                                                                           reasoning: off │ sandbox │ undo
 
   ❯ review the responsive layout
   The layout is stable.
@@ -24,7 +24,7 @@
   ctrl+c:interrupt  │  Shift+Tab:mode  │  ?:help
 
 --- 64x14 ---
-  /workspace                                    sandbox │ undo
+  /workspace                   reasoning: off │ sandbox │ undo
   The layout is stable.
     thought for 3s
     Check spacing and preserve the active input.

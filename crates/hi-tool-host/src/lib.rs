@@ -110,12 +110,14 @@ impl ToolHost {
                 .is_subset(&context.capabilities),
             "tool capability denied"
         );
-        let response = timeout(
-            Duration::from_millis(descriptor.timeout_ms),
-            executor.execute(context, request),
-        )
-        .await
-        .context("tool deadline exceeded")??;
+        let execution = executor.execute(context, request);
+        let response = if descriptor.timeout_ms == 0 {
+            execution.await?
+        } else {
+            timeout(Duration::from_millis(descriptor.timeout_ms), execution)
+                .await
+                .context("tool deadline exceeded")??
+        };
         ensure!(
             serde_json::to_vec(&response)?.len() <= descriptor.maximum_output_bytes as usize,
             "tool response exceeds configured output limit"
@@ -133,10 +135,8 @@ fn validate_descriptor(descriptor: &ToolDescriptor) -> Result<()> {
         descriptor.maximum_output_bytes > 0 && descriptor.maximum_output_bytes <= 64 * 1024 * 1024,
         "invalid tool output limit"
     );
-    ensure!(
-        descriptor.timeout_ms > 0 && descriptor.timeout_ms <= 15 * 60 * 1_000,
-        "invalid tool timeout"
-    );
+    // `0` is the canonical unlimited sentinel. Any positive value is an
+    // explicit operator-selected deadline; do not silently cap it here.
     if matches!(
         descriptor.side_effect,
         SideEffect::WorkspaceWrite | SideEffect::Process | SideEffect::Network
@@ -462,6 +462,98 @@ mod tests {
                 truncated: false,
             })
         }
+    }
+
+    struct GatedExecutor {
+        descriptor: ToolDescriptor,
+        release: std::sync::Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for GatedExecutor {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.descriptor
+        }
+
+        async fn execute(&self, _context: &ToolContext, _request: Value) -> Result<ToolResponse> {
+            self.release
+                .acquire()
+                .await
+                .expect("release semaphore open")
+                .forget();
+            Ok(ToolResponse {
+                succeeded: true,
+                output: serde_json::json!({"ok": true}),
+                stdout_hash: None,
+                stderr_hash: None,
+                truncated: false,
+            })
+        }
+    }
+
+    fn gated_host(
+        timeout_ms: u64,
+    ) -> (
+        ToolHost,
+        ToolContext,
+        std::sync::Arc<tokio::sync::Semaphore>,
+    ) {
+        let descriptor = ToolDescriptor {
+            name: "gated".into(),
+            input_schema: serde_json::json!({}),
+            output_schema: serde_json::json!({}),
+            required_capabilities: BTreeSet::new(),
+            side_effect: SideEffect::None,
+            maximum_output_bytes: 1024,
+            timeout_ms,
+            replayable: true,
+        };
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut host = ToolHost::default();
+        host.register(Box::new(GatedExecutor {
+            descriptor,
+            release: std::sync::Arc::clone(&release),
+        }))
+        .unwrap();
+        let context = ToolContext {
+            run_id: "run".into(),
+            candidate_id: "candidate".into(),
+            stage: "test".into(),
+            workspace: std::env::current_dir().unwrap(),
+            capabilities: BTreeSet::new(),
+        };
+        (host, context, release)
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_keeps_productive_tool_active_until_completion() {
+        let (host, context, release) = gated_host(0);
+        let mut execution = Box::pin(host.execute("gated", &context, serde_json::json!({})));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut execution)
+                .await
+                .is_err(),
+            "zero is unlimited, not an immediate deadline"
+        );
+        release.add_permits(1);
+        let response = tokio::time::timeout(Duration::from_secs(1), execution)
+            .await
+            .expect("released executor finishes")
+            .expect("executor succeeds");
+        assert!(response.succeeded);
+    }
+
+    #[tokio::test]
+    async fn positive_timeout_remains_an_explicit_deadline() {
+        let (host, context, _release) = gated_host(10);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            host.execute("gated", &context, serde_json::json!({})),
+        )
+        .await
+        .expect("host deadline is bounded")
+        .expect_err("held executor must time out");
+        assert!(format!("{error:#}").contains("tool deadline exceeded"));
     }
 
     #[tokio::test]

@@ -1,9 +1,6 @@
-//! Bounded discovery recovery for mutation turns.
+//! Optional bounded discovery recovery for mutation turns.
 
-use super::{
-    ImplementationTracker, MAX_MUTATION_DISCOVERY_NUDGES, MUTATION_DISCOVERY_ROUND_CAP,
-    MUTATION_DISCOVERY_ROUNDS_PER_NUDGE,
-};
+use super::ImplementationTracker;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DiscoveryRecovery {
@@ -24,6 +21,12 @@ pub(crate) enum DiscoveryRecovery {
 
 #[derive(Debug, Default)]
 pub(crate) struct MutationRecovery {
+    /// `None` is the product default: distinct productive discovery has no
+    /// count ceiling. A finite policy is retained for explicitly bounded
+    /// integrations and focused tests.
+    round_cap: Option<u32>,
+    rounds_per_nudge: u32,
+    max_nudges: u32,
     phase_nudges: u32,
     plan_grace_used: bool,
     plan_nudge_sent: bool,
@@ -37,8 +40,11 @@ impl MutationRecovery {
         plan_changed: bool,
         has_pending_plan: bool,
     ) -> bool {
-        let discovery_started = tracker.discovery_nudges > 0
-            || tracker.pre_mutation_rounds >= MUTATION_DISCOVERY_ROUND_CAP;
+        let Some(round_cap) = self.round_cap else {
+            return false;
+        };
+        let discovery_started =
+            tracker.discovery_nudges > 0 || tracker.pre_mutation_rounds >= round_cap;
         if !plan_changed || !has_pending_plan || !discovery_started || self.plan_grace_used {
             return false;
         }
@@ -51,6 +57,9 @@ impl MutationRecovery {
         tracker: &mut ImplementationTracker,
         has_pending_plan: bool,
     ) -> DiscoveryRecovery {
+        let Some(round_cap) = self.round_cap else {
+            return DiscoveryRecovery::None;
+        };
         // A concrete/resumed plan gets one stronger advisory after its next
         // non-mutating round, then the turn stops if it still has not edited.
         if self.plan_grace_used {
@@ -60,10 +69,8 @@ impl MutationRecovery {
             }
             return DiscoveryRecovery::Stop;
         }
-        let limit = MUTATION_DISCOVERY_ROUND_CAP.saturating_add(
-            self.phase_nudges
-                .saturating_mul(MUTATION_DISCOVERY_ROUNDS_PER_NUDGE),
-        );
+        let limit =
+            round_cap.saturating_add(self.phase_nudges.saturating_mul(self.rounds_per_nudge));
         if tracker.pre_mutation_rounds < limit {
             return DiscoveryRecovery::None;
         }
@@ -71,12 +78,12 @@ impl MutationRecovery {
             self.start_plan_phase();
             return DiscoveryRecovery::ExistingPlan;
         }
-        if self.phase_nudges < MAX_MUTATION_DISCOVERY_NUDGES {
+        if self.phase_nudges < self.max_nudges {
             self.phase_nudges += 1;
             tracker.discovery_nudges += 1;
             return DiscoveryRecovery::Nudge {
                 attempt: self.phase_nudges,
-                maximum: MAX_MUTATION_DISCOVERY_NUDGES,
+                maximum: self.max_nudges,
             };
         }
         if !self.force_edit_sent {
@@ -90,6 +97,16 @@ impl MutationRecovery {
         self.plan_grace_used = true;
         self.plan_nudge_sent = false;
     }
+
+    #[cfg(test)]
+    fn bounded_for_test() -> Self {
+        Self {
+            round_cap: Some(10),
+            rounds_per_nudge: 2,
+            max_nudges: 2,
+            ..Self::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -98,7 +115,7 @@ mod tests {
 
     #[test]
     fn discovery_budget_is_two_advisory_nudges_then_force_edit_then_stop() {
-        let mut recovery = MutationRecovery::default();
+        let mut recovery = MutationRecovery::bounded_for_test();
         let mut tracker = ImplementationTracker {
             pre_mutation_rounds: 10,
             pre_mutation_tool_calls: 10,
@@ -136,7 +153,7 @@ mod tests {
 
     #[test]
     fn plan_at_final_threshold_stops_after_the_advisory_read() {
-        let mut recovery = MutationRecovery::default();
+        let mut recovery = MutationRecovery::bounded_for_test();
         let mut tracker = ImplementationTracker {
             pre_mutation_rounds: 14,
             pre_mutation_tool_calls: 14,
@@ -161,12 +178,28 @@ mod tests {
 
     #[test]
     fn completed_plan_does_not_enter_plan_grace() {
-        let mut recovery = MutationRecovery::default();
+        let mut recovery = MutationRecovery::bounded_for_test();
         let tracker = ImplementationTracker {
             pre_mutation_rounds: 14,
             discovery_nudges: 2,
             ..Default::default()
         };
         assert!(!recovery.transition_after_plan(&tracker, true, false));
+    }
+
+    #[test]
+    fn ordinary_discovery_crosses_the_legacy_round_boundary_without_settling() {
+        let mut recovery = MutationRecovery::default();
+        let mut tracker = ImplementationTracker {
+            pre_mutation_rounds: 11,
+            pre_mutation_tool_calls: 33,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            recovery.after_discovery(&mut tracker, false),
+            DiscoveryRecovery::None
+        );
+        assert!(!recovery.transition_after_plan(&tracker, true, true));
     }
 }

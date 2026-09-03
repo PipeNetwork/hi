@@ -8,6 +8,22 @@ use uuid::Uuid;
 use crate::error::ResearchError;
 use crate::types::*;
 
+const RESEARCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RESEARCH_REQUEST_TIMEOUT_ENV: &str = "HI_RESEARCH_TIMEOUT_SECS";
+
+fn configured_request_timeout() -> Option<Duration> {
+    let configured = std::env::var(RESEARCH_REQUEST_TIMEOUT_ENV).ok();
+    request_timeout_from_value(configured.as_deref())
+}
+
+fn request_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .filter(|timeout| std::time::Instant::now().checked_add(*timeout).is_some())
+}
+
 #[derive(Clone, Debug)]
 pub struct ResearchClientConfig {
     pub origin: String,
@@ -35,6 +51,13 @@ impl ResearchClient {
     }
 
     pub fn new(config: ResearchClientConfig) -> Result<Self, ResearchError> {
+        Self::new_with_request_timeout(config, configured_request_timeout())
+    }
+
+    fn new_with_request_timeout(
+        config: ResearchClientConfig,
+        request_timeout: Option<Duration>,
+    ) -> Result<Self, ResearchError> {
         if config.api_key.trim().is_empty() {
             return Err(ResearchError::fail_open(
                 "Research API key missing (set PIPENETWORK_API_KEY or an active Pipe provider key)",
@@ -45,9 +68,13 @@ impl ResearchClient {
             return Err(ResearchError::fail_open("Research API base URL is empty"));
         }
         validate_credential_origin(&origin)?;
-        let http = Client::builder()
+        let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(120))
+            .connect_timeout(RESEARCH_CONNECT_TIMEOUT);
+        if let Some(timeout) = request_timeout {
+            builder = builder.timeout(timeout);
+        }
+        let http = builder
             .build()
             .map_err(|error| ResearchError::hard(error.to_string()))?;
         Ok(Self {
@@ -73,15 +100,9 @@ impl ResearchClient {
         &self,
         builder: RequestBuilder,
     ) -> Result<T, ResearchError> {
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| ResearchError::hard(error.to_string()))?;
+        let response = builder.send().await.map_err(transport_error)?;
         let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| ResearchError::hard(error.to_string()))?;
+        let bytes = response.bytes().await.map_err(transport_error)?;
         if !status.is_success() {
             return Err(ResearchError::from_http(
                 status.as_u16(),
@@ -155,12 +176,9 @@ Then one short reason. Prefer grounded citations over confident guesses.",
             .authorized(self.http.post(self.url("/v1/chat/completions")).json(&body))
             .send()
             .await
-            .map_err(|error| ResearchError::hard(error.to_string()))?;
+            .map_err(transport_error)?;
         let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| ResearchError::hard(error.to_string()))?;
+        let bytes = response.bytes().await.map_err(transport_error)?;
         if status == StatusCode::UNAUTHORIZED
             || status == StatusCode::NOT_FOUND
             || status == StatusCode::SERVICE_UNAVAILABLE
@@ -180,6 +198,14 @@ Then one short reason. Prefer grounded citations over confident guesses.",
             .and_then(|v| v.as_str())
             .unwrap_or("");
         Ok(parse_winning_draft(content, drafts.len()))
+    }
+}
+
+fn transport_error(error: reqwest::Error) -> ResearchError {
+    if error.is_timeout() {
+        ResearchError::hard(format!("research request timed out: {error}"))
+    } else {
+        ResearchError::hard(error.to_string())
     }
 }
 
@@ -222,6 +248,74 @@ mod tests {
             api_key: "pk_test".into(),
         })
         .unwrap()
+    }
+
+    fn client_with_timeout(server: &MockServer, timeout: Option<Duration>) -> ResearchClient {
+        ResearchClient::new_with_request_timeout(
+            ResearchClientConfig {
+                origin: server.uri(),
+                api_key: "pk_test".into(),
+            },
+            timeout,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn productive_research_timeout_is_opt_in() {
+        assert_eq!(request_timeout_from_value(None), None);
+        assert_eq!(request_timeout_from_value(Some("")), None);
+        assert_eq!(request_timeout_from_value(Some("invalid")), None);
+        assert_eq!(request_timeout_from_value(Some("0")), None);
+        assert_eq!(
+            request_timeout_from_value(Some(" 17 ")),
+            Some(Duration::from_secs(17))
+        );
+        assert_eq!(
+            request_timeout_from_value(Some(&u64::MAX.to_string())),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn unlimited_research_wait_is_cancellable_and_explicitly_boundable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(RESEARCH_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(50))
+                    .set_body_json(serde_json::json!({
+                        "object": "research",
+                        "research_id": "res_slow",
+                        "query": "slow",
+                        "queries": [],
+                        "snippets": [],
+                        "pages": []
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let unlimited = client_with_timeout(&server, None);
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(10), unlimited.research("slow")).await;
+        assert!(
+            cancelled.is_err(),
+            "an unlimited research request should remain pending until caller cancellation"
+        );
+        let completed = unlimited.research("slow").await.unwrap();
+        assert_eq!(completed.research_id, "res_slow");
+
+        let bounded = client_with_timeout(&server, Some(Duration::from_millis(10)));
+        let error = bounded
+            .research("slow")
+            .await
+            .expect_err("an explicit research timeout must still fire");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("timed out"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

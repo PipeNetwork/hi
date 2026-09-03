@@ -25,9 +25,8 @@ async fn productive_discovery_continues_to_plan_instead_of_stalling() {
     let mut responses = Vec::new();
     let mut file = 0;
     // Exact batch cardinalities from the live failure: fourteen productive
-    // rounds and thirty-three calls. After the two advisory nudges the
-    // next round is force-edit (tools required), then the scripted plan
-    // still lands instead of the turn stalling.
+    // rounds and thirty-three distinct reads. This crosses the historical
+    // discovery ceiling without forcing an edit or settling the turn.
     for batch_size in [2, 3, 3, 3, 3, 3, 4, 2, 1, 1, 2, 2, 2, 2] {
         let mut calls = Vec::new();
         for _ in 0..batch_size {
@@ -120,28 +119,15 @@ async fn productive_discovery_continues_to_plan_instead_of_stalling() {
             .iter()
             .all(|entry| entry.status == hi_tools::ToolStatus::Succeeded)
     );
-    assert_eq!(
-        ui.statuses
-            .iter()
-            .filter(|status| status.contains("requesting an implementation step"))
-            .count(),
-        2,
-        "discovery nudges are bounded: {:?}",
-        ui.statuses
-    );
     assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("requiring an edit now")),
-        "exhausted discovery must demand an edit: {:?}",
+        ui.statuses.iter().all(
+            |status| !status.contains("requesting an implementation step")
+                && !status.contains("requiring an edit now")
+                && !status.contains("discovery budget was exhausted")
+        ),
+        "distinct productive discovery must not trip a count-only guard: {:?}",
         ui.statuses
     );
-    assert!(
-        !ui.statuses
-            .iter()
-            .any(|status| status.contains("turn stopped incomplete"))
-    );
-    assert!(!agent.last_turn_telemetry().stalled_unfinished);
     let continued_tools = tool_names.lock().unwrap()[14]
         .iter()
         .cloned()
@@ -149,12 +135,12 @@ async fn productive_discovery_continues_to_plan_instead_of_stalling() {
     assert!(continued_tools.contains("read"));
     assert!(continued_tools.contains("update_plan"));
     assert!(continued_tools.contains("write"));
-    assert_eq!(modes.lock().unwrap()[14], ToolMode::Required);
+    assert_ne!(modes.lock().unwrap()[14], ToolMode::ChatOnly);
     assert!(
         tool_names.lock().unwrap()[15]
             .iter()
             .any(|name| name == "read")
     );
-    assert_eq!(modes.lock().unwrap()[15], ToolMode::Required);
-    assert_eq!(modes.lock().unwrap()[16], ToolMode::Required);
+    assert_ne!(modes.lock().unwrap()[15], ToolMode::ChatOnly);
+    assert_ne!(modes.lock().unwrap()[16], ToolMode::ChatOnly);
 }

@@ -47,7 +47,6 @@ pub(super) struct VerifyOutcomeState<'a> {
     pub(super) independent_review_status: &'a mut ReviewStatus,
     pub(super) independent_review_repairs: &'a mut u32,
     pub(super) review_unavailable_reason: &'a mut Option<String>,
-    pub(super) stalled_unfinished: &'a mut bool,
     pub(super) verification_infrastructure_error: &'a mut bool,
     pub(super) verification_unstable: &'a mut bool,
     pub(super) last_verify_attributions: &'a mut Vec<hi_tools::Attribution>,
@@ -58,8 +57,6 @@ pub(super) struct VerifyOutcomeState<'a> {
     pub(super) ranked_context_paths: &'a mut BTreeSet<String>,
     pub(super) context_generation_seen: &'a mut u64,
     pub(super) indexed_ledger_revision: &'a mut u64,
-    pub(super) progress_tracker: &'a mut super::progress::ProgressTracker,
-    pub(super) continue_total_nudges: &'a mut u32,
 }
 
 impl crate::Agent {
@@ -119,37 +116,11 @@ impl crate::Agent {
                             return Ok(VerifyOutcomeControl::ReenterModel);
                         }
                         super::obligation::ObligationReason::FailedVerify => {
-                            let mut repeating = false;
-                            if self.keep_working_after_stall(
-                                state.progress_tracker,
-                                state.force_tools_next,
-                                state.stalled_unfinished,
-                                &mut repeating,
-                                Some(state.continue_total_nudges),
-                                ui,
-                            ) {
-                                verifier.allow_review_revalidation();
-                                return Ok(VerifyOutcomeControl::ReenterModel);
-                            }
-                            *state.stalled_unfinished = true;
                             ui.status(reason.ui_status());
                         }
                     }
                 }
                 if self.report.verify.failed() {
-                    let mut repeating = false;
-                    if self.keep_working_after_stall(
-                        state.progress_tracker,
-                        state.force_tools_next,
-                        state.stalled_unfinished,
-                        &mut repeating,
-                        Some(state.continue_total_nudges),
-                        ui,
-                    ) {
-                        verifier.allow_review_revalidation();
-                        return Ok(VerifyOutcomeControl::ReenterModel);
-                    }
-                    *state.stalled_unfinished = true;
                     ui.status("verification still failed after repair");
                 }
                 Ok(VerifyOutcomeControl::BreakTurn)
@@ -218,6 +189,9 @@ impl crate::Agent {
                 // cannot exist without its bound (revision, digest).
                 self.report.verify =
                     VerifyEvidence::pass(verified_revision, verified_digest.clone());
+                self.runtime
+                    .ledger()
+                    .retain_verification_baseline(verified_revision);
                 let current_files = current_changes
                     .iter()
                     .map(|change| change.path.clone())
@@ -228,9 +202,10 @@ impl crate::Agent {
                 } else {
                     diff.lines().count()
                 };
-                if *state.independent_review_repairs
-                    < self.config.gates.max_independent_review_repairs
-                    && let Some(contract) = self.task.last_task_contract.as_ref()
+                if crate::config::repair_available(
+                    self.config.gates.max_independent_review_repairs,
+                    *state.independent_review_repairs,
+                ) && let Some(contract) = self.task.last_task_contract.as_ref()
                 {
                     let prompt = self.task.last_task_prompt.as_deref().unwrap_or("");
                     let findings = crate::hygiene::assess(contract, &current_changes, prompt);
@@ -240,11 +215,11 @@ impl crate::Agent {
                         *state.independent_review_status = ReviewStatus::Objected;
                         self.report.verify = VerifyEvidence::none();
                         verifier.allow_review_revalidation();
-                        let remaining = self
-                            .config
-                            .gates
-                            .max_independent_review_repairs
-                            .saturating_sub(*state.independent_review_repairs);
+                        let limit = self.config.gates.max_independent_review_repairs;
+                        let remaining = crate::config::remaining_repairs_label(
+                            limit,
+                            *state.independent_review_repairs,
+                        );
                         let bullets = findings
                             .iter()
                             .map(|finding| format!("- {}", finding.reason))
@@ -260,7 +235,7 @@ impl crate::Agent {
                         ui.nudge(&format!(
                             "diff hygiene objected; allowing repair cycle {}/{} ({} remaining)",
                             *state.independent_review_repairs,
-                            self.config.gates.max_independent_review_repairs,
+                            crate::config::repair_limit_label(limit),
                             remaining
                         ));
                         *state.force_tools_next = true;
@@ -375,8 +350,10 @@ impl crate::Agent {
                             ));
                         }
                         super::super::skeptic::SkepticVerdict::Object(objections)
-                            if *state.independent_review_repairs
-                                < self.config.gates.max_independent_review_repairs =>
+                            if crate::config::repair_available(
+                                self.config.gates.max_independent_review_repairs,
+                                *state.independent_review_repairs,
+                            ) =>
                         {
                             *state.independent_review_repairs =
                                 state.independent_review_repairs.saturating_add(1);
@@ -388,11 +365,11 @@ impl crate::Agent {
                             } else {
                                 "Independent review found concrete completion defects"
                             };
-                            let remaining = self
-                                .config
-                                .gates
-                                .max_independent_review_repairs
-                                .saturating_sub(*state.independent_review_repairs);
+                            let limit = self.config.gates.max_independent_review_repairs;
+                            let remaining = crate::config::remaining_repairs_label(
+                                limit,
+                                *state.independent_review_repairs,
+                            );
                             self.messages.push_nudge(
                                 NudgeKind::Review,
                                 format!(
@@ -407,7 +384,7 @@ impl crate::Agent {
                             ui.nudge(&format!(
                                 "{review_label} objected; allowing repair cycle {}/{} ({} remaining)",
                                 *state.independent_review_repairs,
-                                self.config.gates.max_independent_review_repairs,
+                                crate::config::repair_limit_label(limit),
                                 remaining
                             ));
                             return Ok(VerifyOutcomeControl::ReenterModel);
@@ -491,7 +468,6 @@ impl crate::Agent {
                 round,
             } => {
                 *state.verification_unstable = true;
-                *state.stalled_unfinished = true;
                 self.report.verify = VerifyEvidence::fail();
                 ui.status(&format!(
                     "verification is unstable in round {round}: stage {} modified {}",
@@ -515,5 +491,20 @@ mod tests {
 
         assert!(section.starts_with("Canonical user objective:\n"));
         assert!(section.contains(prompt));
+    }
+
+    #[test]
+    fn saturated_unlimited_review_count_keeps_both_repair_paths_available() {
+        let limit = crate::UNLIMITED_REPAIR_CYCLES;
+        let saturated = u32::MAX;
+
+        // The deterministic diff-hygiene objection path and the model-review
+        // objection path use the same sentinel-aware admission predicate.
+        let hygiene_repair_available = crate::config::repair_available(limit, saturated);
+        let model_review_repair_available = crate::config::repair_available(limit, saturated);
+
+        assert!(hygiene_repair_available);
+        assert!(model_review_repair_available);
+        assert!(crate::config::repair_available(limit, u32::MAX - 1));
     }
 }

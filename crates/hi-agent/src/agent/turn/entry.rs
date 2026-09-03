@@ -1,6 +1,6 @@
 //! Turn entry, cancellation backstop, lifecycle callbacks, and project hooks.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use hi_events::{
     ActivityObject, ActivityState, ActivityVerb, EventContext, EventKind, RunEvent,
     SemanticActivity,
@@ -68,7 +68,44 @@ impl crate::Agent {
                     // reusable Agent. Signal the same future and let its bounded
                     // cooperative-cancel path settle before reporting timeout.
                     cancellation.cancel();
-                    match turn.await {
+                    const DEADLINE_SETTLEMENT_GRACE: std::time::Duration =
+                        std::time::Duration::from_secs(30);
+                    let settled =
+                        tokio::time::timeout(DEADLINE_SETTLEMENT_GRACE, turn.as_mut()).await;
+                    let settled = match settled {
+                        Ok(settled) => settled,
+                        Err(_) => {
+                            // A rollback/cleanup implementation must not turn the
+                            // hard deadline into another unbounded wait. Drop the
+                            // in-flight cleanup future and leave an explicit
+                            // terminal diagnostic; the workspace state is
+                            // intentionally reported as uncertain.
+                            drop(turn);
+                            self.turn_cancellation = None;
+                            self.interrupt
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            self.finish_drive_turn();
+                            let _ = self.kill_turn_backgrounds();
+                            if crate::DriveKind::from_prompt(input) == crate::DriveKind::Plan
+                                || self.pending_plan_interruption_resume
+                                || self.turn_consumed_plan_interruption
+                            {
+                                self.pause_plan_drive_until_user_input().context(
+                                    "persisting plan interruption after cleanup deadline",
+                                )?;
+                            }
+                            ui.assistant_text(
+                                "The turn hit its hard deadline and cleanup did not settle in time. I stopped waiting; the workspace may contain partial changes and should be inspected before continuing.",
+                            );
+                            ui.assistant_end();
+                            anyhow::bail!(
+                                "turn deadline exceeded after {}s; cleanup exceeded its {}s grace period",
+                                timeout.as_secs(),
+                                DEADLINE_SETTLEMENT_GRACE.as_secs()
+                            );
+                        }
+                    };
+                    match settled {
                         Ok(outcome) if outcome.stop_reason == TurnStopReason::Cancelled => {
                             anyhow::bail!("turn deadline exceeded after {}s", timeout.as_secs())
                         }
@@ -93,6 +130,28 @@ impl crate::Agent {
         ui: &mut dyn Ui,
         cancellation: crate::TurnCancellation,
     ) -> Result<TurnOutcome> {
+        let requested_drive_kind = crate::DriveKind::from_prompt(input);
+        // Pin the currently active decision-engine generation for the whole
+        // turn. A reload requested during streaming becomes pending and is
+        // promoted only after this lease is dropped.
+        let engine_lease = match self
+            .engine_runtime
+            .begin_turn()
+            .context("pinning decision engine generation")
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                if requested_drive_kind == crate::DriveKind::Plan
+                    || self.pending_plan_interruption_resume
+                    || self.turn_consumed_plan_interruption
+                {
+                    self.pause_plan_drive_until_user_input().context(
+                        "restoring plan interruption after decision-engine setup failed",
+                    )?;
+                }
+                return Err(error);
+            }
+        };
         // A frontend may use the terminal report to decide whether an Err
         // already passed through Agent-owned cancellation cleanup (notably the
         // hard-timeout path, which preserves its deadline error). Clear the
@@ -100,18 +159,34 @@ impl crate::Agent {
         // a new early error look like an already-finalized cancellation.
         self.report.last_turn_outcome = None;
         if cancellation.is_cancelled() {
-            return self
+            let restore_plan_pause = requested_drive_kind == crate::DriveKind::Plan
+                || self.pending_plan_interruption_resume
+                || self.turn_consumed_plan_interruption;
+            let pause_result = if restore_plan_pause {
+                self.pause_plan_drive_until_user_input()
+                    .map(|_| ())
+                    .context("persisting plan interruption before cancellation cleanup")
+            } else {
+                Ok(())
+            };
+            self.pending_plan_interruption_resume = false;
+            self.turn_consumed_plan_interruption = false;
+            let cleanup_result = self
                 .cleanup_turn(crate::TurnCleanupKind::Cancel {
                     session: crate::SessionRollback::AgentOwned {
-                        checkpoint_count_before: self.checkpoint_count(),
+                        checkpoint_refs_before: self.checkpoint_refs().to_vec(),
                     },
                 })
                 .await
                 .map(|cleanup| cleanup.outcome);
+            return cleanup_result.and_then(|outcome| {
+                pause_result?;
+                Ok(outcome)
+            });
         }
         let message_count_before = self.messages.len();
         let state_before = self.state_snapshot();
-        let checkpoint_count_before = self.checkpoint_count();
+        let checkpoint_refs_before = self.checkpoint_refs().to_vec();
         // Install the turn cancel flag before the body runs so tool batches and
         // the Model→Tools loop can cooperatively abort, synthesize tool_results,
         // and return a private marker to the outer cleanup owner instead of only
@@ -123,7 +198,7 @@ impl crate::Agent {
         const COOPERATIVE_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
         let interrupt = std::sync::Arc::clone(&self.interrupt);
         let (body_result, cancellation_observed) = {
-            let body = self.run_turn_body(input, ui);
+            let body = self.run_turn_body(input, ui, engine_lease);
             tokio::pin!(body);
             tokio::select! {
                 biased;
@@ -163,35 +238,85 @@ impl crate::Agent {
                 .unwrap_or(hi_agent_lifecycle::TurnAbortReason::Interrupted)
         });
         let result = if cancellation_cleanup {
+            // Persist the stop latch before rewriting the transcript. If the
+            // process dies between these appends, restart remains safely
+            // paused instead of autonomously re-running abandoned plan work.
+            let restore_plan_pause = requested_drive_kind == crate::DriveKind::Plan
+                || self.pending_plan_interruption_resume
+                || self.turn_consumed_plan_interruption;
+            let pause_result = if restore_plan_pause {
+                self.pause_plan_drive_until_user_input()
+                    .map(|_| ())
+                    .context("persisting plan interruption before cancelled-turn rewind")
+            } else {
+                Ok(())
+            };
             // This is the sole owner of cancellation rollback. In particular,
             // it is outside the body future that the cooperative grace may
             // drop, so an in-progress checkpoint restore can never be detached
             // and then re-entered by a second cleanup attempt.
-            if self.checkpoint_count() > checkpoint_count_before
-                && let Err(error) = self.undo().await
+            let workspace_rolled_back = match self
+                .rollback_turn_checkpoint(&checkpoint_refs_before)
+                .await
             {
-                eprintln!("hi-agent: couldn't roll back cancelled workspace edits: {error:#}");
-            }
+                Ok(restored_files) => restored_files > 0,
+                Err(error) => {
+                    eprintln!("hi-agent: couldn't roll back cancelled workspace edits: {error:#}");
+                    false
+                }
+            };
             let message_start = self
                 .workspace
                 .active_turn_message_start
                 .unwrap_or(message_count_before);
-            if let Err(error) = self.rewind_to_snapshot_durable(message_start, &state_before) {
+            if let Err(error) = self.rewind_to_snapshot_durable_with_workspace_rollback(
+                message_start,
+                &state_before,
+                workspace_rolled_back,
+            ) {
                 // Keep the live agent coherent even when its durable sink is
                 // unavailable. This mirrors the interactive interrupt path;
                 // cleanup below still finalizes cancellation and surfaces a
                 // persistence error if its final write also fails.
                 eprintln!("hi-agent: couldn't persist cancelled turn discard: {error:#}");
                 self.truncate_messages(message_start);
-                self.restore_state_snapshot(&state_before);
+                self.restore_state_snapshot_with_workspace_rollback(
+                    &state_before,
+                    workspace_rolled_back,
+                );
             }
-            self.cleanup_turn(crate::TurnCleanupKind::Cancel {
-                session: crate::SessionRollback::AlreadyApplied,
+            let cleanup_result = self
+                .cleanup_turn(crate::TurnCleanupKind::Cancel {
+                    session: crate::SessionRollback::AlreadyApplied,
+                })
+                .await
+                .map(|cleanup| cleanup.outcome);
+            cleanup_result.and_then(|outcome| {
+                pause_result?;
+                Ok(outcome)
             })
-            .await
-            .map(|cleanup| cleanup.outcome)
         } else {
             body_result.expect("non-cancelled turn body must have a result")
+        };
+        let drive_must_pause = match &result {
+            Err(_) => true,
+            Ok(outcome) => crate::plan_drive::outcome_blocks_automatic_drive(outcome),
+        };
+        let mut drive_state_result = self
+            .settle_plan_interruption_resume(!drive_must_pause)
+            .context("settling transactional plan interruption resume");
+        if drive_state_result.is_ok()
+            && drive_must_pause
+            && requested_drive_kind == crate::DriveKind::Plan
+        {
+            drive_state_result = self
+                .pause_plan_drive_until_user_input()
+                .map(|_| ())
+                .context("pausing plan drive after unsuccessful synthetic turn");
+        }
+        let result = match drive_state_result {
+            Ok(()) => result,
+            Err(error) => Err(error),
         };
         let abort_reason = cancellation_abort_reason.or_else(|| match &result {
             Ok(outcome) if outcome.status == TurnStatus::Cancelled => cancellation
@@ -229,7 +354,12 @@ impl crate::Agent {
         }
     }
 
-    async fn run_turn_body(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
+    async fn run_turn_body(
+        &mut self,
+        input: &str,
+        ui: &mut dyn Ui,
+        engine_lease: hi_engine_host::EngineLease,
+    ) -> Result<TurnOutcome> {
         ui.semantic_event(RunEvent::new(
             EventKind::RunStarted,
             EventContext::default(),
@@ -252,7 +382,7 @@ impl crate::Agent {
         {
             // Per-session turn limit reached before this turn started.
             let outcome = TurnOutcome {
-                status: TurnStatus::Cancelled,
+                status: TurnStatus::Completed,
                 verification: VerificationStatus::NotApplicable,
                 review: ReviewStatus::NotRequired,
                 stop_reason: TurnStopReason::TurnLimit,
@@ -297,7 +427,7 @@ impl crate::Agent {
         } else if hooks.join("pre-turn").is_file() {
             ui.status("project hooks skipped: workspace untrusted (run /trust on to enable)");
         }
-        self.run_turn_core(input, ui).await
+        self.run_turn_core(input, ui, engine_lease).await
     }
 
     async fn finalize_turn_result(
@@ -384,7 +514,7 @@ impl crate::Agent {
                     ActivityState::Failed,
                     ActivityVerb::Fail,
                 ),
-                TurnStatus::Incomplete | TurnStatus::Blocked => (
+                TurnStatus::Blocked => (
                     EventKind::RunCompleted,
                     ActivityState::Failed,
                     ActivityVerb::Complete,
@@ -437,10 +567,10 @@ impl crate::Agent {
         }
         ui.semantic_event(run_event);
 
-        // Project post/stop hooks each carry a 30s process timeout. The hard
-        // 750ms cancellation backstop exists specifically to bound teardown,
-        // so do not turn it into another minute of hook waits after the live
-        // body was already force-dropped.
+        // Hooks have no implicit productive timeout. The hard 750ms turn
+        // cancellation backstop drops the hook future, whose process-group
+        // guard owns descendant cleanup, so do not start more hooks after the
+        // live body was already force-dropped.
         if forced_abort || cancellation.is_cancelled() {
             return;
         }
@@ -480,8 +610,8 @@ async fn wait_for_turn_cancellation(cancellation: crate::TurnCancellation) {
 }
 
 /// Run a project hook until it completes or whole-turn cancellation arrives.
-/// `run_hook` sets `kill_on_drop`, so dropping the losing hook future also
-/// terminates its child process instead of leaving work behind the deadline.
+/// `run_hook` owns a private process group, so dropping the losing hook future
+/// terminates the hook and its descendants instead of leaving work behind.
 async fn run_hook_cancellable(
     workspace: &std::path::Path,
     name: &str,

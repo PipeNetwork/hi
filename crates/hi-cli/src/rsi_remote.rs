@@ -35,19 +35,23 @@ use crate::rsi_policy::{
     MANAGED_CONTEXT_BYTES, MAX_OBJECTIVE_BYTES, SnapshotLimits,
 };
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// Default wall-clock bound for waiting on a remote RSI run. Override with
-/// `HI_RSI_WAIT_TIMEOUT_SECS`.
-const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(10);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn wait_timeout() -> Duration {
-    std::env::var("HI_RSI_WAIT_TIMEOUT_SECS")
-        .ok()
+fn wait_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    value
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_WAIT_TIMEOUT)
+        .filter(|timeout| std::time::Instant::now().checked_add(*timeout).is_some())
+}
+
+/// Optional operator wall-clock bound for waiting on a remote RSI run.
+/// Unset, invalid, or zero allows the remote run to continue until completion
+/// or caller cancellation. HTTP transport deadlines still apply per request.
+fn wait_timeout() -> Option<Duration> {
+    let configured = std::env::var("HI_RSI_WAIT_TIMEOUT_SECS").ok();
+    wait_timeout_from_value(configured.as_deref())
 }
 
 #[derive(Clone, Debug)]
@@ -347,12 +351,13 @@ impl RsiRemoteProvider {
         let mut last_billing = String::new();
         let mut status_failures = 0_u8;
         let mut poll_delay = POLL_INTERVAL;
-        let deadline = tokio::time::Instant::now() + wait_timeout();
+        let timeout = wait_timeout();
+        let deadline = timeout.and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
         loop {
-            if tokio::time::Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                 bail!(
                     "RSI run {run_id} did not finish within {:?}; recover it with /rsi status {run_id}",
-                    wait_timeout()
+                    timeout.expect("deadline requires a configured timeout")
                 );
             }
             // Event batches are replayable, so reconnects resume from the last sequence seen.
@@ -1655,6 +1660,17 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn remote_run_wait_is_unlimited_unless_explicitly_bounded() {
+        assert_eq!(wait_timeout_from_value(None), None);
+        assert_eq!(wait_timeout_from_value(Some("0")), None);
+        assert_eq!(wait_timeout_from_value(Some("invalid")), None);
+        assert_eq!(
+            wait_timeout_from_value(Some("23")),
+            Some(Duration::from_secs(23))
+        );
     }
 
     #[test]

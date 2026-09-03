@@ -131,6 +131,20 @@ impl ConcurrencyLimitedProvider {
             let notified = self.notify.notified();
             {
                 let mut state = self.state.lock().await;
+                // Adaptive throttling must not collapse the entire pool into the
+                // foreground reservation. An auxiliary request may be awaited by
+                // the foreground turn itself (finalization, compaction, review),
+                // so leaving it zero admissible slots deadlocks the turn and also
+                // prevents the successes that would recover the adaptive limit.
+                // Heal an already-degraded state here as well as enforcing the
+                // floor in `record_result`, so restored/legacy state cannot strand
+                // an auxiliary waiter forever.
+                let productive_floor = self
+                    .config
+                    .foreground_reserved
+                    .saturating_add(1)
+                    .min(self.config.max_concurrent);
+                state.current_limit = state.current_limit.max(productive_floor);
                 let auxiliary_limit = state
                     .current_limit
                     .saturating_sub(self.config.foreground_reserved);
@@ -164,7 +178,12 @@ impl ConcurrencyLimitedProvider {
             )
         });
         if throttled {
-            state.current_limit = state.current_limit.saturating_sub(1).max(1);
+            let productive_floor = self
+                .config
+                .foreground_reserved
+                .saturating_add(1)
+                .min(self.config.max_concurrent);
+            state.current_limit = state.current_limit.saturating_sub(1).max(productive_floor);
             state.success_streak = 0;
             state.last_throttle = Some(Instant::now());
         } else if result.is_ok() {
@@ -189,6 +208,10 @@ impl ConcurrencyLimitedProvider {
 
 #[async_trait]
 impl Provider for ConcurrencyLimitedProvider {
+    fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
     async fn stream(
         &self,
         request: ChatRequest,
@@ -209,6 +232,8 @@ impl Provider for ConcurrencyLimitedProvider {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures_util::FutureExt;
 
     use super::*;
     use crate::{Content, RequestProfile, Usage};
@@ -239,6 +264,19 @@ mod tests {
                 refusal: None,
                 tool_call_channel: crate::ToolCallChannel::None,
             })
+        }
+    }
+
+    struct NeverProvider;
+
+    #[async_trait]
+    impl Provider for NeverProvider {
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            _sink: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<Completion> {
+            unreachable!()
         }
     }
 
@@ -348,6 +386,80 @@ mod tests {
         for task in tasks {
             task.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn adaptive_throttling_preserves_an_auxiliary_slot() {
+        let provider = ConcurrencyLimitedProvider::with_config(
+            Box::new(NeverProvider),
+            ProviderConcurrencyConfig {
+                max_concurrent: 8,
+                foreground_reserved: 1,
+                adaptive: true,
+            },
+        )
+        .unwrap();
+        let throttled: Result<Completion> = Err(crate::ProviderError::new(
+            ProviderErrorKind::CapacityUnavailable,
+            "test throttle",
+        )
+        .into());
+
+        for _ in 0..16 {
+            provider.record_result(&throttled).await;
+        }
+
+        let state = provider.state.lock().await;
+        assert_eq!(state.current_limit, 2);
+        assert_eq!(
+            state
+                .current_limit
+                .saturating_sub(provider.config.foreground_reserved),
+            1,
+            "adaptive backoff must retain one auxiliary slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_limit_self_heals_and_keeps_the_foreground_reservation() {
+        let provider = ConcurrencyLimitedProvider::with_config(
+            Box::new(NeverProvider),
+            ProviderConcurrencyConfig {
+                max_concurrent: 3,
+                foreground_reserved: 1,
+                adaptive: true,
+            },
+        )
+        .unwrap();
+        provider.state.lock().await.current_limit = 1;
+
+        let auxiliary = provider
+            .acquire(true)
+            .now_or_never()
+            .expect("an auxiliary request must not deadlock at the reserved limit");
+        {
+            let state = provider.state.lock().await;
+            assert_eq!(state.current_limit, 2);
+            assert_eq!(state.in_flight, 1);
+            assert_eq!(state.auxiliary_in_flight, 1);
+        }
+
+        assert!(
+            provider.acquire(true).now_or_never().is_none(),
+            "a second auxiliary request must leave the foreground slot reserved"
+        );
+        let foreground = provider
+            .acquire(false)
+            .now_or_never()
+            .expect("the reserved foreground slot must remain available");
+        {
+            let state = provider.state.lock().await;
+            assert_eq!(state.in_flight, 2);
+            assert_eq!(state.auxiliary_in_flight, 1);
+        }
+
+        drop(foreground);
+        drop(auxiliary);
     }
 
     #[test]

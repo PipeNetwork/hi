@@ -27,16 +27,20 @@ pub struct Trajectory {
     /// review-repair exhaustion.
     #[serde(default)]
     pub stopped_by_step_cap: bool,
-    pub stalled_unfinished: bool,
-    pub stalled_repeating: bool,
+    /// Whether an explicitly configured finite tool-call budget stopped the
+    /// turn. Kept separate so tool-heavy work is not counted as step-cap loss.
+    #[serde(default)]
+    pub hit_tool_cap: bool,
+    #[serde(default)]
+    pub stopped_by_tool_cap: bool,
     /// Aggregate count of local review-repair nudges spent this turn.
     #[serde(default)]
     pub quality_repair_nudges: u32,
     /// Per-mode review-repair counts.
     #[serde(default)]
     pub review_repair_counts: BTreeMap<String, u32>,
-    /// Review-repair exhaustion reason, when a local repair budget stopped the
-    /// turn incomplete.
+    /// Review-repair exhaustion reason, when a local repair budget ended the
+    /// repair phase.
     #[serde(default)]
     pub review_repair_exhaustion_reason: String,
     /// Whether the turn stopped because a review-repair mode exhausted its
@@ -64,10 +68,10 @@ pub struct Trajectory {
     /// Consecutive no-semantic-progress rounds at turn end.
     #[serde(default)]
     pub no_progress_streak: u32,
-    /// Last no-progress/stall reason observed this turn (empty if none).
-    #[serde(default)]
-    pub last_stall_reason: String,
-    /// Bounded trail of per-round progress classifications (last 20).
+    /// Last no-progress reason observed this turn (empty if none).
+    #[serde(default, alias = "last_stall_reason")]
+    pub last_no_progress_reason: String,
+    /// Complete per-turn trail of progress classifications.
     #[serde(default)]
     pub progress_events: Vec<TrajectoryProgressEvent>,
 }
@@ -491,6 +495,7 @@ mod tests {
             "hit_step_cap": false,
             "stalled_unfinished": false,
             "stalled_repeating": false,
+            "last_stall_reason": "legacy no progress",
             "verify_attributions": []
         });
         let t: Trajectory = serde_json::from_value(old).expect("old trajectory artifact");
@@ -501,10 +506,18 @@ mod tests {
         assert_eq!(t.review_repair_exhaustion_reason, "");
         assert!(!t.review_repair_stopped_by_exhaustion);
         assert!(!t.stopped_by_step_cap);
+        assert!(!t.hit_tool_cap);
+        assert!(!t.stopped_by_tool_cap);
         assert_eq!(t.repeated_verify_failures, 0);
         assert_eq!(t.no_progress_streak, 0);
-        assert_eq!(t.last_stall_reason, "");
+        assert_eq!(t.last_no_progress_reason, "legacy no progress");
         assert!(t.progress_events.is_empty());
+
+        let canonical = serde_json::to_value(&t).expect("serialize canonical trajectory");
+        assert!(canonical.get("stalled_unfinished").is_none());
+        assert!(canonical.get("stalled_repeating").is_none());
+        assert_eq!(canonical["last_no_progress_reason"], "legacy no progress");
+        assert!(canonical.get("last_stall_reason").is_none());
     }
 
     #[test]

@@ -239,7 +239,7 @@ impl crate::Agent {
             hi_tools::checkpoint::CreateResult::Unavailable(reason)
             | hi_tools::checkpoint::CreateResult::Failed(reason) => {
                 // An unsealed 0.2 undo record could overwrite edits made after
-                // this turn, so always drop it. Strict mode becomes incomplete;
+                // this turn, so always drop it. Strict mode fails the operation;
                 // YOLO continues silently and exposes the loss in telemetry.
                 self.workspace.checkpoints.pop();
                 if let Some(session) = self.session.as_mut() {

@@ -23,6 +23,28 @@ metrics) stay available as argv[1] dispatchers; `hi --help` lists the ones
 people look for first.
 ";
 
+fn parse_finite_u32_cap(value: &str) -> std::result::Result<u32, String> {
+    let value = value
+        .parse::<u32>()
+        .map_err(|_| format!("{value:?} is not a valid 32-bit unsigned integer"))?;
+    if value == u32::MAX {
+        return Err(format!(
+            "{} is reserved for the unlimited internal sentinel; use at most {}",
+            u32::MAX,
+            u32::MAX - 1
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_positive_finite_u32_cap(value: &str) -> std::result::Result<u32, String> {
+    let value = parse_finite_u32_cap(value)?;
+    if value == 0 {
+        return Err("the limit must be at least 1".into());
+    }
+    Ok(value)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum CliTraceCapture {
     Metadata,
@@ -153,6 +175,17 @@ pub struct Cli {
     #[arg(long, hide = true, value_name = "PATH")]
     pub events_jsonl: Option<std::path::PathBuf>,
 
+    /// Append a flushed, redacted interactive TUI lifecycle trace as JSONL.
+    /// Reserved for the PTY smoke harness; unlike `--events-jsonl`, this is
+    /// valid only for the full-screen interactive frontend.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "PATH",
+        conflicts_with = "events_jsonl"
+    )]
+    pub tui_events_jsonl: Option<std::path::PathBuf>,
+
     /// Exact session file to create or resume (used internally by the
     /// `/dashboard` fleet: the parent owns the path, so a child running in a
     /// worktree appends to the parent project's session rather than creating
@@ -221,8 +254,8 @@ pub struct Cli {
     #[arg(long)]
     pub no_finalize: bool,
 
-    /// Disable auto-memory: at the end of an interactive session, distill durable
-    /// lessons into `.hi/memory.md` (loaded as context next session).
+    /// Disable durable learning: skip auto-memory and do not read or append the
+    /// per-project failure-findings ledger for this session.
     #[arg(long)]
     pub no_memory: bool,
 
@@ -270,12 +303,13 @@ pub struct Cli {
     /// starting new model/repair rounds and finishes normally — workspace
     /// reconciled, report written — instead of being killed mid-edit by an
     /// outer timeout. Set it a little below any external deadline (CI step,
-    /// benchmark harness, wrapper timeout).
+    /// benchmark harness, wrapper timeout). There is no whole-turn deadline by
+    /// default; 0 is an explicit equivalent of omitting this option.
     #[arg(long, value_name = "SECS", env = "HI_TURN_DEADLINE_SECS")]
     pub turn_deadline: Option<u64>,
 
-    /// Allow long-horizon goals to advance when the skeptic reviewer is
-    /// unavailable (timeout/error). Default is fail-closed: hold progress.
+    /// Legacy compatibility flag. Reviewer outages no longer block verified
+    /// productive goal work; unavailable diagnostics are always retained.
     #[arg(long)]
     pub skeptic_fail_open: bool,
 
@@ -283,8 +317,10 @@ pub struct Cli {
     #[arg(long)]
     pub allow_no_checkpoint: bool,
 
-    /// Repair/check cycles after the initial verification check.
-    #[arg(long)]
+    /// Optional finite repair/check cycles after the initial verification
+    /// check. By default productive repairs continue until verification passes
+    /// or a no-progress/fault circuit fires.
+    #[arg(long, value_parser = parse_finite_u32_cap)]
     pub max_verify_repairs: Option<u32>,
 
     /// Independent-review policy.
@@ -299,13 +335,14 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub tool_set: Option<CliToolSet>,
 
-    /// Optional hard cap on model calls per turn (32 by default; `--max-steps`
-    /// overrides it and a capped turn gets one tool-free wrap-up round).
-    #[arg(long)]
+    /// Optional hard cap on model calls per turn. There is no model-call cap by
+    /// default; an explicitly capped turn gets one tool-free wrap-up round.
+    #[arg(long, value_parser = parse_positive_finite_u32_cap)]
     pub max_steps: Option<u32>,
 
-    /// Safety cap on tool executions per turn, independent of model calls.
-    #[arg(long, value_name = "N")]
+    /// Optional cap on tool executions per turn, independent of model calls.
+    /// There is no tool-execution cap by default.
+    #[arg(long, value_name = "N", value_parser = parse_finite_u32_cap)]
     pub max_tool_calls: Option<u32>,
 
     /// Execute coding turns remotely through the authenticated Pipe RSI service.

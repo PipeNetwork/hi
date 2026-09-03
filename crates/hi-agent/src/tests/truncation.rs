@@ -189,10 +189,6 @@ async fn truncation_exhaustion_does_not_finalize_as_done() {
     agent.run_turn("write the big file", &mut ui).await.unwrap();
     let _ = std::fs::remove_file(&path);
 
-    assert!(
-        agent.last_turn_telemetry().stalled_unfinished,
-        "truncation exhaustion should be an unfinished turn"
-    );
     assert_eq!(
         agent.last_turn_telemetry().truncation_retries,
         1,
@@ -270,6 +266,57 @@ async fn truncation_budget_is_separate_from_empty_retries() {
 }
 
 #[tokio::test]
+async fn ordinary_truncation_recovery_continues_past_legacy_five_retry_ceiling() {
+    let cfg = config();
+    assert_eq!(
+        cfg.loop_limits.max_truncation_retries,
+        u32::MAX,
+        "ordinary truncation recovery must be unlimited"
+    );
+    let mut responses: Vec<Completion> = (0..6)
+        .map(|index| Completion {
+            content: vec![Content::Text(format!("productive fragment {index}"))],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 100,
+                ..Default::default()
+            },
+            stop_reason: Some("length".into()),
+            ..Completion::default()
+        })
+        .collect();
+    responses.push(completion(
+        vec![Content::Text("Finished after six continuations.".into())],
+        10,
+        50,
+    ));
+
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("explain the full result", &mut ui)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ui.statuses
+            .iter()
+            .filter(|status| status.contains("output token limit — continuing"))
+            .count(),
+        6,
+        "all valid truncated responses should continue"
+    );
+    assert!(
+        agent.messages().iter().any(|message| {
+            message.content.iter().any(
+            |content| matches!(content, Content::Text(text) if text.contains("Finished after six"))
+        )
+        }),
+        "the clean completion after the legacy boundary must be consumed"
+    );
+}
+
+#[tokio::test]
 async fn truncation_budget_resets_after_tool_progress() {
     // The truncation budget is a consecutive-stall budget, not a whole-turn
     // lifetime budget. A long task can hit the output cap, make real tool
@@ -318,13 +365,6 @@ async fn truncation_budget_resets_after_tool_progress() {
             .count(),
         2,
         "each truncation separated by tool progress should get a retry, got: {:?}",
-        ui.statuses
-    );
-    assert!(
-        !ui.statuses
-            .iter()
-            .any(|s| s.contains("task may be incomplete")),
-        "should not exhaust the truncation budget after intervening progress: {:?}",
         ui.statuses
     );
     assert!(

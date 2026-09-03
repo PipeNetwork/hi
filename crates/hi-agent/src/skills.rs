@@ -452,6 +452,13 @@ pub fn learned_skills_context() -> Option<String> {
     learned_skills_context_from(&list_skills())
 }
 
+/// Render the compact skills index from explicit roots. Callers that already
+/// own a workspace boundary should use this instead of relying on the
+/// process-global `HI_GLOBAL_SKILLS_DIR` lookup.
+pub fn learned_skills_context_in(roots: &SkillRoots) -> Option<String> {
+    learned_skills_context_from(&list_skills_in(roots))
+}
+
 pub fn learned_skills_context_from(skills: &[LearnedSkill]) -> Option<String> {
     let listed_skills: Vec<&LearnedSkill> = skills
         .iter()

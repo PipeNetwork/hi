@@ -113,7 +113,8 @@ pub struct WorkflowRunSnapshot {
     pub current_phase: Option<String>,
     #[serde(default)]
     pub agents: Vec<WorkflowAgentSnapshot>,
-    pub agent_budget: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_budget: Option<u64>,
     pub agents_used: u64,
     pub agents_reserved: u64,
     pub elapsed_ms: u64,
@@ -164,7 +165,7 @@ mod tests {
             phases: Vec::new(),
             current_phase: None,
             agents: Vec::new(),
-            agent_budget: 8,
+            agent_budget: Some(8),
             agents_used: 0,
             agents_reserved: 0,
             elapsed_ms: 0,

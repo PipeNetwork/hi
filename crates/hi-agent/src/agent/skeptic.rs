@@ -1,16 +1,16 @@
 //! Second-model **completion / goal review** transport shared by three product gates.
 //!
-//! # Fail-open is transport-level, not global product policy
+//! # Reviewer availability is diagnostic, not a completion verdict
 //!
 //! [`SkepticVerdict::Unavailable`] is what the transport returns on provider
 //! errors or unparseable replies. Product policy decides what that means:
 //!
 //! | Gate | Config | Unavailable behavior |
 //! |---|---|---|
-//! | Goal skeptic (`skeptic_gate`) | `AgentGates::skeptic_fail_open` (default **false**) | fail-closed: block goal advance |
+//! | Goal skeptic (`skeptic_gate`) | deterministic verification + current-revision reconciliation | record unavailable and advance verified productive work |
 //! | Independent / large-diff review | always records [`crate::ReviewStatus::Unavailable`] | visible on outcome; does **not** re-enter Model |
 //!
-//! The `/goal team` skeptic gate is a bounded second-model review of a turn
+//! The `/goal team` skeptic gate is a second-model review of a turn
 //! before it advances a sub-goal. Modeled on the planner side-call
 //! ([`decompose_goal`]): a throwaway chat-only request through `self.provider`
 //! at the effective skeptic model (`skeptic_model`, falling back to the session
@@ -153,7 +153,8 @@ impl crate::Agent {
     /// are fixed; the bar does not rise).
     ///
     /// Transport returns [`SkepticVerdict::Unavailable`] on provider error or
-    /// unparseable reply; callers apply `skeptic_fail_open` (default fail-closed).
+    /// unparseable reply. The goal caller records that diagnostic but does not
+    /// let reviewer availability veto deterministically verified productive work.
     /// Books usage; records no history.
     pub(crate) async fn skeptic_gate(
         &mut self,
@@ -174,7 +175,7 @@ impl crate::Agent {
     ///
     /// Returns the raw [`SkepticVerdict`] so callers can distinguish transport
     /// failure ([`SkepticVerdict::Unavailable`]) from a real Approve. Product
-    /// policy (e.g. `skeptic_fail_open`) is **not** applied here — same prompt
+    /// policy is **not** applied here — same prompt
     /// and model as the gate, no history recorded.
     pub async fn review_diff(
         &mut self,
@@ -305,7 +306,12 @@ impl crate::Agent {
         {
             return None;
         }
-        if verify_ran_test_stage(self.last_verification_executions()) {
+        if self
+            .last_turn_telemetry()
+            .diagnostic_retention
+            .successful_test_verification
+            || verify_ran_test_stage(self.last_verification_executions())
+        {
             return None;
         }
         Some(
@@ -319,9 +325,8 @@ impl crate::Agent {
     /// gate works with zero configuration.
     ///
     /// Transport-level only: provider errors and empty/unparseable replies
-    /// become [`SkepticVerdict::Unavailable`]. Callers apply product policy
-    /// (`skeptic_fail_open` for the goal gate; completion review records
-    /// `ReviewStatus::Unavailable`).
+    /// become [`SkepticVerdict::Unavailable`]. Callers record the unavailable
+    /// review as diagnostics without confusing it with an objection.
     async fn skeptic_review(&mut self, context: &str) -> SkepticVerdict {
         let model = self.effective_skeptic_model().to_string();
         let system = crate::skills::gated_review_system_prompt(SKEPTIC_PROMPT, true);
@@ -390,9 +395,21 @@ impl crate::Agent {
                     text.push_str(&t);
                 }
             };
-            let completion = match provider.stream(request.clone(), &mut sink).await {
-                Ok(completion) => completion,
-                Err(err) => {
+            let timeout = self.side_call_timeout();
+            let completion = match crate::agent::turn::await_side_call(
+                timeout,
+                provider.stream(request.clone(), &mut sink),
+            )
+            .await
+            {
+                Err(timeout) => {
+                    return SkepticVerdict::Unavailable(format!(
+                        "provider timed out after {:.1}s",
+                        timeout.as_secs_f64()
+                    ));
+                }
+                Ok(Ok(completion)) => completion,
+                Ok(Err(err)) => {
                     self.add_side_error_usage(&err);
                     if attempts_left > 0 && review_error_is_transient(&err) {
                         let delay = hi_ai::provider_retry_after_seconds(&err)

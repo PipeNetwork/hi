@@ -130,18 +130,33 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
             .unwrap_or(ProviderName::Openai)
     };
 
-    // Last-session model beats the profile's stored model so mid-session
-    // `/model` picks (also written into the profile when possible) win on
-    // restart even if a concurrent edit raced the profile file.
+    // A matching last-session model beats the profile's stored model so
+    // mid-session `/model` picks (also written into the profile when possible)
+    // win on restart even if a concurrent edit raced the profile file. Never
+    // carry a model across an explicit provider mismatch: a profile may have
+    // changed routes since the prior exit, and model ids are provider-scoped.
     //
     // A CLI `--provider` that isn't this profile's provider must not inherit
     // the profile's model: grok-4.3 would otherwise ride onto pipenetwork and
     // ignore `HI_MODEL` / the provider default.
     let profile_model = route_profile.and_then(|p| p.model.clone());
+    let last_model = last
+        .as_ref()
+        .and_then(|session| match session.provider.as_deref() {
+            None => session.model.clone(),
+            Some(label)
+                if label
+                    .parse::<ProviderName>()
+                    .is_ok_and(|remembered| remembered == provider) =>
+            {
+                session.model.clone()
+            }
+            Some(_) => None,
+        });
     let mut model = cli
         .model
         .clone()
-        .or_else(|| last.as_ref().and_then(|s| s.model.clone()))
+        .or(last_model)
         .or(profile_model)
         .or_else(|| std::env::var("HI_MODEL").ok())
         .or_else(|| provider.default_model().map(String::from));

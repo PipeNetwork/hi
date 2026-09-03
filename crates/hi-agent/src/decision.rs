@@ -2,7 +2,8 @@
 //!
 //! When the model commits to a key decision, it records it via the
 //! `record_decision` tool. The log is injected into the system prompt each turn
-//! (capped, oldest-first) so the model stays consistent across a long session.
+//! (as a bounded view, oldest-first) so the model stays consistent across a
+//! long session.
 //! Unlike the conversation history, the decision log is **not** subject to
 //! compaction summarization — it lives in the system message, which compaction
 //! preserves verbatim. This is the *why* of intra-session choices, distinct
@@ -27,10 +28,11 @@ pub struct Decision {
     pub files: Vec<String>,
 }
 
-/// Cap the log so it can't grow the system prompt without bound. Older
-/// decisions age out first — the recent ones are most likely to still govern
-/// the work in progress.
-const MAX_DECISIONS: usize = 12;
+/// Bound only the model-facing view. The authoritative log itself is exact and
+/// never evicts decisions: persistence, retry, and resume must not silently
+/// discard an early architectural constraint merely because a session ran for
+/// a long time.
+const MAX_PROMPT_DECISIONS: usize = 12;
 const MAX_SUMMARY_CHARS: usize = 200;
 const MAX_RATIONALE_CHARS: usize = 400;
 const MAX_DECISION_FILES: usize = 8;
@@ -45,7 +47,7 @@ pub struct DecisionLog {
 
 impl DecisionLog {
     /// Rebuild a log from persisted entries, reusing `record` so duplicate
-    /// summaries and the cap are normalized the same way as live updates.
+    /// summaries are normalized the same way as live updates.
     pub fn from_entries(entries: Vec<Decision>) -> Self {
         let mut log = Self::default();
         for entry in entries {
@@ -58,7 +60,6 @@ impl DecisionLog {
     /// earlier one is replaced (the model is re-stating/refining a decision,
     /// not adding a duplicate).
     pub fn record(&mut self, decision: Decision) {
-        let decision = clip_decision(decision);
         // Replace an existing entry with the same summary rather than
         // accumulating duplicates.
         if let Some(existing) = self
@@ -70,13 +71,10 @@ impl DecisionLog {
             return;
         }
         self.entries.push(decision);
-        // Age out the oldest when over capacity.
-        if self.entries.len() > MAX_DECISIONS {
-            self.entries.remove(0);
-        }
     }
 
-    /// The decisions, oldest-first, for system-prompt injection.
+    /// The complete authoritative decisions, oldest-first, for persistence and
+    /// state restoration. [`Self::prompt_section`] renders a bounded copy.
     pub fn entries(&self) -> &[Decision] {
         &self.entries
     }
@@ -93,7 +91,20 @@ impl DecisionLog {
         }
         let mut out =
             String::from("\n\n[Key decisions this session — stay consistent with these]\n");
-        for (i, d) in self.entries.iter().enumerate() {
+        let omitted = self.entries.len().saturating_sub(MAX_PROMPT_DECISIONS);
+        if omitted > 0 {
+            out.push_str(&format!(
+                "[{omitted} earlier decisions remain retained in durable session state; showing the most recent {MAX_PROMPT_DECISIONS}.]\n"
+            ));
+        }
+        for (i, d) in self
+            .entries
+            .iter()
+            .skip(omitted)
+            .cloned()
+            .map(clip_decision)
+            .enumerate()
+        {
             out.push_str(&format!(
                 "{}. {}\n   why: {}\n",
                 i + 1,
@@ -140,14 +151,26 @@ mod tests {
     }
 
     #[test]
-    fn record_appends_and_caps() {
+    fn record_keeps_more_than_the_prompt_view_capacity() {
         let mut log = DecisionLog::default();
         for i in 0..20 {
             log.record(dec(&format!("d{i}"), "r"));
         }
-        assert_eq!(log.entries().len(), MAX_DECISIONS);
-        // The oldest (d0..d7) aged out; d8 onward remain.
-        assert_eq!(log.entries().first().unwrap().summary, "d8");
+        assert_eq!(log.entries().len(), 20);
+        assert_eq!(log.entries().first().unwrap().summary, "d0");
+        assert_eq!(log.entries().last().unwrap().summary, "d19");
+
+        let resumed = DecisionLog::from_entries(log.entries().to_vec());
+        assert_eq!(resumed.entries(), log.entries());
+
+        let section = resumed.prompt_section().unwrap();
+        assert!(section.contains("8 earlier decisions remain retained"));
+        assert!(
+            !section.contains("1. d7\n"),
+            "old entries stay out of the bounded view"
+        );
+        assert!(section.contains("1. d8\n"));
+        assert!(section.contains("12. d19\n"));
     }
 
     #[test]
@@ -190,25 +213,22 @@ mod tests {
     }
 
     #[test]
-    fn record_clips_unbounded_fields() {
+    fn record_is_exact_while_prompt_view_clips_unbounded_fields() {
         let mut log = DecisionLog::default();
+        let summary = "S".repeat(500);
+        let rationale = "R".repeat(2_000);
+        let files = (0..20)
+            .map(|i| format!("crates/hi-agent/src/{i:03}-very-long-path.rs"))
+            .collect::<Vec<_>>();
         log.record(Decision {
-            summary: "S".repeat(500),
-            rationale: "R".repeat(2_000),
-            files: (0..20)
-                .map(|i| format!("crates/hi-agent/src/{i:03}-very-long-path.rs"))
-                .collect(),
+            summary: summary.clone(),
+            rationale: rationale.clone(),
+            files: files.clone(),
         });
         let entry = &log.entries()[0];
-        assert!(entry.summary.chars().count() <= MAX_SUMMARY_CHARS);
-        assert!(entry.rationale.chars().count() <= MAX_RATIONALE_CHARS);
-        assert_eq!(entry.files.len(), MAX_DECISION_FILES);
-        assert!(
-            entry
-                .files
-                .iter()
-                .all(|f| f.chars().count() <= MAX_DECISION_FILE_CHARS)
-        );
+        assert_eq!(entry.summary, summary);
+        assert_eq!(entry.rationale, rationale);
+        assert_eq!(entry.files, files);
         let section = log.prompt_section().unwrap();
         assert!(
             section.chars().count() < 4_000,

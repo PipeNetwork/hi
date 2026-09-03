@@ -94,16 +94,60 @@ impl App {
         self.status = format!("mode: {}", face.label());
     }
 
+    /// Mirror the permission mode that an interactive synthetic drive will
+    /// use once `Agent::begin_drive_turn` starts polling. The Agent temporarily
+    /// demotes Always to Auto so routine edits remain checkpointed and can be
+    /// auto-approved by the frontend; the App must see that same mode while it
+    /// owns confirmation handling.
+    ///
+    /// This is transient state, not a user choice, so it deliberately does not
+    /// mark the session face dirty. The Agent's starting mode is authoritative
+    /// after the turn (Always restores; Auto/Ask remain), and is returned when
+    /// a temporary drive demotion needs restoring. Shift-Tab still wins by
+    /// marking a real mid-turn choice dirty.
+    pub(crate) fn sync_synthetic_drive_permission(
+        &mut self,
+        kind: hi_agent::DriveKind,
+        agent_mode: PermissionMode,
+    ) -> Option<PermissionMode> {
+        let active_mode = if kind.is_drive() && agent_mode == PermissionMode::Always {
+            PermissionMode::Auto
+        } else {
+            agent_mode
+        };
+        self.permission_mode = active_mode;
+        (active_mode != agent_mode).then_some(agent_mode)
+    }
+
+    pub(crate) fn restore_synthetic_drive_permission(
+        &mut self,
+        restore_mode: Option<PermissionMode>,
+    ) {
+        if !self.session_face_dirty
+            && let Some(restore_mode) = restore_mode
+        {
+            self.permission_mode = restore_mode;
+        }
+    }
+
     /// Push composer flags to the live agent after Shift-Tab (or a mid-turn
     /// cycle that could not borrow the agent until the turn settled).
     pub(crate) fn push_session_face(&mut self, agent: &mut Agent) {
-        if !self.session_face_dirty {
+        if !self.session_face_dirty && !self.plan_drive_pause_dirty {
             return;
         }
-        agent.set_plan_mode(self.plan_mode);
-        agent.set_permission_mode(self.permission_mode);
-        agent.set_plan_drive_paused(self.plan_drive_paused);
+        if self.session_face_dirty {
+            agent.set_plan_mode(self.plan_mode);
+            agent.set_permission_mode(self.permission_mode);
+            agent.set_plan_approval_parked(
+                self.plan_approval.as_ref().is_some_and(|card| card.parked),
+            );
+        }
+        if self.plan_drive_pause_dirty {
+            agent.set_plan_drive_paused(self.plan_drive_paused);
+        }
         self.session_face_dirty = false;
+        self.plan_drive_pause_dirty = false;
         self.refresh_goal(agent);
     }
 
@@ -175,5 +219,102 @@ mod tests {
         app.plan_approval.as_mut().unwrap().parked = true;
         assert!(!app.plan_approval_capturing());
         assert!(cycle_allowed(&app));
+    }
+
+    #[test]
+    fn synthetic_drive_uses_auto_for_safe_edits_then_restores_always() {
+        let mut app = test_app("openai", "gpt-4o");
+        assert_eq!(app.permission_mode, PermissionMode::Always);
+        let previous =
+            app.sync_synthetic_drive_permission(hi_agent::DriveKind::Plan, PermissionMode::Always);
+        let safe = hi_agent::ConfirmationRequest::FileEdit {
+            path: "src/lib.rs".into(),
+            diff: "+fn smoke() {}\n".into(),
+        };
+
+        assert_eq!(app.permission_mode, PermissionMode::Auto);
+        assert!(app.should_auto_approve(&safe));
+        assert!(!app.session_face_dirty);
+
+        app.restore_synthetic_drive_permission(previous);
+        assert_eq!(app.permission_mode, PermissionMode::Always);
+        assert!(!app.session_face_dirty);
+    }
+
+    #[test]
+    fn mid_turn_shift_tab_choice_wins_over_drive_permission_restore() {
+        let mut app = test_app("openai", "gpt-4o");
+        let previous =
+            app.sync_synthetic_drive_permission(hi_agent::DriveKind::Plan, PermissionMode::Always);
+        assert_eq!(app.permission_mode, PermissionMode::Auto);
+
+        // Auto is slash-only, so Shift-Tab enters the visible Plan face.
+        app.cycle_session_face();
+        assert!(app.plan_mode);
+        assert_eq!(app.permission_mode, PermissionMode::Ask);
+        assert!(app.session_face_dirty);
+
+        app.restore_synthetic_drive_permission(previous);
+        assert!(app.plan_mode);
+        assert_eq!(app.permission_mode, PermissionMode::Ask);
+        assert!(app.session_face_dirty);
+
+        // Once the turn releases its Agent borrow, the pending choice must
+        // become the durable agent mode instead of the drive's restored
+        // Always value winning the race.
+        let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+            "http://127.0.0.1:1/v1".into(),
+            "unused".into(),
+        ));
+        let mut agent = Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
+        agent.set_permission_mode(PermissionMode::Always);
+        app.push_session_face(&mut agent);
+        assert!(agent.plan_mode());
+        assert_eq!(agent.permission_mode(), PermissionMode::Ask);
+        assert!(!app.session_face_dirty);
+    }
+
+    #[test]
+    fn ordinary_user_turn_does_not_change_permission_face() {
+        let mut app = test_app("openai", "gpt-4o");
+        assert_eq!(
+            app.sync_synthetic_drive_permission(hi_agent::DriveKind::User, PermissionMode::Always,),
+            None
+        );
+        assert_eq!(app.permission_mode, PermissionMode::Always);
+    }
+
+    #[test]
+    fn stale_app_mode_converges_to_the_agents_post_turn_mode() {
+        let mut app = test_app("openai", "gpt-4o");
+
+        // Auto is not a temporary drive mode when the Agent started there.
+        app.permission_mode = PermissionMode::Always;
+        let restore =
+            app.sync_synthetic_drive_permission(hi_agent::DriveKind::Plan, PermissionMode::Auto);
+        assert_eq!(app.permission_mode, PermissionMode::Auto);
+        assert_eq!(restore, None);
+        app.restore_synthetic_drive_permission(restore);
+        assert_eq!(app.permission_mode, PermissionMode::Auto);
+
+        // User turns do not have a drive demotion, but still synchronize a
+        // stale clean App mirror to the live Agent mode.
+        app.permission_mode = PermissionMode::Always;
+        let restore =
+            app.sync_synthetic_drive_permission(hi_agent::DriveKind::User, PermissionMode::Ask);
+        assert_eq!(app.permission_mode, PermissionMode::Ask);
+        assert_eq!(restore, None);
+        app.restore_synthetic_drive_permission(restore);
+        assert_eq!(app.permission_mode, PermissionMode::Ask);
+
+        // A stale App value must not become the restore target: Always came
+        // from the Agent, so it is what returns after temporary Auto.
+        app.permission_mode = PermissionMode::Ask;
+        let restore =
+            app.sync_synthetic_drive_permission(hi_agent::DriveKind::Goal, PermissionMode::Always);
+        assert_eq!(app.permission_mode, PermissionMode::Auto);
+        assert_eq!(restore, Some(PermissionMode::Always));
+        app.restore_synthetic_drive_permission(restore);
+        assert_eq!(app.permission_mode, PermissionMode::Always);
     }
 }

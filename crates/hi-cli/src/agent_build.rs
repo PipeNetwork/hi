@@ -29,6 +29,8 @@ pub(crate) fn build_agent(
     provider: Arc<dyn Provider>,
     live_metadata: &LiveModelMetadata,
     max_tokens: u32,
+    effective_max_steps: u32,
+    effective_max_tool_calls: u32,
     planner_model: Option<String>,
     skeptic_model: Option<String>,
     rsi_requested: RsiRequested,
@@ -77,15 +79,7 @@ pub(crate) fn build_agent(
             dry_run: cli.dry_run,
             ..hi_agent::AgentGates::default()
         },
-        loop_limits: hi_agent::AgentLoopLimits {
-            max_steps: cli.max_steps.unwrap_or(hi_agent::MAX_MODEL_ROUNDS),
-            max_tool_calls: cli.max_tool_calls.unwrap_or(hi_agent::MAX_TOOL_CALLS),
-            turn_soft_deadline: cli
-                .turn_deadline
-                .filter(|secs| *secs > 0)
-                .map(std::time::Duration::from_secs),
-            ..hi_agent::AgentLoopLimits::default()
-        },
+        loop_limits: resolved_loop_limits(cli, effective_max_steps, effective_max_tool_calls),
         memory: hi_agent::AgentMemory {
             tool_set: quality.tool_set,
             disabled_tools: crate::tool_trim::disabled_tools(&state_root),
@@ -98,10 +92,20 @@ pub(crate) fn build_agent(
                 std::env::var_os("HI_CURATE_SKILLS").is_some(),
                 measured,
             ),
+            learning: session_learning_enabled(cli.no_memory, cli.no_save),
             suggest_next_prompt: settings.suggest_next_prompt && !measured,
-            // hi-eval uses `--report`, not `--eval-input`. Either flag means
-            // there is no human to answer `ask_user`.
-            offer_ask_user: !measured,
+            // Pausing an autonomous coding turn is opt-in. Even when enabled,
+            // the agent-side handler has a bounded wait and resumes with the
+            // best available option on timeout.
+            offer_ask_user: !measured
+                && std::env::var("HI_ENABLE_ASK_USER")
+                    .ok()
+                    .is_some_and(|value| {
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    }),
             offer_memory: !cli.no_memory && !cli.no_save,
             offer_browser: settings.browser_enabled,
             browser_allow_private: settings.browser_allow_private,
@@ -122,12 +126,13 @@ pub(crate) fn build_agent(
         subagents: hi_agent::AgentSubagents {
             explore_subagents: settings.explore_subagents
                 || std::env::var_os("HI_EXPLORE_SUBAGENTS").is_some(),
-            // Profile/settings choose Off/Risk/On; HI_WRITE_SUBAGENTS forces On.
-            write_subagents: if std::env::var_os("HI_WRITE_SUBAGENTS").is_some() {
-                hi_agent::WriteSubagentPolicy::On
-            } else {
-                settings.write_subagents
-            },
+            // Profile/settings choose Off/Risk/On; HI_WRITE_SUBAGENTS forces On
+            // except in a managed worker, whose signed ledger is process-scoped.
+            write_subagents: resolved_write_subagent_policy(
+                rsi_requested,
+                std::env::var_os("HI_WRITE_SUBAGENTS").is_some(),
+                settings.write_subagents,
+            ),
             // `--subagent` marks a delegate child: no explore/delegate offered (depth ≤ 1).
             is_subagent: cli.subagent,
             planner_model: planner_model.clone(),
@@ -167,10 +172,18 @@ pub(crate) fn build_agent(
     };
     let resume_summary = loaded.as_ref().and_then(|l| l.resume_summary.clone());
     let restored_plan = loaded.as_ref().map(|l| l.plan.clone()).unwrap_or_default();
-    let restored_plan_drive = loaded
+    let restored_plan_drive = loaded.as_ref().map(|l| {
+        (
+            l.plan_drive_paused,
+            l.plan_drive_resume_on_user_input,
+            l.plan_drive_stall,
+            l.plan_drive_evidence.clone(),
+        )
+    });
+    let restored_plan_approval = loaded.as_ref().map(|l| l.plan_approval_parked);
+    let restored_goal_drive = loaded
         .as_ref()
-        .map(|l| (l.plan_drive_paused, l.plan_drive_stall));
-    let restored_goal_drive = loaded.as_ref().map(|l| l.goal_drive_stall);
+        .map(|l| (l.goal_drive_stall, l.goal_drive_evidence.clone()));
     let agent_result = match loaded {
         Some(loaded) => Agent::resume(
             provider,
@@ -192,11 +205,14 @@ pub(crate) fn build_agent(
         // Loop children are unattended: Auto so confirms park instead of YOLO.
         agent.set_permission_mode(hi_agent::PermissionMode::Auto);
     }
-    if let Some((paused, stall)) = restored_plan_drive {
-        agent.restore_plan_drive(paused, stall);
+    if let Some((paused, resume_on_user_input, stall, evidence)) = restored_plan_drive {
+        agent.restore_plan_drive_with_policy(paused, resume_on_user_input, stall, evidence);
     }
-    if let Some(stall) = restored_goal_drive {
-        agent.restore_goal_drive(stall);
+    if let Some(parked) = restored_plan_approval {
+        agent.restore_plan_approval_parked(parked);
+    }
+    if let Some((stall, evidence)) = restored_goal_drive {
+        agent.restore_goal_drive(stall, evidence);
     }
 
     Ok(BuiltAgent {
@@ -216,15 +232,67 @@ fn session_measured(eval_input: bool, report: bool) -> bool {
     eval_input || report
 }
 
+fn resolved_loop_limits(
+    cli: &Cli,
+    effective_max_steps: u32,
+    effective_max_tool_calls: u32,
+) -> hi_agent::AgentLoopLimits {
+    hi_agent::AgentLoopLimits {
+        max_steps: effective_max_steps,
+        max_tool_calls: effective_max_tool_calls,
+        turn_soft_deadline: match cli.turn_deadline {
+            Some(0) => None,
+            Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
+            None => hi_agent::AgentLoopLimits::default().turn_soft_deadline,
+        },
+        ..hi_agent::AgentLoopLimits::default()
+    }
+}
+
+/// Managed workers cannot hand work to an external delegate process because it
+/// would not share their signed budget ledger and evidence trace.
+fn resolved_write_subagent_policy(
+    rsi_requested: RsiRequested,
+    env_force: bool,
+    configured: hi_agent::WriteSubagentPolicy,
+) -> hi_agent::WriteSubagentPolicy {
+    if rsi_requested == RsiRequested::Managed {
+        hi_agent::WriteSubagentPolicy::Off
+    } else if env_force {
+        hi_agent::WriteSubagentPolicy::On
+    } else {
+        configured
+    }
+}
+
 /// Skill auto-curation is a follow-up completion after a green mutating turn.
 /// Measured cells skip it so the scored model is not billed for a curator call.
 pub(crate) fn session_curate_skills(settings_on: bool, env_override: bool, measured: bool) -> bool {
     !measured && (settings_on || env_override)
 }
 
+/// Failure findings are durable cross-session learning, so both persistence
+/// opt-outs must disable reading and writing them as well as markdown memory.
+pub(crate) fn session_learning_enabled(no_memory: bool, no_save: bool) -> bool {
+    !no_memory && !no_save
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{session_curate_skills, session_measured};
+    use clap::Parser;
+
+    use super::{
+        resolved_loop_limits, resolved_write_subagent_policy, session_curate_skills,
+        session_learning_enabled, session_measured,
+    };
+
+    #[test]
+    fn persistence_opt_outs_disable_failure_learning() {
+        assert!(session_learning_enabled(false, false));
+        assert!(!session_learning_enabled(true, false));
+        assert!(!session_learning_enabled(false, true));
+        assert!(!session_learning_enabled(true, true));
+    }
 
     #[test]
     fn eval_disables_skill_curation() {
@@ -244,5 +312,51 @@ mod tests {
             true,
             session_measured(false, true)
         ));
+    }
+
+    #[test]
+    fn agent_loop_limits_use_the_prevalidated_effective_step_limit() {
+        let cli = crate::config::Cli::try_parse_from(["hi"]).unwrap();
+        let defaults = resolved_loop_limits(&cli, 12, u32::MAX);
+        assert_eq!(defaults.max_steps, 12);
+        assert_eq!(defaults.max_tool_calls, u32::MAX);
+        assert_eq!(defaults.turn_soft_deadline, None);
+
+        let explicit = crate::config::Cli::try_parse_from([
+            "hi",
+            "--max-steps",
+            "7",
+            "--max-tool-calls",
+            "9",
+            "--turn-deadline",
+            "11",
+        ])
+        .unwrap();
+        let explicit_limits = resolved_loop_limits(&explicit, 7, 9);
+        assert_eq!(explicit_limits.max_steps, 7);
+        assert_eq!(explicit_limits.max_tool_calls, 9);
+        assert_eq!(
+            explicit_limits.turn_soft_deadline,
+            Some(std::time::Duration::from_secs(11))
+        );
+    }
+
+    #[test]
+    fn managed_workers_disable_external_write_subagents_even_when_forced() {
+        use crate::config::RsiRequested;
+        use hi_agent::WriteSubagentPolicy;
+
+        assert_eq!(
+            resolved_write_subagent_policy(RsiRequested::Managed, true, WriteSubagentPolicy::On,),
+            WriteSubagentPolicy::Off
+        );
+        assert_eq!(
+            resolved_write_subagent_policy(RsiRequested::Off, true, WriteSubagentPolicy::Off,),
+            WriteSubagentPolicy::On
+        );
+        assert_eq!(
+            resolved_write_subagent_policy(RsiRequested::Off, false, WriteSubagentPolicy::Risk,),
+            WriteSubagentPolicy::Risk
+        );
     }
 }

@@ -11,6 +11,8 @@ pub enum Command {
     Clear,
     /// Set the model for subsequent turns (empty = report current).
     Model(String),
+    /// Inspect, switch, reload, or watch the optional WASM decision engine.
+    Engine(String),
     /// Show or set request config live: reasoning, temperature, step limit,
     /// RSI, and similar controls. Empty arg reports current values.
     Config(String),
@@ -265,6 +267,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "clear" | "new" => Command::Clear,
         "window" => Command::Compact("window".into()),
         "model" | "m" => Command::Model(arg),
+        "engine" | "logic" => Command::Engine(arg),
         "config" | "cfg" | "set" => Command::Config(arg),
         "durable" | "durability" => Command::Durable(arg),
         "rsi" => Command::Rsi(arg),
@@ -569,21 +572,35 @@ pub fn parse_goal_edit(arg: &str) -> Option<GoalEditArg> {
 }
 
 /// Parse the args after `/loop trio`: an optional `--rounds N` flag followed
-/// by the free-text prompt. Returns `(max_rounds, prompt)`. Default rounds = 3.
-fn parse_trio_args(rest: &str) -> (u8, String) {
+/// by the free-text prompt. `None` means the default unlimited revision loop;
+/// a finite limit exists only when the user explicitly supplies the flag.
+fn parse_trio_args(rest: &str) -> Result<(Option<u64>, String), String> {
     let rest = rest.trim();
-    if let Some(after) = rest.strip_prefix("--rounds") {
-        let after = after.trim();
-        if let Some((n_str, prompt)) = after.split_once(char::is_whitespace)
-            && let Ok(n) = n_str.trim().parse::<u8>()
-            && n > 0
-        {
-            return (n, prompt.trim().to_string());
+    if rest == "--rounds" || rest.starts_with("--rounds ") {
+        let after = rest["--rounds".len()..].trim();
+        let Some((n_str, prompt)) = after.split_once(char::is_whitespace) else {
+            return Err(
+                "usage: /loop trio <prompt>  (optional finite cap: /loop trio --rounds N <prompt>)"
+                    .into(),
+            );
+        };
+        let n = n_str
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("bad trio round limit '{n_str}' — expected a positive integer"))?;
+        if n == 0 {
+            return Err("trio round limit must be at least 1".into());
         }
-        // `--rounds` with no valid number + prompt — fall through to treating
-        // the whole thing as a prompt (the flag is optional).
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(
+                "usage: /loop trio <prompt>  (optional finite cap: /loop trio --rounds N <prompt>)"
+                    .into(),
+            );
+        }
+        return Ok((Some(n), prompt.to_string()));
     }
-    (3, rest.to_string())
+    Ok((None, rest.to_string()))
 }
 
 /// Parse a loop interval like `60s`, `90s`, `30m`, `2h`, `1d` into seconds.
@@ -659,12 +676,16 @@ pub enum LoopArg {
     Cost,
     /// `<interval> <prompt>` — create a loop firing `prompt` every `secs`.
     Create { secs: u64, prompt: String },
-    /// `trio <prompt>` — a bounded plan→execute→review loop (the trio
+    /// `trio <prompt>` — a plan→execute→review loop (the trio
     /// workflow): the planner model produces a lightweight plan, the session
     /// model executes it, and the reviewer model reviews the diff before
-    /// approving or sending it back for revision. Stops when approved or
-    /// `max_rounds` is hit. No persistent goal state — it's a transient loop.
-    Trio { prompt: String, max_rounds: u8 },
+    /// approving or sending it back for revision. It runs until approved by
+    /// default; `max_rounds` is `Some` only for an explicit `--rounds N` cap.
+    /// No persistent goal state — it's a transient loop.
+    Trio {
+        prompt: String,
+        max_rounds: Option<u64>,
+    },
     /// Anything unparseable (bad interval / missing prompt / bad id).
     Invalid(String),
 }
@@ -749,14 +770,18 @@ pub fn parse_loop_arg(arg: &str) -> LoopArg {
             prompt: review_loop_prompt(),
         };
     }
-    // `trio <prompt>` — a bounded plan→execute→review loop.
+    // `trio <prompt>` — an unlimited-by-default plan→execute→review loop.
     if a == "trio" || a.starts_with("trio ") {
         let rest = a[4..].trim();
         // Parse optional `--rounds N` flag, then the prompt.
-        let (max_rounds, prompt) = parse_trio_args(rest);
+        let (max_rounds, prompt) = match parse_trio_args(rest) {
+            Ok(parsed) => parsed,
+            Err(message) => return LoopArg::Invalid(message),
+        };
         if prompt.is_empty() {
             return LoopArg::Invalid(
-                "usage: /loop trio <prompt>  (optional: /loop trio --rounds 3 <prompt>)".into(),
+                "usage: /loop trio <prompt>  (optional finite cap: /loop trio --rounds N <prompt>)"
+                    .into(),
             );
         }
         return LoopArg::Trio { prompt, max_rounds };
@@ -1055,9 +1080,9 @@ pub enum ConfigArg {
     /// it, leaving the provider default).
     Temperature(Option<f32>),
     /// `/config steps <n|off>` — set a fixed cap, or disable it (`None`).
-    /// The default is a finite automatic cap.
+    /// The default is unlimited.
     MaxSteps(Option<u32>),
-    /// `/config steps auto` — restore the finite default cap.
+    /// `/config steps auto` — restore the unlimited default.
     MaxStepsAuto,
     /// `/config moe-streaming <on|off|auto>` — control MLX MoE expert streaming.
     /// `On` forces streaming, `Off` forces resident, `Auto` (the default) lets
@@ -1089,6 +1114,9 @@ pub enum ConfigArg {
     Verify(String),
     Lsp(String),
     Delegate(String),
+    /// `/config engine …` — inspect, select, reload, or watch the optional
+    /// hot-swappable decision engine.
+    Engine(String),
     Theme(String),
     Density(String),
     Mouse(String),
@@ -1192,7 +1220,12 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
                 ConfigArg::MaxStepsAuto
             } else {
                 match val.parse::<u32>() {
-                    Ok(steps) if steps > 0 => ConfigArg::MaxSteps(Some(steps)),
+                    Ok(steps) if steps > 0 && steps < u32::MAX => ConfigArg::MaxSteps(Some(steps)),
+                    Ok(u32::MAX) => ConfigArg::Invalid(format!(
+                        "{} is reserved for unlimited — use off, or at most {}",
+                        u32::MAX,
+                        u32::MAX - 1
+                    )),
                     Ok(_) => {
                         ConfigArg::Invalid("step limit must be at least 1, or use auto/off".into())
                     }
@@ -1253,13 +1286,14 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
         "verify" | "test" => ConfigArg::Verify(val.to_string()),
         "lsp" => ConfigArg::Lsp(val.to_string()),
         "delegate" | "delegates" => ConfigArg::Delegate(val.to_string()),
+        "engine" | "logic" => ConfigArg::Engine(val.to_string()),
         "theme" | "themes" => ConfigArg::Theme(val.to_string()),
         "density" | "dense" => ConfigArg::Density(val.to_string()),
         "mouse" => ConfigArg::Mouse(val.to_string()),
         "ui" => parse_ui_config_arg(val),
         other => ConfigArg::Invalid(format!(
             "unknown /config option '{other}' — try: show, model, provider, auth, \
-reasoning, temp, steps, verify, lsp, delegate, moe-streaming, skeptic-local, suggest, rsi, \
+reasoning, temp, steps, verify, lsp, delegate, engine, moe-streaming, skeptic-local, suggest, rsi, \
 ui theme|density|mouse"
         )),
     }
@@ -1317,6 +1351,7 @@ pub fn resolve_command(command: Command) -> Command {
             ConfigArg::Verify(s) => Command::Verify(s),
             ConfigArg::Lsp(s) => Command::Lsp(s),
             ConfigArg::Delegate(s) => Command::Delegate(s),
+            ConfigArg::Engine(s) => Command::Engine(s),
             ConfigArg::Theme(s) => Command::Theme(s),
             ConfigArg::Density(s) => Command::Density(s),
             ConfigArg::Mouse(s) => Command::Mouse(s),
@@ -1546,6 +1581,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[],
     },
     CommandSpec {
+        name: "engine",
+        args: "[status|native|wasm|reload|watch]",
+        help: "inspect or hot-reload the optional WASM decision engine",
+        arg_values: &[
+            ("status", "show active and pending module generations"),
+            ("reload", "validate a module for the next turn"),
+            ("native", "use the native decision engine"),
+        ],
+    },
+    CommandSpec {
         name: "config",
         args: "[key …]",
         help: "settings hub — model, provider, auth, reasoning, verify, lsp, ui, …",
@@ -1567,7 +1612,7 @@ pub const COMMANDS: &[CommandSpec] = &[
             ("temp", "set sampling temperature: 0.0-2.0, or off"),
             (
                 "steps",
-                "set a turn step limit: positive integer, auto (32), or off (unlimited)",
+                "set a turn step limit: positive integer, or auto/off (unlimited)",
             ),
             ("verify", "show/set/clear the verify command"),
             ("lsp", "toggle LSP or show status"),
@@ -2010,9 +2055,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "loop",
-        args: "[<interval> <prompt>|list|cancel <id>]",
-        help: "recurring agent turns on a cadence (60s..7d; auto-expire after 7 days)",
+        args: "[<interval> <prompt>|trio [--rounds N] <prompt>|list|cancel <id>]",
+        help: "recurring agent turns, plus an unlimited plan→execute→review trio",
         arg_values: &[
+            (
+                "trio",
+                "plan, execute, and review until approved; --rounds N adds a finite cap",
+            ),
             ("list", "show active loops"),
             ("cancel", "stop a loop by id: /loop cancel <id>"),
         ],
@@ -3257,6 +3306,10 @@ mod tests {
         assert_eq!(parse_config_arg("steps auto"), ConfigArg::MaxStepsAuto);
         assert!(matches!(parse_config_arg("steps 0"), ConfigArg::Invalid(_)));
         assert!(matches!(
+            parse_config_arg("steps 4294967295"),
+            ConfigArg::Invalid(_)
+        ));
+        assert!(matches!(
             parse_config_arg("steps many"),
             ConfigArg::Invalid(_)
         ));
@@ -3376,6 +3429,10 @@ mod tests {
             ConfigArg::Delegate("risk".into())
         );
         assert_eq!(
+            parse_config_arg("engine wasm"),
+            ConfigArg::Engine("wasm".into())
+        );
+        assert_eq!(
             parse_config_arg("verify cargo test"),
             ConfigArg::Verify("cargo test".into())
         );
@@ -3398,6 +3455,10 @@ mod tests {
         assert_eq!(
             resolve_command(Command::Config("lsp on".into())),
             Command::Lsp("on".into())
+        );
+        assert_eq!(
+            resolve_command(Command::Config("engine status".into())),
+            Command::Engine("status".into())
         );
         assert_eq!(
             resolve_command(Command::Config("auth login xai".into())),
@@ -3508,7 +3569,7 @@ mod tests {
         match arg {
             LoopArg::Trio { prompt, max_rounds } => {
                 assert_eq!(prompt, "refactor the parser module");
-                assert_eq!(max_rounds, 3); // default
+                assert_eq!(max_rounds, None);
             }
             other => panic!("expected Trio, got {other:?}"),
         }
@@ -3520,10 +3581,22 @@ mod tests {
         match arg {
             LoopArg::Trio { prompt, max_rounds } => {
                 assert_eq!(prompt, "fix the failing tests");
-                assert_eq!(max_rounds, 5);
+                assert_eq!(max_rounds, Some(5));
             }
             other => panic!("expected Trio, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn loop_trio_explicit_round_cap_is_not_artificially_small() {
+        let arg = parse_loop_arg("trio --rounds 100000 run the long campaign");
+        assert!(matches!(
+            arg,
+            LoopArg::Trio {
+                max_rounds: Some(100_000),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3534,19 +3607,19 @@ mod tests {
 
     #[test]
     fn loop_trio_rounds_only_no_prompt_is_invalid() {
-        // `--rounds 3` with no prompt after → the prompt is empty, so the
-        // caller (parse_loop_arg) rejects it as Invalid before we get here.
-        // But parse_trio_args itself returns ("--rounds 3", 3) — the caller
-        // checks for empty prompt. Verify the caller path:
         let arg = parse_loop_arg("trio --rounds 3");
-        // parse_trio_args returns prompt = "--rounds 3" (non-empty), so this
-        // is a Trio with a degenerate prompt. The caller only rejects empty.
-        // This is acceptable — the executor gets "--rounds 3" as the task and
-        // quickly fails review.
-        match arg {
-            LoopArg::Trio { max_rounds, .. } => assert_eq!(max_rounds, 3),
-            LoopArg::Invalid(_) => {}
-            other => panic!("expected Trio or Invalid, got {other:?}"),
-        }
+        assert!(matches!(arg, LoopArg::Invalid(_)));
+    }
+
+    #[test]
+    fn loop_trio_rejects_invalid_explicit_round_caps() {
+        assert!(matches!(
+            parse_loop_arg("trio --rounds 0 do work"),
+            LoopArg::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_loop_arg("trio --rounds many do work"),
+            LoopArg::Invalid(_)
+        ));
     }
 }

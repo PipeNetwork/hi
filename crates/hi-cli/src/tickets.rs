@@ -20,7 +20,6 @@ use tokio::process::Child;
 
 const HEARTBEAT_SECS: u64 = 30;
 const IDLE_POLL_SECS: u64 = 5;
-const DEFAULT_MAX_VERIFY_REPAIRS: u32 = 2;
 
 pub async fn run_cli(args: &[String]) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -253,8 +252,6 @@ fn child_argv(ticket: &TicketView, session: &Path, report: &Path) -> Vec<String>
     {
         argv.push("--verify".into());
         argv.push(verify.to_string());
-        argv.push("--max-verify-repairs".into());
-        argv.push(DEFAULT_MAX_VERIFY_REPAIRS.to_string());
     }
     argv
 }
@@ -274,17 +271,39 @@ fn status_from_hi_report(report: &Value) -> String {
         .pointer("/outcome/status")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let stop_reason = report
+        .pointer("/outcome/stop_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let leftover = report
         .pointer("/goal/drive")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if verification == "passed" && matches!(status, "completed" | "") && leftover != "active" {
-        return "succeeded".into();
-    }
+    let stopped_at_work_limit = matches!(stop_reason, "step_limit" | "tool_limit");
     if status == "cancelled" {
         return "canceled".into();
     }
-    if leftover == "active" || status == "incomplete" {
+    // Failure evidence outranks a coincident/legacy limit reason. Older
+    // reports can contain `failed + step_limit`; a failed check must not be
+    // presented as resumable repair work.
+    if matches!(verification, "failed" | "infrastructure_error") {
+        return "failed".into();
+    }
+    // A finite model- or tool-call ceiling means the child stopped with work
+    // still pending even when verification happened to pass for the partial
+    // workspace. Do not close the ticket as successful merely because the
+    // generic outcome classifier reports `completed` after clean settlement.
+    if stopped_at_work_limit && matches!(verification, "passed" | "not_applicable") {
+        return "repairing".into();
+    }
+    if verification == "passed" && matches!(status, "completed" | "") && leftover != "active" {
+        return "succeeded".into();
+    }
+    if leftover == "active"
+        // Schema-v2 reports written before the outcome migration remain valid
+        // input, but new reports never emit this value.
+        || status == "incomplete"
+    {
         return "repairing".into();
     }
     "failed".into()
@@ -583,8 +602,8 @@ mod tests {
                 .any(|pair| pair == ["--verify", "cargo test"])
         );
         assert!(
-            argv.windows(2)
-                .any(|pair| pair == ["--max-verify-repairs", "2"])
+            !argv.iter().any(|arg| arg == "--max-verify-repairs"),
+            "ticket children inherit the ordinary unlimited repair default"
         );
         assert!(argv.contains(&"--session-file".into()));
         assert!(argv.contains(&"--report".into()));
@@ -620,8 +639,64 @@ mod tests {
     #[test]
     fn leftover_goal_drive_maps_to_repairing() {
         let report = json!({
-            "outcome": { "status": "incomplete", "verification": "passed" },
+            "outcome": { "status": "completed", "verification": "passed", "stop_reason": "step_limit" },
             "goal": { "drive": "active" }
+        });
+        assert_eq!(status_from_hi_report(&report), "repairing");
+    }
+
+    #[test]
+    fn canonicalized_legacy_limit_failure_maps_to_repairing() {
+        let report = json!({
+            "outcome": { "status": "failed", "verification": "passed", "stop_reason": "step_limit" }
+        });
+        assert_eq!(status_from_hi_report(&report), "repairing");
+    }
+
+    #[test]
+    fn completed_step_limit_does_not_close_unfinished_ticket() {
+        let report = json!({
+            "outcome": { "status": "completed", "verification": "passed", "stop_reason": "step_limit" }
+        });
+        assert_eq!(status_from_hi_report(&report), "repairing");
+    }
+
+    #[test]
+    fn completed_tool_limit_does_not_close_unfinished_ticket() {
+        let report = json!({
+            "outcome": { "status": "completed", "verification": "passed", "stop_reason": "tool_limit" }
+        });
+        assert_eq!(status_from_hi_report(&report), "repairing");
+    }
+
+    #[test]
+    fn tool_limit_failure_with_clean_partial_workspace_is_repairing() {
+        let report = json!({
+            "outcome": { "status": "failed", "verification": "not_applicable", "stop_reason": "tool_limit" }
+        });
+        assert_eq!(status_from_hi_report(&report), "repairing");
+    }
+
+    #[test]
+    fn failed_verification_outranks_a_legacy_limit_reason() {
+        let report = json!({
+            "outcome": { "status": "failed", "verification": "failed", "stop_reason": "step_limit" }
+        });
+        assert_eq!(status_from_hi_report(&report), "failed");
+    }
+
+    #[test]
+    fn failed_verification_outranks_tool_limit() {
+        let report = json!({
+            "outcome": { "status": "failed", "verification": "failed", "stop_reason": "tool_limit" }
+        });
+        assert_eq!(status_from_hi_report(&report), "failed");
+    }
+
+    #[test]
+    fn legacy_incomplete_report_still_maps_to_repairing() {
+        let report = json!({
+            "outcome": { "status": "incomplete", "verification": "passed", "stop_reason": "stalled" }
         });
         assert_eq!(status_from_hi_report(&report), "repairing");
     }

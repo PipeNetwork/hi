@@ -1,7 +1,7 @@
-//! Goal decomposition: one bounded planner-model call that turns a `/goal`
+//! Goal decomposition: one auxiliary planner-model call that turns a `/goal`
 //! objective into an ordered list of sub-tasks for the long-horizon engine to
 //! drive. A strong planner (e.g. glm-5.2) plans once; the session model executes
-//! each sub-goal turn-by-turn. Modeled on the other bounded side-calls
+//! each sub-goal turn-by-turn. Modeled on the other auxiliary side-calls
 //! ([`Agent::update_memory_at`], MoA's `reference_guidance`): a throwaway
 //! chat-only request through `self.provider`, usage booked, no history recorded.
 
@@ -12,25 +12,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
 
-/// Safety bound on the planner's *initial* decomposition (a per-call runaway guard,
-/// not a target). Sized so a large multi-section plan document can decompose to
-/// several turn-sized milestones per implementable component without silent
-/// truncation — a whole-crate-per-milestone plan (48 crates → 48 milestones)
-/// each too big for one drive turn is how a big plan grinds and never finishes.
-/// The goal still grows freely past this during execution — the executor appends
-/// milestones via `update_plan`, the completion audit appends missing work, and a
-/// too-large milestone decomposes on the fly ([`super::goal_turn`]); a user can
-/// cap growth with `/goal limit <n>`.
-const MAX_SUB_GOALS: usize = 120;
 const MAX_REFERENCED_DOCUMENTS: usize = 8;
 /// Combined budget for inlined requirement documents. Sized so a large plan
 /// document fits whole — silently truncating the requirements is how a
 /// planner (and the completion auditor, which reuses this) goes blind to a
 /// plan's tail sections. ~256KB ≈ 65k tokens: a big but bounded one-shot call.
 const MAX_DOCUMENT_CONTEXT_BYTES: usize = 256 * 1024;
-/// Side-call copy of the user's objective. The stored goal and transcript
-/// message stay intact; this only bounds what the planner request carries.
-const MAX_PLANNER_OBJECTIVE_CHARS: usize = 32 * 1024;
 
 const PLANNER_PROMPT: &str = "You are a planning assistant for a coding agent. Decompose the \
 user's coding objective into ordered, independently-verifiable implementation milestones — as \
@@ -66,7 +53,7 @@ busywork. Output one imperative milestone per line — no numbering, no bullet c
 no preamble, no blank lines.";
 
 impl crate::Agent {
-    /// Decompose `objective` into ordered sub-task descriptions via one bounded
+    /// Decompose `objective` into ordered sub-task descriptions via one auxiliary
     /// call to the configured `planner_model`. Returns the parsed list; errors if
     /// no planner is configured, the call fails, or nothing usable comes back — the
     /// caller then falls back to a single sub-goal equal to the objective. Books the
@@ -166,9 +153,21 @@ concrete components, files, or requirements that appear in the documents."
                 text.push_str(&t);
             }
         };
-        let completion = match self.provider.stream(request, &mut sink).await {
-            Ok(completion) => completion,
-            Err(err) => {
+        let timeout = self.side_call_timeout();
+        let completion = match crate::agent::turn::await_side_call(
+            timeout,
+            self.provider.stream(request, &mut sink),
+        )
+        .await
+        {
+            Err(timeout) => {
+                return Err(anyhow::anyhow!(
+                    "planner timed out after {:.1}s",
+                    timeout.as_secs_f64()
+                ));
+            }
+            Ok(Ok(completion)) => completion,
+            Ok(Err(err)) => {
                 self.add_side_error_usage(&err);
                 return Err(err);
             }
@@ -183,7 +182,7 @@ concrete components, files, or requirements that appear in the documents."
     }
 
     /// Break one over-large milestone into turn-sized, ordered sub-steps via a
-    /// bounded planner call. Returns 2+ sub-steps, or an error when no planner is
+    /// single planner call. Returns 2+ sub-steps, or an error when no planner is
     /// configured, the call fails, or fewer than two usable lines come back (the
     /// caller then keeps grinding the milestone rather than splitting degenerately).
     pub(crate) async fn decompose_milestone(&mut self, description: &str) -> Result<Vec<String>> {
@@ -227,7 +226,9 @@ pub(crate) struct PlannerInput {
 /// filename. Paths are workspace-contained and the combined payload is bounded.
 pub(crate) fn planner_input(root: &Path, objective: &str) -> PlannerInput {
     let contract = crate::TaskContract::derive(objective, crate::VerificationMode::Disabled);
-    let objective = crate::goal::clip_chars(objective, MAX_PLANNER_OBJECTIVE_CHARS);
+    // The objective is canonical input, not a summary. Keep it whole and let
+    // normal request context fitting own model-window constraints.
+    let objective = objective.trim().to_string();
     let mut documents = Vec::new();
     let mut remaining = MAX_DOCUMENT_CONTEXT_BYTES;
 
@@ -303,20 +304,20 @@ fn content_text(content: &[Content]) -> String {
 }
 
 /// Parse the planner's line-per-task output into clean sub-goal descriptions:
-/// trim, strip any leading list marker, drop empties, cap at [`MAX_SUB_GOALS`].
-/// `pub(crate)` — the completion auditor parses the same one-milestone-per-line
-/// output contract.
+/// trim, strip any leading list marker, and drop empties. The provider's output
+/// token/byte budget already bounds this response; do not silently discard valid
+/// planned work based on an arbitrary task count. `pub(crate)` — the completion
+/// auditor parses the same one-milestone-per-line output contract.
 pub(crate) fn parse_sub_goals(text: &str) -> Vec<String> {
     text.lines()
         .map(strip_list_marker)
         .filter(|s| !s.is_empty())
-        .take(MAX_SUB_GOALS)
         .collect()
 }
 
 /// Verbs that make a leading-read milestone acceptable after all — "review
 /// plan.md and implement the parser" is real work, "review plan.md" is not.
-const IMPLEMENTATION_VERBS: [&str; 13] = [
+const IMPLEMENTATION_VERBS: [&str; 24] = [
     "implement",
     "build",
     "write",
@@ -330,7 +331,117 @@ const IMPLEMENTATION_VERBS: [&str; 13] = [
     "update",
     "extend",
     "integrate",
+    "persist",
+    "modify",
+    "remove",
+    "delete",
+    "rename",
+    "replace",
+    "patch",
+    "edit",
+    "change",
+    "finish",
+    "complete",
 ];
+
+fn is_implementation_action_word(word: &str) -> bool {
+    IMPLEMENTATION_VERBS.contains(&word)
+        || matches!(
+            word,
+            "implementing"
+                | "building"
+                | "writing"
+                | "adding"
+                | "creating"
+                | "fixing"
+                | "wiring"
+                | "porting"
+                | "refactoring"
+                | "migrating"
+                | "updating"
+                | "extending"
+                | "integrating"
+                | "persisting"
+                | "modifying"
+                | "removing"
+                | "deleting"
+                | "renaming"
+                | "replacing"
+                | "patching"
+                | "editing"
+                | "changing"
+                | "finishing"
+                | "completing"
+        )
+}
+
+/// A leading review/validation verb often has implementation-shaped nouns as
+/// its subject ("audit build logs", "inspect patch behavior"). Only treat a
+/// later mutation word as an action when grammar separates it into another
+/// clause: a connector ("and fix", "before implementing") or punctuation.
+fn has_later_implementation_clause(lower: &str) -> bool {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (index, character) in lower
+        .char_indices()
+        .chain(std::iter::once((lower.len(), ' ')))
+    {
+        let is_word = character.is_ascii_alphanumeric() || character == '-' || character == '_';
+        match (start, is_word) {
+            (None, true) => start = Some(index),
+            (Some(word_start), false) => {
+                words.push((word_start, index, &lower[word_start..index]));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+
+    const CONNECTORS: &[&str] = &[
+        "and", "then", "also", "to", "before", "after", "while", "by", "please", "now", "keep",
+        "continue", "complete", "finish", "lets",
+    ];
+    words.iter().enumerate().skip(1).any(|(index, entry)| {
+        let (start, _, word) = *entry;
+        if !is_implementation_action_word(word) {
+            return false;
+        }
+        let (_, previous_end, previous) = words[index - 1];
+        let connector = CONNECTORS.contains(&previous)
+            || (previous == "s" && index >= 2 && words[index - 2].2 == "let");
+        let clause_break = lower[previous_end..start]
+            .chars()
+            .any(|character| matches!(character, ',' | ';'));
+        connector || clause_break
+    })
+}
+
+fn first_milestone_word(lower: &str) -> &str {
+    lower
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || character == '-' || character == '_')
+        })
+        .find(|word| !word.is_empty())
+        .unwrap_or("")
+}
+
+/// Whether a milestone is validation-only rather than implementation. These
+/// steps are meta-work for decomposition, but a `Done` claim still depends on
+/// test/tool effects and must be reopened when those effects are rolled back.
+pub(crate) fn is_validation_milestone(step: &str) -> bool {
+    const VALIDATION_VERBS: [&str; 10] = [
+        "validate", "verify", "confirm", "run", "rerun", "re-run", "execute", "check", "test",
+        "perform",
+    ];
+    let lower = step.to_ascii_lowercase();
+    let first = first_milestone_word(&lower);
+    let validation_shape = VALIDATION_VERBS.contains(&first)
+        // Noun-phrase forms: "Final workspace validation", "Full validation
+        // of the workspace", "End-to-end verification".
+        || ((first == "final" || first == "full" || first == "end-to-end" || first == "overall")
+            && (lower.contains("validation") || lower.contains("verification")));
+    validation_shape && !has_later_implementation_clause(&lower)
+}
 
 /// Whether a milestone is meta-work rather than implementation: a pure
 /// read/review step, or a validation-only step ("Final workspace validation",
@@ -342,9 +453,13 @@ const IMPLEMENTATION_VERBS: [&str; 13] = [
 /// finishes. Conservative: any implementation verb in the line keeps it
 /// ("run the test suite and fix any failures" is real work).
 pub(crate) fn is_meta_milestone(step: &str) -> bool {
-    const READ_VERBS: [&str; 8] = [
+    const READ_VERBS: [&str; 12] = [
         "read",
         "review",
+        "inspect",
+        "investigate",
+        "audit",
+        "trace",
         "examine",
         "study",
         "analyze",
@@ -352,21 +467,17 @@ pub(crate) fn is_meta_milestone(step: &str) -> bool {
         "familiarize",
         "understand",
     ];
-    const VALIDATION_VERBS: [&str; 10] = [
-        "validate", "verify", "confirm", "run", "rerun", "re-run", "execute", "check", "test",
-        "perform",
-    ];
     let lower = step.to_ascii_lowercase();
-    if IMPLEMENTATION_VERBS.iter().any(|v| lower.contains(v)) {
-        return false;
-    }
-    let first = lower.split_whitespace().next().unwrap_or("");
-    READ_VERBS.contains(&first)
-        || VALIDATION_VERBS.contains(&first)
-        // Noun-phrase forms: "Final workspace validation", "Full validation
-        // of the workspace", "End-to-end verification".
-        || ((first == "final" || first == "full" || first == "end-to-end" || first == "overall")
-            && (lower.contains("validation") || lower.contains("verification")))
+    let first = first_milestone_word(&lower);
+    (READ_VERBS.contains(&first) && !has_later_implementation_clause(&lower))
+        || is_validation_milestone(step)
+}
+
+/// Whether completing a checklist step depends on effects that disappear when
+/// a cancelled turn's workspace checkpoint is restored. Pure inspection can
+/// survive that rewind; implementation and validation claims cannot.
+pub(crate) fn plan_step_requires_execution_evidence(step: &str) -> bool {
+    !is_meta_milestone(step) || is_validation_milestone(step)
 }
 
 /// Drop meta milestones (read-only and validation-only; see
@@ -556,15 +667,16 @@ mod tests {
     }
 
     #[test]
-    fn drops_blank_lines_and_bounds_to_cap() {
-        // More non-empty lines than the safety bound, with blanks interspersed.
+    fn drops_blank_lines_without_truncating_large_plans() {
+        // Cross the historical 120-milestone ceiling, with blanks interspersed.
         let mut raw = String::from("first\n\n  \n");
-        for i in 0..MAX_SUB_GOALS + 5 {
+        for i in 0..125 {
             raw.push_str(&format!("step {i}\n"));
         }
         let out = parse_sub_goals(&raw);
-        assert_eq!(out.len(), MAX_SUB_GOALS, "capped at the safety bound");
+        assert_eq!(out.len(), 126, "valid planned work must not disappear");
         assert_eq!(out.first().map(String::as_str), Some("first"));
+        assert_eq!(out.last().map(String::as_str), Some("step 124"));
     }
 
     #[test]
@@ -581,20 +693,19 @@ mod tests {
     }
 
     #[test]
-    fn planner_clips_a_huge_objective() {
+    fn planner_preserves_objective_tail_past_the_old_boundary() {
         let root = temp_root("huge-objective");
-        let objective = "O".repeat(MAX_PLANNER_OBJECTIVE_CHARS + 200);
-        let input = planner_input(&root, &objective);
-        assert!(
-            input.text.chars().count() <= MAX_PLANNER_OBJECTIVE_CHARS,
-            "planner objective copy must be clipped: {}",
-            input.text.chars().count()
+        const OLD_OBJECTIVE_LIMIT: usize = 32 * 1024;
+        let objective = format!(
+            "{}FINAL PLANNER REQUIREMENT MUST SURVIVE",
+            "O".repeat(OLD_OBJECTIVE_LIMIT + 200)
         );
-        assert!(input.text.starts_with('O'), "{}", &input.text[..8]);
+        let input = planner_input(&root, &objective);
+        assert_eq!(input.text, objective);
         assert!(
-            input.text.ends_with('…'),
-            "truncation marker: {}",
-            &input.text[input.text.len().saturating_sub(8)..]
+            input
+                .text
+                .ends_with("FINAL PLANNER REQUIREMENT MUST SURVIVE")
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -632,6 +743,7 @@ mod tests {
     fn read_review_milestones_are_filtered() {
         let steps = vec![
             "Read the supplied workspace documents to identify requirements".to_string(),
+            "Investigate the lifecycle evidence and record the conclusion".to_string(),
             "Review plan.md and implement the parser".to_string(),
             "Implement the tensor-inventory crate".to_string(),
         ];
@@ -644,6 +756,39 @@ mod tests {
         // Never empties the list.
         let all_read = vec!["Read the documents".to_string()];
         assert_eq!(drop_meta_milestones(all_read.clone()), all_read);
+
+        for title in [
+            "Inspect the current request lifecycle",
+            "Investigate the lifecycle evidence",
+            "Audit cancellation behavior",
+            "Audit build logs",
+            "Audit: build logs",
+            "Review recent build output",
+            "Inspect patch behavior",
+            "Review the update strategy",
+            "Trace the provider request path",
+            "Understand fixture behavior",
+            "Review the updated fixture behavior",
+        ] {
+            assert!(
+                is_meta_milestone(title),
+                "{title:?} must stay investigative"
+            );
+        }
+        assert!(
+            !is_meta_milestone("Investigate the lifecycle and fix cancellation cleanup"),
+            "a later implementation clause must keep the step mutation-aware"
+        );
+        for title in [
+            "Review current code before implementing the parser",
+            "Audit logs, then wire cancellation cleanup",
+            "Inspect the service and persist the repaired state",
+        ] {
+            assert!(
+                !is_meta_milestone(title),
+                "{title:?} contains a later implementation action"
+            );
+        }
     }
 
     #[test]
@@ -651,17 +796,34 @@ mod tests {
         // The qtest failure: an executor-appended "Final workspace validation"
         // milestone is unwinnable (honest no-edit validation turns classify as
         // stalls) and killed a 20/21-done goal.
-        assert!(is_meta_milestone("Final workspace validation"));
-        assert!(is_meta_milestone("Validate the full workspace"));
-        assert!(is_meta_milestone(
-            "Run the full test suite and confirm everything passes"
-        ));
-        assert!(is_meta_milestone(
-            "Verify the application runs its primary workflow without errors"
-        ));
-        assert!(is_meta_milestone("Full validation of all components"));
+        for title in [
+            "Validate the full workspace",
+            "Verify the application runs its primary workflow without errors",
+            "Confirm the release artifacts are complete",
+            "Run the full test suite and confirm everything passes",
+            "Rerun the integration suite",
+            "Re-run the cancellation regression",
+            "Execute all smoke scenarios",
+            "Check the persisted session",
+            "Test the primary workflow",
+            "Perform release verification",
+            "Final workspace validation",
+            "Full validation of all components",
+            "End-to-end verification",
+            "Overall workspace validation",
+        ] {
+            assert!(is_validation_milestone(title), "{title:?} is validation");
+            assert!(is_meta_milestone(title), "{title:?} is meta-work");
+            assert!(
+                plan_step_requires_execution_evidence(title),
+                "{title:?} must be reopened when its effects are rolled back"
+            );
+        }
         // Real work survives — an implementation verb keeps the line.
         assert!(!is_meta_milestone(
+            "Run the full test suite and fix any failing tests"
+        ));
+        assert!(!is_validation_milestone(
             "Run the full test suite and fix any failing tests"
         ));
         assert!(!is_meta_milestone("Write and run integration tests"));

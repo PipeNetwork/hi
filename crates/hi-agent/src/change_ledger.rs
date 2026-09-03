@@ -9,17 +9,21 @@ use sha2::{Digest, Sha256};
 
 use hi_tools::{FileChange, FileChangeKind, ToolEffects};
 
-const MAX_REVISION_EVENTS: usize = 512;
 // Automatic reconciliation is for source/configuration state, not model
 // weights, database images, or other multi-gigabyte artifacts. Tool-mediated
 // edits remain exact through `explicit_paths`, regardless of their size.
 pub(crate) const MAX_AUTOMATIC_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_REVISION_EVENTS: usize = 512;
 
 #[derive(Clone, Debug)]
 struct FileState {
     digest: String,
     len: u64,
     mode: u32,
+    /// Used only to skip re-hashing unchanged files during reconcile. Not part
+    /// of content equality — a touch that preserves bytes must not look like a
+    /// mutation once the digest is reused.
+    mtime_ns: u64,
 }
 
 impl PartialEq for FileState {
@@ -29,6 +33,34 @@ impl PartialEq for FileState {
 }
 
 impl Eq for FileState {}
+
+#[derive(Default)]
+struct LedgerWindow {
+    baseline: u64,
+    changes: BTreeMap<String, FileChange>,
+    touched_paths: BTreeSet<String>,
+    had_mutation: bool,
+}
+
+impl LedgerWindow {
+    fn at(baseline: u64) -> Self {
+        Self {
+            baseline,
+            ..Self::default()
+        }
+    }
+
+    fn record(&mut self, revision: u64, changes: &[FileChange]) {
+        if revision <= self.baseline {
+            return;
+        }
+        self.had_mutation = true;
+        for change in changes {
+            self.touched_paths.insert(change.path.clone());
+            merge_change(&mut self.changes, change.clone());
+        }
+    }
+}
 
 /// A monotonically versioned account of all relevant workspace mutations.
 pub struct ChangeLedger {
@@ -40,6 +72,17 @@ pub struct ChangeLedger {
     revision: u64,
     observed: BTreeMap<String, FileState>,
     events: VecDeque<(u64, Vec<FileChange>)>,
+    compacted_through: u64,
+    dropped_events: u64,
+    /// Exact lifetime net change and monotonic touched-path evidence. Their
+    /// size follows distinct workspace paths, not repeated tool rounds.
+    origin_changes: BTreeMap<String, FileChange>,
+    lifetime_touched_paths: BTreeSet<String>,
+    lifetime_had_mutation: bool,
+    /// Exact aggregates for the only baselines that may legitimately remain
+    /// live longer than the raw event window.
+    active_turn_window: Option<LedgerWindow>,
+    verification_window: Option<LedgerWindow>,
     /// Background initial workspace scan, launched at construction so it runs
     /// concurrently with agent/system-prompt setup. `reconcile` and any other
     /// method that reads `observed` call [`Self::ensure_scan_complete`] first,
@@ -78,7 +121,7 @@ impl BackgroundScan {
         let join = std::thread::Builder::new()
             .name("hi-ledger-scan".into())
             .spawn(move || {
-                let scanned = scan_workspace(&scan_root, &scan_excluded, &scan_explicit);
+                let scanned = scan_workspace(&scan_root, &scan_excluded, &scan_explicit, None);
                 // Swallow a poisoned mutex rather than panicking the scan
                 // thread: if the lock is poisoned the result is already lost,
                 // and a panic here would be silently dropped by JoinHandle
@@ -110,7 +153,7 @@ impl ChangeLedger {
             .into_iter()
             .collect::<Vec<_>>();
         let explicit_paths = BTreeSet::new();
-        let observed = scan_workspace(&root, &excluded_roots, &explicit_paths)?;
+        let observed = scan_workspace(&root, &excluded_roots, &explicit_paths, None)?;
         Ok(Self {
             root,
             excluded_roots,
@@ -118,6 +161,13 @@ impl ChangeLedger {
             revision: 0,
             observed,
             events: VecDeque::new(),
+            compacted_through: 0,
+            dropped_events: 0,
+            origin_changes: BTreeMap::new(),
+            lifetime_touched_paths: BTreeSet::new(),
+            lifetime_had_mutation: false,
+            active_turn_window: None,
+            verification_window: None,
             pending_scan: None,
         })
     }
@@ -151,6 +201,13 @@ impl ChangeLedger {
             revision: 0,
             observed: BTreeMap::new(),
             events: VecDeque::new(),
+            compacted_through: 0,
+            dropped_events: 0,
+            origin_changes: BTreeMap::new(),
+            lifetime_touched_paths: BTreeSet::new(),
+            lifetime_had_mutation: false,
+            active_turn_window: None,
+            verification_window: None,
             pending_scan: Some(scan),
         })
     }
@@ -181,6 +238,13 @@ impl ChangeLedger {
             revision: 0,
             observed: BTreeMap::new(),
             events: VecDeque::new(),
+            compacted_through: 0,
+            dropped_events: 0,
+            origin_changes: BTreeMap::new(),
+            lifetime_touched_paths: BTreeSet::new(),
+            lifetime_had_mutation: false,
+            active_turn_window: None,
+            verification_window: None,
             pending_scan: Some(scan),
         })
     }
@@ -249,6 +313,37 @@ impl ChangeLedger {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Establish the long-lived baseline for a new productive turn. Repeated
+    /// mutations after this point are compacted into an exact per-path
+    /// aggregate, so the raw diagnostic event deque can remain bounded.
+    pub(crate) fn begin_turn_retention_window(&mut self) -> u64 {
+        let baseline = self.revision;
+        self.active_turn_window = Some(LedgerWindow::at(baseline));
+        self.verification_window = None;
+        baseline
+    }
+
+    /// Preserve exact deltas from the workspace revision a verification pass
+    /// attested. This window is replaced when a later pass supersedes it.
+    pub(crate) fn retain_verification_baseline(&mut self, baseline: u64) {
+        let mut window = LedgerWindow::at(baseline);
+        for (revision, changes) in self
+            .events
+            .iter()
+            .filter(|(revision, _)| *revision > baseline)
+        {
+            window.record(*revision, changes);
+        }
+        self.verification_window = Some(window);
+    }
+
+    /// Number of raw revision events compacted out of the diagnostic deque.
+    /// Aggregate correctness state remains exact for origin, active-turn, and
+    /// current verification baselines.
+    pub fn dropped_event_count(&self) -> u64 {
+        self.dropped_events
     }
 
     /// The last-reconciled workspace listing as `(relative path, byte length)`,
@@ -337,7 +432,7 @@ impl ChangeLedger {
             let mut current = self.observed.clone();
             for relative in paths.iter().map(|path| normalize(path)) {
                 let absolute = self.root.join(&relative);
-                match read_state(&absolute)? {
+                match read_state(&absolute, self.observed.get(&relative))? {
                     Some(state) => {
                         current.insert(relative, state);
                     }
@@ -348,7 +443,12 @@ impl ChangeLedger {
             }
             current
         } else {
-            scan_workspace(&self.root, &self.excluded_roots, &self.explicit_paths)?
+            scan_workspace(
+                &self.root,
+                &self.excluded_roots,
+                &self.explicit_paths,
+                Some(&self.observed),
+            )?
         };
         let changes = diff_states(&self.observed, &current);
         self.observed = current;
@@ -359,7 +459,20 @@ impl ChangeLedger {
     }
 
     pub fn changes_since(&self, revision: u64) -> Vec<FileChange> {
+        if revision == 0 {
+            return self.origin_changes.values().cloned().collect();
+        }
+        if let Some(window) = self.window_for(revision) {
+            return window.changes.values().cloned().collect();
+        }
         let mut merged: BTreeMap<String, FileChange> = BTreeMap::new();
+        // An unregistered caller asking beyond the retained raw window gets a
+        // conservative origin delta rather than silently missing mutations.
+        // Live turn/verification callers register their baselines above and
+        // therefore remain exact regardless of turn length.
+        if revision < self.compacted_through {
+            return self.origin_changes.values().cloned().collect();
+        }
         for (_, changes) in self.events.iter().filter(|(event, _)| *event > revision) {
             for change in changes {
                 merge_change(&mut merged, change.clone());
@@ -379,6 +492,15 @@ impl ChangeLedger {
     /// or create-then-delete pair. Verification uses this monotonic view;
     /// reports and diffs continue to use [`Self::changes_since`].
     pub fn touched_paths_since(&self, revision: u64) -> Vec<String> {
+        if revision == 0 {
+            return self.lifetime_touched_paths.iter().cloned().collect();
+        }
+        if let Some(window) = self.window_for(revision) {
+            return window.touched_paths.iter().cloned().collect();
+        }
+        if revision < self.compacted_through {
+            return self.lifetime_touched_paths.iter().cloned().collect();
+        }
         self.events
             .iter()
             .filter(|(event, _)| *event > revision)
@@ -391,7 +513,27 @@ impl ChangeLedger {
     /// Whether any applied or externally observed mutation occurred after the
     /// supplied revision, including an applied mutation with no net file diff.
     pub fn had_mutation_since(&self, revision: u64) -> bool {
+        if revision == 0 {
+            return self.lifetime_had_mutation;
+        }
+        if let Some(window) = self.window_for(revision) {
+            return window.had_mutation;
+        }
+        if revision < self.compacted_through {
+            return self.lifetime_had_mutation;
+        }
         self.events.iter().any(|(event, _)| *event > revision)
+    }
+
+    fn window_for(&self, revision: u64) -> Option<&LedgerWindow> {
+        self.verification_window
+            .as_ref()
+            .filter(|window| window.baseline == revision)
+            .or_else(|| {
+                self.active_turn_window
+                    .as_ref()
+                    .filter(|window| window.baseline == revision)
+            })
     }
 
     fn refresh_paths<'a>(&mut self, paths: impl Iterator<Item = &'a str>) -> Result<()> {
@@ -399,7 +541,7 @@ impl ChangeLedger {
             let path = self.root.join(relative);
             // Tool-mediated paths always re-hash: the typed mutation is the
             // correctness boundary and must not reuse a stale fingerprint.
-            match read_state(&path)? {
+            match read_state(&path, None)? {
                 Some(state) => {
                     self.observed.insert(normalize(relative), state);
                 }
@@ -413,9 +555,23 @@ impl ChangeLedger {
 
     fn push_event(&mut self, changes: Vec<FileChange>) {
         self.revision = self.revision.saturating_add(1);
+        self.lifetime_had_mutation = true;
+        for change in &changes {
+            self.lifetime_touched_paths.insert(change.path.clone());
+            merge_change(&mut self.origin_changes, change.clone());
+        }
+        if let Some(window) = self.active_turn_window.as_mut() {
+            window.record(self.revision, &changes);
+        }
+        if let Some(window) = self.verification_window.as_mut() {
+            window.record(self.revision, &changes);
+        }
         self.events.push_back((self.revision, changes));
         while self.events.len() > MAX_REVISION_EVENTS {
-            self.events.pop_front();
+            if let Some((revision, _)) = self.events.pop_front() {
+                self.compacted_through = revision;
+                self.dropped_events = self.dropped_events.saturating_add(1);
+            }
         }
     }
 }
@@ -491,6 +647,7 @@ fn scan_workspace(
     root: &Path,
     excluded_roots: &[PathBuf],
     explicit_paths: &BTreeSet<String>,
+    previous: Option<&BTreeMap<String, FileState>>,
 ) -> Result<BTreeMap<String, FileState>> {
     let mut states = BTreeMap::new();
     let filter_root = root.to_path_buf();
@@ -552,7 +709,8 @@ fn scan_workspace(
         if metadata.is_file() && metadata.len() > MAX_AUTOMATIC_FILE_BYTES {
             continue;
         }
-        if let Some(state) = read_state(path)? {
+        let prior = previous.and_then(|map| map.get(&relative));
+        if let Some(state) = read_state(path, prior)? {
             states.insert(relative, state);
         }
     }
@@ -564,7 +722,8 @@ fn scan_workspace(
             continue;
         }
         let path = root.join(relative);
-        if let Some(state) = read_state(&path)? {
+        let prior = previous.and_then(|map| map.get(relative));
+        if let Some(state) = read_state(&path, prior)? {
             states.insert(relative.clone(), state);
         } else {
             states.remove(relative);
@@ -573,7 +732,7 @@ fn scan_workspace(
     Ok(states)
 }
 
-fn read_state(path: &Path) -> Result<Option<FileState>> {
+fn read_state(path: &Path, previous: Option<&FileState>) -> Result<Option<FileState>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -582,6 +741,7 @@ fn read_state(path: &Path) -> Result<Option<FileState>> {
         }
     };
     let mode = file_mode(&metadata);
+    let mtime_ns = mtime_as_ns(&metadata);
     if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(path)
             .with_context(|| format!("reading symlink {}", path.display()))?;
@@ -590,22 +750,28 @@ fn read_state(path: &Path) -> Result<Option<FileState>> {
             digest: format!("symlink:sha256:{:x}", Sha256::digest(&bytes)),
             len: bytes.len() as u64,
             mode,
+            mtime_ns,
         }));
     }
     if !metadata.is_file() {
         return Ok(None);
     }
     let len = metadata.len();
-    // Do not reuse a previous digest based only on metadata. Filesystems can
-    // coalesce mtime/ctime updates for rapid same-size writes (for example,
-    // two `fs::write` calls in one process), which would make verification
-    // miss a real mutation. The ledger is a correctness boundary, so hash
-    // every file that is within the automatic scan limit.
+    // Cheap fingerprint: reuse the prior digest when len/mode/mtime match so
+    // reconcile does not re-read and re-hash every unchanged source file.
+    if let Some(prev) = previous
+        && prev.len == len
+        && prev.mode == mode
+        && prev.mtime_ns == mtime_ns
+    {
+        return Ok(Some(prev.clone()));
+    }
     if len > MAX_AUTOMATIC_FILE_BYTES {
         return Ok(Some(FileState {
             digest: format!("oversized:{len}"),
             len,
             mode,
+            mtime_ns,
         }));
     }
     let (digest, hashed_len) = hash_file_streaming(path)?;
@@ -613,6 +779,7 @@ fn read_state(path: &Path) -> Result<Option<FileState>> {
         digest,
         len: hashed_len,
         mode,
+        mtime_ns,
     }))
 }
 
@@ -634,6 +801,15 @@ fn hash_file_streaming(path: &Path) -> Result<(String, u64)> {
         hashed_len += n as u64;
     }
     Ok((format!("sha256:{:x}", hasher.finalize()), hashed_len))
+}
+
+fn mtime_as_ns(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 #[cfg(unix)]
@@ -926,6 +1102,150 @@ mod tests {
     }
 
     #[test]
+    fn revision_evidence_survives_more_than_512_distinct_mutations() {
+        let root = root("long-running-revision-evidence");
+        let mut ledger = ChangeLedger::new(&root).unwrap();
+        let baseline = ledger.revision();
+
+        for index in 0..513 {
+            ledger.push_event(vec![FileChange {
+                path: format!("generated/{index}.rs"),
+                kind: FileChangeKind::Create,
+                before_digest: None,
+                after_digest: Some(format!("sha256:{index}")),
+                before_len: None,
+                after_len: Some(index),
+                before_mode: None,
+                after_mode: Some(0o644),
+            }]);
+        }
+
+        let changes = ledger.changes_since(baseline);
+        assert_eq!(changes.len(), 513);
+        assert_eq!(
+            changes.first().map(|change| change.path.as_str()),
+            Some("generated/0.rs")
+        );
+        assert_eq!(
+            changes.last().map(|change| change.path.as_str()),
+            Some("generated/99.rs"),
+            "BTreeMap ordering is lexical, but every mutation must remain represented"
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.path == "generated/512.rs"),
+            "settlement must retain evidence beyond the former 512-event window"
+        );
+        assert_eq!(ledger.touched_paths_since(baseline).len(), 513);
+        assert!(ledger.had_mutation_since(baseline));
+        assert_eq!(ledger.events.len(), MAX_REVISION_EVENTS);
+        assert_eq!(ledger.dropped_event_count(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compacted_events_preserve_active_turn_and_verification_baselines() {
+        let root = root("compacted-active-baselines");
+        let mut ledger = ChangeLedger::new(&root).unwrap();
+        ledger.push_event(vec![FileChange {
+            path: "before-turn.rs".into(),
+            kind: FileChangeKind::Create,
+            before_digest: None,
+            after_digest: Some("old".into()),
+            before_len: None,
+            after_len: Some(1),
+            before_mode: None,
+            after_mode: Some(0o644),
+        }]);
+        let turn_baseline = ledger.begin_turn_retention_window();
+
+        for index in 0..700 {
+            ledger.push_event(vec![FileChange {
+                path: "repeated.rs".into(),
+                kind: FileChangeKind::Modify,
+                before_digest: Some(format!("digest-{index}")),
+                after_digest: Some(format!("digest-{}", index + 1)),
+                before_len: Some(index),
+                after_len: Some(index + 1),
+                before_mode: Some(0o644),
+                after_mode: Some(0o644),
+            }]);
+        }
+        let verification_baseline = ledger.revision();
+        ledger.retain_verification_baseline(verification_baseline);
+        for index in 700..1_400 {
+            ledger.push_event(vec![FileChange {
+                path: "repeated.rs".into(),
+                kind: FileChangeKind::Modify,
+                before_digest: Some(format!("digest-{index}")),
+                after_digest: Some(format!("digest-{}", index + 1)),
+                before_len: Some(index),
+                after_len: Some(index + 1),
+                before_mode: Some(0o644),
+                after_mode: Some(0o644),
+            }]);
+        }
+        ledger.push_event(vec![FileChange {
+            path: "temporary.rs".into(),
+            kind: FileChangeKind::Create,
+            before_digest: None,
+            after_digest: Some("temporary".into()),
+            before_len: None,
+            after_len: Some(1),
+            before_mode: None,
+            after_mode: Some(0o644),
+        }]);
+        ledger.push_event(vec![FileChange {
+            path: "temporary.rs".into(),
+            kind: FileChangeKind::Delete,
+            before_digest: Some("temporary".into()),
+            after_digest: None,
+            before_len: Some(1),
+            after_len: None,
+            before_mode: Some(0o644),
+            after_mode: None,
+        }]);
+
+        assert_eq!(ledger.events.len(), MAX_REVISION_EVENTS);
+        assert!(ledger.dropped_event_count() > 512);
+        let turn_changes = ledger.changes_since(turn_baseline);
+        assert_eq!(turn_changes.len(), 1);
+        assert_eq!(turn_changes[0].path, "repeated.rs");
+        assert_eq!(turn_changes[0].before_digest.as_deref(), Some("digest-0"));
+        assert_eq!(turn_changes[0].after_digest.as_deref(), Some("digest-1400"));
+        assert_eq!(
+            ledger.touched_paths_since(turn_baseline),
+            vec!["repeated.rs", "temporary.rs"]
+        );
+        assert!(ledger.had_mutation_since(turn_baseline));
+
+        let verification_changes = ledger.changes_since(verification_baseline);
+        assert_eq!(verification_changes.len(), 1);
+        assert_eq!(
+            verification_changes[0].before_digest.as_deref(),
+            Some("digest-700")
+        );
+        assert_eq!(
+            verification_changes[0].after_digest.as_deref(),
+            Some("digest-1400")
+        );
+        assert_eq!(
+            ledger.touched_paths_since(verification_baseline),
+            vec!["repeated.rs", "temporary.rs"]
+        );
+        assert!(ledger.had_mutation_since(verification_baseline));
+        assert!(
+            ledger
+                .touched_paths_since(0)
+                .contains(&"before-turn.rs".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn independent_roots_never_share_state() {
         let first = root("first");
         let second = root("second");
@@ -958,7 +1278,7 @@ mod tests {
         let generated = root.join("target/generated.txt");
         std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
         std::fs::write(&generated, "generated\n").unwrap();
-        let after = read_state(&generated).unwrap().unwrap();
+        let after = read_state(&generated, None).unwrap().unwrap();
         ledger
             .record_tool_effects(&ToolEffects {
                 mutation_attempted: true,

@@ -1,12 +1,12 @@
 //! Drive an agent future while keeping the TUI live (redraw, scroll, cancel, interject).
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::prelude::*;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::{ChordPipeline, reconcile_queue_with_interjections, run_chord_pipeline};
@@ -95,15 +95,27 @@ pub(crate) fn settle_turn_cancellation(
     }
 }
 
-/// Trio may repair an incomplete implementation, but it must not ask its
-/// skeptic to "approve" an execution that was blocked, failed, or cancelled.
+/// Trio must not ask its skeptic to "approve" an execution that was blocked,
+/// failed, or cancelled.
 pub(crate) fn trio_non_reviewable_status(status: hi_agent::TurnStatus) -> Option<&'static str> {
     match status {
         hi_agent::TurnStatus::Failed => Some("failed"),
         hi_agent::TurnStatus::Blocked => Some("blocked"),
         hi_agent::TurnStatus::Cancelled => Some("cancelled"),
-        hi_agent::TurnStatus::Completed | hi_agent::TurnStatus::Incomplete => None,
+        hi_agent::TurnStatus::Completed => None,
     }
+}
+
+/// Whether a trio run has exhausted an explicitly configured round cap.
+/// `None` is the ordinary unlimited mode and can never settle due to count.
+pub(crate) fn trio_round_cap_reached(rounds_completed: u64, max_rounds: Option<u64>) -> bool {
+    max_rounds.is_some_and(|max| rounds_completed >= max)
+}
+
+/// Compact progress label for trio status lines. An unlimited run displays its
+/// current round without implying a denominator or hidden ceiling.
+pub(crate) fn trio_round_label(round: u64, max_rounds: Option<u64>) -> String {
+    max_rounds.map_or_else(|| round.to_string(), |max| format!("{round}/{max}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -160,6 +172,7 @@ where
         }
     };
     loop {
+        app.check_tui_event_trace()?;
         // After a cancel request with a shared TurnCancellation, keep the
         // drive loop alive until the turn future settles (or fails). Breaking
         // early would drop the future before cooperative tool cleanup runs.
@@ -169,6 +182,10 @@ where
         if pending_confirmation.is_none() {
             while let Some(request) = confirm_queue.pop_front() {
                 if app.should_auto_approve(&request.request) {
+                    app.trace_approval_decided(
+                        crate::tui_event_trace::approval_kind(&request.request),
+                        "auto_approved",
+                    );
                     let _ = request
                         .response
                         .send(hi_agent::ConfirmationResult::Approved);
@@ -179,6 +196,7 @@ where
                 app.confirmation_selected = 0;
                 app.confirm_focus = crate::confirm_overlay::ConfirmFocus::Options;
                 app.ask_user_draft.clear();
+                app.trace_approval_shown(crate::tui_event_trace::approval_kind(&request.request))?;
                 pending_confirmation = Some(request);
                 break;
             }
@@ -228,8 +246,6 @@ where
                 app.drain_voice();
                 let idle = last_activity.elapsed();
                 app.waiting_for = Some(idle);
-                // Only notify about a quiet backend while no tool is legitimately
-                // running. This is only a soft wait notice.
                 if expect_turn_end
                     && !watchdog_stuck
                     && app.current_tool.is_none()
@@ -241,6 +257,12 @@ where
             },
             maybe = input.recv(), if !input_closed => {
                 match maybe {
+                    Some(Event::Resize(width, height)) => {
+                        // Keep resize synchronization available while a turn is
+                        // active too. The harness must not have to guess whether
+                        // SIGWINCH landed in the idle or drive input loop.
+                        app.trace_resized(width, height)?;
+                    }
                     Some(Event::Mouse(mouse)) => app.handle_mouse(mouse),
                     Some(Event::Paste(text))
                         if pending_confirmation.as_ref().is_some_and(|_| {
@@ -272,6 +294,10 @@ where
                                     pending_confirmation = Some(request);
                                 }
                                 ConfirmDecision::Approve => {
+                                    app.trace_approval_decided(
+                                        crate::tui_event_trace::approval_kind(&request.request),
+                                        "approved",
+                                    );
                                     let _ = request
                                         .response
                                         .send(hi_agent::ConfirmationResult::Approved);
@@ -279,6 +305,10 @@ where
                                     app.ask_user_draft.clear();
                                 }
                                 ConfirmDecision::AlwaysSession => {
+                                    app.trace_approval_decided(
+                                        crate::tui_event_trace::approval_kind(&request.request),
+                                        "always_session",
+                                    );
                                     if let Some((server, tool)) =
                                         request.request.mcp_standing_grant()
                                     {
@@ -317,6 +347,10 @@ where
                                     {
                                         let prefix = App::auto_approve_prefix_for(path);
                                         app.add_auto_approve_path(path);
+                                        app.trace_approval_decided(
+                                            crate::tui_event_trace::approval_kind(&request.request),
+                                            "always_path",
+                                        );
                                         let _ = request
                                             .response
                                             .send(hi_agent::ConfirmationResult::Approved);
@@ -334,6 +368,10 @@ where
                                     }
                                 }
                                 ConfirmDecision::Reject => {
+                                    app.trace_approval_decided(
+                                        crate::tui_event_trace::approval_kind(&request.request),
+                                        "rejected",
+                                    );
                                     let _ = request
                                         .response
                                         .send(hi_agent::ConfirmationResult::Rejected);
@@ -341,6 +379,10 @@ where
                                     app.ask_user_draft.clear();
                                 }
                                 ConfirmDecision::RejectFollowup(text) => {
+                                    app.trace_approval_decided(
+                                        crate::tui_event_trace::approval_kind(&request.request),
+                                        "rejected_with_follow_up",
+                                    );
                                     let _ = request
                                         .response
                                         .send(hi_agent::ConfirmationResult::Rejected);
@@ -351,6 +393,10 @@ where
                                     }
                                 }
                                 ConfirmDecision::Cancel => {
+                                    app.trace_approval_decided(
+                                        crate::tui_event_trace::approval_kind(&request.request),
+                                        "cancelled",
+                                    );
                                     let _ = request
                                         .response
                                         .send(hi_agent::ConfirmationResult::Cancelled);
@@ -364,6 +410,10 @@ where
                                     }
                                 }
                                 ConfirmDecision::Ask(answer) => {
+                                    app.trace_approval_decided(
+                                        crate::tui_event_trace::approval_kind(&request.request),
+                                        "answered",
+                                    );
                                     let _ = request
                                         .response
                                         .send(hi_agent::ConfirmationResult::Answer(answer));
@@ -457,6 +507,10 @@ where
                                     let _ = app.enqueue_prompt_front(
                                         hi_agent::PLAN_DRIVE_PROMPT.to_string(),
                                     );
+                                    continue;
+                                }
+                                Some(ChordPipeline::PlanPark) => {
+                                    app.park_plan_approval_local();
                                     continue;
                                 }
                                 Some(ChordPipeline::PlanRequestChanges) => {
@@ -608,20 +662,28 @@ where
     // is still outstanding — resolve it explicitly so tool code sees Cancelled
     // rather than a disconnected channel.
     if let Some(request) = pending_confirmation.take() {
+        app.trace_approval_decided(
+            crate::tui_event_trace::approval_kind(&request.request),
+            "cancelled_on_turn_end",
+        );
         let _ = request
             .response
             .send(hi_agent::ConfirmationResult::Cancelled);
     }
     while let Some(request) = confirm_queue.pop_front() {
+        app.trace_approval_decided(
+            crate::tui_event_trace::approval_kind(&request.request),
+            "cancelled_on_turn_end",
+        );
         let _ = request
             .response
             .send(hi_agent::ConfirmationResult::Cancelled);
     }
     // Reconcile the visible queue with mid-turn steering: drop entries the
-    // agent already injected, and keep anything still pending in the inbox
-    // (turn ended before the next Model phase) for the next turn.
+    // agent injected only after a successful drive result. Provider errors and
+    // cancellation retain offered user work for the next turn.
     if let Some(inbox) = interject.as_ref() {
-        reconcile_queue_with_interjections(app, inbox);
+        reconcile_queue_with_interjections(app, inbox, value.is_some() && !cancelled);
     } else {
         app.mid_turn_offered.clear();
     }
@@ -763,13 +825,9 @@ mod cancellation_settlement_tests {
     }
 
     #[test]
-    fn trio_reviews_only_completed_or_repairable_incomplete_turns() {
+    fn trio_reviews_only_completed_turns() {
         assert_eq!(
             trio_non_reviewable_status(hi_agent::TurnStatus::Completed),
-            None
-        );
-        assert_eq!(
-            trio_non_reviewable_status(hi_agent::TurnStatus::Incomplete),
             None
         );
         assert_eq!(
@@ -784,5 +842,21 @@ mod cancellation_settlement_tests {
             trio_non_reviewable_status(hi_agent::TurnStatus::Cancelled),
             Some("cancelled")
         );
+    }
+
+    #[test]
+    fn trio_default_never_settles_from_a_round_count() {
+        assert!(!trio_round_cap_reached(0, None));
+        assert!(!trio_round_cap_reached(3, None));
+        assert!(!trio_round_cap_reached(u64::MAX, None));
+        assert_eq!(trio_round_label(4, None), "4");
+    }
+
+    #[test]
+    fn trio_explicit_round_cap_still_settles_at_the_boundary() {
+        assert!(!trio_round_cap_reached(2, Some(3)));
+        assert!(trio_round_cap_reached(3, Some(3)));
+        assert!(trio_round_cap_reached(4, Some(3)));
+        assert_eq!(trio_round_label(2, Some(3)), "2/3");
     }
 }

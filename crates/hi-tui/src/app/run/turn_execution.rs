@@ -30,8 +30,22 @@ pub(super) async fn run_agent_turn(
     loops_file: Option<&Path>,
 ) -> Result<()> {
     // --- Turn phase: run the agent behind a channel, staying responsive. ---
-    let goal_drive_turn = run_line == hi_agent::GOAL_CONTINUE_PROMPT;
-    let plan_drive_turn = run_line == hi_agent::PLAN_DRIVE_PROMPT;
+    // Flush any mode change made while another operation owned the Agent
+    // before snapshotting mode or constructing the provider request.
+    let drive_kind = hi_agent::DriveKind::from_prompt(run_line);
+    app.push_session_face(agent);
+    if agent.prepare_plan_drive_for_turn(drive_kind)? {
+        // The transition must be visible before the future starts. Otherwise
+        // a resumed user/plan turn works while the title bar still says paused.
+        app.refresh_goal(agent);
+    }
+    let goal_drive_turn = drive_kind == hi_agent::DriveKind::Goal;
+    let plan_drive_turn = drive_kind == hi_agent::DriveKind::Plan;
+    // Agent::begin_drive_turn performs the matching Always→Auto demotion once
+    // the future is first polled. Synchronize the frontend before `drive`
+    // handles a confirmation so safe FileEdit requests are auto-approved.
+    let drive_permission_restore =
+        app.sync_synthetic_drive_permission(drive_kind, agent.permission_mode());
     let chrome = hi_agent::drive_chrome_line(
         run_line,
         agent.next_plan_step_title(),
@@ -58,6 +72,7 @@ pub(super) async fn run_agent_turn(
     let plan_step_before = agent.next_plan_step_title().map(str::to_owned);
     let turn_snapshot = agent.state_snapshot();
     app.last_turn_snapshot = Some(turn_snapshot.clone());
+    app.trace_turn_started(agent, run_line)?;
     // Reset the per-turn tool-call counter for the observability panel.
     app.turn_tool_calls = 0;
     app.turn_rounds = 0;
@@ -73,7 +88,13 @@ pub(super) async fn run_agent_turn(
         approval_store: app.approval_store.clone(),
     };
     let _background_before = agent.background_process_ids();
-    let interject = agent.interjection_inbox();
+    // A line typed during an autonomous drive is explicit user work, so it
+    // owns the next turn ahead of any newly synthesized continuation. Feeding
+    // it into the active drive used to let the model consume it as an
+    // interjection; queue reconciliation then removed the line and the TUI
+    // immediately started another plan drive, with no user-origin turn ever
+    // starting. Ordinary user turns retain live mid-turn steering.
+    let interject = accepts_mid_turn_interjections(drive_kind).then(|| agent.interjection_inbox());
     let btw = agent.btw_dispatcher();
     let driven = {
         let bg_tasks = agent.background_task_registry();
@@ -87,7 +108,7 @@ pub(super) async fn run_agent_turn(
             confirm_rx,
             fut,
             true,
-            Some(interject),
+            interject,
             Some(btw),
             tx,
             Some(turn_cancel.clone()),
@@ -224,10 +245,11 @@ pub(super) async fn run_agent_turn(
             ));
         }
         if plan_drive_turn {
-            agent.set_plan_drive_paused(true);
+            agent.pause_plan_drive_until_user_input()?;
             app.refresh_goal(agent);
             app.push(Line::styled(
-                "plan drive interrupted — paused; /plan resume to continue".to_string(),
+                "plan drive interrupted — paused; reply to steer and resume, or use /plan resume"
+                    .to_string(),
                 Style::default().fg(crate::theme::theme().warning),
             ));
         }
@@ -276,10 +298,10 @@ pub(super) async fn run_agent_turn(
             ));
         }
         if plan_drive_turn {
-            agent.set_plan_drive_paused(true);
+            agent.pause_plan_drive_until_user_input()?;
             app.refresh_goal(agent);
             app.push(Line::styled(
-                "plan drive paused; /plan resume to continue".to_string(),
+                "plan drive paused; reply to steer and resume, or use /plan resume".to_string(),
                 Style::default().fg(crate::theme::theme().warning),
             ));
         }
@@ -296,7 +318,10 @@ pub(super) async fn run_agent_turn(
     app.reasoning_effort = agent.reasoning_effort();
     // The goal driver (`goal_turn_end`) may have advanced/failed a sub-goal
     // this turn — mirror the new state so the pinned block + header reflect it.
-    // Push a mid-turn Shift-Tab first so refresh doesn't clobber it.
+    // Restore the transient synthetic-drive face only when the user did not
+    // make a mid-turn Shift-Tab choice. Push a real choice before refresh so
+    // the Agent's own drive restoration cannot clobber it.
+    app.restore_synthetic_drive_permission(drive_permission_restore);
     app.push_session_face(agent);
     app.refresh_goal(agent);
     // Record a main /goal that just reached a terminal state to the activity
@@ -340,11 +365,7 @@ pub(super) async fn run_agent_turn(
     // is only queued into an empty queue.
     if !cancelled && !stop_requested {
         if goal_drive_turn {
-            let made_progress = hi_agent::goal_drive_made_progress(
-                goal_before.as_ref(),
-                agent.structured_goal(),
-                agent.last_changed_files(),
-            );
+            let made_progress = agent.goal_drive_turn_made_progress(goal_before.as_ref());
             let progress = agent.note_goal_drive_progress(made_progress);
             match progress {
                 hi_agent::GoalDriveProgress::Skipped { failed, next } => {
@@ -369,12 +390,7 @@ pub(super) async fn run_agent_turn(
             ));
         }
         if plan_drive_turn {
-            let made_progress = hi_agent::plan_drive_made_progress(
-                plan_step_before.as_deref(),
-                agent.next_plan_step_title(),
-                &agent.last_turn_telemetry().progress_events,
-                agent.last_changed_files(),
-            );
+            let made_progress = agent.plan_drive_turn_made_progress(plan_step_before.as_deref());
             agent.note_plan_drive_progress(made_progress);
             if agent.plan_drive_status() == "parked" {
                 app.push(Line::styled(
@@ -389,6 +405,7 @@ pub(super) async fn run_agent_turn(
         }
         app.maybe_queue_drive(agent, driven.value.as_ref());
     }
+    app.trace_turn_settled(agent, agent.last_turn_outcome())?;
     app.set_working(false);
     // Flush any pending live events from the TUI's /sync on RemoteUi.
     // Spawn as a background task so a slow/unreachable ipop doesn't block
@@ -409,4 +426,20 @@ pub(super) async fn run_agent_turn(
     // them there (the "↓ N new" hint shows the summary is below). A new turn
     // re-pins to the bottom.
     Ok(())
+}
+
+fn accepts_mid_turn_interjections(drive_kind: hi_agent::DriveKind) -> bool {
+    !drive_kind.is_drive()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accepts_mid_turn_interjections;
+
+    #[test]
+    fn synthetic_drives_reserve_mid_turn_input_for_a_user_turn() {
+        assert!(accepts_mid_turn_interjections(hi_agent::DriveKind::User));
+        assert!(!accepts_mid_turn_interjections(hi_agent::DriveKind::Plan));
+        assert!(!accepts_mid_turn_interjections(hi_agent::DriveKind::Goal));
+    }
 }

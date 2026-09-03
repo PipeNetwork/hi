@@ -9,6 +9,7 @@ use crate::{
 };
 
 use super::progress::{ProgressTracker, ToolProgressLabel};
+use super::retention::ToolTimeline;
 use super::retry::ReviewRepairState;
 
 #[allow(clippy::too_many_arguments)]
@@ -21,14 +22,16 @@ pub(super) fn build_turn_telemetry(
     truncation_retries: u32,
     progress: &ProgressTracker,
     hit_step_cap: bool,
-    stalled_unfinished: bool,
-    stalled_repeating: bool,
+    hit_tool_cap: bool,
     verify_attributions: &[hi_tools::Attribution],
     verification_executions: &[crate::VerificationExecution],
+    verification_executions_dropped: u64,
+    verification_execution_count: u64,
+    successful_test_verification: bool,
     tool_calls: u32,
     max_concurrent_batch: u32,
     serial_runs: u32,
-    tool_timeline: &[ToolCallEntry],
+    tool_timeline: &ToolTimeline,
     evidence: &EvidenceTracker,
     review_repair: &ReviewRepairState,
     prefix_stability: &crate::prefix_stability::PrefixStability,
@@ -44,10 +47,9 @@ pub(super) fn build_turn_telemetry(
         no_progress_streak: progress.no_progress_streak,
         forced_final_answer_attempts: progress.forced_final_answer_attempts,
         last_progress_reason: progress.last_progress_reason.clone(),
-        last_stall_reason: progress.last_stall_reason.clone(),
+        last_no_progress_reason: progress.last_no_progress_reason.clone(),
         hit_step_cap,
-        stalled_unfinished,
-        stalled_repeating,
+        hit_tool_cap,
         verify_attributions: verify_attributions
             .iter()
             .map(TurnAttribution::from)
@@ -57,7 +59,8 @@ pub(super) fn build_turn_telemetry(
         max_concurrent_batch,
         serial_runs,
         tool_timeline: tool_timeline.to_vec(),
-        progress_events: progress.events.clone(),
+        progress_events: progress.retained_events(),
+        drive_evidence_hashes: progress.drive_evidence_hashes(),
         file_reads: evidence.file_reads,
         targeted_searches: evidence.targeted_searches,
         listing_only: evidence.listing_only(),
@@ -90,12 +93,21 @@ pub(super) fn build_turn_telemetry(
         wire_audit: Vec::new(),
         requests: Vec::new(),
         compaction: Vec::new(),
+        diagnostic_retention: crate::TurnDiagnosticRetention {
+            progress_events_dropped: progress.retained_events_dropped(),
+            tool_timeline_dropped: tool_timeline.dropped(),
+            verification_executions_dropped,
+            wire_audit_dropped: 0,
+            requests_dropped: 0,
+            compaction_events_dropped: 0,
+            verification_executions_total: verification_execution_count,
+            successful_test_verification,
+        },
     }
 }
 
-/// The per-turn model-call cap. Configuration supplies one uniform finite
-/// default rather than intent-specific caps; `u32::MAX` remains the explicit
-/// unlimited setting selected by `/config steps off`.
+/// The per-turn model-call cap. `u32::MAX` is the ordinary unlimited default;
+/// finite values come from an explicit user or internal budget.
 pub(super) fn effective_max_steps_for_turn(config: &crate::AgentConfig) -> u32 {
     config.loop_limits.max_steps.max(1)
 }
@@ -290,7 +302,7 @@ pub(super) fn combined_review_status(
 ///
 /// An **empty** delta is also benign: the ledger revision/digest can move from
 /// reconcile bookkeeping without any file change. Treating that as a wipe was
-/// flipping green turns into `⚠ incomplete · checks did not settle`.
+/// flipping green turns into failed, unverified outcomes.
 pub(super) fn post_verify_delta_is_benign(changes: &[hi_tools::FileChange]) -> bool {
     changes
         .iter()
@@ -450,14 +462,13 @@ mod step_cap_tests {
     }
 
     #[test]
-    fn uniform_default_step_cap_is_intent_independent() {
-        // Removing intent-aware defaults means every ordinary turn gets the
-        // same bound regardless of intent classification or horizon.
+    fn default_step_budget_is_unlimited_and_intent_independent() {
+        // Intent classification and horizon must not silently introduce a cap.
         for lh in [false, true] {
             assert_eq!(
                 effective_max_steps_for_turn(&cfg(lh)),
-                crate::MAX_MODEL_ROUNDS,
-                "default is uniform (long_horizon={lh})"
+                u32::MAX,
+                "default is unlimited (long_horizon={lh})"
             );
         }
     }

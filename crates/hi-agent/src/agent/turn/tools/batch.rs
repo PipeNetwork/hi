@@ -20,14 +20,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 use futures_util::StreamExt;
 use hi_tools::protocol::{
-    execute_in_runtime_shared_with, execute_prepared_in_runtime, execute_streaming_in_runtime,
-    prepare_mutation_in_with_state,
+    execute_in_runtime_shared_with_runner, execute_prepared_in_runtime,
+    execute_streaming_in_runtime_with_runner, prepare_mutation_in_with_state,
 };
 
+use super::super::speculation::{SpeculationKey, SpeculationRegistry};
 use crate::heuristics::{emit_tool_output, mode_blocks_tool, respects_deps, tool_deps};
 use crate::steering::{
-    BashCommandKind, EvidenceTracker, ImplementationTracker, ToolLoopGuardrail, bash_call_waits,
-    bash_command, classify_bash_command, inspection_signature, read_only_blocked_tool_result,
+    BashCommandKind, EvidenceTracker, ImplementationTracker, bash_call_waits, bash_command,
+    classify_bash_command, inspection_signature, read_only_blocked_tool_result,
     read_only_blocks_tool,
 };
 use crate::verify::Snapshot;
@@ -36,18 +37,176 @@ use crate::{
     confirmation_for_egress_tool, egress_confirm_required,
 };
 use hi_ai::Content;
+use hi_workflow::{
+    ProgramCall, ProgramHostRequest, ProgramOutcome, ProgramRunParams, extract_safe_literal_calls,
+};
+use tokio_util::sync::CancellationToken;
+
+/// Owns every task launched for one workflow program. Dropping an async
+/// `JoinHandle` detaches it, and a running `spawn_blocking` task cannot be
+/// aborted. Cancel the cooperative Rhai token before aborting the watcher so a
+/// dropped turn cannot leave an unlimited program consuming a worker forever.
+struct ProgramRunGuard {
+    cancel: CancellationToken,
+    _watcher: tokio_util::task::AbortOnDropHandle<()>,
+}
+
+impl ProgramRunGuard {
+    fn new(cancel: CancellationToken, watcher: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            cancel,
+            _watcher: tokio_util::task::AbortOnDropHandle::new(watcher),
+        }
+    }
+}
+
+impl Drop for ProgramRunGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+#[derive(Clone)]
+struct ProgramToolRunner {
+    root: std::path::PathBuf,
+    state_root: std::path::PathBuf,
+    process_runner: hi_tools::ProcessRunner,
+    lsp: std::sync::Arc<hi_lsp::LspManager>,
+    background: std::sync::Arc<hi_tools::BackgroundRegistry>,
+    read_cache: std::sync::Arc<std::sync::Mutex<hi_tools::ReadCache>>,
+    repo_map: std::sync::Arc<std::sync::Mutex<hi_tools::RepoMapCache>>,
+    mcp: Option<std::sync::Arc<dyn hi_tools::McpBackend>>,
+    memory: Option<std::sync::Arc<dyn hi_tools::MemoryBackend>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProgramSpeculator {
+    runner: ProgramToolRunner,
+    turn_id: String,
+    enabled: bool,
+    external_allowed: bool,
+    max_calls: usize,
+    context_generation: u64,
+    ledger_revision: u64,
+    external_freshness_epoch: u64,
+}
+
+impl ProgramSpeculator {
+    pub(crate) fn launch(
+        &self,
+        speculation_registry: &SpeculationRegistry,
+        program_id: &str,
+        source: &str,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        for call in extract_safe_literal_calls(source)
+            .into_iter()
+            .take(self.max_calls)
+        {
+            let external = matches!(
+                hi_tools::speculation_class(&call.name),
+                hi_tools::SpeculationClass::IdempotentExternal
+            );
+            if external && !self.external_allowed {
+                continue;
+            }
+            if !matches!(
+                hi_tools::speculation_class(&call.name),
+                hi_tools::SpeculationClass::PureLocal
+                    | hi_tools::SpeculationClass::IdempotentExternal
+            ) {
+                continue;
+            }
+            let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+            let key = SpeculationKey::new(
+                &self.turn_id,
+                program_id,
+                call.occurrence,
+                &call.name,
+                &args,
+                self.context_generation,
+                self.ledger_revision,
+                if external {
+                    self.external_freshness_epoch
+                } else {
+                    0
+                },
+            );
+            let registry = speculation_registry.clone();
+            let runner = self.runner.clone();
+            registry.launch(key, external, async move { runner.execute(&call).await.0 });
+        }
+    }
+}
+
+impl ProgramToolRunner {
+    async fn execute(
+        &self,
+        call: &ProgramCall,
+    ) -> (
+        std::result::Result<hi_workflow::ProgramToolResult, String>,
+        hi_tools::ToolOutcome,
+    ) {
+        let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+        let allowed = matches!(
+            hi_tools::speculation_class(&call.name),
+            hi_tools::SpeculationClass::PureLocal | hi_tools::SpeculationClass::IdempotentExternal
+        ) && hi_tools::is_read_only(&call.name)
+            && call.name != "run_program"
+            && hi_tools::is_known_tool(&call.name);
+        if !allowed {
+            let message = format!(
+                "tool `{}` requires ordinary structured-tool execution; retry without run_program",
+                call.name
+            );
+            let output = synthetic_tool_outcome(message.clone(), hi_tools::ToolStatus::Denied);
+            return (Err(message), output);
+        }
+        let output = execute_in_runtime_shared_with_runner(
+            &self.process_runner,
+            &self.root,
+            &self.state_root,
+            &self.lsp,
+            &self.background,
+            &self.read_cache,
+            &self.repo_map,
+            self.mcp.as_deref(),
+            self.memory.as_deref(),
+            &call.name,
+            &args,
+        )
+        .await;
+        let status = match output.status {
+            hi_tools::ToolStatus::Succeeded => "succeeded",
+            hi_tools::ToolStatus::Failed => "failed",
+            hi_tools::ToolStatus::Denied => "denied",
+            hi_tools::ToolStatus::TimedOut => "timed_out",
+            hi_tools::ToolStatus::Cancelled => "cancelled",
+        };
+        let result = hi_workflow::ProgramToolResult {
+            index: call.occurrence,
+            name: call.name.clone(),
+            status: status.into(),
+            output: output.content.clone(),
+        };
+        (Ok(result), output)
+    }
+}
 
 use crate::agent::delegate_turn::{
-    DelegateJob, delegate_turn_limit, file_sets_disjoint, parallel_delegate_limit, run_delegate_job,
+    DelegateJob, delegate_limit_denial, delegate_turn_limit, file_sets_disjoint,
+    parallel_delegate_limit, run_delegate_job,
 };
 use crate::agent::explore_turn::{
-    ExploreJob, MAX_EXPLORE_SUBAGENTS_PER_TURN, MAX_PARALLEL_EXPLORES, explore_tool_outcome,
-    run_explore_job,
+    ExploreJob, MAX_PARALLEL_EXPLORES, explore_tool_outcome, run_explore_job,
 };
 
 use crate::apply_plan_to_goal;
 use crate::heuristics::plan_has_pending_steps;
 use crate::steering::implementation_tool_call_mutates;
+use hi_tools::PlanStatus;
 
 use super::super::helpers::{
     synthetic_tool_outcome, tool_entry, tool_entry_with_args, tool_satisfies_validation,
@@ -56,6 +215,155 @@ use super::super::phase::TurnPhase;
 use super::super::progress::{
     ProgressKind, ProgressTracker, ToolProgressLabel, classify_tool_progress, signature_seen,
 };
+use super::super::retention::ToolTimeline;
+
+/// Add a scheduler count without allowing a very long unlimited turn to wrap
+/// the telemetry counter back to zero. `usize` inputs are clamped before the
+/// addition so this remains correct on 64-bit hosts as well.
+fn saturating_add_scheduler_count(total: &mut u32, additional: usize) {
+    let additional = u32::try_from(additional).unwrap_or(u32::MAX);
+    *total = total.saturating_add(additional);
+}
+
+/// Constrain a model-authored checklist while the session is in plan mode.
+///
+/// A previously completed step may stay completed when the user re-enters
+/// planning to revise the remaining work. Every other step is executable work
+/// and therefore remains pending until a non-plan turn supplies real evidence.
+fn normalize_plan_mode_update(
+    current: &[hi_tools::PlanStep],
+    proposed: &mut [hi_tools::PlanStep],
+) -> usize {
+    let mut corrected = 0;
+    for (index, step) in proposed.iter_mut().enumerate() {
+        let status = if current.get(index).is_some_and(|existing| {
+            existing.title == step.title && existing.status == PlanStatus::Done
+        }) {
+            PlanStatus::Done
+        } else {
+            PlanStatus::Pending
+        };
+        if step.status != status {
+            step.status = status;
+            corrected += 1;
+        }
+    }
+    corrected
+}
+
+/// Whether a checklist title describes work that normally needs concrete
+/// workspace or validation evidence before it can truthfully become `Done`.
+/// Read-only milestones may still be completed from inspection evidence.
+fn plan_step_requires_execution_evidence(title: &str) -> bool {
+    crate::agent::plan_goal::plan_step_requires_execution_evidence(title)
+}
+
+/// Extract a model-supplied reason that this particular implementation step
+/// did not require a workspace change. A generic top-level recap cannot
+/// self-certify an entire checklist.
+fn plan_step_has_no_change_justification(arguments: &str, index: usize) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return false;
+    };
+    value
+        .get("steps")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|steps| steps.get(index))
+        .and_then(|step| step.get("completion_evidence"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .is_some_and(concrete_no_change_justification)
+}
+
+fn concrete_no_change_justification(reason: &str) -> bool {
+    let normalized = reason
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '/' | '_' | '-') {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    if reason.chars().count() < 12 || words.len() < 3 {
+        return false;
+    }
+    !matches!(
+        words.join(" ").as_str(),
+        "done"
+            | "already done"
+            | "already complete"
+            | "already completed"
+            | "no change needed"
+            | "no changes needed"
+            | "no change required"
+            | "no changes required"
+            | "not needed"
+            | "not required"
+    )
+}
+
+/// Reject unsupported completion claims on implementation-shaped checklist
+/// steps. Successful mutation, successful validation, or an explicit per-step
+/// no-change justification is required.
+fn normalize_unsupported_plan_completion(
+    current: &[hi_tools::PlanStep],
+    proposed: &mut [hi_tools::PlanStep],
+    arguments: &str,
+    execution_evidence: bool,
+) -> Vec<usize> {
+    // Turn-global mutation/validation proves at most the step that was active
+    // when the work began. Letting one unrelated write or an old passing test
+    // authorize every `done` entry allowed a weak model to clear an entire
+    // durable checklist at once. Additional implementation steps need their
+    // own concrete `completion_evidence`.
+    let evidenced_index = execution_evidence
+        .then(|| {
+            current
+                .iter()
+                .position(|step| step.status == PlanStatus::Active)
+                .or_else(|| {
+                    current
+                        .iter()
+                        .position(|step| step.status == PlanStatus::Pending)
+                })
+                .or_else(|| {
+                    proposed.iter().position(|step| {
+                        step.status == PlanStatus::Done
+                            && plan_step_requires_execution_evidence(&step.title)
+                    })
+                })
+        })
+        .flatten();
+
+    let mut corrected = Vec::new();
+    for (index, step) in proposed.iter_mut().enumerate() {
+        if step.status != PlanStatus::Done || !plan_step_requires_execution_evidence(&step.title) {
+            continue;
+        }
+        let already_done = current.get(index).is_some_and(|existing| {
+            existing.title == step.title && existing.status == PlanStatus::Done
+        });
+        if already_done
+            || evidenced_index == Some(index)
+            || plan_step_has_no_change_justification(arguments, index)
+        {
+            continue;
+        }
+
+        step.status = current
+            .get(index)
+            .filter(|existing| existing.title == step.title)
+            .map(|existing| existing.status)
+            .filter(|status| *status != PlanStatus::Done)
+            .unwrap_or(PlanStatus::Pending);
+        corrected.push(index);
+    }
+    corrected
+}
 
 impl crate::Agent {
     /// Execute `calls` for the current round and append assistant+results.
@@ -70,12 +378,14 @@ impl crate::Agent {
         task_contract: &TaskContract,
         implementation_tracker: &mut ImplementationTracker,
         evidence: &mut EvidenceTracker,
-        tool_guardrail: &mut ToolLoopGuardrail,
         progress_tracker: &mut ProgressTracker,
-        tool_timeline: &mut Vec<crate::ToolCallEntry>,
+        tool_timeline: &mut ToolTimeline,
         sched_tool_calls: &mut u32,
         sched_max_concurrent: &mut u32,
         sched_serial_runs: &mut u32,
+        speculation_registry: &SpeculationRegistry,
+        program_fallback_next: &mut bool,
+        program_fallback_used: &mut bool,
         plan_updated_goal: &mut bool,
         proposed_goal: &mut Option<crate::Goal>,
         turn_snapshot: &mut Option<Snapshot>,
@@ -90,6 +400,36 @@ impl crate::Agent {
         // Never let that stale signal cancel the model's next action.
         self.interrupt
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        if calls
+            .iter()
+            .any(|(_, name, _)| hi_tools::is_filesystem_mutating(name) || name == "bash")
+        {
+            // A real mutation changes the meaning of every shadow read. Drop
+            // those entries before dispatching the batch so no stale result
+            // can be claimed by a later program call.
+            speculation_registry.invalidate_all();
+        }
+        // A program envelope owns the completion. Reject a mixed batch before
+        // announcing any individual tool so ordinary calls cannot look as if
+        // they ran and no orphan tool results can enter the transcript.
+        if calls.iter().any(|(_, name, _)| name == "run_program") {
+            return self
+                .execute_program_batch(
+                    calls,
+                    completion_content,
+                    read_only_intent,
+                    progress_tracker,
+                    tool_timeline,
+                    sched_tool_calls,
+                    sched_max_concurrent,
+                    sched_serial_runs,
+                    speculation_registry,
+                    program_fallback_next,
+                    program_fallback_used,
+                    ui,
+                )
+                .await;
+        }
         // This is deliberately emitted before any scheduler or permission
         // branch. Text-promoted tool calls therefore receive the same typed
         // capability audit as provider-native calls.
@@ -142,8 +482,7 @@ impl crate::Agent {
         let permitted_prefix = calls.len().min(
             self.config
                 .loop_limits
-                .max_tool_calls
-                .saturating_sub(*sched_tool_calls) as usize,
+                .remaining_tool_calls(*sched_tool_calls) as usize,
         );
         let budget_denied = calls.len().saturating_sub(permitted_prefix);
         for (i, (id, name, arguments)) in calls.iter().enumerate().skip(permitted_prefix) {
@@ -318,8 +657,8 @@ impl crate::Agent {
                     entry.completion_index = completion_order.len() as u32;
                 }
                 done += 1;
-                *sched_tool_calls += 1;
-                *sched_serial_runs += 1;
+                saturating_add_scheduler_count(sched_tool_calls, 1);
+                saturating_add_scheduler_count(sched_serial_runs, 1);
                 *sched_max_concurrent = (*sched_max_concurrent).max(1);
             }
         }
@@ -329,18 +668,20 @@ impl crate::Agent {
         let initially_executed = if self.config.gates.dry_run {
             0
         } else {
-            done.saturating_sub(budget_denied) as u32
+            done.saturating_sub(budget_denied)
         };
         if initially_executed > 0 {
-            *sched_tool_calls = (*sched_tool_calls).saturating_add(initially_executed);
-            *sched_serial_runs = (*sched_serial_runs).saturating_add(initially_executed);
+            saturating_add_scheduler_count(sched_tool_calls, initially_executed);
+            saturating_add_scheduler_count(sched_serial_runs, initially_executed);
             *sched_max_concurrent = (*sched_max_concurrent).max(1);
         }
         // Proactive per-edit checks: kicked off in the background as
         // mutating calls complete, awaited after the batch so any
         // syntax/lint error surfaces during the turn (before turn-end
         // verify) while the edit is still the model's focus. Each entry
-        // is (path, check label, join handle of the check).
+        // is (path, check label, abort-on-drop handle of the check). The
+        // ownership is important now that checks have no default deadline:
+        // cancelling a turn must not detach an unlimited child process.
         let mut pending_checks: Vec<PendingCheck> = Vec::new();
         // Project-relative paths mutated in this tool batch — drives
         // mid-turn LSP diagnostics + affected cargo check.
@@ -433,7 +774,7 @@ impl crate::Agent {
                 ui.status(
                     "⚠ tool scheduler could not make progress; marking unresolved calls as skipped",
                 );
-                *sched_tool_calls += unresolved.len() as u32;
+                saturating_add_scheduler_count(sched_tool_calls, unresolved.len());
                 for i in unresolved {
                     let (id, name, arguments) = &calls[i];
                     ui.tool_call_id(id, name, arguments);
@@ -511,8 +852,8 @@ impl crate::Agent {
                             entry.completion_index = completion_order.len() as u32;
                         }
                         done += 1;
-                        *sched_tool_calls += 1;
-                        *sched_serial_runs += 1;
+                        saturating_add_scheduler_count(sched_tool_calls, 1);
+                        saturating_add_scheduler_count(sched_serial_runs, 1);
                         *sched_max_concurrent = (*sched_max_concurrent).max(1);
                         continue;
                     }
@@ -555,8 +896,8 @@ impl crate::Agent {
                             entry.completion_index = completion_order.len() as u32;
                         }
                         done += 1;
-                        *sched_tool_calls += 1;
-                        *sched_serial_runs += 1;
+                        saturating_add_scheduler_count(sched_tool_calls, 1);
+                        saturating_add_scheduler_count(sched_serial_runs, 1);
                         *sched_max_concurrent = (*sched_max_concurrent).max(1);
                         continue;
                     }
@@ -597,8 +938,8 @@ impl crate::Agent {
                         entry.completion_index = completion_order.len() as u32;
                     }
                     done += 1;
-                    *sched_tool_calls += 1;
-                    *sched_serial_runs += 1;
+                    saturating_add_scheduler_count(sched_tool_calls, 1);
+                    saturating_add_scheduler_count(sched_serial_runs, 1);
                     *sched_max_concurrent = (*sched_max_concurrent).max(1);
                     continue;
                 }
@@ -608,7 +949,8 @@ impl crate::Agent {
                 let started = std::time::Instant::now();
                 let ui_ref: &mut dyn Ui = &mut *ui;
                 let lsp = self.runtime.lsp();
-                let output = execute_streaming_in_runtime(
+                let output = execute_streaming_in_runtime_with_runner(
+                    self.runtime.process_runner(),
                     self.runtime.root(),
                     self.runtime.state_root(),
                     &lsp,
@@ -657,12 +999,14 @@ impl crate::Agent {
                     validation_succeeded,
                     output.effects.mutation_applied,
                 );
-                let progress = tool_guardrail.record_tool_result_with_effects(
-                    name,
-                    arguments,
-                    &semantic_output,
-                    output.effects.mutation_applied,
-                );
+                let progress = progress_tracker
+                    .tool_guardrail
+                    .record_tool_result_with_effects(
+                        name,
+                        arguments,
+                        &semantic_output,
+                        output.effects.mutation_applied,
+                    );
                 if progress.running_background_poll {
                     running_background_poll_results += 1;
                 }
@@ -712,8 +1056,8 @@ impl crate::Agent {
                 }
                 done += 1;
                 // Bash runs alone → a serial run and a batch of size 1.
-                *sched_tool_calls += 1;
-                *sched_serial_runs += 1;
+                saturating_add_scheduler_count(sched_tool_calls, 1);
+                saturating_add_scheduler_count(sched_serial_runs, 1);
                 *sched_max_concurrent = (*sched_max_concurrent).max(1);
                 continue;
             }
@@ -730,9 +1074,10 @@ impl crate::Agent {
                 .filter(|&i| calls[i].1 == "explore")
                 .collect();
             if !explore_indices.is_empty() {
-                // Prepare jobs for all ready explores (budget permitting).
+                // Prepare jobs for all ready explores. Their count is
+                // unlimited; concurrent fan-out remains bounded below.
                 let mut prepared: Vec<(usize, ExploreJob)> = Vec::new();
-                let mut budget_denied_explores: Vec<usize> = Vec::new();
+                let mut unavailable_explores: Vec<usize> = Vec::new();
                 for &i in &explore_indices {
                     let (id, _, arguments) = &calls[i];
                     if let Some(job) = self.prepare_explore(arguments) {
@@ -742,23 +1087,22 @@ impl crate::Agent {
                         ui.tool_call_id(id, "explore", arguments);
                         prepared.push((i, job));
                     } else {
-                        budget_denied_explores.push(i);
+                        unavailable_explores.push(i);
                     }
                 }
-                // Complete budget-denied explores immediately.
-                for i in budget_denied_explores {
+                // Complete malformed/unavailable explores immediately.
+                for i in unavailable_explores {
                     let (id, _, arguments) = &calls[i];
                     ui.tool_call_id(id, "explore", arguments);
-                    let msg = format!(
-                        "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_TURN} subagents \
-                         this turn); investigate directly for the rest of this turn."
-                    );
+                    let msg = "explore unavailable: could not prepare the requested subagent; \
+                               investigate directly."
+                        .to_string();
                     let output = explore_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
                     emit_tool_output(&mut *ui, id, "explore", &output);
                     let signature = inspection_signature("explore", arguments);
                     let progress_label = ToolProgressLabel::new(
                         ProgressKind::Weak,
-                        "explore budget exhausted",
+                        "explore unavailable",
                         signature,
                     );
                     progress_tracker.record_tool(&progress_label);
@@ -777,8 +1121,8 @@ impl crate::Agent {
                         entry.completion_index = completion_order.len() as u32;
                     }
                     done += 1;
-                    *sched_tool_calls += 1;
-                    *sched_serial_runs += 1;
+                    saturating_add_scheduler_count(sched_tool_calls, 1);
+                    saturating_add_scheduler_count(sched_serial_runs, 1);
                 }
                 // Run prepared explores concurrently and consume each result as
                 // soon as it finishes. UI progress no longer waits for the
@@ -832,12 +1176,14 @@ impl crate::Agent {
                         validation_succeeded,
                         output.effects.mutation_applied,
                     );
-                    let progress = tool_guardrail.record_tool_result_with_effects(
-                        "explore",
-                        arguments,
-                        &semantic_output,
-                        output.effects.mutation_applied,
-                    );
+                    let progress = progress_tracker
+                        .tool_guardrail
+                        .record_tool_result_with_effects(
+                            "explore",
+                            arguments,
+                            &semantic_output,
+                            output.effects.mutation_applied,
+                        );
                     if progress.hashable_idempotent {
                         hashable_idempotent_results += 1;
                         if progress.repeated_idempotent_result {
@@ -875,7 +1221,7 @@ impl crate::Agent {
                         entry.completion_index = completion_order.len() as u32;
                     }
                     done += 1;
-                    *sched_tool_calls += 1;
+                    saturating_add_scheduler_count(sched_tool_calls, 1);
                 }
                 *sched_max_concurrent = (*sched_max_concurrent).max(max_concurrent as u32);
                 continue;
@@ -892,7 +1238,7 @@ impl crate::Agent {
                 .filter(|&i| calls[i].1 == "delegate")
                 .collect();
             if delegate_indices.len() > 1 {
-                // Prepare all delegate jobs (budget, runner, file-set extraction).
+                // Prepare all delegate jobs (optional quota, runner, file-set extraction).
                 let mut prepared_delegates: Vec<(usize, DelegateJob, u64)> = Vec::new();
                 let mut delegate_prep_failed: Vec<usize> = Vec::new();
                 for &i in &delegate_indices {
@@ -919,20 +1265,25 @@ impl crate::Agent {
                     for i in delegate_prep_failed {
                         let (id, _, arguments) = &calls[i];
                         ui.tool_call_id(id, "delegate", arguments);
-                        let msg = format!(
-                            "delegate budget exhausted ({} this turn); implement the rest directly for this turn.",
-                            delegate_turn_limit(),
-                        );
+                        let limit = delegate_turn_limit();
+                        let (msg, label) =
+                            if limit != u32::MAX && self.subagents.delegate_turn_used >= limit {
+                                (delegate_limit_denial(limit), "delegate limit reached")
+                            } else {
+                                (
+                                    "delegate unavailable: could not prepare the requested \
+                                     subagent; implement it directly."
+                                        .to_string(),
+                                    "delegate unavailable",
+                                )
+                            };
                         let mut output =
                             synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
                         output.effects.mutation_attempted = true;
                         emit_tool_output(&mut *ui, id, "delegate", &output);
                         let signature = inspection_signature("delegate", arguments);
-                        let progress_label = ToolProgressLabel::new(
-                            ProgressKind::Weak,
-                            "delegate budget exhausted",
-                            signature,
-                        );
+                        let progress_label =
+                            ToolProgressLabel::new(ProgressKind::Weak, label, signature);
                         progress_tracker.record_tool(&progress_label);
                         tool_progress_labels.push(progress_label.clone());
                         tool_timeline.push(tool_entry(
@@ -949,7 +1300,7 @@ impl crate::Agent {
                             entry.completion_index = completion_order.len() as u32;
                         }
                         done += 1;
-                        *sched_tool_calls += 1;
+                        saturating_add_scheduler_count(sched_tool_calls, 1);
                     }
                     // Capture turn snapshot + checkpoint before any delegate
                     // mutates the tree (same as the serial path).
@@ -991,9 +1342,9 @@ impl crate::Agent {
                             completed[*i] = true;
                             completion_order.push(*i);
                             done += 1;
-                            *sched_tool_calls += 1;
+                            saturating_add_scheduler_count(sched_tool_calls, 1);
                         }
-                        *sched_serial_runs += prepared_delegates.len() as u32;
+                        saturating_add_scheduler_count(sched_serial_runs, prepared_delegates.len());
                         *sched_max_concurrent = (*sched_max_concurrent).max(1);
                         continue;
                     }
@@ -1049,12 +1400,14 @@ impl crate::Agent {
                             validation_succeeded,
                             output.effects.mutation_applied,
                         );
-                        let progress = tool_guardrail.record_tool_result_with_effects(
-                            "delegate",
-                            arguments,
-                            &semantic_output,
-                            output.effects.mutation_applied,
-                        );
+                        let progress = progress_tracker
+                            .tool_guardrail
+                            .record_tool_result_with_effects(
+                                "delegate",
+                                arguments,
+                                &semantic_output,
+                                output.effects.mutation_applied,
+                            );
                         if progress.hashable_idempotent {
                             hashable_idempotent_results += 1;
                             if progress.repeated_idempotent_result {
@@ -1100,7 +1453,7 @@ impl crate::Agent {
                             entry.completion_index = completion_order.len() as u32;
                         }
                         done += 1;
-                        *sched_tool_calls += 1;
+                        saturating_add_scheduler_count(sched_tool_calls, 1);
                     }
                     *sched_max_concurrent = (*sched_max_concurrent).max(max_concurrent as u32);
                     continue;
@@ -1185,8 +1538,8 @@ impl crate::Agent {
                                 entry.completion_index = completion_order.len() as u32;
                             }
                             done += 1;
-                            *sched_tool_calls += 1;
-                            *sched_serial_runs += 1;
+                            saturating_add_scheduler_count(sched_tool_calls, 1);
+                            saturating_add_scheduler_count(sched_serial_runs, 1);
                             *sched_max_concurrent = (*sched_max_concurrent).max(1);
                             continue;
                         }
@@ -1233,8 +1586,8 @@ impl crate::Agent {
                             entry.completion_index = completion_order.len() as u32;
                         }
                         done += 1;
-                        *sched_tool_calls += 1;
-                        *sched_serial_runs += 1;
+                        saturating_add_scheduler_count(sched_tool_calls, 1);
+                        saturating_add_scheduler_count(sched_serial_runs, 1);
                         *sched_max_concurrent = (*sched_max_concurrent).max(1);
                         continue;
                     }
@@ -1277,12 +1630,14 @@ impl crate::Agent {
                     validation_succeeded,
                     output.effects.mutation_applied,
                 );
-                let progress = tool_guardrail.record_tool_result_with_effects(
-                    name,
-                    arguments,
-                    &semantic_output,
-                    output.effects.mutation_applied,
-                );
+                let progress = progress_tracker
+                    .tool_guardrail
+                    .record_tool_result_with_effects(
+                        name,
+                        arguments,
+                        &semantic_output,
+                        output.effects.mutation_applied,
+                    );
                 if progress.hashable_idempotent {
                     hashable_idempotent_results += 1;
                     if progress.repeated_idempotent_result {
@@ -1329,8 +1684,8 @@ impl crate::Agent {
                 }
                 done += 1;
                 // Runs alone, like bash.
-                *sched_tool_calls += 1;
-                *sched_serial_runs += 1;
+                saturating_add_scheduler_count(sched_tool_calls, 1);
+                saturating_add_scheduler_count(sched_serial_runs, 1);
                 *sched_max_concurrent = (*sched_max_concurrent).max(1);
                 continue;
             }
@@ -1338,7 +1693,7 @@ impl crate::Agent {
             // completion order as the ready order (within a concurrent
             // batch, relative order doesn't matter — none depend on
             // each other, or they wouldn't all be ready).
-            let batch_size = ready.len() as u32;
+            let batch_size = ready.len();
             // Small ready sets should start immediately; broad cheap-read waves
             // scale to the configured cap. Mutating/coordination-heavy batches
             // stay narrower to preserve foreground responsiveness.
@@ -1502,6 +1857,7 @@ impl crate::Agent {
             let root = self.runtime.root().to_path_buf();
             let state_root = self.runtime.state_root().to_path_buf();
             let lsp = self.runtime.lsp();
+            let process_runner = self.runtime.process_runner().clone();
             let executions = approved
                 .iter()
                 .map(|&i| {
@@ -1520,6 +1876,7 @@ impl crate::Agent {
                     let background = self.runtime.background();
                     let read_cache = self.runtime.read_cache();
                     let repo_map = self.runtime.repo_map_arc();
+                    let process_runner = process_runner.clone();
                     let mcp = self.mcp.clone();
                     let memory = self.memory.clone();
                     let calls = &calls;
@@ -1529,7 +1886,8 @@ impl crate::Agent {
                         } else if let Some(prepared) = prepared {
                             execute_prepared_in_runtime(lsp, read_cache, prepared).await
                         } else {
-                            execute_in_runtime_shared_with(
+                            execute_in_runtime_shared_with_runner(
+                                &process_runner,
                                 root,
                                 state_root,
                                 lsp,
@@ -1552,10 +1910,10 @@ impl crate::Agent {
             let batch_duration_ms = batch_started.elapsed().as_millis() as u64;
             // Scheduler telemetry: count every call in the ready batch,
             // but report actual concurrency after the configured cap.
-            *sched_tool_calls += batch_size;
+            saturating_add_scheduler_count(sched_tool_calls, batch_size);
             *sched_max_concurrent = (*sched_max_concurrent).max(actual_concurrency);
             if actual_concurrency == 1 {
-                *sched_serial_runs += batch_size;
+                saturating_add_scheduler_count(sched_serial_runs, batch_size);
             }
             // Handle denied calls first: emit their headers and "skipped" results.
             for &i in &denied {
@@ -1605,8 +1963,74 @@ impl crate::Agent {
                 }
                 done += 1;
             }
-            for (i, output) in outputs {
+            // A write/check in the same provider batch is valid evidence even
+            // when scheduler completion order happens to visit update_plan
+            // first. Compute this over the complete successful batch.
+            let batch_supplies_plan_completion_evidence = implementation_tracker.mutation_seen
+                || implementation_tracker.validation_seen
+                || outputs.iter().any(|(index, output)| {
+                    output.status == hi_tools::ToolStatus::Succeeded
+                        && (output.effects.mutation_applied
+                            || (tool_satisfies_validation(output)
+                                && crate::steering::implementation_tool_call_validates(
+                                    &calls[*index].1,
+                                    &calls[*index].2,
+                                )))
+                });
+            for (i, mut output) in outputs {
                 let name = &calls[i].1;
+                let mut unsupported_completion_claims = Vec::new();
+                // In plan mode, `update_plan` describes work to execute after
+                // approval; it is not evidence that the work already ran. A
+                // weak model can otherwise flip a freshly drafted checklist
+                // from 0/N to N/N in one bookkeeping-only call, clearing the
+                // durable plan and making the UI look as though the edits and
+                // checks happened. Preserve completion established before
+                // entering plan mode, but keep all unfinished work pending.
+                if name == "update_plan"
+                    && self.plan_mode
+                    && let Some(plan) = output.plan.as_mut()
+                {
+                    let corrected = normalize_plan_mode_update(self.goals.plan(), plan);
+                    let done = plan
+                        .iter()
+                        .filter(|step| step.status == PlanStatus::Done)
+                        .count();
+                    output.content = format!(
+                        "Plan recorded: {done}/{} done. Plan mode keeps unexecuted steps pending until approval.",
+                        plan.len()
+                    );
+                    if corrected > 0 {
+                        ui.status(&format!(
+                            "kept {corrected} unexecuted plan step(s) pending until plan approval"
+                        ));
+                    }
+                }
+                if name == "update_plan"
+                    && !self.plan_mode
+                    && let Some(plan) = output.plan.as_mut()
+                {
+                    unsupported_completion_claims = normalize_unsupported_plan_completion(
+                        self.goals.plan(),
+                        plan,
+                        &calls[i].2,
+                        batch_supplies_plan_completion_evidence,
+                    );
+                    let corrected = unsupported_completion_claims.len();
+                    if corrected > 0 {
+                        let done = plan
+                            .iter()
+                            .filter(|step| step.status == PlanStatus::Done)
+                            .count();
+                        output.content = format!(
+                            "Plan recorded: {done}/{} done. Kept {corrected} implementation step(s) unfinished because this turn lacks mutation or validation evidence scoped to those steps. Do the work, or add a concrete per-step completion_evidence reason when no change is genuinely required.",
+                            plan.len()
+                        );
+                        ui.status(&format!(
+                            "kept {corrected} unsupported implementation completion claim(s) unfinished"
+                        ));
+                    }
+                }
                 // Emit the transcript header immediately before its
                 // result — in a concurrent batch this pairs each header
                 // with its own result in completion order.
@@ -1640,12 +2064,14 @@ impl crate::Agent {
                     validation_succeeded,
                     output.effects.mutation_applied,
                 );
-                let progress = tool_guardrail.record_tool_result_with_effects(
-                    name,
-                    &calls[i].2,
-                    &semantic_output,
-                    output.effects.mutation_applied,
-                );
+                let progress = progress_tracker
+                    .tool_guardrail
+                    .record_tool_result_with_effects(
+                        name,
+                        &calls[i].2,
+                        &semantic_output,
+                        output.effects.mutation_applied,
+                    );
                 if progress.running_background_poll {
                     running_background_poll_results += 1;
                 }
@@ -1694,7 +2120,6 @@ impl crate::Agent {
                 if calls[i].1 == "update_plan"
                     && let Some(plan) = output.plan.as_deref()
                 {
-                    let _ = self.goals.replace_plan(plan);
                     if let Some(session) = self.session.as_mut() {
                         if plan_has_pending_steps(plan) {
                             session.record_plan(plan)?;
@@ -1704,6 +2129,10 @@ impl crate::Agent {
                             session.clear_plan()?;
                         }
                     }
+                    // Publish live state only after its durable write succeeds.
+                    // Otherwise an I/O error leaves this process showing a new
+                    // plan while restart restores the old one.
+                    let _ = self.goals.replace_plan(plan);
                     // Stage long-horizon progress without changing the
                     // live/durable goal. The turn-end gate commits this
                     // proposal only after current-revision verification
@@ -1716,6 +2145,12 @@ impl crate::Agent {
                         let turn_start_active = current_goal.active_index();
                         let goal = proposed_goal.get_or_insert_with(|| current_goal.clone());
                         apply_plan_to_goal(goal, plan, turn_start_active);
+                        // Normalizing an unsupported `done` claim back to the
+                        // current status must not erase the durable warning
+                        // that the claim happened. Keep the note separately;
+                        // unlike replaying the raw plan, this cannot advance
+                        // the active step without execution evidence.
+                        goal.record_unsupported_completion_claims(&unsupported_completion_claims);
                         *plan_updated_goal = true;
                     }
                 }
@@ -1735,13 +2170,15 @@ impl crate::Agent {
                     {
                         let root = self.runtime.root().to_path_buf();
                         let check = cmd.to_string();
+                        let check_label = check.clone();
                         let check_path = std::path::PathBuf::from(&path);
+                        let handle = tokio::spawn(async move {
+                            hi_tools::run_fast_check_in(&root, &check, &check_path).await
+                        });
                         pending_checks.push((
                             path,
-                            check.clone(),
-                            tokio::spawn(async move {
-                                hi_tools::run_fast_check_in(&root, &check, &check_path).await
-                            }),
+                            check_label,
+                            tokio_util::task::AbortOnDropHandle::new(handle),
                         ));
                     }
                 }
@@ -1832,6 +2269,8 @@ impl crate::Agent {
         }
 
         Ok(ToolBatchOutcome {
+            calls: calls.to_vec(),
+            read_only_intent,
             hash_guard_applies,
             hashable_idempotent_results,
             repeated_idempotent_results,
@@ -1844,6 +2283,718 @@ impl crate::Agent {
             interrupted_coordination_calls,
             protocol_validation_errors,
             unknown_background_handles: self.runtime.background().unknown_handles(),
+            program_fallback_exhausted: false,
         })
+    }
+
+    /// Execute one negotiated program as a single provider-facing tool
+    /// result. Nested calls are visible as activity rows only; they never get
+    /// appended to the provider transcript independently.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "program execution must share the turn's existing accounting and UI state"
+    )]
+    async fn execute_program_batch(
+        &mut self,
+        calls: &[(String, String, String)],
+        completion_content: &mut Vec<Content>,
+        read_only_intent: Option<crate::steering::ReviewIntent>,
+        progress_tracker: &mut ProgressTracker,
+        tool_timeline: &mut ToolTimeline,
+        sched_tool_calls: &mut u32,
+        sched_max_concurrent: &mut u32,
+        sched_serial_runs: &mut u32,
+        speculation_registry: &SpeculationRegistry,
+        program_fallback_next: &mut bool,
+        program_fallback_used: &mut bool,
+        ui: &mut dyn Ui,
+    ) -> Result<ToolBatchOutcome> {
+        let started = std::time::Instant::now();
+        let mut program_fallback_exhausted = false;
+        let (program_index, (id, _, arguments)) = calls
+            .iter()
+            .enumerate()
+            .find(|(_, (_, name, _))| name == "run_program")
+            .expect("program batch is entered with at least one program call");
+        let mut outer_status = hi_tools::ToolStatus::Succeeded;
+        let outcome = if calls.len() != 1 {
+            outer_status = hi_tools::ToolStatus::Failed;
+            ProgramOutcome::Failed {
+                error: "run_program must be the only tool call in a completion; retry with ordinary structured tools".into(),
+                calls: Vec::new(),
+            }
+        } else if !self.config.program.mode_enabled() {
+            outer_status = hi_tools::ToolStatus::Denied;
+            ProgramOutcome::Failed {
+                error: "run_program is disabled; retry with ordinary structured tools".into(),
+                calls: Vec::new(),
+            }
+        } else {
+            match serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("source")
+                        .and_then(|source| source.as_str())
+                        .map(str::to_owned)
+                }) {
+                Some(source) => {
+                    if self.config.program.speculation_enabled() {
+                        self.launch_program_speculation(speculation_registry, id, &source);
+                    }
+                    let remaining_calls = self.max_tool_calls_cap().map(|_| {
+                        self.config
+                            .loop_limits
+                            .remaining_tool_calls(*sched_tool_calls)
+                            .saturating_sub(1) as usize
+                    });
+                    let outcome = self
+                        .run_program_host(source, id, speculation_registry, remaining_calls, ui)
+                        .await;
+                    speculation_registry.cancel_all();
+                    let _ = speculation_registry.telemetry();
+                    outcome
+                }
+                None => {
+                    outer_status = hi_tools::ToolStatus::Failed;
+                    ProgramOutcome::Failed {
+                        error: "run_program requires a string `source` argument; retry with ordinary structured tools".into(),
+                        calls: Vec::new(),
+                    }
+                }
+            }
+        };
+        if matches!(outcome, ProgramOutcome::Cancelled { .. }) {
+            outer_status = hi_tools::ToolStatus::Cancelled;
+        } else if matches!(outcome, ProgramOutcome::Failed { .. }) {
+            outer_status = hi_tools::ToolStatus::Failed;
+            // Give the model one ordinary-tool recovery request. This flag is
+            // consumed while shaping that next request, so a repeated model
+            // failure cannot create an unbounded fallback loop.
+            if *program_fallback_used {
+                program_fallback_exhausted = true;
+            } else {
+                *program_fallback_used = true;
+                *program_fallback_next = true;
+            }
+        }
+        let aggregate = match &outcome {
+            ProgramOutcome::Succeeded { result, calls } => serde_json::json!({
+                "status": "succeeded",
+                "result": result,
+                "calls": calls,
+            }),
+            ProgramOutcome::Failed { error, calls } => serde_json::json!({
+                "status": "failed",
+                "error": error,
+                "calls": calls,
+            }),
+            ProgramOutcome::Cancelled { calls } => serde_json::json!({
+                "status": "cancelled",
+                "error": "program cancelled",
+                "calls": calls,
+            }),
+        };
+        let raw = serde_json::to_string(&aggregate).unwrap_or_else(|_| {
+            "{\"status\":\"failed\",\"error\":\"program result was not serializable\"}".into()
+        });
+        let (content, _) = hi_tools::bound_tool_content(raw);
+        if calls.len() != 1 {
+            // The provider cannot receive an assistant tool-use without a
+            // matching result. Keep only the rejected program envelope in
+            // the transcript; ordinary calls are deliberately not executed
+            // and will be regenerated on the one-shot fallback request.
+            let program_id = &calls[program_index].0;
+            completion_content
+                .retain(|block| !matches!(block, Content::ToolCall { id, .. } if id != program_id));
+        }
+        let output = synthetic_tool_outcome(content.clone(), outer_status);
+        ui.tool_call_id(id, "run_program", arguments);
+        emit_tool_output(&mut *ui, id, "run_program", &output);
+        let label = ToolProgressLabel::new(
+            if outer_status == hi_tools::ToolStatus::Succeeded {
+                ProgressKind::Meaningful
+            } else {
+                ProgressKind::Weak
+            },
+            "program execution",
+            inspection_signature("run_program", arguments),
+        );
+        progress_tracker.record_tool(&label);
+        tool_timeline.push(tool_entry(
+            "run_program".into(),
+            String::new(),
+            started.elapsed().as_millis() as u64,
+            &output,
+            &label,
+        ));
+        let nested_calls = match &outcome {
+            ProgramOutcome::Succeeded { calls, .. }
+            | ProgramOutcome::Failed { calls, .. }
+            | ProgramOutcome::Cancelled { calls } => calls.len(),
+        };
+        // A program is one provider-facing envelope, but each nested operation
+        // consumes the same turn budget as an ordinary structured tool call.
+        saturating_add_scheduler_count(sched_tool_calls, 1);
+        saturating_add_scheduler_count(sched_tool_calls, nested_calls);
+        *sched_serial_runs = sched_serial_runs.saturating_add(1);
+        *sched_max_concurrent = (*sched_max_concurrent).max(1);
+        self.messages.push_assistant_with_results(
+            std::mem::take(completion_content),
+            vec![(id.clone(), content)],
+        );
+        Ok(ToolBatchOutcome {
+            calls: calls.to_vec(),
+            read_only_intent,
+            hash_guard_applies: false,
+            hashable_idempotent_results: 0,
+            repeated_idempotent_results: 0,
+            running_background_poll_results: 0,
+            actionable_poll_results: 0,
+            wait_flavored_results: 0,
+            tool_progress_labels: vec![label],
+            plan_changed_this_batch: false,
+            interrupted_calls: usize::from(outer_status == hi_tools::ToolStatus::Cancelled),
+            interrupted_coordination_calls: 0,
+            protocol_validation_errors: Vec::new(),
+            unknown_background_handles: self.runtime.background().unknown_handles(),
+            program_fallback_exhausted,
+        })
+    }
+
+    /// Launch only the conservative, explicitly classified prefix of a
+    /// streamed program. This method is shared by the provider-delta path and
+    /// the final completion path; the registry makes repeated prefixes cheap
+    /// and prevents duplicate shadow calls.
+    pub(crate) fn launch_program_speculation(
+        &self,
+        speculation_registry: &SpeculationRegistry,
+        program_id: &str,
+        source: &str,
+    ) {
+        self.program_speculator()
+            .launch(speculation_registry, program_id, source);
+    }
+
+    pub(crate) fn program_speculator(&self) -> ProgramSpeculator {
+        ProgramSpeculator {
+            runner: self.program_tool_runner(),
+            turn_id: format!("turn-{}", self.turn_count),
+            enabled: self.config.program.speculation_enabled()
+                && self.provider.capabilities().streamed_tool_call_deltas,
+            // A speculative external request must not get ahead of an
+            // approval prompt that the ordinary real path would show. In Ask
+            // mode the egress policy currently requires approval for fetch/
+            // research, so disable the whole external shadow class for this
+            // turn while retaining local speculation.
+            external_allowed: !egress_confirm_required(
+                self.permission_mode,
+                self.config.gates.confirm_edits,
+                "web_fetch",
+            ),
+            max_calls: self.config.program.max_speculative_calls,
+            context_generation: self.runtime.context_generation(),
+            ledger_revision: self.runtime.ledger().revision(),
+            external_freshness_epoch: external_freshness_epoch(
+                self.config.program.external_ttl_seconds,
+            ),
+        }
+    }
+
+    async fn run_program_host(
+        &mut self,
+        source: String,
+        program_call_id: &str,
+        speculation_registry: &SpeculationRegistry,
+        max_calls: Option<usize>,
+        ui: &mut dyn Ui,
+    ) -> ProgramOutcome {
+        let cancel = CancellationToken::new();
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        let params = ProgramRunParams {
+            source,
+            host_tx,
+            cancel: cancel.clone(),
+            max_ops: ProgramRunParams::DEFAULT_MAX_OPS,
+            max_calls,
+        };
+        let mut task = tokio::task::spawn_blocking(move || hi_workflow::run_program(params));
+        let turn_cancellation = self.turn_cancellation.clone();
+        let watcher_cancel = cancel.clone();
+        let watcher = tokio::spawn(async move {
+            loop {
+                if turn_cancellation
+                    .as_ref()
+                    .is_some_and(crate::TurnCancellation::is_cancelled)
+                {
+                    watcher_cancel.cancel();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+        let _run_guard = ProgramRunGuard::new(cancel.clone(), watcher);
+        let program = async {
+            loop {
+                tokio::select! {
+                    joined = &mut task => {
+                        break match joined {
+                            Ok(outcome) => outcome,
+                            Err(error) => ProgramOutcome::Failed { error: format!("program worker failed: {error}"), calls: Vec::new() },
+                        };
+                    }
+                    request = host_rx.recv() => {
+                        let Some(request) = request else {
+                            // The worker owns the last sender, so channel
+                            // closure normally races with its successful task
+                            // settlement. Join it instead of manufacturing a
+                            // failure based on which ready select branch won.
+                            break match (&mut task).await {
+                                Ok(outcome) => outcome,
+                                Err(error) => ProgramOutcome::Failed {
+                                    error: format!("program worker failed: {error}"),
+                                    calls: Vec::new(),
+                                },
+                            };
+                        };
+                        match request {
+                            ProgramHostRequest::ExecuteTool { call, reply } => {
+                                let (result, output) = if let Some(denied) =
+                                    self.authorize_program_call(&call, ui).await
+                                {
+                                    denied
+                                } else {
+                                    self.resolve_program_call(
+                                        &call,
+                                        program_call_id,
+                                        speculation_registry,
+                                        &cancel,
+                                    )
+                                    .await
+                                };
+                                ui.tool_call_id(&format!("program:{}", call.occurrence), &call.name, &serde_json::to_string(&call.arguments).unwrap_or_default());
+                                emit_tool_output(ui, &format!("program:{}", call.occurrence), &call.name, &output);
+                                let _ = reply.send(result);
+                            }
+                            ProgramHostRequest::ParallelTools { calls, reply } => {
+                                // Confirm externally visible calls before spawning
+                                // the parallel batch. This keeps confirmation on
+                                // the real path and avoids borrowing the UI from
+                                // several concurrent futures.
+                                let mut authorized_calls = Vec::with_capacity(calls.len());
+                                for call in calls {
+                                    let denied = self.authorize_program_call(&call, ui).await;
+                                    authorized_calls.push((call, denied));
+                                }
+                                let agent = &*self;
+                                let parallelism = agent.config.loop_limits.max_parallel_tools.clamp(1, 8);
+                                let outputs = futures_util::stream::iter(authorized_calls.into_iter().map(|(call, denied)| {
+                                    let registry = speculation_registry.clone();
+                                    let cancel = cancel.clone();
+                                    let program_call_id = program_call_id.to_string();
+                                    async move {
+                                        let result = match denied {
+                                            Some(denied) => denied,
+                                            None => agent
+                                                .resolve_program_call(
+                                                    &call,
+                                                    &program_call_id,
+                                                    &registry,
+                                                    &cancel,
+                                                )
+                                                .await,
+                                        };
+                                        (call, result)
+                                    }
+                                }))
+                                .buffer_unordered(parallelism)
+                                .collect::<Vec<_>>()
+                                .await;
+                                let mut outputs = outputs;
+                                outputs.sort_by_key(|(call, _)| call.occurrence);
+                                let mut results = Vec::with_capacity(outputs.len());
+                                let mut parallel_error = None;
+                                for (call, (result, output)) in outputs {
+                                    let nested_id = format!("program:{}", call.occurrence);
+                                    let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+                                    ui.tool_call_id(&nested_id, &call.name, &args);
+                                    emit_tool_output(ui, &nested_id, &call.name, &output);
+                                    match result {
+                                        Ok(value) => results.push(value),
+                                        Err(error) => {
+                                            parallel_error = Some(error);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(error) = parallel_error {
+                                    let _ = reply.send(Err(error));
+                                } else {
+                                    let _ = reply.send(Ok(results));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        // The program has no independent wall-clock deadline. Cancellation is
+        // propagated by the watcher above, while each nested tool retains its
+        // own transport/process policy. This avoids aborting productive
+        // multi-tool programs solely because 60 seconds elapsed.
+        program.await
+    }
+
+    async fn resolve_program_call(
+        &self,
+        call: &ProgramCall,
+        program_call_id: &str,
+        speculation_registry: &SpeculationRegistry,
+        cancel: &CancellationToken,
+    ) -> (
+        std::result::Result<hi_workflow::ProgramToolResult, String>,
+        hi_tools::ToolOutcome,
+    ) {
+        let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+        let key = SpeculationKey::new(
+            format!("turn-{}", self.turn_count),
+            program_call_id,
+            call.occurrence,
+            &call.name,
+            &args,
+            self.runtime.context_generation(),
+            self.runtime.ledger().revision(),
+            if matches!(
+                hi_tools::speculation_class(&call.name),
+                hi_tools::SpeculationClass::IdempotentExternal
+            ) {
+                external_freshness_epoch(self.config.program.external_ttl_seconds)
+            } else {
+                0
+            },
+        );
+        let claimed = if self.config.program.speculation_enabled() {
+            speculation_registry
+                .claim_exact_cancelled(&key, Some(cancel))
+                .await
+        } else {
+            None
+        };
+        match claimed {
+            Some(Ok(value)) => {
+                let status = match value.status.as_str() {
+                    "succeeded" => hi_tools::ToolStatus::Succeeded,
+                    "cancelled" => hi_tools::ToolStatus::Cancelled,
+                    "denied" => hi_tools::ToolStatus::Denied,
+                    _ => hi_tools::ToolStatus::Failed,
+                };
+                let output = synthetic_tool_outcome(value.output.clone(), status);
+                (Ok(value), output)
+            }
+            Some(Err(error)) => {
+                let output = synthetic_tool_outcome(error.clone(), hi_tools::ToolStatus::Failed);
+                (Err(error), output)
+            }
+            None => {
+                tokio::select! {
+                    _ = cancel.cancelled() => (
+                        Err("program cancelled".to_string()),
+                        synthetic_tool_outcome(
+                            "program cancelled".to_string(),
+                            hi_tools::ToolStatus::Cancelled,
+                        ),
+                    ),
+                    result = self.execute_program_tool(call) => result,
+                }
+            }
+        }
+    }
+
+    /// Apply the same egress confirmation policy as ordinary tool batches.
+    /// This runs only after the program has been selected as the real
+    /// completion; shadow calls never reach this method.
+    async fn authorize_program_call(
+        &mut self,
+        call: &ProgramCall,
+        ui: &mut dyn Ui,
+    ) -> Option<(
+        std::result::Result<hi_workflow::ProgramToolResult, String>,
+        hi_tools::ToolOutcome,
+    )> {
+        if !egress_confirm_required(
+            self.permission_mode,
+            self.config.gates.confirm_edits,
+            &call.name,
+        ) {
+            return None;
+        }
+        if self.approval_parked {
+            return Some(program_denied_result(call, PARKED_TOOL_RESULT.to_string()));
+        }
+        let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
+        let decision = ui
+            .confirm(confirmation_for_egress_tool(&call.name, &arguments))
+            .await;
+        if decision == ConfirmationResult::Approved {
+            return None;
+        }
+        if decision == ConfirmationResult::Parked {
+            self.note_approval_parked(ui);
+        } else if decision == ConfirmationResult::Unavailable {
+            ui.status("confirmation required, but this frontend cannot answer it; rerun interactively or disable --confirm-edits");
+        }
+        let message = match decision {
+            ConfirmationResult::Parked => PARKED_TOOL_RESULT.to_string(),
+            ConfirmationResult::Unavailable => {
+                "External tool call skipped because confirmation is unavailable.".to_string()
+            }
+            _ => "External tool call denied by confirmation.".to_string(),
+        };
+        Some(program_denied_result(call, message))
+    }
+
+    async fn execute_program_tool(
+        &self,
+        call: &ProgramCall,
+    ) -> (
+        std::result::Result<hi_workflow::ProgramToolResult, String>,
+        hi_tools::ToolOutcome,
+    ) {
+        self.program_tool_runner().execute(call).await
+    }
+
+    fn program_tool_runner(&self) -> ProgramToolRunner {
+        ProgramToolRunner {
+            root: self.runtime.root().to_path_buf(),
+            state_root: self.runtime.state_root().to_path_buf(),
+            process_runner: self.runtime.process_runner().clone(),
+            lsp: self.runtime.lsp(),
+            background: self.runtime.background_arc(),
+            read_cache: self.runtime.read_cache_arc(),
+            repo_map: self.runtime.repo_map_arc(),
+            mcp: self.mcp.clone(),
+            memory: self.memory.clone(),
+        }
+    }
+}
+
+fn program_denied_result(
+    call: &ProgramCall,
+    message: String,
+) -> (
+    std::result::Result<hi_workflow::ProgramToolResult, String>,
+    hi_tools::ToolOutcome,
+) {
+    let output = synthetic_tool_outcome(message.clone(), hi_tools::ToolStatus::Denied);
+    (
+        Ok(hi_workflow::ProgramToolResult {
+            index: call.occurrence,
+            name: call.name.clone(),
+            status: "denied".into(),
+            output: message,
+        }),
+        output,
+    )
+}
+
+fn external_freshness_epoch(ttl_seconds: u64) -> u64 {
+    let ttl_seconds = ttl_seconds.max(1);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() / ttl_seconds)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod scheduler_count_tests {
+    use super::{
+        ProgramRunGuard, normalize_unsupported_plan_completion,
+        plan_step_requires_execution_evidence, saturating_add_scheduler_count,
+    };
+    use hi_tools::{PlanStatus, PlanStep};
+
+    fn step(title: &str, status: PlanStatus) -> PlanStep {
+        PlanStep {
+            title: title.into(),
+            status,
+        }
+    }
+
+    #[test]
+    fn implementation_plan_completion_requires_execution_evidence() {
+        let title = "Build VoteInstruction::Vote transaction from tower decision";
+        assert!(plan_step_requires_execution_evidence(title));
+        assert!(plan_step_requires_execution_evidence(
+            "Wire vote transaction signing"
+        ));
+        assert!(plan_step_requires_execution_evidence(
+            "Persist vote state in SQLite"
+        ));
+        assert!(plan_step_requires_execution_evidence(
+            "Run the final test suite"
+        ));
+        assert!(
+            !plan_step_requires_execution_evidence("Understand fixture behavior"),
+            "a substring of a read-only subject must not look like an implementation verb"
+        );
+        let current = vec![step(title, PlanStatus::Active)];
+        let mut proposed = vec![step(title, PlanStatus::Done)];
+        let arguments = serde_json::json!({
+            "steps": [{"title": title, "status": "done"}]
+        })
+        .to_string();
+
+        assert_eq!(
+            normalize_unsupported_plan_completion(&current, &mut proposed, &arguments, false,),
+            vec![0]
+        );
+        assert_eq!(proposed[0].status, PlanStatus::Active);
+
+        let mut with_execution = vec![step(title, PlanStatus::Done)];
+        assert_eq!(
+            normalize_unsupported_plan_completion(&current, &mut with_execution, &arguments, true,),
+            Vec::<usize>::new()
+        );
+        assert_eq!(with_execution[0].status, PlanStatus::Done);
+
+        let current = vec![
+            step("Build parser", PlanStatus::Active),
+            step("Persist parser state", PlanStatus::Pending),
+        ];
+        let mut bulk_done = vec![
+            step("Build parser", PlanStatus::Done),
+            step("Persist parser state", PlanStatus::Done),
+        ];
+        let arguments = serde_json::json!({
+            "steps": [
+                {"title": "Build parser", "status": "done"},
+                {"title": "Persist parser state", "status": "done"}
+            ]
+        })
+        .to_string();
+        assert_eq!(
+            normalize_unsupported_plan_completion(&current, &mut bulk_done, &arguments, true,),
+            vec![1],
+            "one turn-global mutation must not self-certify every plan step"
+        );
+        assert_eq!(bulk_done[0].status, PlanStatus::Done);
+        assert_eq!(bulk_done[1].status, PlanStatus::Pending);
+    }
+
+    #[test]
+    fn explicit_per_step_no_change_evidence_can_complete_implementation() {
+        let title = "Implement compatibility shim";
+        let current = vec![step(title, PlanStatus::Active)];
+        let mut proposed = vec![step(title, PlanStatus::Done)];
+        let arguments = serde_json::json!({
+            "steps": [{
+                "title": title,
+                "status": "done",
+                "completion_evidence": "Existing implementation already handles both formats; focused test passed."
+            }]
+        })
+        .to_string();
+
+        assert_eq!(
+            normalize_unsupported_plan_completion(&current, &mut proposed, &arguments, false,),
+            Vec::<usize>::new()
+        );
+        assert_eq!(proposed[0].status, PlanStatus::Done);
+
+        for generic in ["done", "already done", "no changes required"] {
+            let mut unsupported = vec![step(title, PlanStatus::Done)];
+            let arguments = serde_json::json!({
+                "steps": [{
+                    "title": title,
+                    "status": "done",
+                    "completion_evidence": generic
+                }]
+            })
+            .to_string();
+            assert_eq!(
+                normalize_unsupported_plan_completion(
+                    &current,
+                    &mut unsupported,
+                    &arguments,
+                    false,
+                ),
+                vec![0],
+                "generic evidence {generic:?} bypassed the guard"
+            );
+            assert_eq!(unsupported[0].status, PlanStatus::Active);
+        }
+    }
+
+    #[test]
+    fn read_only_or_previously_done_steps_are_not_reopened() {
+        let mut inspection = vec![step("Inspect the vote path", PlanStatus::Done)];
+        assert_eq!(
+            normalize_unsupported_plan_completion(
+                &[step("Inspect the vote path", PlanStatus::Active)],
+                &mut inspection,
+                r#"{"steps":[{"title":"Inspect the vote path","status":"done"}]}"#,
+                false,
+            ),
+            Vec::<usize>::new()
+        );
+
+        let title = "Build vote transaction";
+        let mut retained = vec![step(title, PlanStatus::Done)];
+        assert_eq!(
+            normalize_unsupported_plan_completion(
+                &[step(title, PlanStatus::Done)],
+                &mut retained,
+                r#"{"steps":[{"title":"Build vote transaction","status":"done"}]}"#,
+                false,
+            ),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn scheduler_count_saturates_instead_of_wrapping() {
+        let mut total = u32::MAX - 1;
+        saturating_add_scheduler_count(&mut total, 2);
+        assert_eq!(total, u32::MAX);
+
+        saturating_add_scheduler_count(&mut total, 1);
+        assert_eq!(total, u32::MAX);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn scheduler_count_clamps_oversized_host_counts() {
+        let mut total = 0;
+        saturating_add_scheduler_count(&mut total, (u32::MAX as usize) + 1);
+        assert_eq!(total, u32::MAX);
+    }
+
+    #[tokio::test]
+    async fn dropping_program_run_guard_cancels_unlimited_blocking_worker() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (host_tx, _host_rx) = tokio::sync::mpsc::unbounded_channel();
+        let params = hi_workflow::ProgramRunParams {
+            source: "loop {}".into(),
+            host_tx,
+            cancel: cancel.clone(),
+            max_ops: hi_workflow::ProgramRunParams::DEFAULT_MAX_OPS,
+            max_calls: None,
+        };
+        let worker = tokio::task::spawn_blocking(move || hi_workflow::run_program(params));
+        let watcher = tokio::spawn(std::future::pending::<()>());
+        let guard = ProgramRunGuard::new(cancel.clone(), watcher);
+
+        tokio::task::yield_now().await;
+        drop(guard);
+
+        assert!(cancel.is_cancelled());
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .expect("drop cancellation should stop the unlimited program")
+            .expect("program worker should join cleanly");
+        assert!(matches!(
+            outcome,
+            hi_workflow::ProgramOutcome::Cancelled { .. }
+        ));
     }
 }

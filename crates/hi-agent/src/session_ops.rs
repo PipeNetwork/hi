@@ -99,13 +99,24 @@ pub fn handle_session_command(
                     agent.set_plan_mode(false);
                     "plan mode off — normal editing resumed".into()
                 }
-                "pause" => {
-                    agent.set_plan_drive_paused(true);
-                    "plan drive paused — checklist stays pinned; /plan resume to continue".into()
-                }
+                "pause" => match agent.try_set_plan_drive_paused(true) {
+                    Ok(_) => "plan drive paused — checklist stays pinned; /plan resume to continue"
+                        .into(),
+                    Err(error) => format!("plan pause failed: {error:#}"),
+                },
                 "resume" => {
-                    agent.set_plan_drive_paused(false);
-                    agent.reset_plan_drive_stall();
+                    if let Err(error) = agent.resume_plan_drive() {
+                        return Some(SessionCommandEffect {
+                            message: format!("plan resume failed: {error:#}"),
+                            follow_up_prompt: None,
+                        });
+                    }
+                    if agent.plan_approval_parked() {
+                        return Some(SessionCommandEffect {
+                            message: "plan approval is parked — /view-plan to review it".into(),
+                            follow_up_prompt: None,
+                        });
+                    }
                     if agent.plan_incomplete() && !agent.plan_mode() {
                         return Some(SessionCommandEffect {
                             message: "plan drive resumed".into(),
@@ -134,14 +145,19 @@ pub fn handle_session_command(
                     agent.set_plan_mode(true);
                     return Some(SessionCommandEffect {
                         message: "plan mode on — draft a plan without mutating the tree".into(),
-                        follow_up_prompt: Some(plan_mode_prompt("")),
+                        // Queue human task text; `run_turn_core` owns the
+                        // ephemeral mode wrapper so classifiers and durable
+                        // task state never mistake control prose for the task.
+                        follow_up_prompt: Some(
+                            "Draft a clear implementation plan for the current task.".into(),
+                        ),
                     });
                 }
                 request => {
                     agent.set_plan_mode(true);
                     return Some(SessionCommandEffect {
                         message: format!("plan mode on — planning: {request}"),
-                        follow_up_prompt: Some(plan_mode_prompt(request)),
+                        follow_up_prompt: Some(request.to_string()),
                     });
                 }
             }
@@ -262,6 +278,7 @@ pub fn handle_session_command(
                 inspect_report(agent, matches!(a, "json" | "--json" | "-j"))
             }
         }
+        Command::Engine(arg) => agent.engine_command(arg),
         Command::Agents(arg) => agents_report(agent.workspace_root(), arg),
         Command::Share(arg) => share_report(agent, arg),
         Command::McpAdmin(arg) => mcp_admin_report(arg),
@@ -894,6 +911,31 @@ pub async fn run_hook(workspace: &Path, name: &str, input: &str) -> Result<Strin
     if !path.is_file() {
         bail!("hook not found: {}", path.display());
     }
+    run_hook_process(workspace, name, input, hook_timeout()).await
+}
+
+fn hook_timeout_from_value(value: Option<&str>) -> Option<std::time::Duration> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(std::time::Duration::from_secs)
+}
+
+/// Optional operator-selected lifecycle-hook timeout. Hooks are trusted,
+/// productive project work and therefore have no wall-clock ceiling by
+/// default. Whole-turn cancellation still tears down their process group.
+fn hook_timeout() -> Option<std::time::Duration> {
+    let configured = std::env::var("HI_HOOK_TIMEOUT_SECS").ok();
+    hook_timeout_from_value(configured.as_deref())
+}
+
+async fn run_hook_process(
+    workspace: &Path,
+    name: &str,
+    input: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<String> {
+    let path = workspace.join(".hi").join("hooks").join(name);
     let mut command = tokio::process::Command::new(&path);
     command
         .current_dir(workspace)
@@ -903,29 +945,72 @@ pub async fn run_hook(workspace: &Path, name: &str, input: &str) -> Result<Strin
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     command.kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command
         .spawn()
         .with_context(|| format!("spawning hook {}", path.display()))?;
-    // Write stdin and wait under one deadline. A hook that never reads stdin
-    // used to block forever on `write_all` (pipe buffer full) *before* the
-    // wait timeout started — stalling the coding turn at pre-turn.
-    const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    let output = tokio::time::timeout(HOOK_TIMEOUT, async {
-        if let Some(mut stdin) = child.stdin.take() {
+    let mut process_group = HookProcessGroupGuard::for_child(&child);
+    let mut stdin_task = child.stdin.take().map(|mut stdin| {
+        let input = input.as_bytes().to_vec();
+        tokio::spawn(async move {
             use tokio::io::AsyncWriteExt as _;
-            stdin.write_all(input.as_bytes()).await?;
-            drop(stdin);
-        }
-        child.wait_with_output().await
-    })
-    .await
-    .with_context(|| format!("hook {name} timed out after 30s"))??;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
+            stdin.write_all(&input).await?;
+            stdin.shutdown().await
+        })
+    });
+    let stdout = child.stdout.take().context("hook stdout was not piped")?;
+    let stderr = child.stderr.take().context("hook stderr was not piped")?;
+    let mut stdout_task = tokio::spawn(read_hook_output(stdout));
+    let mut stderr_task = tokio::spawn(read_hook_output(stderr));
+
+    let execution = async {
+        let status = child.wait().await;
+        // A hook may daemonize after its direct script exits. The lifecycle
+        // action is complete at the script boundary, so reap any remaining
+        // descendants before waiting for inherited output pipes to close.
+        process_group.terminate();
+        let status = status.context("waiting for hook process")?;
+
+        let drains = tokio::time::timeout(HOOK_PIPE_DRAIN_GRACE, async {
+            if let Some(task) = stdin_task.as_mut() {
+                task.await.context("joining hook stdin writer")??;
+            }
+            let stdout = (&mut stdout_task)
+                .await
+                .context("joining hook stdout reader")??;
+            let stderr = (&mut stderr_task)
+                .await
+                .context("joining hook stderr reader")??;
+            Ok::<_, anyhow::Error>((stdout, stderr))
+        })
+        .await;
+        let (stdout, stderr) = match drains {
+            Ok(result) => result?,
+            Err(_) => {
+                if let Some(task) = stdin_task.as_ref() {
+                    task.abort();
+                }
+                stdout_task.abort();
+                stderr_task.abort();
+                bail!("hook output pipes did not close after process-group cleanup");
+            }
+        };
+        Ok::<_, anyhow::Error>((status, stdout, stderr))
+    };
+
+    let (status, stdout, stderr) = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, execution)
+            .await
+            .with_context(|| format!("hook {name} timed out after {}s", timeout.as_secs()))??,
+        None => execution.await?,
+    };
+    let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+    if !status.success() {
         bail!(
             "hook {name} failed ({}): {}",
-            output.status.code().unwrap_or(-1),
+            status.code().unwrap_or(-1),
             if stderr.is_empty() { stdout } else { stderr }
         );
     }
@@ -958,6 +1043,88 @@ pub async fn run_hook(workspace: &Path, name: &str, input: &str) -> Result<Strin
     } else {
         format!("hook {name}:\n{stdout}")
     })
+}
+
+const MAX_HOOK_OUTPUT_BYTES: usize = 1024 * 1024;
+const HOOK_PIPE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn read_hook_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    const HEAD_BYTES: usize = MAX_HOOK_OUTPUT_BYTES / 2;
+    const TAIL_BYTES: usize = MAX_HOOK_OUTPUT_BYTES - HEAD_BYTES;
+    const OMITTED: &[u8] = b"\n[... hook output truncated ...]\n";
+    let mut head = Vec::with_capacity(HEAD_BYTES);
+    let mut tail = std::collections::VecDeque::with_capacity(TAIL_BYTES);
+    let mut total = 0usize;
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        total = total.saturating_add(count);
+        for &byte in &buffer[..count] {
+            if head.len() < HEAD_BYTES {
+                head.push(byte);
+            } else {
+                if tail.len() == TAIL_BYTES {
+                    tail.pop_front();
+                }
+                tail.push_back(byte);
+            }
+        }
+    }
+    if total > MAX_HOOK_OUTPUT_BYTES {
+        head.extend_from_slice(OMITTED);
+    }
+    head.extend(tail);
+    Ok(head)
+}
+
+#[cfg(unix)]
+struct HookProcessGroupGuard {
+    process_group: Option<libc::pid_t>,
+}
+
+#[cfg(unix)]
+impl HookProcessGroupGuard {
+    fn for_child(child: &tokio::process::Child) -> Self {
+        Self {
+            process_group: child.id().map(|pid| pid as libc::pid_t),
+        }
+    }
+
+    fn terminate(&mut self) {
+        if let Some(process_group) = self.process_group.take() {
+            // SAFETY: the child was spawned as leader of a private process
+            // group; a negative PID targets only that group. ESRCH is benign.
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HookProcessGroupGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(not(unix))]
+struct HookProcessGroupGuard;
+
+#[cfg(not(unix))]
+impl HookProcessGroupGuard {
+    fn for_child(_child: &tokio::process::Child) -> Self {
+        Self
+    }
+
+    fn terminate(&mut self) {}
 }
 
 pub fn hooks_command(workspace: &Path, arg: &str) -> String {
@@ -1334,18 +1501,49 @@ pub fn format_tasks_report(
 
 pub fn plan_mode_prompt(user_request: &str) -> String {
     let base = "\
-You are in PLAN MODE. Do not modify files or run mutating commands.
+Plan mode is ON for this turn. Do not modify files or run mutating commands.
 Produce a clear, ordered implementation plan the user can approve.
-Prefer the update_plan tool to record steps. Ask clarifying questions if needed.
+Prefer the update_plan tool to record steps. Its checklist represents future
+implementation work: keep new or unexecuted steps pending, and mark a step done
+only if it was already completed before this planning turn. Finishing the plan
+itself does not finish its implementation steps. Ask clarifying questions if needed.
 When the plan is ready, stop and wait — the user will leave plan mode to execute.";
+    // `/plan <request>` already queues this wrapper as its follow-up prompt;
+    // `run_turn_core` also applies it to every turn that starts in plan mode so
+    // Shift-Tab has identical semantics. Keep the operation idempotent.
+    if user_request
+        .trim_start()
+        .starts_with(crate::transcript::TURN_CONTROL_START)
+    {
+        return user_request.to_string();
+    }
     if user_request.trim().is_empty() {
         format!(
-            "{base}\n\nThe user enabled plan mode without a specific request — \
-summarize what you know of the task so far and propose next steps."
+            "{}\n{base}\nThe user enabled plan mode without a specific request — \
+summarize what you know of the task so far and propose next steps.\n{}",
+            crate::transcript::TURN_CONTROL_START,
+            crate::transcript::TURN_CONTROL_END,
         )
     } else {
-        format!("{base}\n\nUser request:\n{}", user_request.trim())
+        format!(
+            "{}\n{base}\n{}\n\nUser request:\n{}",
+            crate::transcript::TURN_CONTROL_START,
+            crate::transcript::TURN_CONTROL_END,
+            user_request.trim()
+        )
     }
+}
+
+/// Authoritative per-turn counter-control for normal operation. Models that
+/// saw a prior planning turn must not infer that its mode restriction remains
+/// active after `/plan off` or Shift-Tab restores mutation-capable tools.
+pub(crate) fn normal_mode_prompt(user_request: &str) -> String {
+    format!(
+        "{}\nPlan mode is OFF for this turn. Earlier plan-mode controls are historical and no longer apply. Follow the current user request and the currently advertised tool permissions; do not claim that plan mode blocks an action.\n{}\n\n{}",
+        crate::transcript::TURN_CONTROL_START,
+        crate::transcript::TURN_CONTROL_END,
+        user_request.trim()
+    )
 }
 
 #[cfg(test)]
@@ -1361,6 +1559,21 @@ mod tests {
             role: Role::Assistant,
             content: vec![hi_ai::Content::Text(t.into())],
         }
+    }
+
+    #[test]
+    fn mode_prompts_are_delimited_and_current_turn_authoritative() {
+        let plan = plan_mode_prompt("build profiles");
+        assert!(plan.starts_with(crate::transcript::TURN_CONTROL_START));
+        assert!(plan.contains("Plan mode is ON for this turn"));
+        assert!(plan.contains("User request:\nbuild profiles"));
+        assert_eq!(plan_mode_prompt(&plan), plan, "plan wrapping is idempotent");
+
+        let normal = normal_mode_prompt("build all of that");
+        assert!(normal.starts_with(crate::transcript::TURN_CONTROL_START));
+        assert!(normal.contains("Plan mode is OFF for this turn"));
+        assert!(normal.contains("Earlier plan-mode controls are historical"));
+        assert!(normal.ends_with("build all of that"));
     }
 
     #[test]
@@ -1513,6 +1726,127 @@ mod tests {
             .to_string();
         assert!(error.contains("untrusted"), "{error}");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hook_timeout_is_opt_in_and_zero_means_unlimited() {
+        assert_eq!(hook_timeout_from_value(None), None);
+        assert_eq!(hook_timeout_from_value(Some("")), None);
+        assert_eq!(hook_timeout_from_value(Some("0")), None);
+        assert_eq!(hook_timeout_from_value(Some("invalid")), None);
+        assert_eq!(
+            hook_timeout_from_value(Some("17")),
+            Some(std::time::Duration::from_secs(17))
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_test_hook(root: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let hooks = root.join(".hi/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let path = hooks.join("pre-turn");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only probes a PID created by the test and does not
+        // alter process state.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_exits(pid: libc::pid_t) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while process_is_alive(pid) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!process_is_alive(pid), "hook descendant {pid} leaked");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_hook_reaps_daemonized_descendants_without_waiting_for_their_pipes() {
+        let root = tempfile::tempdir().unwrap();
+        write_test_hook(
+            root.path(),
+            "sleep 30 &\necho $! > child.pid\nprintf '{\"version\":1,\"decision\":\"allow\",\"message\":\"done\"}\\n'",
+        );
+        // Keep the watchdog strictly outside the implementation's bounded
+        // pipe-drain grace. Equal deadlines made this test flaky under load:
+        // the outer timer could win before cleanup returned (or before its
+        // specific error surfaced), even though the process group was killed.
+        let watchdog = HOOK_PIPE_DRAIN_GRACE + std::time::Duration::from_secs(3);
+        let report = tokio::time::timeout(
+            watchdog,
+            run_hook_process(root.path(), "pre-turn", "input", None),
+        )
+        .await
+        .expect("daemonized hook must not wedge output drain")
+        .unwrap();
+        assert!(report.contains("done"), "{report}");
+
+        let pid: libc::pid_t = std::fs::read_to_string(root.path().join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_exits(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_hook_timeout_reaps_the_complete_process_group() {
+        let root = tempfile::tempdir().unwrap();
+        // Leave enough startup headroom for a heavily loaded test host. The
+        // timeout begins after `spawn`, but the OS may not schedule the shell
+        // quickly enough to create `child.pid` under concurrent PTY campaigns.
+        // Keep the descendant far beyond the deadline so the assertion still
+        // proves timeout-driven process-group cleanup rather than natural exit.
+        write_test_hook(root.path(), "sleep 30 &\necho $! > child.pid\nwait");
+        let error = run_hook_process(
+            root.path(),
+            "pre-turn",
+            "input",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("timed out"), "{error}");
+
+        let pid: libc::pid_t = std::fs::read_to_string(root.path().join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_exits(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_output_is_drained_concurrently_and_retained_with_a_bound() {
+        let root = tempfile::tempdir().unwrap();
+        write_test_hook(
+            root.path(),
+            "i=0\nwhile [ $i -lt 30000 ]; do\n  printf 'stdout-abcdefghijklmnopqrstuvwxyz-0123456789\\n'\n  printf 'stderr-abcdefghijklmnopqrstuvwxyz-0123456789\\n' >&2\n  i=$((i + 1))\ndone",
+        );
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_hook_process(root.path(), "pre-turn", "input", None),
+        )
+        .await
+        .expect("noisy hook must not block on full pipes")
+        .unwrap();
+        assert!(
+            report.len() <= MAX_HOOK_OUTPUT_BYTES + 128,
+            "{}",
+            report.len()
+        );
+        assert!(report.contains("hook output truncated"));
     }
 
     #[test]

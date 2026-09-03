@@ -579,7 +579,7 @@ pub(super) fn delegate_risk_relevant(task: &str) -> bool {
 
 pub(super) fn repository_tools_relevant(task: &str, intent: TaskIntent) -> bool {
     if intent == TaskIntent::ReadOnly
-        && crate::task_contract::prompt_requests_exact_text_response(task)
+        && crate::task_contract::prompt_requests_tool_free_response(task)
     {
         return false;
     }

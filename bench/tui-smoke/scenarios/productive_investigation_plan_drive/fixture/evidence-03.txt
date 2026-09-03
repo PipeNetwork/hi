@@ -1,0 +1,1 @@
+GAMMA_SETTLEMENT: every started turn records one typed settlement.

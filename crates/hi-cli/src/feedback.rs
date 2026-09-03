@@ -8,6 +8,8 @@ use serde_json::json;
 
 use crate::config::{ProviderName, Settings};
 
+const DISABLE_FEEDBACK_ENV: &str = "HI_DISABLE_FEEDBACK";
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct FeedbackState {
     last_prompt_day: Option<u64>,
@@ -22,7 +24,8 @@ pub(crate) fn session_id_from_path(path: &Path) -> String {
 }
 
 pub(crate) async fn maybe_prompt_and_submit(settings: &Settings, session_id: &str) {
-    if settings.provider != ProviderName::Pipenetwork
+    if feedback_disabled()
+        || settings.provider != ProviderName::Pipenetwork
         || !io::stdin().is_terminal()
         || !io::stdout().is_terminal()
     {
@@ -47,6 +50,20 @@ pub(crate) async fn maybe_prompt_and_submit(settings: &Settings, session_id: &st
     if let Err(err) = submit_feedback(settings, session_id, choice).await {
         eprintln!("\x1b[33mfeedback not recorded: {err:#}\x1b[0m");
     }
+}
+
+fn feedback_disabled() -> bool {
+    std::env::var(DISABLE_FEEDBACK_ENV)
+        .ok()
+        .as_deref()
+        .is_some_and(feedback_disabled_value)
+}
+
+fn feedback_disabled_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on" | "yes"
+    )
 }
 
 fn claim_prompt_day(path: &Path, today: u64) -> bool {
@@ -157,7 +174,7 @@ fn current_day() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_prompt_day, session_id_from_path};
+    use super::{claim_prompt_day, feedback_disabled_value, session_id_from_path};
     use std::path::Path;
 
     #[test]
@@ -182,5 +199,15 @@ mod tests {
         assert!(claim_prompt_day(&path, 43));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn feedback_opt_out_accepts_only_truthy_values() {
+        for value in ["1", "true", "TRUE", " on ", "yes", "YeS"] {
+            assert!(feedback_disabled_value(value), "value {value:?}");
+        }
+        for value in ["", "0", "false", "off", "no", "anything"] {
+            assert!(!feedback_disabled_value(value), "value {value:?}");
+        }
     }
 }

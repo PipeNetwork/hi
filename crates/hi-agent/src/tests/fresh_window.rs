@@ -147,7 +147,10 @@ async fn compact_window_kind_uses_the_no_summary_path() {
 
     assert_eq!(agent.messages().len(), 2);
     assert!(agent.messages()[1].text().contains("ship the exporter"));
-    assert!(!agent.messages().iter().any(|m| m.text().contains("q1")));
+    assert!(
+        !agent.messages()[1].text().contains("q1"),
+        "the prior conversation must not survive in the retained task message"
+    );
 }
 
 #[test]
@@ -252,7 +255,7 @@ fn fresh_window_resets_drive_stall_so_the_goal_can_keep_running() {
             .set_structured_goal(Some(Goal::new("ship it", vec!["step one".into()])))
             .unwrap()
     );
-    agent.restore_goal_drive(3);
+    agent.restore_goal_drive(3, Vec::new());
     assert_eq!(agent.goal_drive_stall(), 3);
 
     agent.compact_fresh_window(&mut NullUi).unwrap();
@@ -265,6 +268,72 @@ fn fresh_window_resets_drive_stall_so_the_goal_can_keep_running() {
         ),
         "unparked after a new window epoch"
     );
+}
+
+#[test]
+fn plan_recovery_window_drops_poisoned_history_but_keeps_stall_evidence() {
+    let mut agent = agent(vec![], config());
+    let evidence_hash = "a".repeat(64);
+    agent.restore_plan(vec![hi_tools::PlanStep {
+        title: "Build vote transaction".into(),
+        status: hi_tools::PlanStatus::Active,
+    }]);
+    agent.restore_plan_drive_with_policy(false, false, 2, vec![evidence_hash.clone()]);
+    agent.messages_mut().push(Message::user("old drive prompt"));
+    agent.messages_mut().push(Message::assistant(vec![
+        Content::Text("Now I have everything I need.".into()),
+        Content::ToolCall {
+            id: "read-again".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"src/network.rs"}"#.into(),
+        },
+    ]));
+    agent
+        .messages_mut()
+        .push(Message::tool_result("read-again", "same old output"));
+
+    let mut ui = RecordingUi::default();
+    agent.apply_plan_recovery_window(&mut ui).unwrap();
+
+    assert_eq!(agent.messages().len(), 1, "old loop history was retained");
+    assert_eq!(agent.messages()[0].role, Role::System);
+    assert_eq!(agent.plan_drive_stall(), 2, "recovery renewed the stall");
+    assert_eq!(
+        agent.plan_drive_evidence.snapshot(),
+        vec![evidence_hash],
+        "recovery made prior inspection novel again"
+    );
+    assert!(agent.plan_incomplete());
+    assert!(ui.statuses.iter().any(|status| {
+        status.contains("fresh plan-recovery context")
+            && status.contains("no-progress evidence kept")
+    }));
+}
+
+#[tokio::test]
+async fn automatic_drive_window_does_not_renew_plan_orientation() {
+    let mut cfg = config();
+    cfg.memory.auto_compact = true;
+    cfg.routing.context_window = Some(100_000);
+    let mut agent = agent(vec![], cfg);
+    let evidence_hash = "c".repeat(64);
+    agent.restore_plan(vec![hi_tools::PlanStep {
+        title: "Implement the parser".into(),
+        status: hi_tools::PlanStatus::Active,
+    }]);
+    agent.restore_plan_drive_with_policy(false, false, 0, vec![evidence_hash.clone()]);
+    agent.report.context_used = 90_000;
+    agent.messages_mut().push(Message::user("old drive"));
+
+    assert!(
+        agent
+            .maybe_reclaim_context(&mut NullUi, true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(agent.plan_drive_stall(), 0);
+    assert_eq!(agent.plan_drive_evidence.snapshot(), vec![evidence_hash]);
+    assert_eq!(agent.messages().len(), 1, "old context was not dropped");
 }
 
 #[tokio::test]
@@ -289,7 +358,7 @@ async fn goal_drive_auto_fresh_window_instead_of_summarize() {
             )))
             .unwrap()
     );
-    agent.restore_goal_drive(3);
+    agent.restore_goal_drive(3, Vec::new());
     agent.report.context_used = 180_000;
     agent.messages_mut().push(Message::user("old question"));
     agent
@@ -332,6 +401,10 @@ async fn goal_drive_auto_fresh_window_instead_of_summarize() {
         prompt.contains("new context window"),
         "re-orient note: {prompt}"
     );
-    assert_eq!(agent.goal_drive_stall(), 0);
+    assert_eq!(
+        agent.goal_drive_stall(),
+        3,
+        "automatic transport rollover must not renew semantic progress"
+    );
     assert_eq!(agent.token_budget.window_id, 1);
 }

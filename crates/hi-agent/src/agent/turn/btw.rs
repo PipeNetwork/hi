@@ -754,21 +754,32 @@ async fn answer_one_btw_question(
             StreamEvent::Warning(text) => ui.top_status(&text),
             StreamEvent::Reasoning(_) => {}
             StreamEvent::WireAudit(_) => {}
+            StreamEvent::ToolCallDelta { .. } => {}
         };
 
-        let completion = match job.provider.stream(request, &mut sink).await {
-            Ok(c) => {
-                // Usage is telemetry — drop if the bounded channel is full
-                // rather than blocking the side job's model stream.
-                let _ = report_tx.try_send(BtwJobReport::Usage(c.usage));
-                c
-            }
-            Err(err) => {
-                let msg = format!("(could not answer side question: {err:#})");
-                ui.btw_answer(&msg);
-                return;
-            }
-        };
+        // The outer deadline must also cover the provider stream itself. A
+        // provider that stops yielding before the tool phase would otherwise
+        // bypass the deadline checks below and hold the side-channel task
+        // forever.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let completion =
+            match tokio::time::timeout(remaining, job.provider.stream(request, &mut sink)).await {
+                Err(_) => {
+                    ui.btw_answer("(side question timed out while waiting for the provider)");
+                    return;
+                }
+                Ok(Ok(c)) => {
+                    // Usage is telemetry — drop if the bounded channel is full
+                    // rather than blocking the side job's model stream.
+                    let _ = report_tx.try_send(BtwJobReport::Usage(c.usage));
+                    c
+                }
+                Ok(Err(err)) => {
+                    let msg = format!("(could not answer side question: {err:#})");
+                    ui.btw_answer(&msg);
+                    return;
+                }
+            };
 
         let calls = completion.tool_calls();
         if calls.is_empty() || last_round {

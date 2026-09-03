@@ -36,7 +36,7 @@ pub(super) enum QualityCascadeAction {
         force_tools: bool,
         force_text: bool,
     },
-    /// Budget exhausted — stall incomplete.
+    /// Budget exhausted — preserve the best available answer.
     Exhausted {
         mode: AnswerRepairMode,
         status: String,
@@ -163,7 +163,7 @@ fn evaluate_cascade_mode(
                 Some(QualityCascadeAction::Exhausted {
                     mode,
                     status:
-                        "review still had no inspected evidence after repair; stopping incomplete"
+                        "review still had no inspected evidence after repair; returning the available answer"
                             .into(),
                 })
             }
@@ -227,7 +227,9 @@ fn evaluate_cascade_mode(
             } else {
                 Some(QualityCascadeAction::Exhausted {
                     mode,
-                    status: "review answer stayed generic after repair; stopping incomplete".into(),
+                    status:
+                        "review answer stayed generic after repair; returning the available answer"
+                            .into(),
                 })
             }
         }
@@ -248,7 +250,7 @@ fn evaluate_cascade_mode(
                 Some(QualityCascadeAction::Exhausted {
                     mode,
                     status:
-                        "review still had only listing evidence after repair; stopping incomplete"
+                        "review still had only listing evidence after repair; returning the available answer"
                             .into(),
                 })
             }
@@ -268,7 +270,7 @@ fn evaluate_cascade_mode(
             } else {
                 Some(QualityCascadeAction::Exhausted {
                     mode,
-                    status: "review still had targeted search but no file reads after repair; stopping incomplete".into(),
+                    status: "review still had targeted search but no file reads after repair; returning the available answer".into(),
                 })
             }
         }
@@ -288,7 +290,7 @@ fn evaluate_cascade_mode(
             } else {
                 Some(QualityCascadeAction::Exhausted {
                     mode,
-                    status: "security review still missed required pattern families after repair; stopping incomplete".into(),
+                    status: "security review still missed required pattern families after repair; returning the available answer".into(),
                 })
             }
         }
@@ -307,7 +309,7 @@ fn evaluate_cascade_mode(
             } else {
                 Some(QualityCascadeAction::Exhausted {
                     mode,
-                    status: "security answer still overclaimed after repair; stopping incomplete"
+                    status: "security answer still overclaimed after repair; returning the available answer"
                         .into(),
                 })
             }
@@ -328,7 +330,7 @@ fn evaluate_cascade_mode(
                 Some(QualityCascadeAction::Exhausted {
                     mode,
                     status:
-                        "gap answer still overclaimed after search matches; stopping incomplete"
+                        "gap answer still overclaimed after search matches; returning the available answer"
                             .into(),
                 })
             }
@@ -442,7 +444,7 @@ mod tests {
         let evidence = EvidenceTracker {
             saw_read: true,
             saw_search: true,
-            inspected_paths: vec!["src/auth.rs".into()],
+            inspected_paths: vec!["src/auth.rs".into()].into(),
             ..Default::default()
         };
         let budgets = ReviewRepairBudgets {
@@ -544,7 +546,7 @@ mod tests {
             let evidence = EvidenceTracker {
                 saw_search: true,
                 saw_read: true,
-                inspected_paths: vec!["src/lib.rs".into()],
+                inspected_paths: vec!["src/lib.rs".into()].into(),
                 ..Default::default()
             };
             let action = select_review_quality_repair(
@@ -568,7 +570,7 @@ mod tests {
         {
             let evidence = EvidenceTracker {
                 saw_read: true,
-                inspected_paths: vec!["src/a.rs".into()],
+                inspected_paths: vec!["src/a.rs".into()].into(),
                 ..Default::default()
             };
             let action = select_review_quality_repair(
@@ -593,7 +595,7 @@ mod tests {
         {
             let evidence = EvidenceTracker {
                 saw_read: true,
-                inspected_paths: vec!["src/parser.rs".into()],
+                inspected_paths: vec!["src/parser.rs".into()].into(),
                 ..Default::default()
             };
             let action = select_review_quality_repair(

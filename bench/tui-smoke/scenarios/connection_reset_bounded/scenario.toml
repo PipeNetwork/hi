@@ -1,0 +1,65 @@
+schema_version = 1
+name = "connection-reset-bounded-recovery"
+tags = ["curated"]
+timeout_ms = 60000
+
+[[provider.steps]]
+id = "transport-reset-1"
+[provider.steps.response]
+kind = "reset"
+
+[[provider.steps]]
+id = "transport-reset-2"
+[provider.steps.response]
+kind = "reset"
+
+[[provider.steps]]
+id = "transport-reset-3"
+[provider.steps.response]
+kind = "reset"
+
+[[provider.steps]]
+id = "transport-reset-4"
+[provider.steps.response]
+kind = "reset"
+
+[[provider.steps]]
+id = "transport-reset-5"
+[provider.steps.response]
+kind = "reset"
+
+[[provider.steps]]
+id = "recovered-answer"
+[provider.steps.response]
+kind = "text"
+text = "The connection reset campaign recovered after its transport budget."
+
+[[actions]]
+kind = "send_line"
+text = "Recover from the scripted connection reset campaign."
+
+[[actions]]
+kind = "wait_provider_request"
+count = 6
+timeout_ms = 30000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed" }
+timeout_ms = 15000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 6
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

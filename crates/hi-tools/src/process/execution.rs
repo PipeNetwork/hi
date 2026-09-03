@@ -34,8 +34,21 @@ const MAX_STREAM_LINE_BYTES: usize = 64 * 1024;
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 pub(super) async fn capture_child(
-    mut child: tokio::process::Child,
+    child: tokio::process::Child,
     timeout: Duration,
+    on_line: &mut (dyn FnMut(&str) + Send),
+    started: Instant,
+) -> Result<ProcessExecution> {
+    capture_child_maybe_timeout(child, Some(timeout), on_line, started).await
+}
+
+/// Capture a child with an optional outer deadline. `None` deliberately means
+/// that completion is bounded only by the caller's cancellation/drop path.
+/// This is used by long-lived internal workers, while ordinary shell tools
+/// continue to call [`capture_child`] with an explicit timeout.
+pub(super) async fn capture_child_maybe_timeout(
+    mut child: tokio::process::Child,
+    timeout: Option<Duration>,
     on_line: &mut (dyn FnMut(&str) + Send),
     started: Instant,
 ) -> Result<ProcessExecution> {
@@ -71,11 +84,15 @@ pub(super) async fn capture_child(
                 _ = &mut drains => wait.await,
             }
         };
-        match tokio::time::timeout(timeout, combined).await {
-            Ok(Ok(exit)) if exit.success() => (ToolStatus::Succeeded, exit.code()),
-            Ok(Ok(exit)) => (ToolStatus::Failed, exit.code()),
-            Ok(Err(err)) => return Err(err).context("waiting for command"),
-            Err(_) => {
+        let completed = match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, combined).await.ok(),
+            None => Some(combined.await),
+        };
+        match completed {
+            Some(Ok(exit)) if exit.success() => (ToolStatus::Succeeded, exit.code()),
+            Some(Ok(exit)) => (ToolStatus::Failed, exit.code()),
+            Some(Err(err)) => return Err(err).context("waiting for command"),
+            None => {
                 // SIGKILL the group, then bound the reap. `Child::kill()` waits
                 // for exit; a D-state / wedged descendant would otherwise pin
                 // the coding turn past the command deadline.

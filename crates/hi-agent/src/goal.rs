@@ -112,8 +112,8 @@ pub struct GoalEvent {
 /// Cap on retained [`GoalEvent`]s (ring buffer).
 pub const GOAL_EVENT_LIMIT: usize = 48;
 
-/// One step of a decomposed goal. The agent works sub-goals in order; a failed
-/// sub-goal is retried up to `attempts` before being marked `Failed`.
+/// One step of a decomposed goal. `attempts` retains retry history; ordinary
+/// goals do not turn that diagnostic count into a finite execution ceiling.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubGoal {
     /// A short description of what this step accomplishes.
@@ -128,9 +128,11 @@ pub struct SubGoal {
     /// failed approach.
     #[serde(default)]
     pub notes: Vec<String>,
-    /// How many turns hit the per-turn step cap as continuations of this
-    /// sub-goal (the milestone is bigger than one turn). Such turns don't burn
-    /// the retry budget until the safety ceiling [`MAX_CAP_CONTINUATIONS`].
+    /// How many turns hit an explicit finite per-turn work cap (model steps or
+    /// tool calls) as continuations of this sub-goal (the milestone is bigger
+    /// than one turn). Such turns don't burn the retry budget until the safety
+    /// count. Productive capped turns are not subject to a lifetime ceiling;
+    /// only consecutive barren caps are bounded by [`MAX_BARREN_CAPS`].
     /// Incrementing also marks the goal as changed, which keeps the frontend
     /// drive-stall counter from parking a long multi-turn milestone.
     /// `#[serde(default)]`.
@@ -145,7 +147,7 @@ pub struct SubGoal {
     #[serde(default)]
     pub barren_caps: u32,
     /// How many rounds of on-the-fly decomposition produced this sub-goal. A
-    /// milestone that keeps hitting the step cap while making progress is too big
+    /// milestone that keeps hitting a work cap while making progress is too big
     /// for one turn and is split into turn-sized sub-steps ([`Goal::decompose_active`]);
     /// children carry `split_depth + 1`, so recursion is bounded by
     /// [`MAX_SPLIT_DEPTH`]. `#[serde(default)]`.
@@ -164,7 +166,7 @@ pub struct SubGoal {
     /// stayed active — real progress that did not finish the milestone.
     ///
     /// Distinct from [`Self::cap_continuations`], which only counts turns that
-    /// exhausted the step budget. A model that ends its turns cleanly never
+    /// exhausted an explicit per-turn work budget. A model that ends its turns cleanly never
     /// trips that, so an oversized milestone could consume turns indefinitely
     /// without any signal that it should be split. Past
     /// [`DECOMPOSE_AFTER_PRODUCTIVE_TURNS`] the milestone is decomposed.
@@ -250,29 +252,16 @@ pub struct Goal {
     /// `#[serde(default)]`.
     #[serde(default)]
     pub consecutive_skips: u32,
-    /// Ceiling on how many drive turns this goal may consume before it parks
-    /// and reports. Set automatically from the plan's size (see
-    /// [`auto_budget_for`]); `/goal budget <n>` overrides it and
-    /// `/goal budget off` removes it.
-    ///
-    /// Objectives like "fully build this" against a multi-phase plan have no
-    /// reachable end state — the completion audit is fail-open and every step
-    /// completed only reveals more work. Without a ceiling such a goal simply
-    /// runs until someone notices. A budget converts "runs forever" into "runs
-    /// this long, then tells you where it got to". `#[serde(default)]`.
+    /// Optional user-set ceiling on how many drive turns this goal may consume
+    /// before it parks and reports. `None` is the default: normal goal work
+    /// continues until completion. `/goal budget <n>` installs a finite cap and
+    /// `/goal budget off` removes it. `#[serde(default)]`.
     #[serde(default)]
     pub turn_budget: Option<u32>,
-    /// Whether [`Self::turn_budget`] was derived from the plan rather than
-    /// chosen by the user.
-    ///
-    /// A ceiling nobody remembers to set is not a safety net, so goals get one
-    /// by default. Tracking that it was automatic keeps two behaviours honest:
-    /// it rescales as the plan grows (a budget sized for 10 steps would park a
-    /// 40-step plan almost immediately), and hitting it reads as a checkpoint
-    /// rather than as the user's own limit being reached. Any explicit
-    /// `/goal budget` clears the flag and the value stops moving.
-    /// `#[serde(default)]` — goals saved before this load as user-set, which is
-    /// the conservative reading since their budget won't then change under them.
+    /// Legacy marker for turn budgets generated automatically by older hi
+    /// versions. New goals never set it; load/install paths clear both this
+    /// marker and its generated budget so an old default cannot keep parking a
+    /// resumed goal. Explicit `/goal budget` values always have this false.
     #[serde(default)]
     pub budget_auto: bool,
     /// Drive turns consumed so far, counted whether the turn succeeded or not —
@@ -286,8 +275,9 @@ pub struct Goal {
     #[serde(default)]
     pub last_skeptic_status: Option<SkepticStatus>,
     /// How many completion-audit rounds have appended missing work to this goal.
-    /// Bounds the audit loop so a goal can't oscillate at the finish line forever.
-    /// `#[serde(default)]` so older saved goals load at 0.
+    /// This is diagnostic history, not a completion ceiling: repeated findings
+    /// converge through deduplication, while genuinely new required work keeps
+    /// the goal active. `#[serde(default)]` so older saved goals load at 0.
     #[serde(default)]
     pub audit_rounds: u32,
     /// When true, Goal-drive continues without a human at the overlay:
@@ -297,9 +287,14 @@ pub struct Goal {
     pub unattended: bool,
 }
 
-/// Default per-sub-goal retry budget: how many times to retry a failing sub-goal
-/// (with a "reconsider, don't repeat" nudge) before marking it `Failed`.
-pub const DEFAULT_SUBGOAL_RETRIES: u32 = 2;
+/// Unlimited sentinel for ordinary per-sub-goal retries.
+///
+/// A failed verifier/reviewer round can still retain useful edits and expose the
+/// next concrete issue, so a fixed attempt count must not terminate otherwise
+/// progressing goal work. Callers may still pass an explicitly finite value to
+/// [`Goal::record_failure`]; the independent drive no-progress guard remains the
+/// circuit breaker for a step that is actually spinning.
+pub const DEFAULT_SUBGOAL_RETRIES: u32 = u32::MAX;
 
 /// Shown when `/goal unattended` is turned on.
 pub const UNATTENDED_DRIVE_WARNING: &str = "goal unattended: confirms park in /inbox (permission mode stays Ask/Auto) until the goal ends, pauses, or /goal unattended off";
@@ -356,13 +351,22 @@ pub const BARREN_CAP_NOTE: &str = "a prior turn hit the step cap while exploring
 any file edits — this turn, make concrete code changes (write/edit the files this sub-goal needs) \
 instead of more reading";
 
-/// Safety ceiling on how many step-capped turns a single sub-goal may span
-/// before capped turns start burning its retry budget again — a runaway guard,
-/// not the real gate (that's [`MAX_BARREN_CAPS`]). A big milestone (a whole
-/// crate from scratch) legitimately spans many capped turns as long as it keeps
-/// landing edits; only a milestone that keeps capping out *without* progress, or
-/// one that blows this generous ceiling, is judged by the retry/skip machinery.
-pub const MAX_CAP_CONTINUATIONS: u32 = 40;
+/// Tool-call-cap counterpart to [`BARREN_CAP_NOTE`]. Kept distinct so a goal
+/// resumed on the next turn is not told that its model-step budget ran out when
+/// only an explicitly configured tool-execution budget did.
+pub const BARREN_TOOL_CAP_NOTE: &str = "a prior turn hit the tool-call cap while exploring without \
+landing any file edits — this turn, make concrete code changes (write/edit the files this sub-goal \
+needs) instead of more reading";
+
+/// Note recorded when both explicit per-turn caps fired together.
+pub const BARREN_BOTH_CAPS_NOTE: &str = "a prior turn hit the step and tool-call caps while exploring \
+without landing any file edits — this turn, make concrete code changes (write/edit the files this \
+sub-goal needs) instead of more reading";
+
+/// Unlimited sentinel retained for source/serialization compatibility with the
+/// earlier capped-continuation API. Productive work-capped turns may span as
+/// many turns as needed; [`MAX_BARREN_CAPS`] remains the no-progress circuit.
+pub const MAX_CAP_CONTINUATIONS: u32 = u32::MAX;
 
 /// Consecutive capped turns that change no files before a milestone is judged
 /// stuck (rather than merely large). A capped turn that lands edits resets the
@@ -378,41 +382,23 @@ pub const MAX_BARREN_CAPS: u32 = 3;
 /// round-trip, while any real implementation step still reviews.
 pub const SKEPTIC_TRIVIAL_DIFF_BYTES: u64 = 64;
 
-/// Drive turns the automatic budget allows per planned sub-goal.
-///
-/// Generous on purpose. This is a backstop, not a schedule: the thrashing and
-/// unjudged guards catch pathological runs within a couple of turns, so the
-/// budget only has to stop a goal that is making *some* progress from running
-/// indefinitely. Sized so a healthy run — which lands most milestones in one or
-/// two turns, with retries on a few — finishes well inside it.
-pub const AUTO_BUDGET_TURNS_PER_STEP: u32 = 5;
-
-/// Floor for the automatic budget, so a two-step plan still gets room to retry.
-pub const AUTO_BUDGET_MIN: u32 = 25;
-
-/// Ceiling for the automatic budget. A plan large enough to reach this is one
-/// the user should be checking in on regardless.
-pub const AUTO_BUDGET_MAX: u32 = 500;
-
-/// The automatic drive-turn budget for a plan of `steps` sub-goals.
-pub fn auto_budget_for(steps: usize) -> u32 {
-    u32::try_from(steps)
-        .unwrap_or(u32::MAX)
-        .saturating_mul(AUTO_BUDGET_TURNS_PER_STEP)
-        .clamp(AUTO_BUDGET_MIN, AUTO_BUDGET_MAX)
+/// Compatibility helper retained for callers compiled against the earlier
+/// automatic-budget API. Automatic drive budgets are now unlimited.
+pub fn auto_budget_for(_steps: usize) -> u32 {
+    u32::MAX
 }
 
-/// How many productive step-capped continuations a milestone takes before it's
+/// How many productive explicitly work-capped continuations a milestone takes before it's
 /// judged too big for one turn and decomposed on the fly into turn-sized
-/// sub-steps. Lower than [`MAX_CAP_CONTINUATIONS`] so a huge milestone is split
-/// rather than ground out over dozens of turns.
+/// sub-steps. Decomposition improves milestone granularity; it is not a lifetime
+/// ceiling, and a failed/unavailable planner leaves productive work drivable.
 pub const DECOMPOSE_AFTER_CONTINUATIONS: u32 = 4;
 
 /// How many turns a milestone may consume while *landing verified work* without
 /// completing before it is judged too big and split into turn-sized sub-steps.
 ///
-/// The step-cap signal above only fires when a turn runs out of steps, which a
-/// model that finishes its tool calls never trips — so a milestone sized in days
+/// The explicit-cap signal above only fires when a turn runs out of configured
+/// model rounds or tool calls — so an uncapped milestone sized in days
 /// rather than turns could absorb turn after turn of real, verified progress and
 /// still never reach `Done`, with nothing to distinguish it from a small step
 /// being worked carefully. Productive-but-unfinished turns are that missing
@@ -466,12 +452,8 @@ impl Goal {
             paused: false,
             pause_reason: GoalPauseReason::None,
             consecutive_skips: 0,
-            // Every goal gets a ceiling by default. A safety net the user has
-            // to remember to set is not a safety net — the run this machinery
-            // exists for had no ceiling precisely because nobody thought to ask
-            // for one.
             turn_budget: None,
-            budget_auto: true,
+            budget_auto: false,
             turns_spent: 0,
             step_limit: None,
             events: Vec::new(),
@@ -484,9 +466,23 @@ impl Goal {
             audit_rounds: 0,
             unattended: false,
         };
-        g.refresh_auto_budget();
         g.push_event("set", "goal created");
         g
+    }
+
+    /// Remove a generated turn ceiling written by an older hi version. A
+    /// budget-pause caused solely by that obsolete default is reopened too;
+    /// explicit user budgets have `budget_auto == false` and are untouched.
+    pub(crate) fn clear_legacy_automatic_budget(&mut self) -> bool {
+        if !self.budget_auto {
+            return false;
+        }
+        self.budget_auto = false;
+        self.turn_budget = None;
+        if self.pause_reason == GoalPauseReason::Budget {
+            self.resume();
+        }
+        true
     }
 
     /// Remaining structured-goal work, ignoring pause and stall. Parked and
@@ -507,29 +503,30 @@ impl Goal {
         self.pause_reason.is_paused() || self.paused
     }
 
-    /// Whether this goal changed in a way that counts as progress for the
-    /// frontend's auto-drive stall guard. `turns_spent` is accounting, not
-    /// work: it changes on every synthetic drive turn, including a neutral
-    /// read-only turn, and must not prevent the guard from parking a goal that
-    /// is making no progress.
+    /// Whether this goal changed structurally in a way that counts as progress
+    /// for the frontend's auto-drive stall guard.
+    ///
+    /// Retry notes/counters, event history, reviewer diagnostics, and turn
+    /// accounting are evidence *about* an attempt, not completed work. Ignoring
+    /// them here is what lets the independent no-progress guard park an
+    /// unlimited-default retry loop. File changes and novel read/search evidence
+    /// are accounted separately by `goal_drive_made_progress` before this
+    /// structural fallback runs.
     pub fn drive_state_changed_since(&self, previous: &Self) -> bool {
+        let steps_changed = self.sub_goals.len() != previous.sub_goals.len()
+            || self
+                .sub_goals
+                .iter()
+                .zip(&previous.sub_goals)
+                .any(|(current, prior)| {
+                    current.description != prior.description || current.status != prior.status
+                });
         self.objective != previous.objective
-            || self.sub_goals != previous.sub_goals
+            || steps_changed
             || self.status != previous.status
             || self.paused != previous.paused
             || self.pause_reason != previous.pause_reason
-            || self.step_limit != previous.step_limit
-            || self.events != previous.events
             || self.objective_complete != previous.objective_complete
-            || self.team != previous.team
-            || self.skeptic_objections != previous.skeptic_objections
-            || self.skeptic_unavailable != previous.skeptic_unavailable
-            || self.consecutive_skips != previous.consecutive_skips
-            || self.budget_auto != previous.budget_auto
-            || self.turn_budget != previous.turn_budget
-            || self.skeptic_escalations != previous.skeptic_escalations
-            || self.last_skeptic_status != previous.last_skeptic_status
-            || self.audit_rounds != previous.audit_rounds
     }
 
     /// Pause with a typed reason (keeps `paused` in sync).
@@ -640,8 +637,6 @@ impl Goal {
             "  turns: {} spent · budget: {}\n",
             self.turns_spent,
             match self.turn_budget {
-                Some(budget) if self.budget_auto =>
-                    format!("{budget} (auto, scales with the plan; /goal budget <n> to fix)"),
                 Some(budget) => format!("{budget}"),
                 None => "none — runs until done".to_string(),
             }
@@ -835,8 +830,10 @@ impl Goal {
     /// Record an attempt on the active sub-goal (a verify failure the model
     /// couldn't fix, or a dead end). Returns `true` if the sub-goal still has
     /// retry budget (the agent should nudge "reconsider, don't repeat" and
-    /// retry), `false` if it's now `Failed` (budget exhausted) — in which case
-    /// the overall goal is also `Failed` unless the agent chooses to skip.
+    /// retry), `false` if an explicitly finite budget is exhausted and it is now
+    /// `Failed` — in which case the overall goal is also `Failed` unless the
+    /// agent chooses to skip. [`DEFAULT_SUBGOAL_RETRIES`] is an unlimited
+    /// sentinel; a saturated diagnostic counter never exhausts it.
     pub fn record_failure(&mut self, note: impl Into<String>, max_retries: u32) -> bool {
         let Some(i) = self.active_index() else {
             return false;
@@ -845,9 +842,9 @@ impl Goal {
         // A turn that produced a verdict clears the unjudged run, whichever way
         // the verdict went.
         sg.unjudged_turns = 0;
-        sg.attempts += 1;
+        sg.attempts = sg.attempts.saturating_add(1);
         push_clipped_note(sg, &note.into());
-        if sg.attempts > max_retries {
+        if max_retries != u32::MAX && sg.attempts > max_retries {
             sg.status = GoalStatus::Failed;
             self.status = GoalStatus::Failed;
             false
@@ -1159,6 +1156,21 @@ impl Goal {
         self.rederive_status();
     }
 
+    /// Retain rejected completion claims as durable context without changing
+    /// status. The executor calls this after it has normalized unsupported
+    /// implementation `done` claims back to their current state, so a later
+    /// drive still knows to verify those claims rather than trusting them.
+    pub(crate) fn record_unsupported_completion_claims(&mut self, indices: &[usize]) {
+        for &index in indices {
+            let Some(sub_goal) = self.sub_goals.get_mut(index) else {
+                continue;
+            };
+            if sub_goal.status != GoalStatus::Done {
+                push_note_deduped(sub_goal, CLAIM_NOTE);
+            }
+        }
+    }
+
     /// Continue past a sub-goal that just exhausted its retry budget: when
     /// drivable work remains (any `Pending` step), reactivate the goal — the
     /// exhausted step stays `Failed` as a visible scar, the first pending step
@@ -1284,22 +1296,7 @@ impl Goal {
     /// Re-derive the overall status from the sub-goals: `Done` iff all done;
     /// `Failed` iff a sub-goal failed and none is active; else `Active` — making the
     /// first not-done sub-goal active so there's always a cursor while in progress.
-    /// Keep an automatic budget proportional to the plan.
-    ///
-    /// Plans grow while they run — `update_plan` appends discovered work, the
-    /// completion audit appends gaps, oversized milestones split into several.
-    /// A budget fixed at creation would then park a plan that had legitimately
-    /// tripled in size. A user-set budget is left exactly where they put it.
-    fn refresh_auto_budget(&mut self) {
-        if self.budget_auto {
-            self.turn_budget = Some(auto_budget_for(self.sub_goals.len()));
-        }
-    }
-
     pub(crate) fn rederive_status(&mut self) {
-        // Every structural change funnels through here, so this is the one
-        // place an automatic budget needs to track plan size from.
-        self.refresh_auto_budget();
         if self.sub_goals.is_empty() {
             return;
         }
@@ -1567,37 +1564,35 @@ mod tests {
     }
 
     #[test]
-    fn every_goal_gets_a_budget_without_being_asked() {
-        // The run this machinery exists for had no ceiling because nobody
-        // thought to set one. A default nobody has to remember is the point.
+    fn fresh_goals_have_no_default_turn_budget() {
         let g = goal();
-        assert_eq!(
-            g.turn_budget,
-            Some(auto_budget_for(3)),
-            "a fresh goal is budgeted from its plan size"
-        );
-        assert!(g.budget_auto);
-        assert!(!g.budget_exhausted(), "and has room to actually work");
-        // Generous enough not to interrupt a healthy run of a small plan.
-        assert!(g.turn_budget.unwrap() >= AUTO_BUDGET_MIN);
+        assert_eq!(g.turn_budget, None);
+        assert!(!g.budget_auto);
+        assert!(!g.budget_exhausted());
     }
 
     #[test]
-    fn an_automatic_budget_rescales_as_the_plan_grows() {
-        // Plans grow while they run — discovered work, audit gaps, milestone
-        // splits. A budget fixed at creation would park a plan that had
-        // legitimately tripled in size.
+    fn plan_growth_does_not_install_a_default_turn_budget() {
         let mut g = Goal::new("ship it", vec!["one".into()]);
-        let small = g.turn_budget.expect("auto budget");
         let grown: Vec<String> = (0..80).map(|i| format!("step {i}")).collect();
         g.append_missing(&grown);
-        let large = g.turn_budget.expect("auto budget");
-        assert!(
-            large > small,
-            "{small} -> {large} should grow with the plan"
-        );
-        assert_eq!(large, auto_budget_for(g.sub_goals.len()));
-        assert!(large <= AUTO_BUDGET_MAX, "but stays bounded");
+        assert_eq!(g.turn_budget, None);
+        assert!(!g.budget_auto);
+    }
+
+    #[test]
+    fn a_legacy_automatic_budget_is_removed_and_reopened() {
+        let mut g = Goal::new("ship it", vec!["one".into()]);
+        g.turn_budget = Some(25);
+        g.budget_auto = true;
+        g.pause(GoalPauseReason::Budget);
+
+        assert!(g.clear_legacy_automatic_budget());
+        assert_eq!(g.turn_budget, None);
+        assert!(!g.budget_auto);
+        assert!(!g.is_paused());
+        assert_eq!(g.pause_reason, GoalPauseReason::None);
+        assert!(!g.clear_legacy_automatic_budget());
     }
 
     #[test]
@@ -1615,11 +1610,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_budget_is_clamped_at_both_ends() {
-        assert_eq!(auto_budget_for(0), AUTO_BUDGET_MIN);
-        assert_eq!(auto_budget_for(1), AUTO_BUDGET_MIN);
-        assert_eq!(auto_budget_for(44), 44 * AUTO_BUDGET_TURNS_PER_STEP);
-        assert_eq!(auto_budget_for(100_000), AUTO_BUDGET_MAX);
+    fn compatibility_auto_budget_helper_is_unlimited() {
+        assert_eq!(auto_budget_for(0), u32::MAX);
+        assert_eq!(auto_budget_for(1), u32::MAX);
+        assert_eq!(auto_budget_for(100_000), u32::MAX);
     }
 
     #[test]
@@ -1947,6 +1941,32 @@ mod tests {
         assert_eq!(g.status, GoalStatus::Failed);
         assert_eq!(g.sub_goals[0].attempts, 3);
         assert_eq!(g.sub_goals[0].notes.len(), 3);
+    }
+
+    #[test]
+    fn default_failure_retries_are_unlimited_even_after_counter_saturation() {
+        let mut g = goal();
+        for attempt in 1..=6 {
+            assert!(
+                g.record_failure(
+                    format!("productive retry {attempt}"),
+                    DEFAULT_SUBGOAL_RETRIES,
+                ),
+                "the ordinary retry policy must remain active past the old cap"
+            );
+        }
+        assert_eq!(g.sub_goals[0].attempts, 6);
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Active);
+        assert_eq!(g.status, GoalStatus::Active);
+
+        g.sub_goals[0].attempts = u32::MAX;
+        assert!(
+            g.record_failure("saturated diagnostic counter", DEFAULT_SUBGOAL_RETRIES),
+            "u32::MAX is an unlimited sentinel, not a reachable cap"
+        );
+        assert_eq!(g.sub_goals[0].attempts, u32::MAX);
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Active);
+        assert_eq!(g.status, GoalStatus::Active);
     }
 
     #[test]
@@ -2592,7 +2612,7 @@ mod tests {
     }
 
     #[test]
-    fn drive_state_ignores_turn_accounting_but_detects_real_progress() {
+    fn drive_state_ignores_accounting_and_retry_diagnostics_but_detects_advancement() {
         let before = goal();
         let mut spent = before.clone();
         spent.spend_turn();
@@ -2604,8 +2624,15 @@ mod tests {
         let mut retried = spent.clone();
         retried.record_failure("retry this step", DEFAULT_SUBGOAL_RETRIES);
         assert!(
-            retried.drive_state_changed_since(&before),
-            "retry evidence must reset the stall guard"
+            !retried.drive_state_changed_since(&before),
+            "retry bookkeeping must not disguise a no-progress loop"
+        );
+
+        let mut advanced = retried;
+        advanced.advance();
+        assert!(
+            advanced.drive_state_changed_since(&before),
+            "advancing the active step is structural progress"
         );
     }
 

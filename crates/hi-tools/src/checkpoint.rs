@@ -116,9 +116,11 @@ impl IsolatedGuard {
                 )
             })?;
         }
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
+        // `self.path` is the only directory this guard owns. The parent is a
+        // shared allocation root: another verifier may have created it but not
+        // yet materialized its child. Removing that empty parent here creates
+        // a TOCTOU race where the other verifier reports an infrastructure
+        // failure instead of the stage's real result.
         self.cleaned = true;
         Ok(())
     }
@@ -156,9 +158,7 @@ impl IsolatedGuard {
         } else {
             let _ = std::fs::remove_dir_all(&self.path);
         }
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
+        // Do not remove the shared parent; see the async cleanup path above.
         self.cleaned = true;
     }
 }
@@ -185,7 +185,11 @@ where
     Fut: Future<Output = Result<T>>,
 {
     let (target, _) = parse_reference(reference)?;
-    let parent = state_root.join("verification-sandboxes");
+    // The state root is control-plane data and is intentionally protected by
+    // the default command sandbox. A verification worktree needs to create
+    // compiler/test artifacts, so placing it below state_root makes ordinary
+    // builds fail with EPERM and falsely look like baseline code failures.
+    let parent = std::env::temp_dir().join("hi-verification-sandboxes");
     std::fs::create_dir_all(&parent)
         .with_context(|| format!("creating verification sandbox root {}", parent.display()))?;
     let sandbox = parent.join(format!(
@@ -1753,7 +1757,13 @@ mod tests {
         };
         std::fs::write(dir.join("value.txt"), "after\n").unwrap();
 
+        let protected_state = state.clone();
         with_isolated_checkpoint(&dir, &checkpoint, &state, |isolated| async move {
+            assert!(
+                !isolated.starts_with(&protected_state),
+                "buildable verification worktree must not be nested under protected state: {}",
+                isolated.display()
+            );
             assert!(isolated.join(".git").exists());
             assert_eq!(
                 std::fs::read_to_string(isolated.join("value.txt"))?,
@@ -1789,5 +1799,27 @@ mod tests {
             "sandbox directory should be removed after attribution"
         );
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn isolated_cleanup_keeps_its_shared_allocation_parent() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "hi-isolated-parent-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sandbox = parent.join("first");
+        std::fs::create_dir_all(&sandbox).unwrap();
+
+        let mut guard = IsolatedGuard::directory(sandbox.clone());
+        guard.cleanup().await.unwrap();
+
+        assert!(!sandbox.exists(), "the owned sandbox must be removed");
+        assert!(
+            parent.exists(),
+            "cleanup must not remove the shared parent another verifier may be using"
+        );
+        let _ = std::fs::remove_dir(parent);
     }
 }

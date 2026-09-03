@@ -1,7 +1,10 @@
 //! Provider stream handling: success path, retryable failures, fatal errors.
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use hi_ai::{ChatRequest, Completion, ProviderErrorKind, Role, StreamEvent, provider_error_kind};
+use hi_workflow::extract_partial_program_source;
 
 use crate::snapshot::changed_files_between;
 use crate::steering::{
@@ -10,7 +13,7 @@ use crate::steering::{
 };
 use crate::transcript::NudgeKind;
 use crate::verify::WorkspaceRepairVerifier;
-use crate::{MAX_TOOL_PROTOCOL_RETRIES, ToolCallEntry, Ui};
+use crate::{MAX_TOOL_PROTOCOL_RETRIES, Ui};
 
 use super::helpers::{build_turn_telemetry, effective_model_route};
 use super::progress::ProgressTracker;
@@ -20,6 +23,48 @@ use super::retry::{
     provider_error_is_backoff_retryable, provider_error_is_capacity_retryable,
     provider_overload_retry_delay, transient_route_retry_delay,
 };
+use super::speculation::SpeculationRegistry;
+
+const COMPAT_FALLBACK_LIMIT: usize = 64;
+const COMPAT_FALLBACK_PREFIX: usize = 62;
+const COMPAT_FALLBACK_OMITTED_PREFIX: &str = "[diagnostic truncation: ";
+pub(super) const COMPLETED_PLAN_EMPTY_RECAP_FALLBACK: &str = "The plan is complete and the successful tool results were retained. The provider did not return a final recap.";
+
+fn record_compat_fallback(fallbacks: &mut Vec<String>, fallback: String) {
+    if fallbacks.iter().any(|seen| seen == &fallback) {
+        return;
+    }
+    if fallbacks.len() < COMPAT_FALLBACK_LIMIT {
+        fallbacks.push(fallback);
+        return;
+    }
+
+    let already_compacted = fallbacks
+        .last()
+        .and_then(|marker| marker.strip_prefix(COMPAT_FALLBACK_OMITTED_PREFIX))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|count| count.parse::<u64>().ok());
+    let dropped = match already_compacted {
+        Some(dropped) => {
+            fallbacks[COMPAT_FALLBACK_PREFIX] = fallback;
+            dropped.saturating_add(1)
+        }
+        None => {
+            // The marker itself consumes one slot: retain the first 62 and the
+            // newest event, and explicitly account for the two displaced rows.
+            fallbacks.truncate(COMPAT_FALLBACK_PREFIX);
+            fallbacks.push(fallback);
+            fallbacks.push(String::new());
+            2
+        }
+    };
+    let last = fallbacks
+        .last_mut()
+        .expect("bounded compatibility trail always retains a marker slot");
+    *last = format!(
+        "{COMPAT_FALLBACK_OMITTED_PREFIX}{dropped} additional compatibility events omitted]"
+    );
+}
 
 #[allow(
     clippy::large_enum_variant,
@@ -33,6 +78,9 @@ pub(super) enum ProviderStreamResult {
         streamed_assistant_text: bool,
     },
     Continue,
+    /// End the bounded model loop without turning a recoverable protocol
+    /// exhaustion into an unhandled provider error. The outer turn still owns
+    /// settlement, telemetry, and the deterministic user-facing closeout.
     BreakInner(bool),
 }
 
@@ -45,12 +93,15 @@ impl crate::Agent {
         implementation_intent: Option<ImplementationIntent>,
         buffer_text_for_steering: bool,
         request_max_tokens: u32,
+        request_no_progress_final_answer: bool,
         retry_state: &mut TurnRetryState,
         request_max_tokens_override: &mut Option<u32>,
         empty_retries: &mut u32,
         force_tools_next: &mut bool,
         text_tool_fallback_next: &mut bool,
         made_tool_call: bool,
+        productive_tool_evidence: bool,
+        provider_exhausted: &mut bool,
         turn_start: &mut usize,
         turn_ledger_revision: u64,
         turn_snapshot: &Option<crate::verify::Snapshot>,
@@ -61,14 +112,14 @@ impl crate::Agent {
         continue_total_nudges: &mut u32,
         truncation_total_retries: u32,
         progress_tracker: &mut ProgressTracker,
-        ended_at_cap: bool,
-        stalled_unfinished: &mut bool,
-        stalled_repeating: &mut bool,
+        hit_step_cap: bool,
+        hit_tool_cap: bool,
         last_verify_attributions: &[hi_tools::Attribution],
         sched_tool_calls: u32,
         sched_max_concurrent: u32,
         sched_serial_runs: u32,
-        tool_timeline: &[ToolCallEntry],
+        tool_timeline: &super::retention::ToolTimeline,
+        speculation_registry: &SpeculationRegistry,
         evidence: &EvidenceTracker,
         review_repair: &ReviewRepairState,
         compat_fallbacks: &mut Vec<String>,
@@ -80,6 +131,14 @@ impl crate::Agent {
             || implementation_intent.is_some();
         let mut buffered_assistant_text = String::new();
         let mut streamed_assistant_text = false;
+        let mut program_delta_arguments = BTreeMap::<usize, String>::new();
+        let mut program_delta_ids = BTreeMap::<usize, String>::new();
+        let mut program_delta_names = BTreeMap::<usize, String>::new();
+        let program_speculator = request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "run_program")
+            .then(|| self.program_speculator());
         let mut sink = |event: StreamEvent| match event {
             StreamEvent::Text(text) => {
                 if buffer_read_only_review_text {
@@ -91,18 +150,20 @@ impl crate::Agent {
             }
             StreamEvent::Reasoning(text) => ui.assistant_reasoning(&text),
             StreamEvent::WireAudit(audit) => {
-                const MAX_WIRE_AUDIT: usize = 32;
-                if self.report.last_turn_telemetry.wire_audit.len() < MAX_WIRE_AUDIT {
-                    let mut value = serde_json::to_value(audit).unwrap_or_default();
-                    if let Some(object) = value.as_object_mut() {
-                        object.remove("request_body");
-                    }
-                    self.report.last_turn_telemetry.wire_audit.push(value);
+                // Deliver wire evidence at the provider callback, before tool
+                // execution or an approval can suspend turn settlement. The
+                // frontend owns the persistence sanitizer; telemetry below is
+                // separately redacted for the typed turn report.
+                ui.provider_request(audit.as_ref());
+                let mut value = serde_json::to_value(audit.as_ref()).unwrap_or_default();
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("request_body");
                 }
+                self.report.last_turn_telemetry.record_wire_audit(value);
             }
             StreamEvent::Status(text) => {
                 if let Some(fallback) = text.strip_prefix("compat: ") {
-                    compat_fallbacks.push(fallback.to_string());
+                    record_compat_fallback(compat_fallbacks, fallback.to_string());
                 }
                 if let Some(route) = text.rsplit_once("falling back to ").map(|(_, r)| r) {
                     *effective_fallback_route = Some(route.trim().to_string());
@@ -110,10 +171,69 @@ impl crate::Agent {
                 ui.status(&text);
             }
             StreamEvent::Warning(text) => ui.top_status(&text),
+            StreamEvent::ToolCallDelta {
+                index,
+                id_delta,
+                name_delta,
+                arguments_delta,
+            } => {
+                if let Some(id_delta) = id_delta {
+                    program_delta_ids
+                        .entry(index)
+                        .or_default()
+                        .push_str(&id_delta);
+                }
+                if let Some(name_delta) = name_delta {
+                    program_delta_names
+                        .entry(index)
+                        .or_default()
+                        .push_str(&name_delta);
+                }
+                if !arguments_delta.is_empty() {
+                    program_delta_arguments
+                        .entry(index)
+                        .or_default()
+                        .push_str(&arguments_delta);
+                }
+
+                // The event is deliberately internal-only. Once a provider
+                // has identified this call as run_program, a complete source
+                // prefix is enough to launch safe literal reads in the
+                // shadow executor while the rest of the program streams.
+                if program_delta_names
+                    .get(&index)
+                    .is_some_and(|name| name == "run_program")
+                    && let Some(program_speculator) = program_speculator.as_ref()
+                    && let Some(arguments) = program_delta_arguments.get(&index)
+                    && let Some(source) = extract_partial_program_source(arguments)
+                {
+                    let program_id = program_delta_ids
+                        .get(&index)
+                        .filter(|id| !id.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| format!("stream-program-{index}"));
+                    program_speculator.launch(speculation_registry, &program_id, &source);
+                }
+            }
         };
         let protocol_retry_nudge = tool_protocol_retry_nudge(&request.tools);
-        let pipenetwork_coding_route = hi_ai::is_pipenetwork_coding_route(&request.model);
         let provider_result = self.provider.stream(request, &mut sink).await;
+        // A retry, fatal provider error, or a completed non-program response
+        // invalidates shadow work. Keeping it alive across a changed request
+        // identity could leak a network/read task into the next round and let
+        // a later exact claim observe stale context.
+        if provider_result.as_ref().is_err()
+            || provider_result.as_ref().is_ok_and(|completion| {
+                !completion.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        hi_ai::Content::ToolCall { name, .. } if name == "run_program"
+                    )
+                })
+            })
+        {
+            speculation_registry.cancel_all();
+        }
         match provider_result {
             Ok(completion) => {
                 retry_state.record_provider_success();
@@ -277,7 +397,20 @@ impl crate::Agent {
                     .await?;
                 self.emit_usage(ui);
                 self.report.last_compat_fallbacks = compat_fallbacks.clone();
+                let model_telemetry = self.report.last_turn_telemetry.clone();
                 let wire_audit = std::mem::take(&mut self.report.last_turn_telemetry.wire_audit);
+                let requests = std::mem::take(&mut self.report.last_turn_telemetry.requests);
+                let requests_dropped = self
+                    .report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .requests_dropped;
+                let compaction = std::mem::take(&mut self.report.last_turn_telemetry.compaction);
+                let compaction_events_dropped = self
+                    .report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .compaction_events_dropped;
                 self.report.last_turn_telemetry = build_turn_telemetry(
                     max_steps,
                     verifier.round(),
@@ -286,11 +419,13 @@ impl crate::Agent {
                     *continue_total_nudges,
                     truncation_total_retries,
                     progress_tracker,
-                    ended_at_cap,
-                    *stalled_unfinished,
-                    *stalled_repeating,
+                    hit_step_cap,
+                    hit_tool_cap,
                     last_verify_attributions,
                     verifier.executions(),
+                    verifier.executions_dropped(),
+                    verifier.execution_count(),
+                    verifier.successful_test_stage(),
                     sched_tool_calls,
                     sched_max_concurrent,
                     sched_serial_runs,
@@ -300,6 +435,19 @@ impl crate::Agent {
                     &self.prefix_stability,
                 );
                 self.report.last_turn_telemetry.wire_audit = wire_audit;
+                self.report.last_turn_telemetry.requests = requests;
+                self.report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .requests_dropped = requests_dropped;
+                self.report.last_turn_telemetry.compaction = compaction;
+                self.report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .compaction_events_dropped = compaction_events_dropped;
+                self.report
+                    .last_turn_telemetry
+                    .inherit_model_diagnostics(model_telemetry);
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
@@ -320,6 +468,18 @@ impl crate::Agent {
                 retry_state.protocol_failures_total += 1;
                 retry_state.record_recovery_attempt();
                 let protocol_retries = retry_state.protocol_retries;
+                if request_no_progress_final_answer {
+                    // The live no-progress flag remains sticky in the caller,
+                    // so retry the same ChatOnly request without appending the
+                    // generic tool-protocol nudge. That nudge advertises tools
+                    // and directly contradicts the existing "stop using
+                    // tools" forced-final instruction.
+                    *force_tools_next = false;
+                    ui.nudge(&format!(
+                        "⚠ the forced final answer was not a valid plain-text turn — retrying tool-free ({protocol_retries}/{MAX_TOOL_PROTOCOL_RETRIES})"
+                    ));
+                    return Ok(ProviderStreamResult::Continue);
+                }
                 if implementation_intent.is_some() || made_tool_call {
                     *force_tools_next = true;
                 }
@@ -342,6 +502,7 @@ impl crate::Agent {
             Err(err)
                 if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
                     && hi_ai::provider_error_retryable(&err) != Some(false)
+                    && !request_no_progress_final_answer
                     && implementation_intent.is_some()
                     && retry_state.protocol_text_fallbacks < 1 =>
             {
@@ -373,26 +534,33 @@ impl crate::Agent {
                 if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
                     && hi_ai::provider_error_retryable(&err) != Some(false) =>
             {
-                // Both the consecutive and cumulative invalid-tool-turn
-                // budgets are spent. A model that alternates a valid tool
-                // call with an invalid turn keeps resetting the consecutive
-                // counter, so without the cumulative cap this nudge-and-retry
-                // loop runs forever (spinning CPU, burning tokens). Keep
-                // working with a fresh approach before settling.
                 ui.assistant_end();
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
-                if self.keep_working_after_stall(
+                retry_state.protocol_failures_total =
+                    retry_state.protocol_failures_total.saturating_add(1);
+                progress_tracker.record(
+                    super::progress::ProgressKind::None,
+                    "provider kept returning invalid tool turns",
+                    None,
+                );
+
+                // A bounded change of approach is useful after the
+                // consecutive protocol budget is spent. Reset only the
+                // consecutive counter; the cumulative circuit breaker still
+                // limits an alternating invalid/valid provider trajectory.
+                if self.try_no_progress_recovery(
                     progress_tracker,
                     force_tools_next,
-                    stalled_unfinished,
-                    stalled_repeating,
                     Some(continue_total_nudges),
                     ui,
                 ) {
+                    retry_state.protocol_retries = 0;
                     return Ok(ProviderStreamResult::Continue);
                 }
-                ui.status("⚠ the model kept emitting invalid tool turns — ending the turn");
+
+                ui.status("invalid tool turns exhausted; ending this bounded turn");
+                *provider_exhausted = true;
                 Ok(ProviderStreamResult::BreakInner(false))
             }
             Err(err)
@@ -412,24 +580,11 @@ impl crate::Agent {
                     provider_error_kind(&err),
                     Some(ProviderErrorKind::MalformedStream | ProviderErrorKind::EmptyCompletion)
                 );
-                if provider_error_kind(&err) == Some(ProviderErrorKind::EmptyCompletion)
-                    && !retry_state.empty_completion_headroom_retry_attempted
-                    && pipenetwork_coding_route
-                    && request_max_tokens < hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS
-                {
-                    retry_state.empty_completion_headroom_retry_attempted = true;
-                    retry_state.record_recovery_attempt();
-                    *request_max_tokens_override = Some(hi_ai::CODING_AGENT_MIN_OUTPUT_TOKENS);
-                    ui.nudge(
-                        "⚠ the reasoning model returned no visible answer; retrying with more output headroom",
-                    );
-                    return Ok(ProviderStreamResult::Continue);
-                }
                 if empty_or_malformed && *empty_retries < self.config.loop_limits.max_empty_retries
                 {
                     *empty_retries += 1;
                     retry_state.record_recovery_attempt();
-                    if made_tool_call {
+                    if made_tool_call && !request_no_progress_final_answer {
                         self.nudge_after_post_tool_empty_response(
                             force_tools_next,
                             implementation_intent.is_some(),
@@ -442,19 +597,53 @@ impl crate::Agent {
                     ));
                     return Ok(ProviderStreamResult::Continue);
                 }
-                if self.keep_working_after_stall(
+                progress_tracker.record(
+                    super::progress::ProgressKind::None,
+                    "provider returned no usable response",
+                    None,
+                );
+                if self.try_no_progress_recovery(
                     progress_tracker,
                     force_tools_next,
-                    stalled_unfinished,
-                    stalled_repeating,
                     Some(continue_total_nudges),
                     ui,
                 ) {
+                    *empty_retries = 0;
                     return Ok(ProviderStreamResult::Continue);
                 }
-                if empty_or_malformed {
-                    ui.status("⚠ the model returned no response after retrying");
-                    *stalled_unfinished = true;
+                // If the checklist is complete and the turn has concrete
+                // mutation/validation evidence, the missing prose recap is
+                // optional. Pipe-compatible routes occasionally return an
+                // accepted but empty stream at exactly this boundary. Preserve
+                // the completed work and synthesize a truthful closeout instead
+                // of misclassifying the entire turn as infrastructure failure.
+                let completed_plan_with_tool_evidence = productive_tool_evidence
+                    && !self.goals.plan().is_empty()
+                    && !self.goals.plan_incomplete();
+                if completed_plan_with_tool_evidence {
+                    self.emit_assistant_text(ui, COMPLETED_PLAN_EMPTY_RECAP_FALLBACK);
+                    ui.assistant_end();
+                    self.messages.push_assistant(vec![hi_ai::Content::Text(
+                        COMPLETED_PLAN_EMPTY_RECAP_FALLBACK.into(),
+                    )]);
+                    progress_tracker.no_progress_streak = 0;
+                    progress_tracker.last_no_progress_reason.clear();
+                    progress_tracker.record_final_answer();
+                    ui.status(
+                        "provider returned no final recap; closing from the completed plan and tool evidence",
+                    );
+                    return Ok(ProviderStreamResult::BreakInner(false));
+                }
+                // Once a tool has already produced a result, an exhausted
+                // empty-response retry is a bounded settling condition, not a
+                // provider failure. The outer turn still owns finalization
+                // (including changed-file reconciliation and verification),
+                // and returning through that path keeps a partially completed
+                // implementation usable instead of surfacing a raw scripted
+                // provider error or making the caller retry indefinitely.
+                if made_tool_call {
+                    ui.status("model returned no response after tool results; settling the turn");
+                    *provider_exhausted = true;
                     return Ok(ProviderStreamResult::BreakInner(false));
                 }
                 self.reconcile_error_turn_changes(turn_ledger_revision)
@@ -472,7 +661,20 @@ impl crate::Agent {
                     self.truncate_messages(*turn_start);
                 }
                 self.report.last_compat_fallbacks = compat_fallbacks.clone();
+                let model_telemetry = self.report.last_turn_telemetry.clone();
                 let wire_audit = std::mem::take(&mut self.report.last_turn_telemetry.wire_audit);
+                let requests = std::mem::take(&mut self.report.last_turn_telemetry.requests);
+                let requests_dropped = self
+                    .report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .requests_dropped;
+                let compaction = std::mem::take(&mut self.report.last_turn_telemetry.compaction);
+                let compaction_events_dropped = self
+                    .report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .compaction_events_dropped;
                 self.report.last_turn_telemetry = build_turn_telemetry(
                     max_steps,
                     verifier.round(),
@@ -481,11 +683,13 @@ impl crate::Agent {
                     *continue_total_nudges,
                     truncation_total_retries,
                     progress_tracker,
-                    ended_at_cap,
-                    *stalled_unfinished,
-                    *stalled_repeating,
+                    hit_step_cap,
+                    hit_tool_cap,
                     last_verify_attributions,
                     verifier.executions(),
+                    verifier.executions_dropped(),
+                    verifier.execution_count(),
+                    verifier.successful_test_stage(),
                     sched_tool_calls,
                     sched_max_concurrent,
                     sched_serial_runs,
@@ -495,6 +699,19 @@ impl crate::Agent {
                     &self.prefix_stability,
                 );
                 self.report.last_turn_telemetry.wire_audit = wire_audit;
+                self.report.last_turn_telemetry.requests = requests;
+                self.report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .requests_dropped = requests_dropped;
+                self.report.last_turn_telemetry.compaction = compaction;
+                self.report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .compaction_events_dropped = compaction_events_dropped;
+                self.report
+                    .last_turn_telemetry
+                    .inherit_model_diagnostics(model_telemetry);
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
@@ -524,7 +741,20 @@ impl crate::Agent {
                     self.truncate_messages(*turn_start);
                 }
                 self.report.last_compat_fallbacks = compat_fallbacks.clone();
+                let model_telemetry = self.report.last_turn_telemetry.clone();
                 let wire_audit = std::mem::take(&mut self.report.last_turn_telemetry.wire_audit);
+                let requests = std::mem::take(&mut self.report.last_turn_telemetry.requests);
+                let requests_dropped = self
+                    .report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .requests_dropped;
+                let compaction = std::mem::take(&mut self.report.last_turn_telemetry.compaction);
+                let compaction_events_dropped = self
+                    .report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .compaction_events_dropped;
                 self.report.last_turn_telemetry = build_turn_telemetry(
                     max_steps,
                     verifier.round(),
@@ -533,11 +763,13 @@ impl crate::Agent {
                     *continue_total_nudges,
                     truncation_total_retries,
                     progress_tracker,
-                    ended_at_cap,
-                    *stalled_unfinished,
-                    *stalled_repeating,
+                    hit_step_cap,
+                    hit_tool_cap,
                     last_verify_attributions,
                     verifier.executions(),
+                    verifier.executions_dropped(),
+                    verifier.execution_count(),
+                    verifier.successful_test_stage(),
                     sched_tool_calls,
                     sched_max_concurrent,
                     sched_serial_runs,
@@ -547,6 +779,19 @@ impl crate::Agent {
                     &self.prefix_stability,
                 );
                 self.report.last_turn_telemetry.wire_audit = wire_audit;
+                self.report.last_turn_telemetry.requests = requests;
+                self.report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .requests_dropped = requests_dropped;
+                self.report.last_turn_telemetry.compaction = compaction;
+                self.report
+                    .last_turn_telemetry
+                    .diagnostic_retention
+                    .compaction_events_dropped = compaction_events_dropped;
+                self.report
+                    .last_turn_telemetry
+                    .inherit_model_diagnostics(model_telemetry);
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
@@ -555,5 +800,32 @@ impl crate::Agent {
                 Err(err)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_fallbacks_are_deduplicated_and_bounded() {
+        let mut fallbacks = Vec::new();
+        for index in 0..100 {
+            record_compat_fallback(&mut fallbacks, format!("fallback-{index}"));
+        }
+        record_compat_fallback(&mut fallbacks, "fallback-0".into());
+
+        assert_eq!(fallbacks.len(), COMPAT_FALLBACK_LIMIT);
+        assert_eq!(fallbacks.first().map(String::as_str), Some("fallback-0"));
+        assert_eq!(
+            fallbacks.get(COMPAT_FALLBACK_PREFIX).map(String::as_str),
+            Some("fallback-99")
+        );
+        assert!(
+            fallbacks
+                .last()
+                .is_some_and(|marker| marker.contains("37 additional compatibility events omitted")),
+            "exact dropped count is surfaced in the bounded diagnostic: {fallbacks:?}"
+        );
     }
 }

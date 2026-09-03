@@ -1,0 +1,72 @@
+schema_version = 1
+name = "persistent-http-503-exhausts-route-budget"
+tags = ["curated", "pr"]
+timeout_ms = 30000
+
+[[provider.steps]]
+id = "outage-primary"
+[provider.steps.response]
+kind = "http_error"
+status = 503
+body = '{"error":{"message":"scripted service unavailable","code":"service_unavailable","retryable":true,"retry_after_seconds":0}}'
+
+[[provider.steps]]
+id = "outage-final-retry"
+[provider.steps.response]
+kind = "http_error"
+status = 503
+body = '{"error":{"message":"scripted service unavailable","code":"service_unavailable","retryable":true,"retry_after_seconds":0}}'
+
+[[actions]]
+kind = "send_line"
+text = "Reply briefly after the temporary provider outage clears."
+
+[[actions]]
+kind = "wait_provider_request"
+count = 2
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/stop_reason" = "infrastructure_failure" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_quiescent"
+source = "provider"
+quiet_ms = 300
+timeout_ms = 3000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST", "/headers/x-request-attempt" = "0" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST", "/headers/x-request-attempt" = "1" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/stop_reason" = "infrastructure_failure", "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "infrastructure" }
+exact = 1
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

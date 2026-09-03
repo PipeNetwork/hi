@@ -636,6 +636,7 @@ mod tests {
             StreamEvent::Reasoning(text) => events.push(format!("reasoning:{text}")),
             StreamEvent::WireAudit(_) => events.push("wire_audit".into()),
             StreamEvent::Warning(warning) => events.push(format!("warning:{warning}")),
+            StreamEvent::ToolCallDelta { .. } => {}
         };
         let out = provider
             .stream(request(MOA_MODEL_CONSERVATIVE), &mut sink)

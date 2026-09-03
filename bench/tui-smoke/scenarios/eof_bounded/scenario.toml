@@ -1,0 +1,47 @@
+schema_version = 1
+name = "provider-eof-bounded-recovery"
+tags = ["curated"]
+timeout_ms = 30000
+
+[[provider.steps]]
+id = "truncated-stream"
+[provider.steps.response]
+kind = "raw_sse"
+body = "data: {\"choices\":[{\"delta\":{}}]}\n\n"
+terminal = "eof"
+
+[[provider.steps]]
+id = "recovered-answer"
+[provider.steps.response]
+kind = "text"
+text = "The truncated stream recovered without an autonomous loop."
+
+[[actions]]
+kind = "send_line"
+text = "Recover from one truncated provider stream."
+
+[[actions]]
+kind = "wait_provider_request"
+count = 2
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 2
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

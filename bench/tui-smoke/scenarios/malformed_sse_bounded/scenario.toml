@@ -1,0 +1,49 @@
+schema_version = 1
+name = "malformed-sse-bounded-recovery"
+tags = ["curated", "pr"]
+timeout_ms = 30000
+
+[[provider.steps]]
+id = "malformed-frame"
+[provider.steps.response]
+kind = "raw_sse"
+body = "data: {definitely-not-json}\n\ndata: [DONE]\n\n"
+delay_ms = 5
+chunk_bytes = 3
+terminal = "reset"
+
+[[provider.steps]]
+id = "recovered-answer"
+[provider.steps.response]
+kind = "text"
+text = "The malformed stream recovered on its bounded retry."
+
+[[actions]]
+kind = "send_line"
+text = "Recover from one malformed provider stream."
+
+[[actions]]
+kind = "wait_provider_request"
+count = 2
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 2
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

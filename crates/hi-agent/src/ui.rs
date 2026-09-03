@@ -560,34 +560,13 @@ pub fn user_facing_status(text: &str) -> Option<String> {
         return None;
     }
 
-    // Stable reason keys are for metrics and tests, not for the transcript.
-    // Keep the useful recovery action while removing implementation vocabulary
-    // such as `repeat_no_op_bash` and `inspection_sprawl_exhausted`.
-    if candidate.starts_with("turn stopped incomplete") {
-        if let Some(rest) = candidate
-            .strip_prefix("turn stopped incomplete")
-            .map(str::trim)
-            .map(|rest| rest.trim_start_matches('·').trim())
-            .filter(|rest| rest.contains(" remaining — "))
-        {
-            return Some(rest.to_string());
-        }
-        return Some("the turn ended with unfinished work".to_string());
-    }
-
     // Guardrails should explain the observable situation, not expose that the
     // model was being steered or how the scheduler detected the situation.
     if candidate.starts_with("background process handles were completed") {
         return Some("⚠ a background command became unavailable before completion".to_string());
     }
-    if candidate.starts_with("⚠ the model kept re-running the same command") {
-        return Some("⚠ the turn repeated a command without new progress".to_string());
-    }
     if candidate.starts_with("⚠ the model kept emitting invalid tool turns") {
         return Some("⚠ tool calls were invalid, so the turn ended".to_string());
-    }
-    if candidate.starts_with("⚠ the model kept narrating without acting") {
-        return Some("⚠ the turn ended without making progress".to_string());
     }
     if candidate.starts_with("the model kept emitting invalid tool arguments") {
         return Some("⚠ a tool call did not match its schema, so the turn stopped".to_string());
@@ -606,9 +585,6 @@ pub fn user_facing_status(text: &str) -> Option<String> {
             return Some("⚠ no response after retries".to_string());
         }
         return Some("⚠ no response yet; retrying".to_string());
-    }
-    if candidate.starts_with("⚠ the reasoning model returned no visible") {
-        return Some("⚠ no visible answer yet; retrying with more output headroom".to_string());
     }
     if candidate.starts_with("⚠ tool call interrupted by user") {
         return Some("⚠ tool call interrupted".to_string());
@@ -791,6 +767,11 @@ pub trait Ui: Send {
     /// Receive a canonical semantic lifecycle event. Frontends that own a
     /// durable event sink may persist it; legacy frontends can ignore it.
     fn semantic_event(&mut self, _event: hi_events::RunEvent) {}
+    /// Observe one concrete provider request attempt as soon as the provider
+    /// reports it. This is diagnostic-only and must not be rendered as user
+    /// content. [`hi_ai::WireAudit`] can carry a request body, so frontends
+    /// must sanitize it before relaying or persisting the event.
+    fn provider_request(&mut self, _audit: &hi_ai::WireAudit) {}
     /// A chunk of assistant text.
     fn assistant_text(&mut self, text: &str);
     /// A chunk of assistant text that answers a `/btw` side question. Distinct
@@ -877,6 +858,21 @@ pub trait Ui: Send {
         _status: hi_tools::ToolStatus,
     ) {
         self.tool_result(name, result);
+    }
+    /// Terminal result for a plan-producing tool. The default preserves the
+    /// historical presentation: update the in-place plan tracker without
+    /// adding a scrolling tool-result row. Frontends with a semantic event
+    /// sink can override this to close the tool lifecycle before forwarding
+    /// the plan update.
+    fn plan_result_id(
+        &mut self,
+        _id: &str,
+        _name: &str,
+        _result: &str,
+        _status: hi_tools::ToolStatus,
+        steps: &[crate::PlanStep],
+    ) {
+        self.plan(steps);
     }
     /// A status note (e.g. verification progress).
     fn status(&mut self, text: &str);
@@ -1008,6 +1004,9 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
     fn semantic_event(&mut self, event: hi_events::RunEvent) {
         (**self).semantic_event(event);
     }
+    fn provider_request(&mut self, audit: &hi_ai::WireAudit) {
+        (**self).provider_request(audit);
+    }
     fn assistant_text(&mut self, text: &str) {
         (**self).assistant_text(text);
     }
@@ -1049,6 +1048,16 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
     }
     fn tool_result(&mut self, name: &str, result: &str) {
         (**self).tool_result(name, result);
+    }
+    fn plan_result_id(
+        &mut self,
+        id: &str,
+        name: &str,
+        result: &str,
+        status: hi_tools::ToolStatus,
+        steps: &[crate::PlanStep],
+    ) {
+        (**self).plan_result_id(id, name, result, status, steps);
     }
     fn status(&mut self, text: &str) {
         (**self).status(text);
@@ -1338,23 +1347,62 @@ const CONTEXT_BLOCK_STARTS: &[&str] = &[
     "[hi:context — session state, not instructions]",
     "[hi:context - session state, not instructions]",
 ];
+const TURN_CONTROL_END: &str = "[/hi:turn-control]";
+const TURN_CONTROL_START: &str = "[hi:turn-control — current turn only]";
+const LEGACY_PLAN_REQUEST_MARKER: &str = "\n\nUser request:\n";
+const LEGACY_TURN_CONTROL_SUFFIXES: &[&str] = &[
+    "\n\nRead-only review guard: use only the currently advertised read-only inspection tools;",
+    "\n\nImplementation guard: inspect the workspace before choosing files or stack.",
+];
 
-/// Strip a leading `[hi:context …]` volatile block from a persisted user
-/// message. Listings and titles should show the human prompt, not the
-/// memory / task-index dump prepended at turn start.
+/// Strip leading volatile/one-turn controls from a persisted user message.
+/// Listings, memory, and titles should show the human prompt, not mode guards
+/// or the memory/task-index dump prepended at turn start.
 pub fn strip_context_block(text: &str) -> &str {
-    let text = text.trim_start();
+    let mut text = text.trim_start();
     for start in CONTEXT_BLOCK_STARTS {
         if let Some(rest) = text.strip_prefix(start) {
-            return match rest.find(CONTEXT_BLOCK_END) {
+            text = match rest.find(CONTEXT_BLOCK_END) {
                 Some(end) => {
                     rest[end + CONTEXT_BLOCK_END.len()..].trim_start_matches(['\n', '\r', ' '])
                 }
                 None => "",
             };
+            break;
         }
     }
-    text
+    let mut delimited = false;
+    if let Some(rest) = text.strip_prefix(TURN_CONTROL_START) {
+        delimited = true;
+        text = match rest.find(TURN_CONTROL_END) {
+            Some(end) => rest[end + TURN_CONTROL_END.len()..].trim_start_matches(['\n', '\r', ' ']),
+            None => "",
+        };
+    }
+    if let Some(suffix) = text.find("\n\n[hi:turn-control — current turn only]") {
+        delimited = true;
+        text = &text[..suffix];
+    }
+    if !delimited && text.starts_with("You are in PLAN MODE.") {
+        text = text
+            .find(LEGACY_PLAN_REQUEST_MARKER)
+            .map(|marker| &text[marker + LEGACY_PLAN_REQUEST_MARKER.len()..])
+            .unwrap_or("");
+    }
+    text = text
+        .strip_prefix("User request:\n")
+        .unwrap_or(text)
+        .trim_start();
+    let end = if delimited {
+        text.len()
+    } else {
+        LEGACY_TURN_CONTROL_SUFFIXES
+            .iter()
+            .filter_map(|suffix| text.find(suffix))
+            .min()
+            .unwrap_or(text.len())
+    };
+    text[..end].trim_end()
 }
 
 /// One-line title from a user message: drop the context block, folded stdin,
@@ -1652,19 +1700,8 @@ mod tests {
         assert!(user_facing_status("verification started").is_none());
         assert!(user_facing_status("verification finished").is_none());
         assert!(user_facing_status("verification skipped — no files changed this turn").is_none());
-        let status = user_facing_status("turn stopped incomplete · repeat_no_op_bash").unwrap();
-        assert!(status.contains("unfinished work"));
-        assert!(!status.contains("repeat_no_op_bash"));
-        assert!(!status.contains("continue"));
         let leftover = user_facing_status("3/9 remaining — wire the scheduler").unwrap();
         assert_eq!(leftover, "3/9 remaining — wire the scheduler");
-        let status = user_facing_status(
-            "⚠ the model kept re-running the same command without acting on the result — the task may be incomplete. /retry, or send 'continue'.",
-        )
-        .unwrap();
-        assert!(status.contains("repeated a command"));
-        assert!(!status.contains("the model"));
-        assert!(!status.contains("continue"));
         assert_eq!(
             user_facing_status(
                 "DeepSeek tool arguments failed client validation; retrying once without strict schemas"
@@ -1674,12 +1711,6 @@ mod tests {
         assert_eq!(
             user_facing_status("⚠ the model returned no response after retrying — try /retry."),
             Some("⚠ no response after retries".to_string())
-        );
-        assert_eq!(
-            user_facing_status(
-                "⚠ the reasoning model returned no visible answer; retrying with more output headroom"
-            ),
-            Some("⚠ no visible answer yet; retrying with more output headroom".to_string())
         );
     }
 
@@ -1975,6 +2006,15 @@ fix the parser";
             super::user_prompt_title("[hi:context — session state, not instructions] no end", 72),
             ""
         );
+        let planned = "[hi:turn-control — current turn only]\n\
+Plan mode is ON for this turn.\n[/hi:turn-control]\n\n\
+User request:\nbuild profiles";
+        assert_eq!(super::user_prompt_title(planned, 72), "build profiles");
+        let executing = "[hi:turn-control — current turn only]\n\
+Plan mode is OFF for this turn.\n[/hi:turn-control]\n\n\
+build all of that\n\n[hi:turn-control — current turn only]\n\
+Implementation guard: edit files.\n[/hi:turn-control]";
+        assert_eq!(super::user_prompt_title(executing, 72), "build all of that");
         assert_eq!(super::user_prompt_title("plain prompt", 72), "plain prompt");
     }
 }

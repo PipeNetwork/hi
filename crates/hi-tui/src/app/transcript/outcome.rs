@@ -37,8 +37,7 @@ impl crate::App {
             OutcomeState::Warning => {
                 let label = match outcome.status {
                     TurnStatus::Blocked => format!("blocked · {detail}"),
-                    TurnStatus::Incomplete => format!("incomplete · {detail}"),
-                    _ => detail,
+                    _ => format!("stopped · {detail}"),
                 };
                 self.status = format!("warning · {label}");
                 self.last_turn_state = TurnState::Warning(label.clone());
@@ -53,16 +52,11 @@ impl crate::App {
                 self.status = format!("failed · {detail}");
                 self.last_turn_state = TurnState::Failed(detail.clone());
                 self.last_error = Some(detail.clone());
-                // Infrastructure failures are internal (provider/runner/session).
-                // Keep typed state for reports/eval, but don't dump the jargon
-                // banner into the user transcript.
-                if !is_infrastructure_failure_detail(&detail) {
-                    self.push(accent_line(
-                        theme().accent_error,
-                        format!("✗ failed · {detail}"),
-                        Style::default().fg(theme().accent_error),
-                    ));
-                }
+                self.push(accent_line(
+                    theme().accent_error,
+                    format!("✗ failed · {detail}"),
+                    Style::default().fg(theme().accent_error),
+                ));
             }
             OutcomeState::Cancelled => {
                 self.status = "cancelled".to_string();
@@ -118,21 +112,47 @@ enum OutcomeState {
 }
 
 fn outcome_state(outcome: &TurnOutcome) -> OutcomeState {
-    let stalled_without_project_change =
-        outcome.stop_reason == TurnStopReason::Stalled && outcome.changed_files.is_empty();
-    if outcome.status == TurnStatus::Cancelled {
+    let limit = matches!(
+        outcome.stop_reason,
+        TurnStopReason::StepLimit
+            | TurnStopReason::ToolLimit
+            | TurnStopReason::TimeLimit
+            | TurnStopReason::TurnLimit
+    );
+    let canonicalized_legacy_limit = outcome.status == TurnStatus::Failed
+        && limit
+        && matches!(
+            outcome.verification,
+            VerificationStatus::Passed | VerificationStatus::NotApplicable
+        );
+    if outcome.status == TurnStatus::Cancelled && outcome.stop_reason == TurnStopReason::Cancelled {
         OutcomeState::Cancelled
-    } else if outcome.status == TurnStatus::Failed
-        || outcome.verification == VerificationStatus::InfrastructureError
+    } else if matches!(
+        outcome.verification,
+        VerificationStatus::Failed | VerificationStatus::InfrastructureError
+    ) || (outcome.status == TurnStatus::Failed && !canonicalized_legacy_limit)
     {
+        // Failure evidence outranks a coincident or legacy limit reason.
         OutcomeState::Failed
+    } else if limit {
+        // Limits are expected execution boundaries, not failures. The
+        // canonicalized legacy pair Failed+StepLimit is neutral only when its
+        // verification evidence was passed/not-applicable.
+        OutcomeState::Warning
+    } else if outcome.status == TurnStatus::Cancelled {
+        OutcomeState::Cancelled
     } else if outcome.status == TurnStatus::Completed
         && matches!(
             outcome.verification,
             VerificationStatus::Passed | VerificationStatus::NotApplicable
         )
-        && !stalled_without_project_change
         && outcome.review != ReviewStatus::Objected
+        && matches!(
+            outcome.stop_reason,
+            TurnStopReason::Completed
+                | TurnStopReason::NoApplicableVerification
+                | TurnStopReason::ReviewEscalated
+        )
     {
         // Escalated is a completed scar, not a defect objection.
         OutcomeState::Done
@@ -141,58 +161,20 @@ fn outcome_state(outcome: &TurnOutcome) -> OutcomeState {
     }
 }
 
-fn is_infrastructure_failure_detail(detail: &str) -> bool {
-    detail == "infrastructure failure"
-        || detail == "verification infrastructure failure"
-        || detail.starts_with("infrastructure failure")
-        || detail.starts_with("verification infrastructure failure")
-}
-
 fn outcome_detail(outcome: &TurnOutcome) -> String {
-    // A verified project edit may remain successful after a late interaction
-    // stall. Baseline checks on an unchanged project do not turn a stalled,
-    // answerless turn into success.
     let green_settled = outcome.status == TurnStatus::Completed
         && outcome.verification == VerificationStatus::Passed
-        && (outcome.stop_reason != TurnStopReason::Stalled || !outcome.changed_files.is_empty())
+        && matches!(
+            outcome.stop_reason,
+            TurnStopReason::Completed | TurnStopReason::ReviewEscalated
+        )
         && outcome.review != ReviewStatus::Objected;
-    let base = if green_settled {
+    let base = if outcome.verification == VerificationStatus::InfrastructureError {
+        "verification infrastructure failure".to_string()
+    } else if outcome.verification == VerificationStatus::Failed {
+        "verification failed".to_string()
+    } else if green_settled {
         "verified".to_string()
-    } else if outcome.status == TurnStatus::Incomplete {
-        if let Some(leftover) = outcome
-            .leftover
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            leftover.to_string()
-        } else {
-            match outcome.stop_reason {
-                TurnStopReason::Completed => match outcome.verification {
-                    VerificationStatus::Passed => "verified",
-                    VerificationStatus::NotApplicable => "no applicable checks",
-                    VerificationStatus::Unverified => "checks did not settle",
-                    VerificationStatus::Failed => "verification failed",
-                    VerificationStatus::InfrastructureError => {
-                        "verification infrastructure failure"
-                    }
-                },
-                TurnStopReason::NoApplicableVerification => "no applicable checks",
-                TurnStopReason::VerificationUnavailable => "checks did not settle",
-                TurnStopReason::VerificationFailed => "verification failed",
-                TurnStopReason::VerificationUnstable => "verification was unstable",
-                TurnStopReason::ReviewObjected => "review objected",
-                TurnStopReason::ReviewEscalated => "review escalated",
-                TurnStopReason::ToolModeDenied => "required tool was denied",
-                TurnStopReason::StepLimit => "step limit reached",
-                TurnStopReason::TimeLimit => "time budget reached",
-                TurnStopReason::TurnLimit => "turn limit reached",
-                TurnStopReason::Stalled => "stalled",
-                TurnStopReason::Cancelled => "cancelled",
-                TurnStopReason::InfrastructureFailure => "infrastructure failure",
-            }
-            .to_string()
-        }
     } else {
         match outcome.stop_reason {
             TurnStopReason::Completed => match outcome.verification {
@@ -209,10 +191,11 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
             TurnStopReason::ReviewObjected => "review objected",
             TurnStopReason::ReviewEscalated => "review escalated",
             TurnStopReason::ToolModeDenied => "required tool was denied",
+            TurnStopReason::NoProgress => "no progress",
             TurnStopReason::StepLimit => "step limit reached",
+            TurnStopReason::ToolLimit => "tool-call limit reached",
             TurnStopReason::TimeLimit => "time budget reached",
             TurnStopReason::TurnLimit => "turn limit reached",
-            TurnStopReason::Stalled => "stalled",
             TurnStopReason::Cancelled => "cancelled",
             TurnStopReason::InfrastructureFailure => "infrastructure failure",
         }

@@ -134,10 +134,10 @@ impl crate::Agent {
                         let _ = self.workspace.active_turn_message_start.take();
                     }
                     crate::SessionRollback::AgentOwned {
-                        checkpoint_count_before,
+                        checkpoint_refs_before,
                     } => {
-                        if self.checkpoint_count() > checkpoint_count_before
-                            && let Err(err) = self.undo().await
+                        if let Err(err) =
+                            self.rollback_turn_checkpoint(&checkpoint_refs_before).await
                         {
                             eprintln!(
                                 "hi-agent: couldn't roll back cancelled workspace edits: {err:#}"
@@ -176,6 +176,36 @@ impl crate::Agent {
     pub fn finalize_failed_turn(&mut self) -> crate::TurnOutcome {
         let _ = self.take_and_kill_turn_backgrounds();
         self.finalize_failed_turn_inner()
+    }
+
+    /// Restore the checkpoint created by the active turn, if one is still on
+    /// the stack, then put the exact pre-turn bounded undo history back. A
+    /// length-only comparison is insufficient at [`crate::MAX_CHECKPOINTS`]:
+    /// adding the new checkpoint evicts the oldest and keeps the same length.
+    pub(crate) async fn rollback_turn_checkpoint(
+        &mut self,
+        checkpoint_refs_before: &[String],
+    ) -> Result<usize> {
+        let current = &self.workspace.checkpoints;
+        let new_checkpoint_is_live =
+            current != checkpoint_refs_before && current.len() >= checkpoint_refs_before.len();
+        if !new_checkpoint_is_live {
+            return Ok(0);
+        }
+
+        let restored_files = self.undo().await?.unwrap_or(0);
+        if self.workspace.checkpoints == checkpoint_refs_before {
+            return Ok(restored_files);
+        }
+
+        // A full stack evicted its oldest reference when the active checkpoint
+        // was appended. `undo` removes the active tail; restore that evicted
+        // reference as well so cancellation is state-neutral.
+        if let Some(session) = self.session.as_mut() {
+            session.record_checkpoints(checkpoint_refs_before)?;
+        }
+        self.workspace.checkpoints = checkpoint_refs_before.to_vec();
+        Ok(restored_files)
     }
 
     fn finalize_cancelled_turn_inner(&mut self) -> Result<crate::TurnOutcome> {
@@ -258,6 +288,8 @@ impl crate::Agent {
             structured_goal: self.goals.clone_structured(),
             decisions: self.decisions.clone(),
             plan: self.goals.plan().to_vec(),
+            plan_drive_evidence: self.plan_drive_evidence.snapshot(),
+            goal_drive_evidence: self.goal_drive_evidence.snapshot(),
         }
     }
 
@@ -277,6 +309,12 @@ impl crate::Agent {
             snapshot.decisions,
         )?;
         agent.goals.set_plan_if_pending(snapshot.plan);
+        agent
+            .plan_drive_evidence
+            .restore(snapshot.plan_drive_evidence);
+        agent
+            .goal_drive_evidence
+            .restore(snapshot.goal_drive_evidence);
         Ok(agent)
     }
 }

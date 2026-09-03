@@ -139,6 +139,84 @@ fn reconcile_jsonl_recovers_from_stale_offset_of_a_previous_session_file() {
 }
 
 #[test]
+fn reconcile_jsonl_streams_a_large_backlog_and_leaves_partial_tail_uncommitted() {
+    use std::io::{BufWriter, Write};
+
+    const RECORDS: usize = 512;
+    let sink = RemoteSessionSink::new_for_test(unreachable_config(), "large-backlog".to_string());
+    let dir = std::env::temp_dir().join(format!(
+        "hi-sync-large-backlog-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("session.jsonl");
+    let mut writer = BufWriter::new(std::fs::File::create(&path).unwrap());
+    let padding = "x".repeat(8 * 1024);
+    for index in 0..RECORDS {
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "type": "usage",
+                "input_tokens": index,
+                "output_tokens": 1,
+                "padding": padding,
+            })
+        )
+        .unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+    let complete_len = std::fs::metadata(&path).unwrap().len();
+    assert!(complete_len > 4 * 1024 * 1024);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{\"type\":\"usage\",\"input_tokens\":999")
+        .unwrap();
+
+    sink.reconcile_jsonl(&path).unwrap();
+    assert_eq!(
+        sink.store.track_jsonl("large-backlog", &path).unwrap(),
+        complete_len,
+        "an unterminated tail must remain pending"
+    );
+    assert_eq!(
+        sink.store
+            .ready_records("large-backlog", RECORDS + 1)
+            .unwrap()
+            .len(),
+        RECORDS
+    );
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b",\"output_tokens\":1}\n")
+        .unwrap();
+    sink.reconcile_jsonl(&path).unwrap();
+    assert_eq!(
+        sink.store.track_jsonl("large-backlog", &path).unwrap(),
+        std::fs::metadata(&path).unwrap().len()
+    );
+    assert_eq!(
+        sink.store
+            .ready_records("large-backlog", RECORDS + 1)
+            .unwrap()
+            .len(),
+        RECORDS + 1
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn session_snapshot_backfills_state_and_title() {
     let sink = RemoteSessionSink::new_for_test(unreachable_config(), "snapshot".to_string());
     let loaded = crate::session::LoadedSession {
@@ -152,10 +230,17 @@ fn session_snapshot_backfills_state_and_title() {
         name: Some("Named portal session".into()),
         goal: None,
         decisions: hi_agent::DecisionLog::default(),
-        plan: Vec::new(),
-        plan_drive_paused: false,
-        plan_drive_stall: 0,
-        goal_drive_stall: 0,
+        plan: vec![hi_agent::PlanStep {
+            title: "finish synced work".into(),
+            status: hi_agent::PlanStatus::Pending,
+        }],
+        plan_drive_paused: true,
+        plan_drive_resume_on_user_input: true,
+        plan_approval_parked: true,
+        plan_drive_stall: 2,
+        goal_drive_stall: 3,
+        plan_drive_evidence: vec!["a".repeat(64)],
+        goal_drive_evidence: vec!["b".repeat(64)],
     };
 
     sink.seed_snapshot(&loaded).unwrap();
@@ -176,7 +261,70 @@ fn session_snapshot_backfills_state_and_title() {
         vec![
             RECORD_TYPE_STATE_REPLACEMENT.to_string(),
             RECORD_TYPE_USAGE.to_string(),
-            RECORD_TYPE_CHECKPOINTS.to_string()
+            RECORD_TYPE_CHECKPOINTS.to_string(),
+            RECORD_TYPE_PLAN_DRIVE.to_string(),
+            RECORD_TYPE_PLAN_APPROVAL.to_string(),
+            RECORD_TYPE_GOAL_DRIVE.to_string(),
+        ]
+    );
+
+    let remote_records = sink
+        .store
+        .ready_records("snapshot", 32)
+        .unwrap()
+        .into_iter()
+        .map(|record| crate::session::RemoteRecord {
+            record_type: record.record_type,
+            payload_json: record.payload_json,
+        })
+        .collect::<Vec<_>>();
+    let restored = crate::session::load_history_from_records(&remote_records).unwrap();
+    assert!(restored.plan_drive_paused);
+    assert!(restored.plan_drive_resume_on_user_input);
+    assert!(restored.plan_approval_parked);
+    assert_eq!(restored.plan_drive_stall, 2);
+    assert_eq!(restored.goal_drive_stall, 3);
+    assert_eq!(restored.plan_drive_evidence, vec!["a".repeat(64)]);
+    assert_eq!(restored.goal_drive_evidence, vec!["b".repeat(64)]);
+}
+
+#[test]
+fn session_snapshot_emits_default_drive_state_to_clear_remote_stale_values() {
+    let sink =
+        RemoteSessionSink::new_for_test(unreachable_config(), "snapshot-default".to_string());
+    let loaded = crate::session::LoadedSession {
+        messages: Vec::new(),
+        usage: Usage::default(),
+        checkpoint_refs: Vec::new(),
+        name: None,
+        goal: None,
+        decisions: hi_agent::DecisionLog::default(),
+        plan: Vec::new(),
+        plan_drive_paused: false,
+        plan_drive_resume_on_user_input: false,
+        plan_approval_parked: false,
+        plan_drive_stall: 0,
+        goal_drive_stall: 0,
+        plan_drive_evidence: Vec::new(),
+        goal_drive_evidence: Vec::new(),
+    };
+
+    sink.seed_snapshot(&loaded).unwrap();
+
+    let record_types = sink
+        .store
+        .ready_records("snapshot-default", 32)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.record_type)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        record_types,
+        vec![
+            RECORD_TYPE_STATE_REPLACEMENT.to_string(),
+            RECORD_TYPE_PLAN_DRIVE.to_string(),
+            RECORD_TYPE_PLAN_APPROVAL.to_string(),
+            RECORD_TYPE_GOAL_DRIVE.to_string(),
         ]
     );
 }

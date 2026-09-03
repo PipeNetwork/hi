@@ -11,7 +11,7 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-use crate::provider::{Provider, ProviderError, ProviderErrorKind};
+use crate::provider::{Provider, ProviderCapabilities, ProviderError, ProviderErrorKind};
 use crate::types::{
     ChatRequest, Completion, Content, Message, Role, StreamEvent, ToolCallChannel, ToolMode,
     estimate_completion_output_tokens, estimate_request_input_tokens,
@@ -41,6 +41,13 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calls: true,
+            streamed_tool_call_deltas: true,
+        }
+    }
+
     async fn stream(
         &self,
         request: ChatRequest,
@@ -81,8 +88,7 @@ impl Provider for AnthropicProvider {
         }
 
         // `debug_tap` optionally echoes the raw wire bytes when HI_DEBUG_STREAM
-        // is set; `idle_guard` aborts a silently-dead connection instead of
-        // blocking on it forever.
+        // is set; `idle_guard` applies the optional operator silence deadline.
         let mut stream = Box::pin(
             crate::http::idle_guard(
                 crate::http::debug_tap(resp.bytes_stream()),
@@ -165,7 +171,7 @@ impl Provider for AnthropicProvider {
                 "content_block_delta" => {
                     let index = data["index"].as_u64().unwrap_or(0) as usize;
                     if let Some(Some(builder)) = blocks.get_mut(index) {
-                        builder.apply_delta(&data["delta"], sink);
+                        builder.apply_delta(index, &data["delta"], sink);
                         progressed = true;
                     }
                 }
@@ -510,6 +516,7 @@ enum BlockBuilder {
         id: String,
         name: String,
         input: String,
+        metadata_emitted: bool,
     },
 }
 
@@ -523,6 +530,7 @@ impl BlockBuilder {
                     .unwrap_or_default()
                     .to_string(),
                 input: String::new(),
+                metadata_emitted: false,
             },
             Some("thinking") => BlockBuilder::Thinking {
                 text: content_block["thinking"]
@@ -540,7 +548,12 @@ impl BlockBuilder {
         }
     }
 
-    fn apply_delta(&mut self, delta: &Value, sink: &mut (dyn FnMut(StreamEvent) + Send)) {
+    fn apply_delta(
+        &mut self,
+        index: usize,
+        delta: &Value,
+        sink: &mut (dyn FnMut(StreamEvent) + Send),
+    ) {
         match (self, delta["type"].as_str()) {
             (BlockBuilder::Text(text), Some("text_delta")) => {
                 if let Some(chunk) = delta["text"].as_str() {
@@ -559,9 +572,29 @@ impl BlockBuilder {
                     signature.push_str(chunk);
                 }
             }
-            (BlockBuilder::ToolUse { input, .. }, Some("input_json_delta")) => {
+            (
+                BlockBuilder::ToolUse {
+                    id,
+                    name,
+                    input,
+                    metadata_emitted,
+                },
+                Some("input_json_delta"),
+            ) => {
                 if let Some(chunk) = delta["partial_json"].as_str() {
+                    let emit_metadata = !*metadata_emitted;
+                    *metadata_emitted = true;
                     input.push_str(chunk);
+                    sink(StreamEvent::ToolCallDelta {
+                        index,
+                        id_delta: emit_metadata
+                            .then(|| id.clone())
+                            .filter(|value| !value.is_empty()),
+                        name_delta: emit_metadata
+                            .then(|| name.clone())
+                            .filter(|value| !value.is_empty()),
+                        arguments_delta: chunk.to_string(),
+                    });
                 }
             }
             _ => {}
@@ -576,7 +609,12 @@ impl BlockBuilder {
                 text,
                 signature: (!signature.is_empty()).then_some(signature),
             }),
-            BlockBuilder::ToolUse { id, name, input } => Some(Content::ToolCall {
+            BlockBuilder::ToolUse {
+                id,
+                name,
+                input,
+                metadata_emitted: _,
+            } => Some(Content::ToolCall {
                 id,
                 name,
                 arguments: if input.is_empty() { "{}".into() } else { input },
@@ -589,9 +627,10 @@ impl BlockBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use super::{backfill_missing_usage, build_body, to_anthropic_messages};
+    use super::{BlockBuilder, backfill_missing_usage, build_body, to_anthropic_messages};
     use crate::types::{
-        ChatRequest, Completion, Content, Message, RequestProfile, ToolMode, ToolSpec, Usage,
+        ChatRequest, Completion, Content, Message, RequestProfile, StreamEvent, ToolMode, ToolSpec,
+        Usage,
     };
     use serde_json::json;
 
@@ -666,6 +705,45 @@ mod tests {
         let content = out[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
+    }
+
+    #[test]
+    fn streamed_tool_metadata_is_emitted_once() {
+        let mut builder = BlockBuilder::start(&json!({
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "run_program"
+        }));
+        let mut events = Vec::new();
+        for partial_json in ["{\"source\":\"", "let x = 1; x\"}"] {
+            builder.apply_delta(
+                2,
+                &json!({
+                    "type": "input_json_delta",
+                    "partial_json": partial_json
+                }),
+                &mut |event| events.push(event),
+            );
+        }
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ToolCallDelta {
+                index: 2,
+                id_delta: Some(id),
+                name_delta: Some(name),
+                ..
+            } if id == "call_1" && name == "run_program"
+        ));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::ToolCallDelta {
+                id_delta: None,
+                name_delta: None,
+                arguments_delta,
+                ..
+            } if arguments_delta == "let x = 1; x\"}"
+        ));
     }
 
     #[test]

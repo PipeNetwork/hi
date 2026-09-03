@@ -29,6 +29,27 @@ use tokio::task::AbortHandle;
 /// Maximum number of concurrent background subagent tasks per session.
 const MAX_BG_TASKS: usize = 16;
 
+/// Admission failure when every registry slot is still live or owns a terminal
+/// result that the caller has not observed yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackgroundTaskCapacityError {
+    pub maximum: usize,
+    pub running: usize,
+    pub unobserved_terminal: usize,
+}
+
+impl std::fmt::Display for BackgroundTaskCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "background task capacity reached (max {}): {} running and {} completed/failed result(s) not yet observed; call get_task_output or wait_tasks for existing task IDs, then retry (or use kill_task for work no longer needed)",
+            self.maximum, self.running, self.unobserved_terminal
+        )
+    }
+}
+
+impl std::error::Error for BackgroundTaskCapacityError {}
+
 /// A worker normally acknowledges a queued command in the same scheduler
 /// tick. Bound this wait so a non-yielding LocalSet task cannot make registry
 /// operations wait forever behind the worker's command loop.
@@ -285,6 +306,10 @@ struct BgTaskEntry {
     result_rx: Option<oneshot::Receiver<BackgroundTaskOutcome>>,
     /// Cached final outcome once the task has completed.
     final_outcome: Option<BackgroundTaskOutcome>,
+    /// True only after a terminal result was explicitly returned by poll/wait
+    /// (or by an explicit kill). Capacity pressure may reclaim terminal entries
+    /// only after this acknowledgement; worker publication alone is not delivery.
+    observed: bool,
     /// Stable terminal state shared with workers and dependency gates. Unlike
     /// the registry cache, this cell survives capacity pruning while an
     /// already-queued dependent still holds a reference to it.
@@ -657,11 +682,13 @@ impl BackgroundTaskRegistry {
         description: &str,
         subagent_type: &str,
         proposed: BackgroundTaskOutcome,
+        observed: bool,
     ) -> BackgroundTaskOutcome {
         let mut tasks = self.tasks.lock().await;
         if let Some(entry) = tasks.get_mut(id) {
-            if let Some(outcome) = &entry.final_outcome {
-                return outcome.clone();
+            if let Some(outcome) = entry.final_outcome.clone() {
+                entry.observed |= observed;
+                return outcome;
             }
 
             let outcome = {
@@ -690,6 +717,7 @@ impl BackgroundTaskRegistry {
             };
             entry.abort_handle.take();
             entry.final_outcome = Some(outcome.clone());
+            entry.observed |= observed;
             entry.notify.notify_waiters();
             drop(tasks);
             self.abort_handles
@@ -809,13 +837,25 @@ impl BackgroundTaskRegistry {
             }
         }
 
-        // Prune terminal tasks if at capacity.
+        // Capture stable dependency cells before capacity reclamation. An
+        // acknowledged terminal dependency may then leave the registry while
+        // this newly queued task safely retains the exact terminal outcome.
+        let dependency_gates = dependencies
+            .iter()
+            .map(|dependency| {
+                let entry = tasks.get(dependency).expect("dependency validated");
+                DependencyGate {
+                    id: dependency.clone(),
+                    terminal_outcome: entry.terminal_outcome.clone(),
+                    notify: entry.notify.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Reclaim only terminal results that were explicitly returned to a
+        // caller. Worker publication is not acknowledgement: removing an unread
+        // result here would make its task ID resolve to `not found` forever.
         if tasks.len() >= MAX_BG_TASKS {
-            // A worker publishes its terminal result before the registry gets
-            // polled. Treat that shared result cache as terminal evidence too;
-            // otherwise fire-and-forget tasks that nobody polls permanently
-            // consume registry slots and eventually make every later task
-            // fail with "too many concurrent background tasks".
             let cached_terminal = self
                 .outcomes
                 .lock()
@@ -826,9 +866,9 @@ impl BackgroundTaskRegistry {
                 .collect::<std::collections::HashSet<_>>();
             let to_prune: Vec<String> = tasks
                 .iter()
-                .filter(|(key, e)| {
-                    (e.final_outcome.is_some() || cached_terminal.contains(*key))
-                        && !dependencies.iter().any(|dep| dep == *key)
+                .filter(|(key, entry)| {
+                    entry.observed
+                        && (entry.final_outcome.is_some() || cached_terminal.contains(*key))
                 })
                 .map(|(k, _)| k.clone())
                 .collect();
@@ -842,7 +882,18 @@ impl BackgroundTaskRegistry {
                 }
             }
             if tasks.len() >= MAX_BG_TASKS {
-                anyhow::bail!("too many concurrent background tasks (max {MAX_BG_TASKS})");
+                let terminal = tasks
+                    .iter()
+                    .filter(|(key, entry)| {
+                        entry.final_outcome.is_some() || cached_terminal.contains(*key)
+                    })
+                    .count();
+                return Err(BackgroundTaskCapacityError {
+                    maximum: MAX_BG_TASKS,
+                    running: tasks.len().saturating_sub(terminal),
+                    unobserved_terminal: terminal,
+                }
+                .into());
             }
         }
 
@@ -853,17 +904,6 @@ impl BackgroundTaskRegistry {
         let notify = Arc::new(Notify::new());
         let terminal_outcome = Arc::new(std::sync::Mutex::new(None));
 
-        let dependency_gates = dependencies
-            .iter()
-            .map(|dependency| {
-                let entry = tasks.get(dependency).expect("dependency validated");
-                DependencyGate {
-                    id: dependency.clone(),
-                    terminal_outcome: entry.terminal_outcome.clone(),
-                    notify: entry.notify.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
         let gated_factory: Box<dyn FnOnce() -> BgFuture + Send + 'static> = if dependency_gates
             .is_empty()
         {
@@ -901,6 +941,7 @@ impl BackgroundTaskRegistry {
                 subagent_type: subagent_type.to_string(),
                 result_rx: Some(rx),
                 final_outcome: None,
+                observed: false,
                 terminal_outcome: terminal_outcome.clone(),
                 abort_handle: None,
                 notify: notify.clone(),
@@ -991,6 +1032,18 @@ impl BackgroundTaskRegistry {
 
     /// Poll a single task for its current output/status.
     pub async fn poll(&self, id: &str, timeout: Duration) -> Option<BackgroundTaskOutcome> {
+        self.poll_inner(id, timeout, true).await
+    }
+
+    /// Poll without necessarily acknowledging a terminal result. Aggregate
+    /// waits use `observed = false` for intermediate snapshots, then acknowledge
+    /// only the stable result set they actually return to their caller.
+    async fn poll_inner(
+        &self,
+        id: &str,
+        timeout: Duration,
+        observed: bool,
+    ) -> Option<BackgroundTaskOutcome> {
         // Workers publish into the shared cache before notifying the registry.
         // Shutdown also publishes cancellation there before aborting wrappers,
         // because an aborted wrapper cannot send through its result oneshot.
@@ -1004,8 +1057,9 @@ impl BackgroundTaskRegistry {
         {
             let mut tasks = self.tasks.lock().await;
             let entry = tasks.get_mut(id)?;
-            if let Some(ref outcome) = entry.final_outcome {
-                return Some(outcome.clone());
+            if let Some(outcome) = entry.final_outcome.clone() {
+                entry.observed |= observed;
+                return Some(outcome);
             }
             let stable_terminal = entry
                 .terminal_outcome
@@ -1036,6 +1090,7 @@ impl BackgroundTaskRegistry {
                 entry.result_rx.take();
                 entry.abort_handle.take();
                 entry.final_outcome = Some(outcome.clone());
+                entry.observed |= observed;
                 entry.notify.notify_waiters();
                 return Some(outcome);
             }
@@ -1045,8 +1100,9 @@ impl BackgroundTaskRegistry {
         let (description, subagent_type, mut rx) = {
             let mut tasks = self.tasks.lock().await;
             let entry = tasks.get_mut(id)?;
-            if entry.final_outcome.is_some() {
-                return entry.final_outcome.clone();
+            if let Some(outcome) = entry.final_outcome.clone() {
+                entry.observed |= observed;
+                return Some(outcome);
             }
             match entry.result_rx.take() {
                 Some(rx) => (entry.description.clone(), entry.subagent_type.clone(), rx),
@@ -1088,8 +1144,14 @@ impl BackgroundTaskRegistry {
                 // Workers typically omit registry identity; stamp it before cache.
                 let outcome = outcome.with_registry_identity(id, &description, &subagent_type);
                 Some(
-                    self.commit_worker_terminal(id, &description, &subagent_type, outcome)
-                        .await,
+                    self.commit_worker_terminal(
+                        id,
+                        &description,
+                        &subagent_type,
+                        outcome,
+                        observed,
+                    )
+                    .await,
                 )
             }
             WorkerResult::Closed => {
@@ -1117,8 +1179,14 @@ impl BackgroundTaskRegistry {
                     })
                     .with_registry_identity(id, &description, &subagent_type);
                 Some(
-                    self.commit_worker_terminal(id, &description, &subagent_type, outcome)
-                        .await,
+                    self.commit_worker_terminal(
+                        id,
+                        &description,
+                        &subagent_type,
+                        outcome,
+                        observed,
+                    )
+                    .await,
                 )
             }
             WorkerResult::Pending => {
@@ -1126,6 +1194,7 @@ impl BackgroundTaskRegistry {
                 let mut tasks = self.tasks.lock().await;
                 if let Some(entry) = tasks.get_mut(id) {
                     if let Some(outcome) = &entry.final_outcome {
+                        entry.observed |= observed;
                         return Some(outcome.clone());
                     }
                     entry.result_rx = Some(rx);
@@ -1140,12 +1209,38 @@ impl BackgroundTaskRegistry {
     }
 
     pub async fn poll_many(&self, ids: &[String], timeout: Duration) -> Vec<BackgroundTaskOutcome> {
+        let results = self.poll_many_inner(ids, timeout, false).await;
+        self.acknowledge_terminal_results(ids, &results).await;
+        results
+    }
+
+    async fn poll_many_inner(
+        &self,
+        ids: &[String],
+        timeout: Duration,
+        observed: bool,
+    ) -> Vec<BackgroundTaskOutcome> {
         join_all(ids.iter().map(|id| async move {
-            self.poll(id, timeout)
+            self.poll_inner(id, timeout, observed)
                 .await
                 .unwrap_or_else(|| not_found_outcome(id))
         }))
         .await
+    }
+
+    async fn acknowledge_terminal_results(
+        &self,
+        ids: &[String],
+        results: &[BackgroundTaskOutcome],
+    ) {
+        let mut tasks = self.tasks.lock().await;
+        for (id, outcome) in ids.iter().zip(results) {
+            if outcome.state.is_terminal()
+                && let Some(entry) = tasks.get_mut(id)
+            {
+                entry.observed = true;
+            }
+        }
     }
 
     pub async fn wait_all(&self, ids: &[String], timeout: Duration) -> Vec<BackgroundTaskOutcome> {
@@ -1154,12 +1249,14 @@ impl BackgroundTaskRegistry {
             let notified = self.completed_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let results = self.poll_many(ids, Duration::ZERO).await;
+            let results = self.poll_many_inner(ids, Duration::ZERO, false).await;
             if results.iter().all(|outcome| outcome.state.is_terminal()) {
+                self.acknowledge_terminal_results(ids, &results).await;
                 return results;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
+                self.acknowledge_terminal_results(ids, &results).await;
                 return results;
             }
             // Register before taking the snapshot so a completion between the
@@ -1178,16 +1275,18 @@ impl BackgroundTaskRegistry {
             tokio::pin!(notified);
             notified.as_mut().enable();
             // Snapshot all tasks non-blockingly.
-            let all_snapshots = self.poll_many(ids, Duration::ZERO).await;
+            let all_snapshots = self.poll_many_inner(ids, Duration::ZERO, false).await;
             if all_snapshots
                 .iter()
                 .any(|outcome| outcome.state.is_terminal())
             {
+                self.acknowledge_terminal_results(ids, &all_snapshots).await;
                 return all_snapshots;
             }
 
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
+                self.acknowledge_terminal_results(ids, &all_snapshots).await;
                 return all_snapshots;
             }
             // Event-driven wake: notified when any task completes, or timeout.
@@ -1200,8 +1299,9 @@ impl BackgroundTaskRegistry {
         let mut tasks = self.tasks.lock().await;
         let entry = tasks.get_mut(id)?;
 
-        if let Some(ref outcome) = entry.final_outcome {
-            return Some(outcome.clone());
+        if let Some(outcome) = entry.final_outcome.clone() {
+            entry.observed = true;
+            return Some(outcome);
         }
 
         // Drop the result receiver — the worker task will eventually finish.
@@ -1229,6 +1329,7 @@ impl BackgroundTaskRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome.clone());
         entry.final_outcome = Some(outcome.clone());
+        entry.observed = true;
         self.outcomes
             .lock()
             .expect("outcome cache poisoned")
@@ -2256,35 +2357,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capacity_pruning_reclaims_unpolled_completed_tasks() {
+    async fn capacity_preserves_unobserved_completed_tasks_for_retrieval() {
         let registry = BackgroundTaskRegistry::new();
+        let mut ids = Vec::with_capacity(MAX_BG_TASKS);
         for index in 0..MAX_BG_TASKS {
-            registry
-                .spawn(
-                    &format!("unpolled-{index}"),
-                    "explore",
-                    Box::new(|| {
-                        Box::pin(async {
-                            BackgroundTaskOutcome {
-                                id: String::new(),
-                                description: String::new(),
-                                subagent_type: String::new(),
-                                state: BackgroundTaskState::Completed,
-                                output: "done".into(),
-                                applied: false,
-                                changed_files: vec![],
-                            }
-                        })
-                    }),
-                )
-                .await
-                .unwrap();
+            ids.push(
+                registry
+                    .spawn(
+                        &format!("unpolled-{index}"),
+                        "explore",
+                        Box::new(move || {
+                            Box::pin(async move {
+                                BackgroundTaskOutcome {
+                                    id: String::new(),
+                                    description: String::new(),
+                                    subagent_type: String::new(),
+                                    state: BackgroundTaskState::Completed,
+                                    output: format!("done-{index}"),
+                                    applied: false,
+                                    changed_files: vec![],
+                                }
+                            })
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+            );
         }
-        // Let workers publish outcomes without polling any task through the
-        // registry, which is the fire-and-forget pattern this guards.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let terminal = registry
+                    .outcomes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .filter(|outcome| outcome.state.is_terminal())
+                    .count();
+                if terminal == MAX_BG_TASKS {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all tasks should publish terminal results");
+        let intermediate = registry.poll_many_inner(&ids, Duration::ZERO, false).await;
+        assert!(
+            intermediate
+                .iter()
+                .all(|outcome| outcome.state == BackgroundTaskState::Completed)
+        );
+        assert!(
+            registry
+                .tasks
+                .lock()
+                .await
+                .values()
+                .all(|entry| !entry.observed),
+            "an internal wait snapshot must not acknowledge results before return"
+        );
 
-        let next = registry
+        let error = registry
             .spawn(
                 "after-unpolled",
                 "explore",
@@ -2303,23 +2436,93 @@ mod tests {
                 }),
             )
             .await
-            .expect("unpolled terminal tasks should be reclaimable");
-        let outcome = registry.poll(&next, Duration::from_secs(1)).await.unwrap();
-        assert_eq!(outcome.state, BackgroundTaskState::Completed);
+            .expect_err("unobserved terminal results must retain their slots");
+        let capacity = error
+            .downcast_ref::<BackgroundTaskCapacityError>()
+            .expect("capacity admission should return its typed error");
+        assert_eq!(capacity.maximum, MAX_BG_TASKS);
+        assert_eq!(capacity.running, 0);
+        assert_eq!(capacity.unobserved_terminal, MAX_BG_TASKS);
+        assert!(error.to_string().contains("get_task_output or wait_tasks"));
+
+        for (index, id) in ids.iter().enumerate() {
+            let outcome = registry.poll(id, Duration::ZERO).await.unwrap();
+            assert_eq!(outcome.state, BackgroundTaskState::Completed);
+            assert_eq!(outcome.output, format!("done-{index}"));
+        }
     }
 
     #[tokio::test]
-    async fn capacity_pruning_reclaims_unpolled_panicked_futures() {
+    async fn acknowledged_completed_tasks_are_pruned_to_admit_later_work() {
         let registry = BackgroundTaskRegistry::new();
+        let mut ids = Vec::with_capacity(MAX_BG_TASKS);
         for index in 0..MAX_BG_TASKS {
-            registry
-                .spawn(
-                    &format!("panicked-{index}"),
-                    "explore",
-                    Box::new(|| Box::pin(async { panic!("future boom") })),
-                )
-                .await
-                .unwrap();
+            ids.push(
+                registry
+                    .spawn(
+                        &format!("observed-{index}"),
+                        "explore",
+                        Box::new(|| {
+                            Box::pin(async {
+                                BackgroundTaskOutcome {
+                                    id: String::new(),
+                                    description: String::new(),
+                                    subagent_type: String::new(),
+                                    state: BackgroundTaskState::Completed,
+                                    output: "observed".into(),
+                                    applied: false,
+                                    changed_files: vec![],
+                                }
+                            })
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let observed = registry.wait_all(&ids, Duration::from_secs(2)).await;
+        assert!(observed.iter().all(|outcome| outcome.state.is_terminal()));
+
+        let next = registry
+            .spawn(
+                "seventeenth-cumulative-task",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        BackgroundTaskOutcome {
+                            id: String::new(),
+                            description: String::new(),
+                            subagent_type: String::new(),
+                            state: BackgroundTaskState::Completed,
+                            output: "later".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
+            .await
+            .expect("acknowledged terminal entries should be reclaimable");
+        let outcome = registry.poll(&next, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(outcome.state, BackgroundTaskState::Completed);
+        assert_eq!(outcome.output, "later");
+    }
+
+    #[tokio::test]
+    async fn capacity_pruning_reclaims_observed_panicked_futures() {
+        let registry = BackgroundTaskRegistry::new();
+        let mut ids = Vec::with_capacity(MAX_BG_TASKS);
+        for index in 0..MAX_BG_TASKS {
+            ids.push(
+                registry
+                    .spawn(
+                        &format!("panicked-{index}"),
+                        "explore",
+                        Box::new(|| Box::pin(async { panic!("future boom") })),
+                    )
+                    .await
+                    .unwrap(),
+            );
         }
         // Wait for the workers to publish every caught panic without polling
         // any registry entry. A fixed sleep made this regression sensitive to
@@ -2344,6 +2547,10 @@ mod tests {
         })
         .await
         .expect("all panicked futures should publish terminal failures");
+        let observed = registry.poll_many(&ids, Duration::ZERO).await;
+        assert!(observed.iter().all(|outcome| {
+            outcome.state == BackgroundTaskState::Failed && outcome.output.contains("future boom")
+        }));
 
         let next = registry
             .spawn(
@@ -2364,7 +2571,7 @@ mod tests {
                 }),
             )
             .await
-            .expect("caught panics should be reclaimable terminal tasks");
+            .expect("observed panics should be reclaimable terminal tasks");
         assert_eq!(
             registry
                 .poll(&next, Duration::from_secs(1))

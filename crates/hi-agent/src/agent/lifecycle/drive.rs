@@ -1,5 +1,7 @@
 //! Plan/goal auto-drive state and interactive permission transitions.
 
+use anyhow::Result;
+
 impl crate::Agent {
     /// Install an unfinished plan reconstructed by session storage.
     pub fn restore_plan(&mut self, plan: Vec<hi_tools::PlanStep>) {
@@ -36,13 +38,52 @@ impl crate::Agent {
         &self,
         outcome: Option<&crate::TurnOutcome>,
     ) -> crate::PlanDriveAction {
-        let stop = outcome
-            .or(self.report.last_turn_outcome.as_ref())
-            .map(|outcome| outcome.stop_reason);
+        self.plan_drive_decision_for_outcome(outcome.or(self.report.last_turn_outcome.as_ref()))
+    }
+
+    fn plan_drive_decision_for_outcome(
+        &self,
+        outcome: Option<&crate::TurnOutcome>,
+    ) -> crate::PlanDriveAction {
+        if self.goals.plan_incomplete() && self.plan_approval_parked {
+            return crate::PlanDriveAction::Idle {
+                reason: crate::PlanDriveIdleReason::ApprovalParked,
+            };
+        }
+        match outcome.map(|outcome| (outcome.status, outcome.stop_reason)) {
+            Some((crate::TurnStatus::Cancelled, _))
+            | Some((_, crate::TurnStopReason::Cancelled | crate::TurnStopReason::TurnLimit)) => {
+                return crate::PlanDriveAction::Idle {
+                    reason: crate::PlanDriveIdleReason::Cancelled,
+                };
+            }
+            Some((_, crate::TurnStopReason::InfrastructureFailure)) => {
+                return crate::PlanDriveAction::Idle {
+                    reason: crate::PlanDriveIdleReason::Infrastructure,
+                };
+            }
+            Some((_, crate::TurnStopReason::NoProgress)) => {
+                return crate::PlanDriveAction::Idle {
+                    reason: crate::PlanDriveIdleReason::NoProgress,
+                };
+            }
+            Some((crate::TurnStatus::Blocked, _)) => {
+                return crate::PlanDriveAction::Idle {
+                    reason: crate::PlanDriveIdleReason::Blocked,
+                };
+            }
+            _ => {}
+        }
+        if outcome.is_some_and(crate::plan_drive::outcome_blocks_automatic_drive) {
+            return crate::PlanDriveAction::Idle {
+                reason: crate::PlanDriveIdleReason::Blocked,
+            };
+        }
+        let stop = outcome.map(|outcome| outcome.stop_reason);
         crate::PlanDriveAction::decide(
             self.goals.plan_incomplete(),
             self.plan_mode,
-            self.plan_drive_paused,
+            self.plan_drive_paused(),
             self.plan_drive_stall,
             self.goals
                 .structured
@@ -54,24 +95,48 @@ impl crate::Agent {
 
     /// Unified leftover-work gate: goal drive wins over plan when both apply.
     pub fn drive_decision(&self, outcome: Option<&crate::TurnOutcome>) -> crate::DriveAction {
-        let stop = outcome
-            .or(self.report.last_turn_outcome.as_ref())
-            .map(|outcome| outcome.stop_reason);
-        match stop {
-            // A session TurnLimit cannot be advanced by another synthetic
-            // turn. Treat it as the same terminal drive stop as cancellation;
-            // StepLimit remains resumable and intentionally falls through.
-            Some(crate::TurnStopReason::Cancelled | crate::TurnStopReason::TurnLimit) => {
+        self.drive_decision_for_outcome(outcome.or(self.report.last_turn_outcome.as_ref()))
+    }
+
+    /// Drive gate after an explicit user command installs or resumes a goal.
+    /// This deliberately ignores the previous turn's terminal outcome; only
+    /// automatic post-turn/startup drive is latched by failure or cancellation.
+    pub fn explicit_goal_drive_decision(&self) -> crate::DriveAction {
+        self.drive_decision_for_outcome(None)
+    }
+
+    fn drive_decision_for_outcome(
+        &self,
+        outcome: Option<&crate::TurnOutcome>,
+    ) -> crate::DriveAction {
+        match outcome.map(|outcome| (outcome.status, outcome.stop_reason)) {
+            Some((crate::TurnStatus::Cancelled, _))
+            | Some((_, crate::TurnStopReason::Cancelled | crate::TurnStopReason::TurnLimit)) => {
                 return crate::DriveAction::Idle {
                     reason: crate::DriveIdleReason::Cancelled,
                 };
             }
-            Some(crate::TurnStopReason::InfrastructureFailure) => {
+            Some((_, crate::TurnStopReason::InfrastructureFailure)) => {
                 return crate::DriveAction::Idle {
                     reason: crate::DriveIdleReason::Infrastructure,
                 };
             }
+            Some((_, crate::TurnStopReason::NoProgress)) => {
+                return crate::DriveAction::Idle {
+                    reason: crate::DriveIdleReason::NoProgress,
+                };
+            }
+            Some((crate::TurnStatus::Blocked, _)) => {
+                return crate::DriveAction::Idle {
+                    reason: crate::DriveIdleReason::Blocked,
+                };
+            }
             _ => {}
+        }
+        if outcome.is_some_and(crate::plan_drive::outcome_blocks_automatic_drive) {
+            return crate::DriveAction::Idle {
+                reason: crate::DriveIdleReason::Blocked,
+            };
         }
         if self.plan_mode {
             return crate::DriveAction::Idle {
@@ -101,12 +166,38 @@ impl crate::Agent {
             }
             return crate::DriveAction::Enqueue(crate::DriveKind::Goal);
         }
-        crate::DriveAction::from_plan(self.plan_drive_decision(outcome))
+        crate::DriveAction::from_plan(self.plan_drive_decision_for_outcome(outcome))
     }
 
     /// Whether `/plan pause` has stopped auto-enqueue. The checklist stays pinned.
     pub fn plan_drive_paused(&self) -> bool {
-        self.plan_drive_paused
+        self.plan_drive_pause.is_paused()
+            && !self.pending_plan_interruption_resume
+            && !self.turn_consumed_plan_interruption
+    }
+
+    pub(crate) fn durable_plan_drive_paused(&self) -> bool {
+        self.plan_drive_pause.is_paused()
+    }
+
+    pub(crate) fn plan_drive_resumes_on_user_input(&self) -> bool {
+        self.plan_drive_pause.resumes_on_user_input()
+    }
+
+    /// Whether leftover plan work is waiting on the TUI approval card.
+    pub fn plan_approval_parked(&self) -> bool {
+        self.plan_approval_parked
+    }
+
+    /// Park or reopen the leftover-plan approval. This is a distinct durable
+    /// state from `/plan pause`, so either control can be changed without
+    /// accidentally consuming the other.
+    pub fn set_plan_approval_parked(&mut self, parked: bool) {
+        if self.plan_approval_parked == parked {
+            return;
+        }
+        self.plan_approval_parked = parked;
+        self.persist_plan_approval_parked();
     }
 
     pub fn plan_drive_stall(&self) -> u32 {
@@ -116,7 +207,7 @@ impl crate::Agent {
     pub fn plan_drive_status(&self) -> &'static str {
         crate::plan_drive_status(
             self.goals.plan_incomplete(),
-            self.plan_drive_paused,
+            self.plan_drive_paused(),
             self.plan_drive_stall,
         )
     }
@@ -144,11 +235,193 @@ impl crate::Agent {
     }
 
     pub fn set_plan_drive_paused(&mut self, paused: bool) {
-        if self.plan_drive_paused == paused {
-            return;
+        let _ = self.try_set_plan_drive_paused(paused);
+    }
+
+    /// Persist an explicit manual pause/unpause, reverting the live state when
+    /// the session sink rejects the transition.
+    pub fn try_set_plan_drive_paused(&mut self, paused: bool) -> Result<bool> {
+        let pause = if paused {
+            crate::plan_drive::PlanDrivePause::Manual
+        } else {
+            crate::plan_drive::PlanDrivePause::Running
+        };
+        if self.plan_drive_pause == pause
+            && !self.pending_plan_interruption_resume
+            && !self.turn_consumed_plan_interruption
+        {
+            return Ok(false);
         }
-        self.plan_drive_paused = paused;
-        self.persist_plan_drive();
+        let previous_pause = self.plan_drive_pause;
+        let previous_pending = self.pending_plan_interruption_resume;
+        let previous_consumed = self.turn_consumed_plan_interruption;
+        self.plan_drive_pause = pause;
+        self.pending_plan_interruption_resume = false;
+        self.turn_consumed_plan_interruption = false;
+        if let Err(error) = self.try_persist_plan_drive_evidence_delta(false, &[]) {
+            self.plan_drive_pause = previous_pause;
+            self.pending_plan_interruption_resume = previous_pending;
+            self.turn_consumed_plan_interruption = previous_consumed;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Resume explicit pause/park state in one durable record so restart can
+    /// never observe `paused=false` with the old parked stall ledger.
+    pub fn resume_plan_drive(&mut self) -> Result<bool> {
+        let previous_pause = self.plan_drive_pause;
+        let previous_stall = self.plan_drive_stall;
+        let previous_evidence = self.plan_drive_evidence.clone();
+        let previous_pending = self.pending_plan_interruption_resume;
+        let previous_consumed = self.turn_consumed_plan_interruption;
+        let reset_evidence = !self.plan_drive_evidence.is_empty();
+        let changed = self.durable_plan_drive_paused()
+            || self.plan_drive_stall != 0
+            || reset_evidence
+            || previous_pending
+            || previous_consumed;
+        if !changed {
+            return Ok(false);
+        }
+        self.plan_drive_pause = crate::plan_drive::PlanDrivePause::Running;
+        self.plan_drive_stall = 0;
+        self.plan_drive_evidence.clear();
+        self.pending_plan_interruption_resume = false;
+        self.turn_consumed_plan_interruption = false;
+        if let Err(error) = self.try_persist_plan_drive_evidence_delta(reset_evidence, &[]) {
+            self.plan_drive_pause = previous_pause;
+            self.plan_drive_stall = previous_stall;
+            self.plan_drive_evidence = previous_evidence;
+            self.pending_plan_interruption_resume = previous_pending;
+            self.turn_consumed_plan_interruption = previous_consumed;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Stop an interrupted synthetic plan turn without requiring a special
+    /// command to recover. Autonomous drive remains latched off until genuine
+    /// user work arrives; `/plan pause` uses the separate manual state.
+    pub fn pause_plan_drive_until_user_input(&mut self) -> Result<bool> {
+        let was_effectively_paused = self.plan_drive_paused();
+        let previous_pending = self.pending_plan_interruption_resume;
+        let previous_consumed = self.turn_consumed_plan_interruption;
+        self.pending_plan_interruption_resume = false;
+        self.turn_consumed_plan_interruption = false;
+        if self.plan_drive_pause == crate::plan_drive::PlanDrivePause::Interrupted {
+            return Ok(!was_effectively_paused);
+        }
+        let previous = self.plan_drive_pause;
+        self.plan_drive_pause = crate::plan_drive::PlanDrivePause::Interrupted;
+        if let Err(error) = self.try_persist_plan_drive_evidence_delta(false, &[]) {
+            self.plan_drive_pause = previous;
+            self.pending_plan_interruption_resume = previous_pending;
+            self.turn_consumed_plan_interruption = previous_consumed;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Apply the prompt-owned plan-drive transition before a turn is rendered
+    /// or executed. Returns true when a visible pause or park was consumed.
+    pub fn prepare_plan_drive_for_turn(&mut self, kind: crate::DriveKind) -> Result<bool> {
+        if kind == crate::DriveKind::User
+            && self.plan_drive_pause.resumes_on_user_input()
+            && !self.pending_plan_interruption_resume
+            && !self.turn_consumed_plan_interruption
+        {
+            // Keep the durable latch until this steering turn completes. The
+            // transient flag makes the active turn render as resumed while a
+            // crash, cancellation, or early error still restores as paused.
+            self.pending_plan_interruption_resume = true;
+            return Ok(true);
+        }
+        let resume = match kind {
+            // A synthetic plan prompt is an explicit resume only when drive is
+            // actually paused or parked. Ordinary automatic plan turns must
+            // retain their cross-turn stall/evidence ledger.
+            crate::DriveKind::Plan => {
+                self.plan_drive_paused() || self.plan_drive_stall >= crate::PLAN_DRIVE_STALL_LIMIT
+            }
+            crate::DriveKind::User => false,
+            crate::DriveKind::Goal => false,
+        };
+        if !resume {
+            return Ok(false);
+        }
+        let previous_pause = self.plan_drive_pause;
+        let previous_stall = self.plan_drive_stall;
+        let previous_evidence = self.plan_drive_evidence.clone();
+        let was_paused = self.plan_drive_paused();
+        let reset_evidence = self.plan_drive_evidence.clear();
+        let changed = was_paused || self.plan_drive_stall != 0 || reset_evidence;
+        self.plan_drive_pause = crate::plan_drive::PlanDrivePause::Running;
+        self.plan_drive_stall = 0;
+        if changed
+            && let Err(error) = self.try_persist_plan_drive_evidence_delta(reset_evidence, &[])
+        {
+            self.plan_drive_pause = previous_pause;
+            self.plan_drive_stall = previous_stall;
+            self.plan_drive_evidence = previous_evidence;
+            return Err(error);
+        }
+        Ok(changed)
+    }
+
+    /// Commit or roll back a transactional interruption resume after the user
+    /// turn settles. Until successful completion, the durable state remains
+    /// Interrupted so a crash/restart cannot autonomously drive the plan.
+    pub(crate) fn settle_plan_interruption_resume(&mut self, successful: bool) -> Result<()> {
+        let pending = std::mem::take(&mut self.pending_plan_interruption_resume);
+        let active = std::mem::take(&mut self.turn_consumed_plan_interruption);
+        let consumed = pending || active;
+        if !consumed || !successful {
+            return Ok(());
+        }
+        debug_assert_eq!(
+            self.plan_drive_pause,
+            crate::plan_drive::PlanDrivePause::Interrupted
+        );
+        self.plan_drive_pause = crate::plan_drive::PlanDrivePause::Running;
+        if let Err(error) = self.try_persist_plan_drive_evidence_delta(false, &[]) {
+            self.plan_drive_pause = crate::plan_drive::PlanDrivePause::Interrupted;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Judge one completed synthetic plan turn against evidence already credited
+    /// in this checklist-step scope. This lives on `Agent` so every frontend uses
+    /// the same cross-turn ledger instead of interpreting turn-local telemetry.
+    pub fn plan_drive_turn_made_progress(&mut self, before_step: Option<&str>) -> bool {
+        let structural_progress = before_step != self.next_plan_step_title();
+        let mutation_progress = !self.workspace.last_changed_files.is_empty()
+            || self
+                .report
+                .last_turn_telemetry
+                .progress_events
+                .iter()
+                .any(crate::plan_drive::progress_event_is_structural_or_mutation);
+        if structural_progress || mutation_progress {
+            self.clear_plan_drive_evidence_scope();
+            return true;
+        }
+
+        // An implementation step may spend one turn orienting itself, but a
+        // stream of novel offsets/files is not durable implementation progress.
+        // Remember whether this structural scope already received that initial
+        // evidence credit before recording the current turn's signatures. The
+        // ledger is persisted, so a restart cannot renew the orientation turn.
+        let already_oriented = !self.plan_drive_evidence.is_empty();
+        let added = self
+            .plan_drive_evidence
+            .record_novel(&self.report.last_turn_telemetry);
+        if added.is_empty() {
+            return false;
+        }
+        self.persist_plan_drive_evidence_delta(false, &added);
+        crate::plan_drive::plan_step_allows_continual_evidence(before_step) || !already_oriented
     }
 
     pub fn note_plan_drive_progress(&mut self, made_progress: bool) {
@@ -161,16 +434,43 @@ impl crate::Agent {
     }
 
     pub fn reset_plan_drive_stall(&mut self) {
-        if self.plan_drive_stall == 0 {
+        let reset_evidence = self.plan_drive_evidence.clear();
+        if self.plan_drive_stall == 0 && !reset_evidence {
             return;
         }
         self.plan_drive_stall = 0;
-        self.persist_plan_drive();
+        self.persist_plan_drive_evidence_delta(reset_evidence, &[]);
     }
 
-    pub fn restore_plan_drive(&mut self, paused: bool, stall: u32) {
-        self.plan_drive_paused = paused;
+    pub fn restore_plan_drive(&mut self, paused: bool, stall: u32, evidence_hashes: Vec<String>) {
+        self.restore_plan_drive_with_policy(paused, false, stall, evidence_hashes);
+    }
+
+    /// Restore plan drive state including the interruption-only resume policy.
+    /// The legacy [`Self::restore_plan_drive`] entry point retains manual-pause
+    /// semantics for downstream callers compiled against the public API.
+    pub fn restore_plan_drive_with_policy(
+        &mut self,
+        paused: bool,
+        resume_on_user_input: bool,
+        stall: u32,
+        evidence_hashes: Vec<String>,
+    ) {
+        self.plan_drive_pause = if !paused {
+            crate::plan_drive::PlanDrivePause::Running
+        } else if resume_on_user_input {
+            crate::plan_drive::PlanDrivePause::Interrupted
+        } else {
+            crate::plan_drive::PlanDrivePause::Manual
+        };
+        self.pending_plan_interruption_resume = false;
+        self.turn_consumed_plan_interruption = false;
         self.plan_drive_stall = stall;
+        self.plan_drive_evidence.restore(evidence_hashes);
+    }
+
+    pub fn restore_plan_approval_parked(&mut self, parked: bool) {
+        self.plan_approval_parked = parked;
     }
 
     pub fn note_goal_drive_progress(&mut self, made_progress: bool) -> crate::GoalDriveProgress {
@@ -196,7 +496,7 @@ impl crate::Agent {
             }
             self.goal_drive_stall = next;
             self.persist_goal_drive();
-            return crate::GoalDriveProgress::Stalled { stall: next };
+            return crate::GoalDriveProgress::NoProgress { count: next };
         }
         let Some(goal) = self.goals.structured.as_ref() else {
             self.goal_drive_stall = next;
@@ -225,6 +525,7 @@ impl crate::Agent {
                     crate::GOAL_DRIVE_STALL_LIMIT
                 ));
             });
+            self.clear_goal_drive_evidence_scope();
             let after = self.goals.structured.as_ref();
             let next_title = after
                 .and_then(|goal| goal.active_sub_goal())
@@ -266,6 +567,7 @@ impl crate::Agent {
                     crate::GOAL_DRIVE_STALL_LIMIT
                 ));
             });
+            self.clear_goal_drive_evidence_scope();
             if let Some(count) = self.maybe_requeue_goal_second_pass() {
                 self.goal_drive_stall = 0;
                 self.persist_goal_drive();
@@ -277,6 +579,37 @@ impl crate::Agent {
         crate::GoalDriveProgress::Parked
     }
 
+    /// Goal-drive counterpart to [`Self::plan_drive_turn_made_progress`]. Goal
+    /// retry counters/notes do not clear the ledger; only a real structural
+    /// transition, mutation, or previously unseen signed inspection does.
+    pub fn goal_drive_turn_made_progress(&mut self, before: Option<&crate::Goal>) -> bool {
+        let after = self.goals.structured.as_ref();
+        let structural_progress = match (after, before) {
+            (Some(after), Some(before)) => after.drive_state_changed_since(before),
+            _ => true,
+        };
+        let mutation_progress = !self.workspace.last_changed_files.is_empty()
+            || self
+                .report
+                .last_turn_telemetry
+                .progress_events
+                .iter()
+                .any(crate::plan_drive::progress_event_is_structural_or_mutation);
+        if structural_progress || mutation_progress {
+            self.clear_goal_drive_evidence_scope();
+            return true;
+        }
+
+        let added = self
+            .goal_drive_evidence
+            .record_novel(&self.report.last_turn_telemetry);
+        if added.is_empty() {
+            return false;
+        }
+        self.persist_goal_drive_evidence_delta(false, &added);
+        true
+    }
+
     pub(crate) fn maybe_requeue_goal_second_pass(&mut self) -> Option<usize> {
         let mut count = 0;
         let _ = self.update_structured_goal(|goal| {
@@ -285,6 +618,7 @@ impl crate::Agent {
         if count == 0 {
             return None;
         }
+        self.clear_goal_drive_evidence_scope();
         self.goal_requeue_notice = Some(count);
         Some(count)
     }
@@ -294,42 +628,104 @@ impl crate::Agent {
     }
 
     pub fn reset_goal_drive_stall(&mut self) {
-        if self.goal_drive_stall == 0 {
+        let reset_evidence = self.goal_drive_evidence.clear();
+        if self.goal_drive_stall == 0 && !reset_evidence {
             return;
         }
         self.goal_drive_stall = 0;
-        self.persist_goal_drive();
+        self.persist_goal_drive_evidence_delta(reset_evidence, &[]);
     }
 
-    pub fn restore_goal_drive(&mut self, stall: u32) {
+    pub fn restore_goal_drive(&mut self, stall: u32, evidence_hashes: Vec<String>) {
         self.goal_drive_stall = stall;
+        self.goal_drive_evidence.restore(evidence_hashes);
     }
 
     pub fn clear_pinned_plan(&mut self) {
         self.goals.clear_plan();
-        self.plan_drive_paused = false;
+        self.plan_drive_pause = crate::plan_drive::PlanDrivePause::Running;
+        self.pending_plan_interruption_resume = false;
+        self.turn_consumed_plan_interruption = false;
+        self.plan_approval_parked = false;
         self.plan_drive_stall = 0;
+        self.plan_drive_evidence.clear();
         if let Some(session) = self.session.as_mut() {
             let _ = session.clear_plan();
-            let _ = session.record_plan_drive(false, 0);
+            let _ = session.record_plan_drive_state_with_policy(false, 0, false, true, &[]);
+            let _ = session.record_plan_approval_parked(false);
         }
     }
 
     fn persist_plan_drive(&mut self) {
+        self.persist_plan_drive_evidence_delta(false, &[]);
+    }
+
+    fn persist_plan_drive_evidence_delta(&mut self, reset: bool, added: &[String]) {
+        let _ = self.try_persist_plan_drive_evidence_delta(reset, added);
+    }
+
+    fn try_persist_plan_drive_evidence_delta(
+        &mut self,
+        reset: bool,
+        added: &[String],
+    ) -> Result<()> {
+        let paused = self.durable_plan_drive_paused();
+        let resume_on_user_input = self.plan_drive_resumes_on_user_input();
         if let Some(session) = self.session.as_mut() {
-            let _ = session.record_plan_drive(self.plan_drive_paused, self.plan_drive_stall);
+            session.record_plan_drive_state_with_policy(
+                paused,
+                self.plan_drive_stall,
+                resume_on_user_input,
+                reset,
+                added,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn clear_plan_drive_evidence_scope(&mut self) {
+        if self.plan_drive_evidence.clear() {
+            self.persist_plan_drive_evidence_delta(true, &[]);
+        }
+    }
+
+    fn persist_plan_approval_parked(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.record_plan_approval_parked(self.plan_approval_parked);
         }
     }
 
     fn persist_goal_drive(&mut self) {
+        self.persist_goal_drive_evidence_delta(false, &[]);
+    }
+
+    fn persist_goal_drive_evidence_delta(&mut self, reset: bool, added: &[String]) {
         if let Some(session) = self.session.as_mut() {
-            let _ = session.record_goal_drive(self.goal_drive_stall);
+            let _ = session.record_goal_drive_state(self.goal_drive_stall, reset, added);
+        }
+    }
+
+    fn clear_goal_drive_evidence_scope(&mut self) {
+        if self.goal_drive_evidence.clear() {
+            self.persist_goal_drive_evidence_delta(true, &[]);
         }
     }
 
     /// Book-keep pause, stall, and ask_user streak for this turn's prompt.
-    pub(crate) fn begin_drive_turn(&mut self, kind: crate::DriveKind) {
+    pub(crate) fn begin_drive_turn(&mut self, kind: crate::DriveKind) -> Result<()> {
         self.finish_drive_turn();
+        let preflight_consumed_interruption = if kind == crate::DriveKind::User {
+            std::mem::take(&mut self.pending_plan_interruption_resume)
+        } else {
+            self.pending_plan_interruption_resume = false;
+            false
+        };
+        if !preflight_consumed_interruption {
+            self.prepare_plan_drive_for_turn(kind)?;
+        }
+        let prepared_interruption = std::mem::take(&mut self.pending_plan_interruption_resume);
+        self.turn_consumed_plan_interruption = preflight_consumed_interruption
+            || (kind == crate::DriveKind::User && prepared_interruption);
         self.turn_drive_kind = kind;
         self.ask_user_calls = 0;
         self.approval_parked = false;
@@ -340,12 +736,6 @@ impl crate::Agent {
                 self.reset_goal_drive_stall();
             }
             crate::DriveKind::Plan => {
-                if self.plan_drive_paused || self.plan_drive_stall >= crate::PLAN_DRIVE_STALL_LIMIT
-                {
-                    self.plan_drive_paused = false;
-                    self.plan_drive_stall = 0;
-                    self.persist_plan_drive();
-                }
                 self.maybe_demote_always_for_drive();
             }
             crate::DriveKind::Goal => {
@@ -364,6 +754,7 @@ impl crate::Agent {
                 self.apply_goal_drive_permissions();
             }
         }
+        Ok(())
     }
 
     fn apply_goal_drive_permissions(&mut self) {
@@ -415,6 +806,11 @@ impl crate::Agent {
             // Advertise tools as if the next task were read-only (no mutations).
             self.set_advertised_tools(Some(("", crate::TaskIntent::ReadOnly)));
         } else {
+            // Mode controls are per-turn transport, not durable user intent.
+            // Clean them immediately so `/plan off` also fixes already-loaded
+            // legacy sessions before `/compact`, `/recap`, or the next turn.
+            self.messages.strip_previous_turn_blocks();
+            self.persisted = self.persisted.min(self.messages.len());
             self.set_advertised_tools(None);
         }
     }

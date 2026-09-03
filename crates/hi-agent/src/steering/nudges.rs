@@ -45,7 +45,7 @@ pub(crate) fn answer_says_insufficient_evidence(content: &str) -> bool {
 /// This intentionally does not reject short answers in general (`ok`, `done`,
 /// `yes`) because those may be the user's requested payload. It targets only
 /// canned claims that assert completion while conveying no result or evidence.
-pub(crate) fn answer_is_generic_completion_placeholder(content: &str) -> bool {
+pub fn answer_is_generic_completion_placeholder(content: &str) -> bool {
     let normalized = content
         .to_ascii_lowercase()
         .chars()
@@ -68,6 +68,15 @@ pub(crate) fn answer_is_generic_completion_placeholder(content: &str) -> bool {
             | "the requested task is complete"
             | "the requested task has been completed"
     )
+}
+
+/// Whether production generic-completion answer-integrity guards are active.
+///
+/// The false branch is compiled only by the executable smoke negative-control
+/// script. Keeping the switch compile-time-only prevents scenarios, providers,
+/// or end users from disabling the guards at runtime.
+pub(crate) const fn generic_completion_guards_enabled() -> bool {
+    !cfg!(feature = "smoke-negative-control-disable-generic-completion-guards")
 }
 
 /// Whether the model, challenged by the no-change nudge, explicitly declines
@@ -191,16 +200,16 @@ impl ConcreteReviewAnswerProblem {
     pub(crate) fn exhausted_status(self) -> &'static str {
         match self {
             Self::GenericCompletionPlaceholder => {
-                "review answer remained a completion placeholder after repair; stopping incomplete"
+                "review answer remained a completion placeholder after repair; returning the available answer"
             }
             Self::MissingInspectedCitation => {
-                "review answer still lacked concrete inspected files after repair; stopping incomplete"
+                "review answer still lacked concrete inspected files after repair; returning the available answer"
             }
             Self::GenericInventorySummary => {
-                "review answer stayed generic after repair; stopping incomplete"
+                "review answer stayed generic after repair; returning the available answer"
             }
             Self::MissingReviewShape => {
-                "review answer still lacked bounded review findings after repair; stopping incomplete"
+                "review answer still lacked bounded review findings after repair; returning the available answer"
             }
         }
     }
@@ -712,17 +721,13 @@ pub(crate) fn inspection_round_cap_nudge(rounds: u32) -> String {
 /// Whether the inspection-sprawl guard should fire this round. True when:
 /// - this is a read-only review turn (`intent.is_some()`), or the turn is not
 ///   an expected-mutation implementation (open-ended inspect loops),
-/// - the turn has already gathered a lot of evidence
-///   (`inspection_attempt_count() >= active_inspection_cap`) **or** spent
-///   [`INSPECTION_ONLY_ROUND_CAP`] consecutive inspection-only model rounds,
+/// - the user supplied an explicit inspection cap and the turn reached it,
 /// - every call this round is a read-only inspection (the model is still
 ///   gathering, not answering), and
 /// - the sprawl nudge budget is not yet exhausted.
 ///
-/// This catches the failure mode the repeat/cycle guard misses: a model that
-/// reads 100 *distinct* files, each with a new inspection signature, so
-/// `round_adds_evidence` always returns true and the repeat budget is never
-/// consumed. Without this guard the turn churns until `max_steps`.
+/// Distinct new evidence is intentionally not capped by default. Repeated and
+/// no-new-evidence inspection loops are handled by the cycle guard instead.
 ///
 /// `repo_map` / `explore` / `find_symbol` count as inspection for both the
 /// file cap (1:1) and the all-inspection round check.
@@ -746,9 +751,9 @@ pub(crate) fn should_nudge_inspection_sprawl(
 }
 
 /// Whether the inspection-sprawl guard has exhausted its budget and the turn
-/// should stop incomplete. True on a bounded inspection turn that is still
-/// sprawling (all calls read-only inspections) after the sprawl nudge budget is
-/// spent.
+/// should settle with the evidence already gathered. True on a bounded
+/// inspection turn that is still sprawling (all calls read-only inspections)
+/// after the sprawl nudge budget is spent.
 pub(crate) fn inspection_sprawl_exhausted(
     intent: Option<ReviewIntent>,
     bound_open_ended_inspection: bool,
@@ -779,11 +784,7 @@ pub(crate) fn inspection_budget_exhausted(
     evidence: &EvidenceTracker,
     active_inspection_cap: Option<u32>,
 ) -> bool {
-    let over_file_cap =
-        active_inspection_cap.is_some_and(|cap| evidence.inspection_attempt_count() >= cap);
-    let over_round_cap =
-        evidence.inspection_only_rounds >= super::constants::INSPECTION_ONLY_ROUND_CAP;
-    over_file_cap || over_round_cap
+    active_inspection_cap.is_some_and(|cap| evidence.inspection_attempt_count() >= cap)
 }
 
 pub(crate) fn read_only_blocked_tool_result(name: &str) -> String {
@@ -813,5 +814,13 @@ mod tests {
             ReviewIntent::Review,
             "[P0] Auth bypass — crates/hi-cli/src/auth.rs:12"
         ));
+    }
+
+    #[test]
+    fn generic_completion_guard_feature_state_is_compile_time_scoped() {
+        #[cfg(feature = "smoke-negative-control-disable-generic-completion-guards")]
+        assert!(!generic_completion_guards_enabled());
+        #[cfg(not(feature = "smoke-negative-control-disable-generic-completion-guards"))]
+        assert!(generic_completion_guards_enabled());
     }
 }

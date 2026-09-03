@@ -1,0 +1,299 @@
+schema_version = 1
+name = "productive-investigation-plan-drive"
+tags = ["curated", "pr", "productive-investigation-regression"]
+timeout_ms = 60000
+
+[workspace]
+fixture = "fixture"
+git = "clean"
+
+[hi]
+# Verification is outside this regression's scope. The case isolates the
+# plan-drive progress classifier and its four-turn no-progress park guard.
+args = ["--allow-unverified"]
+
+[[session.plan]]
+title = "Investigate the lifecycle evidence, then record the conclusion"
+status = "pending"
+
+# Each of the first five plan-drive turns terminates without changing either
+# the workspace or structured plan. Their only progress is a novel read/search
+# result, so a classifier regression parks before the mutation turn can run.
+[[provider.steps]]
+id = "read-alpha"
+[provider.steps.response]
+kind = "tool_call"
+name = "read"
+arguments = { path = "evidence-01.txt" }
+
+[[provider.steps]]
+id = "report-alpha"
+[provider.steps.expect]
+body_contains = ["ALPHA_ROUTE"]
+[provider.steps.response]
+kind = "text"
+text = "Evidence pass 1 found ALPHA_ROUTE in evidence-01.txt; more lifecycle evidence remains to inspect."
+
+[[provider.steps]]
+id = "settle-alpha-2"
+[provider.steps.response]
+kind = "text"
+text = "ALPHA_ROUTE is grounded by the first file; this turn can end with the remaining plan still pending."
+
+[[provider.steps]]
+id = "settle-alpha-3"
+[provider.steps.response]
+kind = "text"
+text = "The first distinct finding is recorded from evidence-01.txt; later evidence belongs to a subsequent drive."
+
+[[provider.steps]]
+id = "settle-alpha-4"
+[provider.steps.response]
+kind = "text"
+text = "This pass produced concrete read evidence for ALPHA_ROUTE without changing the workspace."
+
+[[provider.steps]]
+id = "settle-alpha-5"
+[provider.steps.response]
+kind = "text"
+text = "Ending evidence pass 1 now; the pending plan should automatically schedule the next investigation turn."
+
+[[provider.steps]]
+id = "search-beta"
+[provider.steps.response]
+kind = "tool_call"
+name = "grep"
+arguments = { pattern = "BETA_QUEUE", path = "." }
+
+[[provider.steps]]
+id = "report-beta"
+[provider.steps.expect]
+body_contains = ["BETA_QUEUE"]
+[provider.steps.response]
+kind = "text"
+text = "Evidence pass 2 found BETA_QUEUE in evidence-02.txt; the remaining lifecycle claims still need inspection."
+
+[[provider.steps]]
+id = "settle-beta-2"
+[provider.steps.response]
+kind = "text"
+text = "BETA_QUEUE is grounded by a targeted search; this turn can end while the later claims remain pending."
+
+[[provider.steps]]
+id = "settle-beta-3"
+[provider.steps.response]
+kind = "text"
+text = "The second distinct finding is recorded from evidence-02.txt; later evidence belongs to another drive."
+
+[[provider.steps]]
+id = "settle-beta-4"
+[provider.steps.response]
+kind = "text"
+text = "This pass produced concrete search evidence for BETA_QUEUE without changing the workspace."
+
+[[provider.steps]]
+id = "settle-beta-5"
+[provider.steps.response]
+kind = "text"
+text = "Ending evidence pass 2 now; the pending plan should automatically schedule the next investigation turn."
+
+[[provider.steps]]
+id = "read-gamma"
+[provider.steps.response]
+kind = "tool_call"
+name = "read"
+arguments = { path = "evidence-03.txt" }
+
+[[provider.steps]]
+id = "report-gamma"
+[provider.steps.expect]
+body_contains = ["GAMMA_SETTLEMENT"]
+[provider.steps.response]
+kind = "text"
+text = "Evidence pass 3 found GAMMA_SETTLEMENT in evidence-03.txt; restart and cleanup evidence remain."
+
+[[provider.steps]]
+id = "settle-gamma-2"
+[provider.steps.response]
+kind = "text"
+text = "GAMMA_SETTLEMENT is grounded by the third file; this turn can end with two claims still pending."
+
+[[provider.steps]]
+id = "settle-gamma-3"
+[provider.steps.response]
+kind = "text"
+text = "The third distinct finding is recorded from evidence-03.txt; later evidence belongs to another drive."
+
+[[provider.steps]]
+id = "settle-gamma-4"
+[provider.steps.response]
+kind = "text"
+text = "This pass produced concrete read evidence for GAMMA_SETTLEMENT without changing the workspace."
+
+[[provider.steps]]
+id = "settle-gamma-5"
+[provider.steps.response]
+kind = "text"
+text = "Ending evidence pass 3 now; the pending plan should automatically schedule the next investigation turn."
+
+[[provider.steps]]
+id = "search-delta"
+[provider.steps.response]
+kind = "tool_call"
+name = "grep"
+arguments = { pattern = "DELTA_RESTART", path = "." }
+
+[[provider.steps]]
+id = "report-delta"
+[provider.steps.expect]
+body_contains = ["DELTA_RESTART"]
+[provider.steps.response]
+kind = "text"
+text = "Evidence pass 4 found DELTA_RESTART in evidence-04.txt; one distinct cleanup claim remains."
+
+[[provider.steps]]
+id = "settle-delta-2"
+[provider.steps.response]
+kind = "text"
+text = "DELTA_RESTART is grounded by a targeted search; this turn can end with cleanup evidence pending."
+
+[[provider.steps]]
+id = "settle-delta-3"
+[provider.steps.response]
+kind = "text"
+text = "The fourth distinct finding is recorded from evidence-04.txt; cleanup belongs to another drive."
+
+[[provider.steps]]
+id = "settle-delta-4"
+[provider.steps.response]
+kind = "text"
+text = "This pass produced concrete search evidence for DELTA_RESTART without changing the workspace."
+
+[[provider.steps]]
+id = "settle-delta-5"
+[provider.steps.response]
+kind = "text"
+text = "Ending evidence pass 4 now; the pending plan should automatically schedule the fifth investigation turn."
+
+[[provider.steps]]
+id = "read-epsilon"
+[provider.steps.response]
+kind = "tool_call"
+name = "read"
+arguments = { path = "evidence-05.txt" }
+
+[[provider.steps]]
+id = "report-epsilon"
+[provider.steps.expect]
+body_contains = ["EPSILON_CLEANUP"]
+[provider.steps.response]
+kind = "text"
+text = "Evidence pass 5 found EPSILON_CLEANUP in evidence-05.txt; all five claims are now grounded and the conclusion can be recorded."
+
+[[provider.steps]]
+id = "settle-epsilon-2"
+[provider.steps.response]
+kind = "text"
+text = "EPSILON_CLEANUP is grounded by the fifth file; this investigation turn can end before the mutation."
+
+[[provider.steps]]
+id = "settle-epsilon-3"
+[provider.steps.response]
+kind = "text"
+text = "The fifth distinct finding is recorded from evidence-05.txt; writing the conclusion belongs to the next drive."
+
+[[provider.steps]]
+id = "settle-epsilon-4"
+[provider.steps.response]
+kind = "text"
+text = "This pass produced concrete read evidence for EPSILON_CLEANUP without changing the workspace."
+
+[[provider.steps]]
+id = "settle-epsilon-5"
+[provider.steps.response]
+kind = "text"
+text = "Ending evidence pass 5 now; the pending plan should automatically schedule the mutation turn."
+
+[[provider.steps]]
+id = "write-conclusion"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "investigation-complete.txt", content = "ALPHA_ROUTE\nBETA_QUEUE\nGAMMA_SETTLEMENT\nDELTA_RESTART\nEPSILON_CLEANUP\n" }
+
+[[provider.steps]]
+id = "complete-plan"
+[provider.steps.expect]
+body_contains = ["investigation-complete.txt"]
+[provider.steps.response]
+kind = "tool_call"
+name = "update_plan"
+arguments = { steps = [{ title = "Investigate the lifecycle evidence, then record the conclusion", status = "done" }] }
+
+[[actions]]
+kind = "wait_provider_request"
+count = 32
+timeout_ms = 30000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 1, "/data/plan/incomplete" = false, "/data/next_drive/action" = "idle" }
+timeout_ms = 30000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+exact = 6
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 0, "/data/plan/incomplete" = true, "/data/plan/stall" = 0, "/data/next_drive/action" = "enqueue", "/data/next_drive/kind" = "plan_drive" }
+exact = 5
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 1, "/data/plan/incomplete" = false, "/data/plan/stall" = 0, "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "none" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "drive_parked", "/data/kind" = "plan_drive" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "read" }
+exact = 3
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "grep" }
+exact = 2
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 32
+
+[[assertions]]
+kind = "file"
+path = "investigation-complete.txt"
+exists = true
+equals = "ALPHA_ROUTE\nBETA_QUEUE\nGAMMA_SETTLEMENT\nDELTA_RESTART\nEPSILON_CLEANUP\n"
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

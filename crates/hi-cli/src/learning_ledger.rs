@@ -13,6 +13,7 @@
 //!   once is not proven better.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -252,7 +253,7 @@ pub(crate) fn print_learning_report(sessions_dir: &Path, state_root: &Path) {
             let reason = finding
                 .review_unavailable_reason
                 .as_deref()
-                .unwrap_or(&finding.last_stall_reason);
+                .unwrap_or(&finding.last_no_progress_reason);
             let at = match (&finding.session_id, finding.turn) {
                 (Some(id), Some(turn)) => format!(" @ {id} turn {turn}"),
                 (Some(id), None) => format!(" @ {id}"),
@@ -406,14 +407,14 @@ pub(crate) fn newest_session_files(sessions_dir: &Path, limit: usize) -> Vec<std
 fn turn_outcome_timestamps(files: &[std::path::PathBuf]) -> Vec<u64> {
     let mut out = Vec::new();
     for path in files {
-        let Ok(raw) = std::fs::read_to_string(path) else {
+        let Ok(reader) = crate::session::session_snapshot_reader(path) else {
             continue;
         };
-        for line in raw.lines() {
+        for line in reader.lines().map_while(Result::ok) {
             if !line.contains("\"turn_outcome\"") {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
             if value.get("type").and_then(|tag| tag.as_str()) != Some("turn_outcome") {
@@ -433,14 +434,14 @@ fn turn_outcome_timestamps(files: &[std::path::PathBuf]) -> Vec<u64> {
 pub(crate) fn used_tool_names(files: &[std::path::PathBuf]) -> BTreeSet<String> {
     let mut used = BTreeSet::new();
     for path in files {
-        let Ok(raw) = std::fs::read_to_string(path) else {
+        let Ok(reader) = crate::session::session_snapshot_reader(path) else {
             continue;
         };
-        for line in raw.lines() {
+        for line in reader.lines().map_while(Result::ok) {
             if !line.contains("ToolCall") {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
             let Some(content) = value.get("content").and_then(|c| c.as_array()) else {

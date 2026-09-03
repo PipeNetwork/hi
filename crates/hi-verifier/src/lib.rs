@@ -21,7 +21,9 @@ pub struct CheckSpec {
     pub name: String,
     pub program: String,
     pub arguments: Vec<String>,
-    pub timeout: Duration,
+    /// Optional operator/policy deadline. `None` lets productive local work run
+    /// until completion or caller cancellation.
+    pub timeout: Option<Duration>,
     pub required: bool,
     /// Keep the parent process environment instead of the hardened cleared
     /// one. ONLY for the local self-hosted workflow path (toolchains like
@@ -141,6 +143,15 @@ fn hardened_command(workspace: &Path, spec: &CheckSpec) -> Command {
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", "/nonexistent");
     }
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     command
 }
 
@@ -181,7 +192,7 @@ fn cargo<const N: usize>(name: &str, args: [&str; N], seconds: u64) -> CheckSpec
         name: name.into(),
         program: "cargo".into(),
         arguments: args.into_iter().map(str::to_owned).collect(),
-        timeout: Duration::from_secs(seconds),
+        timeout: Some(Duration::from_secs(seconds)),
         required: true,
         inherit_environment: false,
     }
@@ -189,7 +200,7 @@ fn cargo<const N: usize>(name: &str, args: [&str; N], seconds: u64) -> CheckSpec
 
 async fn run_check(
     mut command: Command,
-    deadline: Duration,
+    deadline: Option<Duration>,
 ) -> (VerificationStatus, Option<i32>, Vec<u8>) {
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -201,6 +212,7 @@ async fn run_check(
             );
         }
     };
+    let group_guard = ProcessGroupDropGuard::for_child(&child);
 
     // Drain stdout/stderr on independent tasks so the pipes empty while the
     // child runs: waiting for exit before reading deadlocks any command that
@@ -209,7 +221,11 @@ async fn run_check(
     // exhausting verifier memory.
     let stdout = tokio::spawn(read_pipe(child.stdout.take()));
     let stderr = tokio::spawn(read_pipe(child.stderr.take()));
-    match timeout(deadline, child.wait()).await {
+    let waited = match deadline {
+        Some(deadline) => timeout(deadline, child.wait()).await,
+        None => Ok(child.wait().await),
+    };
+    match waited {
         Ok(Ok(status)) => {
             // Child exited, but a grandchild may still hold the pipes. Bound
             // the drain the same way as the timeout path — an unbounded
@@ -241,6 +257,7 @@ async fn run_check(
             // SIGKILL the direct child, then bound the reap. An uninterruptible
             // descendant (NFS D-state, wedged fuse) must not pin `wait()` and
             // freeze the coding workflow past the check deadline.
+            group_guard.kill();
             let _ = timeout(DRAIN_GRACE, async {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
@@ -254,6 +271,43 @@ async fn run_check(
             )
         }
     }
+}
+
+#[cfg(unix)]
+struct ProcessGroupDropGuard(Option<i32>);
+
+#[cfg(unix)]
+impl ProcessGroupDropGuard {
+    fn for_child(child: &tokio::process::Child) -> Self {
+        Self(child.id().map(|pid| pid as i32))
+    }
+
+    fn kill(&self) {
+        if let Some(pgid) = self.0 {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupDropGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+#[cfg(not(unix))]
+struct ProcessGroupDropGuard;
+
+#[cfg(not(unix))]
+impl ProcessGroupDropGuard {
+    fn for_child(_child: &tokio::process::Child) -> Self {
+        Self
+    }
+
+    fn kill(&self) {}
 }
 
 /// Drain stdout/stderr JoinHandles with a grace period, then abort. A
@@ -388,6 +442,31 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn check_without_a_deadline_runs_to_completion() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a"), "content").unwrap();
+        let verifier = AttestingVerifier::new(TestAttestor, "a".repeat(64)).unwrap();
+        let report = verifier
+            .verify(
+                workspace.path(),
+                "run",
+                "candidate",
+                &[CheckSpec {
+                    name: "uncapped".into(),
+                    program: "/bin/sh".into(),
+                    arguments: vec!["-c".into(), "sleep 0.05; exit 0".into()],
+                    timeout: None,
+                    required: true,
+                    inherit_environment: false,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(report.passed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn timed_out_check_is_terminated() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("a"), "content").unwrap();
@@ -405,7 +484,7 @@ mod tests {
                         "-c".into(),
                         format!("sleep 1; printf survived > {}", marker.display()),
                     ],
-                    timeout: Duration::from_millis(20),
+                    timeout: Some(Duration::from_millis(20)),
                     required: true,
                     inherit_environment: false,
                 }],
@@ -436,7 +515,7 @@ mod tests {
                     name: "chatty".into(),
                     program: "/bin/sh".into(),
                     arguments: vec!["-c".into(), "head -c 500000 /dev/zero".into()],
-                    timeout: Duration::from_secs(30),
+                    timeout: Some(Duration::from_secs(30)),
                     required: true,
                     inherit_environment: false,
                 }],
@@ -475,7 +554,7 @@ mod tests {
                     name: "flooder".into(),
                     program: "/bin/sh".into(),
                     arguments: vec!["-c".into(), "head -c 50000000 /dev/zero".into()],
-                    timeout: Duration::from_secs(30),
+                    timeout: Some(Duration::from_secs(30)),
                     required: true,
                     inherit_environment: false,
                 }],
@@ -520,7 +599,7 @@ mod tests {
                     // `sleep 30` inherits stdout/stderr and survives the kill,
                     // holding the pipes open well beyond DRAIN_GRACE.
                     arguments: vec!["-c".into(), "sleep 30 & sleep 30".into()],
-                    timeout: Duration::from_millis(50),
+                    timeout: Some(Duration::from_millis(50)),
                     required: true,
                     inherit_environment: false,
                 }],
@@ -557,7 +636,7 @@ mod tests {
                     name: "leaky-success".into(),
                     program: "/bin/sh".into(),
                     arguments: vec!["-c".into(), "sleep 30 & echo ok".into()],
-                    timeout: Duration::from_secs(5),
+                    timeout: Some(Duration::from_secs(5)),
                     required: true,
                     inherit_environment: false,
                 }],
@@ -591,7 +670,7 @@ mod tests {
                     name: "false".into(),
                     program: "false".into(),
                     arguments: vec![],
-                    timeout: Duration::from_secs(1),
+                    timeout: Some(Duration::from_secs(1)),
                     required: true,
                     inherit_environment: false,
                 }],

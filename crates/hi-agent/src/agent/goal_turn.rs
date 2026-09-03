@@ -9,9 +9,8 @@ use crate::domain::VerifyEvidence;
 use crate::goal::{DEFAULT_SUBGOAL_RETRIES, Goal, GoalStatus, SkepticStatus};
 
 pub(crate) struct GoalTurnState<'a> {
-    pub(crate) stalled_unfinished: bool,
-    pub(crate) stalled_repeating: bool,
     pub(crate) hit_step_cap: bool,
+    pub(crate) hit_tool_cap: bool,
     pub(crate) plan_updated_goal: bool,
     pub(crate) proposed_goal: Option<Goal>,
     pub(crate) goal_before: Option<Goal>,
@@ -47,7 +46,7 @@ impl crate::Agent {
     /// Long-horizon driver — called at turn end. When a structured goal is set
     /// and `long_horizon` is on, advance or retry the active sub-goal based on
     /// the turn's outcome, so the next turn resumes at the right sub-goal (with
-    /// prior-attempt notes if it stalled, so the model doesn't repeat a failed
+    /// prior-attempt notes if it made no progress, so the model doesn't repeat a failed
     /// approach). The verify retry itself happens *within* the turn (the 'turn
     /// loop re-runs the model on a verify failure); this hook handles the
     /// goal-level progression once the turn settles.
@@ -57,9 +56,8 @@ impl crate::Agent {
         ui: &mut dyn Ui,
     ) -> bool {
         let GoalTurnState {
-            stalled_unfinished,
-            stalled_repeating,
             hit_step_cap,
+            hit_tool_cap,
             plan_updated_goal,
             mut proposed_goal,
             mut goal_before,
@@ -90,14 +88,23 @@ impl crate::Agent {
         }
         let start_active_index = start_goal.active_index();
         let mut verification_invalidated = false;
+        // Ordinary goal work retries without an implicit count ceiling. The
+        // frontend's drive-stall tracker remains the independent circuit breaker
+        // for turns that land no new evidence or workspace progress.
         let max_retries = DEFAULT_SUBGOAL_RETRIES;
+        let hit_work_cap = hit_step_cap || hit_tool_cap;
+        let cap_label = match (hit_step_cap, hit_tool_cap) {
+            (true, true) => "step and tool-call caps",
+            (true, false) => "step cap",
+            (false, true) => "tool-call cap",
+            (false, false) => "work cap",
+        };
         // Only verifier-backed success may advance a long-horizon goal.
         // Phase C: same obligation as the interactive settle path — a done-claim
         // via update_plan or heuristic advance is not enough without a green seal
-        // and a non-stalled turn. Skeptic (below) is an extra gate on top.
+        // and a turn that stayed within its work limit. Skeptic (below) is an extra gate on top.
         let verified_clean = self.report.verify.passed();
-        let mut clean_success =
-            verified_clean && !stalled_unfinished && !stalled_repeating && !hit_step_cap;
+        let mut clean_success = verified_clean && !hit_work_cap;
 
         // Skeptic gate: on a clean-success turn, a second model reviews the work
         // before its progress stands. It reviews the sub-goal that was active AT
@@ -106,9 +113,12 @@ impl crate::Agent {
         // what a skeptic should second-guess. On an objection we revert the turn's
         // goal progress (restore the pre-turn goal) and record the objections as a
         // retry note; the edits stay on disk for the next turn to build on.
-        // Fail-closed by default — reviewer error/timeout/unparseable reply does
-        // not advance the goal (edits stay on disk). Opt in to the legacy
-        // fail-open with `gates.skeptic_fail_open`.
+        // Reviewer transport/protocol failures are diagnostic rather than a
+        // veto: this gate only runs after deterministic verification passed on
+        // concrete workspace changes, and the reviewer transport already uses
+        // bounded retry/backoff. A persistent outage must not turn productive
+        // work into a failed attempt or park an unattended goal. Concrete
+        // OBJECT/ESCALATE verdicts remain authoritative.
         // Trivial-diff exemption: a full second-model review round-trip buys
         // nothing when the turn's net change is tiny and verify already passed
         // — the failures the gate catches (wrong artifact, stub stand-ins,
@@ -208,9 +218,10 @@ impl crate::Agent {
                     ui.status("🔍 skeptic approved — advancing");
                 }
                 SkepticVerdict::Unavailable(reason) => {
-                    // Stamp unavailable on the durable baseline too — the
-                    // fail-closed path restores `goal_before`, which would
-                    // otherwise drop counters written only on the live goal.
+                    // Stamp unavailable on both copies. A model-authored plan
+                    // proposal may replace the live goal below, while a later
+                    // workspace reconciliation failure restores `goal_before`;
+                    // either path must retain the diagnostic scar.
                     if let Some(baseline) = goal_before.as_mut() {
                         baseline.skeptic_unavailable =
                             baseline.skeptic_unavailable.saturating_add(1);
@@ -231,16 +242,14 @@ impl crate::Agent {
                     // it lands in the session's turn-outcome record.
                     self.report.last_turn_telemetry.review_unavailable_reason =
                         Some(reason.clone());
-                    if self.config.gates.skeptic_fail_open {
-                        ui.status(&format!(
-                            "⚠ skeptic unavailable — advancing without review: {reason}"
-                        ));
-                    } else {
-                        clean_success = false;
-                        ui.status(&format!(
-                            "⚠ skeptic unavailable — goal progress held: {reason}"
-                        ));
-                    }
+                    // Keep deterministic, current-revision success intact. Do
+                    // not route this through `record_failure`: reviewer
+                    // availability says nothing about the primary work and
+                    // charging it to the sub-goal retry budget eventually
+                    // parked otherwise healthy continual runs.
+                    ui.status(&format!(
+                        "⚠ skeptic unavailable — deterministic verification passed; advancing without review: {reason}"
+                    ));
                 }
             }
         }
@@ -313,12 +322,10 @@ impl crate::Agent {
             self.goals.structured = goal_before.clone();
         }
         // A clean read-only turn (investigation, Q&A — no edits, no verify,
-        // no stall) is neutral: neither advance nor record failure. The sub-goal
+        // no failed check) is neutral: neither advance nor record failure. The sub-goal
         // stays active for the next turn, which should do the actual work.
         let no_edit_neutral = self.report.verify.as_bool().is_none()
-            && !stalled_unfinished
-            && !stalled_repeating
-            && !hit_step_cap
+            && !hit_work_cap
             && self.workspace.last_changed_files.is_empty();
         if no_edit_neutral {
             // Declaring a block is itself the turn's outcome, and a turn that
@@ -346,7 +353,7 @@ impl crate::Agent {
                 }
             }
             // A goal about to finish must first pass the completion audit —
-            // one bounded side-call comparing the "done" claim against the
+            // one auxiliary side-call comparing the "done" claim against the
             // objective's referenced documents and the real repository. It can
             // only hold the goal open (append missing work), never advance it,
             // so no post-skeptic reconcile pass is needed here. Fail-open.
@@ -422,16 +429,17 @@ impl crate::Agent {
             self.persist_goal(ui);
             return verification_invalidated;
         }
-        // A step-capped turn that made real progress (file changes) is a
-        // continuation, not a failure: the milestone is bigger than one turn.
+        // A turn that reached an explicit work cap and made real progress
+        // (file changes) is a continuation, not a failure: the milestone is
+        // bigger than one turn.
         // The work is on disk; the next drive turn resumes it. Only when a
-        // sub-goal keeps capping out past MAX_CAP_CONTINUATIONS — or caps with
-        // zero progress — does the retry/skip machinery judge it. Incrementing
-        // the counter also changes goal state, which resets the frontend
-        // drive-stall counter so a long milestone isn't parked mid-build.
-        if hit_step_cap {
+        // a sub-goal caps repeatedly without progress does the retry/skip
+        // machinery judge it. Productive capped turns have no lifetime ceiling:
+        // landed file changes independently reset the frontend drive-stall
+        // counter, while the diagnostic continuation counter itself does not.
+        if hit_work_cap {
             let made_progress = !self.workspace.last_changed_files.is_empty();
-            // A milestone that keeps hitting the step cap *while making progress*
+            // A milestone that keeps hitting an explicit work cap *while making progress*
             // is too big for one turn: decompose it into turn-sized sub-steps
             // rather than grind it out over dozens of turns. Snapshot the decision
             // inputs first — the planner call below borrows `self`, so it can't
@@ -440,7 +448,8 @@ impl crate::Agent {
                 let active = g.active_index()?;
                 let sg = &g.sub_goals[active];
                 (made_progress
-                    && sg.cap_continuations + 1 >= crate::goal::DECOMPOSE_AFTER_CONTINUATIONS
+                    && sg.cap_continuations.saturating_add(1)
+                        >= crate::goal::DECOMPOSE_AFTER_CONTINUATIONS
                     && sg.split_depth < crate::goal::MAX_SPLIT_DEPTH
                     && self.config.subagents.planner_model.is_some())
                 .then(|| sg.description.clone())
@@ -465,11 +474,11 @@ impl crate::Agent {
             }
             // Otherwise treat the capped turn as a continuation. A turn that
             // landed edits is real progress and resets the barren counter; a
-            // capped turn with no net file change is "barren". Hitting the step
+            // capped turn with no net file change is "barren". Hitting a work
             // cap means "more work to do," not "failed", so we continue across
-            // turns as long as the milestone keeps making progress — only a run
-            // of barren caps (the model can't land edits) or the generous safety
-            // ceiling ends the continuation and hands it to the retry/skip machinery.
+            // turns as long as the milestone keeps making progress. Only a run
+            // of barren caps (the model can't land edits) hands it to the
+            // retry/skip machinery.
             if let Some(goal) = self.goals.structured.as_mut()
                 && let Some(active) = goal.active_index()
             {
@@ -479,21 +488,24 @@ impl crate::Agent {
                 } else {
                     sub_goal.barren_caps = sub_goal.barren_caps.saturating_add(1);
                     // Steer the next turn to implement rather than keep exploring.
-                    crate::goal::push_note_deduped(sub_goal, crate::goal::BARREN_CAP_NOTE);
+                    let note = match (hit_step_cap, hit_tool_cap) {
+                        (true, true) => crate::goal::BARREN_BOTH_CAPS_NOTE,
+                        (true, false) => crate::goal::BARREN_CAP_NOTE,
+                        (false, true) => crate::goal::BARREN_TOOL_CAP_NOTE,
+                        (false, false) => unreachable!("work-cap branch requires a cap"),
+                    };
+                    crate::goal::push_note_deduped(sub_goal, note);
                 }
-                if sub_goal.barren_caps < crate::goal::MAX_BARREN_CAPS
-                    && sub_goal.cap_continuations < crate::goal::MAX_CAP_CONTINUATIONS
-                {
+                if sub_goal.barren_caps < crate::goal::MAX_BARREN_CAPS {
                     sub_goal.cap_continuations = sub_goal.cap_continuations.saturating_add(1);
                     let n = sub_goal.cap_continuations;
                     let msg = if made_progress {
                         format!(
-                            "⏳ milestone spans turns: hit the step cap with progress — continuing ({n}/{})",
-                            crate::goal::MAX_CAP_CONTINUATIONS
+                            "⏳ milestone spans turns: hit the {cap_label} with progress — continuing ({n})"
                         )
                     } else {
                         format!(
-                            "⏳ milestone spans turns: hit the step cap while exploring ({}/{} barren) — continuing; land concrete edits next turn",
+                            "⏳ milestone spans turns: hit the {cap_label} while exploring ({}/{} barren) — continuing; land concrete edits next turn",
                             sub_goal.barren_caps,
                             crate::goal::MAX_BARREN_CAPS
                         )
@@ -505,7 +517,7 @@ impl crate::Agent {
                 }
             }
         }
-        // A stalled or cap-hit turn, or a verify failure that ended the turn,
+        // A cap-hit turn, or a verify failure that ended the turn,
         // records a sub-goal attempt so the next turn sees the prior note. If
         // the budget is exhausted, the sub-goal (and goal) is marked Failed.
         // Verification never reached a verdict, so there is nothing to hold
@@ -535,14 +547,14 @@ impl crate::Agent {
             self.persist_goal(ui);
             return verification_invalidated;
         }
-        let reason = if hit_step_cap {
+        let reason = if hit_step_cap && hit_tool_cap {
+            "hit the per-turn step and tool-call caps"
+        } else if hit_step_cap {
             "hit the per-turn step cap"
+        } else if hit_tool_cap {
+            "hit the per-turn tool-call cap"
         } else if self.report.verify.failed() {
             "verification failed and the turn ended without fixing it"
-        } else if stalled_repeating {
-            "stalled repeating the same tool call"
-        } else if stalled_unfinished {
-            "ended without completing the requested work"
         } else if self.report.verify.as_bool().is_none()
             && !self.workspace.last_changed_files.is_empty()
         {
@@ -605,10 +617,9 @@ impl crate::Agent {
     /// [`GoalStatus::Blocked`] with the named prerequisite.
     ///
     /// This exists so a missing dependency stops costing retries. Without it
-    /// the model's only options are to keep failing (three attempts, then the
-    /// step is marked `Failed` — reporting the *work* as rejected when the real
-    /// problem was an absent database) or to write a stub that skips the
-    /// required check, which is worse because it looks like success.
+    /// the model's only options are to keep failing (and repeatedly consume
+    /// turns) or to write a stub that skips the required check, which is worse
+    /// because it looks like success.
     pub(crate) fn handle_block_step(&mut self, arguments: &str) -> hi_tools::ToolOutcome {
         #[derive(serde::Deserialize)]
         struct BlockArgs {
@@ -772,7 +783,13 @@ impl crate::Agent {
         if self.turn_drive_kind.is_drive() {
             self.ask_user_drive_streak = self.ask_user_drive_streak.saturating_add(1);
         }
-        let content = match ui.ask_user(question, &args.options).await {
+        let answer = crate::agent::turn::await_side_call(
+            self.side_call_timeout(),
+            ui.ask_user(question, &args.options),
+        )
+        .await
+        .unwrap_or(crate::AskUserResult::Unavailable);
+        let content = match answer {
             crate::AskUserResult::Answer(answer) => {
                 let answer = answer.trim();
                 if answer.is_empty() {
@@ -785,7 +802,8 @@ impl crate::Agent {
                 "the user cancelled the question; pick the best option and continue".to_string()
             }
             crate::AskUserResult::Unavailable => {
-                "this frontend cannot pause; pick the best option and continue".to_string()
+                "the question was unavailable or timed out; pick the best option and continue"
+                    .to_string()
             }
         };
         decision_tool_outcome(content, hi_tools::ToolStatus::Succeeded)

@@ -14,8 +14,6 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const VERIFY_TIMEOUT_SECS: u64 = 120;
-const VERIFY_LOCK_STALE_SECS: u64 = VERIFY_TIMEOUT_SECS * 2 + 60;
 const VERIFY_LOCK_POLL_MILLIS: u64 = 25;
 /// Regenerable build/dependency artifacts excluded from candidate diffs and
 /// merges. The child's change ledger prunes these by name, so leaving them in
@@ -135,20 +133,60 @@ fn lock_owner(path: &Path) -> Option<String> {
         .and_then(|raw| raw.lines().next().map(str::to_owned))
 }
 
+fn lock_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("pid=")?
+                .trim()
+                .parse()
+                .ok()
+                .filter(|pid| *pid > 0)
+        })
+}
+
+fn lock_birth(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("birth=").map(str::trim))
+        .filter(|birth| !birth.is_empty())
+        .map(str::to_owned)
+}
+
+fn verification_lock_stale_after(timeout: Option<Duration>) -> Option<Duration> {
+    timeout.map(|timeout| {
+        timeout
+            .saturating_mul(2)
+            .saturating_add(Duration::from_secs(60))
+    })
+}
+
 fn lock_is_stale(path: &Path) -> bool {
+    let birth = lock_birth(path);
+    if crate::resource_governor::owner_record_is_stale(path, lock_pid(path), birth.as_deref()) {
+        return true;
+    }
     let Ok(modified) = std::fs::metadata(path).and_then(|metadata| metadata.modified()) else {
         return false;
     };
-    SystemTime::now()
-        .duration_since(modified)
-        .map(|age| age >= Duration::from_secs(VERIFY_LOCK_STALE_SECS))
-        .unwrap_or(false)
+    let age = SystemTime::now().duration_since(modified).ok();
+    verification_lock_stale_after(hi_tools::check_timeout())
+        .is_some_and(|stale_after| age.is_some_and(|age| age >= stale_after))
 }
 
 fn create_verify_lock(path: &Path, owner: &str) -> std::io::Result<File> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    writeln!(file, "{owner}\npid={}\n", std::process::id())?;
-    file.sync_all()?;
+    let birth = crate::resource_governor::current_process_birth_identity()
+        .map(|birth| format!("birth={birth}\n"))
+        .unwrap_or_default();
+    if let Err(error) = writeln!(file, "{owner}\npid={}\n{birth}", std::process::id())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
     Ok(file)
 }
 
@@ -674,15 +712,11 @@ pub(crate) fn run_verifier_sync_cancellable(
     }
     let root = root.to_path_buf();
     let command = command.to_string();
-    let timeout = std::env::var("HI_VERIFY_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or(VERIFY_TIMEOUT_SECS);
+    let timeout = hi_tools::check_timeout();
     hi_tools::prepare_verify_workdir(&root);
     run_async_thread(move || async move {
         let runner = hi_tools::ProcessRunner::new(&root)?;
-        let run = runner.run_shell(&command, Duration::from_secs(timeout));
+        let run = runner.run_shell_maybe_timeout(&command, timeout);
         let execution = match cancellation {
             Some(cancel) => {
                 tokio::select! {
@@ -725,6 +759,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unlimited_verification_does_not_age_out_an_active_flight() {
+        assert_eq!(verification_lock_stale_after(None), None);
+        assert_eq!(
+            verification_lock_stale_after(Some(Duration::from_secs(10))),
+            Some(Duration::from_secs(80))
+        );
+    }
 
     #[test]
     fn verify_flight_removes_only_its_own_lock() {

@@ -53,7 +53,7 @@ impl crate::Agent {
         }
         matches!(
             outcome.status,
-            crate::TurnStatus::Completed | crate::TurnStatus::Incomplete
+            crate::TurnStatus::Completed | crate::TurnStatus::Failed
         ) && !matches!(
             outcome.stop_reason,
             crate::TurnStopReason::Cancelled | crate::TurnStopReason::InfrastructureFailure
@@ -112,15 +112,21 @@ impl crate::Agent {
             StreamEvent::Status(_)
             | StreamEvent::Warning(_)
             | StreamEvent::Reasoning(_)
-            | StreamEvent::WireAudit(_) => {}
+            | StreamEvent::WireAudit(_)
+            | StreamEvent::ToolCallDelta { .. } => {}
         };
-        let completion = match self.provider.stream(request, &mut sink).await {
-            Ok(completion) => completion,
-            Err(err) => {
-                self.add_side_error_usage(&err);
-                return;
-            }
-        };
+        let timeout = self.side_call_timeout();
+        let completion =
+            match super::await_side_call(timeout, self.provider.stream(request, &mut sink)).await {
+                Err(_) => {
+                    return;
+                }
+                Ok(Ok(completion)) => completion,
+                Ok(Err(err)) => {
+                    self.add_side_error_usage(&err);
+                    return;
+                }
+            };
         self.add_side_usage(completion.usage);
 
         if raw.trim().is_empty() {
@@ -133,7 +139,7 @@ impl crate::Agent {
 
         if let Some(suggestion) = sanitize_suggestion(&raw) {
             // Suppress an identical back-to-back repeat: the suggest call is
-            // grounded only in the current turn, so a stalled session makes the
+            // grounded only in the current turn, so a no-progress session makes the
             // model propose the same follow-up every turn, which users read as
             // duplicated ghost text. A *different* suggestion still replaces it.
             if is_repeat_suggestion(self.last_suggested_prompt.as_deref(), &suggestion) {

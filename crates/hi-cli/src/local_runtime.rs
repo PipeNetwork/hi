@@ -49,7 +49,7 @@ enum Request {
     },
     Publish {
         session_id: String,
-        event: UiEvent,
+        event: Box<UiEvent>,
     },
     Subscribe {
         session_id: String,
@@ -427,7 +427,7 @@ mod unix {
                 },
             },
             Request::Publish { session_id, event } => {
-                match state.lock().unwrap().publish(session_id, event) {
+                match state.lock().unwrap().publish(session_id, *event) {
                     Ok(envelope) => Response::Published {
                         sequence: envelope.sequence,
                     },
@@ -600,7 +600,7 @@ impl Publisher {
                         &socket_path,
                         Request::Publish {
                             session_id: session_id.clone(),
-                            event,
+                            event: Box::new(event),
                         },
                     )
                     .await;
@@ -852,7 +852,7 @@ mod tests {
             path,
             Request::Publish {
                 session_id: session_id.to_string(),
-                event: text(value),
+                event: Box::new(text(value)),
             },
         )
         .await
@@ -981,7 +981,7 @@ mod tests {
                 &socket,
                 Request::Publish {
                     session_id: "other".into(),
-                    event: text("wrong")
+                    event: Box::new(text("wrong"))
                 }
             )
             .await

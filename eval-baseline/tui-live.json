@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "status": "observing",
+  "successful_nightly_runs": 0,
+  "capture_after_successful_runs": 7,
+  "captured_at": null,
+  "model_route": {
+    "provider": "pipenetwork",
+    "model": "pipe/deepseek-v4-flash-0731",
+    "base_url": "https://api.pipenetwork.ai/v1"
+  },
+  "scenario_count": 3,
+  "scenario_pass_rate": null,
+  "crash_count": null,
+  "infrastructure_loop_count": null,
+  "gates": {
+    "maximum_scenario_pass_regression_points": 5,
+    "maximum_crashes": 0,
+    "maximum_infrastructure_loops": 0
+  },
+  "note": "TUI live canaries are tracked independently. Do not combine this baseline with coding, process, quality, or cost scores. Capture the first reviewed baseline only after seven successful nightly observations."
+}

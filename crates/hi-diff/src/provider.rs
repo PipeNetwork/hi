@@ -35,6 +35,7 @@ pub async fn run_provider_targets(
                 StreamEvent::WireAudit(_) => {}
                 StreamEvent::Status(_) => {}
                 StreamEvent::Warning(_) => {}
+                StreamEvent::ToolCallDelta { .. } => {}
             };
             let result = provider.stream(request, &mut sink).await;
             let outcome = match result {

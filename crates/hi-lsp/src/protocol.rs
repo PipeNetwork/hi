@@ -53,25 +53,44 @@ pub async fn write_message(stdin: &mut ChildStdin, body: &str) -> std::io::Resul
     Ok(())
 }
 
-/// Default timeout for LSP requests. Servers can be slow (rust-analyzer cold
-/// start / indexing a large workspace), but we don't want to hang a turn
-/// forever. Overridable via `HI_LSP_TIMEOUT_SECS`.
-pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
+/// The optional LSP request deadline. Cold indexing and project-wide queries
+/// have no default lifetime ceiling: they remain attached until completion,
+/// transport failure, shutdown, or caller cancellation. Operators can opt in
+/// to a positive deadline with `HI_LSP_TIMEOUT_SECS`; unset, invalid, zero,
+/// and unrepresentable values mean unlimited.
+pub fn request_timeout() -> Option<Duration> {
+    let configured = std::env::var("HI_LSP_TIMEOUT_SECS").ok();
+    request_timeout_from_value(configured.as_deref())
+}
 
-/// The effective LSP request timeout: `HI_LSP_TIMEOUT_SECS` if set to a
-/// positive integer, else [`DEFAULT_REQUEST_TIMEOUT_SECS`]. Read per call so
-/// the env var takes effect without a rebuild.
-pub fn request_timeout() -> Duration {
-    let secs = std::env::var("HI_LSP_TIMEOUT_SECS")
-        .ok()
+fn request_timeout_from_value(value: Option<&str>) -> Option<Duration> {
+    value
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
-    Duration::from_secs(secs)
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .filter(|timeout| std::time::Instant::now().checked_add(*timeout).is_some())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn productive_request_timeout_is_opt_in() {
+        assert_eq!(request_timeout_from_value(None), None);
+        assert_eq!(request_timeout_from_value(Some("")), None);
+        assert_eq!(request_timeout_from_value(Some("invalid")), None);
+        assert_eq!(request_timeout_from_value(Some("0")), None);
+        assert_eq!(
+            request_timeout_from_value(Some(" 13 ")),
+            Some(Duration::from_secs(13))
+        );
+        assert_eq!(
+            request_timeout_from_value(Some(&u64::MAX.to_string())),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn write_then_read_round_trips() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -9,9 +9,11 @@ blake3.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 hi-rsi-runtime.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+# Process-group setup/cleanup uses libc so cancelled verification cannot leak descendants.
+unsafe_code = "allow"

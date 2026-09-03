@@ -127,12 +127,59 @@ fn quality_defaults_to_automatic_safe_policy() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(quality.verification, VerificationMode::Auto);
-    assert_eq!(quality.max_verify_repairs, 2);
+    assert_eq!(
+        quality.max_verify_repairs,
+        hi_agent::UNLIMITED_REPAIR_CYCLES
+    );
+    assert!(!quality.max_verify_repairs_explicit);
     assert_eq!(quality.review, ReviewPolicy::Risk);
     assert_eq!(quality.lsp_mode, LspMode::Auto);
     assert_eq!(quality.tool_set, ToolSet::Dynamic);
     assert!(!cli.allow_no_checkpoint);
     assert!(permits_missing_checkpoint(&cli));
+}
+
+#[test]
+fn model_round_limit_is_opt_in_on_the_cli() {
+    let default = Cli::try_parse_from(["hi"]).unwrap();
+    assert_eq!(default.max_steps, None);
+
+    let capped = Cli::try_parse_from(["hi", "--max-steps", "7"]).unwrap();
+    assert_eq!(capped.max_steps, Some(7));
+
+    assert!(
+        Cli::try_parse_from(["hi", "--max-steps", "0"]).is_err(),
+        "zero cannot mean both a one-round Agent cap and an omitted child-process cap"
+    );
+    for flag in ["--max-steps", "--max-tool-calls", "--max-verify-repairs"] {
+        assert!(
+            Cli::try_parse_from(["hi", flag, "4294967295"]).is_err(),
+            "the internal unlimited sentinel must not masquerade as an explicit finite {flag} cap"
+        );
+    }
+
+    let help = Cli::try_parse_from(["hi", "--help"])
+        .expect_err("clap returns display-help as an error")
+        .to_string();
+    assert!(
+        help.contains("no model-call cap by default"),
+        "help must describe the unlimited default:\n{help}"
+    );
+}
+
+#[test]
+fn project_verify_repair_cap_reserves_the_unlimited_sentinel() {
+    let dir = temp_dir_with("");
+    std::fs::create_dir_all(dir.join(".hi")).unwrap();
+    std::fs::write(
+        dir.join(".hi/config.toml"),
+        "[quality]\nmax_verify_repairs = 4294967295\n",
+    )
+    .unwrap();
+    let cli = super::Cli::try_parse_from(["hi"]).unwrap();
+    let error = resolve_quality(&cli, &dir).unwrap_err();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(format!("{error:#}").contains("omit it for unlimited repairs"));
 }
 
 #[test]
@@ -181,7 +228,6 @@ fn parses_deepseek_compatibility_override() {
 
 #[test]
 fn durable_execution_can_be_selected_by_cli_or_profile() {
-    let cli = Cli::try_parse_from(["hi", "--durable"]).unwrap();
     let mut config = Config::default();
     config.profiles.insert(
         "durable".into(),
@@ -189,19 +235,21 @@ fn durable_execution_can_be_selected_by_cli_or_profile() {
             provider: Some(ProviderName::Openai),
             model: Some("gpt-4o".into()),
             api_key: Some("test".into()),
-            execution: Some(hi_agent::ExecutionMode::Durable),
             ..Profile::default()
         },
     );
     config.default_profile = Some("durable".into());
 
+    // Pin the profile so another parallel test's workspace last-session
+    // fixture cannot redirect this test's route. The profile deliberately
+    // omits `execution` here, so this assertion exercises the CLI flag.
+    let cli = Cli::try_parse_from(["hi", "--profile", "durable", "--durable"]).unwrap();
     assert_eq!(
         resolve(&cli, &config).unwrap().execution,
         hi_agent::ExecutionMode::Durable
     );
 
-    // Select the profile explicitly so another parallel test's workspace
-    // last-session fixture cannot override this test's route.
+    config.profiles.get_mut("durable").unwrap().execution = Some(hi_agent::ExecutionMode::Durable);
     let cli = Cli::try_parse_from(["hi", "--profile", "durable"]).unwrap();
     assert_eq!(
         resolve(&cli, &config).unwrap().execution,
@@ -319,6 +367,7 @@ context_exclusions = ["generated/**"]
         ])
     );
     assert_eq!(quality.max_verify_repairs, 1);
+    assert!(quality.max_verify_repairs_explicit);
     assert_eq!(quality.review, ReviewPolicy::Always);
     assert_eq!(quality.lsp_mode, LspMode::On);
     assert_eq!(quality.tool_set, ToolSet::Minimal);
@@ -602,6 +651,7 @@ fn project_profile_cannot_name_user_environment_key_even_for_official_endpoint()
 
 #[test]
 fn project_profile_custom_endpoint_requires_persisted_folder_trust() {
+    let _env = ClearedSetupEnv::new();
     let mut config = Config::default();
     super::merge_config(
         &mut config,
@@ -1127,6 +1177,56 @@ api_key = "attacker-owned-key"
             .and_then(|section| section.mode.as_deref()),
         Some("chat")
     );
+}
+
+#[test]
+fn unknown_global_outcome_mode_does_not_let_untrusted_project_enable_auto() {
+    let mut config: Config = toml::from_str("[outcome]\nmode = \"typo\"\n").unwrap();
+    let local: Config = toml::from_str("[outcome]\nmode = \"auto\"\n").unwrap();
+
+    super::merge_config(&mut config, local);
+
+    assert_eq!(
+        config
+            .outcome
+            .as_ref()
+            .and_then(|section| section.mode.as_deref()),
+        Some("typo"),
+        "unknown modes parse as direct chat, so untrusted auto is an escalation"
+    );
+}
+
+#[test]
+fn untrusted_project_cannot_enable_outcome_tasks_through_singular_alias() {
+    let mut config = Config::default();
+    let local: Config = toml::from_str("[outcome]\nmode = \"task\"\n").unwrap();
+
+    super::merge_config(&mut config, local);
+
+    assert!(
+        config.outcome.is_none(),
+        "the accepted `task` alias must have the same trust rank as `tasks`"
+    );
+}
+
+#[test]
+fn trusted_project_can_explicitly_enable_outcome_routing() {
+    let mut config = Config::default();
+    let local: Config = toml::from_str(
+        r#"
+[outcome]
+mode = "auto"
+base_url = "https://trusted.example"
+api_key_env = "TRUSTED_OUTCOME_KEY"
+"#,
+    )
+    .unwrap();
+
+    super::merge_config_with_project_trust(&mut config, local, true);
+    let outcome = config.outcome.as_ref().expect("trusted outcome section");
+    assert_eq!(outcome.mode.as_deref(), Some("auto"));
+    assert_eq!(outcome.base_url.as_deref(), Some("https://trusted.example"));
+    assert_eq!(outcome.api_key_env.as_deref(), Some("TRUSTED_OUTCOME_KEY"));
 }
 
 #[test]
@@ -2271,6 +2371,10 @@ fn migrate_preserves_ambiguous_unset_standard_env_reference() {
     // (e.g. "HI_API_KEY" for pipenetwork), but that shape is identical to a
     // legitimate unset reference. Migration must not destroy ambiguous data.
     use super::{Config, Profile, migrate_api_key_env_to_literal};
+    // Developer and CI hosts commonly export HI_API_KEY. Isolate this
+    // unset-reference case under the same process-env lock used by the setup
+    // tests, then restore the caller's credentials on drop.
+    let _env = ClearedSetupEnv::new();
     let env_name = "HI_API_KEY";
     assert!(
         std::env::var(env_name).is_err(),
@@ -3100,6 +3204,7 @@ fn merge_config_keeps_global_reasoning_when_local_omits_it() {
 
 #[test]
 fn resolve_falls_back_to_machine_reasoning_effort() {
+    let _env = ClearedSetupEnv::new();
     let mut config = Config {
         default_profile: Some("work".into()),
         reasoning_effort: Some(hi_ai::ReasoningEffort::High),
@@ -3300,6 +3405,47 @@ fn provider_override_falls_back_to_provider_default_model() {
     let settings = resolve(&cli, &config).unwrap();
     drop(env);
     assert_eq!(settings.model, "pipe/deepseek-v4-flash-vision-exp");
+}
+
+#[test]
+fn last_session_model_is_ignored_after_profile_provider_changes() {
+    use super::{LastSession, save_last_session};
+    let temporary = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temporary.path().join(".hi")).unwrap();
+    let _cwd = crate::CWD_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let previous = std::env::current_dir().unwrap();
+    std::env::set_current_dir(temporary.path()).unwrap();
+    save_last_session(
+        Path::new("."),
+        &LastSession {
+            profile: Some("default".into()),
+            provider: Some("ollama".into()),
+            model: Some("harness-smoke".into()),
+        },
+    )
+    .unwrap();
+
+    let mut config = Config {
+        default_profile: Some("default".into()),
+        ..Default::default()
+    };
+    config.profiles.insert(
+        "default".into(),
+        Profile {
+            provider: Some(ProviderName::Pipenetwork),
+            model: Some("pipe/deepseek-v4-flash-0731".into()),
+            api_key: Some("pipe-key".into()),
+            ..Default::default()
+        },
+    );
+    let cli = Cli::try_parse_from(["hi"]).unwrap();
+    let settings = resolve(&cli, &config).unwrap();
+
+    std::env::set_current_dir(previous).unwrap();
+    assert_eq!(settings.provider, ProviderName::Pipenetwork);
+    assert_eq!(settings.model, "pipe/deepseek-v4-flash-0731");
 }
 
 #[test]

@@ -267,6 +267,10 @@ impl McpDiscoveryProvider {
 
 #[async_trait]
 impl Provider for McpDiscoveryProvider {
+    fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
     async fn stream(
         &self,
         request: ChatRequest,

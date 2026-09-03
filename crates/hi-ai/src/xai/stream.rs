@@ -9,10 +9,8 @@ use crate::types::{
     Completion, Content, StreamEvent, ToolCallChannel, Usage, estimate_completion_output_tokens,
 };
 
-const MAX_STREAM_TOOL_CALLS: usize = 128;
 const MAX_STREAM_TOOL_NAME_BYTES: usize = 256;
 const MAX_STREAM_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_STREAM_TOTAL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
 
 struct StreamAcc {
     text: String,
@@ -20,7 +18,7 @@ struct StreamAcc {
     encrypted: Option<String>,
     refusal: String,
     calls: Vec<FunctionCallAcc>,
-    tool_argument_bytes: usize,
+    tool_payload_bytes: usize,
     native_tool_calls: bool,
 }
 
@@ -29,6 +27,7 @@ struct FunctionCallAcc {
     call_id: String,
     name: String,
     arguments: String,
+    metadata_emitted: bool,
 }
 
 impl FunctionCallAcc {
@@ -63,7 +62,7 @@ pub(crate) async fn collect_completion(
         encrypted: None,
         refusal: String::new(),
         calls: Vec::new(),
-        tool_argument_bytes: 0,
+        tool_payload_bytes: 0,
         native_tool_calls: false,
     };
     let mut completion = Completion::default();
@@ -135,25 +134,47 @@ pub(crate) async fn collect_completion(
                 acc.native_tool_calls = true;
                 progressed = true;
                 let delta = delta_text(&data).unwrap_or("");
-                let call = locate_call_mut(&mut acc.calls, &data)?;
-                append_bounded(
-                    &mut call.arguments,
-                    delta,
-                    MAX_STREAM_TOOL_ARGUMENT_BYTES,
-                    &mut acc.tool_argument_bytes,
-                )?;
+                let index = call_index(&acc.calls, &data);
+                let (id_delta, name_delta) = {
+                    let call = locate_call_mut(&mut acc.calls, &data, &mut acc.tool_payload_bytes)?;
+                    append_bounded(
+                        &mut call.arguments,
+                        delta,
+                        MAX_STREAM_TOOL_ARGUMENT_BYTES,
+                        &mut acc.tool_payload_bytes,
+                    )?;
+                    (
+                        (!call.metadata_emitted)
+                            .then(|| call.call_id.clone())
+                            .filter(|value| !value.is_empty()),
+                        (!call.metadata_emitted)
+                            .then(|| call.name.clone())
+                            .filter(|value| !value.is_empty()),
+                    )
+                };
+                if let Ok(call) =
+                    locate_call_mut(&mut acc.calls, &data, &mut acc.tool_payload_bytes)
+                {
+                    call.metadata_emitted = true;
+                }
+                sink(StreamEvent::ToolCallDelta {
+                    index,
+                    id_delta,
+                    name_delta,
+                    arguments_delta: delta.to_string(),
+                });
             }
             "response.function_call_arguments.done" => {
                 acc.native_tool_calls = true;
                 progressed = true;
                 if let Some(arguments) = data.get("arguments").and_then(Value::as_str) {
-                    let call = locate_call_mut(&mut acc.calls, &data)?;
+                    let call = locate_call_mut(&mut acc.calls, &data, &mut acc.tool_payload_bytes)?;
                     if call.arguments.is_empty() {
                         append_bounded(
                             &mut call.arguments,
                             arguments,
                             MAX_STREAM_TOOL_ARGUMENT_BYTES,
-                            &mut acc.tool_argument_bytes,
+                            &mut acc.tool_payload_bytes,
                         )?;
                     }
                 }
@@ -220,6 +241,16 @@ pub(crate) async fn collect_completion(
     Ok(completion)
 }
 
+fn call_index(calls: &[FunctionCallAcc], data: &Value) -> usize {
+    let item_id = data.get("item_id").and_then(Value::as_str).unwrap_or("");
+    if !item_id.is_empty()
+        && let Some(index) = calls.iter().position(|call| call.item_id == item_id)
+    {
+        return index;
+    }
+    calls.len().saturating_sub(1)
+}
+
 fn event_type<'a>(sse_event: &'a str, data: &'a Value) -> &'a str {
     if !sse_event.is_empty() && sse_event != "message" {
         sse_event
@@ -238,7 +269,7 @@ fn ingest_item(item: &Value, acc: &mut StreamAcc) -> Result<()> {
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") => {
             acc.native_tool_calls = true;
-            upsert_function_call(&mut acc.calls, item, &mut acc.tool_argument_bytes)?;
+            upsert_function_call(&mut acc.calls, item, &mut acc.tool_payload_bytes)?;
         }
         Some("reasoning") => {
             if let Some(enc) = item.get("encrypted_content").and_then(Value::as_str)
@@ -296,7 +327,7 @@ fn ingest_completed(
 fn upsert_function_call(
     calls: &mut Vec<FunctionCallAcc>,
     item: &Value,
-    tool_argument_bytes: &mut usize,
+    tool_payload_bytes: &mut usize,
 ) -> Result<(), anyhow::Error> {
     let item_id = item
         .get("id")
@@ -326,9 +357,11 @@ fn upsert_function_call(
             || (!call_id.is_empty() && call.call_id == call_id)
     }) {
         if existing.call_id.is_empty() {
+            reserve_tool_payload(tool_payload_bytes, call_id.len())?;
             existing.call_id = call_id;
         }
         if existing.name.is_empty() {
+            reserve_tool_payload(tool_payload_bytes, name.len())?;
             existing.name = name;
         }
         if existing.arguments.is_empty() && !arguments.is_empty() {
@@ -336,26 +369,31 @@ fn upsert_function_call(
                 &mut existing.arguments,
                 &arguments,
                 MAX_STREAM_TOOL_ARGUMENT_BYTES,
-                tool_argument_bytes,
+                tool_payload_bytes,
             )?;
         }
         return Ok(());
     }
-    if calls.len() >= MAX_STREAM_TOOL_CALLS {
-        return Err(tool_protocol("model exceeded the streamed tool-call limit").into());
-    }
+    reserve_tool_payload(
+        tool_payload_bytes,
+        crate::tool_validation::TOOL_CALL_SLOT_OVERHEAD_BYTES
+            .saturating_add(item_id.len())
+            .saturating_add(call_id.len())
+            .saturating_add(name.len()),
+    )?;
     let mut acc = FunctionCallAcc {
         item_id,
         call_id,
         name,
         arguments: String::new(),
+        metadata_emitted: false,
     };
     if !arguments.is_empty() {
         append_bounded(
             &mut acc.arguments,
             &arguments,
             MAX_STREAM_TOOL_ARGUMENT_BYTES,
-            tool_argument_bytes,
+            tool_payload_bytes,
         )?;
     }
     calls.push(acc);
@@ -365,30 +403,37 @@ fn upsert_function_call(
 fn locate_call_mut<'a>(
     calls: &'a mut Vec<FunctionCallAcc>,
     data: &Value,
+    tool_payload_bytes: &mut usize,
 ) -> Result<&'a mut FunctionCallAcc, anyhow::Error> {
     let item_id = data.get("item_id").and_then(Value::as_str).unwrap_or("");
     if !item_id.is_empty() {
         if let Some(index) = calls.iter().position(|call| call.item_id == item_id) {
             return Ok(&mut calls[index]);
         }
-        push_empty_call(calls, item_id)?;
+        push_empty_call(calls, item_id, tool_payload_bytes)?;
         return Ok(calls.last_mut().expect("just inserted"));
     }
     if calls.is_empty() {
-        push_empty_call(calls, "")?;
+        push_empty_call(calls, "", tool_payload_bytes)?;
     }
     Ok(calls.last_mut().expect("call slot exists"))
 }
 
-fn push_empty_call(calls: &mut Vec<FunctionCallAcc>, item_id: &str) -> Result<(), anyhow::Error> {
-    if calls.len() >= MAX_STREAM_TOOL_CALLS {
-        return Err(tool_protocol("model exceeded the streamed tool-call limit").into());
-    }
+fn push_empty_call(
+    calls: &mut Vec<FunctionCallAcc>,
+    item_id: &str,
+    tool_payload_bytes: &mut usize,
+) -> Result<(), anyhow::Error> {
+    reserve_tool_payload(
+        tool_payload_bytes,
+        crate::tool_validation::TOOL_CALL_SLOT_OVERHEAD_BYTES.saturating_add(item_id.len()),
+    )?;
     calls.push(FunctionCallAcc {
         item_id: item_id.to_string(),
         call_id: String::new(),
         name: String::new(),
         arguments: String::new(),
+        metadata_emitted: false,
     });
     Ok(())
 }
@@ -402,12 +447,20 @@ fn append_bounded(
     if fragment.is_empty() {
         return Ok(());
     }
-    current.push_str(fragment);
-    *total = total.saturating_add(fragment.len());
-    if current.len() > per_call || *total > MAX_STREAM_TOTAL_ARGUMENT_BYTES {
+    if current.len().saturating_add(fragment.len()) > per_call {
         return Err(tool_protocol("model exceeded the streamed tool-argument size limit").into());
     }
+    reserve_tool_payload(total, fragment.len())?;
+    current.push_str(fragment);
     Ok(())
+}
+
+fn reserve_tool_payload(total: &mut usize, additional: usize) -> Result<(), anyhow::Error> {
+    if crate::tool_validation::try_reserve_tool_payload(total, additional) {
+        Ok(())
+    } else {
+        Err(tool_protocol("model exceeded the streamed tool payload size limit").into())
+    }
 }
 
 fn apply_usage(completion: &mut Completion, usage: &Value) {
@@ -476,5 +529,42 @@ pub(crate) fn backfill_missing_usage(
     if completion.usage.output_tokens == 0 {
         completion.usage.output_tokens = estimate_completion_output_tokens(&completion.content);
         completion.usage.estimated = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use futures_util::stream;
+
+    use super::collect_completion;
+    use crate::types::StreamEvent;
+
+    #[tokio::test]
+    async fn responses_stream_accepts_more_than_128_parallel_tool_calls() {
+        let events = (0..175)
+            .map(|index| {
+                Ok(eventsource_stream::Event {
+                    event: "response.output_item.done".into(),
+                    data: serde_json::json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "function_call",
+                            "id": format!("item_{index}"),
+                            "call_id": format!("call_{index}"),
+                            "name": "read",
+                            "arguments": "{}"
+                        }
+                    })
+                    .to_string(),
+                    ..Default::default()
+                })
+            })
+            .collect::<Vec<Result<eventsource_stream::Event>>>();
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream::iter(events), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(completion.tool_calls().len(), 175);
     }
 }

@@ -6,6 +6,7 @@
 //! deterministic candidate ranking used by every frontend.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -430,15 +431,25 @@ impl RaceSnapshot {
     }
 }
 
-pub fn run_stage(root: &Path, name: &str, command: &str, timeout: Duration) -> StageResult {
+fn run_stage_with_timeout(
+    root: &Path,
+    name: &str,
+    command: &str,
+    timeout: Option<Duration>,
+) -> StageResult {
     let started = Instant::now();
-    let mut child = match Command::new("sh")
+    let mut process = Command::new("sh");
+    process
         .args(["-c", command])
         .current_dir(root)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt as _;
+        process.process_group(0);
+    }
+    let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) => {
             return StageResult {
@@ -451,40 +462,46 @@ pub fn run_stage(root: &Path, name: &str, command: &str, timeout: Duration) -> S
             };
         }
     };
+    let stdout = child.stdout.take().expect("stage stdout is piped");
+    let stderr = child.stderr.take().expect("stage stderr is piped");
+    let stdout_reader = thread::spawn(move || drain_stage_output(stdout));
+    let stderr_reader = thread::spawn(move || drain_stage_output(stderr));
     let mut timed_out = false;
+    let mut wait_error = None;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() >= timeout => {
+            Ok(None) if timeout.is_some_and(|timeout| started.elapsed() >= timeout) => {
                 timed_out = true;
-                let _ = child.kill();
+                kill_stage_process_group(&mut child);
                 break;
             }
             Ok(None) => thread::sleep(Duration::from_millis(20)),
             Err(error) => {
-                let _ = child.kill();
-                return StageResult {
-                    name: name.to_string(),
-                    command: command.to_string(),
-                    passed: false,
-                    timed_out: false,
-                    duration_ms: started.elapsed().as_millis(),
-                    detail: error.to_string(),
-                };
+                kill_stage_process_group(&mut child);
+                wait_error = Some(error);
+                break;
             }
         }
     }
-    let output = child.wait_with_output();
-    let (passed, detail) = match output {
-        Ok(output) => (
-            !timed_out && output.status.success(),
+    // A shell can exit after daemonizing a descendant that still owns its
+    // stdout/stderr pipes. Reap the private group before draining output so a
+    // completed stage cannot leak work or wedge `wait_with_output` forever.
+    kill_stage_process_group(&mut child);
+    let status = child.wait();
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let (passed, detail) = match (wait_error, status) {
+        (Some(error), _) => (false, error.to_string()),
+        (None, Ok(status)) => (
+            !timed_out && status.success(),
             bounded_detail(&format!(
                 "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
             )),
         ),
-        Err(error) => (false, error.to_string()),
+        (None, Err(error)) => (false, error.to_string()),
     };
     StageResult {
         name: name.to_string(),
@@ -496,6 +513,69 @@ pub fn run_stage(root: &Path, name: &str, command: &str, timeout: Duration) -> S
     }
 }
 
+const MAX_STAGE_CAPTURE_BYTES: usize = 64 * 1024;
+
+/// Drain a child pipe continuously while retaining bounded head/tail evidence.
+/// Continuous draining prevents a noisy healthy verifier from blocking on the
+/// OS pipe buffer; bounded retention keeps continual runs memory-safe.
+fn drain_stage_output(mut reader: impl Read) -> Vec<u8> {
+    const HEAD_BYTES: usize = MAX_STAGE_CAPTURE_BYTES / 2;
+    const TAIL_BYTES: usize = MAX_STAGE_CAPTURE_BYTES - HEAD_BYTES;
+    const OMITTED: &[u8] = b"\n[... stage output truncated ...]\n";
+
+    let mut head = Vec::with_capacity(HEAD_BYTES);
+    let mut tail = std::collections::VecDeque::with_capacity(TAIL_BYTES);
+    let mut total = 0usize;
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        total = total.saturating_add(count);
+        for &byte in &buffer[..count] {
+            if head.len() < HEAD_BYTES {
+                head.push(byte);
+            } else {
+                if tail.len() == TAIL_BYTES {
+                    tail.pop_front();
+                }
+                tail.push_back(byte);
+            }
+        }
+    }
+
+    if total > MAX_STAGE_CAPTURE_BYTES {
+        head.extend_from_slice(OMITTED);
+    }
+    head.extend(tail);
+    head
+}
+
+#[cfg(unix)]
+fn kill_stage_process_group(child: &mut std::process::Child) {
+    let process_group = child.id() as libc::pid_t;
+    // SAFETY: a negative PID addresses only the private process group created
+    // for this child. ESRCH is harmless when the leader and descendants have
+    // already exited.
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_stage_process_group(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
+/// Run a stage with an explicit caller-selected wall-clock limit.
+pub fn run_stage(root: &Path, name: &str, command: &str, timeout: Duration) -> StageResult {
+    run_stage_with_timeout(root, name, command, Some(timeout))
+}
+
+/// Run verifier stages without an implicit wall-clock ceiling. A verifier is
+/// productive work, so the ordinary path waits for completion; callers that
+/// need a bounded fault campaign can use [`run_stage`] with an explicit limit.
 pub fn run_verification(root: &Path, commands: &[String]) -> Vec<StageResult> {
     commands
         .iter()
@@ -504,12 +584,8 @@ pub fn run_verification(root: &Path, commands: &[String]) -> Vec<StageResult> {
             if !*continue_running {
                 return None;
             }
-            let stage = run_stage(
-                root,
-                &format!("verify-{}", index + 1),
-                command,
-                Duration::from_secs(900),
-            );
+            let stage =
+                run_stage_with_timeout(root, &format!("verify-{}", index + 1), command, None);
             *continue_running = stage.passed;
             Some(stage)
         })
@@ -706,5 +782,64 @@ mod tests {
         let result = run_stage(dir.path(), "timeout", "sleep 1", Duration::from_millis(10));
         assert!(result.timed_out);
         assert!(!result.passed);
+    }
+
+    #[test]
+    fn verification_uses_the_unlimited_stage_path() {
+        let dir = tempdir().unwrap();
+        let results = run_verification(dir.path(), &["sleep 0.02".into()]);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].passed);
+        assert!(!results[0].timed_out);
+    }
+
+    #[test]
+    fn unlimited_verification_continuously_drains_noisy_output() {
+        let dir = tempdir().unwrap();
+        let command = "i=0; while [ $i -lt 20000 ]; do printf 'stdout-abcdefghijklmnopqrstuvwxyz-0123456789\\n'; printf 'stderr-abcdefghijklmnopqrstuvwxyz-0123456789\\n' >&2; i=$((i + 1)); done";
+        let results = run_verification(dir.path(), &[command.into()]);
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].passed, "noisy verifier failed: {results:?}");
+        assert!(!results[0].timed_out);
+        assert!(
+            results[0].detail.len() <= 4_100,
+            "stage report must remain bounded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_stage_reaps_descendants_that_hold_output_pipes() {
+        let dir = tempdir().unwrap();
+        let started = Instant::now();
+        let result = run_stage(
+            dir.path(),
+            "detached-child",
+            "sleep 3 & echo $! > child.pid",
+            Duration::from_secs(1),
+        );
+
+        assert!(result.passed, "top-level shell should complete: {result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "output drain waited for the detached descendant"
+        );
+        let pid: libc::pid_t = fs::read_to_string(dir.path().join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            // SAFETY: signal 0 only probes the PID written by this test and
+            // never changes process state.
+            let alive = unsafe { libc::kill(pid, 0) == 0 };
+            if !alive || Instant::now() >= deadline {
+                assert!(!alive, "stage descendant {pid} was left alive");
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }

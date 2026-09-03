@@ -1192,6 +1192,9 @@ fn read_report(path: &Path) -> ReportInfo {
     let stopped_by_step_cap = tel["stopped_by_step_cap"]
         .as_bool()
         .unwrap_or_else(|| tel["hit_step_cap"].as_bool().unwrap_or(false));
+    let stopped_by_tool_cap = tel["stopped_by_tool_cap"]
+        .as_bool()
+        .unwrap_or_else(|| tel["hit_tool_cap"].as_bool().unwrap_or(false));
     let trajectory = Trajectory {
         verify_rounds: tel["verify_rounds"].as_u64().unwrap_or(0) as u32,
         recovery_retries: tel["recovery_retries"].as_u64().unwrap_or(0) as u32,
@@ -1201,8 +1204,8 @@ fn read_report(path: &Path) -> ReportInfo {
         effective_max_steps: tel["effective_max_steps"].as_u64().unwrap_or(0) as u32,
         hit_step_cap: tel["hit_step_cap"].as_bool().unwrap_or(false),
         stopped_by_step_cap,
-        stalled_unfinished: tel["stalled_unfinished"].as_bool().unwrap_or(false),
-        stalled_repeating: tel["stalled_repeating"].as_bool().unwrap_or(false),
+        hit_tool_cap: tel["hit_tool_cap"].as_bool().unwrap_or(false),
+        stopped_by_tool_cap,
         quality_repair_nudges: tel["quality_repair_nudges"].as_u64().unwrap_or(0) as u32,
         review_repair_counts: tel["review_repair_counts"]
             .as_object()
@@ -1268,7 +1271,15 @@ fn read_report(path: &Path) -> ReportInfo {
             .collect(),
         repeated_verify_failures: tel["repeated_verify_failures"].as_u64().unwrap_or(0) as u32,
         no_progress_streak: tel["no_progress_streak"].as_u64().unwrap_or(0) as u32,
-        last_stall_reason: tel["last_stall_reason"].as_str().unwrap_or("").to_string(),
+        last_no_progress_reason: tel
+            .get("last_no_progress_reason")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                tel.get("last_stall_reason")
+                    .and_then(|value| value.as_str())
+            })
+            .unwrap_or("")
+            .to_string(),
         progress_events: tel
             .get("progress_events")
             .and_then(|v| v.as_array())
@@ -1455,6 +1466,8 @@ mod tests {
                 "truncation_retries": 0,
                 "hit_step_cap": false,
                 "stopped_by_step_cap": false,
+                "hit_tool_cap": true,
+                "stopped_by_tool_cap": true,
                 "stalled_unfinished": true,
                 "stalled_repeating": false,
                 "quality_repair_nudges": 4,
@@ -1485,6 +1498,8 @@ mod tests {
         assert!(parsed.trajectory.review_repair_stopped_by_exhaustion);
         assert!(!parsed.trajectory.stopped_by_step_cap);
         assert!(!parsed.trajectory.hit_step_cap);
+        assert!(parsed.trajectory.stopped_by_tool_cap);
+        assert!(parsed.trajectory.hit_tool_cap);
 
         let _ = std::fs::remove_file(path);
     }
@@ -1504,7 +1519,8 @@ mod tests {
                 "verify_rounds": 3,
                 "repeated_verify_failures": 2,
                 "no_progress_streak": 1,
-                "last_stall_reason": "no new evidence",
+                "last_no_progress_reason": "no new evidence",
+                "last_stall_reason": "legacy value must not win",
                 "progress_events": [
                     {"kind": "meaningful", "reason": "edited file", "signature": "edit:a.rs"},
                     {"kind": "none", "reason": "re-ran search", "signature": null}
@@ -1523,7 +1539,7 @@ mod tests {
         assert_eq!(t.verify_rounds, 3);
         assert_eq!(t.repeated_verify_failures, 2);
         assert_eq!(t.no_progress_streak, 1);
-        assert_eq!(t.last_stall_reason, "no new evidence");
+        assert_eq!(t.last_no_progress_reason, "no new evidence");
         assert_eq!(t.progress_events.len(), 2);
         assert_eq!(t.progress_events[0].kind, "meaningful");
         assert_eq!(t.progress_events[0].signature, "edit:a.rs");
@@ -1531,6 +1547,32 @@ mod tests {
         assert_eq!(t.progress_events[1].signature, "");
         assert_eq!(t.tool_timeline.len(), 1);
         assert_eq!(t.tool_timeline[0].progress_kind, "weak");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_report_accepts_legacy_last_stall_reason() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-eval-legacy-progress-report-{}.json",
+            std::process::id()
+        ));
+        let report = serde_json::json!({
+            "total_tokens": 1,
+            "input_tokens": 1,
+            "changed_files": [],
+            "compat_fallbacks_used": [],
+            "telemetry": {
+                "last_stall_reason": "legacy no progress"
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&report).unwrap()).unwrap();
+
+        let parsed = read_report(&path);
+        assert_eq!(
+            parsed.trajectory.last_no_progress_reason,
+            "legacy no progress"
+        );
 
         let _ = std::fs::remove_file(path);
     }

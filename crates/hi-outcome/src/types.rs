@@ -434,18 +434,21 @@ impl OutcomeOffer {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OutcomeMode {
-    #[default]
     Auto,
     Tasks,
+    /// Ordinary `hi` runs stay on the direct provider route. Outcome tasks
+    /// carry paid-job cost/deadline/attempt policies and must be opted into.
+    #[default]
     Chat,
 }
 
 impl OutcomeMode {
     pub fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
             "tasks" | "task" => Self::Tasks,
             "chat" => Self::Chat,
-            _ => Self::Auto,
+            _ => Self::Chat,
         }
     }
 }

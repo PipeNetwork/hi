@@ -20,7 +20,6 @@ mod tool_selection;
 pub(crate) mod trio;
 pub(crate) mod turn;
 
-pub(crate) use curate_turn::MAX_AUTO_SKILLS_PER_SESSION;
 // Only referenced from tests; the handlers use the consts directly in-module.
 #[cfg(test)]
 pub(crate) use delegate_turn::MAX_DELEGATE_SUBAGENTS_PER_TURN;

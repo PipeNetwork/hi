@@ -343,10 +343,10 @@ fn run_workflow_headless(arg: &str) {
                 }
                 R::BudgetQuery { reply } => {
                     let _ = reply.send(Ok(hi_workflow::BudgetState {
-                        total: Some(hi_workflow::DEFAULT_AGENT_BUDGET),
+                        total: hi_workflow::DEFAULT_AGENT_BUDGET,
                         spent: 0,
                         reserved: 0,
-                        remaining: Some(hi_workflow::DEFAULT_AGENT_BUDGET),
+                        remaining: hi_workflow::DEFAULT_AGENT_BUDGET,
                     }));
                 }
                 R::RenderTemplate { reply, .. } => {

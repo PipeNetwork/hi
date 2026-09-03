@@ -144,6 +144,9 @@ pub struct SandboxConfig {
     pub deny_read: Vec<PathBuf>,
     /// Glob patterns to deny (e.g. `**/*.pem`, `**/.env*`).
     pub deny_globs: Vec<String>,
+    /// Skip broad host-temp allowances. Hermetic embedded runners can place
+    /// one private temp directory beneath an explicit writable root instead.
+    pub deny_host_temp: bool,
 }
 
 /// A resolved sandbox profile bound to a set of writable roots. Cheap to clone.
@@ -638,8 +641,10 @@ fn seatbelt_profile_with_protected_paths(
         SandboxPolicy::Workspace => {
             out.push_str("(allow default)\n(deny file-write*)\n");
             push_device_writes(&mut out);
-            for temp in temp_roots() {
-                out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(&temp)));
+            if !config.deny_host_temp {
+                for temp in temp_roots() {
+                    out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(&temp)));
+                }
             }
             for root in writable {
                 if let Ok(canonical) = root.canonicalize()
@@ -668,9 +673,11 @@ fn seatbelt_profile_with_protected_paths(
             }
             push_device_writes(&mut out);
             push_device_reads(&mut out);
-            for temp in temp_roots() {
-                out.push_str(&format!("(allow file-read* (subpath {}))\n", quote(&temp)));
-                out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(&temp)));
+            if !config.deny_host_temp {
+                for temp in temp_roots() {
+                    out.push_str(&format!("(allow file-read* (subpath {}))\n", quote(&temp)));
+                    out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(&temp)));
+                }
             }
             // Allow process execution from system paths.
             out.push_str("(allow process-exec (subpath \"/usr\"))\n");
@@ -681,8 +688,10 @@ fn seatbelt_profile_with_protected_paths(
             out.push_str("(allow default)\n(deny file-write*)\n");
             push_device_writes(&mut out);
             // No writable roots — temp is still needed for toolchains.
-            for temp in temp_roots() {
-                out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(&temp)));
+            if !config.deny_host_temp {
+                for temp in temp_roots() {
+                    out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(&temp)));
+                }
             }
             // Restrict network: deny all socket operations.
             out.push_str("(deny network*)\n");
@@ -1237,6 +1246,31 @@ mod tests {
         assert_eq!(quote("/a/b"), "\"/a/b\"");
         assert_eq!(quote("/a\"b"), "\"/a\\\"b\"");
         assert_eq!(quote("/a\\b"), "\"/a\\\\b\"");
+    }
+
+    #[test]
+    fn hermetic_profile_omits_broad_host_temp_write_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let config = SandboxConfig {
+            deny_host_temp: true,
+            ..SandboxConfig::default()
+        };
+        let profile = seatbelt_profile_with_protected_paths(
+            SandboxPolicy::Workspace,
+            &[root.path()],
+            &config,
+            &[],
+        );
+        let canonical_root = root.path().canonicalize().unwrap();
+        assert!(profile.contains(canonical_root.to_str().unwrap()));
+        for temp in temp_roots() {
+            if Path::new(&temp) != canonical_root {
+                assert!(
+                    !profile.contains(&format!("(allow file-write* (subpath {}))", quote(&temp))),
+                    "hermetic profile exposed host temp {temp}: {profile}"
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]

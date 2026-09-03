@@ -144,6 +144,18 @@ impl GoalState {
         if live.is_empty() {
             return snapshot.to_vec();
         }
+        // A turn may replace its checklist wholesale before being cancelled.
+        // Completion counts alone cannot prove that X/Y is progress over the
+        // snapshotted A/B plan. Retain live progress only when the snapshot's
+        // step identities remain an exact prefix; appending new work is safe.
+        let extends_snapshot = live.len() >= snapshot.len()
+            && snapshot
+                .iter()
+                .zip(live)
+                .all(|(before, after)| before.title == after.title);
+        if !extends_snapshot {
+            return snapshot.to_vec();
+        }
         // Live completion wins even when the pre-turn snapshot was incomplete —
         // otherwise Esc after the final update_plan reverts "all done" to N-1.
         if !plan_has_pending_steps(live) {
@@ -162,6 +174,36 @@ impl GoalState {
         } else {
             snapshot.to_vec()
         }
+    }
+
+    /// Keep useful checklist bookkeeping when a turn is discarded, but never
+    /// retain a completion whose implementation/validation evidence was just
+    /// removed by restoring the turn checkpoint.
+    pub(crate) fn prefer_plan_progress_after_workspace_rollback(
+        snapshot: &[PlanStep],
+        live: &[PlanStep],
+    ) -> Vec<PlanStep> {
+        let mut retained = Self::prefer_plan_progress(snapshot, live);
+        for (index, step) in retained.iter_mut().enumerate() {
+            if step.status != PlanStatus::Done
+                || !crate::agent::plan_goal::plan_step_requires_execution_evidence(&step.title)
+            {
+                continue;
+            }
+
+            let prior = snapshot
+                .get(index)
+                .filter(|prior| prior.title == step.title)
+                .or_else(|| snapshot.iter().find(|prior| prior.title == step.title));
+            if prior.is_some_and(|prior| prior.status == PlanStatus::Done) {
+                continue;
+            }
+
+            step.status = prior
+                .map(|prior| prior.status)
+                .unwrap_or(PlanStatus::Pending);
+        }
+        retained
     }
 
     /// Snapshot the triple stored on [`crate::AgentStateSnapshot`] (decisions
@@ -202,22 +244,13 @@ impl GoalState {
     }
 }
 
-const MAX_FREE_TEXT_GOAL_CHARS: usize = 500;
-
 fn normalize_free_text_goal(goal: Option<String>) -> Option<String> {
     goal.and_then(|g| {
         let g = g.trim();
-        if g.is_empty() {
-            return None;
-        }
-        if g.chars().count() <= MAX_FREE_TEXT_GOAL_CHARS {
-            return Some(g.to_string());
-        }
-        let clipped: String = g
-            .chars()
-            .take(MAX_FREE_TEXT_GOAL_CHARS.saturating_sub(1))
-            .collect();
-        Some(format!("{clipped}…"))
+        // This is the canonical user-supplied objective, not a display
+        // summary. Keep every requirement and let normal context fitting own
+        // model-window constraints when the goal is injected.
+        (!g.is_empty()).then(|| g.to_string())
     })
 }
 
@@ -475,24 +508,25 @@ impl TaskContextState {
 }
 
 impl SubagentSessionState {
-    /// Reset the per-turn subagent budgets. Called at turn start: the caps
-    /// guard against within-turn runaway delegation, so a session that runs
-    /// many turns must not starve — each new turn refills the budget while
-    /// the lifetime counters keep slot numbers (and child state dirs) unique
-    /// across turns, including background tasks that outlive their turn.
+    /// Reset per-turn subagent accounting. Ordinary work has no count ceiling;
+    /// these counters support explicit operator quotas while lifetime counters
+    /// keep slot numbers (and child state dirs) stable across turns, including
+    /// background tasks that outlive their turn.
     pub(crate) fn begin_turn(&mut self) {
         self.explore_turn_used = 0;
         self.delegate_turn_used = 0;
     }
 
     /// Try to consume one explore slot; returns the 1-based lifetime slot
-    /// number or `None` if this turn's budget is exhausted.
+    /// number or `None` if an explicit finite turn limit is exhausted.
+    /// `u32::MAX` is the unlimited sentinel, so saturated bookkeeping never
+    /// turns the default into an accidental cap.
     pub(crate) fn try_begin_explore(&mut self, max: u32) -> Option<u32> {
-        if self.explore_turn_used >= max {
+        if max != u32::MAX && self.explore_turn_used >= max {
             return None;
         }
-        self.explore_turn_used += 1;
-        self.explore_subagents_used += 1;
+        self.explore_turn_used = self.explore_turn_used.saturating_add(1);
+        self.explore_subagents_used = self.explore_subagents_used.saturating_add(1);
         Some(self.explore_subagents_used)
     }
 
@@ -509,20 +543,22 @@ impl SubagentSessionState {
     }
 
     /// Try to consume one delegate slot; returns the 1-based lifetime slot
-    /// number or `None` if this turn's budget is exhausted.
+    /// number or `None` if an explicit finite turn limit is exhausted.
+    /// `u32::MAX` is the unlimited sentinel, so saturated bookkeeping never
+    /// turns the default into an accidental cap.
     pub(crate) fn try_begin_delegate(&mut self, max: u32) -> Option<u32> {
-        if self.delegate_turn_used >= max {
+        if max != u32::MAX && self.delegate_turn_used >= max {
             return None;
         }
-        self.delegate_turn_used += 1;
-        self.delegate_subagents_used += 1;
+        self.delegate_turn_used = self.delegate_turn_used.saturating_add(1);
+        self.delegate_subagents_used = self.delegate_subagents_used.saturating_add(1);
         Some(self.delegate_subagents_used)
     }
 }
 
-/// Subagent budgets and the optional write-capable runner. Budgets are
-/// per-turn (refilled by [`Self::begin_turn`]); the lifetime counters exist
-/// for unique slot naming, not budgeting.
+/// Subagent accounting and the optional write-capable runner. Per-turn counts
+/// support explicit operator quotas (ordinary execution is unlimited); the
+/// lifetime counters provide stable slot names.
 #[derive(Default)]
 pub(crate) struct SubagentSessionState {
     /// Frontend-supplied runner for the write-capable `delegate` subagent.
@@ -535,9 +571,9 @@ pub(crate) struct SubagentSessionState {
     pub(crate) explore_subagents_used: u32,
     /// Lifetime count of write-capable `delegate` subagents run this session.
     pub(crate) delegate_subagents_used: u32,
-    /// `explore` subagents consumed this turn (budget counter).
+    /// `explore` subagents consumed this turn (explicit-quota counter).
     pub(crate) explore_turn_used: u32,
-    /// `delegate` subagents consumed this turn (budget counter).
+    /// `delegate` subagents consumed this turn (explicit-quota counter).
     pub(crate) delegate_turn_used: u32,
 }
 
@@ -554,23 +590,33 @@ pub(crate) struct TurnControlFlags {
     /// plain-text tool-call round after structured retries are exhausted.
     pub tool_validation_text_fallback_used: bool,
     pub force_text_answer_next: bool,
-    pub force_no_progress_final_answer_next: bool,
     pub suppress_bookkeeping_tools_next: bool,
     pub made_tool_call: bool,
-    pub stalled_repeating: bool,
-    pub stalled_unfinished: bool,
+    /// The provider exhausted its bounded recovery budget after tool work.
+    /// Preserve the workspace, but report a typed failed turn instead of a
+    /// false successful settlement.
+    pub provider_exhausted: bool,
     pub ended_at_cap: bool,
     /// Whether the turn stopped starting new work because its soft wall-clock
     /// deadline expired (see `AgentLoopLimits::turn_soft_deadline`).
     pub ended_at_deadline: bool,
     /// Whether this turn already granted the one tool-free wrap-up round after
-    /// reaching the step cap. Sticky: the next cap hit ends the turn for real.
+    /// reaching an explicit finite step/tool cap. Sticky: the next cap hit
+    /// ends the turn for real.
     pub cap_wrap_up_requested: bool,
-    /// Whether this turn already forced the one text-only wrap-up after a
-    /// bounded/bare review inspection pass. Sticky so citation-repair can
-    /// keep read tools on later rounds instead of being pinned ChatOnly.
-    pub review_wrap_up_requested: bool,
+    /// Which explicit finite cap requested the terminal wrap-up. `None` means
+    /// no cap has fired. Kept separately from `ended_at_cap` so lifecycle,
+    /// telemetry, and the public outcome never misreport a tool-call ceiling
+    /// as a model-step ceiling.
+    pub cap_kind: Option<TurnCapKind>,
     pub obligation_nudge_fired: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnCapKind {
+    Step,
+    Tool,
+    Both,
 }
 
 impl TurnControlFlags {
@@ -579,7 +625,6 @@ impl TurnControlFlags {
         self.force_tools_next = false;
         self.text_tool_fallback_next = false;
         self.force_text_answer_next = false;
-        self.force_no_progress_final_answer_next = false;
         self.suppress_bookkeeping_tools_next = false;
     }
 }
@@ -633,5 +678,31 @@ mod plan_progress_tests {
         let kept = GoalState::prefer_plan_progress(&snapshot, &[]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].title, "a");
+    }
+
+    #[test]
+    fn interrupt_rejects_an_unrelated_live_plan_rewrite() {
+        let snapshot = vec![
+            step("a", PlanStatus::Active),
+            step("b", PlanStatus::Pending),
+        ];
+        let live = vec![step("x", PlanStatus::Done), step("y", PlanStatus::Active)];
+
+        assert_eq!(GoalState::prefer_plan_progress(&snapshot, &live), snapshot);
+    }
+
+    #[test]
+    fn interrupt_allows_progress_with_steps_appended_to_snapshot() {
+        let snapshot = vec![
+            step("a", PlanStatus::Active),
+            step("b", PlanStatus::Pending),
+        ];
+        let live = vec![
+            step("a", PlanStatus::Done),
+            step("b", PlanStatus::Active),
+            step("c", PlanStatus::Pending),
+        ];
+
+        assert_eq!(GoalState::prefer_plan_progress(&snapshot, &live), live);
     }
 }

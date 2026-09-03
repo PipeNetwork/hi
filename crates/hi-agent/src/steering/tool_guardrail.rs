@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 /// How many consecutive idle `bash_output` polls (running, no new output) for
@@ -6,10 +6,15 @@ use std::hash::{Hash, Hasher};
 /// polls as no progress. Two free polls keep legitimate progress-watching
 /// working; a third identical idle status is a tight loop.
 const IDLE_BG_POLL_FREE_STRIKES: u32 = 2;
+const IDEMPOTENT_RESULT_HASH_LIMIT: usize = 4_096;
+const IDLE_BG_HANDLE_LIMIT: usize = 1_024;
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ToolLoopGuardrail {
     seen_idempotent_result_hashes: HashSet<String>,
+    seen_idempotent_result_order: VecDeque<String>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    evicted_idempotent_result_hashes: u64,
     /// Consecutive idle `bash_output` polls per background handle id.
     idle_bg_poll_strikes: HashMap<String, u32>,
 }
@@ -112,7 +117,18 @@ impl ToolLoopGuardrail {
         } else {
             format!("{name}:{}", stable_result_hash(output))
         };
-        let repeated = !self.seen_idempotent_result_hashes.insert(key);
+        let repeated = self.seen_idempotent_result_hashes.contains(&key);
+        if !repeated {
+            self.seen_idempotent_result_hashes.insert(key.clone());
+            self.seen_idempotent_result_order.push_back(key);
+            if self.seen_idempotent_result_order.len() > IDEMPOTENT_RESULT_HASH_LIMIT
+                && let Some(evicted) = self.seen_idempotent_result_order.pop_front()
+            {
+                self.seen_idempotent_result_hashes.remove(&evicted);
+                self.evicted_idempotent_result_hashes =
+                    self.evicted_idempotent_result_hashes.saturating_add(1);
+            }
+        }
         ToolResultProgress {
             hashable_idempotent: true,
             repeated_idempotent_result: repeated,
@@ -132,6 +148,12 @@ impl ToolLoopGuardrail {
                 actionable_background_output: false,
             };
         };
+        if !self.idle_bg_poll_strikes.contains_key(&id)
+            && self.idle_bg_poll_strikes.len() >= IDLE_BG_HANDLE_LIMIT
+            && let Some(evicted) = self.idle_bg_poll_strikes.keys().next().cloned()
+        {
+            self.idle_bg_poll_strikes.remove(&evicted);
+        }
         let strikes = self.idle_bg_poll_strikes.entry(id).or_insert(0);
         *strikes = strikes.saturating_add(1);
         ToolResultProgress {
@@ -212,6 +234,40 @@ fn stable_result_hash(output: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinct_idempotent_results_use_bounded_fifo_repeat_memory() {
+        let mut guard = ToolLoopGuardrail::default();
+        for index in 0..5_000 {
+            let result = guard.record_tool_result(
+                "read",
+                r#"{"path":"src/lib.rs"}"#,
+                &format!("unique output {index}"),
+            );
+            assert!(!result.repeated_idempotent_result);
+        }
+
+        assert_eq!(
+            guard.seen_idempotent_result_hashes.len(),
+            IDEMPOTENT_RESULT_HASH_LIMIT
+        );
+        assert_eq!(
+            guard.seen_idempotent_result_order.len(),
+            IDEMPOTENT_RESULT_HASH_LIMIT
+        );
+        assert_eq!(guard.evicted_idempotent_result_hashes, 904);
+        assert!(
+            guard
+                .record_tool_result("read", r#"{"path":"src/lib.rs"}"#, "unique output 4999",)
+                .repeated_idempotent_result
+        );
+        assert!(
+            !guard
+                .record_tool_result("read", r#"{"path":"src/lib.rs"}"#, "unique output 0",)
+                .repeated_idempotent_result,
+            "evicting an ancient repeat only weakens the loop heuristic; it must not stop work"
+        );
+    }
 
     #[test]
     fn repeated_read_result_is_no_progress_even_with_different_args() {

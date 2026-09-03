@@ -195,7 +195,9 @@ impl HuggingFaceHubClient {
 
     pub fn new(endpoint: impl Into<String>, token: Option<String>) -> Self {
         Self {
-            http: crate::http::agent_http_client(),
+            // Hub metadata and file transfers are finite HTTP operations, not
+            // productive model streams, so retain their bounded read policy.
+            http: crate::http::agent_http_client_bounded(),
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             token,
         }

@@ -537,6 +537,7 @@ pub(crate) fn handle_command(
                             .unwrap_or_else(|| "metadata".into())
                     );
                     println!("\x1b[2m│ steps:           \x1b[0m {}", s.max_steps);
+                    println!("\x1b[2m│ tool-calls:      \x1b[0m {}", s.max_tool_calls);
                     println!("\x1b[2m│ tool-mode:       \x1b[0m {}", s.tool_mode);
                     println!("\x1b[2m│ compat:          \x1b[0m {}", s.compat);
                     println!("\x1b[2m│ deepseek-compat: \x1b[0m {}", s.deepseek_compat);
@@ -617,8 +618,7 @@ pub(crate) fn handle_command(
                 ConfigArg::MaxStepsAuto => {
                     agent.set_max_steps_auto();
                     println!(
-                        "\x1b[2mstep limit → {} (automatic; applies next turn)\x1b[0m",
-                        hi_agent::MAX_MODEL_ROUNDS
+                        "\x1b[2mstep limit → unlimited (automatic default; applies next turn)\x1b[0m"
                     );
                 }
                 ConfigArg::MoeStreaming(mode) => {
@@ -695,6 +695,7 @@ pub(crate) fn handle_command(
                 | ConfigArg::Verify(_)
                 | ConfigArg::Lsp(_)
                 | ConfigArg::Delegate(_)
+                | ConfigArg::Engine(_)
                 | ConfigArg::Theme(_)
                 | ConfigArg::Density(_)
                 | ConfigArg::Mouse(_) => {}
@@ -913,6 +914,7 @@ pub(crate) fn handle_command(
                 "\x1b[33m/fleet is only available in the full-screen TUI (run hi without --plain); /fleet status works here\x1b[0m"
             ),
         },
+        Command::Engine(arg) => println!("{}", agent.engine_command(&arg)),
         Command::Workflow(arg) => {
             crate::workflow::handle_workflow_command(&arg);
         }
@@ -1240,7 +1242,13 @@ pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: 
 fn handle_goal_workflow(agent: &hi_agent::Agent, objective: &str) {
     match hi_agent::goal_workflow_plan_path(false, agent.workspace_root(), objective) {
         Ok(path) => match std::env::current_exe() {
-            Ok(exe) => match crate::workflow_cmd::spawn_detached_workflow_run(&exe, &path) {
+            Ok(exe) => match crate::workflow_cmd::spawn_detached_workflow_run(
+                &exe,
+                &path,
+                agent.max_steps_limit(),
+                agent.max_tool_calls_cap(),
+                agent.max_verify_repairs_cap(),
+            ) {
                 Ok((pid, log)) => {
                     println!(
                         "\x1b[32m▶ workflow {path} started (pid {pid})\x1b[0m\n\x1b[2m  log: {} — it checkpoints every wave and survives this session\x1b[0m",

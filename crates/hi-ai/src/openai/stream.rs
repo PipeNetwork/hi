@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use super::request;
 use crate::provider::{ProviderError, ProviderErrorKind};
@@ -20,13 +21,8 @@ use crate::types::{
 const SPECIAL_TOKEN_PREFIX: &str = "<|";
 const SPECIAL_TOKEN_SUFFIX: &str = "|>";
 
-/// Upper bound on parallel tool calls in one response. The per-delta `index`
-/// arrives straight from the provider's SSE JSON; without a bound, one corrupt
-/// frame (`"index": 9999999999`) forces a multi-GB allocation.
-const MAX_STREAM_TOOL_CALLS: usize = 128;
 const MAX_STREAM_TOOL_NAME_BYTES: usize = 256;
 const MAX_STREAM_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_STREAM_TOTAL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DSML_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// Bound a possible ChatML token prefix while waiting for its closing `|>`.
 /// A malformed provider stream must not turn a two-byte `<|` prefix into an
@@ -46,11 +42,7 @@ const POST_FINISH_USAGE_GRACE: std::time::Duration = std::time::Duration::from_s
 /// long model prefill/reasoning phases can legitimately produce no chunks.
 /// Set `HI_STREAM_IDLE_TIMEOUT_SECS` to a positive value to opt into a watchdog.
 fn stream_idle_timeout() -> Option<std::time::Duration> {
-    std::env::var("HI_STREAM_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(std::time::Duration::from_secs)
+    crate::http::stream_idle_window()
 }
 
 /// Check if `inner` (the text between `<|` and `|>`) looks like a special
@@ -782,12 +774,15 @@ where
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut refusal = String::new();
-    let mut tool_calls: Vec<ToolCallBuilder> = Vec::new();
+    // Provider-supplied indices are sparse keys, never Vec capacities. A
+    // corrupt `index: usize::MAX` therefore consumes one bounded map node
+    // instead of asking the allocator for an index-sized vector.
+    let mut tool_calls: BTreeMap<usize, ToolCallBuilder> = BTreeMap::new();
     let mut native_tool_calls = false;
     let mut completion = Completion::default();
     let mut progressed = false;
     let mut stream_complete = false;
-    let mut tool_argument_bytes = 0usize;
+    let mut tool_payload_bytes = 0usize;
     // Wrap the sink so ChatML special tokens (<|im_start|>, <|im_end|>, …) are
     // stripped from streamed text, and tool-call JSON (`{"name":…}`) that local
     // models emit as text is suppressed from the live display. The
@@ -828,7 +823,7 @@ where
                     return Err(ProviderError::new(
                         ProviderErrorKind::Outage,
                         format!(
-                            "model stream stalled: no chunks for {}s",
+                            "model stream idle timeout: no chunks for {}s",
                             idle_timeout.as_secs()
                         ),
                     )
@@ -927,16 +922,17 @@ where
                 native_tool_calls = true;
                 progressed = true;
                 for tcd in deltas {
+                    let delta_id = tcd.id.clone().filter(|id| !id.is_empty());
+                    let delta_name = tcd
+                        .function
+                        .as_ref()
+                        .and_then(|function| function.name.clone());
+                    let delta_arguments = tcd
+                        .function
+                        .as_ref()
+                        .and_then(|function| function.arguments.clone())
+                        .unwrap_or_default();
                     let index = match tcd.index {
-                        // The index comes straight off the wire — bound it so a
-                        // corrupt frame can't force a huge `resize_with`
-                        // allocation (or a capacity-overflow abort).
-                        Some(i) if i >= MAX_STREAM_TOOL_CALLS => {
-                            return Err(stream_tool_protocol_error(
-                                "model exceeded the streamed tool-call limit",
-                            )
-                            .into());
-                        }
                         Some(i) => i,
                         // Some local OpenAI-compat servers omit `index` (the
                         // same ones that omit `id` — see ToolCallBuilder::
@@ -947,12 +943,10 @@ where
                         // continuation until the current call has a complete
                         // arguments value. Once the current call is complete,
                         // a new name/argument fragment starts the next call.
-                        None => no_index_tool_call_index(&tool_calls, &tcd),
+                        None => no_index_tool_call_index(&tool_calls, &tcd)?,
                     };
-                    if tool_calls.len() <= index {
-                        tool_calls.resize_with(index + 1, ToolCallBuilder::default);
-                    }
-                    let builder = &mut tool_calls[index];
+                    let builder =
+                        tool_call_builder_mut(&mut tool_calls, index, &mut tool_payload_bytes)?;
                     if let Some(id) = tcd.id
                         && !id.is_empty()
                     {
@@ -962,11 +956,13 @@ where
                             )
                             .into());
                         }
+                        reserve_stream_tool_payload(&mut tool_payload_bytes, id.len())?;
                         builder.id = id;
                     }
                     if let Some(func) = tcd.function {
                         if let Some(name) = func.name {
-                            builder.merge_name(&name);
+                            let added = builder.merge_name(&name);
+                            reserve_stream_tool_payload(&mut tool_payload_bytes, added)?;
                             if builder.name.len() > MAX_STREAM_TOOL_NAME_BYTES {
                                 return Err(stream_tool_protocol_error(
                                     "model exceeded the streamed tool-name size limit",
@@ -976,10 +972,8 @@ where
                         }
                         if let Some(args) = func.arguments {
                             let added = builder.merge_arguments(&args);
-                            tool_argument_bytes = tool_argument_bytes.saturating_add(added);
-                            if builder.arguments.len() > MAX_STREAM_TOOL_ARGUMENT_BYTES
-                                || tool_argument_bytes > MAX_STREAM_TOTAL_ARGUMENT_BYTES
-                            {
+                            reserve_stream_tool_payload(&mut tool_payload_bytes, added)?;
+                            if builder.arguments.len() > MAX_STREAM_TOOL_ARGUMENT_BYTES {
                                 return Err(stream_tool_protocol_error(
                                     "model exceeded the streamed tool-argument size limit",
                                 )
@@ -987,17 +981,25 @@ where
                             }
                         }
                     }
+                    if delta_id.is_some() || delta_name.is_some() || !delta_arguments.is_empty() {
+                        filter.forward(StreamEvent::ToolCallDelta {
+                            index,
+                            id_delta: delta_id,
+                            name_delta: delta_name,
+                            arguments_delta: delta_arguments,
+                        });
+                    }
                 }
             }
             if let Some(func) = delta.function_call {
                 native_tool_calls = true;
                 progressed = true;
-                if tool_calls.is_empty() {
-                    tool_calls.push(ToolCallBuilder::default());
-                }
-                let builder = &mut tool_calls[0];
+                let delta_name = func.name.clone();
+                let delta_arguments = func.arguments.clone().unwrap_or_default();
+                let builder = tool_call_builder_mut(&mut tool_calls, 0, &mut tool_payload_bytes)?;
                 if let Some(name) = func.name {
-                    builder.merge_name(&name);
+                    let added = builder.merge_name(&name);
+                    reserve_stream_tool_payload(&mut tool_payload_bytes, added)?;
                     if builder.name.len() > MAX_STREAM_TOOL_NAME_BYTES {
                         return Err(stream_tool_protocol_error(
                             "model exceeded the streamed tool-name size limit",
@@ -1007,15 +1009,21 @@ where
                 }
                 if let Some(arguments) = func.arguments {
                     let added = builder.merge_arguments(&arguments);
-                    tool_argument_bytes = tool_argument_bytes.saturating_add(added);
-                    if builder.arguments.len() > MAX_STREAM_TOOL_ARGUMENT_BYTES
-                        || tool_argument_bytes > MAX_STREAM_TOTAL_ARGUMENT_BYTES
-                    {
+                    reserve_stream_tool_payload(&mut tool_payload_bytes, added)?;
+                    if builder.arguments.len() > MAX_STREAM_TOOL_ARGUMENT_BYTES {
                         return Err(stream_tool_protocol_error(
                             "model exceeded the streamed tool-argument size limit",
                         )
                         .into());
                     }
+                }
+                if delta_name.is_some() || !delta_arguments.is_empty() {
+                    filter.forward(StreamEvent::ToolCallDelta {
+                        index: 0,
+                        id_delta: None,
+                        name_delta: delta_name,
+                        arguments_delta: delta_arguments,
+                    });
                 }
             }
             if let Some(finish_reason) = choice.finish_reason {
@@ -1083,9 +1091,9 @@ where
             completion.content.push(Content::Text(text));
         }
     }
-    for (i, builder) in tool_calls.into_iter().enumerate() {
+    for (index, builder) in tool_calls {
         if !builder.name.is_empty() {
-            completion.content.push(builder.finish(i));
+            completion.content.push(builder.finish(index));
         }
     }
     completion.tool_call_channel = match (native_tool_calls, text_tool_calls) {
@@ -1112,6 +1120,34 @@ fn stream_tool_protocol_error(message: &str) -> ProviderError {
     )
 }
 
+fn reserve_stream_tool_payload(total: &mut usize, additional: usize) -> Result<()> {
+    if crate::tool_validation::try_reserve_tool_payload(total, additional) {
+        Ok(())
+    } else {
+        Err(
+            stream_tool_protocol_error("model exceeded the streamed tool payload size limit")
+                .into(),
+        )
+    }
+}
+
+fn tool_call_builder_mut<'a>(
+    tool_calls: &'a mut BTreeMap<usize, ToolCallBuilder>,
+    index: usize,
+    tool_payload_bytes: &mut usize,
+) -> Result<&'a mut ToolCallBuilder> {
+    match tool_calls.entry(index) {
+        std::collections::btree_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            reserve_stream_tool_payload(
+                tool_payload_bytes,
+                crate::tool_validation::TOOL_CALL_SLOT_OVERHEAD_BYTES,
+            )?;
+            Ok(entry.insert(ToolCallBuilder::default()))
+        }
+    }
+}
+
 fn valid_stream_tool_call_id(id: &str) -> bool {
     id.len() <= 128
         && id
@@ -1126,13 +1162,18 @@ fn valid_stream_tool_call_id(id: &str) -> bool {
 /// current call, while a delta with a different id or a new function after a
 /// complete JSON argument starts the next call. This handles both common local
 /// server shapes without treating a fragmented `re` + `ad` name as two calls.
-fn no_index_tool_call_index(tool_calls: &[ToolCallBuilder], delta: &ToolCallDelta) -> usize {
-    let Some(last) = tool_calls.last() else {
-        return 0;
+fn no_index_tool_call_index(
+    tool_calls: &BTreeMap<usize, ToolCallBuilder>,
+    delta: &ToolCallDelta,
+) -> Result<usize> {
+    let Some((&last_index, last)) = tool_calls.last_key_value() else {
+        return Ok(0);
     };
     let delta_id = delta.id.as_deref().unwrap_or("");
     if !delta_id.is_empty() && !last.id.is_empty() && last.id != delta_id {
-        return tool_calls.len();
+        return last_index
+            .checked_add(1)
+            .ok_or_else(|| stream_tool_protocol_error("model tool-call index overflow").into());
     }
 
     let delta_name = delta
@@ -1152,10 +1193,12 @@ fn no_index_tool_call_index(tool_calls: &[ToolCallBuilder], delta: &ToolCallDelt
             || delta_arguments.trim_start().starts_with('{')
             || delta_arguments.trim_start().starts_with('['))
     {
-        return tool_calls.len();
+        return last_index
+            .checked_add(1)
+            .ok_or_else(|| stream_tool_protocol_error("model tool-call index overflow").into());
     }
 
-    tool_calls.len() - 1
+    Ok(last_index)
 }
 
 pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
@@ -1899,13 +1942,37 @@ mod tests {
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"ba","arguments":"{\"com"}}]}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"sh","arguments":"mand\":\"echo hi\"}"}}]},"finish_reason":"tool_calls"}]}"#,
         ]);
-        let mut sink = |_: StreamEvent| {};
+        let mut deltas = Vec::new();
+        let mut sink = |event: StreamEvent| {
+            if let StreamEvent::ToolCallDelta { .. } = event {
+                deltas.push(event);
+            }
+        };
         let completion = collect_completion(stream, &mut sink).await.unwrap();
         let calls = completion.tool_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].name, "bash");
         assert_eq!(calls[0].arguments, r#"{"command":"echo hi"}"#);
+        assert_eq!(deltas.len(), 2);
+        assert!(matches!(
+            &deltas[0],
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id_delta: Some(id),
+                name_delta: Some(name),
+                arguments_delta,
+            } if id == "call_1" && name == "ba" && arguments_delta == "{\"com"
+        ));
+        assert!(matches!(
+            &deltas[1],
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id_delta: None,
+                name_delta: Some(name),
+                arguments_delta,
+            } if name == "sh" && arguments_delta == "mand\":\"echo hi\"}"
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2022,18 +2089,43 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn streamed_tool_limits_fail_with_a_retryable_protocol_error() {
-        let stream = stream::iter(vec![Ok(format!(
-            r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":{},"function":{{"name":"read","arguments":"{{}}"}}}}]}}}}]}}"#,
-            super::MAX_STREAM_TOOL_CALLS
-        ))]);
+    async fn streamed_tool_calls_have_no_legacy_count_ceiling() {
+        let calls = (0..175)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "id": format!("call_{index}"),
+                    "function": {"name": "read", "arguments": "{}"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let stream = stream::iter(vec![Ok(serde_json::json!({
+            "choices": [{
+                "delta": {"tool_calls": calls},
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string())]);
         let mut sink = |_: StreamEvent| {};
-        let err = collect_completion(stream, &mut sink).await.unwrap_err();
-        let provider = err
-            .downcast_ref::<crate::provider::ProviderError>()
-            .expect("typed protocol error");
-        assert_eq!(provider.kind, ProviderErrorKind::ToolProtocol);
-        assert_eq!(provider.retryable, Some(true));
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        assert_eq!(completion.tool_calls().len(), 175);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sparse_provider_index_does_not_drive_vector_allocation() {
+        let stream = stream::iter(vec![Ok(serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": usize::MAX,
+                "id": "call_sparse",
+                "function": {"name": "read", "arguments": "{}"}
+            }]}}]
+        })
+        .to_string())]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        let calls = completion.tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_sparse");
     }
 
     #[tokio::test(start_paused = true)]

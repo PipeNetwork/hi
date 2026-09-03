@@ -64,6 +64,16 @@ pub struct DelegateOutcome {
 /// back into the parent's working tree. Implemented by the frontend.
 #[async_trait]
 pub trait DelegateRunner: Send + Sync {
+    /// Synchronize the per-turn model-call cap used by subsequently spawned
+    /// delegate children. Frontends without child processes can ignore this;
+    /// process-owning runners should treat `None` as unlimited/default.
+    fn set_max_steps(&self, _max_steps: Option<u32>) {}
+
+    /// Synchronize the per-turn tool-call cap used by subsequently spawned
+    /// delegate children. This is independent from `set_max_steps`, so a
+    /// runtime step-limit change cannot accidentally clear a finite tool cap.
+    fn set_max_tool_calls(&self, _max_tool_calls: Option<u32>) {}
+
     /// Carry out `task` in an isolated worktree, gating the result on `verify`
     /// (or the session's default when `None`), and apply the diff back only if it
     /// passes.

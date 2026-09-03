@@ -56,8 +56,8 @@ pub mod protocol {
     pub use crate::attribution::{AttrKind, Attribution, parse_attributions};
     pub use crate::background::BackgroundRegistry;
     pub use crate::background_tasks::{
-        BackgroundTaskOutcome, BackgroundTaskRegistry, BackgroundTaskState, BgFuture,
-        DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
+        BackgroundTaskCapacityError, BackgroundTaskOutcome, BackgroundTaskRegistry,
+        BackgroundTaskState, BgFuture, DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
     };
     pub use crate::condense::condense_diagnostics;
     pub use crate::paths::ReadCache;
@@ -68,20 +68,23 @@ pub mod protocol {
     };
     pub use crate::tools::{
         MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo, MemoryBackend,
-        MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, TOOL_CATALOG,
-        TOOL_SPECS, ToolAdmission, ToolCapability, ToolMetadata, ask_user_tool_spec,
-        browser_exec_tool_spec, commit_in, delegate_tool_spec, execute_in_runtime,
-        execute_in_runtime_shared, execute_in_runtime_shared_with, execute_in_runtime_with,
-        execute_prepared_in_runtime, execute_streaming_in_runtime, explore_tool_spec,
-        fast_check_for, get_task_output_tool_spec, is_coordination, is_filesystem_mutating,
-        is_known_tool, is_read_only, kill_task_tool_spec, memory_forget_tool_spec,
-        memory_get_tool_spec, memory_search_tool_spec, memory_update_tool_spec,
-        new_context_tool_spec, prepare_mutation_in_with_state, prepare_verify_workdir,
-        research_read_tool_spec, research_tool_spec, run_check_in, run_check_in_with_timeout,
-        run_fast_check_in, run_memory_forget, run_memory_get, run_memory_search, run_memory_update,
-        run_search_tool, run_skill, run_use_tool, search_tool_tool_spec, skill_tool_spec,
-        target_path, target_paths, task_tool_spec, tool_metadata, use_tool_tool_spec,
-        wait_tasks_tool_spec, working_tree_diff_in, working_tree_diff_plain_in,
+        MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, SpeculationClass,
+        TOOL_CATALOG, TOOL_SPECS, ToolAdmission, ToolCapability, ToolCostClass, ToolMetadata,
+        ask_user_tool_spec, browser_exec_tool_spec, commit_in, delegate_tool_spec,
+        execute_in_runtime, execute_in_runtime_shared, execute_in_runtime_shared_with,
+        execute_in_runtime_shared_with_runner, execute_in_runtime_with,
+        execute_prepared_in_runtime, execute_streaming_in_runtime,
+        execute_streaming_in_runtime_with_runner, explore_tool_spec, fast_check_for,
+        get_task_output_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
+        is_read_only, kill_task_tool_spec, memory_forget_tool_spec, memory_get_tool_spec,
+        memory_search_tool_spec, memory_update_tool_spec, new_context_tool_spec,
+        prepare_mutation_in_with_state, prepare_verify_workdir, research_read_tool_spec,
+        research_tool_spec, run_check_in, run_check_in_with_timeout, run_fast_check_in,
+        run_memory_forget, run_memory_get, run_memory_search, run_memory_update,
+        run_program_tool_spec, run_search_tool, run_skill, run_use_tool, search_tool_tool_spec,
+        skill_tool_spec, speculation_class, target_path, target_paths, task_tool_spec,
+        tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in,
+        working_tree_diff_plain_in,
     };
     pub use crate::transaction::{
         MutationPlan, PlannedFileMutation, recover_workspace_transactions,
@@ -163,8 +166,8 @@ mod web;
 
 pub use background::{BackgroundRegistry, shell_title};
 pub use background_tasks::{
-    BackgroundTaskOutcome, BackgroundTaskRegistry, BackgroundTaskState, BgFuture,
-    DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
+    BackgroundTaskCapacityError, BackgroundTaskOutcome, BackgroundTaskRegistry,
+    BackgroundTaskState, BgFuture, DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
 };
 pub use codebase_graph::references_by_name;
 pub use condense::condense_diagnostics;
@@ -209,20 +212,23 @@ pub fn research_credentials_configured() -> bool {
 pub(crate) use tools::preview_edit_in;
 pub use tools::{
     MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo, MemoryBackend,
-    MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, TOOL_CATALOG, TOOL_SPECS,
-    ToolAdmission, ToolCapability, ToolMetadata, ask_user_tool_spec, browser_exec_tool_spec,
-    check_timeout, commit_in, delegate_tool_spec, execute_in_runtime, execute_in_runtime_shared,
-    execute_in_runtime_shared_with, execute_in_runtime_with, execute_prepared_in_runtime,
-    execute_streaming_in_runtime, explore_tool_spec, fast_check_for, get_task_output_tool_spec,
-    is_coordination, is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec,
-    memory_forget_tool_spec, memory_get_tool_spec, memory_search_tool_spec,
-    memory_update_tool_spec, new_context_tool_spec, prepare_mutation_in_with_state,
-    prepare_verify_workdir, research_read_tool_spec, research_tool_spec, run_check_in,
+    MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, SpeculationClass,
+    TOOL_CATALOG, TOOL_SPECS, ToolAdmission, ToolCapability, ToolCostClass, ToolMetadata,
+    ask_user_tool_spec, browser_exec_tool_spec, check_timeout, commit_in, delegate_tool_spec,
+    execute_in_runtime, execute_in_runtime_shared, execute_in_runtime_shared_with,
+    execute_in_runtime_shared_with_runner, execute_in_runtime_with, execute_prepared_in_runtime,
+    execute_streaming_in_runtime, execute_streaming_in_runtime_with_runner, explore_tool_spec,
+    fast_check_for, get_task_output_tool_spec, is_coordination, is_filesystem_mutating,
+    is_known_tool, is_read_only, kill_task_tool_spec, memory_forget_tool_spec,
+    memory_get_tool_spec, memory_search_tool_spec, memory_update_tool_spec, new_context_tool_spec,
+    prepare_mutation_in_with_state, prepare_verify_workdir, research_read_tool_spec,
+    research_tool_spec, run_check_in, run_check_in_with_runner,
+    run_check_in_with_runner_maybe_timeout, run_check_in_with_runner_timeout,
     run_check_in_with_timeout, run_fast_check_in, run_memory_forget, run_memory_get,
-    run_memory_search, run_memory_update, run_search_tool, run_skill, run_use_tool,
-    search_tool_tool_spec, skill_tool_spec, target_path, target_paths, task_tool_spec,
-    tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in,
-    working_tree_diff_plain_in,
+    run_memory_search, run_memory_update, run_program_tool_spec, run_search_tool, run_skill,
+    run_use_tool, search_tool_tool_spec, skill_tool_spec, speculation_class, target_path,
+    target_paths, task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
+    working_tree_diff_in, working_tree_diff_plain_in,
 };
 
 /// Process-wide `browser_exec` gate. Call once at session setup from `[browser]`
@@ -1179,20 +1185,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_plan_clips_titles_and_caps_step_count() {
+    async fn update_plan_clips_titles_and_preserves_every_step() {
         let mut steps = Vec::new();
         for i in 0..200 {
             steps.push(format!(
-                r#"{{"title":"{}","status":"pending"}}"#,
-                "T".repeat(400) + &i.to_string()
+                r#"{{"title":"step {i}: {}","status":"pending"}}"#,
+                "T".repeat(400)
             ));
         }
         let args = format!(r#"{{"steps":[{}]}}"#, steps.join(","));
         let out = execute("update_plan", &args).await;
         let plan = out.plan.expect("plan is set");
-        assert_eq!(plan.len(), 128);
+        assert_eq!(plan.len(), 200);
         assert!(plan.iter().all(|step| step.title.chars().count() <= 160));
-        assert!(out.content.contains("omitted"), "{}", out.content);
+        assert!(plan.last().unwrap().title.starts_with("step 199:"));
+        assert_eq!(out.content, "Plan recorded: 0/200 done.");
     }
 
     #[tokio::test]
