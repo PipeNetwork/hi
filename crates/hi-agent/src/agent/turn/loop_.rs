@@ -1186,16 +1186,20 @@ impl crate::Agent {
             self.messages.as_slice(),
             turn.turn_start,
         );
+        let bounded_plan_answer_recovery_exhausted =
+            turn.progress_tracker.bounded_plan_answer_recovery_exhausted;
         let mut closeout_generated = false;
-        if self.config.memory.finalize
+        let optional_finalize_requested = self.config.memory.finalize
             && turn.flags.made_tool_call
             && !turn.flags.ended_at_deadline
-            && needs_closeout
-        {
+            && needs_closeout;
+        if optional_finalize_requested || bounded_plan_answer_recovery_exhausted {
             // Side questions may still be streaming — wait so their UI/usage land
             // before we close the turn, then disarm so idle `/btw` can't fire.
             self.join_btw_jobs(ui).await;
             self.disarm_btw_dispatcher();
+        }
+        if optional_finalize_requested && !bounded_plan_answer_recovery_exhausted {
             closeout_generated = self.finalize_turn(turn.turn_start, ui).await;
             // finalize_turn appended a [user: finalize-nudge][assistant: recap]
             // pair. Strip it from the persisted transcript so the FINALIZE_PROMPT
@@ -1214,8 +1218,10 @@ impl crate::Agent {
         // typed no-progress failure, not a successful answer. This is keyed on
         // the semantic tracker and the absence of a model/user-visible answer;
         // lexical guesses about the requested task do not manufacture it.
-        let no_progress_exhausted =
-            needs_closeout && !closeout_generated && turn.progress_tracker.no_progress_streak > 0;
+        let no_progress_exhausted = bounded_plan_answer_recovery_exhausted
+            || (needs_closeout
+                && !closeout_generated
+                && turn.progress_tracker.no_progress_streak > 0);
         turn.phase_latencies.finalize_ms = turn
             .phase_latencies
             .finalize_ms

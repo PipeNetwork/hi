@@ -125,6 +125,11 @@ pub(super) struct ProgressTracker {
     /// retain its construction shape while preserving the established guards.
     pub(super) repeat_sampling_rounds: u32,
     pub(super) force_no_progress_final_answer_next: bool,
+    /// The provider repeated a semantically empty completion claim through
+    /// the bounded answer-repair budget while durable plan work remained.
+    /// Settlement owns this as a typed no-progress outcome; it is not a
+    /// provider transport or verification-infrastructure failure.
+    pub(super) bounded_plan_answer_recovery_exhausted: bool,
     pub(super) prev_added_no_evidence: bool,
     pub(super) prev_call_sig: Option<Vec<(String, String)>>,
     pub(super) tool_guardrail: ToolLoopGuardrail,

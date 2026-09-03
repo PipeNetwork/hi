@@ -312,7 +312,6 @@ impl crate::Agent {
                 return Ok(RoundControl::Continue);
             }
 
-            progress_tracker.record(ProgressKind::None, "generic_completion_placeholder", None);
             if plan_incomplete {
                 if implementation_tracker.mutation_seen || implementation_tracker.validation_seen {
                     // The model failed only at summarizing a productive turn.
@@ -339,16 +338,23 @@ impl crate::Agent {
                 // unchanged unfinished checklist. Accepting it as a successful
                 // turn makes the frontend enqueue the same synthetic drive
                 // again until the cross-turn stall guard parks it. Preserve
-                // the durable plan, but fail this bounded provider attempt now
-                // so the frontend stops auto-driving and reports the real cause.
+                // the durable plan and settle this bounded semantic failure as
+                // no-progress. Returning Err here used to make frontend cleanup
+                // mislabel it as verification infrastructure failure.
+                progress_tracker.bounded_plan_answer_recovery_exhausted = true;
+                progress_tracker.record(
+                    ProgressKind::None,
+                    "generic completion after bounded plan recovery",
+                    None,
+                );
                 self.messages.push_assistant(vec![Content::Text(
                     "[answer rejected: generic completion placeholder repeated]".into(),
                 )]);
                 ui.nudge("model repeated a generic completion response without advancing the plan");
-                return Err(anyhow::anyhow!(
-                    "model returned no usable final answer for the unfinished plan after bounded recovery"
-                ));
+                ui.status("model did not produce a usable plan result after bounded recovery");
+                return Ok(RoundControl::BreakInner(false));
             }
+            progress_tracker.record(ProgressKind::None, "generic_completion_placeholder", None);
             ui.nudge("model repeated a generic completion response; returning the available text");
         }
         if buffer_read_only_review_text {

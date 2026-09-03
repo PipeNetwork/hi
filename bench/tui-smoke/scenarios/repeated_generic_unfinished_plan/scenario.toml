@@ -30,7 +30,7 @@ timeout_ms = 10000
 
 [[actions]]
 kind = "wait_event"
-equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/stop_reason" = "infrastructure_failure" }
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/stop_reason" = "no_progress" }
 timeout_ms = 10000
 
 [[actions]]
@@ -55,7 +55,7 @@ exact = 1
 [[assertions]]
 kind = "records"
 source = "events"
-equals = { "/event" = "turn_settled", "/data/plan/incomplete" = true, "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "infrastructure" }
+equals = { "/event" = "turn_settled", "/data/plan/incomplete" = true, "/data/outcome/verification" = "not_applicable", "/data/outcome/has_plan_leftover" = true, "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "no_progress" }
 exact = 1
 
 [[assertions]]
@@ -67,7 +67,8 @@ exact = 2
 [[assertions]]
 kind = "screen"
 snapshot = "bounded_failure"
-excludes = ["Completed the requested action."]
+contains = ["repeated attempts made no progress", "no progress"]
+excludes = ["Completed the requested action.", "verification infrastructure failure"]
 
 [[assertions]]
 kind = "provider_consumed"

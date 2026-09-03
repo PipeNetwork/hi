@@ -56,7 +56,9 @@ impl crate::Agent {
             crate::TurnStatus::Completed | crate::TurnStatus::Failed
         ) && !matches!(
             outcome.stop_reason,
-            crate::TurnStopReason::Cancelled | crate::TurnStopReason::InfrastructureFailure
+            crate::TurnStopReason::Cancelled
+                | crate::TurnStopReason::InfrastructureFailure
+                | crate::TurnStopReason::NoProgress
         )
     }
 

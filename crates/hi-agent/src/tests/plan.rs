@@ -1459,7 +1459,7 @@ async fn plan_drive_prompt_finishes_next_pending_step() {
 }
 
 #[tokio::test]
-async fn repeated_generic_completion_fails_one_plan_drive_without_parking_loop() {
+async fn repeated_generic_completion_settles_one_plan_drive_as_no_progress() {
     let workspace = IsolatedWorkspace::new("plan-drive-generic-completion");
     let mut cfg = workspace.config();
     cfg.loop_limits.max_silent_continues = 0;
@@ -1475,15 +1475,29 @@ async fn repeated_generic_completion_fails_one_plan_drive_without_parking_loop()
     agent.restore_plan(vec![pending_step("wire timeline replies and likes")]);
     let mut ui = RecUi::default();
 
-    let error = agent
+    let outcome = agent
         .run_turn(crate::PLAN_DRIVE_PROMPT, &mut ui)
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert!(
-        error.to_string().contains("no usable final answer"),
-        "unexpected bounded provider error: {error:#}"
+    assert_eq!(outcome.status, crate::TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, crate::TurnStopReason::NoProgress);
+    assert_eq!(
+        outcome.verification,
+        crate::VerificationStatus::NotApplicable
     );
+    assert_ne!(
+        outcome.verification,
+        crate::VerificationStatus::InfrastructureError
+    );
+    assert_eq!(outcome.review, crate::ReviewStatus::NotRequired);
+    assert!(outcome.changed_files.is_empty());
+    assert!(outcome.verified_workspace_revision.is_none());
+    assert!(
+        outcome.leftover.is_some(),
+        "drive leftover must be reported"
+    );
+    assert_eq!(outcome.exit_code(false), 1);
     assert!(
         !ui.assistant.contains("Completed the requested action"),
         "a rejected completion claim leaked into the UI: {}",
@@ -1496,21 +1510,89 @@ async fn repeated_generic_completion_fails_one_plan_drive_without_parking_loop()
     assert_eq!(
         agent.plan_drive_stall(),
         0,
-        "one failed provider attempt must not manufacture four completed drive turns"
-    );
-    let cleanup = agent
-        .cleanup_turn(crate::TurnCleanupKind::Fail)
-        .await
-        .unwrap();
-    assert_eq!(
-        cleanup.outcome.stop_reason,
-        crate::TurnStopReason::InfrastructureFailure
+        "one no-progress attempt must not manufacture four completed drive turns"
     );
     assert!(
-        !agent
-            .drive_decision(Some(&cleanup.outcome))
-            .should_enqueue(),
-        "the frontend must not auto-queue another identical plan drive after provider exhaustion"
+        !agent.drive_decision(Some(&outcome)).should_enqueue(),
+        "the frontend must not auto-queue another identical plan drive after bounded no-progress"
+    );
+    assert!(
+        outcome.plan_leftover.is_some(),
+        "plan leftover must be reported"
+    );
+    assert!(
+        ui.assistant.contains("repeated attempts made no progress"),
+        "a truthful deterministic closeout should be shown: {}",
+        ui.assistant
+    );
+    assert!(
+        !ui.statuses.iter().any(|status| status
+            .to_ascii_lowercase()
+            .contains("verification infrastructure failure")),
+        "semantic answer exhaustion must not be labeled as verifier failure: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn bounded_generic_plan_recovery_skips_optional_calls_and_disarms_btw() {
+    let workspace = IsolatedWorkspace::new("plan-drive-generic-after-tool");
+    let inspected = workspace.path("README.md");
+    std::fs::write(&inspected, "timeline implementation notes\n").unwrap();
+    let mut cfg = workspace.config();
+    cfg.loop_limits.max_silent_continues = 0;
+    cfg.loop_limits.max_keep_working = 0;
+    cfg.memory.finalize = true;
+    cfg.memory.suggest_next_prompt = true;
+    let generic = || {
+        completion(
+            vec![Content::Text("Completed the requested action.".into())],
+            1,
+            1,
+        )
+    };
+    let inspect = completion(
+        vec![Content::ToolCall {
+            id: "read-notes".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": inspected }).to_string(),
+        }],
+        1,
+        1,
+    );
+    // There is deliberately no fourth response. A regression that invokes
+    // either optional finalization or next-prompt suggestion after bounded
+    // answer recovery records an extra provider request.
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(inspect),
+            ProviderStep::Completion(generic()),
+            ProviderStep::Completion(generic()),
+        ],
+        cfg,
+    );
+    agent.restore_plan(vec![pending_step("wire timeline replies and likes")]);
+    let btw_dispatcher = agent.btw_dispatcher();
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn(crate::PLAN_DRIVE_PROMPT, &mut ui)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, crate::TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, crate::TurnStopReason::NoProgress);
+    assert_eq!(outcome.exit_code(false), 1);
+    assert!(agent.plan_incomplete());
+    assert!(!ui.assistant.contains("Completed the requested action"));
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        3,
+        "bounded recovery must not start a finalize or suggestion model call"
+    );
+    assert!(
+        !btw_dispatcher.is_enabled(),
+        "the side-question dispatcher must be disarmed when the turn settles"
     );
 }
 
