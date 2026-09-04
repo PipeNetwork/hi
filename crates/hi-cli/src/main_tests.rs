@@ -439,7 +439,7 @@ fn initialization_failure_still_writes_a_v2_report() {
     let _ = std::fs::remove_file(path);
     assert_eq!(report["schema_version"], 2);
     assert_eq!(report["outcome"]["status"], "failed");
-    assert_eq!(report["outcome"]["verification"], "infrastructure_error");
+    assert_eq!(report["outcome"]["verification"], "unverified");
     assert_eq!(report["route"]["provider"], "test-provider");
     assert_eq!(report["changes"], serde_json::json!([]));
     assert_eq!(report["rsi"]["mode"], "off");
