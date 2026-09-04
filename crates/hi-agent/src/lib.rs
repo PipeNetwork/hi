@@ -1190,9 +1190,9 @@ pub struct Agent {
     /// ordinary conversation; an interruption pause is consumed by the next
     /// genuine user turn while still preventing spontaneous restart.
     pub(crate) plan_drive_pause: crate::plan_drive::PlanDrivePause,
-    /// The TUI's leftover-plan approval was explicitly parked with Escape.
-    /// Unlike `plan_drive_paused`, this is cleared by reopening the approval
-    /// card, not by `/plan resume` or empty Enter.
+    /// Proposed plan work needs approval while drafting/revising or while the
+    /// TUI card is visible/parked. Kept under its legacy persistence name.
+    /// Reopening the card, `/plan resume`, or empty Enter does not approve it.
     pub(crate) plan_approval_parked: bool,
     /// Consecutive no-progress plan-drive turns. Parked at
     /// [`PLAN_DRIVE_STALL_LIMIT`]. Persisted with pause so resume stays parked.

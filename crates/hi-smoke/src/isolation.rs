@@ -270,6 +270,24 @@ fn content_assurance(portable: &str, path: &Path) -> ContentAssurance {
                 ContentAssurance::Invalid
             }
         }
+        [
+            "xdg",
+            "data",
+            "hi",
+            "projects",
+            _,
+            "runtime",
+            "workspaces",
+            _,
+            "store.lock",
+        ] => {
+            // The snapshot store uses this empty inode solely for flock.
+            if bytes.is_empty() {
+                ContentAssurance::Validated
+            } else {
+                ContentAssurance::Invalid
+            }
+        }
         [.., "manifests", name]
             if name
                 .strip_suffix(".json")
@@ -613,7 +631,7 @@ fn expected_project_state(rest: &[&str], policy: &IsolationPolicy) -> bool {
 
 fn expected_snapshot_state(rest: &[&str]) -> bool {
     match rest {
-        [] | ["objects"] | ["manifests"] => true,
+        [] | ["objects"] | ["manifests"] | ["store.lock"] => true,
         ["manifests", manifest]
             if manifest
                 .strip_suffix(".json")
@@ -799,6 +817,51 @@ mod tests {
             mutation.after.as_ref().unwrap().content_assurance,
             Some(ContentAssurance::Invalid)
         );
+    }
+
+    #[test]
+    fn snapshot_store_lock_requires_empty_regular_file_for_current_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("workspace")).unwrap();
+        let policy = IsolationPolicy::for_workspace(&root.path().join("workspace"), true).unwrap();
+        let relative = format!(
+            "xdg/data/hi/projects/{}/runtime/workspaces/{}/store.lock",
+            policy.project_key, policy.snapshot_workspace_key
+        );
+        let lock = root.path().join(&relative);
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        let baseline = capture(root.path()).unwrap();
+
+        fs::write(&lock, []).unwrap();
+        let evidence =
+            compare_with_policy(&baseline, &capture(root.path()).unwrap(), Some(&policy));
+        assert_eq!(evidence.unexpected_mutation_count, 0);
+        assert_eq!(evidence.expected_runtime_mutation_count, 1);
+
+        let mut wrong_workspace = policy.clone();
+        wrong_workspace.snapshot_workspace_key = "0".repeat(64);
+        let evidence = compare_with_policy(
+            &baseline,
+            &capture(root.path()).unwrap(),
+            Some(&wrong_workspace),
+        );
+        assert_eq!(evidence.unexpected_paths(), vec![relative.as_str()]);
+
+        fs::write(&lock, b"model-owned content").unwrap();
+        let evidence =
+            compare_with_policy(&baseline, &capture(root.path()).unwrap(), Some(&policy));
+        assert_eq!(evidence.unexpected_paths(), vec![relative.as_str()]);
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(&lock).unwrap();
+            let target = root.path().join("workspace/lock-target");
+            fs::write(&target, []).unwrap();
+            std::os::unix::fs::symlink(target, &lock).unwrap();
+            let evidence =
+                compare_with_policy(&baseline, &capture(root.path()).unwrap(), Some(&policy));
+            assert_eq!(evidence.unexpected_paths(), vec![relative.as_str()]);
+        }
     }
 
     #[cfg(unix)]

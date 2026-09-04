@@ -277,22 +277,75 @@ fn handle_session_command_inner(
                     Err(error) => format!("plan pause failed: {error:#}"),
                 },
                 "resume" => {
+                    if agent.plan_incomplete() && agent.plan_approval_parked() {
+                        return Some(SessionCommandEffect {
+                            message: "plan approval is pending — /view-plan to review it".into(),
+                            follow_up_prompt: None,
+                        });
+                    }
+                    if agent.plan_incomplete() && agent.plan_mode() {
+                        return Some(SessionCommandEffect {
+                            message: "plan mode is on — approve the plan before resuming execution"
+                                .into(),
+                            follow_up_prompt: None,
+                        });
+                    }
+                    let goal_pause = agent
+                        .structured_goal()
+                        .filter(|goal| {
+                            agent.plan_incomplete() && goal.has_drive_work() && goal.is_paused()
+                        })
+                        .map(|goal| {
+                            // Legacy sessions stored only `paused=true`, which
+                            // carries the same intent as a typed user pause.
+                            if goal.pause_reason == crate::GoalPauseReason::None {
+                                crate::GoalPauseReason::User
+                            } else {
+                                goal.pause_reason
+                            }
+                        });
+                    if let Some(reason) = goal_pause
+                        && reason != crate::GoalPauseReason::User
+                    {
+                        return Some(SessionCommandEffect {
+                            message: format!(
+                                "goal drive is paused for {} — /goal status to review it before resuming",
+                                reason.as_str()
+                            ),
+                            follow_up_prompt: None,
+                        });
+                    }
                     if let Err(error) = agent.resume_plan_drive() {
                         return Some(SessionCommandEffect {
                             message: format!("plan resume failed: {error:#}"),
                             follow_up_prompt: None,
                         });
                     }
-                    if agent.plan_approval_parked() {
+                    // Quitting plan approval pauses both drivers. Explicitly
+                    // resuming its leftover work must release that user pause
+                    // too, while preserving review/approval/failure barriers.
+                    if goal_pause == Some(crate::GoalPauseReason::User)
+                        && let Err(error) =
+                            agent.try_set_goal_pause_reason(crate::GoalPauseReason::None)
+                    {
                         return Some(SessionCommandEffect {
-                            message: "plan approval is parked — /view-plan to review it".into(),
+                            message: format!("plan resume failed: {error:#}"),
                             follow_up_prompt: None,
                         });
                     }
                     if agent.plan_incomplete() && !agent.plan_mode() {
+                        let follow_up_prompt = agent
+                            .explicit_goal_drive_decision()
+                            .prompt()
+                            .map(str::to_string);
                         return Some(SessionCommandEffect {
-                            message: "plan drive resumed".into(),
-                            follow_up_prompt: Some(crate::PLAN_DRIVE_PROMPT.to_string()),
+                            message: if follow_up_prompt.is_some() {
+                                "plan drive resumed".into()
+                            } else {
+                                "goal drive remains parked — /goal status to review it before resuming"
+                                    .into()
+                            },
+                            follow_up_prompt,
                         });
                     }
                     "plan drive resumed — no leftover checklist work".into()
@@ -1566,11 +1619,11 @@ pub fn plan_mode_prompt(user_request: &str) -> String {
     let base = "\
 Plan mode is ON for this turn. Do not modify files or run mutating commands.
 Produce a clear, ordered implementation plan the user can approve.
-Prefer the update_plan tool to record steps. Its checklist represents future
+Use the update_plan tool to record the plan before finishing. Its checklist represents future
 implementation work: keep new or unexecuted steps pending, and mark a step done
 only if it was already completed before this planning turn. Finishing the plan
 itself does not finish its implementation steps. Ask clarifying questions if needed.
-When the plan is ready, stop and wait — the user will leave plan mode to execute.";
+When the plan is ready, stop and wait for the user's approval before execution.";
     // `/plan <request>` already queues this wrapper as its follow-up prompt;
     // `run_turn_core` also applies it to every turn that starts in plan mode so
     // Shift-Tab has identical semantics. Keep the operation idempotent.

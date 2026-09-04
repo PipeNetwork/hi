@@ -400,9 +400,8 @@ pub(super) async fn run_agent_turn(
             }
         }
         app.refresh_goal(agent);
-        if started_in_plan_mode && agent.plan_incomplete() && !agent.plan_mode() {
-            app.maybe_open_plan_approval();
-        }
+        app.finish_plan_draft(started_in_plan_mode, driven.value.as_ref());
+        app.push_session_face(agent);
         app.maybe_queue_drive(agent, driven.value.as_ref());
     }
     app.trace_turn_settled(agent, agent.last_turn_outcome())?;

@@ -1,4 +1,4 @@
-//! Plan-approval card parked when leaving plan mode with leftover checklist work.
+//! Plan-approval card shown automatically after a successful plan draft.
 //!
 //! Approve starts leftover drive. Request changes returns to plan mode so the
 //! user can type feedback (line comments are included). Quit turns plan mode
@@ -187,7 +187,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let leftover_idx = leftover_indices(app);
     let mut body = vec![
         Line::styled(
-            "Plan mode left leftover work. Review it before driving.",
+            "Review the plan before execution.",
             Style::default()
                 .fg(th.accent_plan)
                 .add_modifier(Modifier::BOLD),
@@ -293,6 +293,7 @@ impl App {
             }
             card.parked = false;
             card.focus = PlanApprovalFocus::Preview;
+            self.completion = None;
             self.session_face_dirty = true;
             self.status = "Waiting on plan approval".into();
             let _ = self.trace_approval_shown("plan");
@@ -321,6 +322,8 @@ impl App {
 
     pub(crate) fn open_plan_approval(&mut self) {
         self.plan_approval = Some(PlanApproval::new());
+        self.completion = None;
+        self.session_face_dirty = true;
         self.status = "Waiting on plan approval".into();
         let _ = self.trace_approval_shown("plan");
     }
@@ -352,6 +355,25 @@ impl App {
         self.open_plan_approval();
     }
 
+    /// Drafting stays read-only until the user approves. The end of a
+    /// successful draft presents that decision without requiring a mode key.
+    /// An explicit mid-turn approval already left plan mode and must not open
+    /// a second card when the original turn finishes.
+    pub(crate) fn finish_plan_draft(
+        &mut self,
+        started_in_plan_mode: bool,
+        outcome: Option<&hi_agent::TurnOutcome>,
+    ) {
+        if started_in_plan_mode
+            && self.plan_mode
+            && self.plan_has_leftover()
+            && self.plan_approval.is_none()
+            && outcome.is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Completed)
+        {
+            self.open_plan_approval();
+        }
+    }
+
     fn comment_prompt(&self) -> Option<String> {
         let card = self.plan_approval.as_ref()?;
         if card.comments.is_empty() {
@@ -366,18 +388,29 @@ impl App {
                 .unwrap_or("step");
             out.push_str(&format!("- [{title}]: {}\n", comment.text));
         }
+        let draft = self.input.text();
+        if !draft.trim().is_empty() {
+            out.push('\n');
+            out.push_str(&draft);
+        }
         Some(out)
     }
 
-    pub(crate) fn apply_plan_approve(&mut self, agent: &mut Agent) {
-        self.trace_approval_decided("plan", "approved");
-        self.plan_approval = None;
+    pub(crate) fn apply_plan_approve(&mut self, agent: &mut Agent) -> bool {
+        let card = self.plan_approval.take();
         self.plan_mode = false;
         self.plan_drive_paused = false;
         self.plan_drive_pause_dirty = true;
         self.session_face_dirty = true;
-        self.push_session_face(agent);
+        if !self.push_session_face(agent) {
+            if card.is_some() {
+                self.plan_approval = card;
+            }
+            return false;
+        }
+        self.trace_approval_decided("plan", "approved");
         self.status = "plan approved — driving leftover work".into();
+        true
     }
 
     pub(crate) fn apply_plan_request_changes(&mut self, agent: &mut Agent) {
@@ -387,7 +420,9 @@ impl App {
         self.plan_mode = true;
         self.permission_mode = hi_agent::PermissionMode::Ask;
         self.session_face_dirty = true;
-        self.push_session_face(agent);
+        if !self.push_session_face(agent) {
+            return;
+        }
         if let Some(prompt) = prompt {
             self.input.set(&prompt);
         }
@@ -401,7 +436,9 @@ impl App {
         self.plan_drive_paused = true;
         self.plan_drive_pause_dirty = true;
         self.session_face_dirty = true;
-        self.push_session_face(agent);
+        if !self.push_session_face(agent) {
+            return;
+        }
         self.status = "plan drive paused".into();
         self.trace_drive_state("drive_paused", "plan_drive", "plan_approval_quit");
     }
@@ -442,3 +479,7 @@ impl App {
         self.trace_drive_state("drive_paused", "plan_drive", "plan_approval_quit");
     }
 }
+
+#[cfg(test)]
+#[path = "plan_approval_tests.rs"]
+mod tests;

@@ -5,6 +5,8 @@
 mod auth;
 mod drive;
 mod helpers;
+#[cfg(test)]
+mod plan_approval_tests;
 mod queue;
 mod turn_execution;
 
@@ -24,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::{
     EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode,
-    KeyEventKind, KeyModifiers,
+    KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
@@ -88,6 +90,66 @@ fn ensure_owned_loop_fire_lock(
             crate::lock::try_acquire(&crate::lock::lock_path(loops_file)).map(std::sync::Arc::new);
     }
     fire_lock.is_some()
+}
+
+/// An approval card owns the next action. Retain user work while it is visible,
+/// and recheck synthetic continuations when dequeuing because a pause, mode
+/// change, or plan replacement may have invalidated them after they were queued.
+fn dequeue_ready_prompt(app: &mut App, agent: &Agent) -> Option<String> {
+    if app.plan_approval_capturing() {
+        return None;
+    }
+    while let Some(prompt) = app.queue.pop_front() {
+        let kind = hi_agent::DriveKind::from_prompt(&prompt);
+        if !kind.is_drive()
+            || (app.plan_approval.is_none()
+                && agent.explicit_goal_drive_decision() == hi_agent::DriveAction::Enqueue(kind))
+        {
+            return Some(prompt);
+        }
+    }
+    None
+}
+
+/// Handle approval before composer completion or any other idle key handler.
+/// Draft text and queued prompts are left intact until the user decides.
+fn handle_idle_plan_approval_key(
+    app: &mut App,
+    agent: &mut Agent,
+    key: &KeyEvent,
+) -> Option<String> {
+    if !app.plan_approval_capturing() {
+        return None;
+    }
+    match crate::plan_approval::handle_key(app, key) {
+        crate::plan_approval::PlanApprovalOutcome::Approve => {
+            if !app.plan_has_leftover() || !agent.plan_incomplete() {
+                app.refresh_goal(agent);
+                return None;
+            }
+            if app.apply_plan_approve(agent) {
+                agent
+                    .explicit_goal_drive_decision()
+                    .prompt()
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        }
+        crate::plan_approval::PlanApprovalOutcome::Park => {
+            app.park_plan_approval(agent);
+            None
+        }
+        crate::plan_approval::PlanApprovalOutcome::RequestChanges => {
+            app.apply_plan_request_changes(agent);
+            None
+        }
+        crate::plan_approval::PlanApprovalOutcome::Quit => {
+            app.apply_plan_quit(agent);
+            None
+        }
+        crate::plan_approval::PlanApprovalOutcome::Continue => None,
+    }
 }
 
 pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
@@ -453,7 +515,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         // Run a queued command first (typed while the previous turn ran);
         // otherwise edit the input line until the user submits.
         let mut line_was_queued = false;
-        let line = match app.queue.pop_front() {
+        let line = match dequeue_ready_prompt(&mut app, agent) {
             Some(queued) => {
                 line_was_queued = true;
                 app.trace_prompt_dequeued(&queued)?;
@@ -592,6 +654,15 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         event
                     }
                 };
+                if let Event::Key(key) = &event
+                    && key.kind == KeyEventKind::Press
+                    && app.plan_approval_capturing()
+                {
+                    if let Some(prompt) = handle_idle_plan_approval_key(&mut app, agent, key) {
+                        break 'input prompt;
+                    }
+                    continue 'input;
+                }
                 match event {
                     Event::Key(key) if key.kind == KeyEventKind::Press && app.race.is_some() => {
                         let close = app.race.as_mut().unwrap().handle_key(key);
@@ -1140,8 +1211,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 continue 'input;
                             }
                             Some(ChordPipeline::PlanApprove) => {
-                                app.apply_plan_approve(agent);
-                                break 'input hi_agent::PLAN_DRIVE_PROMPT.to_string();
+                                if app.apply_plan_approve(agent)
+                                    && let Some(prompt) =
+                                        agent.explicit_goal_drive_decision().prompt()
+                                {
+                                    break 'input prompt.to_string();
+                                }
+                                continue 'input;
                             }
                             Some(ChordPipeline::PlanPark) => {
                                 app.park_plan_approval(agent);

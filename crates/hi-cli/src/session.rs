@@ -93,9 +93,9 @@ enum SessionMeta {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         evidence_add: Vec<String>,
     },
-    /// The leftover-plan approval card was explicitly parked with Escape.
-    /// Kept separate from `PlanDrive.paused` so `/view-plan` cannot silently
-    /// consume an explicit `/plan pause`.
+    /// Approval is pending, whether its card is visible or parked with Escape.
+    /// The legacy `parked` field remains the persisted gate; reopening a card
+    /// does not approve it or consume an explicit `/plan pause`.
     PlanApproval {
         #[serde(default)]
         parked: bool,
@@ -414,7 +414,7 @@ pub struct LoadedSession {
     /// Whether the restored pause is an interruption latch consumed by the
     /// next genuine user turn instead of durable manual `/plan pause` intent.
     pub plan_drive_resume_on_user_input: bool,
-    /// Whether leftover plan work is waiting on a parked approval card.
+    /// Whether proposed plan work still requires approval, including drafts.
     pub plan_approval_parked: bool,
     /// Consecutive no-progress plan-drive turns restored with pause.
     pub plan_drive_stall: u32,

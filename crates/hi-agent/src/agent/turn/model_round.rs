@@ -289,21 +289,22 @@ impl crate::Agent {
         // provider-native call. A ChatOnly envelope never admits either form.
         let wrapping_up =
             request_text_answer || request_no_progress_final_answer || request_cap_wrap_up;
+        let session_tool_mode = self.effective_tool_mode();
         let tool_mode = if request_text_tool_fallback {
             ToolMode::Required
         } else if wrapping_up {
             ToolMode::ChatOnly
-        } else if force_tools_next && self.config.routing.tool_mode == ToolMode::Auto {
+        } else if force_tools_next && session_tool_mode == ToolMode::Auto {
             ToolMode::Required
         } else {
-            self.config.routing.tool_mode
+            session_tool_mode
         };
         let tool_availability_mode = if read_only_intent.is_some()
-            && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
+            && !matches!(session_tool_mode, ToolMode::ChatOnly)
         {
             ToolMode::ReadOnly
         } else {
-            self.config.routing.tool_mode
+            session_tool_mode
         };
         let requested_request_max_tokens =
             request_max_tokens_override.unwrap_or(self.config.routing.max_tokens);

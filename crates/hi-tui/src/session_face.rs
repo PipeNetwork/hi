@@ -132,23 +132,47 @@ impl App {
 
     /// Push composer flags to the live agent after Shift-Tab (or a mid-turn
     /// cycle that could not borrow the agent until the turn settled).
-    pub(crate) fn push_session_face(&mut self, agent: &mut Agent) {
+    pub(crate) fn push_session_face(&mut self, agent: &mut Agent) -> bool {
         if !self.session_face_dirty && !self.plan_drive_pause_dirty {
-            return;
+            return true;
+        }
+        let saved = (|| -> anyhow::Result<()> {
+            if self.plan_drive_pause_dirty {
+                // Save both execution states before releasing approval. A
+                // failed write or restart between records must retain a gate.
+                agent.try_set_plan_drive_paused(self.plan_drive_paused)?;
+                agent.try_set_goal_pause_reason(if self.plan_drive_paused {
+                    hi_agent::GoalPauseReason::User
+                } else {
+                    hi_agent::GoalPauseReason::None
+                })?;
+            }
+            if self.session_face_dirty {
+                // The legacy persisted "parked" flag is the approval gate. Keep
+                // it set while drafting/revising too: plan mode itself is not
+                // durable, and restart must not execute an unapproved checklist.
+                agent
+                    .try_set_plan_approval_parked(self.plan_approval.is_some() || self.plan_mode)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = saved {
+            self.plan_mode = true;
+            agent.set_plan_mode(true);
+            if self.plan_approval.is_none() && self.plan_has_leftover() {
+                self.open_plan_approval();
+            }
+            self.status = format!("could not save plan approval: {error:#}");
+            return false;
         }
         if self.session_face_dirty {
             agent.set_plan_mode(self.plan_mode);
             agent.set_permission_mode(self.permission_mode);
-            agent.set_plan_approval_parked(
-                self.plan_approval.as_ref().is_some_and(|card| card.parked),
-            );
-        }
-        if self.plan_drive_pause_dirty {
-            agent.set_plan_drive_paused(self.plan_drive_paused);
         }
         self.session_face_dirty = false;
         self.plan_drive_pause_dirty = false;
         self.refresh_goal(agent);
+        true
     }
 
     pub(crate) fn plan_has_leftover(&self) -> bool {

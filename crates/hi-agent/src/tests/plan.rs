@@ -88,6 +88,12 @@ impl SessionSink for FailingPlanDriveSession {
         Ok(())
     }
 
+    fn record_plan_approval_parked(&mut self, _parked: bool) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "injected plan-approval persistence failure"
+        ))
+    }
+
     fn record_plan_drive_state_with_policy(
         &mut self,
         _paused: bool,
@@ -645,6 +651,82 @@ async fn plan_mode_cannot_mark_unexecuted_checklist_done() {
         agent.drive_decision(Some(&outcome)).should_enqueue(),
         "leaving plan mode must expose the real pending implementation work"
     );
+}
+
+#[tokio::test]
+async fn plan_mode_blocks_mutation_with_full_and_minimal_tool_catalogs() {
+    for tool_set in [ToolSet::Full, ToolSet::Minimal] {
+        let workspace = IsolatedWorkspace::new("plan-mode-mutation-guard");
+        let changed = workspace.path("must-not-be-written.txt");
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let provider = ModeTransitionProvider {
+            responses: Mutex::new(vec![
+                write_completion(&changed.to_string_lossy()),
+                completion(
+                    vec![Content::ToolCall {
+                        id: "draft-after-denial".into(),
+                        name: "update_plan".into(),
+                        arguments:
+                            r#"{"steps":[{"title":"Implement the feature","status":"pending"}]}"#
+                                .into(),
+                    }],
+                    1,
+                    1,
+                ),
+                completion(
+                    vec![Content::Text(
+                        "The implementation plan is ready for approval.".into(),
+                    )],
+                    1,
+                    1,
+                ),
+            ]),
+            requests: requests.clone(),
+        };
+        let mut cfg = workspace.config();
+        cfg.memory.tool_set = tool_set;
+        let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+        agent.set_plan_mode(true);
+        // Scope must be enforced independently from the confirmation ladder.
+        agent.set_permission_mode(PermissionMode::Always);
+        let mut ui = RecUi::default();
+
+        let outcome = agent
+            .run_turn("Implement the feature", &mut ui)
+            .await
+            .unwrap();
+
+        assert!(
+            !changed.exists(),
+            "plan mode wrote a file with {tool_set:?}"
+        );
+        assert!(outcome.changed_files.is_empty());
+        assert!(agent.plan_incomplete());
+        assert!(
+            agent
+                .last_turn_telemetry()
+                .tool_timeline
+                .iter()
+                .any(|entry| {
+                    entry.tool == "write" && entry.status == hi_tools::ToolStatus::Denied
+                })
+        );
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests[0]
+                .tool_names
+                .iter()
+                .any(|name| name == "update_plan")
+        );
+        assert!(
+            requests[0]
+                .tool_names
+                .iter()
+                .all(|name| { !matches!(name.as_str(), "write" | "edit" | "bash" | "use_tool") }),
+            "planning advertised mutations: {:?}",
+            requests[0].tool_names
+        );
+    }
 }
 
 #[tokio::test]
@@ -2065,6 +2147,118 @@ fn parked_plan_approval_blocks_drive_without_becoming_plan_pause() {
 }
 
 #[test]
+fn pending_plan_approval_blocks_an_active_goal_drive_too() {
+    let mut agent = goal_agent();
+    agent.restore_plan(vec![pending_step("review the proposed scheduler changes")]);
+    agent
+        .set_structured_goal(Some(crate::Goal::new(
+            "ship the scheduler",
+            vec!["implement the scheduler".into()],
+        )))
+        .unwrap();
+    agent.set_plan_approval_parked(true);
+
+    let pending = crate::DriveAction::Idle {
+        reason: crate::DriveIdleReason::PlanApprovalParked,
+    };
+    assert_eq!(agent.drive_decision(None), pending);
+    assert_eq!(agent.explicit_goal_drive_decision(), pending);
+
+    agent.set_plan_approval_parked(false);
+    assert_eq!(
+        agent.drive_decision(None),
+        crate::DriveAction::Enqueue(crate::DriveKind::Goal)
+    );
+}
+
+#[test]
+fn failed_plan_approval_persistence_does_not_release_execution() {
+    let mut agent = agent(Vec::new(), config());
+    agent.restore_plan(vec![pending_step("Implement the scheduler")]);
+    agent.set_plan_approval_parked(true);
+    agent.set_session(Box::new(FailingPlanDriveSession));
+
+    assert!(agent.try_set_plan_approval_parked(false).is_err());
+    assert!(agent.plan_approval_parked());
+    assert!(!agent.drive_decision(None).should_enqueue());
+    // The compatibility wrapper must retain the same fail-closed behavior.
+    agent.set_plan_approval_parked(false);
+    assert!(agent.plan_approval_parked());
+}
+
+#[test]
+fn planning_cannot_block_an_approved_goal_step() {
+    let mut agent = goal_agent();
+    agent
+        .set_structured_goal(Some(crate::Goal::new(
+            "ship the scheduler",
+            vec!["Implement the scheduler".into()],
+        )))
+        .unwrap();
+    let before = agent.structured_goal().cloned();
+    agent.set_plan_mode(true);
+
+    let result = agent.handle_block_step(r#"{"prerequisite":"Choose a database"}"#);
+
+    assert_eq!(result.status, hi_tools::ToolStatus::Denied);
+    assert_eq!(agent.structured_goal(), before.as_ref());
+    assert!(agent.pending_block.is_none());
+}
+
+#[tokio::test]
+async fn capped_planning_turn_does_not_count_as_failed_goal_execution() {
+    let mut cfg = config();
+    cfg.subagents.long_horizon = true;
+    cfg.loop_limits.max_steps = 1;
+    let mut agent = agent(
+        vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "plan-draft".into(),
+                    name: "update_plan".into(),
+                    arguments: serde_json::json!({
+                        "steps": [{"title": "Implement the scheduler", "status": "pending"}]
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text("The plan draft is ready for review.".into())],
+                1,
+                1,
+            ),
+        ],
+        cfg,
+    );
+    let mut goal = crate::Goal::new(
+        "ship the scheduler",
+        vec!["Implement the scheduler".into(), "Wire the API".into()],
+    );
+    // A planning cap must not tip an existing implementation retry over its
+    // barren-turn circuit breaker or add failure notes to the approved goal.
+    goal.sub_goals[0].barren_caps = crate::goal::MAX_BARREN_CAPS - 1;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let before = agent.structured_goal().cloned();
+    agent.set_plan_mode(true);
+
+    agent
+        .run_turn(
+            "Draft the remaining implementation plan",
+            &mut RecUi::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(agent.structured_goal(), before.as_ref());
+    assert!(
+        agent.plan_incomplete(),
+        "the draft must stay available for approval"
+    );
+}
+
+#[test]
 fn plan_resume_does_not_bypass_a_parked_approval() {
     let mut agent = agent(Vec::new(), config());
     agent.restore_plan(vec![pending_step("wire the scheduler")]);
@@ -2075,10 +2269,109 @@ fn plan_resume_does_not_bypass_a_parked_approval() {
         crate::handle_session_command(&mut agent, &crate::Command::Plan("resume".into()), &[])
             .expect("plan command");
 
-    assert!(!agent.plan_drive_paused(), "resume consumes only the pause");
+    assert!(
+        agent.plan_drive_paused(),
+        "pending approval must retain the pause"
+    );
     assert!(agent.plan_approval_parked());
     assert!(effect.follow_up_prompt.is_none());
     assert!(effect.message.contains("/view-plan"));
+}
+
+#[test]
+fn plan_resume_after_quit_resumes_the_user_paused_goal_and_queues_its_prompt() {
+    let mut agent = goal_agent();
+    agent.restore_plan(vec![pending_step("Implement the scheduler")]);
+    agent
+        .set_structured_goal(Some(crate::Goal::new(
+            "ship the scheduler",
+            vec!["Implement the scheduler".into()],
+        )))
+        .unwrap();
+    agent.try_set_plan_drive_paused(true).unwrap();
+    agent
+        .try_set_goal_pause_reason(crate::GoalPauseReason::User)
+        .unwrap();
+
+    let effect = handle_session_command(&mut agent, &Command::Plan("resume".into()), &[])
+        .expect("resume effect");
+
+    assert!(!agent.plan_drive_paused());
+    assert!(!agent.structured_goal().unwrap().is_paused());
+    assert_eq!(
+        effect.follow_up_prompt.as_deref(),
+        Some(crate::GOAL_CONTINUE_PROMPT)
+    );
+    assert_eq!(
+        agent.explicit_goal_drive_decision(),
+        crate::DriveAction::Enqueue(crate::DriveKind::Goal)
+    );
+}
+
+#[test]
+fn plan_resume_preserves_other_goal_pause_reasons_and_pending_approval() {
+    for reason in [
+        crate::GoalPauseReason::Approval,
+        crate::GoalPauseReason::Review,
+        crate::GoalPauseReason::Infra,
+        crate::GoalPauseReason::Budget,
+        crate::GoalPauseReason::Stall,
+        crate::GoalPauseReason::Skeptic,
+        crate::GoalPauseReason::User,
+    ] {
+        let mut agent = goal_agent();
+        agent.restore_plan(vec![pending_step("Implement the scheduler")]);
+        agent
+            .set_structured_goal(Some(crate::Goal::new(
+                "ship the scheduler",
+                vec!["Implement the scheduler".into()],
+            )))
+            .unwrap();
+        agent.try_set_plan_drive_paused(true).unwrap();
+        agent.try_set_goal_pause_reason(reason).unwrap();
+        if reason == crate::GoalPauseReason::User {
+            agent.set_plan_approval_parked(true);
+        }
+
+        let effect = handle_session_command(&mut agent, &Command::Plan("resume".into()), &[])
+            .expect("resume effect");
+
+        assert!(agent.plan_drive_paused(), "reason={reason:?}");
+        assert_eq!(agent.structured_goal().unwrap().pause_reason, reason);
+        assert!(effect.follow_up_prompt.is_none(), "reason={reason:?}");
+        assert!(
+            effect
+                .message
+                .contains(if reason == crate::GoalPauseReason::User {
+                    "/view-plan"
+                } else {
+                    "/goal status"
+                })
+        );
+    }
+}
+
+#[test]
+fn plan_resume_with_empty_draft_does_not_open_approval_or_resume_a_goal() {
+    let mut agent = goal_agent();
+    agent
+        .set_structured_goal(Some(crate::Goal::new(
+            "ship the scheduler",
+            vec!["Implement the scheduler".into()],
+        )))
+        .unwrap();
+    agent
+        .try_set_goal_pause_reason(crate::GoalPauseReason::User)
+        .unwrap();
+    agent.set_plan_approval_parked(true);
+
+    let effect = handle_session_command(&mut agent, &Command::Plan("resume".into()), &[])
+        .expect("resume effect");
+
+    assert!(effect.follow_up_prompt.is_none());
+    assert!(effect.message.contains("no leftover checklist work"));
+    assert!(agent.structured_goal().unwrap().is_paused());
+    assert!(agent.plan_approval_parked());
 }
 
 #[test]

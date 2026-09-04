@@ -16,22 +16,33 @@ id = "draft-plan-answer"
 kind = "text"
 text = "The proposed plan is ready for review."
 
+[[provider.steps]]
+id = "revise-plan-after-feedback"
+[provider.steps.expect]
+body_contains = ["Add a verification step before finishing."]
+[provider.steps.response]
+kind = "tool_call"
+name = "update_plan"
+arguments = { steps = [{ title = "Revise the proposed step", status = "pending" }, { title = "Verify the revised implementation", status = "pending" }] }
+
+[[provider.steps]]
+id = "revised-plan-answer"
+[provider.steps.response]
+kind = "text"
+text = "The revised plan includes a verification step and is ready for review."
+
 [[actions]]
 kind = "send_line"
 text = "/plan revise the proposed step"
 
 [[actions]]
 kind = "wait_event"
-equals = { "/event" = "turn_settled", "/data/plan/mode" = true }
+equals = { "/event" = "approval_shown", "/data/kind" = "plan" }
 timeout_ms = 10000
 
 [[actions]]
-kind = "send_line"
-text = "/plan off"
-
-[[actions]]
 kind = "wait_event"
-equals = { "/event" = "approval_shown", "/data/kind" = "plan" }
+equals = { "/event" = "turn_settled", "/data/plan/mode" = true }
 timeout_ms = 5000
 
 [[actions]]
@@ -52,19 +63,57 @@ equals = { "/event" = "approval_decided", "/data/decision" = "request_changes" }
 timeout_ms = 5000
 
 [[actions]]
+kind = "send_line"
+text = "Add a verification step before finishing."
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "approval_shown", "/data/kind" = "plan" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/plan/mode" = true, "/data/plan/pending" = 2 }
+timeout_ms = 5000
+
+[[actions]]
+kind = "capture_screen"
+name = "revised_plan_approval"
+
+[[actions]]
+kind = "send_key"
+key = "escape"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "approval_decided", "/data/decision" = "parked" }
+timeout_ms = 5000
+
+[[actions]]
 kind = "quit"
 
 [[assertions]]
 kind = "records"
 source = "events"
 equals = { "/event" = "approval_shown", "/data/kind" = "plan" }
-exact = 1
+exact = 2
 
 [[assertions]]
 kind = "records"
 source = "events"
 equals = { "/event" = "approval_decided", "/data/decision" = "request_changes" }
 exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+exact = 0
+
+[[assertions]]
+kind = "screen"
+snapshot = "revised_plan_approval"
+contains = ["Plan approval", "Verify the revised implementation"]
 
 [[assertions]]
 kind = "provider_consumed"

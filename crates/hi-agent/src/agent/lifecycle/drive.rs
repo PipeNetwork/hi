@@ -143,6 +143,13 @@ impl crate::Agent {
                 reason: crate::DriveIdleReason::PlanMode,
             };
         }
+        // Approval belongs to the proposed work, so a structured goal must not
+        // bypass it merely because goal driving normally wins over checklists.
+        if self.goals.plan_incomplete() && self.plan_approval_parked {
+            return crate::DriveAction::Idle {
+                reason: crate::DriveIdleReason::PlanApprovalParked,
+            };
+        }
         if self
             .goals
             .structured
@@ -184,20 +191,29 @@ impl crate::Agent {
         self.plan_drive_pause.resumes_on_user_input()
     }
 
-    /// Whether leftover plan work is waiting on the TUI approval card.
+    /// Whether proposed plan work still requires approval. The durable legacy
+    /// name covers drafts, revisions, and visible or parked approval cards.
     pub fn plan_approval_parked(&self) -> bool {
         self.plan_approval_parked
     }
 
-    /// Park or reopen the leftover-plan approval. This is a distinct durable
-    /// state from `/plan pause`, so either control can be changed without
-    /// accidentally consuming the other.
+    /// Set the pending approval gate independently from `/plan pause`. Opening
+    /// or reopening a card keeps this gate set until approval is accepted.
     pub fn set_plan_approval_parked(&mut self, parked: bool) {
+        let _ = self.try_set_plan_approval_parked(parked);
+    }
+
+    /// Persist an approval transition before publishing it to the live agent.
+    /// A failed approval write must never release autonomous execution.
+    pub fn try_set_plan_approval_parked(&mut self, parked: bool) -> Result<bool> {
         if self.plan_approval_parked == parked {
-            return;
+            return Ok(false);
+        }
+        if let Some(session) = self.session.as_mut() {
+            session.record_plan_approval_parked(parked)?;
         }
         self.plan_approval_parked = parked;
-        self.persist_plan_approval_parked();
+        Ok(true)
     }
 
     pub fn plan_drive_stall(&self) -> u32 {
@@ -689,12 +705,6 @@ impl crate::Agent {
         }
     }
 
-    fn persist_plan_approval_parked(&mut self) {
-        if let Some(session) = self.session.as_mut() {
-            let _ = session.record_plan_approval_parked(self.plan_approval_parked);
-        }
-    }
-
     fn persist_goal_drive(&mut self) {
         self.persist_goal_drive_evidence_delta(false, &[]);
     }
@@ -794,6 +804,16 @@ impl crate::Agent {
     /// Whether `/plan` mode is active (frontends should prefer read-only tools).
     pub fn plan_mode(&self) -> bool {
         self.plan_mode
+    }
+
+    /// Planning is an execution restriction even when a full/minimal catalog
+    /// or the permission ladder would otherwise allow workspace mutations.
+    pub(crate) fn effective_tool_mode(&self) -> hi_ai::ToolMode {
+        if self.plan_mode && self.config.routing.tool_mode != hi_ai::ToolMode::ChatOnly {
+            hi_ai::ToolMode::ReadOnly
+        } else {
+            self.config.routing.tool_mode
+        }
     }
 
     pub fn set_plan_mode(&mut self, on: bool) {

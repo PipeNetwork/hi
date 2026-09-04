@@ -1,14 +1,17 @@
 schema_version = 1
 name = "full-plan-creation-and-approval"
-tags = ["curated"]
+tags = ["curated", "pr"]
 timeout_ms = 45000
+
+[hi]
+args = ["--allow-unverified"]
 
 [[provider.steps]]
 id = "create-plan"
 [provider.steps.response]
 kind = "tool_call"
 name = "update_plan"
-arguments = { steps = [{ title = "Complete approved smoke plan", status = "pending" }] }
+arguments = { steps = [{ title = "Create approved-plan.txt with the approved contents", status = "pending" }] }
 
 [[provider.steps]]
 id = "plan-ready"
@@ -17,43 +20,52 @@ kind = "text"
 text = "The smoke plan is ready for approval."
 
 [[provider.steps]]
+id = "execute-approved-plan"
+[provider.steps.expect]
+body_contains = ["Create approved-plan.txt with the approved contents"]
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "approved-plan.txt", content = "approved execution complete\n" }
+
+[[provider.steps]]
 id = "complete-approved-plan"
+[provider.steps.expect]
+body_contains = ["approved-plan.txt"]
 [provider.steps.response]
 kind = "tool_call"
 name = "update_plan"
-arguments = { steps = [{ title = "Complete approved smoke plan", status = "done", completion_evidence = "The plan-creation and approval lifecycle was exercised; this scenario intentionally requires no workspace mutation." }] }
-
-[[provider.steps]]
-id = "approved-plan-answer"
-[provider.steps.response]
-kind = "text"
-text = "The approved smoke plan is complete."
-
-[[provider.steps]]
-id = "approved-plan-no-file-change-explanation"
-[provider.steps.expect]
-body_contains = ["no successful file changes"]
-[provider.steps.response]
-kind = "text"
-text = "No file changes are needed; this smoke case only verifies full plan creation, approval, and completion."
+arguments = { steps = [{ title = "Create approved-plan.txt with the approved contents", status = "done" }] }
 
 [[actions]]
 kind = "send_line"
-text = "/plan complete an approved smoke plan"
+text = "/plan create approved-plan.txt with the approved contents"
+
+# No mode toggle or extra input should be needed to see the approval card.
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "approval_shown", "/data/kind" = "plan" }
+timeout_ms = 10000
 
 [[actions]]
 kind = "wait_event"
 equals = { "/event" = "turn_settled", "/data/plan/mode" = true, "/data/plan/incomplete" = true }
-timeout_ms = 10000
-
-[[actions]]
-kind = "send_line"
-text = "/plan off"
-
-[[actions]]
-kind = "wait_event"
-equals = { "/event" = "approval_shown" }
 timeout_ms = 5000
+
+# Merely showing the card must not start implementation.
+[[actions]]
+kind = "wait_event_absent"
+equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
+duration_ms = 300
+
+[[actions]]
+kind = "wait_file"
+path = "approved-plan.txt"
+exists = false
+
+[[actions]]
+kind = "capture_screen"
+name = "automatic_plan_approval"
 
 [[actions]]
 kind = "send_key"
@@ -63,9 +75,19 @@ key = "tab"
 kind = "send_key"
 key = "enter"
 
+# Plan approval starts execution while normal per-file permissions still apply.
 [[actions]]
 kind = "wait_event"
-equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/plan/incomplete" = false }
+equals = { "/event" = "approval_shown", "/data/kind" = "file_edit" }
+timeout_ms = 10000
+
+[[actions]]
+kind = "send_key"
+key = "enter"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 1, "/data/plan/mode" = false, "/data/plan/incomplete" = false, "/data/next_drive/action" = "idle" }
 timeout_ms = 15000
 
 [[actions]]
@@ -80,8 +102,43 @@ exact = 1
 [[assertions]]
 kind = "records"
 source = "events"
-equals = { "/event" = "approval_decided", "/data/decision" = "approved" }
+equals = { "/event" = "approval_shown", "/data/kind" = "plan" }
 exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "approval_decided", "/data/kind" = "plan", "/data/decision" = "approved" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "write" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 4
+
+[[assertions]]
+kind = "records"
+source = "session"
+equals = { "/type" = "plan_cleared" }
+exact = 1
+
+[[assertions]]
+kind = "screen"
+snapshot = "automatic_plan_approval"
+contains = ["Plan approval", "Create approved-plan.txt", "Approve"]
+
+[[assertions]]
+kind = "file"
+path = "approved-plan.txt"
+exists = true
+equals = "approved execution complete\n"
 
 [[assertions]]
 kind = "provider_consumed"

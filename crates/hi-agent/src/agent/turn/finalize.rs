@@ -301,9 +301,10 @@ impl crate::Agent {
                 .tools
                 .iter()
                 .filter(|tool| {
-                    hi_tools::is_read_only(&tool.name)
+                    (hi_tools::is_read_only(&tool.name)
                         || tool.name == "run_program"
-                        || (tool.name == "explore" && !self.config.subagents.is_subagent)
+                        || (tool.name == "explore" && !self.config.subagents.is_subagent))
+                        && (!self.plan_mode || tool.name != "block_step")
                 })
                 .cloned()
                 .collect::<Vec<_>>()

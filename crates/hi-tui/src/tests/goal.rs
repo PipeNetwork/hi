@@ -184,7 +184,10 @@ async fn parked_plan_approval_restores_and_view_plan_unparks_once() {
         .await;
 
     assert!(app.plan_approval_capturing());
-    assert!(!agent.plan_approval_parked());
+    assert!(
+        agent.plan_approval_parked(),
+        "a visible card still requires approval after a restart"
+    );
     assert!(
         agent.plan_drive_paused(),
         "/view-plan must preserve /plan pause"
@@ -192,7 +195,10 @@ async fn parked_plan_approval_restores_and_view_plan_unparks_once() {
 
     app.handle_command(&mut agent, hi_agent::Command::ViewPlan)
         .await;
-    assert!(!agent.plan_approval_parked(), "a second view is a no-op");
+    assert!(
+        agent.plan_approval_parked(),
+        "a second view preserves the gate"
+    );
     assert!(agent.plan_drive_paused());
 }
 

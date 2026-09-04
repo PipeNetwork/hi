@@ -503,10 +503,17 @@ where
                                     continue;
                                 }
                                 Some(ChordPipeline::PlanApprove) => {
-                                    app.apply_plan_approve_local();
-                                    let _ = app.enqueue_prompt_front(
-                                        hi_agent::PLAN_DRIVE_PROMPT.to_string(),
-                                    );
+                                    if app.plan_approval_capturing() && app.plan_has_leftover() {
+                                        app.apply_plan_approve_local();
+                                        let prompt = if app.goal.as_ref().is_some_and(hi_agent::Goal::has_drive_work) {
+                                            hi_agent::GOAL_CONTINUE_PROMPT
+                                        } else {
+                                            hi_agent::PLAN_DRIVE_PROMPT
+                                        };
+                                        let _ = app.enqueue_prompt_front(
+                                            prompt.to_string(),
+                                        );
+                                    }
                                     continue;
                                 }
                                 Some(ChordPipeline::PlanPark) => {

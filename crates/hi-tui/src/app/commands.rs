@@ -1547,11 +1547,11 @@ impl crate::App {
                 && self.plan_approval.is_none()
             {
                 self.restore_parked_plan_approval();
-            } else if !self.plan_has_leftover()
-                && self.plan_approval.as_ref().is_some_and(|card| card.parked)
-            {
-                self.plan_approval = None;
             }
+        }
+        if !self.plan_has_leftover() && self.plan_approval.is_some() {
+            self.plan_approval = None;
+            self.session_face_dirty = true;
         }
     }
 
@@ -1939,8 +1939,9 @@ impl crate::App {
                     if self.unpark_plan_approval() {
                         self.push_session_face(agent);
                     }
-                } else if self.plan_has_leftover() && !self.plan_mode {
+                } else if self.plan_has_leftover() {
                     self.open_plan_approval();
+                    self.push_session_face(agent);
                 } else {
                     let queued: Vec<String> = self.queue.iter().cloned().collect();
                     if let Some(effect) =
@@ -1992,23 +1993,27 @@ impl crate::App {
                     }
                     self.refresh_goal(agent);
                     if let Command::Plan(arg) = &command {
-                        match arg.trim() {
-                            "off" | "exit" | "done" => self.maybe_open_plan_approval(),
-                            "resume" | "on" | "" => self.plan_approval = None,
-                            _ => {}
+                        self.session_face_dirty = true;
+                        if matches!(arg.trim(), "off" | "exit" | "done")
+                            && !self.unpark_plan_approval()
+                        {
+                            self.maybe_open_plan_approval();
                         }
                     }
                     if let Some(prompt) = effect.follow_up_prompt {
                         // Plan mode and /synth-evals hand back a prompt to run
                         // as the next turn. Put it first without displacing any
                         // work that was already queued.
-                        self.plan_approval = None;
+                        if self.plan_approval.take().is_some() {
+                            self.session_face_dirty = true;
+                        }
                         let _ = self.enqueue_prompt_front(prompt);
                         self.push(Line::styled(
                             "queued follow-up turn — it will run next".to_string(),
                             dim(),
                         ));
                     }
+                    self.push_session_face(agent);
                 }
             }
             Command::ScreenMode(arg) => {

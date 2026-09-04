@@ -22,16 +22,12 @@ text = "/plan persist the parked step"
 
 [[actions]]
 kind = "wait_event"
-equals = { "/event" = "turn_settled", "/data/plan/incomplete" = true }
+equals = { "/event" = "approval_shown", "/data/kind" = "plan" }
 timeout_ms = 10000
 
 [[actions]]
-kind = "send_line"
-text = "/plan off"
-
-[[actions]]
 kind = "wait_event"
-equals = { "/event" = "approval_shown" }
+equals = { "/event" = "turn_settled", "/data/plan/incomplete" = true }
 timeout_ms = 5000
 
 [[actions]]

@@ -23,7 +23,7 @@ pub(crate) struct GoalTurnState<'a> {
 
 impl crate::Agent {
     pub(crate) fn goal_continuation_context(&self, input: &str) -> Option<String> {
-        if input != crate::GOAL_CONTINUE_PROMPT {
+        if self.plan_mode || input != crate::GOAL_CONTINUE_PROMPT {
             return None;
         }
         let goal = self
@@ -65,7 +65,10 @@ impl crate::Agent {
             turn_ledger_revision,
             verification_infrastructure_error,
         } = state;
-        if !self.config.subagents.long_horizon {
+        // Drafting a plan is not an execution attempt. In particular, a capped
+        // planning turn must not consume the approved goal's retries or mark
+        // its active milestone barren/failed.
+        if self.plan_mode || !self.config.subagents.long_horizon {
             return false;
         }
         // Fold any block declared this turn into the baseline *before* anything
@@ -621,6 +624,12 @@ impl crate::Agent {
     /// turns) or to write a stub that skips the required check, which is worse
     /// because it looks like success.
     pub(crate) fn handle_block_step(&mut self, arguments: &str) -> hi_tools::ToolOutcome {
+        if self.plan_mode {
+            return decision_tool_outcome(
+                "Error: plan mode cannot change goal execution state; describe the prerequisite in the proposed plan for user approval".to_string(),
+                hi_tools::ToolStatus::Denied,
+            );
+        }
         #[derive(serde::Deserialize)]
         struct BlockArgs {
             prerequisite: String,

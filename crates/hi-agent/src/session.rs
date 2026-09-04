@@ -161,9 +161,10 @@ pub trait SessionSink: Send {
         self.record_plan_drive_state(paused, stall, reset_evidence, evidence_add)
     }
 
-    /// Persist whether the TUI plan-approval card was explicitly parked.
-    /// This is intentionally separate from `/plan pause`: reopening the card
-    /// consumes the approval park without resuming a paused drive.
+    /// Persist whether plan approval is pending, including drafts, revisions,
+    /// and visible or parked cards. The legacy name is retained for storage
+    /// compatibility. Reopening or revising keeps the gate set until a final
+    /// decision. This is independent from the pause controlled by `/plan pause`.
     fn record_plan_approval_parked(&mut self, _parked: bool) -> Result<()> {
         Ok(())
     }

@@ -579,7 +579,7 @@ impl crate::Agent {
                 // Use the session tool_mode, not the per-request mode: text-tool
                 // fallback sets request mode to ChatOnly so the provider won't emit
                 // structured calls, but promoted prose calls must still execute.
-                mode_blocks_tool(self.config.routing.tool_mode, name)
+                mode_blocks_tool(self.effective_tool_mode(), name)
             };
             if let Some(content) = blocked {
                 ui.tool_call_id(id, name, arguments);
@@ -2202,7 +2202,8 @@ impl crate::Agent {
                     // and review succeed. The anchor comes from the
                     // durable goal (stable across the turn), so repeated
                     // update_plan calls can't compound past one advance.
-                    if self.config.subagents.long_horizon
+                    if !self.plan_mode
+                        && self.config.subagents.long_horizon
                         && let Some(current_goal) = self.goals.structured.as_ref()
                     {
                         let turn_start_active = current_goal.active_index();
