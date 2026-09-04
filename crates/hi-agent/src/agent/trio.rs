@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
+use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent};
 
 use super::skeptic::SkepticVerdict;
 
@@ -63,6 +63,7 @@ impl crate::Agent {
             // No planner — use the prompt as the plan (single-step).
             return Ok(prompt.to_string());
         };
+        let request_policy = self.seal_chat_only_auxiliary_request(&model, 1024).await;
         let request = ChatRequest {
             model,
             request_id: None,
@@ -73,8 +74,9 @@ impl crate::Agent {
                 Message::system(TRIO_PLANNER_PROMPT),
                 Message::user(crate::goal::clip_chars(prompt, MAX_TRIO_SIDE_CHARS)),
             ]),
-            tools: Arc::new([]),
-            max_tokens: 1024,
+            tools: request_policy.tools,
+            tool_envelope: Some(request_policy.envelope),
+            max_tokens: request_policy.max_tokens,
             temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -82,7 +84,7 @@ impl crate::Agent {
             reasoning_effort: None,
             profile: RequestProfile {
                 compat: self.config.routing.compat,
-                tool_mode: ToolMode::ChatOnly,
+                tool_mode: request_policy.tool_mode,
                 stream_usage: None,
                 deepseek_compat: self.config.routing.deepseek_compat,
                 deepseek_strict: None,
@@ -145,6 +147,8 @@ impl crate::Agent {
         };
         let context = trio_review_context(prompt, plan, &diff);
 
+        let request_policy = self.seal_chat_only_auxiliary_request(&model, 1024).await;
+
         let request = ChatRequest {
             model,
             request_id: None,
@@ -158,8 +162,9 @@ impl crate::Agent {
                 )),
                 Message::user(context),
             ]),
-            tools: Arc::new([]),
-            max_tokens: 1024,
+            tools: request_policy.tools,
+            tool_envelope: Some(request_policy.envelope),
+            max_tokens: request_policy.max_tokens,
             temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -167,7 +172,7 @@ impl crate::Agent {
             reasoning_effort: None,
             profile: RequestProfile {
                 compat: self.config.routing.compat,
-                tool_mode: ToolMode::ChatOnly,
+                tool_mode: request_policy.tool_mode,
                 stream_usage: None,
                 deepseek_compat: self.config.routing.deepseek_compat,
                 deepseek_strict: None,

@@ -9,6 +9,9 @@ use anyhow::{Context, Result, ensure};
 use crate::LspMode;
 use crate::change_ledger::ChangeLedger;
 
+mod hooks;
+use hooks::discover_hooks;
+
 const RECONCILE_RUNNING: u8 = 0;
 const RECONCILE_COMMITTING: u8 = 1;
 const RECONCILE_CANCELLED: u8 = 2;
@@ -198,10 +201,7 @@ impl WorkspaceRuntime {
         Self::new_with_scan_and_sandbox(root, state_root, lsp_mode, scan, None)
     }
 
-    /// Like [`Self::new_with_scan`] with an optional caller-owned sandbox
-    /// policy. `None` preserves the normal `HI_SANDBOX` resolution used by
-    /// standalone callers; an explicit policy avoids process-global
-    /// environment reads for embedded agents and fixtures.
+    /// Like [`Self::new_with_scan`]; `None` preserves normal `HI_SANDBOX` resolution.
     pub fn new_with_scan_and_sandbox(
         root: impl AsRef<Path>,
         state_root: impl AsRef<Path>,
@@ -219,16 +219,35 @@ impl WorkspaceRuntime {
         )
     }
 
-    /// Construct a runtime while optionally suppressing all repository-provided
-    /// executable configuration. Portable workspaces restore untrusted bytes
-    /// from another machine, so their `.hi/hooks` must not be admitted (or even
-    /// trigger an stdin trust prompt) during a live root switch.
+    /// Construct while optionally suppressing repository executable hooks.
+    /// Portable workspaces restore untrusted bytes from another machine.
     pub fn new_with_scan_sandbox_and_project_hooks(
         root: impl AsRef<Path>,
         state_root: impl AsRef<Path>,
         lsp_mode: LspMode,
         scan: Option<crate::change_ledger::BackgroundScan>,
         sandbox_policy: Option<hi_tools::sandbox::SandboxPolicy>,
+        allow_project_hooks: bool,
+    ) -> Result<Self> {
+        Self::new_with_scan_sandbox_config_and_project_hooks(
+            root,
+            state_root,
+            lsp_mode,
+            scan,
+            sandbox_policy,
+            None,
+            allow_project_hooks,
+        )
+    }
+
+    /// Construct with an explicit hermetic sandbox configuration.
+    pub fn new_with_scan_sandbox_config_and_project_hooks(
+        root: impl AsRef<Path>,
+        state_root: impl AsRef<Path>,
+        lsp_mode: LspMode,
+        scan: Option<crate::change_ledger::BackgroundScan>,
+        sandbox_policy: Option<hi_tools::sandbox::SandboxPolicy>,
+        sandbox_config: Option<hi_tools::sandbox::SandboxConfig>,
         allow_project_hooks: bool,
     ) -> Result<Self> {
         let root = root.as_ref().canonicalize().with_context(|| {
@@ -255,9 +274,12 @@ impl WorkspaceRuntime {
         );
         hi_tools::recover_workspace_transactions(&root, &state_root)
             .context("recovering interrupted workspace transactions")?;
-        let process_runner = match sandbox_policy {
-            Some(policy) => hi_tools::ProcessRunner::new_with_policy(&root, policy)?,
-            None => hi_tools::ProcessRunner::new(&root)?,
+        let process_runner = match (sandbox_policy, sandbox_config) {
+            (Some(policy), Some(config)) => {
+                hi_tools::ProcessRunner::new_with_policy_and_config(&root, policy, config)?
+            }
+            (Some(policy), None) => hi_tools::ProcessRunner::new_with_policy(&root, policy)?,
+            (None, _) => hi_tools::ProcessRunner::new(&root)?,
         };
         // In production, use a background scan (either a pre-started one passed
         // in by the caller, or one launched here). In tests, scan synchronously
@@ -275,6 +297,8 @@ impl WorkspaceRuntime {
             });
         }
         let hooks = discover_hooks(&root, allow_project_hooks);
+        let mut read_cache = hi_tools::ReadCache::new();
+        read_cache.set_resource_state_root(state_root.clone());
         Ok(Self {
             root: root.clone(),
             state_root,
@@ -286,7 +310,7 @@ impl WorkspaceRuntime {
                 LspMode::On
             )),
             background: Arc::new(hi_tools::BackgroundRegistry::default()),
-            read_cache: Arc::new(Mutex::new(hi_tools::ReadCache::new())),
+            read_cache: Arc::new(Mutex::new(read_cache)),
             repo_map: Arc::new(Mutex::new(hi_tools::RepoMapCache::new())),
             ledger: Arc::new(Mutex::new(ledger)),
             context_generation: std::sync::atomic::AtomicU64::new(0),
@@ -555,31 +579,6 @@ fn new_ledger(
     {
         ChangeLedger::new_with_state(root, Some(state_root))
     }
-}
-
-/// Load global hooks and, when explicitly permitted, the local hook directory
-/// only after folder trust has been resolved for this machine.  Keeping this in
-/// one helper makes the initial and deferred runtime paths use identical trust
-/// rules.
-fn discover_hooks(root: &Path, allow_project_hooks: bool) -> Option<Arc<hi_hooks::HookRegistry>> {
-    let home = std::env::var("HOME")
-        .ok()
-        .map(|h| std::path::Path::new(&h).join(".hi/hooks"));
-    let project_hooks = root.join(".hi/hooks");
-    let project_hooks_dir = if allow_project_hooks {
-        match hi_tools::folder_trust::resolve_trust(root) {
-            hi_tools::folder_trust::TrustOutcome::Trusted => Some(project_hooks.as_path()),
-            hi_tools::folder_trust::TrustOutcome::Untrusted
-            | hi_tools::folder_trust::TrustOutcome::Prompt => None,
-        }
-    } else {
-        None
-    };
-    let (hooks, hook_errors) = hi_hooks::discover_hooks(home.as_deref(), project_hooks_dir);
-    for err in &hook_errors {
-        eprintln!("hook load warning: {err}");
-    }
-    (!hooks.is_empty()).then(|| Arc::new(hooks))
 }
 
 fn lock_ledger_cancellable<'a>(

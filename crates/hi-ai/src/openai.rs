@@ -146,10 +146,7 @@ impl OpenAiProvider {
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            native_tool_calls: true,
-            streamed_tool_call_deltas: true,
-        }
+        ProviderCapabilities::native_tools(true)
     }
 
     async fn stream(
@@ -705,6 +702,14 @@ fn wire_audit(
         accepted,
         request_body: Some(body.clone()),
         response_status,
+        tool_envelope_digest: request
+            .tool_envelope
+            .as_ref()
+            .map(|envelope| envelope.digest.clone()),
+        tool_envelope: request
+            .tool_envelope
+            .as_ref()
+            .map(|envelope| envelope.payload.clone()),
     }
 }
 
@@ -1924,6 +1929,7 @@ mod tests {
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
             tools: tools.into(),
+            tool_envelope: None,
             max_tokens: 16,
             temperature: None,
             top_p: None,

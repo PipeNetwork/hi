@@ -11,6 +11,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::request_envelope::RequestToolEnvelope;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolMode {
@@ -450,6 +452,8 @@ pub struct ChatRequest {
     /// cheaply (ref-count bump) instead of copying every message on every round.
     pub messages: Arc<Vec<Message>>,
     pub tools: Arc<[ToolSpec]>,
+    /// Exact post-selection tool/capability envelope governing this request.
+    pub tool_envelope: Option<Arc<RequestToolEnvelope>>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
     /// Nucleus-sampling cutoff. Mainly used by recovery sampling (bumped on a
@@ -785,6 +789,10 @@ pub struct WireAudit {
     pub request_body: Option<Value>,
     #[serde(default)]
     pub response_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_envelope_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_envelope: Option<Value>,
 }
 
 impl Completion {

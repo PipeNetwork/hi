@@ -3,10 +3,15 @@
 //! the orchestration entry points stay in `lib.rs`.
 
 pub(crate) mod audit_goal;
+mod background_candidate;
+mod background_candidate_verification;
 mod background_task;
+mod child_process_teardown;
 mod coding_memory_turn;
+mod compaction_job;
 mod compaction_turn;
 mod curate_turn;
+mod delegate_binding;
 pub(crate) mod delegate_turn;
 mod explore_turn;
 mod goal_turn;
@@ -15,10 +20,14 @@ mod memory_turn;
 mod mutation_recovery_turn;
 pub(crate) mod plan_goal;
 mod preflight;
+mod process_coordination;
+mod provider_capability_runtime;
 pub mod skeptic;
 mod tool_selection;
 pub(crate) mod trio;
 pub(crate) mod turn;
+
+pub(crate) use compaction_turn::ContextWindowLimits;
 
 // Only referenced from tests; the handlers use the consts directly in-module.
 #[cfg(test)]

@@ -27,6 +27,8 @@ impl Provider for HangAfterTwoCalls {
             _ => std::future::pending().await,
         }
     }
+
+    native_tool_test_provider!();
 }
 
 #[tokio::test]

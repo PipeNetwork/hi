@@ -68,34 +68,31 @@ pub fn decide(feature_enabled: bool, i: &DecideInputs) -> TrustOutcome {
     TrustOutcome::Untrusted
 }
 
-/// Whether the folder-trust system is inert for this binary.
-///
-/// Local/dev builds (no `HI_VERSION` release stamp) auto-trust everything.
-/// Folder-trust applies only to shipped, release-stamped binaries.
+/// Whether the operator explicitly disabled folder trust. Build stamping is
+/// deliberately irrelevant: self-built binaries enforce the same policy.
 pub fn folder_trust_inert() -> bool {
-    is_local_build()
+    !feature_enabled()
 }
 
-/// Whether this is a local/dev build (no release version stamp).
-fn is_local_build() -> bool {
-    option_env!("HI_VERSION").is_none()
-}
-
-/// Resolve whether the folder-trust gate is enabled.
-///
-/// On a local/dev build the feature is OFF regardless of env — a self-built hi
-/// auto-trusts. On a release build, `HI_FOLDER_TRUST` env var controls it
-/// (default: on).
+/// Resolve the every-build gate; `HI_FOLDER_TRUST=off` is an audited override.
 pub fn feature_enabled() -> bool {
-    if is_local_build() {
-        return false;
-    }
-    match std::env::var("HI_FOLDER_TRUST") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
+    feature_enabled_for_value(std::env::var("HI_FOLDER_TRUST").ok().as_deref())
+}
+
+fn feature_enabled_for_value(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
             "off" | "0" | "false" | "no" | ""
-        ),
-        Err(_) => true,
+        )
+    })
+}
+
+pub fn policy_description() -> &'static str {
+    if feature_enabled() {
+        "enforced"
+    } else {
+        "DISABLED by explicit HI_FOLDER_TRUST override"
     }
 }
 
@@ -672,6 +669,9 @@ pub fn resolve_trust(cwd: &Path) -> TrustOutcome {
         other => other,
     }
 }
+
+#[cfg(test)]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {

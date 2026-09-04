@@ -292,6 +292,9 @@ async fn run_one_api_case(
         canonical_objective: Some(prompt.to_string()),
         messages: Arc::new(vec![Message::user(prompt)]),
         tools: Arc::from(Vec::<hi_ai::ToolSpec>::new()),
+        // This value is an unsent fan-out template. `run_provider_targets`
+        // seals a fresh envelope after substituting each target's exact model.
+        tool_envelope: None,
         max_tokens,
         temperature: Some(0.0),
         top_p: None,

@@ -63,15 +63,18 @@ impl crate::Agent {
         messages.push(Message::user(FINALIZE_PROMPT));
         repair_invalid_tool_call_arguments_in_messages(&mut messages);
 
+        let model = self.config.routing.model.clone();
+        let request_policy = self.seal_chat_only_auxiliary_request(&model, 2048).await;
         let request = ChatRequest {
-            model: self.config.routing.model.clone(),
+            model,
             request_id: None,
             retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: Arc::from(messages),
-            tools: Arc::new([]), // recap only — no tool use
-            max_tokens: 2048,    // throwaway call — recaps can be detailed
+            tools: request_policy.tools,
+            tool_envelope: Some(request_policy.envelope),
+            max_tokens: request_policy.max_tokens,
             temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -79,7 +82,7 @@ impl crate::Agent {
             reasoning_effort: None,
             profile: RequestProfile {
                 compat: self.config.routing.compat,
-                tool_mode: ToolMode::ChatOnly,
+                tool_mode: request_policy.tool_mode,
                 stream_usage: None,
                 deepseek_compat: self.config.routing.deepseek_compat,
                 deepseek_strict: None,

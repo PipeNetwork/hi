@@ -243,13 +243,10 @@ pub(super) async fn run_bash_tool_with_auto_background(
                 return Ok(outcome);
             }
         };
-        let id = resources.background.spawn_tracked(
-            runner,
-            &args.command,
-            root,
-            state_root,
-            baseline,
-        )?;
+        let id = resources
+            .background
+            .spawn_tracked(runner, &args.command, root, state_root, baseline)
+            .await?;
         if let Ok(mut cache) = resources.read_cache.lock() {
             cache.clear();
         }
@@ -294,14 +291,19 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop."
             {
                 Ok(crate::AdoptableOutcome::Completed(execution)) => Ok(execution),
                 Ok(crate::AdoptableOutcome::StillRunning(running)) => {
-                    let id = resources.background.adopt_read_only(
-                        &args.command,
-                        running.child,
-                        running.stdout,
-                        running.stderr,
-                        running.pgid,
-                        running.partial_output,
-                    )?;
+                    let foreground_registration = running.foreground_registration;
+                    let id = resources
+                        .background
+                        .adopt_read_only(
+                            &args.command,
+                            running.child,
+                            running.stdout,
+                            running.stderr,
+                            running.pgid,
+                            running.partial_output,
+                        )
+                        .await?;
+                    drop(foreground_registration);
                     let title = crate::background::shell_title(&args.command);
                     let mut outcome = background_tool_outcome(
                         format!(
@@ -370,15 +372,20 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
                 return Ok(outcome);
             }
             Ok(crate::AdoptableOutcome::StillRunning(running)) => {
-                let id = resources.background.adopt(
-                    &args.command,
-                    running.child,
-                    running.stdout,
-                    running.stderr,
-                    running.pgid,
-                    running.partial_output,
-                    (root.to_path_buf(), state_root.to_path_buf(), before),
-                )?;
+                let foreground_registration = running.foreground_registration;
+                let id = resources
+                    .background
+                    .adopt(
+                        &args.command,
+                        running.child,
+                        running.stdout,
+                        running.stderr,
+                        running.pgid,
+                        running.partial_output,
+                        (root.to_path_buf(), state_root.to_path_buf(), before),
+                    )
+                    .await?;
+                drop(foreground_registration);
                 let title = crate::background::shell_title(&args.command);
                 let mut outcome = background_tool_outcome(
                     format!(
@@ -430,119 +437,7 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
 /// scripts, and ambiguous subcommands; a false negative costs a snapshot,
 /// while a false positive would weaken effect attribution.
 fn definitely_read_only_shell(command: &str) -> bool {
-    let trimmed = command.trim();
-    if trimmed.is_empty()
-        || trimmed
-            .chars()
-            .any(|ch| matches!(ch, ';' | '\n' | '\r' | '|' | '&' | '>' | '<' | '$' | '`'))
-    {
-        return false;
-    }
-
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
-    let Some(mut command_index) = words
-        .iter()
-        .position(|word| !is_env_assignment(word) && *word != "env")
-    else {
-        return false;
-    };
-    let program = basename(words[command_index]);
-
-    if matches!(program, "find")
-        && words.iter().any(|word| {
-            matches!(
-                *word,
-                "-delete"
-                    | "-exec"
-                    | "-execdir"
-                    | "-ok"
-                    | "-okdir"
-                    | "-fprint"
-                    | "-fprintf"
-                    | "-fls"
-            )
-        })
-    {
-        return false;
-    }
-    if matches!(program, "sed")
-        && words
-            .iter()
-            .any(|word| *word == "-i" || *word == "--in-place" || word.starts_with("-i"))
-    {
-        return false;
-    }
-    if matches!(program, "sort")
-        && words
-            .iter()
-            .any(|word| *word == "-o" || *word == "--output" || word.starts_with("--output="))
-    {
-        return false;
-    }
-
-    if program != "git" {
-        return matches!(
-            program,
-            "cat"
-                | "cut"
-                | "date"
-                | "du"
-                | "echo"
-                | "false"
-                | "file"
-                | "grep"
-                | "head"
-                | "ls"
-                | "nl"
-                | "pwd"
-                | "printf"
-                | "rg"
-                | "sort"
-                | "stat"
-                | "tail"
-                | "tr"
-                | "true"
-                | "uniq"
-                | "wc"
-                | "which"
-        );
-    }
-
-    // `git` has global options before its subcommand. Only the unambiguously
-    // read-only subcommands are admitted, and file-output flags are rejected.
-    if words.iter().any(|word| {
-        *word == "-o" || *word == "--output" || word.starts_with("--output=") || *word == "-O"
-    }) {
-        return false;
-    }
-    command_index += 1;
-    while command_index < words.len() {
-        let word = words[command_index];
-        if word == "-C" || word == "--git-dir" || word == "--work-tree" {
-            command_index = command_index.saturating_add(2);
-            continue;
-        }
-        if word.starts_with('-') {
-            command_index += 1;
-            continue;
-        }
-        return matches!(
-            word,
-            "blame"
-                | "describe"
-                | "diff"
-                | "grep"
-                | "help"
-                | "log"
-                | "ls-files"
-                | "rev-parse"
-                | "show"
-                | "status"
-                | "version"
-        );
-    }
-    // Bare `git` prints help and is safe.
-    true
+    crate::shell_policy::classify_shell_command(command).is_proven_read_only()
 }
 
 #[cfg(test)]
@@ -1007,13 +902,7 @@ mod tests {
 
     #[test]
     fn read_only_shell_allowlist_is_conservative() {
-        for command in [
-            "rg TODO src",
-            "git status --short",
-            "git -C /tmp/repo diff",
-            "head -20 README.md",
-            "printf 'done\\n'",
-        ] {
+        for command in ["rg TODO src", "head -20 README.md", "printf 'done\\n'"] {
             assert!(definitely_read_only_shell(command), "{command:?}");
         }
         for command in [
@@ -1021,7 +910,14 @@ mod tests {
             "sed -i s/old/new/ src/lib.rs",
             "find . -exec rm {} \\;",
             "sort -o sorted.txt input.txt",
+            // Even observational Git commands can refresh the index, invoke
+            // fsmonitor/textconv/external-diff helpers, or start a pager. Keep
+            // them on the live-writer reconciliation path unless a future
+            // broker can prove the complete invocation hermetic.
+            "git status --short",
+            "git -C nested/repo diff",
             "git diff --output=patch.txt",
+            "git -C /tmp/repo diff",
             "./scripts/check.sh",
             "cargo test",
         ] {

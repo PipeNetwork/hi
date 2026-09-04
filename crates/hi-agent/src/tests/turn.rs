@@ -985,7 +985,6 @@ async fn useful_distinct_bash_commands_are_not_no_progress_bounded() {
     ];
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
-
     agent
         .run_turn("run two harmless shell checks", &mut ui)
         .await
@@ -1017,8 +1016,9 @@ impl hi_ai::Provider for RecordScriptedModes {
         self.modes.lock().unwrap().push(request.profile.tool_mode);
         hi_ai::Provider::stream(&self.scripted, request, sink).await
     }
-}
 
+    native_tool_test_provider!();
+}
 #[allow(clippy::type_complexity)]
 fn scripted_agent_recording_tool_modes(
     steps: Vec<ProviderStep>,
@@ -1597,9 +1597,12 @@ async fn workspace_mcp_admin_is_wrapped_in_the_durability_fence() {
 }
 
 #[test]
-fn remote_rsi_cannot_be_enabled_after_pipefs_durability_is_installed() {
+fn remote_rsi_cannot_be_enabled_after_pipefs_controller_is_installed() {
     let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut subject = agent(Vec::new(), config());
+    subject
+        .activate_pipefs_workspace_controller("rsi-pipefs-test", 1, false)
+        .unwrap();
     subject.set_workspace_durability(Some(std::sync::Arc::new(RecordingAdminDurability(events))));
 
     let error = subject.set_rsi_enabled(true).unwrap_err();
@@ -5771,10 +5774,7 @@ impl hi_ai::Provider for NativeProgramProvider {
     }
 
     fn capabilities(&self) -> hi_ai::ProviderCapabilities {
-        hi_ai::ProviderCapabilities {
-            native_tool_calls: true,
-            streamed_tool_call_deltas: false,
-        }
+        hi_ai::ProviderCapabilities::native_tools(false)
     }
 }
 

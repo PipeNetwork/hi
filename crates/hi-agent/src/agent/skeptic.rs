@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use crate::domain::VerifyEvidence;
 
-use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
+use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent};
 
 /// How much of the turn diff to show the **goal** skeptic, counted in **Unicode
 /// chars** (not bytes). Intentionally smaller than completion-review's
@@ -339,6 +339,7 @@ impl crate::Agent {
         system_prompt: &str,
         model: String,
     ) -> SkepticVerdict {
+        let request_policy = self.seal_chat_only_auxiliary_request(&model, 1024).await;
         let request = ChatRequest {
             model,
             request_id: None,
@@ -346,8 +347,9 @@ impl crate::Agent {
             user_turn: false,
             canonical_objective: None,
             messages: Arc::new(vec![Message::system(system_prompt), Message::user(context)]),
-            tools: Arc::new([]), // review only — no tool use
-            max_tokens: 1024,
+            tools: request_policy.tools,
+            tool_envelope: Some(request_policy.envelope),
+            max_tokens: request_policy.max_tokens,
             // Deterministic structured verdict — do not inherit the coding turn's
             // sampling (higher temp makes first-line APPROVE/OBJECT less reliable
             // on non-GLM hosts such as xAI).
@@ -358,7 +360,7 @@ impl crate::Agent {
             reasoning_effort: None,
             profile: RequestProfile {
                 compat: self.config.routing.compat,
-                tool_mode: ToolMode::ChatOnly,
+                tool_mode: request_policy.tool_mode,
                 stream_usage: None,
                 deepseek_compat: self.config.routing.deepseek_compat,
                 deepseek_strict: None,

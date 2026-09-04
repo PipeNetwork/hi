@@ -271,6 +271,14 @@ impl Provider for McpDiscoveryProvider {
         self.inner.capabilities()
     }
 
+    fn capability_candidates(
+        &self,
+        route: &str,
+        model: &str,
+    ) -> Vec<crate::ProviderCapabilityCandidate> {
+        self.inner.capability_candidates(route, model)
+    }
+
     async fn stream(
         &self,
         request: ChatRequest,

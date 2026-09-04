@@ -1,6 +1,6 @@
 //! Interactive best-of-N execution.
 //!
-//! Every candidate runs in an isolated worktree and must emit a successful
+//! Every candidate runs in an isolated private repository and must emit a successful
 //! typed report, produce a non-empty exact diff, and pass an independent
 //! parent-side verifier without changing that diff. The selected candidate is
 //! applied transactionally and reverified in the destination. All candidate
@@ -21,7 +21,7 @@ use crate::candidate_gate::{
     independently_verify_candidate, inspect_child_report, repository_root, same_paths,
     staged_candidate_diff,
 };
-use crate::candidate_merge::{MergeTimings, apply_candidate_and_reverify};
+use crate::candidate_merge::{MergeTimings, apply_candidate_and_reverify_cancellable_at_base};
 
 const MAX_VERIFY_CONCURRENCY: usize = 8;
 
@@ -99,6 +99,7 @@ struct CandidateExecution {
     model_queue_ms: u128,
     wall_clock_ms: u128,
     base_revision: String,
+    source_snapshot_id: String,
     target_name: String,
     target_priority: u32,
 }
@@ -250,16 +251,10 @@ pub fn run(opts: &BestOf) -> Result<bool> {
     let repository = repository_root(&workspace_root)?
         .canonicalize()
         .context("canonicalizing best-of repository root")?;
-    let workspace_relative = workspace_root
-        .strip_prefix(&repository)
-        .context("best-of workspace is outside its repository root")?
-        .to_path_buf();
     if !hi_tools::worktree::in_git_repo(&workspace_root) {
-        bail!("--best-of requires a git repository (candidates run in worktrees)");
+        bail!("--best-of requires a git repository (candidates run in detached repositories)");
     }
     let base_revision = resolve_revision(&repository, "HEAD")?;
-    let workspace_snapshot = hi_race::capture_workspace_snapshot(&workspace_root)
-        .context("capturing the race workspace snapshot")?;
     if working_tree_dirty(&workspace_root) {
         eprintln!(
             "\x1b[2mrace snapshot: preserving uncommitted changes for every candidate\x1b[0m"
@@ -275,12 +270,15 @@ pub fn run(opts: &BestOf) -> Result<bool> {
     let worktrees = std::thread::scope(|scope| {
         (0..opts.candidates)
             .map(|index| {
-                let repository = &repository;
-                let base_revision = &base_revision;
+                let workspace_root = &workspace_root;
                 let state_root = &state_root;
-                let workspace_relative = &workspace_relative;
-                let snapshot = &workspace_snapshot;
-                scope.spawn(move || -> Result<(u32, PathBuf, f32, String)> {
+                scope.spawn(move || -> Result<(
+                    u32,
+                    hi_tools::candidate_workspace::CandidateWorkspace,
+                    crate::child_process::CandidateChildPaths,
+                    f32,
+                    String,
+                )> {
                     let _setup_lease = crate::resource_governor::acquire_while_optional(
                         state_root,
                         crate::resource_governor::ResourceClass::Setup,
@@ -288,13 +286,16 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                         &|| false,
                     )?;
                     let temperature = temperature_for(index, opts.candidates);
-                    let worktree = hi_tools::worktree::worktree_path("bestof", index);
-                    hi_tools::worktree::add_worktree(repository, &worktree, base_revision)?;
-                    let candidate_root = worktree.join(workspace_relative);
-                    snapshot.materialize_into(&candidate_root)?;
-                    let candidate_base =
-                        materialize_snapshot_base(&worktree, base_revision, snapshot)?;
-                    Ok((index, worktree, temperature, candidate_base))
+                    let owner = hi_tools::worktree::worktree_path("bestof", index);
+                    let candidate = prepare_detached_candidate(
+                        workspace_root,
+                        state_root,
+                        &owner,
+                    )?;
+                    let child_paths =
+                        crate::child_process::CandidateChildPaths::prepare(&candidate)?;
+                    let candidate_base = candidate.baseline_commit().to_string();
+                    Ok((index, candidate, child_paths, temperature, candidate_base))
                 })
             })
             .collect::<Vec<_>>()
@@ -303,18 +304,29 @@ pub fn run(opts: &BestOf) -> Result<bool> {
             .collect::<Result<Vec<_>>>()
     });
     let mut worktrees = worktrees?;
-    worktrees.sort_by_key(|(index, _, _, _)| *index);
+    worktrees.sort_by_key(|(index, _, _, _, _)| *index);
+    let source_snapshot_id = worktrees
+        .first()
+        .map(|(_, candidate, _, _, _)| candidate.source_snapshot_id().to_string())
+        .context("best-of candidate setup produced no candidates")?;
+    ensure!(
+        worktrees
+            .iter()
+            .all(|(_, candidate, _, _, _)| candidate.source_snapshot_id()
+                == source_snapshot_id.as_str()),
+        "workspace changed during parallel best-of preparation; candidates were discarded"
+    );
+    for (_, candidate, _, _, _) in &worktrees {
+        candidate.ensure_source_unchanged().context(
+            "workspace changed during parallel best-of preparation; candidates were discarded",
+        )?;
+    }
     let setup_wall_clock_ms = setup_started.elapsed().as_millis();
 
     println!(
         "\x1b[36m── running {} candidates in parallel ──────────────────\x1b[0m",
         opts.candidates
     );
-    let cleanup_paths = worktrees
-        .iter()
-        .map(|(_, worktree, _, _)| worktree.clone())
-        .collect::<Vec<_>>();
-
     let (research_id, snippet_block) = shared_research_corpus(opts);
     let child_prompt = if snippet_block.is_empty() {
         opts.prompt.to_string()
@@ -324,11 +336,14 @@ pub fn run(opts: &BestOf) -> Result<bool> {
 
     let (completion_tx, completion_rx) = std::sync::mpsc::channel();
     let candidate_slots = CandidateSlots::new(opts.max_concurrency);
+    let source_workspace_root = workspace_root.clone();
     let handles = worktrees
         .iter()
-        .map(|(index, worktree, temperature, candidate_base)| {
+        .map(|(index, worktree, child_paths, temperature, candidate_base)| {
             let index = *index;
-            let worktree = worktree.join(&workspace_relative);
+            let source_snapshot_id = worktree.source_snapshot_id().to_string();
+            let worktree = worktree.root().to_path_buf();
+            let child_paths = child_paths.clone();
             let temperature = *temperature;
             let candidate_base = candidate_base.clone();
             let exe = opts.exe.to_path_buf();
@@ -372,6 +387,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
             let log_path = art_dir.join(format!("candidate-{index}.log"));
             let completion_tx = completion_tx.clone();
             let candidate_slots = Arc::clone(&candidate_slots);
+            let source_workspace_root = source_workspace_root.clone();
             (
                 index,
                 worktree.clone(),
@@ -417,10 +433,11 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                             let mut result = run_candidate(
                                 &thread_opts,
                                 index,
-                                &worktree,
                                 temperature,
                                 &report_path,
                                 &log_path,
+                                &source_workspace_root,
+                                &child_paths,
                             );
                             drop(lease);
                             result.model_queue_ms = model_queue_ms;
@@ -442,6 +459,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                     // failed candidate auditable and keeps ranking/reporting
                     // independent of which failure happened first.
                     result.base_revision = candidate_base;
+                    result.source_snapshot_id = source_snapshot_id;
                     result.target_name = target_name;
                     result.target_priority = target_priority;
                     println!(
@@ -474,6 +492,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                 model_queue_ms: 0,
                 wall_clock_ms: 0,
                 base_revision: base_revision.clone(),
+                source_snapshot_id: source_snapshot_id.clone(),
                 target_name: format!("candidate-{index}"),
                 target_priority: index,
             });
@@ -697,12 +716,14 @@ pub fn run(opts: &BestOf) -> Result<bool> {
             } else {
                 opts.verify
             };
-            match apply_candidate_and_reverify(
+            match apply_candidate_and_reverify_cancellable_at_base(
                 &execution.worktree,
                 &execution.base_revision,
                 &workspace_root,
                 &state_root,
                 apply_verify,
+                Some(&execution.source_snapshot_id),
+                None,
             ) {
                 Ok(changes) => {
                     selected_candidate = Some(execution.index);
@@ -788,7 +809,10 @@ pub fn run(opts: &BestOf) -> Result<bool> {
         Ok(())
     });
 
-    hi_tools::worktree::cleanup(&repository, &cleanup_paths);
+    // CandidateWorkspace owns each private repository and removes it here.
+    // No cleanup operation ever touches the authoritative repository's
+    // worktree registry or other `.git` bytes.
+    drop(worktrees);
     print_candidate_summary(&art_dir, &aggregates);
     report_result?;
 
@@ -817,52 +841,33 @@ pub(crate) fn resolve_revision(root: &Path, revision: &str) -> Result<String> {
     Ok(revision.to_string())
 }
 
-pub(crate) fn materialize_snapshot_base(
-    worktree: &Path,
-    base_revision: &str,
-    snapshot: &hi_race::WorkspaceSnapshot,
-) -> Result<String> {
-    if snapshot.tracked_patch.is_empty() && snapshot.untracked_files.is_empty() {
-        return Ok(base_revision.to_string());
-    }
-    let output = Command::new("git")
-        .current_dir(worktree)
-        .args(["add", "-A", "--", "."])
-        .output()
-        .context("staging the race workspace snapshot")?;
-    ensure!(
-        output.status.success(),
-        "could not stage the race workspace snapshot: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let output = Command::new("git")
-        .current_dir(worktree)
-        .args(["-c", "user.name=hi race", "-c", "user.email=hi@localhost"])
-        .args(["commit", "--no-verify", "-m", "hi race workspace snapshot"])
-        .output()
-        .context("committing the race workspace snapshot")?;
-    ensure!(
-        output.status.success(),
-        "could not commit the race workspace snapshot: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    resolve_revision(worktree, "HEAD")
+pub(crate) fn prepare_detached_candidate(
+    workspace_root: &Path,
+    state_root: &Path,
+    owner: &Path,
+) -> Result<hi_tools::candidate_workspace::CandidateWorkspace> {
+    hi_tools::candidate_workspace::CandidateWorkspace::create(workspace_root, state_root, owner)
+        .context("creating exact detached race candidate")
 }
 
 fn run_candidate(
     opts: &BestOf,
     index: u32,
-    worktree: &Path,
     temperature: f32,
     report_path: &Path,
     log_path: &Path,
+    source_workspace_root: &Path,
+    child_paths: &crate::child_process::CandidateChildPaths,
 ) -> CandidateExecution {
+    let worktree = child_paths.workspace_root();
     let started = Instant::now();
     let _ = std::fs::remove_file(report_path);
     let _ = std::fs::remove_file(log_path);
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    let child_report_path = child_paths.report();
+    let _ = std::fs::remove_file(&child_report_path);
 
     let mut arguments = vec![
         OsString::from("--subagent"),
@@ -876,7 +881,7 @@ fn run_candidate(
         OsString::from("--temperature"),
         OsString::from(temperature.to_string()),
         OsString::from("--report"),
-        report_path.as_os_str().to_os_string(),
+        child_report_path.as_os_str().to_os_string(),
     ];
     if opts.max_verify != hi_agent::UNLIMITED_REPAIR_CYCLES {
         arguments.push(OsString::from("--max-verify-repairs"));
@@ -896,10 +901,7 @@ fn run_candidate(
     append_execution_cap_arguments(&mut arguments, opts.max_steps, opts.max_tool_calls);
     arguments.push(opts.prompt.into());
 
-    let mut environment = vec![
-        ("HI_FORCE_API_KEY".into(), opts.api_key.into()),
-        ("HI_API_KEY".into(), opts.api_key.into()),
-    ];
+    let mut environment = child_paths.delegate_environment(opts.api_key);
     if let Some(research_id) = opts
         .research_id
         .as_deref()
@@ -919,13 +921,20 @@ fn run_candidate(
         }
     }
     let process = match crate::child_process::run_maybe_cancelled(
-        worktree,
-        opts.exe,
-        arguments,
-        environment,
-        best_of_candidate_timeout(),
-        log_path,
-        None,
+        crate::child_process::CandidateChildLaunch {
+            workspace_root: worktree,
+            runtime_root: child_paths.runtime_root(),
+            executable: opts.exe,
+            arguments,
+            environment,
+            timeout: best_of_candidate_timeout(),
+            log_path,
+            cancellation: None,
+            isolation: crate::child_process::CandidateProcessIsolation::new(
+                source_workspace_root,
+                opts.state_root,
+            ),
+        },
     ) {
         Ok(process) => process,
         Err(error) => {
@@ -943,6 +952,7 @@ fn run_candidate(
             );
         }
     };
+    child_paths.retain(report_path, None);
     let process_succeeded = process.status == hi_tools::ToolStatus::Succeeded;
     let process_status = match process.status {
         hi_tools::ToolStatus::Succeeded | hi_tools::ToolStatus::Failed => process
@@ -1021,6 +1031,7 @@ fn run_candidate(
         model_queue_ms: 0,
         wall_clock_ms: started.elapsed().as_millis(),
         base_revision: String::new(),
+        source_snapshot_id: String::new(),
         target_name: format!("candidate-{index}"),
         target_priority: index,
     }
@@ -1049,14 +1060,24 @@ fn positive_timeout_from_value(value: Option<&str>) -> Option<Duration> {
         .filter(|timeout| Instant::now().checked_add(*timeout).is_some())
 }
 
+fn managed_timeout_from_value(value: Option<&str>, fallback: Duration) -> Duration {
+    positive_timeout_from_value(value).unwrap_or(fallback)
+}
+
 fn best_of_candidate_timeout() -> Option<Duration> {
     let configured = std::env::var("HI_BEST_OF_TIMEOUT_SECS").ok();
-    positive_timeout_from_value(configured.as_deref())
+    let fallback = hi_workspace::ResolvedHarnessSettings::default()
+        .jobs
+        .candidate_timeout;
+    Some(managed_timeout_from_value(configured.as_deref(), fallback))
 }
 
 fn best_of_queue_timeout() -> Option<Duration> {
     let configured = std::env::var("HI_BEST_OF_QUEUE_TIMEOUT_SECS").ok();
-    positive_timeout_from_value(configured.as_deref())
+    let fallback = hi_workspace::ResolvedHarnessSettings::default()
+        .jobs
+        .queue_timeout;
+    Some(managed_timeout_from_value(configured.as_deref(), fallback))
 }
 
 fn configured_verify_concurrency(value: Option<&str>, default: usize) -> usize {
@@ -1122,6 +1143,7 @@ fn failed_execution(
         model_queue_ms: 0,
         wall_clock_ms,
         base_revision: String::new(),
+        source_snapshot_id: String::new(),
         target_name: format!("candidate-{index}"),
         target_priority: index,
     }
@@ -1276,170 +1298,5 @@ fn pick_model_winner(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
-
-    fn test_opts<'a>(exe: &'a Path, verify: &'a str) -> BestOf<'a> {
-        BestOf {
-            exe,
-            provider: "openai",
-            model: "test-model",
-            base_url: "http://127.0.0.1:9/v1",
-            api_key: "test-key",
-            verify,
-            prompt: "do the thing",
-            candidates: 1,
-            max_steps: Some(1),
-            max_tool_calls: Some(0),
-            max_verify: 1,
-            workspace_root: Path::new("/"),
-            state_root: Path::new("/tmp"),
-            report: None,
-            targets: None,
-            max_concurrency: 1,
-            apply: true,
-            fuzz: None,
-            expected_workspace_digest: None,
-            judge: hi_research::JudgeChoice::Tests,
-            research_id: None,
-            snippet_block: String::new(),
-        }
-    }
-
-    fn temp_file(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "hi-bestof-{label}-{}-candidate-0.report.json",
-            std::process::id()
-        ))
-    }
-
-    #[test]
-    fn best_of_wall_clock_limits_are_explicit_opt_ins() {
-        assert_eq!(positive_timeout_from_value(None), None);
-        assert_eq!(positive_timeout_from_value(Some("0")), None);
-        assert_eq!(positive_timeout_from_value(Some("invalid")), None);
-        assert_eq!(
-            positive_timeout_from_value(Some("17")),
-            Some(Duration::from_secs(17))
-        );
-    }
-
-    #[test]
-    fn run_candidate_rejects_nonzero_exit_even_without_a_report() {
-        let exe = Path::new("/bin/false");
-        if !exe.exists() {
-            return;
-        }
-        let opts = test_opts(exe, "true");
-        let report = temp_file("failure");
-        let log = report.with_extension("log");
-        let workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let execution = run_candidate(&opts, 0, &workspace, 0.2, &report, &log);
-        assert!(!execution.process_succeeded);
-        assert!(!execution.typed_child_succeeded);
-        assert!(log.exists(), "candidate log must be persisted");
-        let _ = std::fs::remove_file(report);
-        let _ = std::fs::remove_file(log);
-    }
-
-    #[test]
-    fn candidate_arguments_preserve_both_explicit_caps_including_zero_tools() {
-        let mut arguments = Vec::new();
-        append_execution_cap_arguments(&mut arguments, Some(7), Some(0));
-        let arguments = arguments
-            .iter()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(arguments, ["--max-steps", "7", "--max-tool-calls", "0"]);
-
-        arguments_for_unlimited_caps_are_empty();
-    }
-
-    fn arguments_for_unlimited_caps_are_empty() {
-        let mut arguments = Vec::new();
-        append_execution_cap_arguments(&mut arguments, None, None);
-        assert!(arguments.is_empty());
-    }
-
-    #[test]
-    fn exit_zero_without_typed_report_is_not_eligible() {
-        let exe = Path::new("/bin/true");
-        if !exe.exists() {
-            return;
-        }
-        let opts = test_opts(exe, "true");
-        let report = temp_file("missing-report");
-        let log = report.with_extension("log");
-        let workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let execution = run_candidate(&opts, 0, &workspace, 0.2, &report, &log);
-        assert!(execution.process_succeeded);
-        assert!(!execution.typed_child_succeeded);
-        assert!(
-            execution
-                .child_gate_reason
-                .contains("typed child gate failed")
-        );
-        let _ = std::fs::remove_file(report);
-        let _ = std::fs::remove_file(log);
-    }
-
-    #[test]
-    fn empty_verifier_is_rejected_before_candidate_setup() {
-        let opts = test_opts(Path::new("/bin/true"), "  ");
-        let error = run(&opts).expect_err("empty verifier must be a usage error");
-        assert!(format!("{error:#}").contains("resolved non-empty"));
-    }
-
-    #[test]
-    fn model_judge_skips_empty_verifier_usage_error() {
-        let mut opts = test_opts(Path::new("/bin/true"), "  ");
-        opts.judge = hi_research::JudgeChoice::Model;
-        let error = run(&opts).expect_err("workspace setup still fails");
-        assert!(
-            !format!("{error:#}").contains("resolved non-empty"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn bounded_map_preserves_order_and_limits_parallelism() {
-        let items = [0usize, 1, 2, 3];
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let first_wave = Arc::new(Barrier::new(2));
-        let results = bounded_ordered_map(&items, 2, |item| {
-            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-            peak.fetch_max(current, Ordering::SeqCst);
-            if *item < 2 {
-                first_wave.wait();
-            }
-            std::thread::sleep(Duration::from_millis((3 - item) as u64));
-            active.fetch_sub(1, Ordering::SeqCst);
-            item * 10
-        });
-
-        assert_eq!(results, [0, 10, 20, 30]);
-        assert_eq!(peak.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn percentiles_use_nearest_rank() {
-        let values = latency_percentiles([1, 2, 3, 4, 100]);
-        assert_eq!(values.samples, 5);
-        assert_eq!(values.p50_ms, 3);
-        assert_eq!(values.p95_ms, 100);
-    }
-
-    #[test]
-    fn verify_concurrency_clamps_and_falls_back() {
-        assert_eq!(
-            configured_verify_concurrency(Some("999"), 2),
-            MAX_VERIFY_CONCURRENCY
-        );
-        assert_eq!(configured_verify_concurrency(Some("0"), 2), 1);
-        assert_eq!(configured_verify_concurrency(Some("invalid"), 3), 3);
-        assert_eq!(configured_verify_concurrency(None, 3), 3);
-    }
-}
+#[path = "bestof_tests.rs"]
+mod tests;

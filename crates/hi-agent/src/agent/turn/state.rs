@@ -35,6 +35,7 @@ pub(super) struct TurnState {
     pub expected_mutation: bool,
     pub requested_validation: bool,
     pub turn_input: String,
+    pub native_director: super::native_director::TurnNativeDirector,
 
     // --- checkpoints / verify harness ---
     pub turn_checkpoint_allowed: Option<bool>,

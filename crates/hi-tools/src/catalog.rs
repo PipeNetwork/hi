@@ -7,14 +7,16 @@ use serde_json::json;
 use std::sync::LazyLock;
 
 mod optional_specs;
+mod policy;
 
 pub use optional_specs::{
     ask_user_tool_spec, browser_exec_tool_spec, delegate_tool_spec, explore_tool_spec,
     get_task_output_tool_spec, kill_task_tool_spec, memory_forget_tool_spec, memory_get_tool_spec,
     memory_search_tool_spec, memory_update_tool_spec, new_context_tool_spec,
-    research_read_tool_spec, research_tool_spec, search_tool_tool_spec, skill_tool_spec,
-    task_tool_spec, use_tool_tool_spec, wait_tasks_tool_spec,
+    research_read_tool_spec, research_tool_spec, run_program_tool_spec, search_tool_tool_spec,
+    skill_tool_spec, task_tool_spec, use_tool_tool_spec, wait_tasks_tool_spec,
 };
+pub use policy::*;
 
 /// Whether a tool is safe to pre-launch while a program is still streaming.
 /// This is deliberately separate from `read_only`: a read-only operation can
@@ -30,27 +32,6 @@ pub enum SpeculationClass {
 pub enum ToolCostClass {
     Normal,
     Expensive,
-}
-
-/// The provider-facing envelope for a restricted Rhai program. It is kept out
-/// of `TOOL_SPECS` so providers without native tool calling see no schema.
-pub fn run_program_tool_spec() -> ToolSpec {
-    ToolSpec {
-        name: "run_program".into(),
-        description: "Execute a bounded Rhai program. The final expression is returned. Use `tool(name, #{...})` for existing tools and `parallel([#{name: \"read\", args: #{path: \"src/lib.rs\"}}])` for independent calls. No filesystem, process, network, imports, dynamic evaluation, time, sleep, or exit functions are available; only approved host tools may run.".into(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "source": {
-                    "type": "string",
-                    "maxLength": 262144,
-                    "description": "Rhai source whose final expression is the program result."
-                }
-            },
-            "required": ["source"],
-            "additionalProperties": false
-        }),
-    }
 }
 
 /// The tools advertised to the model each turn.
@@ -112,11 +93,12 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read".into(),
-            description: "Read one or more UTF-8 text files. Lines are returned numbered (`<n>\\t<text>`). Each file is capped by the shared result budget; if the footer says `read more with offset N`, use that exact offset only when the missing lines are needed. For a summary, answer once the returned evidence is sufficient instead of paging automatically. Prefer this over `bash` `cat`/`sed`/`head` for source and spec files — those dumps are clipped and lose the middle. When a task names multiple files, use one call with the `paths` array instead of separate calls with `path`. For a named single-file edit, read that target first; do not read unrelated manifests or project files unless the requested change or validation actually needs them.".into(),
+            description: "Read one or more UTF-8 text files by workspace path, or one typed resource URI. Lines are returned numbered (`<n>\\t<text>`). Each file is capped by the shared result budget; if the footer says `read more with offset N`, use that exact offset only when the missing lines are needed. For a summary, answer once the returned evidence is sufficient instead of paging automatically. Prefer this over `bash` `cat`/`sed`/`head` for source and spec files — those dumps are clipped and lose the middle. When a task names multiple files, use one call with the `paths` array instead of separate calls with `path`. For a named single-file edit, read that target first; do not read unrelated manifests or project files unless the requested change or validation actually needs them.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path to the file to read." },
+                    "uri": { "type": "string", "description": "Typed resource URI to read, such as `workspace://src/lib.rs`. Non-workspace schemes require a host resolver." },
                     "paths": {
                         "type": "array",
                         "description": "Multiple paths to read in one call; use instead of `path`.",
@@ -127,10 +109,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                     "offset": { "type": "integer", "description": "1-based line to start at (default: first line)." },
                     "limit": { "type": "integer", "description": "Maximum number of lines to return (default: 2000)." }
                 },
-                "oneOf": [
-                    { "required": ["path"] },
-                    { "required": ["paths"] }
-                ],
+                "oneOf": [{ "required": ["path"] }, { "required": ["paths"] }, { "required": ["uri"] }],
                 "additionalProperties": false
             }),
         },
@@ -447,6 +426,7 @@ pub enum ToolAdmission {
 /// Authoritative behavioral metadata for every built-in and injected tool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolMetadata {
+    pub schema_version: u16,
     pub name: &'static str,
     pub capability: ToolCapability,
     pub read_only: bool,
@@ -460,6 +440,7 @@ pub struct ToolMetadata {
     pub speculation: SpeculationClass,
     pub cancellation_supported: bool,
     pub cost_class: ToolCostClass,
+    pub policy: ToolPolicy,
 }
 
 macro_rules! tool_metadata {
@@ -473,6 +454,7 @@ macro_rules! tool_metadata {
         $alternative:literal
     ) => {
         ToolMetadata {
+            schema_version: TOOL_METADATA_SCHEMA_VERSION,
             name: $name,
             capability: ToolCapability::$capability,
             read_only: $read_only,
@@ -483,6 +465,12 @@ macro_rules! tool_metadata {
             speculation: SpeculationClass::Never,
             cancellation_supported: true,
             cost_class: ToolCostClass::Normal,
+            policy: ToolPolicy::classified(
+                ToolCapability::$capability,
+                SpeculationClass::Never,
+                $read_only,
+                $mutating,
+            ),
         }
     };
     (
@@ -497,6 +485,7 @@ macro_rules! tool_metadata {
         $cost_class:ident
     ) => {
         ToolMetadata {
+            schema_version: TOOL_METADATA_SCHEMA_VERSION,
             name: $name,
             capability: ToolCapability::$capability,
             read_only: $read_only,
@@ -507,11 +496,18 @@ macro_rules! tool_metadata {
             speculation: SpeculationClass::$speculation,
             cancellation_supported: true,
             cost_class: ToolCostClass::$cost_class,
+            policy: ToolPolicy::classified(
+                ToolCapability::$capability,
+                SpeculationClass::$speculation,
+                $read_only,
+                $mutating,
+            ),
         }
     };
 }
 
 const RUN_PROGRAM_METADATA: ToolMetadata = ToolMetadata {
+    schema_version: TOOL_METADATA_SCHEMA_VERSION,
     name: "run_program",
     capability: ToolCapability::Structure,
     read_only: true,
@@ -522,6 +518,7 @@ const RUN_PROGRAM_METADATA: ToolMetadata = ToolMetadata {
     speculation: SpeculationClass::Never,
     cancellation_supported: true,
     cost_class: ToolCostClass::Normal,
+    policy: ToolPolicy::program_dispatch(),
 };
 
 pub const TOOL_CATALOG: &[ToolMetadata] = &[
@@ -990,23 +987,9 @@ pub fn is_coordination(name: &str) -> bool {
 pub fn target_path(name: &str, arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
     match name {
-        // read/write/edit/multi_edit carry an explicit `path`. `read` may also
-        // use `paths` (an array): a one-element array is that single path; a
-        // multi-element array has no single target, so return None and let
-        // dependency inference treat it conservatively.
-        "read" => value
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .or_else(|| {
-                value.get("paths").and_then(|v| v.as_array()).and_then(|a| {
-                    if a.len() == 1 {
-                        a[0].as_str().map(str::to_string)
-                    } else {
-                        None
-                    }
-                })
-            }),
+        // `read` accepts compatibility paths or a typed workspace URI. Other
+        // schemes have no local path until a host resolver routes them.
+        "read" => crate::read::workspace_path_from_read_arguments(arguments),
         "write" | "edit" | "multi_edit" => value.get("path")?.as_str().map(str::to_string),
         // list's path is optional (defaults to ".").
         "list" => value.get("path")?.as_str().map(str::to_string),

@@ -1,19 +1,11 @@
-//! Remote session sync: pushes hi session records to an ipop API endpoint so
-//! the session can be viewed (and later resumed) from another machine.
-//!
-//! Phase 1 is sync-only: the local `hi` process still owns the agent and the
-//! filesystem. This module provides a [`RemoteSessionSink`] that mirrors the
-//! JSONL records to ipop alongside the local file. The sink is best-effort —
-//! if the network is down, the local session continues uninterrupted and the
-//! failed records are queued for the next flush.
+//! Best-effort remote session mirroring. The local process remains authoritative
+//! and failed record uploads stay queued for a later flush.
 
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Lock a `std::sync::Mutex`, recovering the guard if a panic poisoned it. A
-/// poisoned lock here means a producer panicked mid-update; the sync layer is
-/// best-effort and must not take the whole session down over it.
+/// Recover poisoned producer locks rather than taking down session sync.
 fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -25,20 +17,18 @@ use hi_agent::SessionSink;
 use hi_ai::{Message, Role, Usage};
 use serde::Deserialize;
 
-/// Session IDs are used in URL paths and local token filenames. Keep them to
-/// one safe path segment so a caller cannot redirect either operation.
-pub fn validate_session_id(id: &str) -> Result<()> {
-    if id.is_empty()
-        || id.len() > 128
-        || matches!(id, "." | "..")
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    {
-        anyhow::bail!("invalid session id: use 1-128 ASCII letters, digits, '.', '_' or '-'");
-    }
-    Ok(())
-}
+mod config;
+mod daemon;
+mod lease_confirmation;
+mod lease_signal;
+mod pipefs_causal;
+mod transport_ack;
+mod workspace_execution;
+pub use config::{HeartbeatTelemetry, SyncConfig, validate_session_id};
+use daemon::complete_daemon_run;
+use lease_signal::LeaseLossSignal;
+use transport_ack::AppendRecordsReceipt;
+use workspace_execution::RequiredWorkspaceStageFailure;
 
 /// The record types that hi writes to a session JSONL file. Each variant
 /// matches one `SessionMeta` tag, plus `message` for a bare `Message` line.
@@ -46,6 +36,7 @@ pub fn validate_session_id(id: &str) -> Result<()> {
 const RECORD_TYPE_MESSAGE: &str = "message";
 const RECORD_TYPE_USAGE: &str = "usage";
 const RECORD_TYPE_CHECKPOINTS: &str = "checkpoints";
+const RECORD_TYPE_HARNESS_SETTINGS: &str = crate::session_harness::RECORD_TYPE;
 const RECORD_TYPE_STATE_REPLACEMENT: &str = "state_replacement";
 const RECORD_TYPE_PLAN_DRIVE: &str = "plan_drive";
 const RECORD_TYPE_PLAN_APPROVAL: &str = "plan_approval";
@@ -63,20 +54,6 @@ const LEASE_CONFIRMATION_TIMEOUT: std::time::Duration = std::time::Duration::fro
 // to the server's actual expiry.
 const LEASE_CONFIRMED_FRESH_SECS: u64 = 90;
 
-/// Configuration for syncing a session to ipop.
-#[derive(Clone, Debug)]
-pub struct SyncConfig {
-    /// The ipop API base URL, e.g. `https://api.pipenetwork.ai/v1`.
-    pub base_url: String,
-    /// The project API key for authentication.
-    pub api_key: String,
-    /// A stable identifier for this machine (so a remote viewer knows where
-    /// the coding work runs). If `None`, the server omits it.
-    pub machine_id: Option<String>,
-    /// The hi cwd digest (16 hex chars) — groups sessions by project.
-    pub cwd_digest: Option<String>,
-}
-
 /// A [`SessionSink`] that mirrors session records to an ipop API endpoint.
 ///
 /// Records are buffered in memory and flushed in batches. If a flush fails,
@@ -86,16 +63,6 @@ pub struct SyncConfig {
 /// The sink is **not** responsible for local file persistence; that stays
 /// with [`crate::session::JsonlSession`]. Use [`SyncSession`] to multiplex
 /// both.
-/// What the host reports to the control plane on heartbeat, so a remote
-/// viewer can show the model and context spend without guessing. `None`
-/// fields are omitted server-side ("`Some` updates, `None` leaves").
-#[derive(Clone, Default)]
-pub struct HeartbeatTelemetry {
-    pub model: Option<String>,
-    pub context_used_tokens: Option<u64>,
-    pub context_max_tokens: Option<u64>,
-}
-
 pub struct RemoteSessionSink {
     config: SyncConfig,
     session_id: String,
@@ -109,7 +76,7 @@ pub struct RemoteSessionSink {
     registered: Mutex<bool>,
     /// The per-session input token returned by ipop at registration.
     input_token: Mutex<Option<String>>,
-    lease_lost: std::sync::Arc<AtomicBool>,
+    lease_lost: LeaseLossSignal,
     heartbeat_started: std::sync::Arc<AtomicBool>,
     /// Shared with the heartbeat task; written by the agent via the session
     /// sink, read on every heartbeat tick.
@@ -151,6 +118,10 @@ pub struct RemoteSessionSink {
     /// This is deliberately session-local rather than a SyncStore setting so
     /// disabling PipeFS restores the user's normal global sync preference.
     pipefs_sync_required: std::sync::Arc<AtomicBool>,
+    /// A required workspace-execution transcript could not be staged after
+    /// its effect ran. Keep this latched: allowing a later empty causal batch
+    /// to settle would turn a local outbox failure into false remote success.
+    required_workspace_stage_failure: Mutex<Option<RequiredWorkspaceStageFailure>>,
 }
 
 impl RemoteSessionSink {
@@ -167,6 +138,13 @@ impl RemoteSessionSink {
                 std::sync::Arc::new(crate::sync_store::SyncStore::in_memory()),
             )
         })
+    }
+
+    /// Open the durable outbox without the ordinary best-effort in-memory
+    /// fallback. PipeFS recovery cannot proceed if this database is absent or
+    /// corrupt because transcript acknowledgement is part of publication.
+    pub(crate) fn new_required(config: SyncConfig, session_id: String) -> Result<Self> {
+        Self::with_activation(config, session_id, None)
     }
 
     #[cfg(test)]
@@ -223,7 +201,7 @@ impl RemoteSessionSink {
             store,
             registered: Mutex::new(false),
             input_token: Mutex::new(None),
-            lease_lost: std::sync::Arc::new(AtomicBool::new(false)),
+            lease_lost: LeaseLossSignal::new(),
             heartbeat_started: std::sync::Arc::new(AtomicBool::new(false)),
             telemetry: std::sync::Arc::new(std::sync::Mutex::new(HeartbeatTelemetry::default())),
             accepts_input: AtomicBool::new(false),
@@ -236,6 +214,7 @@ impl RemoteSessionSink {
             requeued_quarantined: AtomicBool::new(false),
             lease_takeover: AtomicBool::new(true),
             pipefs_sync_required: std::sync::Arc::new(AtomicBool::new(false)),
+            required_workspace_stage_failure: Mutex::new(None),
         }
     }
 
@@ -250,6 +229,30 @@ impl RemoteSessionSink {
         self.pipefs_sync_required.load(Ordering::Acquire)
     }
 
+    /// Install the exact writer lease acquired by the preactivation recovery
+    /// command. Marking the existing remote session registered prevents the
+    /// transcript flush from acquiring a second, differently-fenced lease.
+    pub(crate) fn adopt_preactivation_lease(
+        &self,
+        receipt: &hi_pipefs::LeaseReceipt,
+        machine_id: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            receipt.lease.generation > 0 && !receipt.lease.token.trim().is_empty(),
+            "preactivation recovery lease is incomplete"
+        );
+        self.store.store_lease(
+            &self.session_id,
+            &receipt.lease.token,
+            receipt.lease.generation,
+            machine_id,
+            receipt.expires_at_unix,
+        )?;
+        self.lease_lost.reset();
+        *lock_recover(&self.registered) = true;
+        Ok(())
+    }
+
     fn transport_enabled(&self) -> Result<bool> {
         Ok(self.pipefs_sync_required()
             || self.store.effective_mode()? == crate::sync_store::SyncMode::On)
@@ -258,7 +261,7 @@ impl RemoteSessionSink {
     /// Push a record to the pending buffer. `&self` because it uses interior
     /// mutability — this lets `SyncSession` call it via an `Arc` handle.
     pub fn push(&self, record_type: &str, payload_json: &str) {
-        if self.lease_lost.load(Ordering::Acquire) {
+        if self.lease_lost.is_lost() {
             return;
         }
         let wire_bytes = serde_json::to_string(payload_json)
@@ -536,6 +539,10 @@ impl RemoteSessionSink {
                 }))?,
             );
         }
+        self.push(
+            RECORD_TYPE_HARNESS_SETTINGS,
+            &crate::session_harness::encode(&loaded.harness_settings)?,
+        );
         // These are last-write-wins records, so seed even the running/default
         // values. The destination session may already contain an older pause,
         // park, stall, or evidence ledger that this snapshot must clear.
@@ -658,7 +665,7 @@ impl RemoteSessionSink {
                 "sync endpoint cooling down after recent connect failures; retrying later"
             );
         }
-        if self.lease_lost.load(Ordering::Acquire) {
+        if self.lease_lost.is_lost() {
             anyhow::bail!("lease_lost: select another session before accepting new turns");
         }
         let activation = self.activation.lock().await.take();
@@ -870,7 +877,7 @@ impl RemoteSessionSink {
             &client_instance_id,
             expiry,
         )?;
-        self.lease_lost.store(false, Ordering::Release);
+        self.lease_lost.reset();
         Ok(())
     }
 
@@ -889,84 +896,6 @@ impl RemoteSessionSink {
         // Force a fresh POST /hi/sessions so `accepts_input` is updated server-side.
         *lock_recover(&self.registered) = false;
         self.ensure_registered().await
-    }
-
-    /// Writer lease token for authenticated long-polls (GET input / heartbeat).
-    pub fn writer_lease_token(&self) -> Option<String> {
-        self.lease_token()
-    }
-
-    /// Session identity shared by transcript sync and PipeFS. PipeFS checks
-    /// this before using the lease so a live session switch cannot persist
-    /// workspace bytes under the previously active transcript.
-    pub fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    /// Generation paired with [`writer_lease_token`](Self::writer_lease_token).
-    /// PipeFS uses the same writer identity rather than inventing a parallel
-    /// session or lock namespace.
-    pub fn writer_lease_generation(&self) -> u64 {
-        self.store
-            .status(Some(&self.session_id))
-            .map(|status| status.lease_generation)
-            .unwrap_or_default()
-    }
-
-    /// True once any lease-authenticated sync operation learns that another
-    /// machine took over this session. PipeFS consults the same flag before
-    /// admitting a native filesystem mutation.
-    pub fn writer_lease_is_lost(&self) -> bool {
-        self.lease_lost.load(Ordering::Acquire)
-    }
-
-    /// Synchronously prove this writer still owns the server lease. PipeFS
-    /// calls this before admitting every native filesystem mutation, rather
-    /// than relying on a cached token or eventually-consistent heartbeat task.
-    pub(crate) async fn confirm_writer_lease(&self) -> Result<()> {
-        if self.lease_lost.load(Ordering::Acquire) {
-            anyhow::bail!("lease_lost: this session was taken over by another writer");
-        }
-        let token = self
-            .lease_token()
-            .ok_or_else(|| anyhow!("writer lease is unavailable"))?;
-        let url = format!(
-            "{}/hi/sessions/{}/heartbeat",
-            self.config.base_url, self.session_id
-        );
-        let telemetry = lock_recover(&self.telemetry).clone();
-        let response = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.config.api_key)
-            .header("x-hi-lease-token", token)
-            .json(&serde_json::json!({
-                "model": telemetry.model,
-                "context_used_tokens": telemetry.context_used_tokens,
-                "context_max_tokens": telemetry.context_max_tokens,
-            }))
-            .timeout(LEASE_CONFIRMATION_TIMEOUT)
-            .send()
-            .await;
-        note_endpoint_outcome(&self.store, response.as_ref().err());
-        let response = response.with_context(|| format!("confirming writer lease at {url}"))?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::CONFLICT {
-                self.lease_lost.store(true, Ordering::Release);
-            }
-            anyhow::bail!("writer lease confirmation failed: HTTP {status} {body}");
-        }
-        let confirmed_until = (unix_now().max(0) as u64).saturating_add(LEASE_CONFIRMED_FRESH_SECS);
-        self.store
-            .renew_lease_expiry(&self.session_id, confirmed_until)
-            .context("recording confirmed writer lease freshness")?;
-        Ok(())
-    }
-
-    pub fn lease_token(&self) -> Option<String> {
-        self.store.lease_token(&self.session_id).ok().flatten()
     }
 
     /// Record the model this session runs, for the heartbeat body. Called via
@@ -1022,6 +951,12 @@ impl RemoteSessionSink {
                 let Some(token) = store.lease_token(&session_id).ok().flatten() else {
                     break;
                 };
+                if store.status(Some(&session_id)).is_ok_and(|status| {
+                    status.lease_expiry_unix != 0
+                        && status.lease_expiry_unix <= unix_now().max(0) as u64
+                }) {
+                    lease_lost.mark_uncertain();
+                }
                 // The body carries host telemetry when known. `None` fields
                 // serialise to null, which the server reads as "leave as is" —
                 // identical to the empty body older builds send.
@@ -1042,16 +977,24 @@ impl RemoteSessionSink {
                     .await;
                 match response {
                     Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => {
-                        lease_lost.store(true, Ordering::Release);
+                        lease_lost.mark_lost();
                         break;
                     }
                     Ok(response) if response.status().is_success() => {
                         consecutive_failures = 0;
                         let confirmed_until =
                             (unix_now().max(0) as u64).saturating_add(LEASE_CONFIRMED_FRESH_SECS);
-                        let _ = store.renew_lease_expiry(&session_id, confirmed_until);
+                        // Do not clear a previously published uncertainty here:
+                        // only an explicit admission/recovery proof reopens writers.
+                        if store
+                            .renew_lease_expiry(&session_id, confirmed_until)
+                            .is_err()
+                        {
+                            lease_lost.mark_uncertain();
+                        }
                     }
                     Ok(_) | Err(_) => {
+                        lease_lost.mark_uncertain();
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         if consecutive_failures >= 5 {
                             break;
@@ -1226,7 +1169,7 @@ impl RemoteSessionSink {
                     .and_then(|value| value.parse::<u64>().ok());
                 let body = response.text().await.unwrap_or_default();
                 if status == reqwest::StatusCode::CONFLICT && body.contains("lease_lost") {
-                    self.lease_lost.store(true, Ordering::Release);
+                    self.lease_lost.mark_lost();
                 }
                 let permanent = status.is_client_error()
                     && !matches!(
@@ -1256,12 +1199,12 @@ impl RemoteSessionSink {
                 }
                 return Err(anyhow!("ipop sync flush failed: {status} {body}"));
             }
-            let cursor = response
-                .json::<serde_json::Value>()
+            let receipt = response
+                .json::<AppendRecordsReceipt>()
                 .await
-                .ok()
-                .and_then(|body| body.get("record_count").and_then(|value| value.as_u64()))
-                .unwrap_or_default();
+                .context("parsing typed transcript acknowledgement")?;
+            let previous_cursor = self.store.status(Some(&self.session_id))?.server_cursor;
+            let cursor = receipt.validate(previous_cursor, records.len())?;
             self.store.acknowledge_records(
                 &self.session_id,
                 &records
@@ -1416,6 +1359,13 @@ impl SessionSink for SyncSession {
         self.remote.observe_context_used(usage.context_occupancy);
         self.reconcile_best_effort();
         Ok(())
+    }
+
+    fn stage_workspace_execution(
+        &mut self,
+        record: &hi_agent::WorkspaceTranscriptExecution,
+    ) -> Result<()> {
+        self.remote.stage_workspace_execution(record)
     }
 
     fn record_model_context(&mut self, model: &str, context_window: Option<u32>) {
@@ -2100,7 +2050,16 @@ pub async fn run_daemon_loop(
 
     // Trigger early registration so the input token is available immediately.
     if let Some(handle) = &sync_handle {
-        handle.ensure_registered_now().await?;
+        if let Err(error) = handle.ensure_registered_now().await {
+            return complete_daemon_run(
+                &mut agent,
+                Err(error),
+                sync_handle.as_ref(),
+                remote_ui.as_ref(),
+                &session_id,
+            )
+            .await;
+        }
         if let Some(token) = handle.input_token() {
             // Write the token to a local file so `hi --attach` on the same
             // machine can read it automatically.
@@ -2122,7 +2081,7 @@ pub async fn run_daemon_loop(
     let hb_url = heartbeat_url.clone();
     let hb_key = api_key.clone();
     let hb_lease = writer_lease.clone();
-    tokio::spawn(async move {
+    let heartbeat = tokio::spawn(async move {
         let mut consecutive_failures = 0_u8;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -2145,7 +2104,7 @@ pub async fn run_daemon_loop(
         }
     });
 
-    loop {
+    let result = 'daemon: loop {
         // Long-poll for pending inputs, but also watch for shutdown.
         let mut poll_request = client.get(&input_url).header("x-api-key", &api_key);
         if let Some(token) = &writer_lease {
@@ -2166,12 +2125,12 @@ pub async fn run_daemon_loop(
                         if status == reqwest::StatusCode::CONFLICT {
                             let body = response.text().await.unwrap_or_default();
                             if body.contains("lease_lost") {
-                                return Err(anyhow!("lease_lost: this daemon was replaced by another writer"));
+                                break 'daemon Err(anyhow!("lease_lost: this daemon was replaced by another writer"));
                             }
-                            return Err(anyhow!("the remote session writer lease is no longer valid"));
+                            break 'daemon Err(anyhow!("the remote session writer lease is no longer valid"));
                         }
                         if remote_input_poll_status_is_terminal(status) {
-                            return Err(anyhow!(
+                            break 'daemon Err(anyhow!(
                                 "remote session input polling stopped after terminal HTTP status {status}"
                             ));
                         }
@@ -2187,26 +2146,8 @@ pub async fn run_daemon_loop(
                 }
             }
             _ = hi_daemon_shutdown_signal() => {
-                println!("\x1b[2m⟳ daemon stopping — flushing sync and ending session\x1b[0m");
-                // Flush any pending sync records + live events.
-                if let Some(handle) = &sync_handle {
-                    if let Err(err) = handle.flush().await {
-                        eprintln!("\x1b[33msync: {err:#}\x1b[0m");
-                    }
-                    handle.end_session().await;
-                }
-                if let Some(rui) = &remote_ui
-                    && let Err(err) = rui.flush().await {
-                        eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
-                    }
-                // Clean up the local token file so it doesn't persist after the
-                // session ends. Best-effort — if removal fails, the token is
-                // stale but harmless (the session is ended on the server).
-                if let Some(dir) = crate::session::sessions_dir() {
-                    let token_path = dir.join(format!("{session_id}.token"));
-                    let _ = std::fs::remove_file(&token_path);
-                }
-                return Ok(());
+                println!("\x1b[2m⟳ daemon stopping — settling workspace\x1b[0m");
+                break 'daemon Ok(());
             }
         };
 
@@ -2268,7 +2209,17 @@ pub async fn run_daemon_loop(
             }
             let _ = request.send().await;
         }
-    }
+    };
+    heartbeat.abort();
+    let _ = heartbeat.await;
+    complete_daemon_run(
+        &mut agent,
+        result,
+        sync_handle.as_ref(),
+        remote_ui.as_ref(),
+        &session_id,
+    )
+    .await
 }
 
 // ─── Attach mode (Phase 3) ──────────────────────────────────────────────────
@@ -3242,6 +3193,18 @@ pub async fn run_resume_local(
     // remote identity into that cache so every later `--resume <local-id>`
     // continues the same transcript, writer lease, and PipeFS workspace.
     loaded.remote_session_id = Some(session_id.clone());
+    let local_path = crate::session::new_session_path()?;
+    let local_id = local_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("continuation")
+        .to_string();
+    if crate::session_harness::ensure_agent_compatible(agent, &loaded.harness_settings).is_err() {
+        crate::session::cache_loaded_session(&local_path, &loaded)?;
+        anyhow::bail!(
+            "remote session harness settings differ; cached it locally — restart with `hi --resume {local_id}`"
+        );
+    }
 
     let n_messages = loaded.messages.len();
     let has_goal = loaded.goal.is_some();
@@ -3253,12 +3216,6 @@ pub async fn run_resume_local(
     // 3. Seed a new local continuation file with the complete remote state.
     //    Merely detaching the startup sink would make every continued turn
     //    ephemeral and leave a partial local file that cannot be resumed.
-    let local_path = crate::session::new_session_path()?;
-    let local_id = local_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("continuation")
-        .to_string();
     crate::session::cache_loaded_session(&local_path, &loaded)?;
     let local = crate::session::JsonlSession::new(local_path.clone());
     let remote = RemoteSessionSink::new(sync_config.clone(), session_id.clone());
@@ -3326,8 +3283,7 @@ pub async fn run_resume_local(
         {
             let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
         }
-        agent.kill_background_processes();
-        agent.background_task_registry().kill_all().await;
+        agent.settle_workspace_for_exit().await?;
         if let Err(err) = sync_handle.flush().await {
             eprintln!("\x1b[33msync: {err:#}\x1b[0m");
         }
@@ -3369,8 +3325,7 @@ pub async fn run_resume_local(
     if let Err(err) = sync_handle.flush().await {
         eprintln!("\x1b[33msync: {err:#}\x1b[0m");
     }
-    agent.kill_background_processes();
-    agent.background_task_registry().kill_all().await;
+    agent.settle_workspace_for_exit().await?;
     pipefs_host
         .clean_exit(agent)
         .await

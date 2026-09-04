@@ -125,6 +125,7 @@ hi-policy = { version = "0.3.1", path = "crates/hi-policy" }
 hi-control = { version = "0.3.1", path = "crates/hi-control" }
 hi-routing = { version = "0.3.1", path = "crates/hi-routing" }
 hi-pipefs = { version = "0.3.1", path = "crates/hi-pipefs" }
+hi-workspace = { version = "0.3.1", path = "crates/hi-workspace" }
 notify = "8"
 notify-debouncer-full = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
@@ -151,6 +152,7 @@ nohash-hasher = "0.2"
 git2 = { version = "0.21", default-features = false }
 mimalloc = "0.1"
 tree-sitter = "0.25.10"
+tree-sitter-bash = "0.25.1"
 tree-sitter-rust = "0.24.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25.0"

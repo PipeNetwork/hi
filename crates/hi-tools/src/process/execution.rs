@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use crate::{ProcessOutcome, ToolStatus, TruncationState};
 
 use super::ProcessExecution;
+use super::foreground::{ForegroundProcessRegistration, ForegroundProcessRegistry};
 
 /// Maximum bytes retained from each process stream before the middle is
 /// discarded. The reader continues draining after the cap so a noisy child can
@@ -38,8 +39,9 @@ pub(super) async fn capture_child(
     timeout: Duration,
     on_line: &mut (dyn FnMut(&str) + Send),
     started: Instant,
+    foreground: &ForegroundProcessRegistry,
 ) -> Result<ProcessExecution> {
-    capture_child_maybe_timeout(child, Some(timeout), on_line, started).await
+    capture_child_maybe_timeout(child, Some(timeout), on_line, started, foreground).await
 }
 
 /// Capture a child with an optional outer deadline. `None` deliberately means
@@ -51,8 +53,10 @@ pub(super) async fn capture_child_maybe_timeout(
     timeout: Option<Duration>,
     on_line: &mut (dyn FnMut(&str) + Send),
     started: Instant,
+    foreground: &ForegroundProcessRegistry,
 ) -> Result<ProcessExecution> {
     let mut group_guard = ProcessGroupDropGuard::for_child(&child);
+    let _foreground = foreground.register(&child);
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
 
@@ -133,6 +137,7 @@ pub struct RunningChild {
     /// The combined stdout+stderr produced while in the foreground, to seed the
     /// background handle so a later poll shows the whole run.
     pub partial_output: String,
+    pub(crate) foreground_registration: ForegroundProcessRegistration,
 }
 
 /// Either the command completed within the foreground budget, or it is still
@@ -191,8 +196,10 @@ pub(super) async fn capture_child_adoptable(
     foreground_budget: Duration,
     on_line: &mut (dyn FnMut(&str) + Send),
     started: Instant,
+    foreground: &ForegroundProcessRegistry,
 ) -> Result<AdoptableOutcome> {
     let mut group_guard = ProcessGroupDropGuard::for_child(&child);
+    let foreground_registration = foreground.register(&child);
     let pgid = child.id().map(|pid| pid as i32);
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
@@ -274,6 +281,7 @@ pub(super) async fn capture_child_adoptable(
         stderr,
         pgid,
         partial_output: partial,
+        foreground_registration,
     }))
 }
 

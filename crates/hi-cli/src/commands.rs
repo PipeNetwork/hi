@@ -756,7 +756,7 @@ pub(crate) fn handle_command(
             println!("hi {}", hi_agent::VERSION);
         }
         Command::Export(arg) => {
-            if agent.workspace_durability_enabled() {
+            if agent.pipefs_workspace_active() {
                 eprintln!(
                     "\x1b[33m/export is unavailable while PipeFS is active because it writes outside the workspace durability fence\x1b[0m"
                 );

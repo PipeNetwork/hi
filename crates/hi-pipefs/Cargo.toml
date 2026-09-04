@@ -4,7 +4,9 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+hi-workspace.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 blake3.workspace = true
 filetime.workspace = true
 reqwest.workspace = true

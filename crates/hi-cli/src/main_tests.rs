@@ -525,6 +525,8 @@ fn test_settings() -> Settings {
         browser_allow_private: false,
         mcp_pipe_enabled: true,
         mcp_pipe_allow: Vec::new(),
+        session_harness: crate::session_harness::empty_layer(),
+        harness: hi_workspace::ResolvedHarnessSettings::default(),
     }
 }
 
@@ -559,6 +561,8 @@ fn pipenetwork_settings(model: &str, max_tokens: u32, explicit: bool) -> Setting
         browser_allow_private: false,
         mcp_pipe_enabled: true,
         mcp_pipe_allow: Vec::new(),
+        session_harness: crate::session_harness::empty_layer(),
+        harness: hi_workspace::ResolvedHarnessSettings::default(),
     }
 }
 

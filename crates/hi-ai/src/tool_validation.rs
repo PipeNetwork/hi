@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::{Completion, Content, ProviderError, ProviderErrorKind, ToolMode, ToolSpec};
 
-const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 /// Aggregate retained payload budget for one model-emitted tool batch. This is
 /// a memory/resource guard, not a call-count ceiling: every call consumes a
 /// conservative slot charge plus its encoded fields, so small valid batches
@@ -94,8 +94,20 @@ pub fn validate_client_tool_calls(
 pub fn validate_client_tool_batch_limits<'a>(
     arguments: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), ProviderError> {
+    validate_client_tool_batch_limits_with(arguments, MAX_TOOL_ARGUMENT_BYTES)
+}
+
+pub fn validate_client_tool_batch_limits_with<'a>(
+    arguments: impl IntoIterator<Item = &'a str>,
+    max_argument_bytes: usize,
+) -> Result<(), ProviderError> {
     let mut total_bytes = 0usize;
     for argument in arguments {
+        if argument.len() > max_argument_bytes.min(MAX_TOOL_ARGUMENT_BYTES) {
+            return Err(tool_protocol_error(
+                "model exceeded the negotiated tool-argument size limit",
+            ));
+        }
         if !try_reserve_tool_payload(
             &mut total_bytes,
             TOOL_CALL_SLOT_OVERHEAD_BYTES.saturating_add(argument.len()),
@@ -115,13 +127,23 @@ pub fn validate_client_tool_call(
     arguments: &str,
     tools: &[ToolSpec],
 ) -> Result<(), ProviderError> {
+    validate_client_tool_call_with_limit(id, name, arguments, tools, MAX_TOOL_ARGUMENT_BYTES)
+}
+
+pub fn validate_client_tool_call_with_limit(
+    id: &str,
+    name: &str,
+    arguments: &str,
+    tools: &[ToolSpec],
+    max_argument_bytes: usize,
+) -> Result<(), ProviderError> {
     if !valid_tool_call_id(id) {
         return Err(tool_protocol_error("model emitted an invalid tool-call id"));
     }
     let Some(tool) = tools.iter().find(|tool| tool.name == name) else {
         return Err(tool_protocol_error("model emitted an unknown tool name"));
     };
-    if arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+    if arguments.len() > max_argument_bytes.min(MAX_TOOL_ARGUMENT_BYTES) {
         return Err(tool_protocol_error(
             "model exceeded the client tool-argument size limit",
         ));

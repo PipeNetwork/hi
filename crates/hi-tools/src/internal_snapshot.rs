@@ -12,6 +12,9 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[path = "internal_snapshot_lock.rs"]
+mod store_lock;
+
 const ID_PREFIX: &str = "internal:v1:";
 const MAX_MANIFESTS: usize = 50;
 const MAX_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -62,6 +65,8 @@ pub(crate) fn is_internal_id(id: &str) -> bool {
 pub(crate) fn create(root: &Path, state_root: &Path) -> Result<String> {
     let root = canonical_root(root)?;
     let store = Store::open(&root, state_root)?;
+    let store_lock = store_lock::StoreLock::open(&store.workspace_dir)?;
+    let _store_guard = store_lock.acquire()?;
     recover_temps(&store)?;
     let manifest = capture(&root, state_root, &store)?;
     let bytes = serde_json::to_vec(&manifest).context("serializing internal snapshot")?;
@@ -93,7 +98,10 @@ pub(crate) fn materialize(
     destination: &Path,
 ) -> Result<()> {
     let root = canonical_root(root)?;
-    let (store, manifest, _) = load(&root, state_root, id)?;
+    let store = Store::open(&root, state_root)?;
+    let store_lock = store_lock::StoreLock::open(&store.workspace_dir)?;
+    let _store_guard = store_lock.acquire()?;
+    let (store, manifest, _) = load_from_store(store, id)?;
     ensure!(
         !destination.exists(),
         "isolated snapshot destination already exists: {}",
@@ -182,12 +190,15 @@ pub(crate) fn prepare_restore_after_recovery(
     use crate::transaction::{MutationPlan, RestoreMutation};
 
     let root = canonical_root(root)?;
-    let (store, target_manifest, _) = load(&root, state_root, target_id)?;
+    let store = Store::open(&root, state_root)?;
+    let store_lock = store_lock::StoreLock::open(&store.workspace_dir)?;
+    let _store_guard = store_lock.acquire()?;
+    let (store, target_manifest, _) = load_from_store(store, target_id)?;
     let target = decoded_entries(target_manifest.entries)?;
     let current_encoded = scan(&root, state_root, None)?;
     let current = decoded_entries(current_encoded.into_values().collect())?;
     let expected = if let Some(expected_id) = expected_current {
-        let (_, manifest, _) = load(&root, state_root, expected_id)?;
+        let (_, manifest, _) = load_from_store(store.clone(), expected_id)?;
         let expected = decoded_entries(manifest.entries)?;
         ensure!(
             current == expected,
@@ -240,7 +251,10 @@ pub(crate) fn ensure_current_matches(
     expected_id: &str,
 ) -> Result<()> {
     let root = canonical_root(root)?;
-    let (_, expected_manifest, _) = load(&root, state_root, expected_id)?;
+    let store = Store::open(&root, state_root)?;
+    let store_lock = store_lock::StoreLock::open(&store.workspace_dir)?;
+    let _store_guard = store_lock.acquire()?;
+    let (_, expected_manifest, _) = load_from_store(store, expected_id)?;
     let expected = decoded_entries(expected_manifest.entries)?;
     let observed = decoded_entries(scan(&root, state_root, None)?.into_values().collect())?;
     ensure!(
@@ -376,7 +390,10 @@ fn restore_node(
 
 pub(crate) fn diff(root: &Path, state_root: &Path, id: &str) -> Result<Option<String>> {
     let root = canonical_root(root)?;
-    let (store, before_manifest, _) = load(&root, state_root, id)?;
+    let store = Store::open(&root, state_root)?;
+    let store_lock = store_lock::StoreLock::open(&store.workspace_dir)?;
+    let _store_guard = store_lock.acquire()?;
+    let (store, before_manifest, _) = load_from_store(store, id)?;
     let current_manifest = capture(&root, state_root, &store)?;
     let before: BTreeMap<String, SnapshotEntry> = before_manifest
         .entries
@@ -601,8 +618,15 @@ impl Store {
     }
 }
 
+#[cfg(test)]
 fn load(root: &Path, state_root: &Path, id: &str) -> Result<(Store, Manifest, PathBuf)> {
     let store = Store::open(root, state_root)?;
+    let store_lock = store_lock::StoreLock::open(&store.workspace_dir)?;
+    let _store_guard = store_lock.acquire()?;
+    load_from_store(store, id)
+}
+
+fn load_from_store(store: Store, id: &str) -> Result<(Store, Manifest, PathBuf)> {
     let rest = id
         .strip_prefix(ID_PREFIX)
         .context("not an internal checkpoint id")?;
@@ -630,8 +654,8 @@ fn load(root: &Path, state_root: &Path, id: &str) -> Result<(Store, Manifest, Pa
         manifest.version == 1 && manifest.workspace == store.workspace_id,
         "invalid snapshot manifest"
     );
-    // Rewrite identical bytes to update the manifest's LRU timestamp.
-    let _ = fs::write(&path, &bytes);
+    // The creation mtime is the eviction order. Rewriting a content-addressed
+    // manifest in place here let a concurrent reader observe truncated JSON.
     Ok((store, manifest, path))
 }
 
@@ -1071,32 +1095,8 @@ mod tests {
         assert_eq!(fs::read_to_string(workspace.join("b")).unwrap(), "after-b");
         let _ = fs::remove_dir_all(workspace.parent().unwrap());
     }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_capture_collects_unreferenced_objects() {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let (workspace, state) = roots("failed-gc");
-        let store = Store::open(&workspace.canonicalize().unwrap(), &state).unwrap();
-        let bytes = b"unreferenced";
-        let object = digest(bytes);
-        write_object(&store, &object, bytes).unwrap();
-        let fifo = workspace.join("unsupported-fifo");
-        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: fifo_c is a valid NUL-terminated path owned for the call.
-        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-
-        assert!(capture(&workspace, &state, &store).is_err());
-        assert!(
-            !store
-                .objects_dir
-                .join(&object[..2])
-                .join(&object[2..])
-                .exists(),
-            "failed capture left an unreachable object"
-        );
-        let _ = fs::remove_dir_all(workspace.parent().unwrap());
-    }
 }
+
+#[cfg(test)]
+#[path = "internal_snapshot_concurrency_tests.rs"]
+mod concurrency_tests;

@@ -2,9 +2,12 @@
 //!
 //! File mutations live in [`mutations`]. Advertised specs live in [`crate::catalog`].
 
+mod commit;
 mod external;
 mod mutations;
 mod process_tools;
+
+pub use commit::{CommitOutcome, commit_in, commit_in_typed};
 
 pub use external::{
     McpBackend, McpToolInfo, MemoryBackend, MemorySearchResult, SkillBackend, run_memory_forget,
@@ -39,7 +42,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::condense::condense;
-use crate::read::{run_glob, run_grep_with_runner, run_list, run_read};
+use crate::read::{run_glob, run_grep_with_runner, run_list};
 use crate::{PlanStatus, PlanStep, ProcessRunner, ToolEffects, ToolOutcome};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -535,206 +538,6 @@ fn collapse_untracked_path(path: &str) -> String {
     }
 }
 
-/// Stage session-touched paths and commit them with an auto-generated
-/// message summarizing the changed files. This is the body of the `/commit`
-/// slash command. Never runs `git add -A`: empty `paths` refuses so a dirty
-/// extra file cannot ride along. After staging, scans `git diff --cached` for
-/// secret shapes and unstages if any match.
-pub async fn commit_in(root: &Path, paths: &[String]) -> String {
-    // 1. Confirm we're inside a work tree before touching anything.
-    let in_tree = match run_git_operation(
-        root,
-        vec!["rev-parse".into(), "--is-inside-work-tree".into()],
-    )
-    .await
-    {
-        Ok(o) => {
-            o.status == crate::ToolStatus::Succeeded && o.outcome.stdout_summary.trim() == "true"
-        }
-        Err(err) => return format!("git not available: {err}"),
-    };
-    if !in_tree {
-        return "not a git repository".to_string();
-    }
-
-    let staged_paths = sanitize_commit_paths(root, paths);
-    if staged_paths.is_empty() {
-        return "nothing this session changed — stage files yourself.".to_string();
-    }
-
-    // 2. Stage only the named session paths (never `-A` / `.`).
-    let mut add_args = vec!["add".into(), "--".into()];
-    add_args.extend(staged_paths.iter().cloned());
-    let add = match run_git_operation(root, add_args).await {
-        Ok(o) => o,
-        Err(err) => return format!("git add failed: {err}"),
-    };
-    if add.status != crate::ToolStatus::Succeeded {
-        return format!("git add failed: {}", add.model_content().trim());
-    }
-
-    // 3. Refuse if the staged diff looks like secrets. Scan the raw patch
-    //    (not ProcessRunner output — that path already redacts, which would
-    //    hide the match).
-    match staged_diff_raw(root) {
-        Ok(cached) => {
-            if secret_in_staged_diff(&cached) {
-                unstage_paths(root, &staged_paths).await;
-                return "refusing to commit: staged diff looks like it contains secrets"
-                    .to_string();
-            }
-        }
-        Err(err) => {
-            unstage_paths(root, &staged_paths).await;
-            return format!("git diff failed: {err}");
-        }
-    }
-
-    // 4. Summarize the staged changes for the commit message.
-    let stat = match run_git_operation(
-        root,
-        vec![
-            "--no-pager".into(),
-            "diff".into(),
-            "--cached".into(),
-            "--name-only".into(),
-        ],
-    )
-    .await
-    {
-        Ok(o) => o.outcome.stdout_summary,
-        Err(err) => {
-            unstage_paths(root, &staged_paths).await;
-            return format!("git diff failed: {err}");
-        }
-    };
-    let files: Vec<&str> = stat.lines().filter(|l| !l.trim().is_empty()).collect();
-    if files.is_empty() {
-        return "nothing to commit (working tree clean)".to_string();
-    }
-
-    // Build a message from the file list: keep it to a single subject line plus
-    // a short body. Conventional-ish subject ("update N files") so it reads well
-    // in `git log` without depending on a model call.
-    let n = files.len();
-    let subject = if n == 1 {
-        format!("update {}", files[0])
-    } else {
-        format!("update {n} files")
-    };
-    // Body: list the files, trimmed to a reasonable cap so huge staging sets
-    // don't produce a multi-thousand-line commit message.
-    const MAX_FILES_IN_BODY: usize = 40;
-    let mut body = String::new();
-    for f in files.iter().take(MAX_FILES_IN_BODY) {
-        body.push_str("  - ");
-        body.push_str(f);
-        body.push('\n');
-    }
-    if n > MAX_FILES_IN_BODY {
-        body.push_str(&format!("  - … and {} more\n", n - MAX_FILES_IN_BODY));
-    }
-    let message = if body.trim().is_empty() {
-        subject.clone()
-    } else {
-        format!("{subject}\n\n{body}", body = body.trim_end())
-    };
-
-    // 5. Commit. We pass the message via `-m`; embedded newlines cover subject
-    //    + body in a single argument.
-    let commit =
-        match run_git_operation(root, vec!["commit".into(), "-m".into(), message.clone()]).await {
-            Ok(o) => o,
-            Err(err) => return format!("git commit failed: {err}"),
-        };
-    if commit.status != crate::ToolStatus::Succeeded {
-        let detail = if commit.outcome.stderr_summary.trim().is_empty() {
-            commit.outcome.stdout_summary.trim()
-        } else {
-            commit.outcome.stderr_summary.trim()
-        };
-        return format!("git commit failed: {detail}");
-    }
-
-    // Echo the summary the way the UI expects: `── … ──`.
-    format!(
-        "staged {n} file{}\ncommitted: \"{subject}\"",
-        if n == 1 { "" } else { "s" }
-    )
-}
-
-fn sanitize_commit_paths(root: &Path, paths: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    for raw in paths {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed == "." || trimmed == "./" || trimmed == "-A" {
-            continue;
-        }
-        let candidate = if Path::new(trimmed).is_absolute() {
-            match Path::new(trimmed).strip_prefix(root) {
-                Ok(rel) => rel.to_path_buf(),
-                Err(_) => continue,
-            }
-        } else {
-            Path::new(trimmed).to_path_buf()
-        };
-        if candidate
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            continue;
-        }
-        let normalized = candidate.to_string_lossy().replace('\\', "/");
-        if normalized.is_empty() {
-            continue;
-        }
-        if !out.iter().any(|existing| existing == &normalized) {
-            out.push(normalized);
-        }
-    }
-    out
-}
-
-fn secret_in_staged_diff(diff: &str) -> bool {
-    !matches!(
-        hi_secrets::redact_secrets(diff),
-        std::borrow::Cow::Borrowed(_)
-    )
-}
-
-/// Cap on the raw staged patch we will inspect for secrets. Larger diffs are
-/// refused rather than scanned incompletely.
-const MAX_STAGED_DIFF_BYTES: usize = 1_048_576;
-
-fn staged_diff_raw(root: &Path) -> Result<String, String> {
-    let out = std::process::Command::new("git")
-        .args(["--no-pager", "diff", "--cached"])
-        .current_dir(root)
-        .output()
-        .map_err(|err| err.to_string())?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err.trim().to_string());
-    }
-    if out.stdout.len() > MAX_STAGED_DIFF_BYTES {
-        let prefix = String::from_utf8_lossy(&out.stdout[..MAX_STAGED_DIFF_BYTES]);
-        if secret_in_staged_diff(&prefix) {
-            return Ok(prefix.into_owned());
-        }
-        return Err("staged diff too large to scan for secrets".into());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-async fn unstage_paths(root: &Path, paths: &[String]) {
-    if paths.is_empty() {
-        return;
-    }
-    let mut args = vec!["reset".into(), "HEAD".into(), "--".into()];
-    args.extend(paths.iter().cloned());
-    let _ = run_git_operation(root, args).await;
-}
-
 async fn run_git_operation(root: &Path, args: Vec<String>) -> Result<crate::ProcessExecution> {
     run_git_operation_maybe_timeout(root, args, None).await
 }
@@ -1175,7 +978,10 @@ async fn run(
     arguments: &str,
 ) -> Result<ToolOutcome> {
     match name {
-        "read" => run_read(root, resources.read_cache, arguments).await,
+        "read" => {
+            crate::read::run_read_with_mcp(root, resources.read_cache, resources.mcp, arguments)
+                .await
+        }
         "update_plan" => {
             #[derive(Deserialize)]
             struct StepArg {
@@ -1234,7 +1040,7 @@ async fn run(
                 id: String,
             }
             let args: Args = parse(arguments)?;
-            let result = resources.background.kill(&args.id)?;
+            let result = resources.background.kill_and_reap(&args.id).await?;
             let background = resources.background.outcome(&args.id)?;
             if let Ok(mut cache) = resources.read_cache.lock() {
                 cache.clear();
@@ -1663,7 +1469,7 @@ mod tests {
     };
     use super::{
         MAX_WRITE_OVERWRITE_BYTES, RuntimeResources, TOOL_SPECS, check_timeout_from_value,
-        commit_in, execute_in, fast_check_for, fast_check_passed, redact_tool_output,
+        commit_in_typed, execute_in, fast_check_for, fast_check_passed, redact_tool_output,
         render_untracked_files, render_untracked_files_with_contents, run_check_in,
         run_fast_check_in_maybe_timeout, run_git_operation_maybe_timeout,
         working_tree_diff_plain_in,
@@ -1774,10 +1580,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "hi-commit-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let status = std::process::Command::new("git")
@@ -1859,10 +1662,13 @@ mod tests {
         std::fs::write(dir.join("skip.txt"), "dirty extra\n").unwrap();
         std::fs::write(dir.join("untracked.txt"), "not in ledger\n").unwrap();
 
-        let out = commit_in(&dir, &["keep.txt".into()]).await;
+        let outcome = commit_in_typed(&dir, &["keep.txt".into()]).await;
         let status = git_stdout(&dir, &["status", "--porcelain"]);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(out.contains("committed:"), "{out}");
+        assert_eq!(outcome.status, crate::ToolStatus::Succeeded);
+        assert!(outcome.content.contains("committed:"), "{outcome:?}");
+        assert!(outcome.workspace_may_have_changed);
+        assert!(outcome.external_effect_may_have_occurred);
         assert!(
             status.contains("skip.txt"),
             "extra dirty file must stay uncommitted: {status}"
@@ -1885,10 +1691,16 @@ mod tests {
         git_in(&dir, &["commit", "-qm", "baseline"]);
         std::fs::write(dir.join("keep.txt"), "dirty\n").unwrap();
 
-        let out = commit_in(&dir, &[]).await;
+        let outcome = commit_in_typed(&dir, &[]).await;
         let status = git_stdout(&dir, &["status", "--porcelain"]);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(out.contains("nothing this session changed"), "{out}");
+        assert_eq!(outcome.status, crate::ToolStatus::Failed);
+        assert!(
+            outcome.content.contains("nothing this session changed"),
+            "{outcome:?}"
+        );
+        assert!(!outcome.workspace_may_have_changed);
+        assert!(!outcome.external_effect_may_have_occurred);
         assert!(status.contains("keep.txt"), "must not stage: {status}");
     }
 
@@ -1904,11 +1716,14 @@ mod tests {
         )
         .unwrap();
 
-        let out = commit_in(&dir, &["secret.env".into()]).await;
+        let outcome = commit_in_typed(&dir, &["secret.env".into()]).await;
         let cached = git_stdout(&dir, &["diff", "--cached", "--name-only"]);
         let log = git_stdout(&dir, &["log", "--oneline"]);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(out.contains("secrets"), "{out}");
+        assert_eq!(outcome.status, crate::ToolStatus::Failed);
+        assert!(outcome.content.contains("secrets"), "{outcome:?}");
+        assert!(outcome.workspace_may_have_changed);
+        assert!(outcome.external_effect_may_have_occurred);
         assert!(
             cached.trim().is_empty(),
             "secret path must be unstaged: {cached}"

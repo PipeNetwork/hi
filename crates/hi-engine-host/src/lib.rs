@@ -29,6 +29,10 @@ use wasmtime::{
     component::{Component, Linker, TypedFunc},
 };
 
+mod native_director;
+
+pub use native_director::*;
+
 pub const DEFAULT_MAX_MODULE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_GUEST_FUEL: u64 = 10_000_000;
 pub const DEFAULT_GUEST_MEMORY_BYTES: usize = 64 * 1024 * 1024;

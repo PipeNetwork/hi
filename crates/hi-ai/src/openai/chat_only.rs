@@ -19,6 +19,7 @@ fn chat_only_request(model: &str, deepseek_compat: DeepSeekCompat) -> crate::typ
             parameters: serde_json::json!({"type": "object"}),
         }]
         .into(),
+        tool_envelope: None,
         max_tokens: 16,
         temperature: None,
         top_p: None,

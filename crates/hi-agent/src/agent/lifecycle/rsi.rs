@@ -67,7 +67,7 @@ impl crate::Agent {
 
     pub fn set_rsi_enabled(&mut self, enabled: bool) -> Result<()> {
         anyhow::ensure!(
-            !enabled || !self.workspace_durability_enabled(),
+            !enabled || !self.pipefs_workspace_active(),
             "remote RSI is unavailable while PipeFS is active because its patch runner is bound to the launch workspace"
         );
         anyhow::ensure!(
@@ -89,7 +89,7 @@ impl crate::Agent {
 
     pub async fn set_rsi_enabled_validated(&mut self, enabled: bool) -> Result<()> {
         anyhow::ensure!(
-            !enabled || !self.workspace_durability_enabled(),
+            !enabled || !self.pipefs_workspace_active(),
             "remote RSI is unavailable while PipeFS is active because its patch runner is bound to the launch workspace"
         );
         let control = self.config.rsi.control.clone();
@@ -109,7 +109,7 @@ impl crate::Agent {
 
     pub async fn rsi_command(&self, argument: &str) -> Result<String> {
         anyhow::ensure!(
-            !self.workspace_durability_enabled(),
+            !self.pipefs_workspace_active(),
             "RSI commands are unavailable while PipeFS is active because RSI artifacts are bound to the launch workspace"
         );
         let control = self

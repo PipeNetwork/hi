@@ -168,7 +168,7 @@ impl crate::Agent {
         // keeps provider alternation valid. Also fold any finished side-job UI.
         self.poll_btw_jobs(ui).await;
         // Keep live snapshot/transcript fresh for immediate BtwDispatcher::ask.
-        self.arm_btw_dispatcher();
+        self.arm_btw_dispatcher().await;
         let interjected = self.interjections.drain();
         if !interjected.is_empty() {
             let steering = self.answer_btw_side_questions(interjected, ui).await;
@@ -284,11 +284,14 @@ impl crate::Agent {
         // ChatOnly/ReadOnly restriction, and Required already forces.
         // Wrap-up is ChatOnly *policy* (`tool_choice: none`); the catalog
         // stays the working-round set so the tool-prefix cache still hits.
-        let wrapping_up = request_text_tool_fallback
-            || request_text_answer
-            || request_no_progress_final_answer
-            || request_cap_wrap_up;
-        let tool_mode = if wrapping_up {
+        // Plain-text tool repair is not a wrap-up: it remains Required so a
+        // parsed textual call is covered by the same executable envelope as a
+        // provider-native call. A ChatOnly envelope never admits either form.
+        let wrapping_up =
+            request_text_answer || request_no_progress_final_answer || request_cap_wrap_up;
+        let tool_mode = if request_text_tool_fallback {
+            ToolMode::Required
+        } else if wrapping_up {
             ToolMode::ChatOnly
         } else if force_tools_next && self.config.routing.tool_mode == ToolMode::Auto {
             ToolMode::Required
@@ -305,6 +308,7 @@ impl crate::Agent {
         let requested_request_max_tokens =
             request_max_tokens_override.unwrap_or(self.config.routing.max_tokens);
         let mut request_tools = self.request_tools_for(tool_availability_mode);
+        request_tools = super::model_request::ensure_plan_tool(request_tools, self.plan_mode);
         if program_fallback_next {
             program_fallback_next = false;
             request_tools = request_tools
@@ -319,6 +323,17 @@ impl crate::Agent {
             suppress_bookkeeping_tools_next = false;
             request_tools = super::model_request::apply_bookkeeping_suppress(request_tools, true);
         }
+        let effective_provider_capabilities = self.effective_provider_capabilities().await;
+        let request_shape = super::model_request::provider_constraints::constrain(
+            request_tools,
+            tool_mode,
+            requested_request_max_tokens,
+            self.config.loop_limits.max_parallel_tools,
+            &effective_provider_capabilities.capabilities,
+        );
+        let request_tools = request_shape.tools.clone();
+        let tool_mode = request_shape.tool_mode;
+        let requested_request_max_tokens = request_shape.max_output_tokens;
         let request_tool_schema_tokens = super::model_request::note_advertised_tools(
             &request_tools,
             &mut advertised_tool_names,
@@ -338,7 +353,7 @@ impl crate::Agent {
             turn_start,
             requested_request_max_tokens,
             request_tool_schema_tokens,
-            context_safety_window,
+            request_shape.context_windows(context_safety_window),
             ui,
         ) {
             Ok(context_preflight) => context_preflight,
@@ -418,7 +433,14 @@ impl crate::Agent {
         if request_max_tokens != requested_request_max_tokens {
             request_max_tokens_override = Some(request_max_tokens);
         }
+        self.refresh_session_resource();
         let advertised_tool_specs = request_tools.clone();
+        let tool_envelope = self.build_tool_envelope(
+            &request_tools,
+            tool_mode,
+            request_shape.envelope_limits(request_max_tokens, sched_tool_calls),
+            effective_provider_capabilities,
+        );
         // Prompt-cache health: measure whether this request extends the
         // previous one append-only (cacheable prefix) or rewrote history.
         self.prefix_stability
@@ -431,6 +453,7 @@ impl crate::Agent {
             canonical_objective: Some(context_task.to_string()),
             messages: self.messages.arc(),
             tools: request_tools,
+            tool_envelope: Some(super::model_request::request_envelope(&tool_envelope)),
             max_tokens: request_max_tokens,
             temperature,
             top_p: self.config.routing.top_p.or(top_p),
@@ -497,6 +520,7 @@ impl crate::Agent {
         let stream_result = self
             .handle_provider_stream(
                 request,
+                tool_envelope.clone(),
                 read_only_intent,
                 implementation_intent,
                 task_intent == crate::TaskIntent::ReadOnly
@@ -1517,23 +1541,11 @@ If the task is already complete, stop and give your final recap."
             }
         }
 
-        // Execution validation uses the complete built-in catalog, plus any
-        // dynamically advertised agent/MCP specs. The request may advertise a
-        // task-focused subset, but the executor has always safely handled
-        // other known calls (including promoted plain-text fallback calls).
-        let mut execution_tool_specs = hi_tools::TOOL_SPECS.iter().cloned().collect::<Vec<_>>();
-        for tool in advertised_tool_specs.iter() {
-            if !execution_tool_specs
-                .iter()
-                .any(|known| known.name == tool.name)
-            {
-                execution_tool_specs.push(tool.clone());
-            }
-        }
         Ok(ModelRoundControl::RunTools {
             calls,
             completion_content: completion.content,
-            tool_specs: std::sync::Arc::from(execution_tool_specs),
+            tool_specs: advertised_tool_specs,
+            tool_envelope,
         })
 
         }.await;

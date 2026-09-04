@@ -4,9 +4,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::{collections::HashMap, time::Duration};
 
+use crate::sync::{RemoteSessionSink, SyncConfig};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
-use crate::sync::{RemoteSessionSink, SyncConfig};
+mod controller_bridge;
+mod lease_monitor;
 
 pub(crate) type SharedSyncHandle = Arc<Mutex<Option<Arc<RemoteSessionSink>>>>;
 
@@ -62,9 +64,7 @@ impl PipeFsHost {
         mcp: PipeFsMcpConfig,
     ) -> Result<Self> {
         crate::sync::validate_session_id(&session_id)?;
-        // Ordinary local sessions must not require IPOP credentials merely
-        // because the optional PipeFS host is installed. A valid client is
-        // required before any scoped cache is inspected or mutated.
+        // Local sessions inspect no scoped cache without valid credentials.
         let cache_scope = hi_pipefs::PipeFsClient::new(hi_pipefs::PipeFsClientConfig::new(
             sync_config.base_url.clone(),
             sync_config.api_key.clone(),
@@ -284,11 +284,8 @@ impl PipeFsHost {
             {
                 let _ = hi_pipefs::record_local_mode_hint(&cache_scope, &session_id, false);
             }
-            // Startup candidates were intentionally constructed without LSP,
-            // project hooks, or repository MCP. Once the remote authority says
-            // PipeFS is off, activate the deferred integrations in place and
-            // only then admit trusted repository integrations. Rebinding the
-            // same launch root would reset loaded task/checkpoint state.
+            // PipeFS-off startup may now activate the deferred trusted
+            // integrations without rebinding and resetting session state.
             agent.activate_deferred_local_workspace_runtime();
             agent.set_workspace_project_context(crate::project_context::load_project_context_from(
                 &self.original_workspace_root,
@@ -321,6 +318,10 @@ impl PipeFsHost {
             .ensure_background_processes_quiescent()
             .await
             .context("waiting for stopped background processes before /pipefs on")?;
+        agent
+            .require_workspace_barrier(hi_workspace::BarrierKind::ModeSwitch)
+            .await
+            .context("waiting for the unified workspace mode-switch barrier")?;
         if let Some(cleanup) = self.cleanup_pending.lock().await.clone() {
             cleanup
                 .finish_disable()
@@ -412,10 +413,10 @@ impl PipeFsHost {
                 };
             }
         };
-        // A cache path can be reused across launches. Remove any exact persisted
-        // grant defensively, then construct the runtime without consulting folder
-        // trust: restored repository bytes must never auto-enable local hooks or
-        // stdio MCP commands on this machine.
+        let prepared_controller =
+            controller_bridge::prepare(agent, workspace.clone(), sync.clone(), &activation).await?;
+        // A reused cache must not retain a trust grant or auto-enable repository
+        // hooks and stdio MCP commands for restored bytes.
         let _ = hi_tools::folder_trust::try_revoke_folder_trust(&activation.workspace_root);
         if let Err(error) = agent
             .rebind_portable_workspace(&activation.workspace_root, &activation.state_root)
@@ -444,20 +445,12 @@ impl PipeFsHost {
                 ))),
             };
         }
-        agent.set_workspace_project_context(crate::project_context::load_project_context_from(
-            &activation.workspace_root,
-        ));
+        agent.set_workspace_project_context(
+            crate::project_context::load_untrusted_project_context_from(&activation.workspace_root),
+        );
         self.reconnect_workspace_mcp(agent, &activation.workspace_root, false)
             .await;
-        let background_processes = agent.background_process_registry();
-        let durability = Arc::new(PipeFsDurability {
-            workspace: workspace.clone(),
-            sync: sync.clone(),
-            background_processes,
-            background_checkpoints: Arc::default(),
-            failure: Arc::default(),
-        });
-        agent.set_workspace_durability(Some(durability.clone()));
+        let durability = prepared_controller.install(agent)?;
         *self.active_durability.lock().await = Some(durability);
         *self.active.lock().await = Some(workspace);
         let durability = self
@@ -488,6 +481,7 @@ impl PipeFsHost {
     }
 
     pub(crate) async fn disable(&self, agent: &mut hi_agent::Agent) -> Result<String> {
+        agent.ensure_workspace_rebind_ready()?;
         let sync = self.require_sync_handle()?;
         ensure!(
             agent.active_background_process_ids().is_empty()
@@ -498,6 +492,10 @@ impl PipeFsHost {
             .ensure_background_processes_quiescent()
             .await
             .context("waiting for stopped background processes before /pipefs off")?;
+        agent
+            .require_workspace_barrier(hi_workspace::BarrierKind::ModeSwitch)
+            .await
+            .context("waiting for the unified workspace mode-switch barrier")?;
         if let Some(durability) = self.active_durability.lock().await.clone() {
             durability
                 .quiesce_background_checkpoints()
@@ -657,6 +655,17 @@ impl PipeFsHost {
         if let Some(workspace) = self.active.lock().await.clone() {
             let sync = self.require_sync_handle()?;
             let durability = self.active_durability.lock().await.clone();
+            if workspace.status().await.phase == hi_pipefs::WorkspacePhase::LeaseLost {
+                let session_id = self.session_id();
+                let recovery = agent.workspace_controller_status().recovery_id;
+                let evidence = recovery.map_or_else(
+                    || "local recovery evidence may still be present".to_owned(),
+                    |id| format!("workspace recovery {id} remains unresolved"),
+                );
+                bail!(
+                    "PipeFS lease was declared lost and /pipefs retry cannot reuse it or publish unmatched effects; {evidence}. Exit this process, run `hi workspace recover list --session {session_id}` to inspect/export/discard any evidence, then explicitly run `hi workspace takeover --session {session_id}` and reactivate PipeFS"
+                );
+            }
             let authority_result = async {
                 refresh_pipefs_lease(&workspace, &sync).await?;
                 workspace
@@ -674,9 +683,12 @@ impl PipeFsHost {
                 }
                 return Err(error);
             }
-            // `checkpoint` deliberately scans even a controller recorded as
-            // Clean. This recovers writes from opaque/direct command paths that
-            // could otherwise be missed by a no-op retry.
+            if let Some(status) =
+                controller_bridge::retry(agent, &workspace, durability.as_ref()).await?
+            {
+                return Ok(status);
+            }
+            // Scan even Clean state to recover opaque/direct command writes.
             if let Some(durability) = &durability {
                 durability.checkpoint_with_lease().await?;
             } else {
@@ -696,6 +708,10 @@ impl PipeFsHost {
             if let Some(durability) = &durability {
                 durability.clear_failure();
             }
+            agent
+                .acknowledge_workspace_recovery()
+                .await
+                .context("reopening workspace admission after authoritative recovery")?;
             return Ok(workspace.status().await.to_string());
         }
         if let Some(cleanup) = self.cleanup_pending.lock().await.clone() {
@@ -765,109 +781,26 @@ impl PipeFsHost {
             "off" => self.disable(agent).await,
             "retry" => self.retry(agent).await,
             "recover" => self.recovery_command(remainder).await,
-            _ => bail!("usage: /pipefs on|off|status|retry|recover list|inspect|export|discard"),
+            _ => bail!(
+                "usage: /pipefs on|off|status|retry|recover list|inspect|retry|export|discard"
+            ),
         }
     }
 
     async fn recovery_command(&self, argument: &str) -> Result<String> {
-        let mut parts = argument.splitn(2, char::is_whitespace);
-        let operation = parts.next().unwrap_or("").to_ascii_lowercase();
-        let remainder = parts.next().unwrap_or("").trim();
         let session_id = self.session_id();
         let cache_scope = self.require_cache_scope()?.clone();
-        match operation.as_str() {
-            "list" if remainder.is_empty() => {
-                let caches = hi_pipefs::list_recovery_caches(&cache_scope, &session_id)?;
-                if caches.is_empty() {
-                    return Ok("PipeFS: no recovery caches for this session".to_string());
-                }
-                let mut output = String::from("PipeFS recovery caches:\n");
-                for cache in caches {
-                    output.push_str(&format!(
-                        "- {}: phase {}, {} logical bytes, {} pending archive bytes",
-                        cache.id,
-                        cache
-                            .phase
-                            .map_or_else(|| "unknown".to_string(), |phase| format!("{phase:?}")),
-                        cache.logical_size_bytes,
-                        cache.pending_archive_bytes
-                    ));
-                    if let Some(error) = cache.last_error {
-                        output.push_str(&format!("; warning: {error}"));
-                    }
-                    output.push('\n');
-                }
-                Ok(output)
-            }
-            "inspect" => {
-                ensure!(
-                    !remainder.is_empty() && !remainder.contains(char::is_whitespace),
-                    "usage: /pipefs recover inspect <cache-id>"
-                );
-                let cache =
-                    hi_pipefs::inspect_recovery_cache(&cache_scope, &session_id, remainder)?;
-                Ok(format_recovery_cache(&cache))
-            }
-            "export" => {
-                ensure!(
-                    self.active.lock().await.is_none(),
-                    "turn PipeFS off before exporting a recovery cache"
-                );
-                let mut values = remainder.splitn(2, char::is_whitespace);
-                let cache_id = values.next().unwrap_or("");
-                let destination = values.next().unwrap_or("").trim();
-                ensure!(
-                    !cache_id.is_empty() && !destination.is_empty(),
-                    "usage: /pipefs recover export <cache-id> <destination.tar.zst>"
-                );
-                let session_id = session_id.clone();
-                let cache_id = cache_id.to_string();
-                let destination = PathBuf::from(destination);
-                let cache_scope = cache_scope.clone();
-                let exported = tokio::task::spawn_blocking(move || {
-                    hi_pipefs::export_recovery_cache(
-                        &cache_scope,
-                        &session_id,
-                        &cache_id,
-                        destination.as_path(),
-                    )
-                })
-                .await
-                .context("PipeFS recovery export task panicked")??;
-                Ok(format!(
-                    "PipeFS recovery cache exported to {}; source cache retained",
-                    exported.display()
-                ))
-            }
-            "discard" => {
-                ensure!(
-                    self.active.lock().await.is_none(),
-                    "turn PipeFS off before discarding a recovery cache"
-                );
-                let values = remainder.split_whitespace().collect::<Vec<_>>();
-                ensure!(
-                    values.len() == 3 && values[1] == "--confirm" && values[0] == values[2],
-                    "usage: /pipefs recover discard <cache-id> --confirm <same-cache-id>"
-                );
-                let cache_id = values[0].to_string();
-                let confirmation = values[2].to_string();
-                let cache_scope = cache_scope.clone();
-                tokio::task::spawn_blocking(move || {
-                    hi_pipefs::discard_recovery_cache(
-                        &cache_scope,
-                        &session_id,
-                        &cache_id,
-                        &confirmation,
-                    )
-                })
-                .await
-                .context("PipeFS recovery discard task panicked")??;
-                Ok(format!("PipeFS recovery cache {} discarded", values[0]))
-            }
-            _ => bail!(
-                "usage: /pipefs recover list | inspect <cache-id> | export <cache-id> <destination.tar.zst> | discard <cache-id> --confirm <same-cache-id>"
-            ),
-        }
+        let client = self.client()?;
+        let active = self.active.lock().await.is_some();
+        crate::workspace_cmd::run_pipefs_recovery_alias(
+            &client,
+            &cache_scope,
+            &session_id,
+            &self.sync_config,
+            active,
+            argument,
+        )
+        .await
     }
 
     pub(crate) async fn is_active(&self) -> bool {
@@ -956,6 +889,10 @@ impl PipeFsHost {
             .ensure_background_processes_quiescent()
             .await
             .context("waiting for stopped background processes before PipeFS exit")?;
+        agent
+            .require_workspace_barrier(hi_workspace::BarrierKind::Exit)
+            .await
+            .context("waiting for the unified workspace exit barrier")?;
         if let Some(durability) = self.active_durability.lock().await.clone() {
             durability
                 .quiesce_background_checkpoints()
@@ -994,24 +931,6 @@ impl PipeFsHost {
     }
 }
 
-fn format_recovery_cache(cache: &hi_pipefs::PipeFsRecoveryCache) -> String {
-    format!(
-        "PipeFS recovery cache {}\npath: {}\nphase: {}\nworkspace: {}\nlogical bytes: {}\npending archive bytes: {}\nlast error: {}",
-        cache.id,
-        cache.path.display(),
-        cache
-            .phase
-            .map_or_else(|| "unknown".to_string(), |phase| format!("{phase:?}")),
-        cache.workspace_root.as_ref().map_or_else(
-            || "unavailable".to_string(),
-            |path| path.display().to_string()
-        ),
-        cache.logical_size_bytes,
-        cache.pending_archive_bytes,
-        cache.last_error.as_deref().unwrap_or("none")
-    )
-}
-
 fn effective_startup_mode(
     remote_is_authoritative: bool,
     remote_enabled: Option<bool>,
@@ -1038,11 +957,10 @@ struct PipeFsDurability {
     sync: Arc<RemoteSessionSink>,
     background_processes: Arc<hi_tools::BackgroundRegistry>,
     background_checkpoints: Arc<BackgroundCheckpointTasks>,
-    /// Fail closed after a mutation was admitted but its durability fence
-    /// could not complete (including a lease-confirmation outage before the
-    /// archive commit). Only a successful explicit/automatic checkpoint
-    /// clears this latch.
+    /// Blocks admission after an incomplete durability fence until a proven
+    /// checkpoint clears it.
     failure: Arc<Mutex<Option<String>>>,
+    _lease_loss_monitor: lease_monitor::LeaseLossMonitor,
 }
 
 async fn stop_background_processes_after_durability_failure(
@@ -1193,6 +1111,13 @@ impl hi_agent::WorkspaceDurability for PipeFsDurability {
         self.checkpoint_with_lease().await
     }
 
+    fn stage_workspace_execution(
+        &self,
+        record: &hi_agent::WorkspaceTranscriptExecution,
+    ) -> Result<()> {
+        self.sync.stage_workspace_execution(record)
+    }
+
     async fn background_process_state(&self, id: &str, running: bool) -> Result<()> {
         if !running {
             let task = self
@@ -1284,50 +1209,5 @@ impl hi_agent::WorkspaceDurability for PipeFsDurability {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    use super::{PipeFsHost, PipeFsMcpConfig, effective_startup_mode};
-    use crate::sync::SyncConfig;
-
-    #[test]
-    fn existing_remote_state_wins_startup_precedence() {
-        assert!(!effective_startup_mode(true, Some(false), true));
-        assert!(effective_startup_mode(true, Some(true), false));
-        assert!(!effective_startup_mode(true, None, true));
-    }
-
-    #[test]
-    fn new_session_uses_explicit_or_configured_request_then_defaults_off() {
-        assert!(effective_startup_mode(false, Some(false), true));
-        assert!(!effective_startup_mode(false, Some(true), false));
-        assert!(!effective_startup_mode(false, None, false));
-    }
-
-    #[test]
-    fn ordinary_local_host_does_not_require_pipefs_credentials() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let host = PipeFsHost::new(
-            SyncConfig {
-                base_url: String::new(),
-                api_key: String::new(),
-                machine_id: None,
-                cwd_digest: None,
-            },
-            "local-session".to_string(),
-            temp.path().join("session.jsonl"),
-            Arc::new(Mutex::new(None)),
-            temp.path().join("workspace"),
-            temp.path().join("state"),
-            PipeFsMcpConfig {
-                import_policy: hi_mcp::McpImportPolicy::default(),
-                pipe_attach: None,
-                server_policies: HashMap::new(),
-            },
-        )
-        .expect("ordinary local session host");
-
-        assert!(!host.local_state_requires_remote_probe());
-    }
-}
+#[path = "pipefs/tests.rs"]
+mod tests;

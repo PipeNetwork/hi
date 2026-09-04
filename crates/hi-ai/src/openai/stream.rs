@@ -1530,6 +1530,7 @@ mod tests {
             canonical_objective: None,
             messages: messages.clone(),
             tools: tools.clone(),
+            tool_envelope: None,
             max_tokens: 64,
             temperature: None,
             top_p: None,

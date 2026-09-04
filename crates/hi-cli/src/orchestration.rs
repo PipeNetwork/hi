@@ -136,6 +136,15 @@ pub(crate) fn build_sync_config(settings: &Settings, cli: &Cli, file: &Config) -
 }
 
 fn sync_section_api_key(section: &crate::config::SyncSection) -> Option<String> {
+    if let Some(reference) = section.api_key_ref.as_deref() {
+        return crate::config::resolve_credential_reference(
+            reference,
+            section.project_local,
+            section.project_local,
+        )
+        .ok()
+        .filter(|key| !key.is_empty());
+    }
     let literal = section.api_key.clone().filter(|key| !key.is_empty());
     if literal.is_some() {
         return literal;

@@ -10,7 +10,7 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
+use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent};
 
 const MAX_REFERENCED_DOCUMENTS: usize = 8;
 /// Combined budget for inlined requirement documents. Sized so a large plan
@@ -119,6 +119,7 @@ concrete components, files, or requirements that appear in the documents."
         let Some(model) = self.config.subagents.planner_model.clone() else {
             return Err(anyhow!("no planner model configured"));
         };
+        let request_policy = self.seal_chat_only_auxiliary_request(&model, 4096).await;
         let request = ChatRequest {
             model,
             request_id: None,
@@ -129,8 +130,9 @@ concrete components, files, or requirements that appear in the documents."
                 Message::system(system_prompt),
                 Message::user(input.to_string()),
             ]),
-            tools: Arc::new([]), // planning — no tool use
-            max_tokens: 4096,    // bounded call — room for a large plan's full milestone list
+            tools: request_policy.tools,
+            tool_envelope: Some(request_policy.envelope),
+            max_tokens: request_policy.max_tokens,
             temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -138,7 +140,7 @@ concrete components, files, or requirements that appear in the documents."
             reasoning_effort: None,
             profile: RequestProfile {
                 compat: self.config.routing.compat,
-                tool_mode: ToolMode::ChatOnly,
+                tool_mode: request_policy.tool_mode,
                 stream_usage: None,
                 deepseek_compat: self.config.routing.deepseek_compat,
                 deepseek_strict: None,

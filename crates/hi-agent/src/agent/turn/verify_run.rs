@@ -85,7 +85,11 @@ impl crate::Agent {
         .with_process_runner(self.runtime.process_runner())
         .with_changed_files(&ledger_touched_files)
         .with_mutation_seen(ledger_mutation_seen)
-        .with_skippable_affected(&skip_checks, &skip_tests);
+        .with_skippable_affected(&skip_checks, &skip_tests)
+        .with_workspace_coordination(
+            self.workspace_coordination.clone(),
+            self.workspace_durability.clone(),
+        );
         Ok(verifier
             .check(
                 &workspace,

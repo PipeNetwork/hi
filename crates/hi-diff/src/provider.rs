@@ -26,6 +26,18 @@ pub async fn run_provider_targets(
         let mut request = request.clone();
         request.model = target.model.clone();
         jobs.spawn(async move {
+            // Fan-out changes the concrete provider/model identity, so seal at
+            // this final boundary rather than cloning a stale source envelope.
+            let request_policy = hi_tools::envelope::seal_chat_only_request(
+                provider.as_ref(),
+                &target.provider,
+                &target.model,
+                request.max_tokens,
+                "diff-lab",
+            )
+            .await;
+            request.max_tokens = request_policy.max_output_tokens;
+            request.tool_envelope = Some(request_policy.envelope);
             let started = Instant::now();
             let mut text = String::new();
             let mut reasoning = String::new();
@@ -124,6 +136,7 @@ mod tests {
     struct MockProvider {
         text: &'static str,
         seen_models: Arc<Mutex<Vec<String>>>,
+        seen_envelopes: Arc<Mutex<Vec<Option<String>>>>,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
     }
@@ -135,6 +148,12 @@ mod tests {
             request: ChatRequest,
             sink: &mut (dyn FnMut(StreamEvent) + Send),
         ) -> anyhow::Result<Completion> {
+            self.seen_envelopes.lock().unwrap().push(
+                request
+                    .tool_envelope
+                    .as_ref()
+                    .map(|envelope| envelope.digest.clone()),
+            );
             self.seen_models.lock().unwrap().push(request.model);
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
@@ -159,6 +178,7 @@ mod tests {
             canonical_objective: Some("same prompt".into()),
             messages: Arc::new(vec![Message::user("same prompt")]),
             tools: Arc::from(Vec::new()),
+            tool_envelope: None,
             max_tokens: 128,
             temperature: Some(0.0),
             top_p: None,
@@ -181,11 +201,13 @@ mod tests {
     #[tokio::test]
     async fn fans_out_same_request_concurrently_and_compares_normalized_text() {
         let seen_models = Arc::new(Mutex::new(Vec::new()));
+        let seen_envelopes = Arc::new(Mutex::new(Vec::new()));
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let provider = |text| MockProvider {
             text,
             seen_models: seen_models.clone(),
+            seen_envelopes: seen_envelopes.clone(),
             active: active.clone(),
             max_active: max_active.clone(),
         };
@@ -214,6 +236,10 @@ mod tests {
 
         assert_eq!(verdict.verdict, crate::Verdict::Equivalent);
         assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert!(
+            seen_envelopes.lock().unwrap().iter().all(Option::is_some),
+            "every provider-bound request must carry a sealed envelope"
+        );
         let mut models = seen_models.lock().unwrap().clone();
         models.sort();
         assert_eq!(models, ["pipe/glm-5.2", "pipe/kimi3"]);

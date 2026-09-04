@@ -71,6 +71,7 @@ impl crate::App {
             event_sink: None,
             approval_store: None,
             transcript: Vec::new(),
+            session_projection: Default::default(),
             workflow_revisions: std::collections::HashMap::new(),
             workflow_completion_handoffs: std::collections::HashMap::new(),
             pending: None,
@@ -442,7 +443,7 @@ impl crate::App {
         // workspace.  Do not invoke it after a PipeFS rebind, where that would
         // silently mutate the original local project instead of the active
         // materialization (and outside its durability fence).
-        if agent.workspace_durability_enabled() {
+        if agent.pipefs_workspace_active() {
             return;
         }
         let Some(cb) = &self.session_remember else {

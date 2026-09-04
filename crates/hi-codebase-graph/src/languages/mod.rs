@@ -6,7 +6,6 @@ mod ts;
 pub mod types;
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -119,23 +118,35 @@ impl LanguageRegistry {
     /// The hash is computed by:
     /// 1. Sorting languages by their primary ID for deterministic ordering
     /// 2. Hashing each language's query string in order
-    /// 3. Combining into a single u64 hash
+    /// 3. Combining into a stable, domain-separated BLAKE3 digest
+    /// 4. Truncating to the legacy `u64` storage width in little-endian order
     pub fn compute_query_hash(&self) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-
         // Sort configs by primary language ID for deterministic ordering
         let mut sorted_configs: Vec<_> = self.configs.iter().collect();
         sorted_configs.sort_by_key(|c| c.primary_language_id());
 
-        let mut hasher = DefaultHasher::new();
+        // Query versions are serialized into the persisted index. Keep the
+        // existing u64 wire shape while replacing implementation-defined
+        // DefaultHasher output with a canonical digest.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"hi.codebase-graph.query-version.v1\0");
 
         for config in sorted_configs {
-            // Hash the language ID and query together
-            config.primary_language_id().hash(&mut hasher);
-            config.file_definition_queries().hash(&mut hasher);
+            for value in [
+                config.primary_language_id().as_bytes(),
+                config.file_definition_queries().as_bytes(),
+            ] {
+                hasher.update(&(value.len() as u64).to_le_bytes());
+                hasher.update(value);
+            }
         }
 
-        hasher.finish()
+        let digest = hasher.finalize();
+        u64::from_le_bytes(
+            digest.as_bytes()[..8]
+                .try_into()
+                .expect("BLAKE3 is 32 bytes"),
+        )
     }
 }
 

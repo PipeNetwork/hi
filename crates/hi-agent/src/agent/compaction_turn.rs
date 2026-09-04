@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use hi_ai::{
     ChatRequest, Content, Message, ProviderError, ProviderErrorKind, RequestProfile, Role,
-    StreamEvent, ToolMode,
+    StreamEvent,
 };
 
 use crate::Ui;
@@ -19,6 +19,12 @@ use crate::{COMPACTION_REFERENCE_PREFIX, COMPACTION_SUMMARY_END, SUMMARIZE_PROMP
 pub(crate) struct ContextPreflight {
     pub(crate) max_tokens: u32,
     pub(crate) dropped_prior_context: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ContextWindowLimits {
+    pub(crate) safety: Option<u32>,
+    pub(crate) provider: Option<u32>,
 }
 
 /// Cap recovered recap text so a too-large retry cannot immediately overflow
@@ -105,33 +111,6 @@ impl crate::Agent {
     /// The compaction strategy configured for this session.
     pub fn compaction_kind(&self) -> CompactionKind {
         self.config.memory.compaction.clone()
-    }
-
-    /// Reclaim context using the session's configured strategy. Compaction is
-    /// persisted as a replacement boundary, so resuming starts from the
-    /// compacted transcript.
-    pub async fn compact(&mut self, ui: &mut dyn Ui) -> Result<()> {
-        self.compact_with(self.config.memory.compaction.clone(), ui)
-            .await
-    }
-
-    /// Reclaim context using a specific strategy (e.g. `/compact <kind>`).
-    pub async fn compact_with(&mut self, kind: CompactionKind, ui: &mut dyn Ui) -> Result<()> {
-        // Compaction runs between user turns. Remove ephemeral mode/review/
-        // implementation controls first so a summary cannot fossilize an old
-        // PLAN MODE restriction after the user exits it.
-        self.messages.strip_previous_turn_blocks();
-        self.persisted = self.persisted.min(self.messages.len());
-        match kind {
-            CompactionKind::Summarize => self.compact_summarize(ui).await,
-            CompactionKind::Hybrid { keep_recent } => self.compact_hybrid(keep_recent, ui).await,
-            CompactionKind::ElideToolOutput { keep_recent } => self.compact_elide(keep_recent, ui),
-            CompactionKind::ElideThenSummarizeTail { keep_recent } => {
-                self.compact_elide_then_summarize_tail(keep_recent, ui)
-                    .await
-            }
-            CompactionKind::FreshWindow => self.compact_fresh_window(ui),
-        }
     }
 
     /// Provider byte/request caps can be lower than the model catalog's token
@@ -223,7 +202,7 @@ impl crate::Agent {
         turn_start: usize,
         requested_max_tokens: u32,
         request_tool_schema_tokens: u64,
-        safety_window: Option<u32>,
+        windows: ContextWindowLimits,
         ui: &mut dyn Ui,
     ) -> Result<ContextPreflight> {
         // The *soft* window is the min of the real model window and any
@@ -234,8 +213,10 @@ impl crate::Agent {
         // hard-fail. Otherwise an ordinary read-only question on a 200k-window
         // model would durably discard the whole session the instant its context
         // crossed the 12k safety preference.
-        let soft_window = self.effective_context_window(safety_window);
-        let hard_window = self.effective_context_window(None);
+        let hard_window =
+            min_context_windows(self.effective_context_window(None), windows.provider);
+        let soft_window =
+            min_context_windows(self.effective_context_window(windows.safety), hard_window);
 
         // 1. Already within the soft preference → nothing to do.
         if let Some(soft) = soft_window
@@ -384,150 +365,6 @@ impl crate::Agent {
             .saturating_add(u64::from(max_tokens))
     }
 
-    /// Summarize the whole conversation and reset to system + summary.
-    async fn compact_summarize(&mut self, ui: &mut dyn Ui) -> Result<()> {
-        // Need at least one exchange beyond the system prompt to summarize.
-        if self.messages.len() <= 1 {
-            ui.status("nothing to compact yet");
-            return Ok(());
-        }
-        // Own the slice so it doesn't borrow `self` across the `&mut self` call.
-        let slice = self.messages.as_slice()[1..].to_vec();
-        let Some(summary) = self.summarize(&slice, ui).await? else {
-            ui.status("compaction produced no summary; keeping history");
-            return Ok(());
-        };
-        let system = self.system_message();
-        let next = vec![system, Message::user(reference_summary_block(&summary))];
-        self.replace_history_with_compaction(next)?;
-        self.runtime.invalidate_context_after_compaction();
-        ui.status("✓ compacted — context reset to the summary");
-        Ok(())
-    }
-
-    /// Keep the last `keep_recent` user turns verbatim; summarize everything
-    /// older and fold the brief into the first kept turn. Folding (rather than
-    /// inserting a separate summary message) avoids two consecutive user
-    /// messages, which some providers reject.
-    async fn compact_hybrid(&mut self, keep_recent: usize, ui: &mut dyn Ui) -> Result<()> {
-        if keep_recent == 0 {
-            return self.compact_summarize(ui).await;
-        }
-        let Some(split) = compaction::recent_split(self.messages.as_slice(), keep_recent) else {
-            // Nothing older than the recent window — summarize everything so a
-            // triggered compaction still makes progress.
-            return self.compact_summarize(ui).await;
-        };
-        let old = self.messages.as_slice()[1..split].to_vec();
-        let Some(summary) = self.summarize(&old, ui).await? else {
-            ui.status("compaction produced no summary; keeping history");
-            return Ok(());
-        };
-
-        let system = self.system_message();
-        let mut recent = self.messages.as_slice()[split..].to_vec();
-        let head = recent[0].text();
-        recent[0] = Message::user(fold_reference_summary_into_user(&summary, &head));
-        let mut next = Vec::with_capacity(recent.len() + 1);
-        next.push(system);
-        next.extend(recent);
-        self.replace_history_with_compaction(next)?;
-        self.runtime.invalidate_context_after_compaction();
-        ui.status("✓ compacted — kept recent turns, summarized the rest");
-        Ok(())
-    }
-
-    /// Elide-first, summarize-only-the-conversational-tail. Keep the recent
-    /// `keep_recent` turns verbatim (their tool results elided, skeleton kept).
-    /// For old turns: **keep** the tool-bearing ones in history with their bulky
-    /// output elided (the call/result skeleton stays, so the model remembers
-    /// "I read file X" — just without the verbatim output), and summarize only
-    /// the tool-free Q&A turns into a brief folded into the first kept turn. A
-    /// pure tool-heavy session with no old Q&A makes no model call at all — just
-    /// the deterministic elision.
-    async fn compact_elide_then_summarize_tail(
-        &mut self,
-        keep_recent: usize,
-        ui: &mut dyn Ui,
-    ) -> Result<()> {
-        if keep_recent == 0 {
-            return self.compact_summarize(ui).await;
-        }
-        let Some(split) = compaction::recent_split(self.messages.as_slice(), keep_recent) else {
-            // Nothing older than the recent window — fall back to summarizing
-            // everything so a triggered compaction still makes progress.
-            return self.compact_summarize(ui).await;
-        };
-        // Elide bulky tool output in an owned copy. The live transcript is only
-        // replaced after the durable boundary is recorded.
-        let mut working = self.messages.as_slice().to_vec();
-        compaction::elide_tool_outputs(&mut working, split);
-
-        // Summarize only the conversational (tool-free) old tail. The tool-bearing
-        // old turns are NOT summarized — they stay in history, elided.
-        let convo = compaction::conversational_tail(&working, split);
-        let summary = if convo.is_empty() {
-            None
-        } else {
-            self.summarize(&convo, ui).await?
-        };
-
-        // Rebuild: system + old tool-bearing turns (elided, kept) + recent turns
-        // (with the Q&A summary folded into the first recent turn). The old
-        // Q&A-only messages are dropped (replaced by the summary).
-        let system = self.system_message();
-        let old = compaction::tool_bearing_turns(&working, split);
-        let mut recent = working[split..].to_vec();
-        let had_summary = summary.is_some();
-        if let Some(summary) = summary {
-            // Fold the brief into the first kept turn (avoids two consecutive
-            // user messages, which some providers reject) — same shape as
-            // `compact_hybrid`. If the old tool-bearing region is non-empty, the
-            // summary sits between it and the recent turns as a user message.
-            // A preserved tool-bearing turn ends with either a ToolResult or a
-            // final Assistant answer, so the folded recent User turn alternates
-            // correctly.
-            let head = recent[0].text();
-            recent[0] = Message::user(fold_reference_summary_into_user(&summary, &head));
-        }
-        let mut next = Vec::with_capacity(1 + old.len() + recent.len());
-        next.push(system);
-        next.extend(old);
-        next.extend(recent);
-        self.replace_history_with_compaction(next)?;
-        self.runtime.invalidate_context_after_compaction();
-        if had_summary {
-            ui.status("✓ compacted — elided old tool output, summarized the Q&A tail");
-        } else {
-            ui.status("✓ compacted — elided old tool output (no Q&A tail to summarize)");
-        }
-        Ok(())
-    }
-
-    /// Deterministically shrink the bulky output of old tool calls. No model
-    /// call. Persisted as a replacement boundary, like the summary strategies.
-    fn compact_elide(&mut self, keep_recent: usize, ui: &mut dyn Ui) -> Result<()> {
-        // Only turns older than the recent window are eligible; if everything is
-        // recent there's nothing to elide.
-        let Some(split) = compaction::recent_split(self.messages.as_slice(), keep_recent) else {
-            ui.status("nothing old to elide");
-            return Ok(());
-        };
-        let mut next = self.messages.as_slice().to_vec();
-        let freed = compaction::elide_tool_outputs(&mut next, split);
-        if freed > 0 {
-            self.replace_history_with_compaction(next)?;
-            self.runtime.invalidate_context_after_compaction();
-            ui.status(&format!(
-                "✓ elided ~{}k chars of old tool output",
-                freed / 1000
-            ));
-        } else {
-            ui.status("nothing old to elide");
-        }
-        Ok(())
-    }
-
     pub(crate) fn elide_in_turn_context_if_needed(
         &mut self,
         _ui: &mut dyn Ui,
@@ -568,7 +405,11 @@ impl crate::Agent {
     /// Run the summarization model call over `slice`, returning the summary text
     /// (trimmed), or `None` if the model produced nothing. Shared by the
     /// Summarize and Hybrid strategies.
-    async fn summarize(&mut self, slice: &[Message], ui: &mut dyn Ui) -> Result<Option<String>> {
+    pub(super) async fn summarize(
+        &mut self,
+        slice: &[Message],
+        ui: &mut dyn Ui,
+    ) -> Result<Option<String>> {
         ui.status("compacting the conversation…");
 
         // Elide bulky tool outputs before sending to the model — the summary
@@ -584,15 +425,18 @@ impl crate::Agent {
         messages.push(Message::user(SUMMARIZE_PROMPT));
         repair_invalid_tool_call_arguments_in_messages(&mut messages);
 
+        let model = self.config.routing.model.clone();
+        let request_policy = self.seal_chat_only_auxiliary_request(&model, 1024).await;
         let request = ChatRequest {
-            model: self.config.routing.model.clone(),
+            model,
             request_id: None,
             retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: Arc::from(messages),
-            tools: Arc::new([]), // summarizing — no tool use
-            max_tokens: 1024,    // throwaway call — summaries are short
+            tools: request_policy.tools,
+            tool_envelope: Some(request_policy.envelope),
+            max_tokens: request_policy.max_tokens,
             temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -600,7 +444,7 @@ impl crate::Agent {
             reasoning_effort: None,
             profile: RequestProfile {
                 compat: self.config.routing.compat,
-                tool_mode: ToolMode::ChatOnly,
+                tool_mode: request_policy.tool_mode,
                 stream_usage: None,
                 deepseek_compat: self.config.routing.deepseek_compat,
                 deepseek_strict: None,
@@ -671,6 +515,14 @@ impl crate::Agent {
     }
 }
 
+fn min_context_windows(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 const MAX_COMPACTION_SUMMARY_CHARS: usize = 6_000;
 
 fn clip_summary(summary: &str) -> String {
@@ -684,14 +536,14 @@ fn clip_summary(summary: &str) -> String {
     format!("{clipped}…")
 }
 
-fn reference_summary_block(summary: &str) -> String {
+pub(super) fn reference_summary_block(summary: &str) -> String {
     format!(
         "{COMPACTION_REFERENCE_PREFIX}\n\n{}\n\n{COMPACTION_SUMMARY_END}",
         clip_summary(summary)
     )
 }
 
-fn fold_reference_summary_into_user(summary: &str, latest_user: &str) -> String {
+pub(super) fn fold_reference_summary_into_user(summary: &str, latest_user: &str) -> String {
     format!(
         "{}\n\n--- LATEST USER MESSAGE ---\n\n{}",
         reference_summary_block(summary),

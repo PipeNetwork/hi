@@ -78,6 +78,124 @@ fn turn_record_survives_broken_outbox_store() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn workspace_execution_stages_locally_without_a_live_remote_lease() {
+    let sink = RemoteSessionSink::new_for_test(
+        unreachable_config(),
+        "workspace-stage-after-lease-loss".to_string(),
+    );
+    sink.set_pipefs_sync_required(true);
+    let record = hi_agent::WorkspaceTranscriptExecution {
+        schema_version: hi_agent::WorkspaceTranscriptExecution::SCHEMA_VERSION,
+        operation_id: hi_workspace::OperationId::new("operation-1"),
+        assistant_content: vec![hi_ai::Content::Text("running edit".into())],
+        calls: vec![hi_agent::WorkspaceTranscriptCall {
+            call_id: "call-1".into(),
+            name: "edit".into(),
+            result: "done".into(),
+        }],
+        execution: hi_workspace::ExecutionReport::succeeded(Some("digest-1".into())),
+    };
+
+    sink.stage_workspace_execution(&record)
+        .expect("local recovery evidence must not depend on a remote lease");
+    let queued = sink
+        .store
+        .ready_records("workspace-stage-after-lease-loss", 10)
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].record_type, RECORD_TYPE_USAGE);
+    let compatibility_payload =
+        serde_json::from_str::<serde_json::Value>(&queued[0].payload_json).unwrap();
+    assert_eq!(compatibility_payload["type"], "workspace_execution");
+    assert_eq!(compatibility_payload["operation_id"], "operation-1");
+    let replayed = crate::session::load_history_from_records(&[crate::session::RemoteRecord {
+        record_type: queued[0].record_type.clone(),
+        payload_json: queued[0].payload_json.clone(),
+    }])
+    .unwrap();
+    assert!(
+        replayed.messages.is_empty(),
+        "carrier is not a visible message"
+    );
+    assert_eq!(replayed.usage, Usage::default());
+
+    let store = sink.store.clone();
+    drop(sink);
+    let restarted = RemoteSessionSink::with_store(
+        unreachable_config(),
+        "workspace-stage-after-lease-loss".to_string(),
+        None,
+        remote_session_http_client(),
+        store,
+    );
+    restarted.set_pipefs_sync_required(true);
+    let causal = restarted.causal_pipefs_transcript_batch().unwrap();
+    assert_eq!(causal.records.len(), 1);
+    assert_eq!(causal.records[0].record_type, "workspace_execution");
+    assert_eq!(
+        causal.records[0].payload,
+        serde_json::to_value(&record).unwrap()
+    );
+    let operation = hi_pipefs::CausalOperationReceipt {
+        operation_id: "operation-1".into(),
+        idempotency_key: "operation-key".into(),
+        binding_id: "binding-1".into(),
+        binding_epoch: 1,
+        replay_class: hi_workspace::ReplayClass::PureWorkspace,
+        execution: record.execution.clone(),
+    };
+    restarted
+        .ensure_compatibility_workspace_execution(&operation)
+        .expect("the exact queued execution is compatibility recovery proof");
+    let mut wrong_batch = causal.clone();
+    wrong_batch.records[0].payload["execution"]["detail"] =
+        serde_json::Value::String("different result".into());
+    let mismatch = restarted
+        .acknowledge_causal_pipefs_transcript(&wrong_batch, 1)
+        .unwrap_err();
+    assert!(mismatch.to_string().contains("does not exactly match"));
+    let stale = restarted
+        .acknowledge_causal_pipefs_transcript(&causal, 0)
+        .unwrap_err();
+    assert!(stale.to_string().contains("outbox retained"));
+    assert_eq!(
+        restarted
+            .store
+            .ready_records("workspace-stage-after-lease-loss", 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    restarted
+        .acknowledge_causal_pipefs_transcript(&causal, 1)
+        .unwrap();
+    assert!(
+        restarted
+            .store
+            .ready_records("workspace-stage-after-lease-loss", 10)
+            .unwrap()
+            .is_empty()
+    );
+    restarted
+        .ensure_compatibility_workspace_execution(&operation)
+        .expect("acknowledgement and outbox deletion must be one durable proof transition");
+    assert_eq!(
+        restarted
+            .compatibility_workspace_execution_cursor(&operation)
+            .unwrap(),
+        1
+    );
+    let mut mismatched = operation;
+    mismatched.execution.detail = Some("different result".into());
+    assert!(
+        restarted
+            .ensure_compatibility_workspace_execution(&mismatched)
+            .is_err(),
+        "a cursor for another execution must not release recovery evidence"
+    );
+}
+
 /// The `--session-file` collision bug: session ids derive from the file
 /// stem, so a second session at a same-named path inherits the first
 /// session's byte offset into a different file. Reconcile must reset the
@@ -227,6 +345,13 @@ fn session_snapshot_backfills_state_and_title() {
             ..Usage::default()
         },
         checkpoint_refs: vec!["checkpoint-1".into()],
+        harness_settings: hi_workspace::SettingLayer {
+            source: hi_workspace::SettingSource::Session,
+            values: std::collections::BTreeMap::from([(
+                hi_workspace::JOB_MAX_ACTIVE.to_string(),
+                hi_workspace::SettingValue::Integer(7),
+            )]),
+        },
         remote_session_id: None,
         pipefs_enabled: Some(true),
         name: Some("Named portal session".into()),
@@ -264,6 +389,7 @@ fn session_snapshot_backfills_state_and_title() {
             RECORD_TYPE_STATE_REPLACEMENT.to_string(),
             RECORD_TYPE_USAGE.to_string(),
             RECORD_TYPE_CHECKPOINTS.to_string(),
+            crate::session_harness::RECORD_TYPE.to_string(),
             RECORD_TYPE_PLAN_DRIVE.to_string(),
             RECORD_TYPE_PLAN_APPROVAL.to_string(),
             RECORD_TYPE_GOAL_DRIVE.to_string(),
@@ -288,6 +414,7 @@ fn session_snapshot_backfills_state_and_title() {
     assert_eq!(restored.goal_drive_stall, 3);
     assert_eq!(restored.plan_drive_evidence, vec!["a".repeat(64)]);
     assert_eq!(restored.goal_drive_evidence, vec!["b".repeat(64)]);
+    assert_eq!(restored.harness_settings, loaded.harness_settings);
 }
 
 #[test]
@@ -298,6 +425,7 @@ fn session_snapshot_emits_default_drive_state_to_clear_remote_stale_values() {
         messages: Vec::new(),
         usage: Usage::default(),
         checkpoint_refs: Vec::new(),
+        harness_settings: crate::session_harness::empty_layer(),
         remote_session_id: None,
         pipefs_enabled: None,
         name: None,
@@ -326,6 +454,7 @@ fn session_snapshot_emits_default_drive_state_to_clear_remote_stale_values() {
         record_types,
         vec![
             RECORD_TYPE_STATE_REPLACEMENT.to_string(),
+            crate::session_harness::RECORD_TYPE.to_string(),
             RECORD_TYPE_PLAN_DRIVE.to_string(),
             RECORD_TYPE_PLAN_APPROVAL.to_string(),
             RECORD_TYPE_GOAL_DRIVE.to_string(),

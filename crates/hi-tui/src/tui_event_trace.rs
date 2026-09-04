@@ -691,9 +691,7 @@ mod tests {
             output_token_parameter: "max_tokens".into(),
             max_output_tokens: 512,
             temperature: Some(0.2),
-            top_p: None,
             reasoning_request: Some("high".into()),
-            reasoning_replay: None,
             native_tools_enabled: true,
             tool_count: 7,
             strict_schema: true,
@@ -706,6 +704,7 @@ mod tests {
                 "authorization": "Bearer private-key"
             })),
             response_status: Some(200),
+            ..hi_ai::WireAudit::default()
         }
     }
 

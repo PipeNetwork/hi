@@ -3752,6 +3752,7 @@ dependencies = [
  "hi-update",
  "hi-verifier",
  "hi-workflow",
+ "hi-workspace",
  "hi-x402",
  "ignore",
  "libc",
@@ -3780,6 +3781,7 @@ dependencies = [
  "futures-util",
  "hi-agent-lifecycle",
  "hi-ai",
+ "hi-control",
  "hi-engine-api",
  "hi-engine-host",
  "hi-events",
@@ -3790,6 +3792,7 @@ dependencies = [
  "hi-secrets",
  "hi-tools",
  "hi-workflow",
+ "hi-workspace",
  "ignore",
  "libc",
  "serde",
@@ -3910,6 +3913,7 @@ name = "hi-codebase-graph"
 version = "0.3.1"
 dependencies = [
  "ahash",
+ "blake3",
  "clap",
  "crossbeam",
  "dashmap 6.2.1",
@@ -3944,15 +3948,18 @@ name = "hi-control"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "blake3",
  "hi-events",
  "hi-policy",
  "hi-sqlite-journal",
+ "hi-workspace",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
  "uuid",
 ]
 
@@ -3974,6 +3981,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "hi-ai",
+ "hi-tools",
  "rand 0.8.7",
  "serde",
  "serde_json",
@@ -4165,8 +4173,10 @@ name = "hi-pipefs"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "blake3",
  "filetime",
+ "hi-workspace",
  "reqwest",
  "rustix",
  "serde",
@@ -4319,7 +4329,9 @@ dependencies = [
  "hi-ai",
  "hi-provider-config",
  "hi-tools",
+ "hi-workspace",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "uuid",
@@ -4380,6 +4392,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "blake3",
  "futures-util",
  "hi-ai",
  "hi-browser",
@@ -4389,6 +4402,7 @@ dependencies = [
  "hi-research",
  "hi-secrets",
  "hi-tool-host",
+ "hi-workspace",
  "ignore",
  "libc",
  "reflink-copy",
@@ -4399,9 +4413,13 @@ dependencies = [
  "sha2 0.10.9",
  "similar",
  "tempfile",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-util",
  "toml 0.8.23",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "uuid",
 ]
 
 [[package]]
@@ -4517,6 +4535,19 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "hi-workspace"
+version = "0.3.1"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -10681,6 +10712,16 @@ dependencies = [
  "regex-syntax",
  "serde_json",
  "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-bash"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e5ec769279cc91b561d3df0d8a5deb26b0ad40d183127f409494d6d8fc53062"
+dependencies = [
+ "cc",
  "tree-sitter-language",
 ]
 

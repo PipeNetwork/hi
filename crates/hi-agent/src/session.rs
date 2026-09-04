@@ -2,7 +2,35 @@
 //! through a [`SessionSink`]; the CLI provides a JSONL-file implementation.
 
 use anyhow::Result;
-use hi_ai::{Message, Usage};
+use hi_ai::{Content, Message, Usage};
+
+/// One provider-facing result sealed into a workspace settlement transcript.
+///
+/// This record is deliberately independent of the ordinary JSONL message
+/// projection. PipeFS stages it in the remote outbox before workspace
+/// settlement, so the causal commit can acknowledge the exact result that is
+/// about to become visible to the model. The ordinary assistant/tool messages
+/// are appended only after that acknowledgement.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceTranscriptCall {
+    pub call_id: String,
+    pub name: String,
+    pub result: String,
+}
+
+/// Durable execution evidence paired with one workspace operation.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceTranscriptExecution {
+    pub schema_version: u16,
+    pub operation_id: hi_workspace::OperationId,
+    pub assistant_content: Vec<Content>,
+    pub calls: Vec<WorkspaceTranscriptCall>,
+    pub execution: hi_workspace::ExecutionReport,
+}
+
+impl WorkspaceTranscriptExecution {
+    pub const SCHEMA_VERSION: u16 = 1;
+}
 
 /// Records conversation messages durably. Implementations do their own IO.
 pub trait SessionSink: Send {
@@ -22,6 +50,17 @@ pub trait SessionSink: Send {
 
     /// Append `messages` (the ones produced since the last call) to storage.
     fn record(&mut self, messages: &[Message], usage: Usage) -> Result<()>;
+
+    /// Stage the exact result of an admitted workspace operation for a causal
+    /// durability commit.
+    ///
+    /// Local-only sessions never call this hook. A PipeFS host must override
+    /// it and durably enqueue the record before returning; the default fails
+    /// closed so a remote workspace can never silently settle against an
+    /// empty or one-step-behind transcript batch.
+    fn stage_workspace_execution(&mut self, _record: &WorkspaceTranscriptExecution) -> Result<()> {
+        anyhow::bail!("this session sink cannot stage a workspace execution transcript")
+    }
 
     /// Persist a compaction boundary: the compacted messages replace all prior
     /// messages in storage, so a resumed session starts from the compacted state.

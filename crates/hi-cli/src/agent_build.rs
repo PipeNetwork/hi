@@ -10,7 +10,9 @@ use hi_ai::Provider;
 use crate::config::{Cli, QualitySettings, RsiRequested, Settings, permits_missing_checkpoint};
 use crate::goal_drive;
 use crate::landing::LoadedAgentSession;
-use crate::project_context::{load_project_context_from, load_standing_rules};
+use crate::project_context::{
+    load_candidate_project_context_from, load_standing_rules, load_trust_aware_project_context_from,
+};
 use crate::provider::{LiveModelMetadata, provider_label};
 
 pub(crate) struct BuiltAgent {
@@ -81,6 +83,8 @@ pub(crate) fn build_agent(
             ..hi_agent::AgentGates::default()
         },
         loop_limits: resolved_loop_limits(cli, effective_max_steps, effective_max_tool_calls),
+        harness: settings.harness.clone(),
+        harness_session: Some(settings.session_harness.clone()),
         memory: hi_agent::AgentMemory {
             tool_set: quality.tool_set,
             disabled_tools: crate::tool_trim::disabled_tools(&state_root),
@@ -110,7 +114,16 @@ pub(crate) fn build_agent(
             offer_memory: !cli.no_memory && !cli.no_save,
             offer_browser: settings.browser_enabled,
             browser_allow_private: settings.browser_allow_private,
-            project_context: load_project_context_from(&workspace_root),
+            project_context: if cli.subagent {
+                load_candidate_project_context_from(&workspace_root)
+            } else {
+                load_trust_aware_project_context_from(&workspace_root)
+            },
+            // Detached write children must not execute repository skills. A
+            // project-local pack may shadow a built-in pack with the same
+            // slug, so disable automatic pack injection at the Agent boundary.
+            inject_review_skill: !cli.subagent,
+            inject_stack_skill: !cli.subagent,
             standing_rules: load_standing_rules(),
             context_exclusions: quality.context_exclusions.clone(),
             auto_compact: !cli.no_auto_compact,
@@ -169,7 +182,7 @@ pub(crate) fn build_agent(
             remote_switch: rsi_remote_switch.clone(),
             control: rsi_control,
         },
-        suppress_initial_project_hooks: defer_launch_workspace_runtime,
+        suppress_initial_project_hooks: defer_launch_workspace_runtime || cli.subagent,
         defer_initial_lsp: defer_launch_workspace_runtime,
         ..AgentConfig::default()
     };
@@ -187,6 +200,7 @@ pub(crate) fn build_agent(
     let restored_goal_drive = loaded
         .as_ref()
         .map(|l| (l.goal_drive_stall, l.goal_drive_evidence.clone()));
+    let declared_provider_capabilities = provider.capabilities();
     let agent_result = match loaded {
         Some(loaded) => Agent::resume(
             provider,
@@ -200,6 +214,18 @@ pub(crate) fn build_agent(
         None => Agent::with_background_scan(provider, agent_config, ledger_scan),
     };
     let mut agent = agent_result.context("initializing workspace runtime")?;
+    if let Some(capabilities) = &live_metadata.provider_capabilities {
+        let registry = hi_ai::ProviderCapabilityRegistry::default();
+        registry.seed_observation(
+            hi_ai::CapabilityRoute::new(provider_label(settings.provider), settings.model.clone()),
+            declared_provider_capabilities,
+            hi_ai::CapabilityProbeObservation {
+                capabilities: capabilities.clone(),
+                actual_model_revision: capabilities.actual_model_revision.clone(),
+            },
+        );
+        agent.set_provider_capability_registry(registry);
+    }
     agent.set_usage_pricing(live_metadata.price);
     agent.restore_plan(restored_plan);
     if std::env::var_os("HI_LOOP_ID").is_some()

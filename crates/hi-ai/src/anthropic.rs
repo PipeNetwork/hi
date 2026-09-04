@@ -17,6 +17,8 @@ use crate::types::{
     estimate_completion_output_tokens, estimate_request_input_tokens,
 };
 
+mod wire_audit;
+
 const API_VERSION: &str = "2023-06-01";
 
 /// Upper bound on content blocks in one response — the per-event `index`
@@ -42,10 +44,7 @@ impl AnthropicProvider {
 #[async_trait]
 impl Provider for AnthropicProvider {
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            native_tool_calls: true,
-            streamed_tool_call_deltas: true,
-        }
+        ProviderCapabilities::native_tools(true)
     }
 
     async fn stream(
@@ -72,8 +71,10 @@ impl Provider for AnthropicProvider {
             .with_api_contract(None, Some(true), None)
         })?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        wire_audit::emit(sink, &request, &self.base_url, &body, status);
+
+        if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             let kind = if is_policy_blocked_text(&text) {
                 ProviderErrorKind::PolicyBlocked
@@ -812,6 +813,7 @@ mod tests {
                 description: "Read a file".into(),
                 parameters: json!({"type": "object"}),
             }]),
+            tool_envelope: None,
             max_tokens: 64,
             temperature: None,
             top_p: None,
@@ -845,6 +847,7 @@ mod tests {
             canonical_objective: None,
             messages: Arc::new(vec![Message::user("cached prompt")]),
             tools: Arc::from([]),
+            tool_envelope: None,
             max_tokens: 64,
             temperature: None,
             top_p: None,

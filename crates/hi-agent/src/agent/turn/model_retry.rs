@@ -89,6 +89,7 @@ impl crate::Agent {
     pub(super) async fn handle_provider_stream(
         &mut self,
         request: ChatRequest,
+        tool_envelope: std::sync::Arc<hi_tools::envelope::ToolEnvelope>,
         read_only_intent: Option<crate::steering::ReviewIntent>,
         implementation_intent: Option<ImplementationIntent>,
         buffer_text_for_steering: bool,
@@ -126,6 +127,7 @@ impl crate::Agent {
         effective_fallback_route: &mut Option<String>,
         ui: &mut dyn Ui,
     ) -> Result<ProviderStreamResult> {
+        self.validate_and_audit_request_envelope(&request, &tool_envelope)?;
         let buffer_read_only_review_text = buffer_text_for_steering
             || read_only_intent.is_some()
             || implementation_intent.is_some();
@@ -138,7 +140,7 @@ impl crate::Agent {
             .tools
             .iter()
             .any(|tool| tool.name == "run_program")
-            .then(|| self.program_speculator());
+            .then(|| self.program_speculator(&tool_envelope));
         let mut sink = |event: StreamEvent| match event {
             StreamEvent::Text(text) => {
                 if buffer_read_only_review_text {
@@ -150,14 +152,13 @@ impl crate::Agent {
             }
             StreamEvent::Reasoning(text) => ui.assistant_reasoning(&text),
             StreamEvent::WireAudit(audit) => {
-                // Deliver wire evidence at the provider callback, before tool
-                // execution or an approval can suspend turn settlement. The
-                // frontend owns the persistence sanitizer; telemetry below is
-                // separately redacted for the typed turn report.
+                // Deliver wire evidence before execution or approval can
+                // suspend settlement. The report copy is separately redacted.
                 ui.provider_request(audit.as_ref());
                 let mut value = serde_json::to_value(audit.as_ref()).unwrap_or_default();
                 if let Some(object) = value.as_object_mut() {
                     object.remove("request_body");
+                    super::model_request::attach_tool_envelope_audit(object, &tool_envelope);
                 }
                 self.report.last_turn_telemetry.record_wire_audit(value);
             }

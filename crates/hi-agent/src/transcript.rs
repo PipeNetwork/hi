@@ -486,14 +486,14 @@ pub(crate) fn strip_turn_scoped_user_text(text: &str) -> String {
 #[derive(Clone, Debug)]
 pub(crate) struct Transcript {
     messages: Arc<Vec<Message>>,
+    revision: u64,
 }
 
 impl Transcript {
     /// Wrap an existing history (e.g. the system prompt, or resumed history).
     pub(crate) fn new(mut messages: Vec<Message>) -> Self {
-        // Older sessions may contain tool results produced before every
-        // model-facing tool path enforced the shared output budget. Keep the
-        // durable JSONL intact for auditability, but never put an oversized
+        // Older sessions may predate the shared tool-output budget. Keep the
+        // durable JSONL intact, but never put an oversized
         // legacy result back into provider context when the session resumes.
         for message in &mut messages {
             for block in &mut message.content {
@@ -503,8 +503,7 @@ impl Transcript {
                 }
             }
         }
-        // Keep the newest user-turn's write/edit payloads intact so the model
-        // can still quote what it just wrote. Older bulky arguments are stubbed.
+        // Keep newest-turn write/edit payloads intact; stub older bulky arguments.
         if let Some(split) =
             crate::compaction::recent_split(&messages, crate::compaction::DEFAULT_KEEP_RECENT)
         {
@@ -512,12 +511,12 @@ impl Transcript {
         }
         Self {
             messages: Arc::new(messages),
+            revision: 0,
         }
     }
 
-    /// The shared handle, for `ChatRequest::messages` and `record_compaction`.
-    /// Cloning the `Arc` is a refcount bump — in-flight requests keep their
-    /// snapshot until a mutation forces a unique copy via [`make_mut`].
+    /// Shared handle for requests and persistence. In-flight requests retain
+    /// their snapshot until mutation forces a unique copy via [`make_mut`].
     pub(crate) fn arc(&self) -> Arc<Vec<Message>> {
         Arc::clone(&self.messages)
     }
@@ -538,22 +537,25 @@ impl Transcript {
         &self.messages
     }
 
+    /// Monotonic generation used to reject stale speculative work, including ABA.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// The last message, if any.
     #[allow(dead_code)]
     pub(crate) fn last(&self) -> Option<&Message> {
         self.messages.last()
     }
 
-    /// A unique mutable reference to the backing `Vec`, cloning if an in-flight
-    /// `ChatRequest` still holds the `Arc` (refcount > 1). Preserves the
-    /// `Arc::make_mut` optimization: repeated tool rounds without a model call
-    /// avoid copying the history.
+    /// A unique mutable backing `Vec`, cloning only if another `Arc` owns the
+    /// current snapshot.
     fn make_mut(&mut self) -> &mut Vec<Message> {
+        self.revision = self.revision.saturating_add(1);
         Arc::make_mut(&mut self.messages)
     }
 
     // ---- basic appends -------------------------------------------------
-
     /// Append a plain user message (real user input).
     pub(crate) fn push_user(&mut self, text: impl Into<String>) {
         self.make_mut().push(Message::user(text));
@@ -725,10 +727,8 @@ impl Transcript {
     /// fresh blocks are attached, so only the current mode/review/build guard
     /// remains authoritative.
     ///
-    /// The legacy cleanup is deliberate migration code for sessions written
-    /// before turn controls were delimited. Those sessions persisted a bare
-    /// `You are in PLAN MODE` prefix (and sometimes a read-only review suffix)
-    /// as if it were durable user intent. Preserve only the actual request.
+    /// Legacy sessions persisted turn controls as durable intent; preserve
+    /// only their actual request.
     pub(crate) fn strip_previous_turn_blocks(&mut self) {
         let has_block = self.messages.iter().any(|message| {
             message.role == Role::User
@@ -896,7 +896,7 @@ impl Transcript {
             }
             repaired.push(message);
         }
-        self.messages = Arc::new(repaired);
+        self.replace_all(repaired);
     }
 
     /// Repair legacy/corrupted histories with adjacent assistant turns.
@@ -921,7 +921,7 @@ impl Transcript {
             }
             repaired.push(message);
         }
-        self.messages = Arc::new(repaired);
+        self.replace_all(repaired);
     }
 
     /// Repair legacy/corrupted histories whose tool results are not immediately
@@ -975,7 +975,7 @@ impl Transcript {
                 }
             }
         }
-        self.messages = Arc::new(repaired);
+        self.replace_all(repaired);
     }
 
     /// Repair malformed tool-call argument blocks loaded from older sessions or
@@ -1059,8 +1059,7 @@ impl Transcript {
     /// A prior nudge is replaceable only when it *immediately precedes* the
     /// trailing run of `Tool`/`Assistant` messages — i.e. the tail is exactly
     /// the prior nudge's response cycle. Then that cycle and the nudge are
-    /// popped and the fresh nudge pushed. Otherwise (first round of this turn,
-    /// or any other message in between) the nudge is simply appended: deciding
+    /// popped and the fresh nudge pushed. Otherwise the nudge is appended: deciding
     /// off a marker anywhere in history — as this used to — meant a stale
     /// nudge from an *earlier* turn erased the current turn's work and left
     /// two consecutive user messages.
@@ -1159,6 +1158,7 @@ impl Transcript {
 
     /// Replace the entire history with `messages` (compaction strategies).
     pub(crate) fn replace_all(&mut self, messages: Vec<Message>) {
+        self.revision = self.revision.saturating_add(1);
         self.messages = Arc::new(messages);
     }
 

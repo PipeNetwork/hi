@@ -1,15 +1,16 @@
 //! The CLI's write-`delegate` subagent runner.
 //!
-//! A delegate works in an isolated Git worktree based on an immutable snapshot
-//! of the parent's current tree. Only a typed successful child outcome with a
-//! non-empty, independently verified diff is eligible for transactional merge.
+//! A delegate works in a detached candidate with private Git metadata and an
+//! exact snapshot of the parent's current tree. Only a typed successful child
+//! outcome with a non-empty, independently verified diff is eligible for a
+//! fenced transactional merge.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -19,13 +20,15 @@ use hi_tools::ToolStatus;
 
 use crate::candidate_gate::{
     independently_verify_candidate_cached, inspect_child_report, is_destination_verify_cancelled,
-    is_verifier_cancelled, repository_root, same_paths, staged_candidate_diff,
+    is_verifier_cancelled, same_paths, staged_candidate_diff,
 };
-use crate::candidate_merge::apply_candidate_and_reverify_cancellable;
+use crate::candidate_merge::apply_candidate_and_reverify_cancellable_at_base;
 use crate::delegate_events;
 use crate::resource_governor::{self, ResourceClass};
 
 const DELEGATE_SETTLEMENT_GRACE_SECS: u64 = 60;
+const DEFAULT_DELEGATE_QUEUE_TIMEOUT_SECS: u64 = 5 * 60;
+const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 15 * 60;
 const DEFAULT_GLOBAL_DELEGATE_CONCURRENCY: usize = 4;
 const MAX_GLOBAL_DELEGATE_CONCURRENCY: usize = 16;
 
@@ -250,7 +253,7 @@ pub struct CliDelegateRunner {
     model: String,
     base_url: String,
     api_key: String,
-    default_verify: Option<String>,
+    configured_verify: Option<String>,
     /// `0` means no explicit cap; positive values are forwarded to children.
     /// Atomic because `/config steps` can change it after this runner is
     /// attached to the long-lived interactive Agent.
@@ -259,9 +262,15 @@ pub struct CliDelegateRunner {
     /// managed zero budget) is forwarded losslessly to children.
     max_tool_calls: AtomicU64,
     max_verify: u32,
+    workspace: RwLock<DelegateWorkspaceBinding>,
+    counter: AtomicU32,
+}
+
+#[derive(Clone)]
+struct DelegateWorkspaceBinding {
     workspace_root: PathBuf,
     state_root: PathBuf,
-    counter: AtomicU32,
+    default_verify: Option<String>,
 }
 
 impl CliDelegateRunner {
@@ -279,34 +288,21 @@ impl CliDelegateRunner {
         workspace_root: PathBuf,
         state_root: PathBuf,
     ) -> Result<Self> {
-        let workspace_root = canonical_directory(&workspace_root, "delegate workspace root")?;
-        std::fs::create_dir_all(&state_root)
-            .with_context(|| format!("creating delegate state root {}", state_root.display()))?;
-        let state_root = canonical_directory(&state_root, "delegate state root")?;
-        ensure!(
-            state_root != workspace_root && !workspace_root.starts_with(&state_root),
-            "delegate state root must not equal or contain the workspace root"
-        );
-        // No configured verify pipeline used to mean "delegate unavailable".
-        // Known project types have an obvious build gate, and a delegate whose
-        // work must compile is strictly safer than no delegate at all — the
-        // child also gets its verify-repair loop, so gate failures feed the
-        // compiler error back to the model before anything is rejected.
-        let default_verify = default_verify
-            .filter(|command| !command.trim().is_empty())
-            .or_else(|| derive_default_verify(&workspace_root));
+        let configured_verify = default_verify.filter(|command| !command.trim().is_empty());
+        let workspace =
+            delegate_workspace_binding(&workspace_root, &state_root, configured_verify.as_deref())?;
+        // Derive a conservative build gate when no verifier was configured.
         Ok(Self {
             exe,
             provider,
             model,
             base_url,
             api_key,
-            default_verify,
+            configured_verify,
             max_steps: AtomicU32::new(max_steps.unwrap_or(0)),
             max_tool_calls: AtomicU64::new(encode_optional_u32(max_tool_calls)),
             max_verify,
-            workspace_root,
-            state_root,
+            workspace: RwLock::new(workspace),
             counter: AtomicU32::new(0),
         })
     }
@@ -325,6 +321,30 @@ impl CliDelegateRunner {
 
 #[async_trait]
 impl DelegateRunner for CliDelegateRunner {
+    fn bind_workspace(&self, workspace_root: &Path, state_root: &Path) -> bool {
+        let Ok(binding) = delegate_workspace_binding(
+            workspace_root,
+            state_root,
+            self.configured_verify.as_deref(),
+        ) else {
+            return false;
+        };
+        *self
+            .workspace
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = binding;
+        true
+    }
+
+    fn is_bound_to_workspace(&self, workspace_root: &Path, state_root: &Path) -> bool {
+        let binding = self
+            .workspace
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::fs::canonicalize(workspace_root).ok().as_ref() == Some(&binding.workspace_root)
+            && std::fs::canonicalize(state_root).ok().as_ref() == Some(&binding.state_root)
+    }
+
     fn set_max_steps(&self, max_steps: Option<u32>) {
         self.max_steps
             .store(max_steps.unwrap_or(0), Ordering::Relaxed);
@@ -423,58 +443,20 @@ impl CliDelegateRunner {
         if cancellation.is_cancelled() {
             return outcome(ToolStatus::Cancelled, "delegate cancelled before setup");
         }
+        let workspace = self
+            .workspace
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let Some(verify_cmd) = verify
             .map(str::to_string)
-            .or_else(|| self.default_verify.clone())
+            .or_else(|| workspace.default_verify.clone())
             .filter(|command| !command.trim().is_empty())
         else {
             return outcome(
                 ToolStatus::Denied,
                 "delegate unavailable: no verification pipeline was resolved; nothing was run.",
             );
-        };
-
-        let repo_root = match repository_root(&self.workspace_root)
-            .and_then(|root| canonical_directory(&root, "delegate repository root"))
-        {
-            Ok(root) => root,
-            Err(error) => {
-                return outcome(
-                    ToolStatus::Denied,
-                    &format!("delegate unavailable: not in a git repository: {error:#}"),
-                );
-            }
-        };
-        if !hi_tools::worktree::in_git_repo(&self.workspace_root) {
-            return outcome(
-                ToolStatus::Denied,
-                "delegate unavailable: not in a git repository.",
-            );
-        }
-        // Start from the exact parent state, including uncommitted files.
-        let checkpoint = match hi_tools::checkpoint::create_detailed_with_state(
-            &self.workspace_root,
-            &self.state_root,
-        )
-        .await
-        {
-            hi_tools::checkpoint::CreateResult::Created(sha) => sha,
-            hi_tools::checkpoint::CreateResult::Unavailable(reason)
-            | hi_tools::checkpoint::CreateResult::Failed(reason) => {
-                return outcome(
-                    ToolStatus::Denied,
-                    &format!("delegate unavailable: couldn't snapshot the working tree: {reason}"),
-                );
-            }
-        };
-        let workspace_relative = match self.workspace_root.strip_prefix(&repo_root) {
-            Ok(relative) => relative.to_path_buf(),
-            Err(error) => {
-                return outcome(
-                    ToolStatus::Failed,
-                    &format!("delegate workspace is outside its repository root: {error}"),
-                );
-            }
         };
 
         let idx = self.counter.fetch_add(1, Ordering::Relaxed);
@@ -484,8 +466,8 @@ impl CliDelegateRunner {
         let max_tool_calls = self.configured_max_tool_calls();
         let max_verify = self.max_verify;
         let task = task.to_string();
-        let workspace_root = self.workspace_root.clone();
-        let state_root = self.state_root.clone();
+        let workspace_root = workspace.workspace_root;
+        let state_root = workspace.state_root;
         if cancellation.is_cancelled() {
             return outcome(ToolStatus::Cancelled, "delegate cancelled before setup");
         }
@@ -502,10 +484,7 @@ impl CliDelegateRunner {
                 max_steps,
                 max_tool_calls,
                 max_verify,
-                &checkpoint,
                 idx,
-                &repo_root,
-                &workspace_relative,
                 &workspace_root,
                 &state_root,
                 progress,
@@ -534,16 +513,13 @@ fn run_blocking(
     max_steps: Option<u32>,
     max_tool_calls: Option<u32>,
     max_verify: u32,
-    checkpoint: &str,
     idx: u32,
-    repo_root: &Path,
-    workspace_relative: &Path,
     workspace_root: &Path,
     state_root: &Path,
     progress: Option<Arc<dyn DelegateProgress>>,
     cancellation: hi_agent::TurnCancellation,
 ) -> DelegateOutcome {
-    if let Some(out) = stop_if_cancelled(&cancellation, None, None) {
+    if let Some(out) = stop_if_cancelled(&cancellation) {
         return out;
     }
     let queue_started = Instant::now();
@@ -553,7 +529,7 @@ fn run_blocking(
     }) {
         Ok(lease) => lease,
         Err(error) => {
-            if let Some(out) = stop_if_cancelled(&cancellation, None, None) {
+            if let Some(out) = stop_if_cancelled(&cancellation) {
                 return out;
             }
             return outcome(
@@ -572,7 +548,7 @@ fn run_blocking(
     ) {
         Ok(lease) => lease,
         Err(error) => {
-            if let Some(out) = stop_if_cancelled(&cancellation, None, None) {
+            if let Some(out) = stop_if_cancelled(&cancellation) {
                 return out;
             }
             return outcome(
@@ -583,29 +559,30 @@ fn run_blocking(
     };
     let setup_queue_ms = setup_queue_started.elapsed().as_millis();
     let setup_started = Instant::now();
-    report_progress(progress.as_deref(), "creating worktree");
-    if let Some(out) = stop_if_cancelled(&cancellation, None, None) {
+    report_progress(progress.as_deref(), "creating detached candidate");
+    if let Some(out) = stop_if_cancelled(&cancellation) {
         return out;
     }
     let worktree_root = hi_tools::worktree::worktree_path("delegate", idx);
-    if let Err(error) = hi_tools::worktree::add_worktree(repo_root, &worktree_root, checkpoint) {
-        return outcome(
-            ToolStatus::Failed,
-            &format!("delegate failed to create an isolated worktree: {error}"),
-        );
-    }
-    let worktree = worktree_root.join(workspace_relative);
-    if !worktree.is_dir() {
-        hi_tools::worktree::cleanup(repo_root, &[worktree_root]);
-        return outcome(
-            ToolStatus::Failed,
-            "delegate failed to resolve its scoped workspace in the isolated worktree.",
-        );
-    }
+    let candidate = match hi_tools::candidate_workspace::CandidateWorkspace::create(
+        workspace_root,
+        state_root,
+        &worktree_root,
+    ) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return outcome(
+                ToolStatus::Failed,
+                &format!("delegate failed to create a detached candidate: {error:#}"),
+            );
+        }
+    };
+    let worktree = candidate.root().to_path_buf();
+    let checkpoint = candidate.baseline_commit().to_string();
+    let source_snapshot_id = candidate.source_snapshot_id().to_string();
 
     let artifact_dir = delegate_artifacts_dir(state_root, idx);
     if let Err(error) = std::fs::create_dir_all(&artifact_dir) {
-        hi_tools::worktree::cleanup(repo_root, &[worktree_root]);
         return outcome(
             ToolStatus::Failed,
             &format!("delegate failed to create artifact directory: {error}"),
@@ -614,7 +591,17 @@ fn run_blocking(
     let report_path = artifact_dir.join("report.json");
     let log_path = artifact_dir.join("child.log");
     let events_path = artifact_dir.join("events.jsonl");
-
+    let child_paths = match crate::child_process::CandidateChildPaths::prepare(&candidate) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return outcome(
+                ToolStatus::Failed,
+                &format!("delegate failed to create isolated child artifacts: {error}"),
+            );
+        }
+    };
+    let child_report_path = child_paths.report();
+    let child_events_path = child_paths.events();
     let prompt = child_prompt(task, verify_cmd);
     let child_timeout_secs = delegate_timeout_secs();
     let mut arguments = vec![
@@ -633,7 +620,7 @@ fn run_blocking(
         OsString::from("--review"),
         OsString::from("always"),
         OsString::from("--report"),
-        report_path.as_os_str().to_os_string(),
+        child_report_path.as_os_str().to_os_string(),
     ];
     if max_verify != hi_agent::UNLIMITED_REPAIR_CYCLES {
         arguments.push(OsString::from("--max-verify-repairs"));
@@ -646,19 +633,17 @@ fn run_blocking(
     ));
     let mut event_tailer = None;
     if let Some(progress) = progress.clone()
-        && std::fs::write(&events_path, []).is_ok()
+        && std::fs::write(&child_events_path, []).is_ok()
     {
         arguments.push("--events-jsonl".into());
-        arguments.push(events_path.as_os_str().into());
-        event_tailer = delegate_events::start_event_tailer(events_path.clone(), progress);
+        arguments.push(child_events_path.as_os_str().into());
+        event_tailer = delegate_events::start_event_tailer(child_events_path.clone(), progress);
     }
     arguments.push(prompt.into());
 
     let worktree_setup_ms = setup_started.elapsed().as_millis();
     drop(setup_lease);
-    if let Some(out) =
-        stop_if_cancelled(&cancellation, Some(repo_root), Some(worktree_root.clone()))
-    {
+    if let Some(out) = stop_if_cancelled(&cancellation) {
         return out;
     }
     let model_queue_started = Instant::now();
@@ -670,12 +655,9 @@ fn run_blocking(
     ) {
         Ok(lease) => lease,
         Err(error) => {
-            if let Some(out) =
-                stop_if_cancelled(&cancellation, Some(repo_root), Some(worktree_root.clone()))
-            {
+            if let Some(out) = stop_if_cancelled(&cancellation) {
                 return out;
             }
-            hi_tools::worktree::cleanup(repo_root, &[worktree_root]);
             return outcome(
                 ToolStatus::Failed,
                 &format!("delegate could not acquire shared model capacity: {error:#}"),
@@ -685,34 +667,28 @@ fn run_blocking(
     let model_queue_ms = model_queue_started.elapsed().as_millis();
     let child_started = Instant::now();
     report_progress(progress.as_deref(), "running");
-    let execution = crate::child_process::run_maybe_cancelled(
-        &worktree,
-        exe,
-        arguments,
-        vec![
-            ("HI_FORCE_API_KEY".into(), api_key.into()),
-            ("HI_API_KEY".into(), api_key.into()),
-            (
-                "CARGO_TARGET_DIR".into(),
-                state_root.join("build-cache/cargo-target").into_os_string(),
+    let execution =
+        crate::child_process::run_maybe_cancelled(crate::child_process::CandidateChildLaunch {
+            workspace_root: &worktree,
+            runtime_root: child_paths.runtime_root(),
+            executable: exe,
+            arguments,
+            environment: child_paths.delegate_environment(api_key),
+            timeout: child_timeout_secs.map(Duration::from_secs),
+            log_path: &log_path,
+            cancellation: Some(cancellation.clone()),
+            isolation: crate::child_process::CandidateProcessIsolation::new(
+                workspace_root,
+                state_root,
             ),
-            (
-                "SCCACHE_DIR".into(),
-                state_root.join("build-cache/sccache").into_os_string(),
-            ),
-        ],
-        child_timeout_secs.map(Duration::from_secs),
-        &log_path,
-        Some(cancellation.clone()),
-    );
+        });
     let child_runtime_ms = child_started.elapsed().as_millis();
     drop(process_lease);
     if let Some(tailer) = event_tailer {
         tailer.finish();
     }
-    if let Some(out) =
-        stop_if_cancelled(&cancellation, Some(repo_root), Some(worktree_root.clone()))
-    {
+    child_paths.retain(&report_path, Some(&events_path));
+    if let Some(out) = stop_if_cancelled(&cancellation) {
         return out;
     }
     let decision_started = Instant::now();
@@ -720,7 +696,8 @@ fn run_blocking(
     let mut result = match execution {
         Ok(execution) if execution.status == ToolStatus::Succeeded => decide(
             &worktree,
-            checkpoint,
+            &checkpoint,
+            &source_snapshot_id,
             verify_cmd,
             &report_path,
             &artifact_dir,
@@ -728,13 +705,10 @@ fn run_blocking(
             state_root,
             &cancellation,
         ),
-        Ok(execution) if execution.status == ToolStatus::Cancelled => {
-            hi_tools::worktree::cleanup(repo_root, std::slice::from_ref(&worktree_root));
-            outcome(
-                ToolStatus::Cancelled,
-                "delegate cancelled — child process stopped; nothing was applied.",
-            )
-        }
+        Ok(execution) if execution.status == ToolStatus::Cancelled => outcome(
+            ToolStatus::Cancelled,
+            "delegate cancelled — child process stopped; nothing was applied.",
+        ),
         Ok(execution) => {
             let status = execution.status;
             if matches!(status, ToolStatus::TimedOut | ToolStatus::Failed) {
@@ -765,7 +739,6 @@ fn run_blocking(
     if result.applied {
         record_verified_merge(state_root, task, &result.changed_files);
     }
-    hi_tools::worktree::cleanup(repo_root, &[worktree_root]);
     result
 }
 
@@ -805,16 +778,9 @@ fn report_progress(progress: Option<&dyn DelegateProgress>, activity: &str) {
     }
 }
 
-fn stop_if_cancelled(
-    cancellation: &hi_agent::TurnCancellation,
-    repo_root: Option<&Path>,
-    worktree_root: Option<PathBuf>,
-) -> Option<DelegateOutcome> {
+fn stop_if_cancelled(cancellation: &hi_agent::TurnCancellation) -> Option<DelegateOutcome> {
     if !cancellation.is_cancelled() {
         return None;
-    }
-    if let (Some(repo), Some(worktree)) = (repo_root, worktree_root) {
-        hi_tools::worktree::cleanup(repo, &[worktree]);
     }
     Some(outcome(
         ToolStatus::Cancelled,
@@ -839,13 +805,15 @@ fn delegate_queue_timeout() -> Option<Duration> {
     .map(Duration::from_secs)
 }
 
-/// Resolve the opt-in delegate capacity wait. Unset, invalid, and zero wait
-/// until capacity arrives or cancellation is observed; a positive value is an
-/// explicit finite queue timeout.
+/// Resolve the managed delegate capacity wait. Detached work is finite by
+/// default; a valid positive override replaces the five-minute default.
 pub(crate) fn delegate_queue_timeout_secs_from_value(configured: Option<&str>) -> Option<u64> {
-    configured
-        .and_then(|value| value.parse().ok())
-        .filter(|&seconds| seconds > 0)
+    Some(
+        configured
+            .and_then(|value| value.parse().ok())
+            .filter(|&seconds| seconds > 0)
+            .unwrap_or(DEFAULT_DELEGATE_QUEUE_TIMEOUT_SECS),
+    )
 }
 
 pub(crate) fn queue_wait_timed_out(elapsed: Duration, timeout: Option<Duration>) -> bool {
@@ -857,12 +825,16 @@ fn delegate_timeout_secs() -> Option<u64> {
     delegate_timeout_secs_from_value(configured.as_deref())
 }
 
-/// Resolve the opt-in delegate wall-clock timeout. Unset, invalid, and zero
-/// values all mean unlimited. A positive value is used exactly as supplied.
+/// Resolve the detached delegate wall-clock deadline. A valid positive
+/// override is exact; unset, invalid, and zero use the fifteen-minute managed
+/// default rather than creating an unbounded unattended process.
 pub(crate) fn delegate_timeout_secs_from_value(configured: Option<&str>) -> Option<u64> {
-    configured
-        .and_then(|value| value.parse().ok())
-        .filter(|&seconds| seconds > 0)
+    Some(
+        configured
+            .and_then(|value| value.parse().ok())
+            .filter(|&seconds| seconds > 0)
+            .unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
+    )
 }
 
 /// Child soft budget plus explicit model-round/tool-call caps. This stays a pure argv
@@ -910,6 +882,7 @@ fn decode_optional_u32(value: u64) -> Option<u32> {
 fn decide(
     worktree: &Path,
     checkpoint: &str,
+    source_snapshot_id: &str,
     verify_cmd: &str,
     report_path: &Path,
     artifact_dir: &Path,
@@ -1011,12 +984,13 @@ fn decide(
         );
     }
 
-    match apply_candidate_and_reverify_cancellable(
+    match apply_candidate_and_reverify_cancellable_at_base(
         worktree,
         checkpoint,
         destination,
         state_root,
         verify_cmd,
+        Some(source_snapshot_id),
         Some(cancellation.clone()),
     ) {
         Ok(applied) => DelegateOutcome {
@@ -1055,7 +1029,11 @@ impl CliDelegateRunner {
     /// Test-only view of the effective default verify pipeline.
     #[cfg(test)]
     pub(crate) fn default_verify_for_tests(&self) -> Option<String> {
-        self.default_verify.clone()
+        self.workspace
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .default_verify
+            .clone()
     }
 }
 
@@ -1071,6 +1049,28 @@ pub(crate) fn derive_default_verify(workspace_root: &Path) -> Option<String> {
         return Some("go build ./...".to_string());
     }
     None
+}
+
+fn delegate_workspace_binding(
+    workspace_root: &Path,
+    state_root: &Path,
+    configured_verify: Option<&str>,
+) -> Result<DelegateWorkspaceBinding> {
+    let workspace_root = canonical_directory(workspace_root, "delegate workspace root")?;
+    std::fs::create_dir_all(state_root)
+        .with_context(|| format!("creating delegate state root {}", state_root.display()))?;
+    let state_root = canonical_directory(state_root, "delegate state root")?;
+    ensure!(
+        state_root != workspace_root && !workspace_root.starts_with(&state_root),
+        "delegate state root must not equal or contain the workspace root"
+    );
+    Ok(DelegateWorkspaceBinding {
+        default_verify: configured_verify
+            .map(str::to_owned)
+            .or_else(|| derive_default_verify(&workspace_root)),
+        workspace_root,
+        state_root,
+    })
 }
 
 fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf> {

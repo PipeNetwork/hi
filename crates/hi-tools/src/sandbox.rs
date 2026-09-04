@@ -57,6 +57,10 @@ pub enum SandboxBackendStatus {
 /// project-local state directory inside the explicit workspace.
 pub const NESTED_SANDBOX_ENV: &str = "HI_SANDBOXED";
 
+/// Empty host-data-free directory used to hide denied directories in Linux
+/// mount namespaces.
+pub(crate) const PRIVATE_DENY_READ_MASK_DIR: &str = ".deny-read-directory";
+
 /// How much of the filesystem a shell command may modify.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SandboxPolicy {
@@ -147,6 +151,11 @@ pub struct SandboxConfig {
     /// Skip broad host-temp allowances. Hermetic embedded runners can place
     /// one private temp directory beneath an explicit writable root instead.
     pub deny_host_temp: bool,
+    /// Exact private temporary directory exposed to a hermetic child. The
+    /// process runner canonicalizes this path, makes it owner-only, adds only
+    /// this directory to the writable roots, and exports it as TMPDIR/TMP/TEMP.
+    /// It must not name a broad host temporary root.
+    pub private_temp: Option<PathBuf>,
     /// Omit pipe-wrap's parent-death signal when an embedding supervisor owns
     /// the complete process group and performs its own bounded cleanup.
     pub supervisor_owns_lifetime: bool,
@@ -200,11 +209,22 @@ impl SandboxProfile {
         }
         let restrict_network = policy.restricts_network();
         let protected_paths = shared_cache_protected_paths_for_writable_roots(writable);
-        let roots: Vec<PathBuf> = writable
+        let mut roots: Vec<PathBuf> = writable
             .iter()
             .filter(|path| !writable_root_exposes_protected_path(path, &protected_paths))
             .map(|path| path.to_path_buf())
             .collect();
+        if let Some(private_temp) = config
+            .private_temp
+            .as_deref()
+            .and_then(|path| path.canonicalize().ok())
+            && !writable_root_exposes_protected_path(&private_temp, &protected_paths)
+            && !roots
+                .iter()
+                .any(|root| resolve_path_for_comparison(root) == private_temp)
+        {
+            roots.push(private_temp);
+        }
         let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
         let profile = if cfg!(target_os = "macos") {
             seatbelt_profile_with_protected_paths(policy, &root_refs, &config, &protected_paths)
@@ -359,9 +379,9 @@ impl SandboxProfile {
             }
             for path in &self.config.deny_read {
                 if let Some(s) = path.to_str() {
-                    // Bind /dev/null over the path to make it unreadable.
+                    let mask = deny_read_overlay_source(&self.config, path);
                     args.push("--ro-bind".to_string());
-                    args.push("/dev/null".to_string());
+                    args.push(mask.to_string_lossy().into_owned());
                     args.push(s.to_string());
                 }
             }
@@ -631,7 +651,8 @@ fn pipe_wrap_arguments_with_protected_roots(
         push_flag_path(&mut args, "--ro-bind", path, path);
     }
     for path in &config.deny_read {
-        push_flag_path(&mut args, "--ro-bind", Path::new("/dev/null"), path);
+        let mask = deny_read_overlay_source(config, path);
+        push_flag_path(&mut args, "--ro-bind", &mask, path);
     }
     if matches!(policy, SandboxPolicy::Workspace | SandboxPolicy::Strict) {
         // Defense in depth when an operator selects a broad ancestor: later
@@ -654,6 +675,20 @@ fn push_flag_path(args: &mut Vec<OsString>, flag: &str, source: &Path, target: &
         args.push(source.as_os_str().to_os_string());
         args.push(target.as_os_str().to_os_string());
     }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn deny_read_overlay_source(config: &SandboxConfig, target: &Path) -> PathBuf {
+    if target.is_dir()
+        && let Some(mask) = config
+            .private_temp
+            .as_deref()
+            .map(|temp| temp.join(PRIVATE_DENY_READ_MASK_DIR))
+            .filter(|mask| mask.is_dir())
+    {
+        return mask;
+    }
+    PathBuf::from("/dev/null")
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -1067,8 +1102,14 @@ fn emit_seatbelt_deny(out: &mut String, path: &Path, deny_read: bool) {
     let quoted = quote(text);
     if deny_read {
         out.push_str(&format!("(deny file-read* (literal {quoted}))\n"));
+        if path.is_dir() {
+            out.push_str(&format!("(deny file-read* (subpath {quoted}))\n"));
+        }
     }
     out.push_str(&format!("(deny file-write* (literal {quoted}))\n"));
+    if path.is_dir() {
+        out.push_str(&format!("(deny file-write* (subpath {quoted}))\n"));
+    }
     for sub in [
         "file-write-data",
         "file-write-create",
@@ -1080,6 +1121,9 @@ fn emit_seatbelt_deny(out: &mut String, path: &Path, deny_read: bool) {
         "file-write-setugid",
     ] {
         out.push_str(&format!("(deny {sub} (literal {quoted}))\n"));
+        if path.is_dir() {
+            out.push_str(&format!("(deny {sub} (subpath {quoted}))\n"));
+        }
     }
 }
 
@@ -1175,6 +1219,8 @@ fn quote(text: &str) -> String {
     out
 }
 
+#[cfg(test)]
+mod candidate_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1341,31 +1387,6 @@ mod tests {
         assert_eq!(quote("/a\\b"), "\"/a\\\\b\"");
     }
 
-    #[test]
-    fn hermetic_profile_omits_broad_host_temp_write_rules() {
-        let root = tempfile::tempdir().unwrap();
-        let config = SandboxConfig {
-            deny_host_temp: true,
-            ..SandboxConfig::default()
-        };
-        let profile = seatbelt_profile_with_protected_paths(
-            SandboxPolicy::Workspace,
-            &[root.path()],
-            &config,
-            &[],
-        );
-        let canonical_root = root.path().canonicalize().unwrap();
-        assert!(profile.contains(canonical_root.to_str().unwrap()));
-        for temp in temp_roots() {
-            if Path::new(&temp) != canonical_root {
-                assert!(
-                    !profile.contains(&format!("(allow file-write* (subpath {}))", quote(&temp))),
-                    "hermetic profile exposed host temp {temp}: {profile}"
-                );
-            }
-        }
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn workspace_profile_names_the_canonical_root_and_denies_writes() {
@@ -1400,42 +1421,6 @@ mod tests {
             "relative sh must be resolved, got {wrapped:?}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn pipe_wrap_candidates_never_use_path_or_writable_siblings() {
-        let writable = PathBuf::from("/work/project");
-        let candidates = pipe_wrap_candidates(
-            Some(OsStr::new("pipe-wrap")),
-            Some(Path::new("/work/project/target/debug/hi")),
-            std::slice::from_ref(&writable),
-        );
-        assert!(
-            candidates.is_empty(),
-            "relative HI_PIPE_WRAP and a workspace sibling are untrusted"
-        );
-
-        let candidates = pipe_wrap_candidates(
-            Some(OsStr::new("/operator/pipe-wrap")),
-            Some(Path::new("/opt/hi/bin/hi")),
-            std::slice::from_ref(&writable),
-        );
-        assert_eq!(
-            candidates,
-            [
-                PathBuf::from("/operator/pipe-wrap"),
-                PathBuf::from("/opt/hi/bin/pipe-wrap")
-            ]
-        );
-        assert!(
-            !candidates.contains(&PathBuf::from("/untrusted/path/pipe-wrap")),
-            "PATH is deliberately not an input to candidate discovery"
-        );
-
-        assert!(
-            pipe_wrap_candidates(None, Some(Path::new("/tmp/hi")), &[]).is_empty(),
-            "the sandbox can replace a sibling in its writable temp mount"
-        );
     }
 
     #[test]

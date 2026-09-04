@@ -53,22 +53,26 @@ pub type Result<T> = std::result::Result<T, CacheError>;
 /// and checkpoint of every tool that walks the tree — it showed up as a
 /// `.goto_index.bin` "source change" in agent diffs.
 pub fn get_cache_path(root_path: &Path) -> std::path::PathBuf {
-    use std::hash::{Hash, Hasher};
     let base = cache_base_dir();
     // Canonicalize so every spelling of the same repository (e.g. macOS
     // `/var/…` vs `/private/var/…`) shares one cache entry.
     let root_path = &root_path
         .canonicalize()
         .unwrap_or_else(|_| root_path.to_path_buf());
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    root_path.hash(&mut hasher);
+    // Cache identities are persisted across binary versions, so they must not
+    // depend on Rust's implementation-defined `DefaultHasher` algorithm.
+    // Domain-separate the canonical path bytes to keep this digest distinct
+    // from other BLAKE3 identities used by the harness.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hi.goto-index.cache-path.v1\0");
+    hasher.update(root_path.as_os_str().as_encoded_bytes());
     let stem = root_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "root".to_string());
     base.join("hi")
         .join("goto-index")
-        .join(format!("{stem}-{:016x}.bin", hasher.finish()))
+        .join(format!("{stem}-{}.bin", hasher.finalize().to_hex()))
 }
 
 /// The directory under which goto-index caches/locks live. A test-only

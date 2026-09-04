@@ -7,19 +7,11 @@ use super::*;
 fn bg_config() -> AgentConfig {
     let mut cfg = config();
     cfg.subagents.explore_subagents = true;
+    cfg.harness.features.candidate_jobs_v2 = true;
     cfg
 }
 
 struct BackgroundDropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
-
-struct BackgroundDelegateRunner;
-
-#[async_trait::async_trait]
-impl crate::DelegateRunner for BackgroundDelegateRunner {
-    async fn run(&self, _task: &str, _verify: Option<&str>) -> crate::DelegateOutcome {
-        unreachable!("background general-purpose children run in-process")
-    }
-}
 
 impl Drop for BackgroundDropFlag {
     fn drop(&mut self) {
@@ -188,9 +180,62 @@ async fn handle_task_unknown_subagent_type_fails() {
 }
 
 #[tokio::test]
-async fn pipefs_rejects_write_capable_background_tasks_before_spawn() {
-    let mut agent = agent(Vec::new(), bg_config());
+async fn typed_limits_configure_registry_and_candidate_rollout_admission() {
+    let mut cfg = config();
+    cfg.subagents.write_subagents = WriteSubagentPolicy::On;
+    cfg.harness.jobs.max_active = 3;
+    cfg.harness.jobs.max_preparations = 2;
+    cfg.harness.jobs.queue_timeout = std::time::Duration::from_millis(17);
+    let mut agent = agent(Vec::new(), cfg);
+    assert_eq!(
+        agent.background_task_registry().limits(),
+        hi_tools::BackgroundTaskLimits {
+            max_tasks: 3,
+            max_concurrent_preparations: 2,
+            queue_timeout: std::time::Duration::from_millis(17),
+        }
+    );
+
+    agent
+        .activate_pipefs_workspace_controller("candidate-gate-disabled", 1, false)
+        .unwrap();
+
+    let outcome = agent
+        .handle_task(
+            r#"{"description":"writer","prompt":"write a file","subagent_type":"general-purpose"}"#,
+            &mut NullUi,
+        )
+        .await;
+    assert_eq!(outcome.status, hi_tools::ToolStatus::Denied);
+    assert!(outcome.content.contains("features.candidate_jobs_v2"));
+}
+
+#[test]
+fn causal_pipefs_capability_requires_the_resolved_rollout_gate() {
+    let disabled = agent(Vec::new(), config());
+    disabled
+        .activate_pipefs_workspace_controller("causal-disabled", 2, true)
+        .unwrap();
+    assert!(!disabled.workspace_controller_capabilities().causal_commit);
+
+    let mut cfg = config();
+    cfg.harness.features.pipefs_causal_commit_v1 = true;
+    let enabled = agent(Vec::new(), cfg);
+    enabled
+        .activate_pipefs_workspace_controller("causal-enabled", 2, true)
+        .unwrap();
+    assert!(enabled.workspace_controller_capabilities().causal_commit);
+}
+
+#[tokio::test]
+async fn pipefs_without_background_writers_still_admits_detached_candidates() {
+    let mut cfg = bg_config();
+    cfg.subagents.write_subagents = WriteSubagentPolicy::On;
+    let mut agent = agent(Vec::new(), cfg);
     agent.set_workspace_durability(Some(std::sync::Arc::new(TestWorkspaceDurability)));
+    agent
+        .activate_pipefs_workspace_controller("candidate-test", 2, true)
+        .unwrap();
     let mut ui = NullUi;
     let outcome = agent
         .handle_task(
@@ -199,8 +244,29 @@ async fn pipefs_rejects_write_capable_background_tasks_before_spawn() {
         )
         .await;
 
+    assert_eq!(outcome.status, hi_tools::ToolStatus::Succeeded);
+    assert_eq!(agent.background_task_registry().list().await.len(), 1);
+}
+
+#[tokio::test]
+async fn pipefs_protocol_one_rejects_background_write_candidates() {
+    let mut cfg = bg_config();
+    cfg.subagents.write_subagents = WriteSubagentPolicy::On;
+    let mut agent = agent(Vec::new(), cfg);
+    agent.set_workspace_durability(Some(std::sync::Arc::new(TestWorkspaceDurability)));
+    agent
+        .activate_pipefs_workspace_controller("candidate-protocol-one", 1, false)
+        .unwrap();
+
+    let outcome = agent
+        .handle_task(
+            r#"{"description":"writer","prompt":"write a file","subagent_type":"general-purpose"}"#,
+            &mut NullUi,
+        )
+        .await;
+
     assert_eq!(outcome.status, hi_tools::ToolStatus::Denied);
-    assert!(outcome.content.contains("PipeFS"), "{}", outcome.content);
+    assert!(outcome.content.contains("writer protocol 2"));
     assert!(agent.background_task_registry().list().await.is_empty());
 }
 
@@ -238,97 +304,350 @@ async fn handle_task_reports_registry_capacity_as_actionable_denial() {
 }
 
 #[tokio::test]
-async fn general_purpose_task_continues_an_incomplete_plan_after_a_recap() {
+async fn general_purpose_task_is_isolated_and_cannot_succeed_before_parent_apply() {
     let mut cfg = bg_config();
     cfg.memory.tool_set = ToolSet::Full;
+    cfg.subagents.write_subagents = WriteSubagentPolicy::On;
+    cfg.gates.review = ReviewPolicy::Off;
+    // Candidate preparation must replace even an explicit ambient opt-out.
+    cfg.sandbox_policy = Some(hi_tools::sandbox::SandboxPolicy::Off);
     let root = cfg.paths.workspace_root.clone();
-    let plan = |id: &str, first: &str, second: &str, third: &str| {
-        completion(
-            vec![Content::ToolCall {
-                id: id.into(),
-                name: "update_plan".into(),
-                arguments: serde_json::json!({
-                    "steps": [
-                        {"title": "write the first file", "status": first},
-                        {"title": "write the second file", "status": second},
-                        {"title": "write the third file", "status": third}
-                    ]
-                })
-                .to_string(),
-            }],
-            1,
-            1,
-        )
-    };
-    let write = |id: &str, path: &str| {
-        completion(
-            vec![Content::ToolCall {
-                id: id.into(),
-                name: "write".into(),
-                arguments: serde_json::json!({"path": path, "content": path}).to_string(),
-            }],
-            1,
-            1,
-        )
-    };
-    let responses = vec![
-        plan("plan-start", "active", "pending", "pending"),
-        write("write-first", "bg-first.txt"),
-        plan("plan-middle", "done", "active", "pending"),
-        completion(
-            vec![Content::Text("The first step is complete.".into())],
-            1,
-            1,
-        ),
-        write("write-second", "bg-second.txt"),
-        plan("plan-late", "done", "done", "active"),
-        completion(
-            vec![Content::Text("The second step is complete.".into())],
-            1,
-            1,
-        ),
-        write("write-third", "bg-third.txt"),
-        plan("plan-done", "done", "done", "done"),
-        completion(
-            vec![Content::Text("All background steps are complete.".into())],
-            1,
-            1,
-        ),
-    ];
-    let mut agent = agent(responses, cfg);
-    agent.set_delegate_runner(std::sync::Arc::new(BackgroundDelegateRunner));
-    let mut ui = NullUi;
-    let spawned = agent
-        .handle_task(
-            r#"{"description":"three writes","prompt":"Implement all three file writes as a multi-step plan.","subagent_type":"general-purpose"}"#,
-            &mut ui,
-        )
-        .await;
-    assert_eq!(spawned.status, hi_tools::ToolStatus::Succeeded);
-    let task_id = spawned
-        .content
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("general-purpose task spawned: "))
-        .expect("spawned task id");
-    let result = agent
-        .handle_wait_tasks(
-            &serde_json::json!({
-                "task_ids": [task_id],
-                "timeout_ms": 5_000
-            })
-            .to_string(),
-        )
-        .await;
-
-    assert!(
-        result.content.contains("— Completed:"),
-        "child stopped before its second productive step: {}",
-        result.content
+    let state_root = cfg.paths.state_root.clone();
+    git(&root, &["init", "--quiet"]);
+    std::fs::write(root.join("source-sentinel.txt"), "source\n").unwrap();
+    git(&root, &["add", "source-sentinel.txt"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        ],
     );
-    assert!(root.join("bg-first.txt").is_file());
-    assert!(root.join("bg-second.txt").is_file());
-    assert!(root.join("bg-third.txt").is_file());
+    let git_before = directory_bytes(&root.join(".git"));
+    let mut agent = agent(Vec::new(), cfg);
+    agent.set_delegate_route(
+        Some("delegate-model".into()),
+        Some("http://delegate.invalid/v1".into()),
+        None,
+    );
+    assert_eq!(
+        agent.background_candidate_plan_identity(),
+        (
+            Some(hi_tools::sandbox::SandboxPolicy::Strict),
+            true,
+            vec![
+                root.canonicalize().unwrap(),
+                state_root.canonicalize().unwrap()
+            ],
+            "http://delegate.invalid/v1".into(),
+            "delegate-model".into(),
+            Some(std::time::Duration::from_secs(120)),
+        )
+    );
+    let registry = agent.background_task_registry();
+    let owner = state_root.join("candidate-owner");
+    let candidate =
+        hi_tools::candidate_workspace::CandidateWorkspace::create(&root, &state_root, &owner)
+            .unwrap();
+    std::fs::write(candidate.root().join("candidate.txt"), "detached\n").unwrap();
+    assert!(!root.join("candidate.txt").exists());
+    assert_eq!(directory_bytes(&root.join(".git")), git_before);
+    let binding = agent.workspace_controller_binding();
+    let (id_tx, id_rx) = tokio::sync::oneshot::channel::<String>();
+    let worker_registry = registry.clone();
+    let artifact_state = state_root.clone();
+    let task_id = registry
+        .spawn(
+            "isolated write",
+            "general-purpose",
+            Box::new(move || {
+                Box::pin(async move {
+                    let task_id = id_rx.await.unwrap();
+                    let job_id = worker_registry
+                        .candidate_workspace_job_id(&task_id)
+                        .await
+                        .unwrap();
+                    let verification_ms = worker_registry
+                        .candidate_workspace_verification_ms(&task_id)
+                        .await
+                        .unwrap();
+                    let sealed = candidate
+                        .seal_verified(hi_tools::candidate_workspace::CandidateSealContext {
+                            job_id: hi_workspace::JobId::new(job_id),
+                            binding,
+                            route: hi_workspace::CandidateRoute {
+                                provider: "test".into(),
+                                model: "test-model".into(),
+                                actual_model_revision: None,
+                                capability_digest: "blake3:test-capabilities".into(),
+                            },
+                            verification: vec![hi_workspace::CandidateVerification {
+                                name: "test verification".into(),
+                                passed: true,
+                                verifier_digest: "blake3:test-verification".into(),
+                                detail: None,
+                                artifacts: Vec::new(),
+                            }],
+                            destination_verification: vec![
+                                hi_workspace::CandidateDestinationVerifier {
+                                    name: "test verification".into(),
+                                    command: "true".into(),
+                                    timeout_ms: verification_ms,
+                                },
+                            ],
+                            destination_verification_budget_ms: verification_ms,
+                        })
+                        .unwrap();
+                    let sealed =
+                        hi_tools::candidate_workspace::PersistedDetachedCandidate::persist(
+                            sealed,
+                            &artifact_state,
+                        )
+                        .unwrap();
+                    worker_registry.publish_candidate(&task_id, sealed).unwrap();
+                    hi_tools::BackgroundTaskOutcome {
+                        id: String::new(),
+                        description: String::new(),
+                        subagent_type: "general-purpose".into(),
+                        state: hi_tools::BackgroundTaskState::Completed,
+                        output: "candidate prepared".into(),
+                        applied: false,
+                        changed_files: vec!["candidate.txt".into()],
+                    }
+                })
+            }),
+        )
+        .await
+        .unwrap();
+    id_tx.send(task_id.clone()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !registry.candidate_is_ready(&task_id) {
+            let state = registry
+                .poll(&task_id, std::time::Duration::ZERO)
+                .await
+                .unwrap();
+            assert_eq!(
+                state.state,
+                hi_tools::BackgroundTaskState::Running,
+                "candidate preparation failed: {}",
+                state.output
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("candidate should become ready for parent apply");
+
+    let before_apply = registry
+        .poll(&task_id, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(before_apply.state, hi_tools::BackgroundTaskState::Running);
+    assert!(!before_apply.applied);
+    assert!(!root.join("candidate.txt").exists());
+    assert_eq!(directory_bytes(&root.join(".git")), git_before);
+    let persisted =
+        hi_tools::candidate_workspace::PersistedDetachedCandidate::discover(&state_root).unwrap();
+    assert_eq!(persisted.len(), 1);
+    let artifact_path = persisted[0].path().to_path_buf();
+    let store = hi_control::ControlStore::open_for_state(&state_root).unwrap();
+    let jobs = store
+        .jobs_for_binding(agent.workspace_controller_binding().binding_id.as_str())
+        .unwrap();
+    assert_eq!(
+        jobs[0].candidate_ref.as_deref(),
+        Some(persisted[0].artifact.uri.as_str())
+    );
+
+    let binding_before_rebind = agent.workspace_controller_binding();
+    let other_root = state_root.join("blocked-rebind-root");
+    let other_state = state_root.join("blocked-rebind-state");
+    std::fs::create_dir_all(&other_root).unwrap();
+    let rebind_error = agent
+        .rebind_workspace(&other_root, &other_state)
+        .await
+        .unwrap_err();
+    assert!(rebind_error.to_string().contains("jobs remain unsettled"));
+    assert_eq!(
+        agent.workspace_root().canonicalize().unwrap(),
+        root.canonicalize().unwrap()
+    );
+    assert_eq!(agent.workspace_controller_binding(), binding_before_rebind);
+
+    // Claim and cancellation are one atomic ownership race: once the parent
+    // owns merge, kill_task cannot publish Cancelled while these bytes remain
+    // eligible to apply. Restore models a failed parent admission retry.
+    let mut claimed = registry.claim_ready_candidates();
+    assert_eq!(claimed.len(), 1);
+    let (claimed_id, claimed_candidate) = claimed.pop().unwrap();
+    assert_eq!(claimed_id, task_id);
+    let kill_during_claim = registry.kill(&task_id).await.unwrap();
+    assert_eq!(
+        kill_during_claim.state,
+        hi_tools::BackgroundTaskState::Running
+    );
+    assert!(kill_during_claim.output.contains("merge has started"));
+    assert!(!root.join("candidate.txt").exists());
+    registry.restore_ready_candidate(&task_id, claimed_candidate);
+
+    agent.settle_ready_candidates_at_boundary().await.unwrap();
+    let applied = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let outcome = registry
+                .poll(&task_id, std::time::Duration::ZERO)
+                .await
+                .unwrap();
+            if outcome.state != hi_tools::BackgroundTaskState::Running {
+                break outcome;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("settled candidate should publish a terminal task result");
+    assert_eq!(applied.state, hi_tools::BackgroundTaskState::Completed);
+    assert!(applied.applied);
+    assert_eq!(
+        std::fs::read_to_string(root.join("candidate.txt")).unwrap(),
+        "detached\n"
+    );
+    assert!(!artifact_path.exists());
+}
+
+#[tokio::test]
+async fn killing_a_ready_candidate_cancels_its_workspace_job_without_applying() {
+    let mut cfg = bg_config();
+    cfg.subagents.write_subagents = WriteSubagentPolicy::On;
+    let root = cfg.paths.workspace_root.clone();
+    let state_root = cfg.paths.state_root.clone();
+    git(&root, &["init", "--quiet"]);
+    std::fs::write(root.join("source-sentinel.txt"), "source\n").unwrap();
+    let git_before = directory_bytes(&root.join(".git"));
+    let mut agent = agent(Vec::new(), cfg);
+    let binding = agent.workspace_controller_binding();
+    let registry = agent.background_task_registry();
+    let candidate = hi_tools::candidate_workspace::CandidateWorkspace::create(
+        &root,
+        &state_root,
+        &state_root.join("cancel-candidate-owner"),
+    )
+    .unwrap();
+    std::fs::write(candidate.root().join("must-not-apply.txt"), "candidate\n").unwrap();
+    let (id_tx, id_rx) = tokio::sync::oneshot::channel::<String>();
+    let worker_registry = registry.clone();
+    let artifact_state = state_root.clone();
+    let task_id = registry
+        .spawn(
+            "cancel isolated write",
+            "general-purpose",
+            Box::new(move || {
+                Box::pin(async move {
+                    let task_id = id_rx.await.unwrap();
+                    let job_id = worker_registry
+                        .candidate_workspace_job_id(&task_id)
+                        .await
+                        .unwrap();
+                    let verification_ms = worker_registry
+                        .candidate_workspace_verification_ms(&task_id)
+                        .await
+                        .unwrap();
+                    let sealed = candidate
+                        .seal_verified(hi_tools::candidate_workspace::CandidateSealContext {
+                            job_id: hi_workspace::JobId::new(job_id),
+                            binding,
+                            route: hi_workspace::CandidateRoute {
+                                provider: "test".into(),
+                                model: "test-model".into(),
+                                actual_model_revision: None,
+                                capability_digest: "blake3:test-capabilities".into(),
+                            },
+                            verification: vec![hi_workspace::CandidateVerification {
+                                name: "test verification".into(),
+                                passed: true,
+                                verifier_digest: "blake3:test-verification".into(),
+                                detail: None,
+                                artifacts: Vec::new(),
+                            }],
+                            destination_verification: vec![
+                                hi_workspace::CandidateDestinationVerifier {
+                                    name: "test verification".into(),
+                                    command: "true".into(),
+                                    timeout_ms: verification_ms,
+                                },
+                            ],
+                            destination_verification_budget_ms: verification_ms,
+                        })
+                        .unwrap();
+                    let sealed =
+                        hi_tools::candidate_workspace::PersistedDetachedCandidate::persist(
+                            sealed,
+                            &artifact_state,
+                        )
+                        .unwrap();
+                    worker_registry.publish_candidate(&task_id, sealed).unwrap();
+                    hi_tools::BackgroundTaskOutcome {
+                        id: String::new(),
+                        description: String::new(),
+                        subagent_type: "general-purpose".into(),
+                        state: hi_tools::BackgroundTaskState::Completed,
+                        output: "candidate prepared".into(),
+                        applied: false,
+                        changed_files: vec!["must-not-apply.txt".into()],
+                    }
+                })
+            }),
+        )
+        .await
+        .unwrap();
+    id_tx.send(task_id.clone()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !registry.candidate_is_ready(&task_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let store = hi_control::ControlStore::open_for_state(&state_root).unwrap();
+    let ready = store
+        .jobs_for_binding(agent.workspace_controller_binding().binding_id.as_str())
+        .unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].state, hi_control::ControlJobState::ReadyToMerge);
+    let artifacts =
+        hi_tools::candidate_workspace::PersistedDetachedCandidate::discover(&state_root).unwrap();
+    assert_eq!(artifacts.len(), 1);
+    let artifact_path = artifacts[0].path().to_path_buf();
+    assert_eq!(
+        ready[0].candidate_ref.as_deref(),
+        Some(artifacts[0].artifact.uri.as_str())
+    );
+    let cancelled = registry.kill(&task_id).await.unwrap();
+    assert_eq!(cancelled.state, hi_tools::BackgroundTaskState::Cancelled);
+    assert!(!root.join("must-not-apply.txt").exists());
+    assert_eq!(directory_bytes(&root.join(".git")), git_before);
+    assert!(!artifact_path.exists());
+    agent.settle_ready_candidates_at_boundary().await.unwrap();
+    assert!(!root.join("must-not-apply.txt").exists());
+
+    let terminal = store.get_job(&ready[0].job_id).unwrap().unwrap();
+    assert_eq!(terminal.state, hi_control::ControlJobState::Cancelled);
+    let revision = terminal.revision;
+    assert_eq!(
+        registry.kill(&task_id).await.unwrap().state,
+        hi_tools::BackgroundTaskState::Cancelled
+    );
+    assert_eq!(
+        store.get_job(&ready[0].job_id).unwrap().unwrap().revision,
+        revision,
+        "repeated kill must not write another terminal transition"
+    );
 }
 
 #[test]
@@ -344,13 +663,53 @@ fn task_tool_spec_lists_grok_build_kinds() {
     assert!(spec.description.contains("explore"));
     assert!(spec.description.contains("plan"));
     assert!(spec.description.contains("general-purpose"));
-    // scope was advertised but never enforced — removed until BG parallel
-    // admission exists. Live-tree GP semantics are documented instead.
     assert!(spec.parameters.pointer("/properties/scope").is_none());
     assert!(
-        spec.description.contains("live working tree") || spec.description.contains("live tree"),
-        "GP isolation caveat missing from task tool description"
+        spec.description
+            .contains("applies them transactionally at a safe turn boundary"),
+        "general-purpose isolation contract missing from task tool description"
     );
+    assert!(!spec.description.contains("live working tree"));
+}
+
+fn git(root: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn directory_bytes(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        root: &std::path::Path,
+        at: &std::path::Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in std::fs::read_dir(at).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, root, &mut files);
+    files
 }
 
 #[tokio::test]

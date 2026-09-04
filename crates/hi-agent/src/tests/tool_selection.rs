@@ -448,6 +448,8 @@ async fn bare_review_codebase_first_request_advertises_inspection_tools() {
                 .push(request.profile.deepseek_thinking);
             pop_canned_completion(&self.responses, "Rec")
         }
+
+        native_tool_test_provider!();
     }
     let provider = Rec {
         responses: Mutex::new(

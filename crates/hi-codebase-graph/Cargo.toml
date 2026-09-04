@@ -23,6 +23,7 @@ name = "bench_file_listing"
 path = "src/bin/bench_file_listing.rs"
 
 [dependencies]
+blake3.workspace = true
 # Path utilities
 dunce.workspace = true
 # Graph generation

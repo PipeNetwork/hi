@@ -12,9 +12,6 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
-use hi_engine_api::{
-    EngineAction, EngineInput, EngineStateSnapshot, PresentationDirective, ToolDescriptor,
-};
 
 use crate::command;
 use crate::domain::TurnControlFlags;
@@ -53,7 +50,7 @@ impl crate::Agent {
         self.set_turn_phase(TurnPhase::Setup);
         // Immediate `/btw` launcher — TUI fires asides without waiting for a
         // model-round boundary. Refreshed each round; disarmed at join.
-        self.arm_btw_dispatcher();
+        self.arm_btw_dispatcher().await;
         // Repair-effort escalation is turn-scoped.
         self.repair_effort_escalated = false;
         // A leftover block request: `goal_turn_end` consumes it, so a turn that
@@ -458,11 +455,12 @@ impl crate::Agent {
                 self.config.gates.max_verify_repairs.saturating_add(1)
             };
         // Workspace repair only — not review-answer repair (see ReviewRepairState).
-        let verifier = if matches!(&self.config.gates.verification, VerificationMode::Auto) {
+        let mut verifier = if matches!(&self.config.gates.verification, VerificationMode::Auto) {
             WorkspaceRepairVerifier::automatic(resolved_verify_stages, verify_rounds)
         } else {
             WorkspaceRepairVerifier::new(resolved_verify_stages, verify_rounds)
         };
+        verifier.timeout_override = self.config.verification_timeout;
         // Mid-turn LSP + affected cargo check state (dedupes packages across batches).
         let fast_feedback = super::fast_feedback::FastFeedbackState::default();
         let max_steps = effective_max_steps_for_turn(&self.config);
@@ -642,6 +640,19 @@ impl crate::Agent {
             expected_mutation,
             requested_validation,
             turn_input: input.to_string(),
+            native_director: self.initialize_native_director_v2(
+                &turn_input,
+                context_generation_seen,
+                turn_ledger_revision,
+                super::native_director::DirectorTurnRequirements {
+                    plan: planning_turn || plan_drive_turn,
+                    goal: goal_drive_turn,
+                    reminder: self.goals.plan_incomplete(),
+                    forced_tool: flags.force_tools_next,
+                    verify_before_yield: (expected_mutation || requested_validation)
+                        && verifier.is_on(),
+                },
+            ),
             turn_checkpoint_allowed,
             turn_checkpoint_created,
             verifier,
@@ -767,6 +778,11 @@ impl crate::Agent {
                 {
                     return Err(TurnCancellationRequested.into());
                 }
+                // A write-capable background child can only publish a detached,
+                // verified candidate. Merge it here, between foreground batches,
+                // under a fresh parent-owned workspace permit before any next
+                // model request can observe or report success.
+                self.settle_ready_candidates_at_boundary().await?;
                 let model_started = std::time::Instant::now();
                 let model_result = self
                     .run_model_round(&mut turn.as_model_round_state(), ui)
@@ -782,16 +798,21 @@ impl crate::Agent {
                 self.workspace.set_message_start(turn.turn_start);
                 match model_result? {
                     super::model_round::ModelRoundControl::Continue => continue,
-                    super::model_round::ModelRoundControl::BreakInner(hit) => break hit,
+                    super::model_round::ModelRoundControl::BreakInner(hit) => {
+                        if self.native_director_candidate_yield(&mut turn, hit) {
+                            continue;
+                        }
+                        break hit;
+                    }
                     super::model_round::ModelRoundControl::RunTools {
                         calls,
                         completion_content,
                         tool_specs,
+                        tool_envelope,
                     } => {
                         let mut completion_content = completion_content;
                         turn.flags.made_tool_call = true;
                         turn.silent_continues = 0;
-                        // Tools ran — drop one-shot force flags for the next Model round.
                         turn.flags.clear_one_shot_forces();
                         self.set_turn_phase(TurnPhase::Tools);
                         let tool_started = std::time::Instant::now();
@@ -800,6 +821,7 @@ impl crate::Agent {
                                 &calls,
                                 &mut completion_content,
                                 &tool_specs,
+                                &tool_envelope,
                                 turn.read_only_intent,
                                 turn.max_parallel_tools,
                                 &turn.task_contract,
@@ -858,12 +880,16 @@ impl crate::Agent {
                         }
                         match steer {
                             super::steer::RoundControl::Continue => {}
-                            super::steer::RoundControl::BreakInner(hit) => break hit,
+                            super::steer::RoundControl::BreakInner(hit) => {
+                                if self.native_director_candidate_yield(&mut turn, hit) {
+                                    continue;
+                                }
+                                break hit;
+                            }
                         }
                     }
                 }
             };
-
             if hit_cap {
                 let limit = match turn.flags.cap_kind {
                     Some(crate::domain::TurnCapKind::Tool) => "tool-call limit",
@@ -875,6 +901,11 @@ impl crate::Agent {
                 ));
                 turn.flags.ended_at_cap = true;
             }
+
+            // A candidate may have finished while the final model request was
+            // in flight. Apply it before whole-workspace verification, never
+            // from task polling or the child's completion callback.
+            self.settle_ready_candidates_at_boundary().await?;
 
             // TurnPhase::WorkspaceRepair — compile/lint/test stages; not review repair.
             // The state machine lives in WorkspaceRepairVerifier; this loop reacts.
@@ -1631,108 +1662,5 @@ impl crate::Agent {
         self.workspace.clear_active_baselines();
         let _ = self.maybe_requeue_goal_second_pass();
         Ok(outcome)
-    }
-}
-
-impl crate::Agent {
-    /// Run the guest's first decision step after the turn context is known.
-    /// During migration, effect actions are intentionally rejected here: the
-    /// existing Rust loop remains the only executor until a replay-equivalent
-    /// action router is enabled. This still validates and exercises the hot
-    /// module boundary without allowing a guest to bypass native policy.
-    fn initialize_wasm_turn(
-        &mut self,
-        lease: &hi_engine_host::EngineLease,
-        prompt: &str,
-        workspace_context_generation: u64,
-        ledger_revision: u64,
-        ui: &mut dyn Ui,
-    ) -> Result<()> {
-        if self.config.engine.mode != hi_engine_api::EngineMode::Wasm {
-            return Ok(());
-        }
-        let Some(mut engine) = lease.wasm_engine()? else {
-            return Ok(());
-        };
-        let tools = self
-            .tools
-            .iter()
-            .take(hi_engine_api::MAX_ENGINE_TOOLS)
-            .map(|tool| {
-                Ok(ToolDescriptor {
-                    name: tool.name.clone(),
-                    description: tool.description.clone(),
-                    parameters_json: serde_json::to_string(&tool.parameters)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let input = EngineInput::TurnStarted {
-            snapshot: EngineStateSnapshot {
-                api_major: hi_engine_api::ENGINE_API_MAJOR,
-                api_minor: hi_engine_api::ENGINE_API_MINOR,
-                state_schema_version: hi_engine_api::ENGINE_STATE_SCHEMA_VERSION,
-                turn_id: format!("turn-{}", self.turn_count.saturating_add(1)),
-                workspace_context_generation,
-                ledger_revision,
-                state: Vec::new(),
-            },
-            prompt: prompt.to_string(),
-            tools,
-        };
-        let module = engine.info().guest_version.clone();
-        let actions = match engine.step(&input) {
-            Ok(actions) => actions,
-            Err(error) => {
-                self.engine_runtime.rollback_active();
-                tracing::warn!(guest = %module, %error, "WASM engine trapped during turn initialization");
-                ui.status(&format!(
-                    "logic {module} failed; retained previous module and using native engine"
-                ));
-                return Ok(());
-            }
-        };
-        let ledger = hi_engine_host::ActionLedger::default();
-        if let Err(error) = ledger.claim(&actions) {
-            self.engine_runtime.rollback_active();
-            tracing::warn!(guest = %module, %error, "WASM engine returned duplicate or invalid actions");
-            ui.status(&format!(
-                "logic {module} returned invalid actions; retained previous module and using native engine"
-            ));
-            return Ok(());
-        }
-        for action in actions {
-            match action {
-                EngineAction::RequestModel { .. }
-                | EngineAction::Wait { .. }
-                | EngineAction::UpdateState { .. }
-                | EngineAction::Complete { .. } => {}
-                EngineAction::Present { directive, .. } => match directive {
-                    PresentationDirective::Status { text, .. }
-                    | PresentationDirective::Activity { text, .. }
-                    | PresentationDirective::Completion { text, .. } => ui.status(&text),
-                    PresentationDirective::Warning { text, .. } => ui.top_status(&text),
-                    PresentationDirective::ChangedFiles { .. } => {
-                        tracing::debug!(guest = %module, "ignored pre-turn changed-files directive")
-                    }
-                },
-                EngineAction::ExecuteTool { .. } | EngineAction::ExecuteParallel { .. } => {
-                    self.engine_runtime.rollback_active();
-                    tracing::warn!(guest = %module, "WASM engine requested an effect before the native action router was enabled");
-                    ui.status(&format!(
-                        "logic {module} requested an unavailable effect; retained previous module and using native engine"
-                    ));
-                    break;
-                }
-                EngineAction::Fail { code, message, .. } => {
-                    self.engine_runtime.rollback_active();
-                    tracing::warn!(guest = %module, code = %code, %message, "WASM engine reported initialization failure");
-                    ui.status(&format!(
-                        "logic {module} failed ({code}); retained previous module and using native engine"
-                    ));
-                    break;
-                }
-            }
-        }
-        Ok(())
     }
 }

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Task;
+use crate::identity::IdentityDetails;
 
 pub const PLATFORM_SCHEMA_VERSION: u32 = 1;
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1181,6 +1182,8 @@ pub struct RunIdentity {
     pub secret_configuration_digest: String,
     #[serde(default)]
     pub runtime_identity: String,
+    #[serde(default)]
+    pub identity_dimensions: BTreeMap<String, String>,
     pub digest: String,
 }
 
@@ -1231,21 +1234,12 @@ impl RunIdentity {
             mcp_configuration_digest: details.mcp_configuration_digest,
             secret_configuration_digest: details.secret_configuration_digest,
             runtime_identity: details.runtime_identity,
+            identity_dimensions: details.identity_dimensions,
             digest: String::new(),
         };
         identity.digest = digest_bytes(&serde_json::to_vec(&identity)?)?;
         Ok(identity)
     }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct IdentityDetails {
-    pub adapter_version: String,
-    pub hi_binary_digest: String,
-    pub provider_policy_digest: String,
-    pub mcp_configuration_digest: String,
-    pub secret_configuration_digest: String,
-    pub runtime_identity: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

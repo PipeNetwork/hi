@@ -10,7 +10,7 @@ pub(crate) struct PrefixStability {
     /// Per-message content hashes of the most recent request sent.
     prev_hashes: Vec<u64>,
     /// Fingerprint of the tool schemas sent with that request.
-    prev_tools_hash: u64,
+    prev_tools_digest: String,
     /// This turn's append-only request count (messages and tools unchanged).
     pub(crate) stable_rounds: u32,
     /// This turn's prefix-breaking request count (messages or tools).
@@ -42,13 +42,13 @@ impl PrefixStability {
         tools: &[hi_ai::ToolSpec],
     ) {
         let hashes = message_hashes(messages);
-        let tools_hash = tools_hash(tools);
+        let tools_digest = hi_tools::envelope::canonical_tool_schema_digest(tools);
         if !self.prev_hashes.is_empty() {
             let shared = self.prev_hashes.len().min(hashes.len());
             let divergence = (0..shared)
                 .find(|&i| self.prev_hashes[i] != hashes[i])
                 .or_else(|| (hashes.len() < self.prev_hashes.len()).then_some(hashes.len()));
-            let tools_changed = self.prev_tools_hash != tools_hash;
+            let tools_changed = self.prev_tools_digest != tools_digest;
             if divergence.is_none() && !tools_changed {
                 self.stable_rounds = self.stable_rounds.saturating_add(1);
             } else {
@@ -66,20 +66,8 @@ impl PrefixStability {
             }
         }
         self.prev_hashes = hashes;
-        self.prev_tools_hash = tools_hash;
+        self.prev_tools_digest = tools_digest;
     }
-}
-
-fn tools_hash(tools: &[hi_ai::ToolSpec]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    tools.len().hash(&mut hasher);
-    for tool in tools {
-        tool.name.hash(&mut hasher);
-        tool.description.hash(&mut hasher);
-        tool.parameters.to_string().hash(&mut hasher);
-    }
-    hasher.finish()
 }
 
 fn message_hashes(messages: &[hi_ai::Message]) -> Vec<u64> {

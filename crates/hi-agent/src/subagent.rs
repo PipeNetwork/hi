@@ -64,6 +64,25 @@ pub struct DelegateOutcome {
 /// back into the parent's working tree. Implemented by the frontend.
 #[async_trait]
 pub trait DelegateRunner: Send + Sync {
+    /// Rebind future detached candidates to a newly authoritative workspace.
+    /// Returning `false` keeps portable-workspace delegate admission closed.
+    fn bind_workspace(
+        &self,
+        _workspace_root: &std::path::Path,
+        _state_root: &std::path::Path,
+    ) -> bool {
+        false
+    }
+
+    /// Prove that candidate creation and parent apply target this exact root.
+    fn is_bound_to_workspace(
+        &self,
+        _workspace_root: &std::path::Path,
+        _state_root: &std::path::Path,
+    ) -> bool {
+        false
+    }
+
     /// Synchronize the per-turn model-call cap used by subsequently spawned
     /// delegate children. Frontends without child processes can ignore this;
     /// process-owning runners should treat `None` as unlimited/default.

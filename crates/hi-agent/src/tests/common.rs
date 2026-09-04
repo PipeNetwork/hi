@@ -59,6 +59,21 @@ thread_local! {
 /// A provider that returns canned completions in order.
 pub(crate) struct Canned(pub(crate) Mutex<Vec<Completion>>);
 
+pub(crate) fn test_provider_capabilities() -> hi_ai::ProviderCapabilities {
+    let mut capabilities = hi_ai::ProviderCapabilities::native_tools(false);
+    capabilities.parallel_tool_calls = true;
+    capabilities
+}
+
+macro_rules! native_tool_test_provider {
+    () => {
+        fn capabilities(&self) -> hi_ai::ProviderCapabilities {
+            $crate::tests::common::test_provider_capabilities()
+        }
+    };
+}
+pub(crate) use native_tool_test_provider;
+
 pub(crate) fn pop_canned_completion(
     responses: &Mutex<Vec<Completion>>,
     provider: &str,
@@ -82,6 +97,10 @@ impl Provider for Canned {
     ) -> Result<Completion> {
         pop_canned_completion(&self.0, "Canned")
     }
+
+    fn capabilities(&self) -> hi_ai::ProviderCapabilities {
+        test_provider_capabilities()
+    }
 }
 
 /// Canned provider that also emits text through the streaming sink. Most unit
@@ -103,6 +122,10 @@ impl Provider for StreamingCanned {
             }
         }
         Ok(completion)
+    }
+
+    fn capabilities(&self) -> hi_ai::ProviderCapabilities {
+        test_provider_capabilities()
     }
 }
 
@@ -129,6 +152,10 @@ impl Provider for RecordTemps {
         ));
         pop_canned_completion(&self.responses, "RecordTemps")
     }
+
+    fn capabilities(&self) -> hi_ai::ProviderCapabilities {
+        test_provider_capabilities()
+    }
 }
 
 /// Like [`Canned`], but records each request's `tool_mode` so a test can
@@ -147,6 +174,10 @@ impl Provider for RecordToolModes {
     ) -> Result<Completion> {
         self.modes.lock().unwrap().push(request.profile.tool_mode);
         pop_canned_completion(&self.responses, "RecordToolModes")
+    }
+
+    fn capabilities(&self) -> hi_ai::ProviderCapabilities {
+        test_provider_capabilities()
     }
 }
 
@@ -169,6 +200,10 @@ impl Provider for RecordRequests {
             .push(request.tools.iter().map(|tool| tool.name.clone()).collect());
         self.modes.lock().unwrap().push(request.profile.tool_mode);
         pop_canned_completion(&self.responses, "RecordRequests")
+    }
+
+    fn capabilities(&self) -> hi_ai::ProviderCapabilities {
+        test_provider_capabilities()
     }
 }
 
@@ -237,6 +272,10 @@ impl Provider for ScriptedProvider {
                     .into())
             }
         }
+    }
+
+    fn capabilities(&self) -> hi_ai::ProviderCapabilities {
+        test_provider_capabilities()
     }
 }
 

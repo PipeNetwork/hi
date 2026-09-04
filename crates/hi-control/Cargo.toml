@@ -8,6 +8,8 @@ description = "Local durable control-plane state for hi runs, leases, effects, e
 hi-events.workspace = true
 hi-policy.workspace = true
 hi-sqlite-journal.workspace = true
+hi-workspace.workspace = true
+async-trait.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -15,6 +17,7 @@ rusqlite.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

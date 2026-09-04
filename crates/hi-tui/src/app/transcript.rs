@@ -60,9 +60,9 @@ impl crate::App {
         *index = Some(self.transcript.len().saturating_sub(1));
     }
 
-    /// Push a user-prompt echo as a structurally-distinct entry so the render
-    /// pass can pin it as a sticky header when scrolled past.
+    /// Push a distinct user-prompt echo so rendering can pin it as a sticky header.
     pub(crate) fn push_user_prompt(&mut self, line: Line<'static>) {
+        self.record_projected_user_prompt(&line);
         self.freeze_verb_group();
         if self.following {
             self.page_flip_on_send = true;
@@ -373,7 +373,7 @@ impl crate::App {
         // While following, the view already tracks the growing bottom.
     }
 
-    pub(crate) fn apply(&mut self, event: UiEvent) {
+    pub(crate) fn apply_legacy(&mut self, event: UiEvent) {
         // Bound the debug event log (each arm below pushes one entry). Drop the
         // oldest quarter in a batch when over the cap, so the front-drain is
         // amortized O(1) per event rather than shifting the whole vec each push.

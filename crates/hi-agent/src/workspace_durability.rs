@@ -14,6 +14,18 @@ pub trait WorkspaceDurability: Send + Sync {
     /// Reconcile the materialized tree and durably commit any changed bytes.
     async fn checkpoint(&self) -> Result<()>;
 
+    /// Durably stage the execution record which must be published with the
+    /// next remote workspace receipt. Local durability backends never need
+    /// this hook. The default is deliberately fail-closed because a remote
+    /// controller must not settle bytes against a transcript batch that omits
+    /// the native verifier which produced them.
+    fn stage_workspace_execution(
+        &self,
+        _record: &crate::WorkspaceTranscriptExecution,
+    ) -> Result<()> {
+        anyhow::bail!("this workspace durability backend cannot stage execution evidence")
+    }
+
     /// Start or stop periodic reconciliation for a native background process.
     /// Implementations that do not need it may ignore the notification.
     async fn background_process_state(&self, _id: &str, _running: bool) -> Result<()> {

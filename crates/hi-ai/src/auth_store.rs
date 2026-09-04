@@ -5,8 +5,9 @@
 //! config path could land in a repo and be committed. This file lives only in
 //! the user config dir and is created 0600 before any secret reaches it.
 //!
-//! API keys are not stored here — they stay in `config.toml`/env, where they
-//! already live. This is for credentials that expire and get rewritten.
+//! Static API keys and refreshable credentials share this private store. Public
+//! configuration persists only an opaque `auth-store://...` reference; static
+//! entries use an empty refresh token and never expire.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
@@ -45,6 +46,16 @@ impl StoredToken {
             access,
             refresh,
             expires: now + expires_in_secs.saturating_sub(Self::REFRESH_SKEW_SECS),
+        }
+    }
+
+    /// Store a non-refreshable credential without writing it into ordinary
+    /// profile/config files.
+    pub fn static_access(access: String) -> Self {
+        Self {
+            access,
+            refresh: String::new(),
+            expires: u64::MAX,
         }
     }
 

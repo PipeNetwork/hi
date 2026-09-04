@@ -111,6 +111,46 @@ fn metadata_catalog_covers_every_schema_once() {
     assert!(!is_known_tool("hallucinated_tool"));
 }
 
+#[test]
+fn metadata_carries_conservative_envelope_policy() {
+    for metadata in TOOL_CATALOG {
+        assert_eq!(metadata.schema_version, TOOL_METADATA_SCHEMA_VERSION);
+        assert!(metadata.policy.output.max_inline_bytes > 0);
+        assert!(metadata.policy.output.redact_secrets);
+        assert!(metadata.policy.artifacts.digest_required);
+        assert!(metadata.policy.artifacts.max_count > 0);
+    }
+
+    let read = tool_metadata("read").unwrap();
+    assert_eq!(read.policy.effect_scope, EffectScope::ReadOnly);
+    assert_eq!(read.policy.replay_class, ReplayClass::PureWorkspace);
+    assert!(read.policy.resource_access.workspace_read);
+    assert!(!read.policy.resource_access.workspace_write);
+
+    let edit = tool_metadata("edit").unwrap();
+    assert_eq!(edit.policy.effect_scope, EffectScope::LiveWriter);
+    assert_eq!(edit.policy.replay_class, ReplayClass::PureWorkspace);
+    assert!(edit.policy.resource_access.workspace_write);
+
+    let search = tool_metadata("web_search").unwrap();
+    assert_eq!(search.policy.replay_class, ReplayClass::IdempotentExternal);
+    assert!(search.policy.resource_access.network);
+
+    let bash = tool_metadata("bash").unwrap();
+    assert_eq!(bash.policy.effect_scope, EffectScope::LiveWriter);
+    assert_eq!(bash.policy.replay_class, ReplayClass::NonReplayableExternal);
+    assert!(bash.policy.resource_access.workspace_write);
+    assert!(bash.policy.resource_access.network);
+    assert!(bash.policy.resource_access.credentials);
+
+    let delegate = tool_metadata("delegate").unwrap();
+    assert_eq!(delegate.policy.effect_scope, EffectScope::CandidateOnly);
+    assert_eq!(
+        delegate.policy.replay_class,
+        ReplayClass::NonReplayableExternal
+    );
+}
+
 fn spec(name: &str) -> &'static ToolSpec {
     TOOL_SPECS
         .iter()
@@ -260,6 +300,14 @@ fn target_path_extracts_path_field() {
         target_path("read", r#"{"paths":["src/a.rs"]}"#),
         Some("src/a.rs".into())
     );
+    assert_eq!(
+        target_path("read", r#"{"uri":"workspace://src/a.rs"}"#),
+        Some("src/a.rs".into())
+    );
+    assert_eq!(
+        target_path("read", r#"{"uri":"artifact://sha256/example"}"#),
+        None
+    );
     // A multi-element array has no single target → None.
     assert_eq!(
         target_path("read", r#"{"paths":["src/a.rs","src/b.rs"]}"#),
@@ -323,9 +371,27 @@ fn read_schema_accepts_single_or_multi_path_calls() {
     );
     assert!(
         hi_ai::validate_client_tool_call(
+            "read-uri",
+            "read",
+            r#"{"uri":"workspace://src/lib.rs","offset":10,"limit":20}"#,
+            std::slice::from_ref(read),
+        )
+        .is_ok()
+    );
+    assert!(
+        hi_ai::validate_client_tool_call(
             "read-both",
             "read",
             r#"{"path":"src/lib.rs","paths":["src/main.rs"]}"#,
+            std::slice::from_ref(read),
+        )
+        .is_err()
+    );
+    assert!(
+        hi_ai::validate_client_tool_call(
+            "read-path-and-uri",
+            "read",
+            r#"{"path":"src/lib.rs","uri":"workspace://src/lib.rs"}"#,
             std::slice::from_ref(read),
         )
         .is_err()

@@ -297,31 +297,15 @@ pub(crate) async fn repl(
                                 );
                                 continue;
                             }
-                            let diff =
-                                hi_tools::working_tree_diff_plain_in(agent.workspace_root()).await;
-                            if diff.trim() != "(no changes)" && !diff.trim().is_empty() {
-                                let preview: String =
-                                    diff.lines().take(20).collect::<Vec<_>>().join("\n");
-                                let total = diff.lines().count();
-                                println!(
-                                    "\x1b[2m--- committing session paths ({total} line(s) of diff) ---\x1b[0m"
-                                );
-                                println!("{preview}");
-                                if total > 20 {
-                                    println!("\x1b[2m  … {} more line(s)\x1b[0m", total - 20);
+                            let out = match agent.commit_session_changes(&paths).await {
+                                Ok(out) => out,
+                                Err(error) => {
+                                    eprintln!(
+                                        "\x1b[33mcommit failed or was not durably published: {error:#}\x1b[0m"
+                                    );
+                                    continue;
                                 }
-                            }
-                            if let Err(error) = agent.begin_durable_workspace_mutation(None).await {
-                                eprintln!("\x1b[33mcommit blocked: {error:#}\x1b[0m");
-                                continue;
-                            }
-                            let out = hi_tools::commit_in(agent.workspace_root(), &paths).await;
-                            if let Err(error) = agent.checkpoint_durable_workspace().await {
-                                eprintln!(
-                                    "\x1b[33mcommit completed locally but PipeFS persistence failed: {error:#}; run /pipefs retry\x1b[0m"
-                                );
-                                continue;
-                            }
+                            };
                             for line in out.lines() {
                                 println!("\x1b[2m── {line} ──\x1b[0m");
                             }
@@ -870,7 +854,8 @@ pub(crate) async fn repl(
                         | Command::Rename(_)
                         | Command::Resume(_) => {
                             if let Some(effect) =
-                                hi_agent::handle_session_command(agent, &command, &[])
+                                hi_agent::handle_session_command_coordinated(agent, &command, &[])
+                                    .await
                             {
                                 print!("{}", effect.message);
                                 if !effect.message.ends_with('\n') {
@@ -1181,10 +1166,6 @@ pub(crate) async fn repl(
         let _ = drive_with_spinner(memory, &progress, None).await;
     }
 
-    // Don't leave background processes (dev servers, watchers) running after
-    // the session ends.
-    agent.kill_background_processes();
-
     if let Some(path) = &history {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1199,7 +1180,7 @@ pub(crate) async fn repl(
     // This callback is rooted at the process launch directory. While PipeFS
     // is active, writing there would violate the promise that enabling from a
     // local project leaves that project untouched.
-    if !agent.workspace_durability_enabled() {
+    if !agent.pipefs_workspace_active() {
         let _ = config::remember_session(
             Path::new("."),
             profile,

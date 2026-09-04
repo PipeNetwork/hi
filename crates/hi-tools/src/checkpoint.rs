@@ -2679,7 +2679,7 @@ mod tests {
             wait_for_process_exit(child).await,
             "worktree-add descendant survived cancellation"
         );
-        assert!(!sandbox.exists(), "interrupted worktree directory survived");
+        assert!(wait_for_path(&sandbox, false).await, "sandbox survived");
     }
 
     #[tokio::test]

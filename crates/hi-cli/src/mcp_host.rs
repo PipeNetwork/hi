@@ -69,6 +69,15 @@ impl McpBackend for ConnectedMcp {
         Ok(result.content)
     }
 
+    async fn read_resource(&self, server: &str, uri: &str) -> Result<String> {
+        self.client
+            .lock()
+            .await
+            .read_resource(server, uri)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))
+    }
+
     async fn workspace_status(&self) -> String {
         self.client.lock().await.status_table()
     }
@@ -403,7 +412,18 @@ mod tests {
         )
         .unwrap();
         let started = std::time::Instant::now();
-        let (host, _) = connect_workspace_mcp(tmp.path(), &McpImportPolicy::default(), None).await;
+        // This test isolates lazy registration from folder-trust admission.
+        // Repo-local MCP is intentionally unavailable in an untrusted,
+        // headless workspace, so grant trust explicitly through the internal
+        // test seam instead of weakening the production trust resolver.
+        let (host, _) = connect_workspace_mcp_with_trust(
+            tmp.path(),
+            &McpImportPolicy::default(),
+            None,
+            true,
+            &HashMap::new(),
+        )
+        .await;
         let host = host.expect("registered");
         let elapsed = started.elapsed();
         assert!(

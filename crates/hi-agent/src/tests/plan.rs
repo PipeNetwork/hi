@@ -124,14 +124,14 @@ impl hi_ai::Provider for ModeTransitionProvider {
         });
         pop_canned_completion(&self.responses, "ModeTransitionProvider")
     }
-}
 
+    native_tool_test_provider!();
+}
 #[tokio::test]
 async fn distinct_discovery_plan_transitions_to_verified_mutation_without_a_count_cap() {
     let workspace = IsolatedWorkspace::new("mixed-review-build");
     let mut responses = Vec::new();
-    // Reproduce the failed live turn: thirteen distinct reads, then a concrete
-    // plan. Every read must remain available without count-based steering.
+    // Reproduce thirteen reads before a concrete, uncapped plan.
     for index in 0..13 {
         let relative = format!("src/context-{index}.rs");
         let path = workspace.path(&relative);

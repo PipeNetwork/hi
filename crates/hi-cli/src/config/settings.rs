@@ -37,6 +37,9 @@ pub struct Settings {
     /// Auto-attach first-party Pipe `/mcp` as server `pipe`.
     pub mcp_pipe_enabled: bool,
     pub mcp_pipe_allow: Vec<String>,
+    /// Raw session-source overrides, retained to fence live session switches.
+    pub session_harness: hi_workspace::SettingLayer,
+    pub harness: hi_workspace::ResolvedHarnessSettings,
 }
 
 #[derive(Clone, Debug)]
@@ -251,6 +254,13 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         profile.and_then(|profile| profile.execution),
         config.execution,
     )?;
+    let session_harness = resolve_session_harness(cli)?;
+    let harness = resolve_harness(
+        config,
+        profile,
+        Some(session_harness.clone()),
+        &cli.harness_settings,
+    )?;
 
     Ok(Settings {
         execution,
@@ -282,6 +292,8 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         browser_allow_private: config.browser.allows_private_urls(),
         mcp_pipe_enabled: config.mcp.pipe.is_enabled(),
         mcp_pipe_allow: config.mcp.pipe.allow.clone(),
+        session_harness,
+        harness,
     })
 }
 
@@ -480,6 +492,8 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         .or(config.execution)
         .or(resolve_execution_env()?)
         .unwrap_or(hi_agent::ExecutionMode::Durable);
+    let session_harness = crate::session_harness::empty_layer();
+    let harness = resolve_harness(config, profile, Some(session_harness.clone()), &[])?;
 
     Ok(Settings {
         execution,
@@ -523,6 +537,8 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         browser_allow_private: config.browser.allows_private_urls(),
         mcp_pipe_enabled: config.mcp.pipe.is_enabled(),
         mcp_pipe_allow: config.mcp.pipe.allow.clone(),
+        session_harness,
+        harness,
     })
 }
 

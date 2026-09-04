@@ -1806,6 +1806,7 @@ mod tests {
                 },
             ]),
             tools: Arc::new([]),
+            tool_envelope: None,
             max_tokens: 10,
             temperature: None,
             top_p: None,

@@ -26,6 +26,12 @@ jobs:
       - name: Verify PipeFS archives and native Git on macOS
         run: cargo test -p hi-pipefs --all-targets
 
+      - name: Verify native process cancellation and reaping on macOS
+        run: |
+          cargo test -p hi-tools background --lib --no-default-features
+          cargo test -p hi-agent cancellation_settlement --lib --no-default-features
+          cargo test -p hi --bin hi child_process::tests --no-default-features
+
       - name: Build release TUI smoke binaries
         run: cargo build --release -p hi -p hi-smoke --no-default-features
 

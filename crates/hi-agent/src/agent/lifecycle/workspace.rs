@@ -3,35 +3,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use hi_ai::Provider;
+use hi_ai::{Content, Provider};
 
+use super::workspace_failure::verification_after_turn_failure;
 use crate::AgentConfig;
-
-/// Retain deterministic evidence across a later, unrelated turn failure only
-/// when a pass is still bound to the current workspace. Provider/session
-/// failures are not verifier infrastructure failures, and therefore default to
-/// `Unverified` rather than manufacturing `InfrastructureError`.
-fn verification_after_turn_failure(
-    evidence: &crate::domain::VerifyEvidence,
-    workspace_reconciled: bool,
-    current_revision: u64,
-    current_digest: &str,
-) -> (crate::VerificationStatus, Option<String>) {
-    if !workspace_reconciled {
-        return (crate::VerificationStatus::Unverified, None);
-    }
-    match evidence {
-        crate::domain::VerifyEvidence::Passed { revision, digest }
-            if *revision == current_revision && digest == current_digest =>
-        {
-            (crate::VerificationStatus::Passed, Some(digest.clone()))
-        }
-        crate::domain::VerifyEvidence::Failed => (crate::VerificationStatus::Failed, None),
-        crate::domain::VerifyEvidence::None | crate::domain::VerifyEvidence::Passed { .. } => {
-            (crate::VerificationStatus::Unverified, None)
-        }
-    }
-}
 
 impl crate::Agent {
     /// Install or clear the host-provided durability fence used by PipeFS.
@@ -40,10 +15,15 @@ impl crate::Agent {
         durability: Option<Arc<dyn crate::WorkspaceDurability>>,
     ) {
         self.workspace_durability = durability;
-        // Portable workspaces currently deny write-capable child agents: the
-        // frontend delegate runner captures a concrete root, and background
-        // writers cannot participate in the parent's durability fence. Refresh
-        // the advertised set immediately so `delegate` is not offered there.
+        if self.workspace_durability.is_none()
+            && let Err(error) = self.workspace_coordination.install_local(
+                &self.config.paths.workspace_root,
+                &self.config.paths.state_root,
+            )
+        {
+            tracing::error!(%error, "could not restore the local workspace controller");
+        }
+        // Refresh tools because portable workspaces deny write-capable delegates.
         self.set_advertised_tools(None);
     }
 
@@ -51,8 +31,65 @@ impl crate::Agent {
         self.workspace_durability.is_some()
     }
 
-    /// Record the remote workspace-authority bit alongside the durable
-    /// transcript so a later resume still probes IPOP after OS cache cleanup.
+    /// Whether the active workspace authority is PipeFS. Policy gates must use
+    /// this binding fact rather than the optional legacy durability adapter.
+    pub fn pipefs_workspace_active(&self) -> bool {
+        matches!(
+            self.workspace_controller_binding().authority,
+            hi_workspace::WorkspaceAuthority::PipeFs { .. }
+        )
+    }
+
+    pub fn workspace_controller_binding(&self) -> hi_workspace::WorkspaceBinding {
+        self.workspace_coordination.binding()
+    }
+
+    pub fn workspace_controller_capabilities(&self) -> hi_workspace::WorkspaceCapabilities {
+        self.workspace_coordination.capabilities()
+    }
+
+    pub fn workspace_controller_status(&self) -> hi_workspace::WorkspaceStatus {
+        self.workspace_coordination.status()
+    }
+
+    pub fn harness_settings(&self) -> &hi_workspace::ResolvedHarnessSettings {
+        &self.config.harness
+    }
+
+    pub fn harness_session_layer(&self) -> Option<&hi_workspace::SettingLayer> {
+        self.config.harness_session.as_ref()
+    }
+
+    pub fn activate_pipefs_workspace_controller(
+        &self,
+        session_id: &str,
+        writer_protocol: u16,
+        causal_commit: bool,
+    ) -> Result<()> {
+        self.workspace_coordination.install_pipefs(
+            session_id,
+            writer_protocol,
+            causal_commit && self.config.harness.features.pipefs_causal_commit_v1,
+            &self.config.paths.workspace_root,
+            &self.config.paths.state_root,
+        )
+    }
+
+    /// Install a controller that owns its backend settlement path.
+    pub fn install_workspace_controller(
+        &self,
+        controller: Arc<dyn hi_workspace::WorkspaceController>,
+    ) -> Result<()> {
+        self.workspace_coordination.install_controller(controller)
+    }
+
+    pub async fn acknowledge_workspace_recovery(&mut self) -> Result<()> {
+        self.workspace_coordination
+            .reconcile_after_external_proof()
+            .await
+    }
+
+    /// Persist remote authority so resume still probes IPOP after cache cleanup.
     pub fn record_pipefs_mode(&mut self, enabled: bool) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             session.record_pipefs_mode(enabled)?;
@@ -60,9 +97,7 @@ impl crate::Agent {
         Ok(())
     }
 
-    /// Replace repository-supplied prompt context after a controlled root
-    /// switch. Standing user rules remain session-scoped; only files from the
-    /// newly materialized workspace are re-read by the frontend.
+    /// Replace repository-supplied prompt context after a controlled root switch.
     pub fn set_workspace_project_context(&mut self, context: Option<String>) {
         self.config.memory.project_context = context;
         self.refresh_system_message();
@@ -72,17 +107,103 @@ impl crate::Agent {
         &self,
         dirty_paths: Option<Vec<String>>,
     ) -> Result<()> {
-        if let Some(durability) = &self.workspace_durability {
-            durability.mutation_started(dirty_paths).await?;
+        self.workspace_coordination
+            .begin(self.workspace_durability.clone(), dirty_paths)
+            .await
+    }
+
+    pub(crate) async fn begin_classified_workspace_operation(
+        &self,
+        intent: hi_workspace::MutationIntent,
+    ) -> Result<()> {
+        self.workspace_coordination
+            .begin_intent(self.workspace_durability.clone(), intent)
+            .await?;
+        if let Err(error) =
+            hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::ToolBeforeStart)
+        {
+            self.workspace_coordination.abandon_active()?;
+            return Err(error.into());
         }
         Ok(())
     }
 
-    pub async fn checkpoint_durable_workspace(&self) -> Result<()> {
-        if let Some(durability) = &self.workspace_durability {
-            durability.checkpoint().await?;
+    /// Stage the exact provider-facing result before a PipeFS settlement.
+    /// Local workspaces publish their transcript after the local checkpoint and
+    /// therefore need no pre-stage. Remote workspaces must place this record in
+    /// the durable outbox first so the controller cannot commit bytes against a
+    /// one-step-behind transcript batch.
+    pub(crate) fn stage_active_workspace_execution(
+        &mut self,
+        calls: &[(String, String, String)],
+        assistant_content: &[Content],
+        results: &[(String, String)],
+        execution: &hi_workspace::ExecutionReport,
+    ) -> Result<()> {
+        if !matches!(
+            self.workspace_controller_binding().authority,
+            hi_workspace::WorkspaceAuthority::PipeFs { .. }
+        ) {
+            return Ok(());
         }
-        Ok(())
+        let operation_id = match self.workspace_coordination.active_parent_operation() {
+            Some(operation_id) => operation_id,
+            None if !self.config.harness.features.workspace_controller_v2 => return Ok(()),
+            None => anyhow::bail!("PipeFS execution has no admitted workspace operation"),
+        };
+        anyhow::ensure!(
+            calls.len() == results.len(),
+            "workspace execution transcript has {} calls but {} results",
+            calls.len(),
+            results.len()
+        );
+        let transcript_calls = calls
+            .iter()
+            .zip(results)
+            .map(|((call_id, name, _), (result_id, result))| {
+                anyhow::ensure!(
+                    call_id == result_id,
+                    "workspace execution result order does not match call order"
+                );
+                Ok(crate::WorkspaceTranscriptCall {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    result: result.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let record = crate::WorkspaceTranscriptExecution {
+            schema_version: crate::WorkspaceTranscriptExecution::SCHEMA_VERSION,
+            operation_id,
+            assistant_content: assistant_content.to_vec(),
+            calls: transcript_calls,
+            execution: execution.clone(),
+        };
+        self.session
+            .as_mut()
+            .context("PipeFS execution requires a durable session sink")?
+            .stage_workspace_execution(&record)
+            .context("staging PipeFS workspace execution transcript")
+    }
+
+    /// Settle an admitted operation using the executor's real typed result.
+    /// Storage success must never rewrite a failed/cancelled/indeterminate
+    /// execution into `Succeeded` in the operation journal.
+    pub(crate) async fn checkpoint_durable_workspace_with_execution(
+        &self,
+        mut execution: hi_workspace::ExecutionReport,
+    ) -> Result<()> {
+        if execution.workspace_may_have_changed && execution.content_digest.is_none() {
+            execution.content_digest = Some(self.runtime.ledger().workspace_revision());
+        }
+        let pending = self.runtime.background().pending_job_settlements().await;
+        self.workspace_coordination
+            .checkpoint(self.workspace_durability.clone(), execution)
+            .await?;
+        self.runtime
+            .background()
+            .settle_jobs_after_workspace(&pending)
+            .await
     }
 
     /// Recreate all workspace-scoped runtime state against a materialized root.
@@ -150,6 +271,15 @@ impl crate::Agent {
         allow_project_hooks: bool,
         record_checkpoint_boundary: bool,
     ) -> Result<()> {
+        // Hold the exclusive admission side from the first stable drain
+        // through controller publication. Job terminal callbacks remain
+        // available, but no cloned registry can cross the final barrier on
+        // the old binding.
+        let rebind_admission = self
+            .workspace_coordination
+            .close_admission_for_rebind()
+            .await;
+        self.ensure_workspace_rebind_ready()?;
         self.runtime
             .background()
             .ensure_quiescent_and_reaped()
@@ -161,21 +291,24 @@ impl crate::Agent {
             "cannot switch workspaces while background tasks remain active: {}",
             background_tasks.join(", ")
         );
+        self.require_workspace_barrier(hi_workspace::BarrierKind::Rebind)
+            .await
+            .context("waiting for the unified workspace rebind barrier")?;
+        hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::RebindAfterDrain)
+            .map_err(anyhow::Error::from)?;
 
-        #[cfg(test)]
         let sandbox_policy = self.config.sandbox_policy;
-        #[cfg(not(test))]
-        let sandbox_policy = None;
-        let replacement = crate::WorkspaceRuntime::new_with_scan_sandbox_and_project_hooks(
+        let sandbox_config = self.config.sandbox_config.clone();
+        let replacement = crate::WorkspaceRuntime::new_with_scan_sandbox_config_and_project_hooks(
             workspace_root.as_ref(),
             state_root.as_ref(),
             self.config.gates.lsp_mode,
             None,
             sandbox_policy,
+            sandbox_config,
             allow_project_hooks,
         )?;
-        // Do not disable the old runtime until every fallible replacement
-        // construction step has succeeded. This keeps a failed rebind atomic
+        // Keep the old runtime until fallible replacement construction succeeds.
         // from the caller's perspective.
         // Checkpoint references address snapshots of one concrete workspace.
         // Append an explicit empty, last-write-wins boundary before switching
@@ -184,10 +317,18 @@ impl crate::Agent {
         if record_checkpoint_boundary {
             self.record_workspace_checkpoint_boundary()?;
         }
+        self.workspace_coordination.install_local_during_rebind(
+            replacement.root(),
+            replacement.state_root(),
+            &rebind_admission,
+        )?;
         self.runtime.lsp().set_enabled(false).await;
         self.config.paths.workspace_root = replacement.root().to_path_buf();
         self.config.paths.state_root = replacement.state_root().to_path_buf();
         self.runtime = replacement;
+        self.workspace_coordination
+            .bind_background_registries(self.runtime.background(), &self.bg_tasks);
+        self.bind_delegate_runner_workspace();
         if self.memory.is_some() {
             self.memory = Some(Arc::new(crate::MarkdownMemory::new(
                 self.config.paths.workspace_root.clone(),
@@ -209,6 +350,7 @@ impl crate::Agent {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.set_advertised_tools(None);
         self.refresh_system_message();
+        drop(rebind_admission);
         Ok(())
     }
 
@@ -373,61 +515,6 @@ impl crate::Agent {
         // be called from async cleanup paths if needed.
     }
 
-    /// Single entry point for abnormal turn teardown (cancel / infrastructure fail).
-    ///
-    /// Owns turn-scoped background kill via [`WorkspaceTurnState::active_turn_background_baseline`]
-    /// (taken once — second call is a no-op). Frontends should prefer this over
-    /// ad-hoc kill + finalize sequences.
-    ///
-    /// Normal successful turns clear baselines inside `run_turn` and must not call this.
-    pub async fn cleanup_turn(
-        &mut self,
-        kind: crate::TurnCleanupKind,
-    ) -> Result<crate::TurnCleanupResult> {
-        // Abort immediate `/btw` so a cancelled/failed turn can't keep answering.
-        self.disarm_btw_dispatcher();
-        match kind {
-            crate::TurnCleanupKind::Cancel { session } => {
-                let killed = self.take_and_kill_turn_backgrounds();
-                match session {
-                    crate::SessionRollback::AlreadyApplied => {
-                        // Frontend already rewound transcript/goals; don't truncate again.
-                        let _ = self.workspace.active_turn_message_start.take();
-                    }
-                    crate::SessionRollback::AgentOwned {
-                        checkpoint_refs_before,
-                    } => {
-                        if let Err(err) =
-                            self.rollback_turn_checkpoint(&checkpoint_refs_before).await
-                        {
-                            eprintln!(
-                                "hi-agent: couldn't roll back cancelled workspace edits: {err:#}"
-                            );
-                        }
-                        if let Some(start) = self.workspace.active_turn_message_start.take() {
-                            self.truncate_messages(start);
-                        }
-                    }
-                }
-                self.reconcile_abnormal_turn_bounded().await;
-                let outcome = self.finalize_cancelled_turn_inner()?;
-                Ok(crate::TurnCleanupResult {
-                    outcome,
-                    killed_backgrounds: killed,
-                })
-            }
-            crate::TurnCleanupKind::Fail => {
-                let killed = self.take_and_kill_turn_backgrounds();
-                let workspace_reconciled = self.reconcile_abnormal_turn_bounded().await;
-                let outcome = self.finalize_failed_turn_inner(workspace_reconciled);
-                Ok(crate::TurnCleanupResult {
-                    outcome,
-                    killed_backgrounds: killed,
-                })
-            }
-        }
-    }
-
     /// Legacy synchronous cancelled-turn finalizer.
     ///
     /// Use [`Self::cleanup_turn`] so background kill and bounded ledger
@@ -506,36 +593,6 @@ impl crate::Agent {
         self.finalize_failed_turn_inner(false)
     }
 
-    /// Restore the checkpoint created by the active turn, if one is still on
-    /// the stack, then put the exact pre-turn bounded undo history back. A
-    /// length-only comparison is insufficient at [`crate::MAX_CHECKPOINTS`]:
-    /// adding the new checkpoint evicts the oldest and keeps the same length.
-    pub(crate) async fn rollback_turn_checkpoint(
-        &mut self,
-        checkpoint_refs_before: &[String],
-    ) -> Result<usize> {
-        let current = &self.workspace.checkpoints;
-        let new_checkpoint_is_live =
-            current != checkpoint_refs_before && current.len() >= checkpoint_refs_before.len();
-        if !new_checkpoint_is_live {
-            return Ok(0);
-        }
-
-        let restored_files = self.undo_without_ledger_reconcile().await?.unwrap_or(0);
-        if self.workspace.checkpoints == checkpoint_refs_before {
-            return Ok(restored_files);
-        }
-
-        // A full stack evicted its oldest reference when the active checkpoint
-        // was appended. `undo` removes the active tail; restore that evicted
-        // reference as well so cancellation is state-neutral.
-        if let Some(session) = self.session.as_mut() {
-            session.record_checkpoints(checkpoint_refs_before)?;
-        }
-        self.workspace.checkpoints = checkpoint_refs_before.to_vec();
-        Ok(restored_files)
-    }
-
     fn finalize_cancelled_turn_inner(&mut self) -> Result<crate::TurnOutcome> {
         // Message truncate only if still set (AlreadyApplied path takes it first).
         if let Some(start) = self.workspace.active_turn_message_start.take() {
@@ -545,7 +602,7 @@ impl crate::Agent {
         self.finalize_cancelled_turn_with_changes(changes)
     }
 
-    fn finalize_cancelled_turn_with_changes(
+    pub(super) fn finalize_cancelled_turn_with_changes(
         &mut self,
         changes: Vec<hi_tools::FileChange>,
     ) -> Result<crate::TurnOutcome> {
@@ -574,7 +631,7 @@ impl crate::Agent {
         self.finalize_failed_turn_with_changes(changes, workspace_reconciled, current_workspace)
     }
 
-    fn finalize_failed_turn_with_changes(
+    pub(super) fn finalize_failed_turn_with_changes(
         &mut self,
         changes: Vec<hi_tools::FileChange>,
         workspace_reconciled: bool,
@@ -610,7 +667,7 @@ impl crate::Agent {
     /// cleanup to inherit an unbounded filesystem walk. Dropping the timed
     /// future signals the blocking worker; the short follow-up wait lets it
     /// release the ledger mutex but never takes that mutex on this async task.
-    async fn reconcile_abnormal_turn_bounded(&self) -> bool {
+    pub(super) async fn reconcile_abnormal_turn_bounded(&self) -> bool {
         const RECONCILE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
         const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
         if self.workspace.active_turn_ledger_revision.is_none() {
@@ -643,7 +700,7 @@ impl crate::Agent {
         self.take_abnormal_turn_ledger_snapshot().0
     }
 
-    fn take_abnormal_turn_ledger_snapshot(
+    pub(super) fn take_abnormal_turn_ledger_snapshot(
         &mut self,
     ) -> (Vec<hi_tools::FileChange>, Option<(u64, String)>) {
         let baseline = self.workspace.active_turn_ledger_revision.take();
@@ -722,25 +779,8 @@ impl crate::Agent {
 }
 
 #[cfg(test)]
-mod failure_attribution_tests {
-    use super::verification_after_turn_failure;
-    use crate::VerificationStatus;
-    use crate::domain::VerifyEvidence;
+#[path = "workspace_failure_tests.rs"]
+mod failure_attribution_tests;
 
-    #[test]
-    fn only_a_current_revision_pass_survives_later_infrastructure_failure() {
-        let pass = VerifyEvidence::pass(7, "current".into());
-        assert_eq!(
-            verification_after_turn_failure(&pass, true, 7, "current"),
-            (VerificationStatus::Passed, Some("current".into()))
-        );
-        assert_eq!(
-            verification_after_turn_failure(&pass, true, 8, "changed"),
-            (VerificationStatus::Unverified, None)
-        );
-        assert_eq!(
-            verification_after_turn_failure(&pass, false, 7, "current"),
-            (VerificationStatus::Unverified, None)
-        );
-    }
-}
+#[path = "workspace_checkpoint.rs"]
+mod checkpoint;

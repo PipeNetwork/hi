@@ -167,6 +167,69 @@ impl HiShell {
             .filter(|session| !session.closed.load(Ordering::Acquire))
             .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))
     }
+
+    async fn settle_session_for_close(
+        &self,
+        session_id: &acp::SessionId,
+        session: Arc<Session>,
+    ) -> Result<()> {
+        session.closed.store(true, Ordering::Release);
+        if let Some(cancellation) = session.active_turn.lock().await.as_ref() {
+            cancellation.cancel();
+        }
+        let mut agent = session.agent.lock().await;
+        agent.settle_workspace_for_exit().await.with_context(|| {
+            format!(
+                "session {session_id} remains fenced. Inspect `hi workspace status` and \
+                 `hi workspace recover list`, resolve the recovery, then retry close"
+            )
+        })?;
+        self.store_snapshot(
+            session_id.clone(),
+            StoredSession {
+                cwd: agent.workspace_root().to_path_buf(),
+                snapshot: agent.session_snapshot(),
+                model: agent.model().to_string(),
+                mode: agent.tool_mode(),
+                stored_at: 0,
+            },
+        )
+        .await;
+        drop(agent);
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &session))
+        {
+            sessions.remove(session_id);
+        }
+        Ok(())
+    }
+
+    async fn settle_all_sessions_for_transport_close(&self) -> Result<()> {
+        let sessions = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .map(|(id, session)| (id.clone(), session.clone()))
+            .collect::<Vec<_>>();
+        let mut failures = Vec::new();
+        for (session_id, session) in sessions {
+            if let Err(error) = self.settle_session_for_close(&session_id, session).await {
+                failures.push(format!("{session_id}: {error:#}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "ACP transport closed with unsettled workspace sessions; recovery evidence was \
+                 retained and the affected sessions were not published as cleanly closed:\n{}",
+                failures.join("\n")
+            )
+        }
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -239,6 +302,9 @@ impl acp::Agent for HiShell {
         })?;
         let cancellation = TurnCancellation::new();
         let mut active_turn = session.active_turn.lock().await;
+        if session.closed.load(Ordering::Acquire) {
+            return Err(acp::Error::invalid_params().data("session is closing"));
+        }
         if active_turn.is_some() {
             return Err(acp::Error::invalid_params().data("session already has an active prompt"));
         }
@@ -363,25 +429,17 @@ impl acp::Agent for HiShell {
             .sessions
             .lock()
             .await
-            .remove(&args.session_id)
+            .get(&args.session_id)
+            .cloned()
             .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
-        session.closed.store(true, Ordering::Release);
-        if let Some(cancellation) = session.active_turn.lock().await.as_ref() {
-            cancellation.cancel();
-        }
-        let agent = session.agent.lock().await;
-        self.store_snapshot(
-            args.session_id,
-            StoredSession {
-                cwd: agent.workspace_root().to_path_buf(),
-                snapshot: agent.session_snapshot(),
-                model: agent.model().to_string(),
-                mode: agent.tool_mode(),
-                stored_at: 0,
-            },
-        )
-        .await;
-        agent.kill_background_processes();
+        self.settle_session_for_close(&args.session_id, session)
+            .await
+            .map_err(|error| {
+                acp::Error::internal_error().data(format!(
+                    "session close is blocked because workspace settlement did not complete; \
+                     {error:#}"
+                ))
+            })?;
         Ok(acp::CloseSessionResponse::new())
     }
 
@@ -788,7 +846,19 @@ pub async fn serve_stdio(config: ShellConfig) -> Result<()> {
         tokio::task::spawn_local(future);
     });
     shell.connect(Arc::new(connection));
-    io.await.context("serving ACP over stdio")
+    let transport = io.await.context("serving ACP over stdio");
+    let settlement = shell
+        .settle_all_sessions_for_transport_close()
+        .await
+        .context("settling ACP sessions after the transport closed");
+    match (transport, settlement) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(transport), Err(settlement)) => Err(anyhow::anyhow!(
+            "ACP transport failed ({transport:#}), and session settlement also failed: \
+             {settlement:#}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -981,3 +1051,7 @@ mod tests {
         assert!(!shell.model_allowed("unadvertised"));
     }
 }
+
+#[cfg(test)]
+#[path = "server_close_tests.rs"]
+mod close_tests;

@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use hi_agent_runtime::{
     DenyGates, StageDriver, StageModel, StageOutcome, TerminalOutcome, WorkflowExecutor,
 };
-use hi_ai::{ChatRequest, Content, Message, Provider, RequestProfile};
+use hi_ai::{ChatRequest, Content, Message, Provider, RequestProfile, ToolMode};
 use hi_rsi_runtime::{
     ArtifactRef, BudgetKind, Checkpoint, EngineeringPlan, RunState, RuntimeBudgets,
     SharedBudgetLedger, StageId, WorkflowGraph,
@@ -185,6 +185,14 @@ impl StageModel for ProviderStageModel {
         attempt: u32,
         state: &RunState,
     ) -> Result<StageOutcome> {
+        let request_policy = hi_tools::envelope::seal_chat_only_request(
+            self.provider.as_ref(),
+            "rsi-stage",
+            &self.model,
+            MODEL_STAGE_MAX_TOKENS,
+            "rsi-stage",
+        )
+        .await;
         let request = ChatRequest {
             model: self.model.clone(),
             request_id: Some(format!("rsi-{}-{}-{attempt}", state.run_id, stage.0)),
@@ -196,13 +204,17 @@ impl StageModel for ProviderStageModel {
                 Message::user(stage_context(stage, attempt, state)),
             ]),
             tools: Vec::new().into(),
-            max_tokens: MODEL_STAGE_MAX_TOKENS,
+            tool_envelope: Some(request_policy.envelope),
+            max_tokens: request_policy.max_output_tokens,
             temperature: None,
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
             reasoning_effort: None,
-            profile: RequestProfile::default(),
+            profile: RequestProfile {
+                tool_mode: ToolMode::ChatOnly,
+                ..RequestProfile::default()
+            },
         };
         let completion = self.provider.stream(request, &mut |_| {}).await?;
         self.ledger

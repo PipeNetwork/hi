@@ -2,11 +2,16 @@
 //! the message/usage/context/goal/verify accessors, system-prompt refresh,
 //! and `persist`/`persist_goal`/`messages_mut`.
 
+mod cancellation;
+mod commit;
 mod drive;
 mod goals;
+mod mcp;
 mod routes;
 mod rsi;
 mod workspace;
+mod workspace_failure;
+mod workspace_shutdown;
 
 use std::sync::Arc;
 
@@ -103,12 +108,7 @@ impl crate::Agent {
             .flatten();
         agent.pending_legacy_goal_budget_migration =
             migrated_legacy_goal_budget && agent.goals.structured.is_some();
-        // Seed the context-occupancy gauge from the restored transcript. It
-        // starts at 0 otherwise, which disables the graceful pre-turn
-        // compaction (gated on this gauge) for the first resumed turn — a
-        // near-full session then falls through to the destructive send-time
-        // recovery that durably replaces the whole history with the system
-        // message alone.
+        // Seed occupancy so a near-full resume can compact before its first turn.
         agent.report.context_used = crate::compaction::estimate_tokens(agent.messages.as_slice());
         agent.refresh_system_message();
         Ok(agent)
@@ -122,10 +122,7 @@ impl crate::Agent {
         scan: Option<crate::change_ledger::BackgroundScan>,
     ) -> Result<Self> {
         let mut messages = Transcript::new(messages);
-        // Clean up any stale synthetic nudges from a session saved by an older
-        // version (before strip_finalize_pair existed). This prevents a resumed
-        // session from carrying a FINALIZE_PROMPT ("don't take any further
-        // action") into the next turn's context.
+        // Do not carry an older synthetic FINALIZE_PROMPT into the next turn.
         messages.strip_finalize_pair();
         messages.strip_trailing_nudges();
         messages.strip_previous_turn_blocks();
@@ -137,21 +134,20 @@ impl crate::Agent {
         // incremental session recorder doesn't slice past the end.
         let persisted = persisted.min(messages.len());
         config.gates.verification.validate()?;
-        #[cfg(test)]
         let sandbox_policy = config.sandbox_policy;
-        #[cfg(not(test))]
-        let sandbox_policy = None;
+        let sandbox_config = config.sandbox_config.clone();
         let initial_lsp_mode = if config.defer_initial_lsp {
             crate::LspMode::Off
         } else {
             config.gates.lsp_mode
         };
-        let runtime = WorkspaceRuntime::new_with_scan_sandbox_and_project_hooks(
+        let runtime = WorkspaceRuntime::new_with_scan_sandbox_config_and_project_hooks(
             &config.paths.workspace_root,
             &config.paths.state_root,
             initial_lsp_mode,
             scan,
             sandbox_policy,
+            sandbox_config,
             !config.suppress_initial_project_hooks,
         )?;
         let tools = advertised_tools(&config, None);
@@ -201,8 +197,23 @@ impl crate::Agent {
         }
         let btw_jobs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let btw_dispatch = crate::agent::turn::btw::BtwDispatcher::new(btw_jobs.clone());
+        let workspace_coordination =
+            crate::workspace_coordination::WorkspaceCoordination::new_local_with_settings(
+                &config.paths.workspace_root,
+                &config.paths.state_root,
+                config.harness.clone(),
+            );
+        let bg_tasks = Arc::new(hi_tools::BackgroundTaskRegistry::new_with_limits(
+            hi_tools::BackgroundTaskLimits {
+                max_tasks: config.harness.jobs.max_active,
+                max_concurrent_preparations: config.harness.jobs.max_preparations,
+                queue_timeout: config.harness.jobs.queue_timeout,
+            },
+        ));
+        workspace_coordination.bind_background_registries(runtime.background(), &bg_tasks);
         Ok(Self {
             provider,
+            provider_capability_registry: hi_ai::ProviderCapabilityRegistry::default(),
             skeptic_provider,
             local_skeptic: None,
             team_local_servers: Vec::new(),
@@ -211,6 +222,7 @@ impl crate::Agent {
             engine_runtime,
             side_call_timeout: crate::agent::turn::DEFAULT_SIDE_CALL_TIMEOUT,
             runtime,
+            workspace_coordination,
             workspace_durability: None,
             task: crate::domain::TaskContextState::default(),
             messages,
@@ -223,7 +235,7 @@ impl crate::Agent {
             report: crate::domain::TurnReportState::new(last_effective_route),
             workspace: crate::domain::WorkspaceTurnState::default(),
             subagents: crate::domain::SubagentSessionState::default(),
-            bg_tasks: Arc::new(hi_tools::BackgroundTaskRegistry::new()),
+            bg_tasks,
             interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             turn_cancellation: None,
             #[cfg(test)]
@@ -279,44 +291,6 @@ impl crate::Agent {
         self.config.memory.offer_mcp = true;
     }
 
-    /// Workspace MCP status table, if a host is attached.
-    pub async fn mcp_workspace_status(&self) -> Option<String> {
-        let backend = self.mcp.as_ref()?;
-        Some(backend.workspace_status().await)
-    }
-
-    /// Workspace MCP admin (`reconnect` / `enable` / `disable`).
-    pub async fn mcp_workspace_admin(&self, args: &str) -> Option<anyhow::Result<String>> {
-        let backend = self.mcp.as_ref()?;
-        let durability = self.workspace_durability.clone();
-        if let Some(durability) = &durability
-            && let Err(error) = durability
-                .mutation_started(Some(vec!["<workspace MCP configuration>".to_string()]))
-                .await
-        {
-            return Some(Err(
-                error.context("PipeFS refused the workspace MCP configuration mutation")
-            ));
-        }
-
-        let result = backend.workspace_admin(args).await;
-        let checkpoint = if let Some(durability) = durability {
-            durability.checkpoint().await
-        } else {
-            Ok(())
-        };
-        Some(match (result, checkpoint) {
-            (Ok(output), Ok(())) => Ok(output),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(error.context(
-                "workspace MCP configuration changed, but its PipeFS revision was not committed; run /pipefs retry",
-            )),
-            (Err(admin_error), Err(checkpoint_error)) => Err(anyhow::anyhow!(
-                "workspace MCP command failed ({admin_error:#}), and reconciling its possible filesystem changes also failed ({checkpoint_error:#}); run /pipefs retry"
-            )),
-        })
-    }
-
     /// Installs already-validated managed RSI reference context for the next
     /// one-shot turn. This is deliberately separate from `AgentConfig` so
     /// ordinary agents and read-only subagents cannot inherit it accidentally.
@@ -354,7 +328,37 @@ impl crate::Agent {
         }
         self.begin_durable_workspace_mutation(None).await?;
         let operation = self.undo_inner(reconcile_ledger).await;
-        let durability = self.checkpoint_durable_workspace().await;
+        let mut execution = hi_workspace::ExecutionReport {
+            disposition: if operation.is_ok() {
+                hi_workspace::ExecutionDisposition::Succeeded
+            } else {
+                hi_workspace::ExecutionDisposition::Failed
+            },
+            workspace_may_have_changed: true,
+            external_effect_may_have_occurred: false,
+            content_digest: reconcile_ledger.then(|| self.runtime.ledger().workspace_revision()),
+            changed_paths: Vec::new(),
+            artifacts: Vec::new(),
+            detail: Some(match &operation {
+                Ok(Some(restored)) => format!("undo restored {restored} workspace entries"),
+                Ok(None) => "undo completed without a restorable checkpoint".into(),
+                Err(error) => format!("undo execution failed: {error:#}"),
+            }),
+        };
+        let transcript = [hi_ai::Content::Text(
+            "Workspace undo operation completed.".into(),
+        )];
+        if let Err(error) = self.stage_active_workspace_execution(&[], &transcript, &[], &execution)
+        {
+            execution.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
+            execution.content_digest = None;
+            execution.detail = Some(format!(
+                "undo transcript staging is ambiguous after execution: {error:#}"
+            ));
+        }
+        let durability = self
+            .checkpoint_durable_workspace_with_execution(execution)
+            .await;
         match (operation, durability) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(error), Ok(())) => Err(error),
@@ -668,12 +672,8 @@ impl crate::Agent {
         .iter()
         .cloned()
         .collect();
-        if self.workspace_durability_enabled() {
-            // The CLI delegate runner is bound to the root where it was
-            // constructed. Until runners can be atomically rebound together
-            // with this runtime, advertising it in PipeFS risks applying a
-            // verified diff to the launch directory instead of the portable
-            // materialization. Read-only `task` roles remain available.
+        if !self.delegate_runner_matches_workspace() {
+            // Never advertise a runner that cannot prove the portable root.
             specs.retain(|spec| spec.name != "delegate");
         }
         // `run_program` is negotiated at the provider boundary rather than
@@ -2065,7 +2065,7 @@ impl crate::Agent {
         // Goal snapshots are UI/runtime state, not user workspace content.
         // They cannot use the asynchronous PipeFS durability fence from this
         // synchronous state update, so never emit them into a portable root.
-        if !self.workspace_durability_enabled()
+        if !self.pipefs_workspace_active()
             && !is_cwd_default
             && let Some(goal) = &self.goals.structured
         {

@@ -251,7 +251,24 @@ mod tests {
         assert_eq!(check, KeyCheck::Accepted);
         let saved = read_config_file(&path).unwrap();
         let profile = saved.profiles.get("openai").expect("openai profile");
-        assert_eq!(profile.api_key.as_deref(), Some("sk-good"));
+        assert!(
+            profile.api_key.is_none(),
+            "literal key must not be persisted"
+        );
+        assert!(profile.api_key_env.is_none());
+        let reference = profile
+            .api_key_ref
+            .as_deref()
+            .expect("credential-store reference");
+        let key = reference
+            .strip_prefix("auth-store://")
+            .expect("private credential-store reference");
+        assert_eq!(
+            hi_ai::auth_store::load(key).map(|credential| credential.access),
+            Some("sk-good".into())
+        );
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("sk-good"));
+        hi_ai::auth_store::delete(key).unwrap();
         assert_eq!(saved.default_profile.as_deref(), Some("openai"));
     }
 }

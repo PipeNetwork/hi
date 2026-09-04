@@ -1,5 +1,3 @@
-//! Built-in tools and workspace effects for the interactive agent.
-//!
 //! # Module layout
 //!
 //! - [`protocol`] — agent tool protocol and workspace effects (catalog, execute,
@@ -13,7 +11,6 @@
 //! `hi_tools::infra::…` in new code when the boundary matters.
 //!
 //! # Firewall policy (soft)
-//!
 //! | Prefer | Contents |
 //! |--------|----------|
 //! | [`protocol`] | tool catalog/execute, checkpoint, guard, sandbox, worktree, process, transactions, `ToolOutcome` family |
@@ -35,7 +32,6 @@
 //! `docs/adr/002-tool-admission.md`.
 
 use serde::{Deserialize, Serialize};
-
 /// Agent tool protocol and recoverable workspace effects.
 pub mod protocol {
     pub mod checkpoint {
@@ -56,24 +52,26 @@ pub mod protocol {
     pub use crate::attribution::{AttrKind, Attribution, parse_attributions};
     pub use crate::background::BackgroundRegistry;
     pub use crate::background_tasks::{
-        BackgroundTaskCapacityError, BackgroundTaskOutcome, BackgroundTaskRegistry,
-        BackgroundTaskState, BgFuture, DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
+        BackgroundTaskCapacityError, BackgroundTaskLimits, BackgroundTaskOutcome,
+        BackgroundTaskRegistry, BackgroundTaskState, BgFuture, DEFAULT_WAIT_TIMEOUT,
+        MAX_WAIT_TIMEOUT,
     };
     pub use crate::condense::condense_diagnostics;
-    pub use crate::paths::ReadCache;
+    pub use crate::paths::{ReadCache, ResourceRegistrationError};
     pub use crate::process::{AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild};
+    pub use crate::shell_policy::{classify_shell_command, classify_shell_tool_arguments};
     pub use crate::structured_failure::{
         StructuredFailure, format_structured_failure, format_structured_failure_with_limit,
         render_cause_section,
     };
     pub use crate::tools::{
-        MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo, MemoryBackend,
-        MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, SpeculationClass,
-        TOOL_CATALOG, TOOL_SPECS, ToolAdmission, ToolCapability, ToolCostClass, ToolMetadata,
-        ask_user_tool_spec, browser_exec_tool_spec, commit_in, delegate_tool_spec,
-        execute_in_runtime, execute_in_runtime_shared, execute_in_runtime_shared_with,
-        execute_in_runtime_shared_with_runner, execute_in_runtime_with,
-        execute_prepared_in_runtime, execute_streaming_in_runtime,
+        CommitOutcome, MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo,
+        MemoryBackend, MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend,
+        SpeculationClass, TOOL_CATALOG, TOOL_SPECS, ToolAdmission, ToolCapability, ToolCostClass,
+        ToolMetadata, ask_user_tool_spec, browser_exec_tool_spec, commit_in, commit_in_typed,
+        delegate_tool_spec, execute_in_runtime, execute_in_runtime_shared,
+        execute_in_runtime_shared_with, execute_in_runtime_shared_with_runner,
+        execute_in_runtime_with, execute_prepared_in_runtime, execute_streaming_in_runtime,
         execute_streaming_in_runtime_with_runner, explore_tool_spec, fast_check_for,
         get_task_output_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
         is_read_only, kill_task_tool_spec, memory_forget_tool_spec, memory_get_tool_spec,
@@ -131,43 +129,44 @@ pub mod infra {
     pub use crate::repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
     pub use crate::web::{run_web_fetch, run_web_search};
 }
-
-// --- implementation modules (private layout; public surface via root + namespaces) ---
-pub mod checkpoint;
-pub mod folder_trust;
-pub mod guard;
-mod lsp;
-pub mod sandbox;
-pub mod stub_scan;
-pub mod worktree;
-
 mod attribution;
 mod background;
 mod background_tasks;
-mod catalog;
+pub mod candidate_workspace;
+pub mod catalog;
+pub mod checkpoint;
 mod codebase_graph;
 mod condense;
 mod edit;
 mod effects;
+pub mod envelope;
 mod fast_feedback;
+pub mod folder_trust;
+pub mod guard;
 mod hf;
 mod hf_downloader;
 mod internal_snapshot;
+mod job_lifecycle;
 mod local_server;
+mod lsp;
 mod paths;
 mod process;
-mod read;
+pub mod read;
 mod repo_map;
 mod research;
+pub mod sandbox;
+pub mod shell_policy;
 mod structured_failure;
+pub mod stub_scan;
 mod tools;
 mod transaction;
 mod web;
-
+pub mod worktree;
 pub use background::{BackgroundRegistry, shell_title};
 pub use background_tasks::{
-    BackgroundTaskCapacityError, BackgroundTaskOutcome, BackgroundTaskRegistry,
-    BackgroundTaskState, BgFuture, DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
+    BackgroundTaskCapacityError, BackgroundTaskLimits, BackgroundTaskOutcome,
+    BackgroundTaskRegistry, BackgroundTaskState, BackgroundTaskTeardown, BgFuture,
+    DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
 };
 pub use codebase_graph::references_by_name;
 pub use condense::condense_diagnostics;
@@ -188,6 +187,7 @@ pub use hf_downloader::{
     HfDownloadOptions, download_progress_bytes, download_progress_bytes_for_files,
     download_total_bytes,
 };
+pub use job_lifecycle::*;
 pub use local_server::{
     LocalServerHandle, await_local_server_health, ensure_hi_local_mlx_binary,
     local_server_is_running, local_server_os_pid, skeptic_model_dir, skeptic_model_dir_for_ref,
@@ -196,31 +196,31 @@ pub use local_server::{
     verify_local_server_contract,
 };
 pub use lsp::lsp_status_report_for;
-pub use paths::ReadCache;
+pub use paths::{ReadCache, ResourceRegistrationError};
 pub use process::{
-    AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild, preserve_detached_descendants,
+    AdoptableOutcome, ForegroundProcessRegistry, ProcessExecution, ProcessRunner, RunningChild,
+    preserve_detached_descendants,
 };
 pub use read::read_output_invites_paging;
 pub use repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
-
 /// True when a Pipe research API key is installed for this process.
 pub fn research_credentials_configured() -> bool {
     hi_research::credentials_configured()
 }
-
 #[cfg(test)]
 pub(crate) use tools::preview_edit_in;
 pub use tools::{
-    MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo, MemoryBackend,
-    MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, SpeculationClass,
-    TOOL_CATALOG, TOOL_SPECS, ToolAdmission, ToolCapability, ToolCostClass, ToolMetadata,
-    ask_user_tool_spec, browser_exec_tool_spec, check_timeout, commit_in, delegate_tool_spec,
-    execute_in_runtime, execute_in_runtime_shared, execute_in_runtime_shared_with,
-    execute_in_runtime_shared_with_runner, execute_in_runtime_with, execute_prepared_in_runtime,
-    execute_streaming_in_runtime, execute_streaming_in_runtime_with_runner, explore_tool_spec,
-    fast_check_for, get_task_output_tool_spec, is_coordination, is_filesystem_mutating,
-    is_known_tool, is_read_only, kill_task_tool_spec, memory_forget_tool_spec,
-    memory_get_tool_spec, memory_search_tool_spec, memory_update_tool_spec, new_context_tool_spec,
+    CommitOutcome, MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo,
+    MemoryBackend, MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend,
+    SpeculationClass, TOOL_CATALOG, TOOL_SPECS, ToolAdmission, ToolCapability, ToolCostClass,
+    ToolMetadata, ask_user_tool_spec, browser_exec_tool_spec, check_timeout, commit_in,
+    commit_in_typed, delegate_tool_spec, execute_in_runtime, execute_in_runtime_shared,
+    execute_in_runtime_shared_with, execute_in_runtime_shared_with_runner, execute_in_runtime_with,
+    execute_prepared_in_runtime, execute_streaming_in_runtime,
+    execute_streaming_in_runtime_with_runner, explore_tool_spec, fast_check_for,
+    get_task_output_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
+    is_read_only, kill_task_tool_spec, memory_forget_tool_spec, memory_get_tool_spec,
+    memory_search_tool_spec, memory_update_tool_spec, new_context_tool_spec,
     prepare_mutation_in_with_state, prepare_verify_workdir, research_read_tool_spec,
     research_tool_spec, run_check_in, run_check_in_with_runner,
     run_check_in_with_runner_maybe_timeout, run_check_in_with_runner_timeout,

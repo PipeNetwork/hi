@@ -172,26 +172,6 @@ impl crate::Agent {
         )
     }
 
-    /// The provider in-process background `delegate` tasks run on — the
-    /// delegate route when configured, else the driver's provider. (The
-    /// synchronous delegate path applies the same route in its child-process
-    /// runner instead.)
-    pub(crate) fn delegate_child_provider(&self) -> std::sync::Arc<dyn hi_ai::Provider> {
-        let stale = self.team_route_is_dead(
-            self.config.subagents.delegate_model.as_deref(),
-            self.config.subagents.delegate_endpoint.as_deref(),
-        );
-        routed_provider(
-            (!stale)
-                .then_some(self.config.subagents.delegate_endpoint.as_deref())
-                .flatten(),
-            (!stale)
-                .then_some(self.config.subagents.delegate_endpoint_key.as_deref())
-                .flatten(),
-            &self.provider,
-        )
-    }
-
     pub(crate) fn effective_explore_child_model(&self) -> String {
         let stale = self.team_route_is_dead(
             self.config.subagents.explore_model.as_deref(),
@@ -282,7 +262,7 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
         child_config,
     } = job;
 
-    let mut child = match crate::Agent::new(provider, child_config) {
+    let child = match crate::Agent::new(provider, child_config) {
         Ok(child) => child,
         Err(error) => {
             return ExploreResult {
@@ -295,12 +275,13 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
             };
         }
     };
+    let mut child = super::child_process_teardown::ReapingChild::new(child, None);
     // `Box::pin` breaks the async-recursion cycle (`run_turn` → `handle_explore`
     // → child `run_turn`) that would otherwise make the future infinitely sized.
     let outcome = {
-        match Box::pin(child.run_turn(&explore_child_prompt(&task), ui)).await {
+        match Box::pin(child.child_mut().run_turn(&explore_child_prompt(&task), ui)).await {
             Ok(outcome) => {
-                let answer = child.last_assistant_text();
+                let answer = child.child().last_assistant_text();
                 let mut status = match outcome.status {
                     crate::TurnStatus::Completed => hi_tools::ToolStatus::Succeeded,
                     crate::TurnStatus::Blocked => hi_tools::ToolStatus::Denied,
@@ -315,7 +296,10 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
             }
             Err(err) => {
                 // Nested escapes: typed fail cleanup (turn-scoped bg kill).
-                let _ = child.cleanup_turn(crate::TurnCleanupKind::Fail).await;
+                let _ = child
+                    .child_mut()
+                    .cleanup_turn(crate::TurnCleanupKind::Fail)
+                    .await;
                 explore_tool_outcome(
                     format!("explore subagent error: {err}"),
                     hi_tools::ToolStatus::Failed,
@@ -323,9 +307,14 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
             }
         }
     };
-    // Throwaway child runtime: full kill (local skeptic + any leftover bg).
-    child.kill_background_processes();
-    let usage = *child.totals();
+    let outcome = match child.stop_and_reap().await {
+        Ok(()) => outcome,
+        Err(error) => explore_tool_outcome(
+            format!("explore child process teardown failed: {error:#}"),
+            hi_tools::ToolStatus::Failed,
+        ),
+    };
+    let usage = *child.child().totals();
     ExploreResult {
         slot,
         outcome,

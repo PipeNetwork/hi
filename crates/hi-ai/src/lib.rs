@@ -22,6 +22,8 @@ pub mod moa;
 pub mod openai;
 pub mod pipenetwork_auth;
 pub mod provider;
+pub mod provider_capabilities;
+mod request_envelope;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod token;
@@ -68,9 +70,22 @@ pub use provider::{
     provider_error_usage, provider_output_cap_error, provider_retry_after_seconds,
     provider_route_error_is_retryable,
 };
+pub use provider_capabilities::{
+    CAPABILITY_RECORD_SCHEMA_VERSION, CAPABILITY_REGISTRY_VERSION, CancellationSupport,
+    CapabilityMemberRecord, CapabilityProbe, CapabilityProbeAuditRecord,
+    CapabilityProbeDisposition, CapabilityProbeObservation, CapabilityRegistryConfig,
+    CapabilityRoute, DEFAULT_CAPABILITY_CACHE_TTL, DEFAULT_CAPABILITY_PROBE_MEMBERS,
+    DEFAULT_CAPABILITY_PROBE_TIMEOUT, EffectiveProviderCapabilities, MAX_CAPABILITY_PROBE_MEMBERS,
+    MAX_CAPABILITY_PROBE_TIMEOUT, ProviderCapabilityCandidate, ProviderCapabilityRegistry,
+    ProviderModalities, ProviderRequestLimits, ReasoningReplayCapabilities, StrictSchemaDialect,
+    ToolChoiceCapabilities, UsageReporting,
+};
+pub use request_envelope::RequestToolEnvelope;
 pub use token::{PersistableToken, StaticToken, TokenSource};
 pub use tool_validation::{
-    validate_client_tool_batch_limits, validate_client_tool_call, validate_client_tool_calls,
+    MAX_TOOL_ARGUMENT_BYTES, validate_client_tool_batch_limits,
+    validate_client_tool_batch_limits_with, validate_client_tool_call,
+    validate_client_tool_call_with_limit, validate_client_tool_calls,
 };
 pub use types::{
     ChatRequest, CompatMode, Completion, Content, CostEstimate, DeepSeekCompat, Message,

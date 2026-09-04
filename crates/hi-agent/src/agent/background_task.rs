@@ -9,7 +9,7 @@
 //! Built-in kinds match grok-build's task catalog:
 //! - `explore` — fast read-only codebase investigation
 //! - `plan` — read-only architecture / implementation planning
-//! - `general-purpose` — full write-capable multi-step work
+//! - `general-purpose` — reserved compatibility name for candidate jobs
 //!
 //! `delegate` is accepted as a legacy alias for `general-purpose`.
 //!
@@ -33,7 +33,7 @@ use crate::Ui;
 
 /// Canonical background task kinds (grok-build naming).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BgTaskKind {
+pub(super) enum BgTaskKind {
     Explore,
     Plan,
     GeneralPurpose,
@@ -89,9 +89,9 @@ impl crate::Agent {
     /// Handle the `task` tool — spawn a background subagent.
     ///
     /// Parses `description`, `prompt`, `subagent_type` (`explore` / `plan` /
-    /// `general-purpose`, plus legacy aliases), and optional `verify` (for
-    /// write-capable kinds). Spawns the subagent as a detached Tokio task and
-    /// returns immediately with the task ID.
+    /// `general-purpose`, plus legacy aliases). Read-only kinds spawn as a
+    /// detached Tokio task and return immediately. Write-capable children run
+    /// only inside a detached candidate and wait for a parent apply boundary.
     pub(crate) async fn handle_task(
         &mut self,
         arguments: &str,
@@ -143,17 +143,25 @@ impl crate::Agent {
                 hi_tools::ToolStatus::Failed,
             );
         };
-        if !kind.is_read_only() && self.workspace_durability_enabled() {
+        let subagent_type = kind.as_str().to_string();
+        let pipefs_writer_protocol = match self.workspace_controller_binding().authority {
+            hi_workspace::WorkspaceAuthority::Local => None,
+            hi_workspace::WorkspaceAuthority::PipeFs {
+                writer_protocol, ..
+            } => Some(writer_protocol),
+        };
+        if !kind.is_read_only() && !self.config.harness.features.candidate_jobs_v2 {
             return bg_tool_outcome(
-                "task error: write-capable background subagents are unavailable while PipeFS is active because concurrent child writes cannot be covered by the foreground durability fence; use explore/plan or perform the change in the parent agent",
+                "task error: detached write candidates are disabled by features.candidate_jobs_v2",
                 hi_tools::ToolStatus::Denied,
             );
         }
-        let subagent_type = kind.as_str().to_string();
-        let cost = parsed
-            .get("cost")
-            .and_then(Value::as_str)
-            .unwrap_or("normal");
+        if !kind.is_read_only() && pipefs_writer_protocol.is_some_and(|protocol| protocol < 2) {
+            return bg_tool_outcome(
+                "task error: PipeFS background write candidates require writer protocol 2",
+                hi_tools::ToolStatus::Denied,
+            );
+        }
         let dependency_values = parsed.get("depends_on").and_then(Value::as_array);
         let dependencies: Vec<String> = dependency_values
             .map(|values| {
@@ -170,52 +178,23 @@ impl crate::Agent {
                 hi_tools::ToolStatus::Failed,
             );
         }
-        let prompt = if !kind.is_read_only() && cost == "tiny" {
-            format!(
-                "Complete this tiny task as one cohesive job, including any closely related cleanup needed to verify the result:\n\n{prompt}"
-            )
-        } else {
-            prompt
-        };
-
-        let verify = parsed
-            .get("verify")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
-
         // Reserve accounting. Ordinary read-only and write work is unlimited;
         // an explicit delegate quota can still deny a write reservation.
-        let is_read_only = kind.is_read_only();
-        let slot = if is_read_only {
+        let slot = if kind.is_read_only() {
             self.subagents
                 .try_begin_explore(crate::agent::explore_turn::MAX_EXPLORE_SUBAGENTS_PER_TURN)
-        } else {
+        } else if self.config.subagents.write_subagents.is_enabled() {
             self.subagents
                 .try_begin_delegate(crate::agent::delegate_turn::delegate_turn_limit())
+        } else {
+            None
         };
         let Some(n) = slot else {
-            let message = if is_read_only {
-                format!("unable to reserve {subagent_type} subagent accounting")
-            } else {
-                crate::agent::delegate_turn::delegate_limit_denial(
-                    crate::agent::delegate_turn::delegate_turn_limit(),
-                )
-            };
             return bg_tool_outcome(
-                format!("task error: {message}"),
+                format!("task error: unable to reserve {subagent_type} subagent accounting"),
                 hi_tools::ToolStatus::Denied,
             );
         };
-
-        // Write-capable kinds need a delegate runner.
-        if !is_read_only && self.subagents.delegate_runner.is_none() {
-            self.subagents.release_delegate();
-            return bg_tool_outcome(
-                "task error: no delegate runner attached — write-capable background subagents are unavailable",
-                hi_tools::ToolStatus::Denied,
-            );
-        }
 
         let summary = crate::clip_subagent_description(&description);
         let sink = ui.subagent_sink();
@@ -224,21 +203,22 @@ impl crate::Agent {
         // Build the future factory and spawn the task. Each role runs on its
         // configured route (team roles): explore/delegate children may use a
         // different model or endpoint than the driver.
-        let provider = if is_read_only {
-            self.explore_child_provider()
-        } else {
-            self.delegate_child_provider()
-        };
-        let child_config = if is_read_only {
-            self.build_bg_explore_config(n, kind)
-        } else {
-            self.build_bg_delegate_config(n)
-        };
+        let read_run = kind.is_read_only().then(|| {
+            (
+                self.explore_child_provider(),
+                self.build_bg_explore_config(n, kind),
+            )
+        });
+        let candidate_run = (!kind.is_read_only()).then(|| {
+            self.prepare_background_candidate(n, parsed.get("verify").and_then(Value::as_str))
+        });
+        let candidate_registry = self.bg_tasks.clone();
+        let teardown = hi_tools::BackgroundTaskTeardown::new();
+        let child_teardown = teardown.clone();
 
         // The future factory is `Send` (a closure), but the future it produces
         // does NOT need to be `Send` — it runs on a worker thread's `LocalSet`.
         let prompt_for_factory = prompt.clone();
-        let verify_for_factory = verify.clone();
         let factory: Box<dyn FnOnce() -> hi_tools::BgFuture + Send + 'static> =
             Box::new(move || {
                 Box::pin(async move {
@@ -251,24 +231,30 @@ impl crate::Agent {
                     if let Some(s) = &sink {
                         s.progress(&id, "running", None);
                     }
-                    let result = if is_read_only {
-                        run_bg_readonly(
-                            provider,
-                            child_config,
-                            kind,
-                            prompt_for_factory,
-                            &mut child_ui,
-                        )
-                        .await
-                    } else {
-                        run_bg_general_purpose(
-                            provider,
-                            child_config,
-                            prompt_for_factory,
-                            verify_for_factory,
-                            &mut child_ui,
-                        )
-                        .await
+                    let result = match candidate_run {
+                        Some(plan) => {
+                            plan.run(
+                                &id,
+                                prompt_for_factory,
+                                candidate_registry,
+                                child_teardown,
+                                &mut child_ui,
+                            )
+                            .await
+                        }
+                        None => {
+                            let (provider, child_config) =
+                                read_run.expect("read-only background run was prepared");
+                            run_bg_readonly(
+                                provider,
+                                child_config,
+                                kind,
+                                prompt_for_factory,
+                                child_teardown,
+                                &mut child_ui,
+                            )
+                            .await
+                        }
                     };
                     if let Some(s) = &sink {
                         let status = match result.state {
@@ -286,12 +272,18 @@ impl crate::Agent {
 
         let task_id = match self
             .bg_tasks
-            .spawn_after(&description, &subagent_type, &dependencies, factory)
+            .spawn_after_with_teardown(
+                &description,
+                &subagent_type,
+                &dependencies,
+                teardown,
+                factory,
+            )
             .await
         {
             Ok(id) => id,
             Err(e) => {
-                if is_read_only {
+                if kind.is_read_only() {
                     self.subagents.release_explore();
                 } else {
                     self.subagents.release_delegate();
@@ -312,12 +304,17 @@ impl crate::Agent {
         };
         let _ = id_tx.send(task_id.clone());
         ui.subagent_spawned(&task_id, &subagent_type, &summary, true);
+        self.register_job_resource(&hi_tools::BackgroundTaskOutcome::running(
+            &task_id,
+            &description,
+            &subagent_type,
+        ));
 
         // The full text is model-facing protocol (how to poll); the UI only
         // needs the short kind+description — the subagent note already announced it.
         let mut outcome = bg_tool_outcome(
             format!(
-                "{subagent_type} task spawned: {task_id}\nDescription: {description}\nPoll results with get_task_output (task_ids: [\"{task_id}\"]) or wait_tasks."
+                "{subagent_type} task spawned: {task_id}\nDescription: {description}\nOutput resource: job://{task_id}/output\nPoll results with get_task_output (task_ids: [\"{task_id}\"]) or wait_tasks."
             ),
             hi_tools::ToolStatus::Succeeded,
         );
@@ -370,6 +367,9 @@ impl crate::Agent {
         };
 
         let results = self.bg_tasks.poll_many(&ids, timeout).await;
+        for result in &results {
+            self.register_job_resource(result);
+        }
         let content = format_task_results(&results);
         bg_tool_outcome(content, hi_tools::ToolStatus::Succeeded)
     }
@@ -419,6 +419,10 @@ impl crate::Agent {
             self.bg_tasks.wait_all(&ids, timeout).await
         };
 
+        for result in &results {
+            self.register_job_resource(result);
+        }
+
         let content = format_task_results(&results);
         bg_tool_outcome(content, hi_tools::ToolStatus::Succeeded)
     }
@@ -453,6 +457,7 @@ impl crate::Agent {
 
         match self.bg_tasks.kill(&task_id).await {
             Some(outcome) => {
+                self.register_job_resource(&outcome);
                 let content = format!(
                     "Task {} cancelled.\nState: {:?}\nOutput: {}",
                     outcome.id, outcome.state, outcome.output
@@ -463,6 +468,19 @@ impl crate::Agent {
                 format!("kill_task error: no task with id \"{task_id}\""),
                 hi_tools::ToolStatus::Failed,
             ),
+        }
+    }
+
+    fn register_job_resource(&self, outcome: &hi_tools::BackgroundTaskOutcome) {
+        let Ok(uri) = hi_workspace::ResourceUri::parse(format!("job://{}/output", outcome.id))
+        else {
+            return;
+        };
+        let Ok(body) = serde_json::to_string_pretty(outcome) else {
+            return;
+        };
+        if let Ok(mut cache) = self.runtime.read_cache().lock() {
+            let _ = cache.register_resource(uri, body);
         }
     }
 
@@ -511,63 +529,6 @@ impl crate::Agent {
                 max_parallel_tools: 4,
                 max_silent_continues: 0,
                 max_keep_working: 0,
-                ..crate::AgentLoopLimits::default()
-            },
-            subagents: crate::AgentSubagents {
-                explore_subagents: false,
-                write_subagents: crate::WriteSubagentPolicy::Off,
-                is_subagent: true,
-                ..crate::AgentSubagents::default()
-            },
-            ..self.config.clone()
-        }
-    }
-
-    /// Build a child config for a background delegate subagent.
-    fn build_bg_delegate_config(&self, n: u32) -> AgentConfig {
-        // `delegate_route` drops stale managed-local routes. Keep the child
-        // model aligned with that provider fallback, just as synchronous
-        // delegates are.
-        let delegate_model = self
-            .delegate_route()
-            .model
-            .unwrap_or_else(|| self.config.routing.model.clone());
-        AgentConfig {
-            paths: crate::AgentPaths {
-                workspace_root: self.runtime.root().to_path_buf(),
-                state_root: self
-                    .runtime
-                    .state_root()
-                    .join("subagents")
-                    .join(format!("bg-general-purpose-{n}")),
-            },
-            routing: crate::AgentRouting {
-                model: delegate_model,
-                requested_max_tokens: self.config.routing.requested_max_tokens,
-                max_tokens: self.config.routing.max_tokens,
-                max_tokens_explicit: self.config.routing.max_tokens_explicit,
-                temperature: self.config.routing.temperature,
-                thinking_budget: self.config.routing.thinking_budget,
-                reasoning_effort: self.config.routing.reasoning_effort,
-                compat: self.config.routing.compat,
-                deepseek_compat: self.config.routing.deepseek_compat,
-                context_window: self.config.routing.context_window,
-                tool_mode: ToolMode::Auto,
-                ..crate::AgentRouting::default()
-            },
-            gates: crate::AgentGates {
-                verification: crate::VerificationMode::Disabled,
-                read_only_preflight: false,
-                lsp_mode: self.config.gates.lsp_mode,
-                ..crate::AgentGates::default()
-            },
-            loop_limits: crate::AgentLoopLimits {
-                // Inherit the parent's step setting (off unless the operator
-                // capped the session). The old hard cap of 20 made every
-                // `cost: large` delegate end at the step limit — work done,
-                // verification unrun, outcome branded Failed.
-                max_steps: self.config.loop_limits.max_steps,
-                max_parallel_tools: 2,
                 ..crate::AgentLoopLimits::default()
             },
             subagents: crate::AgentSubagents {
@@ -638,6 +599,7 @@ async fn run_bg_readonly(
     config: AgentConfig,
     kind: BgTaskKind,
     prompt: String,
+    teardown: hi_tools::BackgroundTaskTeardown,
     ui: &mut dyn Ui,
 ) -> hi_tools::BackgroundTaskOutcome {
     let kind_label = kind.as_str();
@@ -658,14 +620,15 @@ async fn run_bg_readonly(
         }
     };
 
-    let mut child = child;
-    let result = child.run_turn(&child_prompt, ui).await;
+    let mut child = super::child_process_teardown::ReapingChild::new(child, Some(teardown));
+    let result = child.child_mut().run_turn(&child_prompt, ui).await;
 
     let (state, output) = match result {
         Ok(turn) => match turn.status {
             crate::TurnStatus::Completed => (
                 hi_tools::BackgroundTaskState::Completed,
                 child
+                    .child()
                     .last_assistant_text()
                     .unwrap_or_else(|| format!("{kind_label} subagent produced no answer")),
             ),
@@ -680,6 +643,7 @@ async fn run_bg_readonly(
             crate::TurnStatus::Failed => (
                 hi_tools::BackgroundTaskState::Failed,
                 child
+                    .child()
                     .last_assistant_text()
                     .unwrap_or_else(|| format!("{kind_label} subagent failed")),
             ),
@@ -690,7 +654,17 @@ async fn run_bg_readonly(
         ),
     };
 
-    child.kill_background_processes();
+    if let Err(error) = child.stop_and_reap().await {
+        return hi_tools::BackgroundTaskOutcome {
+            id: String::new(),
+            description: String::new(),
+            subagent_type: kind_label.into(),
+            state: hi_tools::BackgroundTaskState::Failed,
+            output: format!("{output}; child process teardown failed: {error:#}"),
+            applied: false,
+            changed_files: vec![],
+        };
+    }
 
     hi_tools::BackgroundTaskOutcome {
         id: String::new(),
@@ -699,109 +673,6 @@ async fn run_bg_readonly(
         state,
         output,
         applied: false,
-        changed_files: vec![],
-    }
-}
-
-/// Run a background `general-purpose` (write-capable) subagent to completion.
-///
-/// Changes apply directly to the working tree (no worktree isolation for
-/// background tasks — the parent is still working and can observe changes as
-/// they happen). If a `verify` command is provided, it's run after the child
-/// completes; if it fails, the outcome is marked failed but changes are NOT
-/// rolled back (background tasks don't have the same transactional guarantees
-/// as synchronous delegate).
-async fn run_bg_general_purpose(
-    provider: std::sync::Arc<dyn hi_ai::Provider>,
-    config: AgentConfig,
-    prompt: String,
-    verify: Option<String>,
-    ui: &mut dyn Ui,
-) -> hi_tools::BackgroundTaskOutcome {
-    let kind_label = BgTaskKind::GeneralPurpose.as_str();
-    let child = match crate::Agent::new(provider, config) {
-        Ok(c) => c,
-        Err(e) => {
-            return hi_tools::BackgroundTaskOutcome {
-                id: String::new(),
-                description: String::new(),
-                subagent_type: kind_label.into(),
-                state: hi_tools::BackgroundTaskState::Failed,
-                output: format!("Failed to create {kind_label} subagent: {e}"),
-                applied: false,
-                changed_files: vec![],
-            };
-        }
-    };
-
-    let mut child = child;
-    let result = child.run_turn(&prompt, ui).await;
-
-    let (state, output) = match result {
-        Ok(turn) => match turn.status {
-            crate::TurnStatus::Completed => (
-                hi_tools::BackgroundTaskState::Completed,
-                child
-                    .last_assistant_text()
-                    .unwrap_or_else(|| format!("{kind_label} subagent completed")),
-            ),
-            crate::TurnStatus::Blocked => (
-                hi_tools::BackgroundTaskState::Failed,
-                format!("{kind_label} subagent was blocked"),
-            ),
-            crate::TurnStatus::Cancelled => (
-                hi_tools::BackgroundTaskState::Cancelled,
-                format!("{kind_label} subagent was cancelled"),
-            ),
-            crate::TurnStatus::Failed => (
-                hi_tools::BackgroundTaskState::Failed,
-                child
-                    .last_assistant_text()
-                    .unwrap_or_else(|| format!("{kind_label} subagent failed")),
-            ),
-        },
-        Err(e) => (
-            hi_tools::BackgroundTaskState::Failed,
-            format!("{kind_label} subagent error: {e}"),
-        ),
-    };
-
-    child.kill_background_processes();
-
-    // If a verify command was provided, run it.
-    let (final_state, final_output) = if let Some(verify_cmd) = verify {
-        if state == hi_tools::BackgroundTaskState::Completed {
-            match hi_tools::run_check_in(child.runtime.root(), &verify_cmd).await {
-                Ok(exec) if exec.status == hi_tools::ToolStatus::Succeeded => (
-                    state,
-                    format!("{output}\n\nVerification passed: {verify_cmd}"),
-                ),
-                Ok(exec) => (
-                    hi_tools::BackgroundTaskState::Failed,
-                    format!(
-                        "{output}\n\nVerification failed: {verify_cmd}\n{}",
-                        exec.outcome.stdout_summary
-                    ),
-                ),
-                Err(e) => (
-                    hi_tools::BackgroundTaskState::Failed,
-                    format!("{output}\n\nVerification error: {e}"),
-                ),
-            }
-        } else {
-            (state, output)
-        }
-    } else {
-        (state, output)
-    };
-
-    hi_tools::BackgroundTaskOutcome {
-        id: String::new(),
-        description: String::new(),
-        subagent_type: kind_label.into(),
-        state: final_state,
-        output: final_output,
-        applied: final_state == hi_tools::BackgroundTaskState::Completed,
         changed_files: vec![],
     }
 }

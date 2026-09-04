@@ -24,9 +24,10 @@ use hi_agent::local_skeptic::{
     detect_backend_offload, provision_team_local_model, resolve_team_local_model, system_ram_gb,
     team_model_spec,
 };
-use hi_ai::{ChatRequest, Content, Message, OpenAiProvider, Provider, RequestProfile};
-use std::sync::Arc;
+use hi_ai::{Content, OpenAiProvider, Provider};
 use std::time::{Duration, Instant};
+
+mod request_policy;
 
 /// One benchmark task: a prompt and a machine validator for the reply.
 struct BenchTask {
@@ -252,24 +253,7 @@ async fn bench_model(resolved: ResolvedLocalModel, tasks: &[BenchTask]) -> Resul
 /// One prompt → validate round. Task failures (bad output) are results, not
 /// errors; only transport-level problems surface as FAIL with the cause.
 async fn run_task(provider: &OpenAiProvider, model_id: &str, task: &BenchTask) -> TaskResult {
-    let request = ChatRequest {
-        model: model_id.to_string(),
-        request_id: None,
-        retry_attempt: 0,
-        user_turn: false,
-        canonical_objective: None,
-        messages: Arc::new(vec![Message::user(task.prompt.clone())]),
-        tools: Arc::new([]),
-        // Room for models that reason inline before the code; hi-local's
-        // default per-request ceiling is 8192.
-        max_tokens: 3500,
-        temperature: Some(0.0),
-        top_p: None,
-        frequency_penalty: None,
-        thinking_budget: None,
-        reasoning_effort: None,
-        profile: RequestProfile::default(),
-    };
+    let request = request_policy::build(provider, model_id, &task.prompt).await;
     let started = Instant::now();
     let mut first_event: Option<Duration> = None;
     let completion = tokio::time::timeout(

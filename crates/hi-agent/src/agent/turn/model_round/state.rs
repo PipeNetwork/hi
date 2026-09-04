@@ -95,6 +95,7 @@ pub(in crate::agent::turn) enum ModelRoundControl {
         calls: Vec<(String, String, String)>,
         completion_content: Vec<Content>,
         tool_specs: std::sync::Arc<[hi_ai::ToolSpec]>,
+        tool_envelope: std::sync::Arc<hi_tools::envelope::ToolEnvelope>,
     },
 }
 

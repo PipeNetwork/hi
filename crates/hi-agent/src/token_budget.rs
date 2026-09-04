@@ -324,11 +324,44 @@ impl crate::Agent {
         Ok(false)
     }
 
+    /// Build a fresh-window transcript from an immutable compaction source.
+    /// Session state is not changed until the caller wins its revision claim.
+    pub(crate) fn prepare_fresh_window_compaction(
+        &self,
+        source: &[hi_ai::Message],
+    ) -> Vec<hi_ai::Message> {
+        let task = self.current_window_task_from(source);
+        let mut messages = vec![self.system_message()];
+        if let Some(task) = task {
+            messages.push(hi_ai::Message::user(wrap_current_task(
+                self.volatile_context_block().as_deref(),
+                &task,
+            )));
+        }
+        messages
+    }
+
+    /// Apply non-transcript fresh-window state after the compacted transcript
+    /// and its durable replacement boundary have been published.
+    pub(crate) fn finish_fresh_window_compaction(&mut self) {
+        self.token_budget.advance_window();
+        self.report.context_used = 0;
+        self.token_budget
+            .begin_turn(0, self.config.routing.context_window);
+        self.reset_goal_drive_stall();
+        self.reset_plan_drive_stall();
+    }
+
+    #[cfg(test)]
     pub(crate) fn compact_fresh_window(&mut self, ui: &mut dyn Ui) -> Result<()> {
         self.apply_fresh_window(ui, None)
     }
 
     fn current_window_task(&self) -> Option<String> {
+        self.current_window_task_from(self.messages.as_slice())
+    }
+
+    fn current_window_task_from(&self, messages: &[hi_ai::Message]) -> Option<String> {
         if let Some(prompt) = self
             .task
             .last_task_prompt
@@ -338,7 +371,7 @@ impl crate::Agent {
         {
             return Some(prompt.to_string());
         }
-        let inner = self.messages.as_slice().iter().rev().find_map(|message| {
+        let inner = messages.iter().rev().find_map(|message| {
             (message.role == hi_ai::Role::User).then(|| inner_user_text(&message.text()))
         })?;
         let trimmed = inner.trim();

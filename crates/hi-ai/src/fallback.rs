@@ -12,6 +12,7 @@ use crate::provider::{
     Provider, ProviderCapabilities, ProviderError, ServedModel, provider_error_affects_health,
     provider_error_is_fallback_eligible, provider_error_kind, provider_error_usage,
 };
+use crate::provider_capabilities::ProviderCapabilityCandidate;
 use crate::types::{ChatRequest, Completion, StreamEvent, Usage};
 
 /// One link in the fallback chain: a built provider plus the model id to request
@@ -76,12 +77,23 @@ impl Provider for FallbackProvider {
         self.chain
             .iter()
             .map(|backend| backend.provider.capabilities())
-            .reduce(|left, right| ProviderCapabilities {
-                native_tool_calls: left.native_tool_calls && right.native_tool_calls,
-                streamed_tool_call_deltas: left.streamed_tool_call_deltas
-                    && right.streamed_tool_call_deltas,
-            })
+            .reduce(|left, right| left.conservative_intersection(&right))
             .unwrap_or_default()
+    }
+
+    fn capability_candidates(
+        &self,
+        _route: &str,
+        _model: &str,
+    ) -> Vec<ProviderCapabilityCandidate> {
+        self.chain
+            .iter()
+            .flat_map(|backend| {
+                backend
+                    .provider
+                    .capability_candidates(&backend.label, &backend.model)
+            })
+            .collect()
     }
 
     async fn stream(
@@ -285,6 +297,7 @@ mod tests {
             canonical_objective: None,
             messages: vec![].into(),
             tools: vec![].into(),
+            tool_envelope: None,
             max_tokens: 16,
             temperature: None,
             top_p: None,

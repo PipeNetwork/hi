@@ -1,3 +1,7 @@
+use super::credential_refs::{
+    resolve_credential_reference, rmw_profile_file, seal_profile_credential,
+    supported_credential_reference,
+};
 use super::*;
 
 /// The fields needed to create or edit a profile, collected from the user.
@@ -42,6 +46,8 @@ impl ProfileForm {
             p.base_url = Some(self.base_url.clone());
         }
         if !self.api_key.is_empty() {
+            if supported_credential_reference(&self.api_key) {
+                p.api_key_ref = Some(self.api_key.clone());
             // The API-key field accepts either a literal key or the *name* of an
             // env var that holds the key. Distinguish by checking the environment:
             // if the input is a plausible env var name AND an env var with that
@@ -51,7 +57,7 @@ impl ProfileForm {
             // happens to be all-caps+digits+underscores is stored correctly
             // instead of being mistaken for an env var name (which would fail at
             // resolve time with "env var … is not set").
-            if is_env_var_reference(&self.api_key) {
+            } else if is_env_var_reference(&self.api_key) {
                 p.api_key_env = Some(self.api_key.clone());
             } else {
                 p.api_key = Some(self.api_key.clone());
@@ -70,6 +76,7 @@ impl ProfileForm {
             provider: form.provider,
             model: form.model,
             base_url: form.base_url,
+            api_key_ref: form.api_key_ref,
             api_key: form.api_key,
             api_key_env: form.api_key_env,
             ..existing.clone()
@@ -82,11 +89,15 @@ impl ProfileForm {
             name: name.to_string(),
             provider: p.provider.unwrap_or(ProviderName::Openai),
             api_key: p
-                .api_key_env
+                .api_key_ref
                 .clone()
+                .or_else(|| p.api_key_env.clone())
                 .or_else(|| p.api_key.clone())
                 .unwrap_or_default(),
-            store_as_env: p.api_key_env.is_some(),
+            store_as_env: p.api_key_env.is_some()
+                || p.api_key_ref
+                    .as_deref()
+                    .is_some_and(|reference| reference.starts_with("env://")),
             model: p.model.clone().unwrap_or_default(),
             base_url: p.base_url.clone().unwrap_or_default(),
         }
@@ -172,8 +183,9 @@ pub fn upsert_profile(
     profile: Profile,
     explicit: Option<&Path>,
 ) -> Result<()> {
-    validate_profile(&profile)?;
     let target = profile_save_target(name, explicit)?;
+    let profile = seal_profile_credential(name, &target, profile)?;
+    validate_profile(&profile)?;
     rmw_config_file(&target, |file| {
         file.profiles.insert(name.to_string(), profile.clone());
     })?;
@@ -190,10 +202,11 @@ pub fn upsert_profile_project_local(
     profile: Profile,
     explicit: Option<&Path>,
 ) -> Result<()> {
-    validate_profile(&profile)?;
     let target = explicit
         .map(PathBuf::from)
         .unwrap_or_else(local_config_path);
+    let profile = seal_profile_credential(name, &target, profile)?;
+    validate_profile(&profile)?;
     rmw_config_file(&target, |file| {
         file.profiles.insert(name.to_string(), profile.clone());
     })?;
@@ -237,24 +250,15 @@ pub fn set_profile_model(
 ) -> Result<()> {
     let profile = config
         .profiles
-        .get_mut(name)
+        .get(name)
         .ok_or_else(|| anyhow!("profile '{name}' not found in config"))?;
-    profile.model = Some(model.to_string());
-    validate_profile(profile)?;
-    let updated = profile.clone();
+    let fallback = profile.clone();
     let target = profile_save_target(name, explicit)?;
-    rmw_config_file(&target, |file| {
-        match file.profiles.get_mut(name) {
-            // Touch only the model, preserving whatever else that file says
-            // about the profile.
-            Some(p) => p.model = Some(model.to_string()),
-            // The file doesn't define it (deleted mid-session, or a fresh
-            // explicit path): write the full in-memory profile.
-            None => {
-                file.profiles.insert(name.to_string(), updated.clone());
-            }
-        }
-    })
+    let updated = rmw_profile_file(&target, name, fallback, |profile| {
+        profile.model = Some(model.to_string());
+    })?;
+    config.profiles.insert(name.to_string(), updated);
+    Ok(())
 }
 
 /// Persist `reasoning_effort` to profile `name` so it survives across sessions
@@ -270,21 +274,15 @@ pub fn persist_profile_reasoning_effort(
 ) -> Result<()> {
     let profile = config
         .profiles
-        .get_mut(name)
+        .get(name)
         .ok_or_else(|| anyhow!("profile '{name}' not found in config"))?;
-    profile.reasoning_effort = effort;
+    let fallback = profile.clone();
     let target = profile_save_target(name, explicit)?;
-    rmw_config_file(&target, |file| match file.profiles.get_mut(name) {
-        Some(p) => p.reasoning_effort = effort,
-        None => {
-            // The file doesn't define the profile (deleted mid-session, or a
-            // fresh explicit path): write the full in-memory profile.
-            let updated = config.profiles.get(name).cloned();
-            if let Some(p) = updated {
-                file.profiles.insert(name.to_string(), p);
-            }
-        }
-    })
+    let updated = rmw_profile_file(&target, name, fallback, |profile| {
+        profile.reasoning_effort = effort;
+    })?;
+    config.profiles.insert(name.to_string(), updated);
+    Ok(())
 }
 
 /// Persist the machine-wide last `/config reasoning` choice.
@@ -353,6 +351,11 @@ pub fn remove_profile(config: &mut Config, name: &str, explicit: Option<&Path>) 
 /// and `/models` itself — a common copy-paste mistake is to paste the full
 /// endpoint URL, which produces 404s).
 pub(crate) fn validate_profile(profile: &Profile) -> Result<()> {
+    if let Some(reference) = profile.api_key_ref.as_deref()
+        && !supported_credential_reference(reference)
+    {
+        bail!("unsupported profile credential reference {reference:?}");
+    }
     if let Some(url) = &profile.base_url {
         let trimmed = url.trim_end_matches('/');
         for suffix in ["/chat/completions", "/completions", "/messages"] {
@@ -586,13 +589,15 @@ fn validate_mcp_url(
             .is_some_and(|profile| {
                 if profile.project_local {
                     profile.project_trusted
-                        && profile.api_key.is_some()
+                        && (profile.api_key_ref.is_some() || profile.api_key.is_some())
                         && profile
                             .base_url
                             .as_deref()
                             .is_some_and(|url| !is_official_provider_url(provider, url))
                 } else {
-                    profile.api_key.is_some() || profile.api_key_env.is_some()
+                    profile.api_key_ref.is_some()
+                        || profile.api_key.is_some()
+                        || profile.api_key_env.is_some()
                 }
             }),
         McpUrlSource::Profile | McpUrlSource::Environment | McpUrlSource::Default => false,
@@ -710,6 +715,11 @@ fn ensure_project_endpoint_trusted(
 }
 
 fn resolve_profile_api_key(profile: Option<&Profile>) -> Result<Option<String>> {
+    if let Some(reference) = profile.and_then(|profile| profile.api_key_ref.as_deref()) {
+        let project_local = profile.is_some_and(|profile| profile.project_local);
+        let project_trusted = profile.is_some_and(|profile| profile.project_trusted);
+        return resolve_credential_reference(reference, project_local, project_trusted).map(Some);
+    }
     if let Some(key) = profile.and_then(|profile| profile.api_key.clone()) {
         return Ok(Some(key));
     }

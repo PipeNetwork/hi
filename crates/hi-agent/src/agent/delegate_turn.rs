@@ -281,11 +281,9 @@ impl crate::Agent {
     /// Returns `None` if an explicit quota is exhausted, no runner is attached,
     /// or the task is empty.
     pub(crate) fn prepare_delegate(&mut self, arguments: &str) -> Option<(DelegateJob, u64)> {
-        // Frontend delegate runners capture a concrete destination root. A live
-        // PipeFS rebind cannot safely reuse a runner constructed for the launch
-        // directory, and the child does not share the parent's durability
-        // controller. Fail closed even for an unadvertised/hallucinated call.
-        if self.workspace_durability_enabled() {
+        // Fail closed for an unadvertised call unless the runner proves the
+        // exact portable destination root and the controller permits apply.
+        if !self.delegate_runner_matches_workspace() {
             return None;
         }
         let parsed = serde_json::from_str::<Value>(arguments).ok();
@@ -379,9 +377,9 @@ impl crate::Agent {
         arguments: &str,
         ui: &mut dyn Ui,
     ) -> hi_tools::ToolOutcome {
-        if self.workspace_durability_enabled() {
+        if !self.delegate_runner_matches_workspace() {
             return delegate_tool_outcome(
-                "delegate is unavailable while PipeFS is active because write subagents cannot yet share its durability fence; implement the change in the parent agent",
+                "delegate is unavailable because its candidate runner is not bound to the active PipeFS/portable workspace or candidate apply is disabled",
                 hi_tools::ToolStatus::Denied,
                 false,
                 false,

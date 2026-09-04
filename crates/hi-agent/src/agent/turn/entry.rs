@@ -81,6 +81,13 @@ impl crate::Agent {
                             // terminal diagnostic; the workspace state is
                             // intentionally reported as uncertain.
                             drop(turn);
+                            // If cleanup was dropped before it transferred the
+                            // admitted permit to shielded settlement, dropping
+                            // it here synchronously publishes RecoveryRequired.
+                            // A hard-deadline error is preferable to falsely
+                            // claiming a clean cancellation.
+                            let _ = self.workspace_coordination.abandon_active();
+                            self.foreground_process_registry().kill_current();
                             self.turn_cancellation = None;
                             self.interrupt
                                 .store(false, std::sync::atomic::Ordering::Release);
@@ -197,25 +204,46 @@ impl crate::Agent {
         // future must be dropped before cleanup_turn borrows `self` again.
         const COOPERATIVE_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
         let interrupt = std::sync::Arc::clone(&self.interrupt);
-        let (body_result, cancellation_observed) = {
+        let foreground_processes = self.foreground_process_registry();
+        let (body_result, cancellation_observed, foreground_reap_proven) = {
             let body = self.run_turn_body(input, ui, engine_lease);
             tokio::pin!(body);
             tokio::select! {
                 biased;
-                result = &mut body => (Some(result), false),
+                result = &mut body => (Some(result), false, true),
                 _ = wait_for_turn_cancellation(cancellation.clone()) => {
                     interrupt.store(true, std::sync::atomic::Ordering::Release);
-                    let result = tokio::select! {
+                    // Wake an in-flight foreground shell/program immediately.
+                    // Its owning capture future remains alive during the grace
+                    // window so it can observe exit and reap the direct child.
+                    foreground_processes.kill_current();
+                    let mut result = tokio::select! {
                         biased;
                         result = &mut body => Some(result),
                         _ = tokio::time::sleep(COOPERATIVE_CANCEL_GRACE) => None,
                     };
+                    let mut foreground_reap_proven = true;
+                    if result.is_none() && foreground_processes.active_count() > 0 {
+                        // Keep the body allocation alive while capture owns the
+                        // child. If we dropped it first, the registry token
+                        // would disappear before Tokio's kill-on-drop reaper
+                        // could be observed, creating a false quiescent state.
+                        const FOREGROUND_REAP_GRACE: std::time::Duration =
+                            std::time::Duration::from_secs(5);
+                        tokio::select! {
+                            biased;
+                            settled = &mut body => result = Some(settled),
+                            reaped = foreground_processes.wait_until_empty(FOREGROUND_REAP_GRACE) => {
+                                foreground_reap_proven = reaped;
+                            }
+                        }
+                    }
                     // Cancellation has won the outer race. Even if the body
                     // happens to finish normally during its grace window, the
                     // caller's request still owns the result and must roll the
                     // turn back. A normal result that wins the biased outer
                     // branch is not retroactively cancelled.
-                    (result, true)
+                    (result, true, foreground_reap_proven)
                 }
             }
             // `body` drops here, releasing `&mut self`.
@@ -255,15 +283,34 @@ impl crate::Agent {
             // it is outside the body future that the cooperative grace may
             // drop, so an in-progress checkpoint restore can never be detached
             // and then re-entered by a second cleanup attempt.
-            let workspace_rolled_back = match self
-                .rollback_turn_checkpoint(&checkpoint_refs_before)
-                .await
-            {
-                Ok(restored_files) => restored_files > 0,
-                Err(error) => {
-                    eprintln!("hi-agent: couldn't roll back cancelled workspace edits: {error:#}");
-                    false
+            // A killed child can execute a final write until it is reaped.
+            // Never begin rollback while foreground or auto-backgrounded turn
+            // writers can still race the restoration.
+            let quiescence_result = self.quiesce_abnormal_turn_processes().await;
+            let quiescence_error = if foreground_reap_proven {
+                quiescence_result.err()
+            } else {
+                Some(anyhow::anyhow!(
+                    "timed out waiting for a cancelled foreground process to be reaped"
+                ))
+            };
+            if quiescence_error.is_some() {
+                // The permit's synchronous drop fence records the ambiguity
+                // even if the remaining cleanup is itself cancelled later.
+                let _ = self.workspace_coordination.abandon_active();
+            }
+            let workspace_rolled_back = if quiescence_error.is_none() {
+                match self.rollback_turn_checkpoint(&checkpoint_refs_before).await {
+                    Ok(restored_files) => restored_files > 0,
+                    Err(error) => {
+                        eprintln!(
+                            "hi-agent: couldn't roll back cancelled workspace edits: {error:#}"
+                        );
+                        false
+                    }
                 }
+            } else {
+                false
             };
             let message_start = self
                 .workspace
@@ -285,16 +332,24 @@ impl crate::Agent {
                     workspace_rolled_back,
                 );
             }
-            let cleanup_result = self
-                .cleanup_turn(crate::TurnCleanupKind::Cancel {
-                    session: crate::SessionRollback::AlreadyApplied,
-                })
-                .await
-                .map(|cleanup| cleanup.outcome);
-            cleanup_result.and_then(|outcome| {
+            if let Some(error) = quiescence_error {
+                let cleanup = self.cleanup_turn(crate::TurnCleanupKind::Fail).await;
+                cleanup?;
                 pause_result?;
-                Ok(outcome)
-            })
+                Err(error
+                    .context("cancelled turn could not prove all writer processes were reaped"))
+            } else {
+                let cleanup_result = self
+                    .cleanup_turn(crate::TurnCleanupKind::Cancel {
+                        session: crate::SessionRollback::AlreadyApplied,
+                    })
+                    .await
+                    .map(|cleanup| cleanup.outcome);
+                cleanup_result.and_then(|outcome| {
+                    pause_result?;
+                    Ok(outcome)
+                })
+            }
         } else {
             body_result.expect("non-cancelled turn body must have a result")
         };
@@ -419,12 +474,22 @@ impl crate::Agent {
         // `pre-turn` is a gate; `post-turn` and `stop` are best-effort notices.
         let hooks = self.workspace_root().join(".hi/hooks");
         let hooks_trusted = crate::workspace_trusted(self.workspace_root());
-        let portable_workspace = self.workspace_durability_enabled();
+        let portable_workspace = self.pipefs_workspace_active();
         if hooks.join("pre-turn").is_file() && hooks_trusted && !portable_workspace {
-            let report = crate::run_hook(self.workspace_root(), "pre-turn", input)
+            let hook_cancellation = self
+                .turn_cancellation
+                .clone()
+                .expect("turn cancellation is installed before lifecycle hooks");
+            match self
+                .run_workspace_lifecycle_hook("pre-turn", input, &hook_cancellation)
                 .await
-                .map_err(|e| anyhow::anyhow!("pre-turn hook blocked turn: {e:#}"))?;
-            ui.status(&report);
+            {
+                Ok(Some(report)) => ui.status(&report),
+                Ok(None) => return Err(TurnCancellationRequested.into()),
+                Err(error) => {
+                    return Err(anyhow::anyhow!("pre-turn hook blocked turn: {error:#}"));
+                }
+            }
         } else if hooks.join("pre-turn").is_file() && portable_workspace {
             ui.status(
                 "project hooks skipped in PipeFS; trust and execute restored code explicitly",
@@ -586,22 +651,25 @@ impl crate::Agent {
         };
         let hooks = self.workspace_root().join(".hi/hooks");
         let hooks_trusted = crate::workspace_trusted(self.workspace_root());
-        let portable_workspace = self.workspace_durability_enabled();
+        let portable_workspace = self.pipefs_workspace_active();
         if hooks.join("post-turn").is_file() && hooks_trusted && !portable_workspace {
-            match run_hook_cancellable(self.workspace_root(), "post-turn", &summary, cancellation)
+            match self
+                .run_workspace_lifecycle_hook("post-turn", &summary, cancellation)
                 .await
             {
-                Some(Ok(report)) => ui.status(&report),
-                Some(Err(error)) => ui.status(&format!("post-turn hook failed: {error:#}")),
-                None => return,
+                Ok(Some(report)) => ui.status(&report),
+                Err(error) => ui.status(&format!("post-turn hook failed: {error:#}")),
+                Ok(None) => return,
             }
         }
         if hooks.join("stop").is_file() && hooks_trusted && !portable_workspace {
-            match run_hook_cancellable(self.workspace_root(), "stop", &summary, cancellation).await
+            match self
+                .run_workspace_lifecycle_hook("stop", &summary, cancellation)
+                .await
             {
-                Some(Ok(report)) => ui.status(&report),
-                Some(Err(error)) => ui.status(&format!("stop hook failed: {error:#}")),
-                None => (),
+                Ok(Some(report)) => ui.status(&report),
+                Err(error) => ui.status(&format!("stop hook failed: {error:#}")),
+                Ok(None) => (),
             }
         }
     }
@@ -612,24 +680,5 @@ async fn wait_for_turn_cancellation(cancellation: crate::TurnCancellation) {
     // Notify-based redesign of TurnCancellation (still an AtomicBool).
     while !cancellation.is_cancelled() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-}
-
-/// Run a project hook until it completes or whole-turn cancellation arrives.
-/// `run_hook` owns a private process group, so dropping the losing hook future
-/// terminates the hook and its descendants instead of leaving work behind.
-async fn run_hook_cancellable(
-    workspace: &std::path::Path,
-    name: &str,
-    input: &str,
-    cancellation: &crate::TurnCancellation,
-) -> Option<Result<String>> {
-    if cancellation.is_cancelled() {
-        return None;
-    }
-    tokio::select! {
-        biased;
-        _ = wait_for_turn_cancellation(cancellation.clone()) => None,
-        result = crate::run_hook(workspace, name, input) => Some(result),
     }
 }

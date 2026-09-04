@@ -14,13 +14,16 @@ use std::sync::{Arc, Mutex};
 
 use hi_ai::{
     ChatRequest, CompatMode, Content, Message, Provider, RequestProfile, Role, StreamEvent,
-    ToolMode, ToolSpec, Usage,
+    ToolSpec, Usage,
 };
 use hi_tools::execute_in_runtime_shared;
 use tokio::sync::mpsc;
 
 use crate::Ui;
-use crate::heuristics::mode_blocks_tool;
+
+use super::model_request::SealedRequestPolicy;
+
+mod request_policy;
 
 /// Soft cap on recent transcript characters attached to a side question.
 const BTW_CONTEXT_CHARS: usize = 2_400;
@@ -78,7 +81,8 @@ struct BtwJob {
     system: Message,
     snapshot: String,
     recent: String,
-    tools: Arc<[ToolSpec]>,
+    read_policy: SealedRequestPolicy,
+    chat_policy: SealedRequestPolicy,
     questions: Vec<String>,
     root: PathBuf,
     state_root: PathBuf,
@@ -177,7 +181,8 @@ pub(crate) struct BtwLiveContext {
     snapshot: String,
     recent: String,
     system: Message,
-    tools: Arc<[ToolSpec]>,
+    read_policy: SealedRequestPolicy,
+    chat_policy: SealedRequestPolicy,
     model: String,
     temperature: Option<f32>,
     compat: CompatMode,
@@ -359,7 +364,8 @@ impl BtwDispatcher {
                 system: live.system.clone(),
                 snapshot: live.snapshot.clone(),
                 recent: live.recent.clone(),
-                tools: live.tools.clone(),
+                read_policy: live.read_policy.clone(),
+                chat_policy: live.chat_policy.clone(),
                 questions: vec![question],
                 root,
                 state_root,
@@ -395,7 +401,8 @@ impl crate::Agent {
     /// Arm (or refresh) the immediate `/btw` dispatcher with live session context.
     /// Call at turn start and each model-round boundary so snapshot/transcript stay fresh.
     /// Updates the shared Arc in place so TUI clones taken earlier still work.
-    pub(crate) fn arm_btw_dispatcher(&mut self) {
+    pub(crate) async fn arm_btw_dispatcher(&mut self) {
+        let (model, read_policy, chat_policy) = request_policy::seal(self).await;
         let live = BtwLiveContext {
             snapshot: self.btw_session_snapshot(),
             recent: recent_transcript_excerpt(self.messages.as_slice(), BTW_CONTEXT_CHARS),
@@ -403,8 +410,9 @@ impl crate::Agent {
                 let base = self.minimal_system_message().text();
                 Message::system(format!("{base}\n\n{BTW_SYSTEM}"))
             },
-            tools: btw_tool_specs(self.request_tools_for(ToolMode::ReadOnly).as_ref()),
-            model: self.config.routing.model.clone(),
+            read_policy,
+            chat_policy,
+            model,
             temperature: self.config.routing.temperature,
             compat: self.config.routing.compat,
             deepseek_compat: self.config.routing.deepseek_compat,
@@ -464,7 +472,7 @@ impl crate::Agent {
         ui: &mut dyn Ui,
     ) -> Vec<String> {
         self.poll_btw_jobs(ui).await;
-        self.arm_btw_dispatcher();
+        self.arm_btw_dispatcher().await;
 
         if interjected.is_empty() {
             return interjected;
@@ -489,9 +497,10 @@ impl crate::Agent {
 
         // No main-transcript status spam — the BTW pane owns side-channel chrome.
 
+        let (model, read_policy, chat_policy) = request_policy::seal(self).await;
         let job = BtwJob {
             provider: self.provider.clone(),
-            model: self.config.routing.model.clone(),
+            model,
             temperature: self.config.routing.temperature,
             compat: self.config.routing.compat,
             deepseek_compat: self.config.routing.deepseek_compat,
@@ -501,7 +510,8 @@ impl crate::Agent {
             },
             snapshot: self.btw_session_snapshot(),
             recent: recent_transcript_excerpt(self.messages.as_slice(), BTW_CONTEXT_CHARS),
-            tools: btw_tool_specs(self.request_tools_for(ToolMode::ReadOnly).as_ref()),
+            read_policy,
+            chat_policy,
             questions,
             root: self.runtime.root().to_path_buf(),
             state_root: self.runtime.state_root().to_path_buf(),
@@ -700,7 +710,7 @@ async fn answer_one_btw_question(
         job.snapshot, job.recent
     );
     let mut messages: Vec<Message> = vec![job.system.clone(), Message::user(user)];
-    let tools_empty = job.tools.is_empty();
+    let tools_empty = job.read_policy.tools.is_empty();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(BTW_DEADLINE_SECS);
 
     for round in 0..BTW_MAX_ROUNDS {
@@ -709,15 +719,10 @@ async fn answer_one_btw_question(
             return;
         }
         let last_round = round + 1 >= BTW_MAX_ROUNDS || tools_empty;
-        let request_tools = if last_round {
-            Arc::new([])
+        let policy = if last_round {
+            &job.chat_policy
         } else {
-            job.tools.clone()
-        };
-        let tool_mode = if last_round {
-            ToolMode::ChatOnly
-        } else {
-            ToolMode::ReadOnly
+            &job.read_policy
         };
 
         let request = ChatRequest {
@@ -727,8 +732,9 @@ async fn answer_one_btw_question(
             user_turn: false,
             canonical_objective: None,
             messages: Arc::from(messages.clone()),
-            tools: request_tools,
-            max_tokens: BTW_MAX_TOKENS,
+            tools: policy.tools.clone(),
+            tool_envelope: Some(policy.envelope.clone()),
+            max_tokens: policy.max_tokens,
             temperature: job.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -736,7 +742,7 @@ async fn answer_one_btw_question(
             reasoning_effort: None,
             profile: RequestProfile {
                 compat: job.compat,
-                tool_mode,
+                tool_mode: policy.tool_mode,
                 stream_usage: None,
                 deepseek_compat: job.deepseek_compat,
                 deepseek_strict: None,
@@ -805,19 +811,8 @@ async fn answer_one_btw_question(
 
         let mut batch: Vec<(String, String, String)> = Vec::new();
         for call in &calls {
-            if let Some(reason) = mode_blocks_tool(ToolMode::ReadOnly, call.name) {
+            if let Some(reason) = request_policy::rejection(policy, call) {
                 messages.push(Message::tool_result(call.id, reason));
-                continue;
-            }
-            if !BTW_TOOL_ALLOWLIST.contains(&call.name) {
-                messages.push(Message::tool_result(
-                    call.id,
-                    format!(
-                        "tool `{}` is not available on /btw side questions \
-                         (read-only inspection only)",
-                        call.name
-                    ),
-                ));
                 continue;
             }
             batch.push((
@@ -850,6 +845,8 @@ async fn answer_one_btw_question(
         // side-channel, not the main transcript) and `run_btw_job` still
         // sends `Done` after this returns.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let max_parallel = usize::from(policy.execution_envelope.payload.limits.max_parallel_calls)
+            .clamp(1, BTW_MAX_PARALLEL_TOOLS);
         let tool_stream = futures_util::stream::iter(batch.into_iter().map(|(id, name, args)| {
             let root = root.clone();
             let state_root = state_root.clone();
@@ -872,7 +869,7 @@ async fn answer_one_btw_question(
                 (id, name, outcome.content)
             }
         }))
-        .buffer_unordered(BTW_MAX_PARALLEL_TOOLS.max(1));
+        .buffer_unordered(max_parallel);
 
         let results = match tokio::time::timeout(remaining, tool_stream.collect::<Vec<_>>()).await {
             Ok(results) => results,

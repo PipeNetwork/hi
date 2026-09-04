@@ -184,9 +184,15 @@ pub(crate) fn wrap_provider(
         } else {
             ""
         };
+        let referenced_key = section
+            .and_then(|rsi| rsi.api_key_ref.as_deref())
+            .map(|reference| crate::config::resolve_credential_reference(reference, false, false))
+            .transpose()?;
         match RsiSettings::resolve(
             section.and_then(|rsi| rsi.base_url.as_deref()),
-            section.and_then(|rsi| rsi.api_key.as_deref()),
+            referenced_key
+                .as_deref()
+                .or_else(|| section.and_then(|rsi| rsi.api_key.as_deref())),
             section.and_then(|rsi| rsi.api_key_env.as_deref()),
             section.and_then(|rsi| rsi.maximum_cost_microusd),
             section.and_then(|rsi| rsi.channel.as_deref()),

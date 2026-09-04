@@ -3,6 +3,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+pub use crate::provider_capabilities::ProviderCapabilities;
+use crate::provider_capabilities::{CapabilityRoute, ProviderCapabilityCandidate};
 use crate::types::{ChatRequest, Completion, StreamEvent, Usage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -638,12 +640,8 @@ fn largest_number(text: &str) -> Option<u32> {
     best
 }
 
-/// A model backend. Implementations own the wire-format translation and SSE
-/// reassembly so the agent loop stays provider-agnostic.
-///
-/// `sink` is invoked for each incremental [`StreamEvent`] as it arrives; the
-/// returned [`Completion`] is the fully-assembled assistant turn (text,
-/// reasoning, and tool calls).
+/// A model backend. Implementations own wire translation and SSE reassembly.
+/// `sink` receives incremental events; the return value is the assembled turn.
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn stream(
@@ -652,24 +650,24 @@ pub trait Provider: Send + Sync {
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion>;
 
-    /// Capabilities that affect how the agent may advertise optional action
-    /// protocols. The default is deliberately conservative for third-party
-    /// providers and test doubles.
+    /// Optional protocol promises. The default is deliberately conservative.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
     }
 
-    /// The models this endpoint actually serves (via its `/models` route), with
-    /// any live metadata reported. Default: empty.
+    /// Conservative members behind this effective route. Wrappers that can
+    /// dispatch to several backends must expose every possible member.
+    fn capability_candidates(&self, route: &str, model: &str) -> Vec<ProviderCapabilityCandidate> {
+        vec![ProviderCapabilityCandidate::new(
+            CapabilityRoute::new(route, model),
+            self.capabilities(),
+        )]
+    }
+
+    /// Models served by the endpoint, with best-effort live metadata.
     async fn list_models(&self) -> Result<Vec<ServedModel>> {
         Ok(Vec::new())
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ProviderCapabilities {
-    pub native_tool_calls: bool,
-    pub streamed_tool_call_deltas: bool,
 }
 
 #[cfg(test)]

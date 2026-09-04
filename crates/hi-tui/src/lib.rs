@@ -1,10 +1,9 @@
 //! Full-screen terminal UI for `hi`.
 //!
-//! A ratatui application on the alternate screen in grok-build's session
-//! chrome: a flat status bar, unboxed scrollback, a quiet rounded prompt, and
-//! a shortcuts row. The agent runs behind an mpsc channel ([`ChannelUi`]) so
-//! the event loop can keep redrawing — spinner, streaming output, scrolling —
-//! while a turn is in flight, and can cancel it with Ctrl-C.
+//! A ratatui application on the alternate screen in grok-build's session chrome:
+//! a flat status bar, unboxed scrollback, a quiet rounded prompt, and
+//! a shortcuts row. The agent runs behind an mpsc channel ([`ChannelUi`]) and
+//! keeps redrawing while a turn runs, with Ctrl-C cancellation.
 
 mod action;
 mod activity;
@@ -15,6 +14,7 @@ pub mod benchmark;
 mod daemon;
 mod dashboard;
 mod dashboard_goal;
+pub mod debug_harness;
 mod diff_lab;
 mod dispatch;
 mod domain;
@@ -1142,12 +1142,12 @@ pub(crate) struct App {
     pub(crate) reasoning_effort_saver: Option<ReasoningEffortSaver>,
     /// Saves/selects a managed local MLX profile after `/hf run --mlx`.
     pub(crate) mlx_switcher: MlxProfileSwitcher,
-    /// Provisions and saves a managed local model selected in the provider
-    /// picker. The callback runs only after the runtime is verified.
+    /// Provisions and saves a managed local model selected in the provider picker after verification.
     pub(crate) local_runtime_switcher: LocalRuntimeSwitcher,
     /// Best-effort persist of active profile/provider/model for next launch.
     pub(crate) session_remember: Option<crate::SessionRemember>,
     pub(crate) transcript: Vec<TranscriptEntry>,
+    pub(crate) session_projection: crate::app::session_projection::PresentationProjection,
     /// Highest accepted workflow revision by run. Terminal entries remain here
     /// as tombstones so delayed active updates cannot resurrect a completed run.
     pub(crate) workflow_revisions: HashMap<String, (u64, bool)>,

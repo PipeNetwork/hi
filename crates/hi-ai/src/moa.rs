@@ -11,13 +11,14 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::ProviderCapabilityCandidate;
 use crate::provider::{
     Provider, ProviderError, ProviderErrorKind, ServedModel, provider_error_kind,
     provider_error_usage,
 };
-use crate::types::{
-    ChatRequest, Completion, Content, Message, RequestProfile, Role, StreamEvent, ToolMode, Usage,
-};
+
+mod request_policy;
+use crate::types::{ChatRequest, Completion, Content, Message, Role, StreamEvent, Usage};
 
 pub const MOA_MODEL_CONSERVATIVE: &str = "moa/conservative";
 pub const MOA_PRESET_CONSERVATIVE: &str = "conservative";
@@ -190,6 +191,20 @@ impl MoaProvider {
 
 #[async_trait]
 impl Provider for MoaProvider {
+    fn capabilities(&self) -> crate::ProviderCapabilities {
+        request_policy::capabilities(self.passthrough.as_ref(), self.routes.as_ref())
+    }
+
+    fn capability_candidates(&self, route: &str, model: &str) -> Vec<ProviderCapabilityCandidate> {
+        request_policy::candidates(
+            &self.config,
+            self.passthrough.as_ref(),
+            self.routes.as_ref(),
+            route,
+            model,
+        )
+    }
+
     async fn stream(
         &self,
         request: ChatRequest,
@@ -259,7 +274,20 @@ impl MoaProvider {
             .first()
             .cloned()
             .unwrap_or_else(|| MOA_REFERENCE_CONSERVATIVE.to_string());
-        let reference_request = reference_request(request, preset, reference_model.clone());
+        let (max_tokens, envelope) = request_policy::reference_envelope(
+            self.routes.as_ref(),
+            request,
+            preset,
+            &reference_model,
+        )
+        .await;
+        let reference_request = request_policy::build_reference_request(
+            request,
+            reference_model.clone(),
+            max_tokens,
+            preset.reference_tool_result_budget_chars,
+            envelope,
+        );
         let mut private_sink = |_event: StreamEvent| {};
 
         match self
@@ -299,40 +327,6 @@ fn virtual_moa_model() -> ServedModel {
             MOA_REFERENCE_CONSERVATIVE, MOA_AGGREGATOR_CONSERVATIVE
         )),
         capabilities: vec!["tools".to_string(), "moa".to_string()],
-    }
-}
-
-fn reference_request(
-    request: &ChatRequest,
-    preset: &MoaPreset,
-    reference_model: String,
-) -> ChatRequest {
-    ChatRequest {
-        model: reference_model,
-        request_id: request.request_id.clone(),
-        retry_attempt: request.retry_attempt,
-        user_turn: false,
-        canonical_objective: None,
-        messages: Arc::new(reference_messages(
-            &request.messages,
-            preset.reference_tool_result_budget_chars,
-        )),
-        tools: Arc::from([]),
-        max_tokens: request.max_tokens.min(preset.reference_max_tokens),
-        temperature: request.temperature,
-        top_p: request.top_p,
-        frequency_penalty: request.frequency_penalty,
-        thinking_budget: None,
-        reasoning_effort: None,
-        profile: RequestProfile {
-            compat: request.profile.compat,
-            tool_mode: ToolMode::ChatOnly,
-            stream_usage: request.profile.stream_usage,
-            deepseek_compat: request.profile.deepseek_compat,
-            deepseek_strict: request.profile.deepseek_strict,
-            deepseek_thinking: request.profile.deepseek_thinking,
-            output_token_parameter: request.profile.output_token_parameter,
-        },
     }
 }
 
@@ -481,7 +475,7 @@ fn add_reference_usage(aggregate: &mut Usage, reference: Usage) {
 mod tests {
     use super::*;
     use crate::provider::{ProviderError, ProviderErrorKind};
-    use crate::types::{RateLimitBucket, RateLimitState, ToolSpec};
+    use crate::types::{RateLimitBucket, RateLimitState, RequestProfile, ToolMode, ToolSpec};
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -553,6 +547,7 @@ mod tests {
                 description: "read a file".into(),
                 parameters: json!({"type":"object"}),
             }]),
+            tool_envelope: None,
             max_tokens: 8192,
             temperature: None,
             top_p: None,
@@ -659,6 +654,7 @@ mod tests {
         assert_eq!(requests[0].model, MOA_REFERENCE_CONSERVATIVE);
         assert_eq!(requests[0].profile.tool_mode, ToolMode::ChatOnly);
         assert!(requests[0].tools.is_empty());
+        assert!(requests[0].tool_envelope.is_some());
         assert_eq!(requests[0].max_tokens, 2048);
         assert_eq!(requests[0].thinking_budget, None);
 

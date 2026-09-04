@@ -212,6 +212,14 @@ impl Provider for ConcurrencyLimitedProvider {
         self.inner.capabilities()
     }
 
+    fn capability_candidates(
+        &self,
+        route: &str,
+        model: &str,
+    ) -> Vec<crate::ProviderCapabilityCandidate> {
+        self.inner.capability_candidates(route, model)
+    }
+
     async fn stream(
         &self,
         request: ChatRequest,
@@ -288,6 +296,7 @@ mod tests {
             canonical_objective: None,
             messages: Vec::new().into(),
             tools: Vec::new().into(),
+            tool_envelope: None,
             max_tokens: 16,
             temperature: None,
             top_p: None,

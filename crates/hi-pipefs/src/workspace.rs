@@ -10,11 +10,14 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    ARCHIVE_VERSION, PipeFsCacheScope, PipeFsCapabilities, PipeFsClient, PipeFsError, PipeFsLease,
-    PipeFsRemoteState, RevisionKind, Snapshot, StagedArchiveArtifact, apply_archive_file,
-    build_revision_from_snapshot_to_file_bounded, revision_archive_size_upper_bound,
-    scan_workspace,
+    ARCHIVE_VERSION, CausalCommitReceipt, CausalCommitRequest, CausalOperationReceipt,
+    CausalTranscriptRecord, PipeFsCacheScope, PipeFsCapabilities, PipeFsClient, PipeFsError,
+    PipeFsLease, PipeFsRemoteState, RevisionKind, Snapshot, StagedArchiveArtifact,
+    apply_archive_file, build_revision_from_snapshot_to_file_bounded,
+    revision_archive_size_upper_bound, scan_workspace,
 };
+
+mod recovery_open;
 
 #[derive(Clone, Debug)]
 pub struct PipeFsWorkspaceConfig {
@@ -29,6 +32,9 @@ pub struct PipeFsWorkspaceConfig {
 pub struct Activation {
     pub workspace_root: PathBuf,
     pub state_root: PathBuf,
+    pub writer_protocol: u16,
+    pub causal_commit_available: bool,
+    pub writes_available: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -54,6 +60,12 @@ pub struct PipeFsStatus {
     pub recovery_caches: Vec<PathBuf>,
     pub materialized_logical_bytes: u64,
     pub pending_archive_bytes: u64,
+    pub causal_operation_pending: bool,
+    pub transcript_pending: bool,
+    pub lease_generation: u64,
+    pub manifest_digest: Option<String>,
+    pub remote_sequence: Option<u64>,
+    pub transcript_cursor: Option<u64>,
     pub available_cache_bytes: Option<u64>,
 }
 
@@ -65,6 +77,9 @@ pub struct PipeFsStatus {
 #[derive(Clone, Debug)]
 pub struct PipeFsRecoveryCache {
     pub id: String,
+    /// Content-bound token required for permanent discard. `None` means the
+    /// cache could not be verified and therefore cannot be discarded.
+    pub confirmation_digest: Option<String>,
     pub path: PathBuf,
     pub workspace_root: Option<PathBuf>,
     pub phase: Option<WorkspacePhase>,
@@ -98,7 +113,14 @@ impl std::fmt::Display for PipeFsStatus {
         }
         if let Some(error) = &self.last_error {
             writeln!(formatter, "last persistence error: {error}")?;
-            writeln!(formatter, "action: run /pipefs retry")?;
+            if self.phase == WorkspacePhase::LeaseLost {
+                writeln!(
+                    formatter,
+                    "action: inspect recovery evidence, then reacquire authority"
+                )?;
+            } else {
+                writeln!(formatter, "action: run /pipefs retry")?;
+            }
         }
         if !self.recovery_caches.is_empty() {
             writeln!(
@@ -228,12 +250,22 @@ struct ControllerState {
     remote: Option<PipeFsRemoteStateDisk>,
     snapshot: Option<Snapshot>,
     pending: Option<PendingRevision>,
+    #[serde(default)]
+    pending_causal: Option<PendingCausalOperation>,
+    /// Protocol-1 compatibility publication has committed workspace bytes (or
+    /// proved no byte change) but has not yet durably acknowledged the
+    /// deterministic transcript flush. Keep the archive and recovery marker
+    /// until [`finish_compatibility_checkpoint`](Self::finish_compatibility_checkpoint).
+    #[serde(default)]
+    pending_compatibility: Option<PendingCompatibilityOperation>,
     materialized_root: Option<PathBuf>,
     dirty_paths: BTreeSet<String>,
     #[serde(default)]
     active_background_processes: BTreeSet<String>,
     retry_count: u32,
     last_error: Option<String>,
+    #[serde(default)]
+    transcript_cursor: Option<u64>,
     capabilities: Option<CapabilitiesDisk>,
 }
 
@@ -245,11 +277,14 @@ impl Default for ControllerState {
             remote: None,
             snapshot: None,
             pending: None,
+            pending_causal: None,
+            pending_compatibility: None,
             materialized_root: None,
             dirty_paths: BTreeSet::new(),
             active_background_processes: BTreeSet::new(),
             retry_count: 0,
             last_error: None,
+            transcript_cursor: None,
             capabilities: None,
         }
     }
@@ -320,6 +355,8 @@ struct CapabilitiesDisk {
     writes_available: bool,
     #[serde(default = "default_true")]
     restore_available: bool,
+    #[serde(default)]
+    causal_commit_available: bool,
 }
 
 fn default_true() -> bool {
@@ -334,6 +371,7 @@ impl From<&PipeFsCapabilities> for CapabilitiesDisk {
             maximum_delta_chain: value.maximum_delta_chain,
             writes_available: value.writes_available(),
             restore_available: value.restore_available(),
+            causal_commit_available: value.causal_commit_available(),
         }
     }
 }
@@ -351,11 +389,45 @@ struct PendingRevision {
     snapshot: Snapshot,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PendingCausalOperation {
+    operation: CausalOperationReceipt,
+    transcript_records: Vec<CausalTranscriptRecord>,
+    receipt: Option<CausalCommitReceipt>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PendingCompatibilityOperation {
+    operation: CausalOperationReceipt,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PersistedCausalRecovery {
+    pub operation: CausalOperationReceipt,
+    pub transcript_records: Vec<CausalTranscriptRecord>,
+    pub receipt: Option<CausalCommitReceipt>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PersistedCompatibilityRecovery {
+    pub operation: CausalOperationReceipt,
+    pub remote_commit_landed: bool,
+}
+
 impl PipeFsWorkspace {
     pub fn new(
         client: PipeFsClient,
         lease: PipeFsLease,
         config: PipeFsWorkspaceConfig,
+    ) -> Result<Self> {
+        Self::new_inner(client, lease, config, None)
+    }
+
+    fn new_inner(
+        client: PipeFsClient,
+        lease: PipeFsLease,
+        config: PipeFsWorkspaceConfig,
+        recovery_cache_id: Option<&str>,
     ) -> Result<Self> {
         ensure_supported_platform()?;
         validate_session_id(&config.session_id)?;
@@ -379,38 +451,44 @@ impl PipeFsWorkspace {
         let session_digest = blake3::hash(config.session_id.as_bytes())
             .to_hex()
             .to_string();
-        let generation_digest = blake3::hash(
-            format!(
-                "{}\0{}\0{}",
-                config.cache_scope.as_str(),
-                config.session_id,
-                lease.generation
-            )
-            .as_bytes(),
-        )
-        .to_hex()
-        .to_string();
         let session_cache_root = authority_cache_root.join(&session_digest[..32]);
         create_private_dir(&session_cache_root)?;
         let mode_hint_file = session_cache_root.join("remote-mode");
-        let generation_cache_root = session_cache_root.join(&generation_digest[..32]);
-        let generation_needs_recovery = mark_cache_for_recovery_if_drifted(
-            &generation_cache_root,
-            &generation_cache_root.join("recovery-required"),
-            &config.cache_scope,
-        )?;
-        // A crashed process can reacquire the same lease generation (for
-        // example a PID-1 container restart). Never reuse and overwrite a
-        // marked generation directory: activate from a fresh sibling so the
-        // existing bytes are discovered by the normal recovery path.
-        let cache_root = if generation_needs_recovery {
-            session_cache_root.join(format!(
-                "{}-resume-{}",
-                &generation_digest[..32],
-                Uuid::new_v4().simple()
-            ))
+        let cache_root = if let Some(cache_id) = recovery_cache_id {
+            recovery_open::validated_cache_root(&session_cache_root, cache_id, &config.cache_scope)?
         } else {
-            generation_cache_root
+            let generation_digest = blake3::hash(
+                format!(
+                    "{}\0{}\0{}",
+                    config.cache_scope.as_str(),
+                    config.session_id,
+                    lease.generation
+                )
+                .as_bytes(),
+            )
+            .to_hex()
+            .to_string();
+            let generation_cache_root = session_cache_root.join(&generation_digest[..32]);
+            let generation_needs_recovery = mark_cache_for_recovery_if_drifted(
+                &generation_cache_root,
+                &generation_cache_root.join("recovery-required"),
+                &config.cache_scope,
+            )?;
+            let resumable_operation = generation_needs_recovery
+                && cache_has_pending_operation(&generation_cache_root, &config.cache_scope)?;
+            // A crashed process can reacquire the same lease generation (for
+            // example a PID-1 container restart). Never reuse and overwrite a
+            // marked generation directory: activate from a fresh sibling so
+            // the existing bytes are discovered by the normal recovery path.
+            if generation_needs_recovery && !resumable_operation {
+                session_cache_root.join(format!(
+                    "{}-resume-{}",
+                    &generation_digest[..32],
+                    Uuid::new_v4().simple()
+                ))
+            } else {
+                generation_cache_root
+            }
         };
         create_private_dir(&cache_root)?;
         let runtime_state_root = cache_root.join("runtime-state");
@@ -454,9 +532,10 @@ impl PipeFsWorkspace {
 
     /// Refresh the shared HI writer lease used by subsequent control-plane
     /// operations. A lease generation can advance when the same client
-    /// reacquires an expired lease. Any archive staged under the previous
-    /// generation is no longer committable, so discard only that derived
-    /// archive and reconcile the still-materialized workspace again.
+    /// reacquires an expired lease. A pending commit may have reached the
+    /// server even when its acknowledgement did not reach this process, so a
+    /// fresh remote head must prove whether it landed before its recovery
+    /// archive is discarded.
     pub async fn update_lease(&self, lease: PipeFsLease) -> Result<()> {
         ensure!(
             lease.generation > 0,
@@ -470,18 +549,148 @@ impl PipeFsWorkspace {
             current.generation,
             lease.generation
         );
-        if lease.generation == current.generation {
-            *current = lease;
-            return Ok(());
-        }
         ensure!(
             state.phase != WorkspacePhase::LeaseLost,
             "PipeFS writer lease was already declared lost; reactivate the session before mutating"
         );
+        if lease.generation == current.generation {
+            *current = lease;
+            return Ok(());
+        }
+        if let Some(causal) = &state.pending_causal {
+            hi_workspace::hit_harness_failpoint(
+                hi_workspace::HarnessFailpoint::LeaseGenerationChanged,
+            )
+            .map_err(anyhow::Error::from)?;
+            let remote = self.inner.client.state(&self.inner.session_id).await?;
+            let consistent = if let Some(receipt) = &causal.receipt {
+                remote.current_head == receipt.head
+                    && remote.manifest_digest == receipt.manifest_digest
+            } else if let Some(pending) = &state.pending {
+                pending_matches_remote_head(pending, &remote)
+                    || (remote.enabled && remote.current_head == pending.expected_base_revision_id)
+            } else {
+                remote.enabled
+                    && remote.current_head
+                        == state.remote.as_ref().and_then(|stored| stored.current_head)
+            };
+            if !consistent {
+                state.remote = Some((&remote).into());
+                state.last_error = Some(
+                    "causal operation conflicts with the head observed after lease renewal".into(),
+                );
+                self.persist_locked(&state)?;
+                *current = lease;
+                bail!(
+                    "recovery_conflict: causal PipeFS evidence was preserved because the remote head changed"
+                );
+            }
+            state.remote = Some((&remote).into());
+            state.last_error =
+                Some("causal operation remains pending after lease generation advanced".into());
+            self.persist_locked(&state)?;
+            *current = lease;
+            return Ok(());
+        }
+        if state.pending_compatibility.is_some() {
+            hi_workspace::hit_harness_failpoint(
+                hi_workspace::HarnessFailpoint::LeaseGenerationChanged,
+            )
+            .map_err(anyhow::Error::from)?;
+            let remote = self.inner.client.state(&self.inner.session_id).await?;
+            let consistent = state.pending.as_ref().map_or_else(
+                || {
+                    remote.current_head
+                        == state.remote.as_ref().and_then(|stored| stored.current_head)
+                },
+                |pending| {
+                    pending_matches_remote_head(pending, &remote)
+                        || (remote.enabled
+                            && remote.current_head == pending.expected_base_revision_id)
+                },
+            );
+            state.remote = Some((&remote).into());
+            state.last_error = Some(if consistent {
+                "compatibility transcript acknowledgement remains pending after lease renewal"
+                    .into()
+            } else {
+                "compatibility recovery conflicts with the head observed after lease renewal".into()
+            });
+            write_private(
+                &self.inner.recovery_marker,
+                b"compatibility operation requires transcript acknowledgement proof\n",
+            )?;
+            self.persist_locked(&state)?;
+            *current = lease;
+            ensure!(
+                consistent,
+                "recovery_conflict: compatibility PipeFS evidence was preserved because the remote head changed"
+            );
+            return Ok(());
+        }
         if state.phase == WorkspacePhase::Pending {
+            let pending = state
+                .pending
+                .clone()
+                .ok_or_else(|| anyhow!("PipeFS pending phase has no staged revision"))?;
+            let remote = match self.inner.client.state(&self.inner.session_id).await {
+                Ok(remote) => remote,
+                Err(error) => {
+                    state.last_error = Some(format!(
+                        "could not reconcile the pending revision after lease generation advanced: {error}"
+                    ));
+                    write_private(
+                        &self.inner.recovery_marker,
+                        b"pending revision requires remote acknowledgement proof\n",
+                    )?;
+                    self.persist_locked(&state)?;
+                    // Retain the newly-issued token for an explicit retry, but
+                    // leave Pending admission-closed and preserve its archive.
+                    *current = lease;
+                    return Err(error.into());
+                }
+            };
+
+            let landed = pending_matches_remote_head(&pending, &remote);
+            let still_at_expected_base =
+                remote.enabled && remote.current_head == pending.expected_base_revision_id;
+            if !landed && !still_at_expected_base {
+                state.remote = Some((&remote).into());
+                state.last_error = Some(format!(
+                    "pending revision cannot be restaged after lease generation advanced: remote head is {}, expected base was {}",
+                    remote
+                        .current_head
+                        .map_or_else(|| "empty".to_string(), |id| id.to_string()),
+                    pending
+                        .expected_base_revision_id
+                        .map_or_else(|| "empty".to_string(), |id| id.to_string()),
+                ));
+                write_private(
+                    &self.inner.recovery_marker,
+                    b"pending revision conflicts with the current remote head\n",
+                )?;
+                self.persist_locked(&state)?;
+                *current = lease;
+                bail!(
+                    "recovery_conflict: pending PipeFS revision was preserved because the remote head changed"
+                );
+            }
+
+            // Either the pending bytes are now the acknowledged remote head,
+            // or a fresh read proved the remote is still at their expected
+            // base. In both cases the materialized tree is the recovery source
+            // for a new-generation checkpoint. Conservatively keep it Dirty:
+            // the next full scan will prove whether another commit is needed.
+            if landed {
+                state.snapshot = Some(pending.snapshot);
+            }
+            state.remote = Some((&remote).into());
             state.pending = None;
             state.phase = WorkspacePhase::Dirty;
             state.last_error = None;
+            state
+                .dirty_paths
+                .insert("<lease generation advanced>".to_string());
             write_private(
                 &self.inner.recovery_marker,
                 b"uncommitted workspace changes\n",
@@ -550,6 +759,15 @@ impl PipeFsWorkspace {
         mut remote: PipeFsRemoteState,
     ) -> Result<Activation> {
         self.record_mode_hint(true)?;
+        if let Some(activation) = self.resume_pending_causal(&capabilities, &remote).await? {
+            return Ok(activation);
+        }
+        if let Some(activation) = self
+            .resume_pending_compatibility(&capabilities, &remote)
+            .await?
+        {
+            return Ok(activation);
+        }
         self.cleanup_stale_clean_caches(&remote);
         ensure_cache_capacity(
             &self.inner.cache_root,
@@ -591,6 +809,8 @@ impl PipeFsWorkspace {
                 state.phase = WorkspacePhase::Disabled;
                 state.snapshot = None;
                 state.pending = None;
+                state.pending_causal = None;
+                state.pending_compatibility = None;
                 state.materialized_root = None;
                 state.dirty_paths.clear();
                 state.last_error = Some(format!("recovery failed: {error:#}"));
@@ -614,6 +834,8 @@ impl PipeFsWorkspace {
             let old = state.materialized_root.replace(materialized_path.clone());
             state.snapshot = Some(snapshot);
             state.pending = None;
+            state.pending_causal = None;
+            state.pending_compatibility = None;
             state.phase = WorkspacePhase::Clean;
             state.remote = Some((&remote).into());
             state.dirty_paths.clear();
@@ -644,7 +866,155 @@ impl PipeFsWorkspace {
         Ok(Activation {
             workspace_root: materialized_path,
             state_root: self.inner.runtime_state_root.clone(),
+            writer_protocol: if capabilities.supports_writer_protocol(crate::CAUSAL_WRITER_PROTOCOL)
+            {
+                crate::CAUSAL_WRITER_PROTOCOL
+            } else {
+                1
+            },
+            causal_commit_available: capabilities.causal_commit_available(),
+            writes_available: capabilities.writes_available(),
         })
+    }
+
+    async fn resume_pending_causal(
+        &self,
+        capabilities: &PipeFsCapabilities,
+        remote: &PipeFsRemoteState,
+    ) -> Result<Option<Activation>> {
+        let mut state = self.inner.state.lock().await;
+        let Some(causal) = state.pending_causal.as_ref() else {
+            return Ok(None);
+        };
+        let receipt = causal.receipt.clone();
+        let causal_available = capabilities.supports_writer_protocol(crate::CAUSAL_WRITER_PROTOCOL)
+            && capabilities.causal_commit_available();
+        let workspace_root = state
+            .materialized_root
+            .clone()
+            .ok_or_else(|| anyhow!("recovery_required: pending causal state has no workspace"))?;
+        ensure!(
+            workspace_root.starts_with(&self.inner.cache_root)
+                && workspace_root != self.inner.cache_root,
+            "recovery_required: pending causal workspace points outside its cache"
+        );
+        let metadata = fs::symlink_metadata(&workspace_root)
+            .context("reading the pending causal workspace")?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "recovery_required: pending causal workspace is not a real directory"
+        );
+        let remote_matches = receipt.as_ref().map_or_else(
+            || {
+                state.pending.as_ref().map_or_else(
+                    || {
+                        remote.current_head
+                            == state.remote.as_ref().and_then(|saved| saved.current_head)
+                    },
+                    |pending| {
+                        remote.current_head == pending.expected_base_revision_id
+                            || pending_matches_remote_head(pending, remote)
+                    },
+                )
+            },
+            |receipt| {
+                remote.current_head == receipt.head
+                    && remote.manifest_digest == receipt.manifest_digest
+            },
+        );
+        state.capabilities = Some(capabilities.into());
+        state.remote = Some(remote.into());
+        state.phase = WorkspacePhase::Pending;
+        state.last_error = Some(if !causal_available {
+            "pending causal recovery is incompatible with current server capabilities".into()
+        } else if receipt.is_some() && remote_matches {
+            "remote commit landed; transcript acknowledgement pending".into()
+        } else if remote_matches {
+            "causal operation requires idempotent remote reconciliation".into()
+        } else {
+            "causal operation conflicts with the current remote head".into()
+        });
+        write_private(
+            &self.inner.recovery_marker,
+            b"causal workspace operation requires recovery\n",
+        )?;
+        self.persist_locked(&state)?;
+        ensure!(
+            remote_matches,
+            "recovery_conflict: pending causal operation does not match the authoritative remote head; evidence retained"
+        );
+        Ok(Some(Activation {
+            workspace_root,
+            state_root: self.inner.runtime_state_root.clone(),
+            writer_protocol: if causal_available {
+                crate::CAUSAL_WRITER_PROTOCOL
+            } else {
+                1
+            },
+            causal_commit_available: causal_available,
+            writes_available: capabilities.writes_available(),
+        }))
+    }
+
+    async fn resume_pending_compatibility(
+        &self,
+        capabilities: &PipeFsCapabilities,
+        remote: &PipeFsRemoteState,
+    ) -> Result<Option<Activation>> {
+        let mut state = self.inner.state.lock().await;
+        if state.pending_compatibility.is_none() {
+            return Ok(None);
+        }
+        let workspace_root = state.materialized_root.clone().ok_or_else(|| {
+            anyhow!("recovery_required: pending compatibility state has no workspace")
+        })?;
+        ensure!(
+            workspace_root.starts_with(&self.inner.cache_root)
+                && workspace_root != self.inner.cache_root,
+            "recovery_required: pending compatibility workspace points outside its cache"
+        );
+        let metadata = fs::symlink_metadata(&workspace_root)
+            .context("reading the pending compatibility workspace")?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "recovery_required: pending compatibility workspace is not a real directory"
+        );
+        let remote_matches = state.pending.as_ref().map_or_else(
+            || remote.current_head == state.remote.as_ref().and_then(|saved| saved.current_head),
+            |pending| {
+                remote.current_head == pending.expected_base_revision_id
+                    || pending_matches_remote_head(pending, remote)
+            },
+        );
+        state.capabilities = Some(capabilities.into());
+        state.remote = Some(remote.into());
+        state.phase = WorkspacePhase::Pending;
+        state.last_error = Some(if !capabilities.writes_available() {
+            "pending compatibility recovery is read-only under current server capabilities".into()
+        } else if remote_matches {
+            "compatibility operation requires transcript acknowledgement".into()
+        } else {
+            "compatibility operation conflicts with the current remote head".into()
+        });
+        write_private(
+            &self.inner.recovery_marker,
+            b"compatibility workspace operation requires recovery\n",
+        )?;
+        self.persist_locked(&state)?;
+        ensure!(
+            remote_matches,
+            "recovery_conflict: pending compatibility operation does not match the authoritative remote head; evidence retained"
+        );
+        Ok(Some(Activation {
+            workspace_root,
+            state_root: self.inner.runtime_state_root.clone(),
+            // Finish the operation with the same fallback protocol that
+            // created its recovery evidence. A subsequent clean activation
+            // may negotiate causal protocol 2.
+            writer_protocol: 1,
+            causal_commit_available: false,
+            writes_available: capabilities.writes_available(),
+        }))
     }
 
     async fn recover_local_cache(
@@ -684,6 +1054,11 @@ impl PipeFsWorkspace {
                 .with_context(|| format!("reading recovery state from {}", candidate.display()))?,
         )
         .with_context(|| format!("parsing recovery state from {}", candidate.display()))?;
+        ensure!(
+            old_state.pending_causal.is_none() && old_state.pending_compatibility.is_none(),
+            "recovery_required: a PipeFS operation or transcript acknowledgement is pending in {}; the cache was preserved for controller recovery",
+            candidate.display()
+        );
         validate_controller_cache_scope(&old_state, &self.inner.cache_scope).with_context(
             || {
                 format!(
@@ -892,7 +1267,7 @@ impl PipeFsWorkspace {
             self.persist_locked(&state)?;
             self.stage_pending_locked(&mut state, artifact, generation)?;
             recovered_staging.disarm();
-            self.retry_locked(&mut state).await
+            self.retry_locked(&mut state, false).await
         };
         let committed_remote = match commit_result {
             Ok((_, committed_remote)) => committed_remote,
@@ -901,6 +1276,8 @@ impl PipeFsWorkspace {
                 state.phase = WorkspacePhase::Disabled;
                 state.snapshot = None;
                 state.pending = None;
+                state.pending_causal = None;
+                state.pending_compatibility = None;
                 state.materialized_root = None;
                 state.dirty_paths.clear();
                 state.last_error = Some(format!("local recovery failed: {error:#}"));
@@ -1056,6 +1433,36 @@ impl PipeFsWorkspace {
         self.persist_locked(&state)
     }
 
+    pub async fn acknowledge_operation_intent(
+        &self,
+        operation: &hi_workspace::MutationPermitRecord,
+    ) -> Result<()> {
+        let state = self.inner.state.lock().await;
+        ensure!(
+            state
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.causal_commit_available),
+            "PipeFS operation intents require causal commit negotiation"
+        );
+        let expected_head = state.remote.as_ref().and_then(|remote| remote.current_head);
+        drop(state);
+        let lease = self.inner.lease.lock().await.clone();
+        self.inner
+            .client
+            .acknowledge_operation_intent(
+                &self.inner.session_id,
+                &lease,
+                &crate::CausalIntentRequest::for_operation(
+                    expected_head,
+                    lease.generation,
+                    operation,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn mutation_allowed(&self) -> Result<()> {
         let state = self.inner.state.lock().await;
         match state.phase {
@@ -1082,11 +1489,39 @@ impl PipeFsWorkspace {
             state.phase,
             WorkspacePhase::Clean | WorkspacePhase::Dirty | WorkspacePhase::Pending
         ) {
+            let recovery_required =
+                matches!(state.phase, WorkspacePhase::Dirty | WorkspacePhase::Pending)
+                    || state.pending.is_some()
+                    || !state.dirty_paths.is_empty()
+                    || !state.active_background_processes.is_empty();
+            if recovery_required {
+                write_private(
+                    &self.inner.recovery_marker,
+                    b"writer lease lost with workspace recovery state\n",
+                )?;
+            }
             state.phase = WorkspacePhase::LeaseLost;
             state.last_error = Some(detail.into());
             self.persist_locked(&state)?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn lease_loss_recovery_required(&self) -> bool {
+        let state = self.inner.state.lock().await.clone();
+        if !state.dirty_paths.is_empty()
+            || state.pending.is_some()
+            || state.pending_causal.is_some()
+            || state.pending_compatibility.is_some()
+            || !state.active_background_processes.is_empty()
+            || fs::symlink_metadata(&self.inner.recovery_marker).is_ok()
+        {
+            return true;
+        }
+        let cache_root = self.inner.cache_root.clone();
+        tokio::task::spawn_blocking(move || !materialized_snapshot_matches(&cache_root, &state))
+            .await
+            .unwrap_or(true)
     }
 
     /// Keep the recovery marker present for the entire lifetime of a native
@@ -1113,12 +1548,122 @@ impl PipeFsWorkspace {
 
     pub async fn checkpoint(&self) -> Result<Option<Uuid>> {
         let mut state = self.inner.state.lock().await;
+        ensure!(
+            state.pending_causal.is_none(),
+            "a causal PipeFS operation is awaiting transcript acknowledgement"
+        );
+        ensure!(
+            state.pending_compatibility.is_none(),
+            "a compatibility PipeFS operation is awaiting transcript acknowledgement"
+        );
         if state.phase == WorkspacePhase::Pending {
             return self
-                .retry_locked(&mut state)
+                .retry_locked(&mut state, false)
                 .await
                 .map(|(head, _)| Some(head));
         }
+        if !self.stage_checkpoint_locked(&mut state).await? {
+            return Ok(state.remote.as_ref().and_then(|remote| remote.current_head));
+        }
+        self.retry_locked(&mut state, false)
+            .await
+            .map(|(head, _)| Some(head))
+    }
+
+    /// Publish workspace bytes for the legacy CAS + transcript-flush
+    /// compatibility protocol without releasing the local archive or recovery
+    /// marker. The controller must follow with
+    /// [`finish_compatibility_checkpoint`](Self::finish_compatibility_checkpoint)
+    /// only after `flush_through` has returned an acknowledged cursor.
+    pub async fn checkpoint_for_compatibility_transcript(
+        &self,
+        operation: CausalOperationReceipt,
+    ) -> Result<Option<Uuid>> {
+        let mut state = self.inner.state.lock().await;
+        ensure!(
+            state.pending_causal.is_none(),
+            "a causal PipeFS operation is awaiting transcript acknowledgement"
+        );
+        if let Some(pending_operation) = &state.pending_compatibility {
+            ensure!(
+                pending_operation.operation == operation,
+                "compatibility PipeFS retry does not match the persisted operation"
+            );
+            if state.phase == WorkspacePhase::Pending {
+                if let Some(pending) = &state.pending
+                    && state.remote.as_ref().is_some_and(|remote| {
+                        remote.current_head.is_some()
+                            && remote.manifest_digest.as_deref()
+                                == Some(pending.manifest_digest.as_str())
+                            && remote.logical_size_bytes == pending.logical_size_bytes
+                    })
+                {
+                    return Ok(state.remote.as_ref().and_then(|remote| remote.current_head));
+                }
+                if state.pending.is_none() {
+                    return Ok(state.remote.as_ref().and_then(|remote| remote.current_head));
+                }
+            }
+        } else {
+            state.pending_compatibility = Some(PendingCompatibilityOperation { operation });
+            write_private(
+                &self.inner.recovery_marker,
+                b"compatibility workspace operation requires acknowledgement\n",
+            )?;
+            self.persist_locked(&state)?;
+        }
+        if state.phase == WorkspacePhase::Pending {
+            return self
+                .retry_locked(&mut state, true)
+                .await
+                .map(|(head, _)| Some(head));
+        }
+        if !self.stage_checkpoint_locked(&mut state).await? {
+            state.phase = WorkspacePhase::Pending;
+            state.last_error =
+                Some("workspace unchanged; transcript acknowledgement pending".into());
+            write_private(
+                &self.inner.recovery_marker,
+                b"compatibility operation requires transcript acknowledgement\n",
+            )?;
+            self.persist_locked(&state)?;
+            return Ok(state.remote.as_ref().and_then(|remote| remote.current_head));
+        }
+        self.retry_locked(&mut state, true)
+            .await
+            .map(|(head, _)| Some(head))
+    }
+
+    /// Complete the compatibility publication only after the transcript
+    /// outbox has durably accepted the server cursor.
+    pub async fn finish_compatibility_checkpoint(
+        &self,
+        operation_id: &str,
+        transcript_cursor: u64,
+    ) -> Result<()> {
+        let mut state = self.inner.state.lock().await;
+        let pending = state.pending_compatibility.as_ref().ok_or_else(|| {
+            anyhow!("PipeFS has no compatibility operation awaiting transcript acknowledgement")
+        })?;
+        ensure!(
+            pending.operation.operation_id == operation_id,
+            "compatibility transcript acknowledgement does not match the pending operation"
+        );
+        state.pending = None;
+        state.pending_compatibility = None;
+        state.transcript_cursor = Some(transcript_cursor);
+        state.phase = WorkspacePhase::Clean;
+        state.dirty_paths.clear();
+        state.last_error = None;
+        self.persist_locked(&state)?;
+        let _ = fs::remove_file(&self.inner.pending_archive);
+        self.clear_recovery_marker_if_safe(&state);
+        Ok(())
+    }
+
+    /// Scan and durably stage current bytes, without publishing a head.
+    /// Returns false when the materialized tree already matches the snapshot.
+    async fn stage_checkpoint_locked(&self, state: &mut ControllerState) -> Result<bool> {
         ensure!(
             state.phase == WorkspacePhase::Dirty || state.phase == WorkspacePhase::Clean,
             "PipeFS workspace is not checkpointable"
@@ -1137,12 +1682,12 @@ impl PipeFsWorkspace {
             match tokio::task::spawn_blocking(move || scan_workspace(&root_for_scan)).await {
                 Ok(Ok(current)) => current,
                 Ok(Err(error)) => {
-                    self.record_checkpoint_failure_locked(&mut state, &error)?;
+                    self.record_checkpoint_failure_locked(state, &error)?;
                     return Err(error);
                 }
                 Err(join_error) => {
                     let error = anyhow!("PipeFS scan task panicked: {join_error}");
-                    self.record_checkpoint_failure_locked(&mut state, &error)?;
+                    self.record_checkpoint_failure_locked(state, &error)?;
                     return Err(error);
                 }
             };
@@ -1154,12 +1699,12 @@ impl PipeFsWorkspace {
             state.phase = WorkspacePhase::Clean;
             state.dirty_paths.clear();
             state.last_error = None;
-            self.persist_locked(&state)?;
-            self.clear_recovery_marker_if_safe(&state);
-            return Ok(state.remote.as_ref().and_then(|remote| remote.current_head));
+            self.persist_locked(state)?;
+            self.clear_recovery_marker_if_safe(state);
+            return Ok(false);
         }
 
-        let force_full = must_write_full(&state);
+        let force_full = must_write_full(state);
         let capabilities = state
             .capabilities
             .clone()
@@ -1172,7 +1717,7 @@ impl PipeFsWorkspace {
             &capabilities,
             "staging a workspace revision",
         ) {
-            self.record_checkpoint_failure_locked(&mut state, &error)?;
+            self.record_checkpoint_failure_locked(state, &error)?;
             return Err(error);
         }
         let root_for_build = root;
@@ -1195,18 +1740,18 @@ impl PipeFsWorkspace {
             Ok(Ok(artifact)) => artifact,
             Ok(Err(error)) => {
                 let _ = fs::remove_file(&build_path);
-                self.record_checkpoint_failure_locked(&mut state, &error)?;
+                self.record_checkpoint_failure_locked(state, &error)?;
                 return Err(error);
             }
             Err(join_error) => {
                 let _ = fs::remove_file(&build_path);
                 let error = anyhow!("PipeFS archive task panicked: {join_error}");
-                self.record_checkpoint_failure_locked(&mut state, &error)?;
+                self.record_checkpoint_failure_locked(state, &error)?;
                 return Err(error);
             }
         };
         if artifact.manifest.revision_type == RevisionKind::Delta
-            && cumulative_delta_would_exceed_full(&state, artifact.size_bytes)
+            && cumulative_delta_would_exceed_full(state, artifact.size_bytes)
         {
             let current = artifact.snapshot.clone();
             let _ = fs::remove_file(&artifact.path);
@@ -1221,7 +1766,7 @@ impl PipeFsWorkspace {
                 &capabilities,
                 "staging a full workspace compaction",
             ) {
-                self.record_checkpoint_failure_locked(&mut state, &error)?;
+                self.record_checkpoint_failure_locked(state, &error)?;
                 return Err(error);
             }
             let maximum_revision_bytes = capabilities.maximum_revision_bytes;
@@ -1240,25 +1785,235 @@ impl PipeFsWorkspace {
                 Ok(Ok(artifact)) => artifact,
                 Ok(Err(error)) => {
                     let _ = fs::remove_file(&build_path);
-                    self.record_checkpoint_failure_locked(&mut state, &error)?;
+                    self.record_checkpoint_failure_locked(state, &error)?;
                     return Err(error);
                 }
                 Err(join_error) => {
                     let _ = fs::remove_file(&build_path);
                     let error = anyhow!("PipeFS compaction archive task panicked: {join_error}");
-                    self.record_checkpoint_failure_locked(&mut state, &error)?;
+                    self.record_checkpoint_failure_locked(state, &error)?;
                     return Err(error);
                 }
             };
         }
         let lease_generation = self.inner.lease.lock().await.generation;
-        if let Err(error) = self.stage_pending_locked(&mut state, artifact, lease_generation) {
-            self.record_checkpoint_failure_locked(&mut state, &error)?;
+        if let Err(error) = self.stage_pending_locked(state, artifact, lease_generation) {
+            self.record_checkpoint_failure_locked(state, &error)?;
             return Err(error);
         }
-        self.retry_locked(&mut state)
+        hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::ArchiveAfterFsync)
+            .map_err(anyhow::Error::from)?;
+        Ok(true)
+    }
+
+    /// Atomically publish the staged workspace revision, operation receipt,
+    /// and supplied transcript records through writer protocol 2. The pending
+    /// archive and recovery marker remain until the caller durably removes the
+    /// same records from its local transcript outbox and calls
+    /// [`finish_causal_checkpoint`](Self::finish_causal_checkpoint).
+    pub async fn causal_checkpoint(
+        &self,
+        operation: CausalOperationReceipt,
+        transcript_records: Vec<CausalTranscriptRecord>,
+    ) -> Result<CausalCommitReceipt> {
+        let mut state = self.inner.state.lock().await;
+        ensure!(
+            state.pending_compatibility.is_none(),
+            "a compatibility PipeFS operation is awaiting transcript acknowledgement"
+        );
+        ensure!(
+            state
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.causal_commit_available),
+            "PipeFS causal commit was not negotiated"
+        );
+        if let Some(pending) = &state.pending_causal {
+            ensure!(
+                pending.operation == operation && pending.transcript_records == transcript_records,
+                "causal PipeFS retry does not match the persisted operation and transcript batch"
+            );
+            if let Some(receipt) = &pending.receipt {
+                return Ok(receipt.clone());
+            }
+        } else {
+            if state.phase != WorkspacePhase::Pending {
+                let _ = self.stage_checkpoint_locked(&mut state).await?;
+            }
+            state.pending_causal = Some(PendingCausalOperation {
+                operation,
+                transcript_records,
+                receipt: None,
+            });
+            state.phase = WorkspacePhase::Pending;
+            write_private(
+                &self.inner.recovery_marker,
+                b"causal workspace operation requires acknowledgement\n",
+            )?;
+            self.persist_locked(&state)?;
+        }
+        self.retry_causal_locked(&mut state).await
+    }
+
+    async fn retry_causal_locked(
+        &self,
+        state: &mut ControllerState,
+    ) -> Result<CausalCommitReceipt> {
+        let causal = state
+            .pending_causal
+            .clone()
+            .ok_or_else(|| anyhow!("PipeFS has no causal operation to retry"))?;
+        if let Some(receipt) = causal.receipt {
+            return Ok(receipt);
+        }
+        let lease = self.inner.lease.lock().await.clone();
+        let uploaded = if let Some(pending) = &state.pending {
+            let archive_path = self.inner.pending_archive.clone();
+            let expected_size = pending.archive_size_bytes;
+            let expected_hash = pending.archive_blake3.clone();
+            let archive_size = tokio::task::spawn_blocking(move || {
+                verify_staged_archive(&archive_path, expected_size, &expected_hash)
+            })
             .await
-            .map(|(head, _)| Some(head))
+            .context("PipeFS staged archive verification task panicked")??;
+            Some(
+                self.inner
+                    .client
+                    .upload_archive_file(
+                        &self.inner.session_id,
+                        &lease,
+                        pending.expected_base_revision_id,
+                        pending.revision_type,
+                        &self.inner.pending_archive,
+                        archive_size,
+                        &pending.archive_blake3,
+                        &pending.manifest_digest,
+                        pending.logical_size_bytes,
+                        &pending.idempotency_key,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)?,
+            )
+        } else {
+            None
+        };
+        let expected_head = state.pending.as_ref().map_or_else(
+            || state.remote.as_ref().and_then(|remote| remote.current_head),
+            |pending| pending.expected_base_revision_id,
+        );
+        let request = CausalCommitRequest {
+            expected_head,
+            lease_generation: lease.generation,
+            uploaded_revision: uploaded.as_ref().map(|revision| revision.revision_id),
+            uploaded_artifact: uploaded.as_ref().map(|revision| revision.artifact.clone()),
+            operation: causal.operation,
+            transcript_records: causal.transcript_records,
+        };
+        let receipt = match self
+            .inner
+            .client
+            .causal_commit(&self.inner.session_id, &lease, &request)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.record_causal_failure_locked(state, &error)?;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) =
+            receipt.validate_for_request(&request, state.transcript_cursor.unwrap_or_default())
+        {
+            self.record_causal_failure_locked(state, &error)?;
+            return Err(error.into());
+        }
+        hi_workspace::hit_harness_failpoint(
+            hi_workspace::HarnessFailpoint::CommitAfterServerBeforeAck,
+        )
+        .map_err(anyhow::Error::from)?;
+        let remote = match self.inner.client.state(&self.inner.session_id).await {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.record_causal_failure_locked(state, &error)?;
+                return Err(error.into());
+            }
+        };
+        ensure!(
+            remote.current_head == receipt.head
+                && remote.manifest_digest == receipt.manifest_digest,
+            "causal commit receipt does not match the authoritative remote head"
+        );
+        if let Some(pending) = &state.pending {
+            ensure!(
+                receipt.head == uploaded.as_ref().map(|revision| revision.revision_id)
+                    && receipt.manifest_digest.as_deref() == Some(&pending.manifest_digest),
+                "causal commit did not publish the staged PipeFS revision"
+            );
+            state.snapshot = Some(pending.snapshot.clone());
+        }
+        state.remote = Some((&remote).into());
+        state
+            .pending_causal
+            .as_mut()
+            .expect("causal operation was persisted above")
+            .receipt = Some(receipt.clone());
+        state.phase = WorkspacePhase::Pending;
+        state.last_error = Some("remote commit landed; transcript acknowledgement pending".into());
+        self.persist_locked(state)?;
+        Ok(receipt)
+    }
+
+    fn record_causal_failure_locked(
+        &self,
+        state: &mut ControllerState,
+        error: &PipeFsError,
+    ) -> Result<()> {
+        state.phase = if matches!(error, PipeFsError::LeaseLost(_)) {
+            WorkspacePhase::LeaseLost
+        } else {
+            WorkspacePhase::Pending
+        };
+        state.retry_count = state.retry_count.saturating_add(1);
+        state.last_error = Some(error.to_string());
+        write_private(
+            &self.inner.recovery_marker,
+            b"causal workspace operation requires recovery\n",
+        )?;
+        self.persist_locked(state)
+    }
+
+    /// Release recovery evidence only after the local transcript outbox has
+    /// durably accepted the server cursor returned by the causal commit.
+    pub async fn finish_causal_checkpoint(
+        &self,
+        operation_id: &str,
+        transcript_cursor: u64,
+    ) -> Result<()> {
+        let mut state = self.inner.state.lock().await;
+        let pending = state
+            .pending_causal
+            .as_ref()
+            .ok_or_else(|| anyhow!("PipeFS has no causal operation awaiting acknowledgement"))?;
+        let receipt = pending
+            .receipt
+            .as_ref()
+            .ok_or_else(|| anyhow!("PipeFS causal operation has no remote receipt"))?;
+        ensure!(
+            pending.operation.operation_id == operation_id
+                && receipt.operation_id == operation_id
+                && receipt.transcript_cursor == transcript_cursor,
+            "causal transcript acknowledgement does not match the pending operation"
+        );
+        state.pending = None;
+        state.pending_causal = None;
+        state.transcript_cursor = Some(transcript_cursor);
+        state.phase = WorkspacePhase::Clean;
+        state.dirty_paths.clear();
+        state.last_error = None;
+        self.persist_locked(&state)?;
+        let _ = fs::remove_file(&self.inner.pending_archive);
+        self.clear_recovery_marker_if_safe(&state);
+        Ok(())
     }
 
     fn record_checkpoint_failure_locked(
@@ -1334,7 +2089,11 @@ impl PipeFsWorkspace {
         result
     }
 
-    async fn retry_locked(&self, state: &mut ControllerState) -> Result<(Uuid, PipeFsRemoteState)> {
+    async fn retry_locked(
+        &self,
+        state: &mut ControllerState,
+        retain_for_transcript: bool,
+    ) -> Result<(Uuid, PipeFsRemoteState)> {
         let pending = state
             .pending
             .clone()
@@ -1393,13 +2152,26 @@ impl PipeFsWorkspace {
                 );
                 state.remote = Some((&remote).into());
                 state.snapshot = Some(pending.snapshot);
-                state.pending = None;
-                state.phase = WorkspacePhase::Clean;
+                if retain_for_transcript {
+                    state.phase = WorkspacePhase::Pending;
+                    state.last_error =
+                        Some("remote commit landed; transcript acknowledgement pending".into());
+                    write_private(
+                        &self.inner.recovery_marker,
+                        b"compatibility workspace commit requires transcript acknowledgement\n",
+                    )?;
+                } else {
+                    state.pending = None;
+                    state.pending_compatibility = None;
+                    state.phase = WorkspacePhase::Clean;
+                    state.last_error = None;
+                }
                 state.dirty_paths.clear();
-                state.last_error = None;
                 self.persist_locked(state)?;
-                let _ = fs::remove_file(&self.inner.pending_archive);
-                self.clear_recovery_marker_if_safe(state);
+                if !retain_for_transcript {
+                    let _ = fs::remove_file(&self.inner.pending_archive);
+                    self.clear_recovery_marker_if_safe(state);
+                }
                 Ok((head, remote))
             }
             Err(error)
@@ -1419,7 +2191,7 @@ impl PipeFsWorkspace {
                     // A full revision cannot take this delta-only recovery
                     // branch again. Box the one bounded retry so the async
                     // state machine remains finite.
-                    Ok(()) => Box::pin(self.retry_locked(state)).await,
+                    Ok(()) => Box::pin(self.retry_locked(state, retain_for_transcript)).await,
                     Err(restage_error) => {
                         state.phase = WorkspacePhase::Pending;
                         state.last_error = Some(format!(
@@ -1490,12 +2262,22 @@ impl PipeFsWorkspace {
     }
 
     pub async fn retry(&self) -> Result<Option<Uuid>> {
-        let phase = self.inner.state.lock().await.phase;
+        let state = self.inner.state.lock().await;
+        ensure!(
+            state.pending_causal.is_none(),
+            "causal PipeFS recovery must be retried through the workspace controller"
+        );
+        ensure!(
+            state.pending_compatibility.is_none(),
+            "compatibility transcript recovery must be retried through the workspace controller"
+        );
+        let phase = state.phase;
+        drop(state);
         match phase {
             WorkspacePhase::Dirty => self.checkpoint().await,
             WorkspacePhase::Pending => {
                 let mut state = self.inner.state.lock().await;
-                self.retry_locked(&mut state)
+                self.retry_locked(&mut state, false)
                     .await
                     .map(|(head, _)| Some(head))
             }
@@ -1535,6 +2317,9 @@ impl PipeFsWorkspace {
         Ok(Activation {
             workspace_root: self.inner.original_workspace_root.clone(),
             state_root: self.inner.original_state_root.clone(),
+            writer_protocol: 0,
+            causal_commit_available: false,
+            writes_available: false,
         })
     }
 
@@ -1603,6 +2388,8 @@ impl PipeFsWorkspace {
         ensure!(
             state.phase == WorkspacePhase::Clean
                 && state.pending.is_none()
+                && state.pending_causal.is_none()
+                && state.pending_compatibility.is_none()
                 && state.last_error.is_none()
                 && state.active_background_processes.is_empty(),
             "PipeFS cache is not safe to remove"
@@ -1622,6 +2409,7 @@ impl PipeFsWorkspace {
 
     pub async fn status(&self) -> PipeFsStatus {
         let state = self.inner.state.lock().await;
+        let lease_generation = self.inner.lease.lock().await.generation;
         let recovery_caches =
             recovery_caches(&self.inner.session_cache_root, Some(&self.inner.cache_root));
         PipeFsStatus {
@@ -1647,15 +2435,104 @@ impl PipeFsWorkspace {
             pending_archive_bytes: fs::metadata(&self.inner.pending_archive)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0),
+            causal_operation_pending: state.pending_causal.is_some(),
+            transcript_pending: state
+                .pending_causal
+                .as_ref()
+                .is_some_and(|pending| pending.receipt.is_some())
+                || state.pending_compatibility.is_some(),
+            lease_generation,
+            manifest_digest: state
+                .remote
+                .as_ref()
+                .and_then(|remote| remote.manifest_digest.clone()),
+            remote_sequence: state.remote.as_ref().map(|remote| remote.sequence),
+            transcript_cursor: state
+                .pending_causal
+                .as_ref()
+                .and_then(|pending| pending.receipt.as_ref())
+                .map(|receipt| receipt.transcript_cursor)
+                .or(state.transcript_cursor),
             available_cache_bytes: available_space_bytes(&self.inner.cache_root),
         }
+    }
+
+    pub(crate) async fn persisted_causal_recovery(&self) -> Option<PersistedCausalRecovery> {
+        self.inner
+            .state
+            .lock()
+            .await
+            .pending_causal
+            .as_ref()
+            .map(|pending| PersistedCausalRecovery {
+                operation: pending.operation.clone(),
+                transcript_records: pending.transcript_records.clone(),
+                receipt: pending.receipt.clone(),
+            })
+    }
+
+    pub(crate) async fn persisted_compatibility_recovery(
+        &self,
+    ) -> Option<PersistedCompatibilityRecovery> {
+        let state = self.inner.state.lock().await;
+        state
+            .pending_compatibility
+            .as_ref()
+            .map(|pending| PersistedCompatibilityRecovery {
+                operation: pending.operation.clone(),
+                remote_commit_landed: state.pending.as_ref().is_none_or(|revision| {
+                    state.remote.as_ref().is_some_and(|remote| {
+                        remote.current_head.is_some()
+                            && remote.manifest_digest.as_deref()
+                                == Some(revision.manifest_digest.as_str())
+                            && remote.logical_size_bytes == revision.logical_size_bytes
+                    })
+                }),
+            })
+    }
+
+    /// Exact operation evidence retained for startup reconciliation with the
+    /// control journal. Callers must match every identity fence; the presence
+    /// of one pending archive is not evidence for unrelated operations/jobs.
+    pub async fn persisted_operation_recovery_evidence(&self) -> Option<CausalOperationReceipt> {
+        let state = self.inner.state.lock().await;
+        state
+            .pending_causal
+            .as_ref()
+            .map(|pending| pending.operation.clone())
+            .or_else(|| {
+                state
+                    .pending_compatibility
+                    .as_ref()
+                    .map(|pending| pending.operation.clone())
+            })
+    }
+
+    pub(crate) fn retain_for_journal_recovery(&self) -> Result<()> {
+        write_private(
+            &self.inner.recovery_marker,
+            b"control journal recovery required\n",
+        )
     }
 
     pub fn original_activation(&self) -> Activation {
         Activation {
             workspace_root: self.inner.original_workspace_root.clone(),
             state_root: self.inner.original_state_root.clone(),
+            writer_protocol: 0,
+            causal_commit_available: false,
+            writes_available: false,
         }
+    }
+
+    pub async fn record_transcript_cursor(&self, cursor: u64) -> Result<()> {
+        let mut state = self.inner.state.lock().await;
+        state.transcript_cursor = Some(
+            state
+                .transcript_cursor
+                .map_or(cursor, |old| old.max(cursor)),
+        );
+        self.persist_locked(&state)
     }
 
     fn persist_locked(&self, state: &ControllerState) -> Result<()> {
@@ -1670,6 +2547,8 @@ impl PipeFsWorkspace {
                 WorkspacePhase::Clean | WorkspacePhase::Disabled
             )
             && state.pending.is_none()
+            && state.pending_causal.is_none()
+            && state.pending_compatibility.is_none()
             && state.last_error.is_none()
         {
             let _ = fs::remove_file(&self.inner.recovery_marker);
@@ -1707,6 +2586,8 @@ impl PipeFsWorkspace {
                 state.phase,
                 WorkspacePhase::Clean | WorkspacePhase::Disabled
             ) && state.pending.is_none()
+                && state.pending_causal.is_none()
+                && state.pending_compatibility.is_none()
                 && state.last_error.is_none();
             let represented = state.remote.as_ref().is_some_and(|stored| {
                 stored.current_head == remote.current_head
@@ -1777,7 +2658,15 @@ fn mark_cache_for_recovery_if_drifted(
         return Ok(true);
     }
     let explicitly_dirty = matches!(state.phase, WorkspacePhase::Dirty | WorkspacePhase::Pending)
+        || (state.phase == WorkspacePhase::LeaseLost
+            && (!state.dirty_paths.is_empty()
+                || state.pending.is_some()
+                || state.pending_causal.is_some()
+                || state.pending_compatibility.is_some()
+                || !state.active_background_processes.is_empty()))
         || state.pending.is_some()
+        || state.pending_causal.is_some()
+        || state.pending_compatibility.is_some()
         || !state.active_background_processes.is_empty();
     if explicitly_dirty || !materialized_snapshot_matches(cache_root, &state) {
         write_private(
@@ -1787,6 +2676,17 @@ fn mark_cache_for_recovery_if_drifted(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn cache_has_pending_operation(cache_root: &Path, cache_scope: &PipeFsCacheScope) -> Result<bool> {
+    let state_file = cache_root.join("controller.json");
+    if !state_file.is_file() {
+        return Ok(false);
+    }
+    let state: ControllerState = serde_json::from_slice(&fs::read(&state_file)?)
+        .context("reading pending PipeFS operation controller state")?;
+    validate_controller_cache_scope(&state, cache_scope)?;
+    Ok(state.pending_causal.is_some() || state.pending_compatibility.is_some())
 }
 
 fn materialized_snapshot_matches(cache_root: &Path, state: &ControllerState) -> bool {
@@ -2105,6 +3005,21 @@ pub fn inspect_recovery_cache(
     Ok(cache)
 }
 
+/// Return the exact pending operation receipt retained by a recovery cache.
+/// `None` means the cache cannot prove any particular journal operation.
+pub fn recovery_cache_operation_evidence(
+    cache_scope: &PipeFsCacheScope,
+    session_id: &str,
+    cache_id: &str,
+) -> Result<Option<CausalOperationReceipt>> {
+    let cache = inspect_recovery_cache(cache_scope, session_id, cache_id)?;
+    let state = load_scoped_recovery_controller(&cache.path, cache_scope)?;
+    Ok(state
+        .pending_causal
+        .map(|pending| pending.operation)
+        .or_else(|| state.pending_compatibility.map(|pending| pending.operation)))
+}
+
 /// Export the materialized tree from a recovery cache as a deterministic full
 /// PipeFS archive. The source cache is deliberately retained.
 pub fn export_recovery_cache(
@@ -2183,20 +3098,22 @@ pub fn export_recovery_cache(
     Ok(destination)
 }
 
-/// Permanently discard one recovery cache. The confirmation must exactly
-/// equal the cache identifier so a stale path, wildcard, or session ID cannot
-/// broaden the deletion target.
+/// Permanently discard one recovery cache. Confirmation is bound to the
+/// authority, session, cache metadata, pending archive, and materialized tree.
 pub fn discard_recovery_cache(
     cache_scope: &PipeFsCacheScope,
     session_id: &str,
     cache_id: &str,
     confirmation: &str,
 ) -> Result<()> {
-    ensure!(
-        confirmation == cache_id,
-        "recovery cache confirmation must exactly match {cache_id:?}"
-    );
     let cache = inspect_recovery_cache(cache_scope, session_id, cache_id)?;
+    let expected = cache.confirmation_digest.as_deref().ok_or_else(|| {
+        anyhow!("recovery cache could not be verified and cannot be discarded; export it first")
+    })?;
+    ensure!(
+        confirmation == expected,
+        "recovery cache confirmation digest does not match; inspect the cache again"
+    );
     let session_root = session_cache_root(&default_cache_base(), cache_scope, session_id)?;
     remove_cache_directory(&session_root, &cache.path)
 }
@@ -2257,7 +3174,7 @@ fn validate_recovery_cache_id(cache_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn list_recovery_caches_at(
+pub(crate) fn list_recovery_caches_at(
     base: &Path,
     cache_scope: &PipeFsCacheScope,
     session_id: &str,
@@ -2336,18 +3253,73 @@ fn list_recovery_caches_at(
             .ok()
             .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
             .map_or(0, |metadata| metadata.len());
-        caches.push(PipeFsRecoveryCache {
+        let mut cache = PipeFsRecoveryCache {
             id: id.to_string(),
+            confirmation_digest: None,
             path,
             workspace_root,
             phase,
             logical_size_bytes,
             pending_archive_bytes,
             last_error,
-        });
+        };
+        match recovery_confirmation_digest(cache_scope, session_id, &cache) {
+            Ok(digest) => cache.confirmation_digest = Some(digest),
+            Err(error) => {
+                let detail = format!("discard confirmation unavailable: {error:#}");
+                cache.last_error = Some(match cache.last_error {
+                    Some(existing) => format!("{existing}; {detail}"),
+                    None => detail,
+                });
+            }
+        }
+        caches.push(cache);
     }
     caches.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(caches)
+}
+
+fn recovery_confirmation_digest(
+    cache_scope: &PipeFsCacheScope,
+    session_id: &str,
+    cache: &PipeFsRecoveryCache,
+) -> Result<String> {
+    let workspace_root = recovery_workspace_root(cache)?;
+    let snapshot = scan_workspace(&workspace_root)
+        .context("scanning recovery workspace for discard confirmation")?;
+    let mut hasher = blake3::Hasher::new_derive_key("hi.pipefs.recovery-discard-confirmation.v1");
+    for value in [cache_scope.as_str(), session_id, cache.id.as_str()] {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(&serde_json::to_vec(&snapshot)?);
+    for name in ["controller.json", "recovery-required", "pending.tar.zst"] {
+        let path = cache.path.join(name);
+        if path.is_file() {
+            hasher.update(name.as_bytes());
+            hash_recovery_file(&path, &mut hasher)?;
+        }
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn hash_recovery_file(path: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "recovery evidence is not a regular file: {}",
+        path.display()
+    );
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(())
 }
 
 fn load_scoped_recovery_controller(
@@ -2662,6 +3634,53 @@ fn recovery_caches(session_root: &Path, current: Option<&Path>) -> Vec<PathBuf> 
 mod tests {
     use super::*;
 
+    async fn client_serving_remote_state(
+        session_id: &str,
+        current_head: Option<Uuid>,
+        manifest_digest: Option<&str>,
+        logical_size_bytes: u64,
+    ) -> PipeFsClient {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let session_id = session_id.to_string();
+        let body = serde_json::json!({
+            "session_id": session_id,
+            "enabled": true,
+            "current_head": current_head,
+            "sequence": u64::from(current_head.is_some()),
+            "manifest_digest": manifest_digest,
+            "logical_size_bytes": logical_size_bytes,
+            "restore_chain": [],
+        })
+        .to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut config = crate::PipeFsClientConfig::new(format!("http://{address}"), "test-key");
+        config.request_timeout = std::time::Duration::from_secs(2);
+        PipeFsClient::new(config).unwrap()
+    }
+
     fn test_cache_scope() -> PipeFsCacheScope {
         PipeFsClient::new(crate::PipeFsClientConfig::new(
             "http://127.0.0.1:1",
@@ -2697,6 +3716,7 @@ mod tests {
                 maximum_delta_chain: 20,
                 writes_available: true,
                 restore_available: true,
+                causal_commit_available: false,
             }),
             ..ControllerState::default()
         }
@@ -2834,6 +3854,7 @@ mod tests {
             maximum_delta_chain: 20,
             writes_available: true,
             restore_available: true,
+            causal_commit_available: false,
         });
         let old_key = revision_idempotency_key(
             1,
@@ -2897,6 +3918,7 @@ mod tests {
             maximum_delta_chain: 20,
             writes_available: false,
             restore_available: true,
+            causal_commit_available: false,
         });
         drop(state);
 
@@ -2976,6 +3998,36 @@ mod tests {
             fs::read(source_recovery.join("user-data")).unwrap(),
             b"preserve"
         );
+    }
+
+    #[test]
+    fn recovery_discard_confirmation_is_bound_to_workspace_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache_path = temporary.path().join("generation-7");
+        let workspace_root = cache_path.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(workspace_root.join("answer.txt"), b"before").unwrap();
+        fs::write(cache_path.join("controller.json"), b"controller").unwrap();
+        fs::write(cache_path.join("recovery-required"), b"dirty").unwrap();
+        let cache = PipeFsRecoveryCache {
+            id: "generation-7".to_string(),
+            confirmation_digest: None,
+            path: cache_path,
+            workspace_root: Some(workspace_root.clone()),
+            phase: Some(WorkspacePhase::Dirty),
+            logical_size_bytes: 6,
+            pending_archive_bytes: 0,
+            last_error: None,
+        };
+        let scope = test_cache_scope();
+        let before = recovery_confirmation_digest(&scope, "session-1", &cache).unwrap();
+        assert_eq!(
+            before,
+            recovery_confirmation_digest(&scope, "session-1", &cache).unwrap()
+        );
+        fs::write(workspace_root.join("answer.txt"), b"after").unwrap();
+        let after = recovery_confirmation_digest(&scope, "session-1", &cache).unwrap();
+        assert_ne!(before, after);
     }
 
     #[tokio::test]
@@ -3335,19 +4387,17 @@ mod tests {
         let state_root = temporary.path().join("state");
         fs::create_dir_all(&workspace_root).unwrap();
         fs::create_dir_all(&state_root).unwrap();
+        let client = client_serving_remote_state("lease-refresh-test", None, None, 0).await;
+        let cache_scope = client.cache_scope();
         let workspace = PipeFsWorkspace::new(
-            PipeFsClient::new(crate::PipeFsClientConfig::new(
-                "http://127.0.0.1:1",
-                "test-key",
-            ))
-            .unwrap(),
+            client,
             PipeFsLease {
                 token: "old-token".to_string(),
                 generation: 4,
             },
             PipeFsWorkspaceConfig {
                 session_id: "lease-refresh-test".to_string(),
-                cache_scope: test_cache_scope(),
+                cache_scope,
                 original_workspace_root: workspace_root,
                 original_state_root: state_root,
                 cache_base: Some(temporary.path().join("cache")),
@@ -3389,274 +4439,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removes_only_stale_clean_cache_represented_by_remote_head() {
+    async fn compatibility_transcript_boundary_retains_archive_until_acknowledgement() {
         let temporary = tempfile::tempdir().unwrap();
         let workspace_root = temporary.path().join("workspace");
         let state_root = temporary.path().join("state");
         fs::create_dir_all(&workspace_root).unwrap();
         fs::create_dir_all(&state_root).unwrap();
-        let make_workspace = |generation| {
-            PipeFsWorkspace::new(
-                PipeFsClient::new(crate::PipeFsClientConfig::new(
-                    "http://127.0.0.1:1",
-                    "test-key",
-                ))
-                .unwrap(),
-                PipeFsLease {
-                    token: format!("token-{generation}"),
-                    generation,
-                },
-                PipeFsWorkspaceConfig {
-                    session_id: "clean-cache-test".to_string(),
-                    cache_scope: test_cache_scope(),
-                    original_workspace_root: workspace_root.clone(),
-                    original_state_root: state_root.clone(),
-                    cache_base: Some(temporary.path().join("cache")),
-                },
-            )
-            .unwrap()
-        };
-        let old = make_workspace(1);
-        let head = Uuid::new_v4();
-        let remote = PipeFsRemoteState {
-            session_id: "clean-cache-test".to_string(),
-            enabled: true,
-            current_head: Some(head),
-            sequence: 1,
-            manifest_digest: Some("a".repeat(64)),
-            logical_size_bytes: 0,
-            restore_chain: Vec::new(),
-        };
-        {
-            let mut state = old.inner.state.lock().await;
-            let materialized = old.inner.cache_root.join("workspace-clean");
-            create_private_dir(&materialized).unwrap();
-            state.phase = WorkspacePhase::Clean;
-            state.remote = Some((&remote).into());
-            state.snapshot = Some(Snapshot {
-                manifest_digest: remote.manifest_digest.clone(),
-                ..Snapshot::default()
-            });
-            state.materialized_root = Some(materialized);
-            old.persist_locked(&state).unwrap();
-        }
-        let old_root = old.inner.cache_root.clone();
-        let current = make_workspace(2);
-
-        current.cleanup_stale_clean_caches(&remote);
-
-        assert!(!old_root.exists());
-        assert!(current.inner.cache_root.exists());
-    }
-
-    #[tokio::test]
-    async fn same_generation_restart_preserves_clean_controller_with_unscanned_drift() {
-        let temporary = tempfile::tempdir().unwrap();
-        let workspace_root = temporary.path().join("workspace");
-        let state_root = temporary.path().join("state");
-        fs::create_dir_all(&workspace_root).unwrap();
-        fs::create_dir_all(&state_root).unwrap();
-        let config = PipeFsWorkspaceConfig {
-            session_id: "same-generation-drift-test".to_string(),
-            cache_scope: test_cache_scope(),
-            original_workspace_root: workspace_root,
-            original_state_root: state_root,
-            cache_base: Some(temporary.path().join("cache")),
-        };
-        let make_workspace = || {
-            PipeFsWorkspace::new(
-                PipeFsClient::new(crate::PipeFsClientConfig::new(
-                    "http://127.0.0.1:1",
-                    "test-key",
-                ))
-                .unwrap(),
-                PipeFsLease {
-                    token: "same-token".to_string(),
-                    generation: 7,
-                },
-                config.clone(),
-            )
-            .unwrap()
-        };
-        let old = make_workspace();
-        let old_materialized = old.inner.cache_root.join("workspace-old");
-        create_private_dir(&old_materialized).unwrap();
-        let committed_snapshot = scan_workspace(&old_materialized).unwrap();
-        {
-            let mut state = old.inner.state.lock().await;
-            state.phase = WorkspacePhase::Clean;
-            state.snapshot = Some(committed_snapshot);
-            state.materialized_root = Some(old_materialized.clone());
-            old.persist_locked(&state).unwrap();
-        }
-
-        // Simulate a direct editor write followed by SIGKILL, after the
-        // controller had most recently persisted `Clean`.
-        fs::write(old_materialized.join("unfenced-change"), "keep me").unwrap();
-        let old_cache = old.inner.cache_root.clone();
-        drop(old);
-
-        let resumed = make_workspace();
-        assert_ne!(resumed.inner.cache_root, old_cache);
-        assert!(old_cache.join("recovery-required").is_file());
-        assert_eq!(
-            fs::read_to_string(old_materialized.join("unfenced-change")).unwrap(),
-            "keep me"
-        );
-        assert!(
-            recovery_caches(
-                &resumed.inner.session_cache_root,
-                Some(&resumed.inner.cache_root)
-            )
-            .contains(&old_cache)
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_clean_cache_with_drift_is_marked_instead_of_deleted() {
-        let temporary = tempfile::tempdir().unwrap();
-        let workspace_root = temporary.path().join("workspace");
-        let state_root = temporary.path().join("state");
-        fs::create_dir_all(&workspace_root).unwrap();
-        fs::create_dir_all(&state_root).unwrap();
-        let make_workspace = |generation| {
-            PipeFsWorkspace::new(
-                PipeFsClient::new(crate::PipeFsClientConfig::new(
-                    "http://127.0.0.1:1",
-                    "test-key",
-                ))
-                .unwrap(),
-                PipeFsLease {
-                    token: format!("token-{generation}"),
-                    generation,
-                },
-                PipeFsWorkspaceConfig {
-                    session_id: "stale-drift-test".to_string(),
-                    cache_scope: test_cache_scope(),
-                    original_workspace_root: workspace_root.clone(),
-                    original_state_root: state_root.clone(),
-                    cache_base: Some(temporary.path().join("cache")),
-                },
-            )
-            .unwrap()
-        };
-        let old = make_workspace(1);
-        let materialized = old.inner.cache_root.join("workspace-old");
-        create_private_dir(&materialized).unwrap();
-        let snapshot = scan_workspace(&materialized).unwrap();
-        let remote = PipeFsRemoteState {
-            session_id: "stale-drift-test".to_string(),
-            enabled: true,
-            current_head: Some(Uuid::new_v4()),
-            sequence: 1,
-            manifest_digest: Some("a".repeat(64)),
-            logical_size_bytes: 0,
-            restore_chain: Vec::new(),
-        };
-        {
-            let mut state = old.inner.state.lock().await;
-            state.phase = WorkspacePhase::Clean;
-            state.remote = Some((&remote).into());
-            state.snapshot = Some(snapshot);
-            state.materialized_root = Some(materialized.clone());
-            old.persist_locked(&state).unwrap();
-        }
-        fs::write(materialized.join("late-write"), "preserve").unwrap();
-        let old_cache = old.inner.cache_root.clone();
-        drop(old);
-        let current = make_workspace(2);
-
-        current.cleanup_stale_clean_caches(&remote);
-
-        assert!(old_cache.exists());
-        assert!(old_cache.join("recovery-required").is_file());
-        assert_eq!(
-            fs::read_to_string(materialized.join("late-write")).unwrap(),
-            "preserve"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn recovery_discovery_never_follows_generation_or_marker_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        let temporary = tempfile::tempdir().unwrap();
-        let session_root = temporary.path().join("session");
-        let outside = temporary.path().join("outside");
-        fs::create_dir_all(&session_root).unwrap();
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(outside.join("recovery-required"), b"outside\n").unwrap();
-
-        symlink(&outside, session_root.join("linked-generation")).unwrap();
-
-        let linked_marker = session_root.join("linked-marker");
-        fs::create_dir_all(&linked_marker).unwrap();
-        symlink(
-            outside.join("recovery-required"),
-            linked_marker.join("recovery-required"),
-        )
+        let client = PipeFsClient::new(crate::PipeFsClientConfig::new(
+            "http://127.0.0.1:1",
+            "test-key",
+        ))
         .unwrap();
-
-        let genuine = session_root.join("genuine");
-        fs::create_dir_all(&genuine).unwrap();
-        fs::write(genuine.join("recovery-required"), b"recover\n").unwrap();
-
-        assert_eq!(recovery_caches(&session_root, None), vec![genuine]);
-    }
-
-    #[tokio::test]
-    async fn rejects_workspace_larger_than_server_capability_before_staging() {
-        let temporary = tempfile::tempdir().unwrap();
-        let workspace_root = temporary.path().join("workspace");
-        let state_root = temporary.path().join("state");
-        fs::create_dir_all(&workspace_root).unwrap();
-        fs::create_dir_all(&state_root).unwrap();
-        fs::write(workspace_root.join("large"), b"0123456789").unwrap();
+        let cache_scope = client.cache_scope();
         let workspace = PipeFsWorkspace::new(
-            PipeFsClient::new(crate::PipeFsClientConfig::new(
-                "http://127.0.0.1:1",
-                "test-key",
-            ))
-            .unwrap(),
+            client,
             PipeFsLease {
-                token: "token".to_string(),
-                generation: 1,
+                token: "lease-token".into(),
+                generation: 4,
             },
             PipeFsWorkspaceConfig {
-                session_id: "workspace-limit-test".to_string(),
-                cache_scope: test_cache_scope(),
-                original_workspace_root: workspace_root.clone(),
+                session_id: "compatibility-ack-test".into(),
+                cache_scope,
+                original_workspace_root: workspace_root,
                 original_state_root: state_root,
                 cache_base: Some(temporary.path().join("cache")),
             },
         )
         .unwrap();
-        let mut state = workspace.inner.state.lock().await;
-        state.phase = WorkspacePhase::Dirty;
-        state.materialized_root = Some(workspace_root);
-        state.snapshot = Some(Snapshot::default());
-        state.capabilities = Some(CapabilitiesDisk {
-            maximum_revision_bytes: 1_000_000,
-            maximum_workspace_bytes: 5,
-            maximum_delta_chain: 20,
-            writes_available: true,
-            restore_available: true,
-        });
-        workspace.persist_locked(&state).unwrap();
-        drop(state);
+        let head = Uuid::new_v4();
+        let manifest = "b".repeat(64);
+        let operation = CausalOperationReceipt {
+            operation_id: "operation-1".into(),
+            idempotency_key: "idempotency-1".into(),
+            binding_id: "binding-1".into(),
+            binding_epoch: 3,
+            replay_class: hi_workspace::ReplayClass::PureWorkspace,
+            execution: hi_workspace::ExecutionReport::succeeded(Some(manifest.clone())),
+        };
+        {
+            let mut state = workspace.inner.state.lock().await;
+            state.phase = WorkspacePhase::Pending;
+            state.remote = Some(PipeFsRemoteStateDisk {
+                enabled: true,
+                current_head: Some(head),
+                sequence: 1,
+                manifest_digest: Some(manifest.clone()),
+                logical_size_bytes: 7,
+                restore_chain: Vec::new(),
+            });
+            state.pending = Some(PendingRevision {
+                expected_base_revision_id: None,
+                revision_type: RevisionKind::Full,
+                archive_blake3: "a".repeat(64),
+                archive_size_bytes: 6,
+                manifest_digest: manifest,
+                logical_size_bytes: 7,
+                idempotency_key: "revision-key".into(),
+                snapshot: Snapshot::default(),
+            });
+            state.pending_compatibility = Some(PendingCompatibilityOperation {
+                operation: operation.clone(),
+            });
+            workspace.persist_locked(&state).unwrap();
+        }
+        write_private(&workspace.inner.pending_archive, b"staged").unwrap();
+        write_private(&workspace.inner.recovery_marker, b"pending transcript\n").unwrap();
 
-        let error = workspace.checkpoint().await.unwrap_err();
-
-        assert!(error.to_string().contains("exceeding the server limit"));
-        let state = workspace.inner.state.lock().await;
-        assert!(state.pending.is_none());
-        assert!(!workspace.inner.pending_archive.exists());
-        assert!(
-            fs::read_dir(&workspace.inner.cache_root)
-                .unwrap()
-                .filter_map(Result::ok)
-                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tar.zst"))
+        assert_eq!(
+            workspace
+                .checkpoint_for_compatibility_transcript(operation)
+                .await
+                .unwrap(),
+            Some(head)
         );
+        assert!(workspace.inner.pending_archive.is_file());
+        assert!(workspace.inner.recovery_marker.is_file());
+
+        workspace
+            .finish_compatibility_checkpoint("operation-1", 9)
+            .await
+            .unwrap();
+        let state = workspace.inner.state.lock().await;
+        assert_eq!(state.phase, WorkspacePhase::Clean);
+        assert!(state.pending.is_none());
+        assert!(state.pending_compatibility.is_none());
+        assert!(!workspace.inner.pending_archive.exists());
+        assert!(!workspace.inner.recovery_marker.exists());
     }
+
+    #[path = "tail_tests.rs"]
+    mod tail_tests;
 }

@@ -6,6 +6,8 @@ Commands:
   auth               Paste and verify an API key (openai / anthropic / xai)
   browser            Install the Chrome debugger extension (`install`)
   doctor             Diagnose config, credentials, git, and MCP
+  debug tui          Deterministic TUI JSONL harness (`--stdio`)
+  workspace          Inspect and salvage local PipeFS recovery state
   update             Update the hi binary
   workflow           Run or inspect a workflow
   trace              List, show, or verify local traces
@@ -130,6 +132,18 @@ pub struct Cli {
     /// Path to a config file (default: ./hi.toml or ~/.config/hi/config.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
+
+    /// Override one typed harness setting for this invocation (`KEY=VALUE`).
+    #[arg(long = "harness-setting", value_name = "KEY=VALUE")]
+    pub harness_settings: Vec<String>,
+
+    /// Persist a typed override in this saved session (`KEY=VALUE`).
+    #[arg(
+        long = "session-harness-setting",
+        value_name = "KEY=VALUE",
+        conflicts_with_all = ["no_save", "subagent", "eval_input"]
+    )]
+    pub session_harness_settings: Vec<String>,
 
     /// Print the resolved configuration (provider, model, base URL, etc.) and exit.
     #[arg(long)]

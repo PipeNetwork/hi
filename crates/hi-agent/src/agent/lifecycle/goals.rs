@@ -132,7 +132,7 @@ impl crate::Agent {
     /// Export goal checklist markdown to `.hi/goal-plan.md`.
     pub fn export_goal_plan(&mut self) -> Result<Option<std::path::PathBuf>> {
         anyhow::ensure!(
-            !self.workspace_durability_enabled(),
+            !self.pipefs_workspace_active(),
             "/goal export is unavailable while PipeFS is active because it writes the workspace outside the durability fence"
         );
         let Some(goal) = self.goals.structured.as_ref() else {

@@ -13,11 +13,11 @@ use anyhow::{Context, Result, bail};
 use hi_eval::backends::{DockerMount, DockerRunSpec, HarborDockerBackend};
 use hi_eval::{
     ArtifactSpec, AttemptRecord, AttemptStatus, ClaimLevel, EnvironmentSpec, EvalEvidence,
-    EvalInput, EvalManifest, EvalProfile, EvalScore, EvalStateStore, IdentityDetails, ImportStore,
+    EvalInput, EvalManifest, EvalProfile, EvalScore, EvalStateStore, ImportStore,
     PreparationReceipt, ProgressEvent, RunIdentity, RunRecord, RunStatus, TaskPackage,
     VerifierSpec, command_output_with_timeout,
 };
-use hi_eval_adapters::{ADAPTER_API_VERSION, plan_directory};
+use hi_eval_adapters::plan_directory;
 
 use crate::review_target::resolve_runtime_roots;
 
@@ -27,7 +27,7 @@ pub(crate) async fn run_eval_cli(args: &[String]) -> Result<()> {
         "import" | "prepare" => prepare(args).await,
         "run" => run_profile(args).await,
         "status" => status(args),
-        "report" => report(args),
+        "report" => crate::eval_report::report(args),
         "stop" => stop(args),
         "cleanup" => cleanup(args),
         "help" | "--help" | "-h" => {
@@ -126,11 +126,12 @@ async fn prepare(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let manifest_digest = manifest.digest()?;
-    let identity = build_identity(
+    let identity = crate::eval_identity::build_identity(
         &profile_name,
         &manifest_digest,
         dataset_digests.clone(),
         profile,
+        &workspace_root,
     )?;
     let receipt = PreparationReceipt {
         schema_version: hi_eval::PLATFORM_SCHEMA_VERSION,
@@ -171,18 +172,19 @@ async fn run_profile(args: &[String]) -> Result<()> {
             profile.backend
         );
     }
-    let (_, default_state_root) = resolve_runtime_roots()?;
+    let (workspace_root, default_state_root) = resolve_runtime_roots()?;
     let state_root = flag_path(args, "--state").unwrap_or_else(|| default_state_root.join("evals"));
     let state = EvalStateStore::new(&state_root);
     let receipt = state.read_preparation(&profile_name).with_context(|| {
         format!("profile {profile_name:?} is not prepared; run `hi eval prepare --profile {profile_name}`")
     })?;
     let manifest_digest = manifest.digest()?;
-    let expected = build_identity(
+    let expected = crate::eval_identity::build_identity(
         &profile_name,
         &manifest_digest,
         receipt.datasets.clone(),
         profile,
+        &workspace_root,
     )?;
     if receipt.identity.digest != expected.digest {
         bail!(
@@ -434,83 +436,6 @@ async fn run_profile(args: &[String]) -> Result<()> {
             failures.join(", ")
         )
     }
-}
-
-fn build_identity(
-    profile_name: &str,
-    manifest_digest: &str,
-    dataset_digests: std::collections::BTreeMap<String, String>,
-    profile: &EvalProfile,
-) -> Result<RunIdentity> {
-    let hi_digest = binary_identity_digest()?;
-    let digest_value = |value: &serde_json::Value| -> Result<String> {
-        Ok(blake3::hash(&serde_json::to_vec(value)?)
-            .to_hex()
-            .to_string())
-    };
-    let configuration_digest = blake3::hash(&serde_json::to_vec(profile)?)
-        .to_hex()
-        .to_string();
-    let mcp_configuration_digest = digest_value(&serde_json::to_value(&profile.mcp_servers)?)?;
-    let provider_policy_digest = digest_value(&serde_json::json!({
-        "policy": profile.provider_policy,
-        "sampling": profile.sampling,
-        "models": profile.models,
-    }))?;
-    let scoring_policy_digest = digest_value(&serde_json::to_value(&profile.scoring)?)?;
-    let secret_configuration_digest = profile
-        .secret_configuration_digest
-        .clone()
-        .unwrap_or_default();
-    RunIdentity::new_with_details(
-        profile_name,
-        manifest_digest,
-        dataset_digests,
-        profile.models.clone(),
-        &profile.backend,
-        scoring_policy_digest,
-        configuration_digest,
-        IdentityDetails {
-            adapter_version: ADAPTER_API_VERSION.into(),
-            hi_binary_digest: hi_digest,
-            provider_policy_digest,
-            mcp_configuration_digest,
-            secret_configuration_digest,
-            runtime_identity: format!(
-                "{}-{}-{}",
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-                profile.backend
-            ),
-        },
-    )
-}
-
-fn binary_identity_digest() -> Result<String> {
-    let candidate = std::env::var_os("HI_BIN")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-        .or_else(|| std::env::current_exe().ok().filter(|path| path.is_file()));
-    let evaluator = std::env::var_os("HI_EVAL_BIN")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|current| current.parent().map(|parent| parent.join("hi-eval")))
-                .filter(|path| path.is_file())
-        });
-    let digest = |path: Option<PathBuf>| -> Result<Option<String>> {
-        path.map(|path| Ok(blake3::hash(&fs::read(&path)?).to_hex().to_string()))
-            .transpose()
-    };
-    let value = serde_json::json!({
-        "candidate": digest(candidate)?,
-        "evaluator": digest(evaluator)?,
-    });
-    Ok(blake3::hash(&serde_json::to_vec(&value)?)
-        .to_hex()
-        .to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1345,32 +1270,6 @@ fn status(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn report(args: &[String]) -> Result<()> {
-    let profile = required_profile(args)?;
-    let (_, default_state_root) = resolve_runtime_roots()?;
-    let state = EvalStateStore::new(
-        flag_path(args, "--state").unwrap_or_else(|| default_state_root.join("evals")),
-    );
-    let root = state.profile_root(&profile)?;
-    let mut reports = Vec::new();
-    collect_json(&root.join("attempts"), &mut reports)?;
-    collect_json(&root.join("evidence"), &mut reports)?;
-    let report = serde_json::json!({
-        "schema_version": hi_eval::PLATFORM_SCHEMA_VERSION,
-        "profile": profile,
-        "preparation": state.read_preparation(&profile).ok(),
-        "run": state.read_run(&profile)?,
-        "records": reports,
-    });
-    let path = state.write_report(&profile, &report)?;
-    println!(
-        "{}\nreport: {}",
-        serde_json::to_string_pretty(&report)?,
-        path.display()
-    );
-    Ok(())
-}
-
 fn stop(args: &[String]) -> Result<()> {
     let profile = required_profile(args)?;
     let (_, default_state_root) = resolve_runtime_roots()?;
@@ -1438,29 +1337,6 @@ fn find_eval_binary() -> Result<PathBuf> {
         return Ok(path);
     }
     bail!("could not find hi-eval; set HI_EVAL_BIN to the evaluator binary")
-}
-
-fn collect_json(root: &Path, output: &mut Vec<serde_json::Value>) -> Result<()> {
-    if !root.is_dir() {
-        return Ok(());
-    }
-    let mut entries = fs::read_dir(root)?.collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_json(&path, output)?;
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "json")
-        {
-            let bytes = fs::read(&path)?;
-            if let Ok(value) = serde_json::from_slice(&bytes) {
-                output.push(value);
-            }
-        }
-    }
-    Ok(())
 }
 
 fn print_help() {

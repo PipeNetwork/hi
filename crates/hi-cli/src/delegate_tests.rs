@@ -11,6 +11,7 @@ use crate::candidate_gate::{
 };
 use crate::candidate_merge::{
     apply_candidate_and_reverify, apply_candidate_and_reverify_cancellable,
+    apply_candidate_and_reverify_cancellable_at_base,
 };
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -49,16 +50,16 @@ fn delegate_child_budget_precedes_outer_kill_and_preserves_explicit_cap() {
     );
     assert_eq!(
         crate::delegate::delegate_timeout_secs_from_value(Some("0")),
-        None,
-        "zero explicitly disables the delegate timeout"
+        Some(900),
+        "zero falls back to the mandatory managed timeout"
     );
     assert_eq!(
         crate::delegate::delegate_timeout_secs_from_value(None),
-        None
+        Some(900)
     );
     assert_eq!(
         crate::delegate::delegate_timeout_secs_from_value(Some("invalid")),
-        None
+        Some(900)
     );
     assert_eq!(
         crate::delegate::delegate_timeout_secs_from_value(Some("1")),
@@ -79,27 +80,27 @@ fn delegate_child_budget_precedes_outer_kill_and_preserves_explicit_cap() {
 }
 
 #[test]
-fn delegate_capacity_wait_is_unlimited_by_default_and_explicit_when_requested() {
+fn delegate_capacity_wait_is_finite_by_default_and_explicit_when_requested() {
     assert_eq!(
         crate::delegate::delegate_queue_timeout_secs_from_value(None),
-        None
+        Some(300)
     );
     assert_eq!(
         crate::delegate::delegate_queue_timeout_secs_from_value(Some("0")),
-        None
+        Some(300)
     );
     assert_eq!(
         crate::delegate::delegate_queue_timeout_secs_from_value(Some("invalid")),
-        None
+        Some(300)
     );
     assert_eq!(
         crate::delegate::delegate_queue_timeout_secs_from_value(Some("3")),
         Some(3)
     );
-    assert!(
-        !crate::delegate::queue_wait_timed_out(Duration::from_secs(100_000), None),
-        "an ordinary capacity wait must not acquire a hidden wall-clock deadline"
-    );
+    assert!(crate::delegate::queue_wait_timed_out(
+        Duration::from_secs(300),
+        Some(Duration::from_secs(300))
+    ));
     assert!(crate::delegate::queue_wait_timed_out(
         Duration::from_millis(1),
         Some(Duration::from_millis(1))
@@ -328,6 +329,51 @@ fn passing_destination_revision_is_applied_with_candidate_mode() {
 
     hi_tools::worktree::cleanup(&root, &[worktree]);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn detached_candidate_rejects_a_changed_complete_source_base() {
+    let container = temp_path("detached-stale-base");
+    let source = container.join("source");
+    let state = container.join("state");
+    let candidate_owner = container.join("candidate");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    git_ok(&source, &["init", "-q"]);
+    git_ok(&source, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&source, &["config", "user.name", "Hi Test"]);
+    std::fs::write(source.join("value.txt"), "before\n").unwrap();
+    git_ok(&source, &["add", "value.txt"]);
+    git_ok(&source, &["commit", "-qm", "base"]);
+    let candidate = hi_tools::candidate_workspace::CandidateWorkspace::create(
+        &source,
+        &state,
+        &candidate_owner,
+    )
+    .unwrap();
+    std::fs::write(candidate.root().join("value.txt"), "candidate\n").unwrap();
+
+    // Even a disjoint parent edit changes the complete base version and must
+    // prevent safe auto-apply.
+    std::fs::write(source.join("other.txt"), "concurrent\n").unwrap();
+    let error = apply_candidate_and_reverify_cancellable_at_base(
+        candidate.root(),
+        candidate.baseline_commit(),
+        &source,
+        &state,
+        "true",
+        Some(candidate.source_snapshot_id()),
+        None,
+    )
+    .expect_err("a stale complete base must not auto-apply");
+
+    assert!(format!("{error:#}").contains("candidate base is stale"));
+    assert_eq!(
+        std::fs::read_to_string(source.join("value.txt")).unwrap(),
+        "before\n"
+    );
+    drop(candidate);
+    let _ = std::fs::remove_dir_all(container);
 }
 
 #[test]
@@ -676,4 +722,36 @@ fn missing_verify_pipeline_derives_a_build_gate_for_known_project_types() {
     .unwrap();
     assert_eq!(explicit.default_verify_for_tests().as_deref(), Some("true"));
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn delegate_runner_rebinds_candidates_to_the_new_authoritative_root() {
+    use hi_agent::DelegateRunner;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let first = temporary.path().join("first");
+    let second = temporary.path().join("second");
+    let first_state = temporary.path().join("first-state");
+    let second_state = temporary.path().join("second-state");
+    for path in [&first, &second, &first_state, &second_state] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let runner = crate::delegate::CliDelegateRunner::new(
+        PathBuf::from("hi"),
+        "openai".into(),
+        "model".into(),
+        "http://127.0.0.1".into(),
+        "key".into(),
+        Some("true".into()),
+        None,
+        None,
+        1,
+        first.clone(),
+        first_state.clone(),
+    )
+    .unwrap();
+    assert!(runner.is_bound_to_workspace(&first, &first_state));
+    assert!(runner.bind_workspace(&second, &second_state));
+    assert!(!runner.is_bound_to_workspace(&first, &first_state));
+    assert!(runner.is_bound_to_workspace(&second, &second_state));
 }

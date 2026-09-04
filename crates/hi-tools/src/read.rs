@@ -9,6 +9,10 @@ use crate::{ProcessRunner, ToolOutcome, ToolStatus};
 mod discovery;
 mod formatting;
 mod grep_fallback;
+mod resource;
+
+pub(crate) use resource::workspace_path_from_read_arguments;
+pub use resource::{ResourceReadRoutingError, route_resource_read};
 
 #[cfg(test)]
 use discovery::run_list_sync;
@@ -113,66 +117,71 @@ pub(crate) async fn run_read(
     cache: &std::sync::Mutex<ReadCache>,
     arguments: &str,
 ) -> Result<ToolOutcome> {
-    let args: ReadArgs = crate::tools::parse(arguments)?;
-    // Multi-file mode: read each path and join with a header per file.
-    if let Some(paths) = args.paths.as_deref() {
-        if paths.is_empty() {
-            bail!("`paths` must list at least one path");
+    run_read_with_mcp(root, cache, None, arguments).await
+}
+
+pub(crate) async fn run_read_with_mcp(
+    root: &std::path::Path,
+    cache: &std::sync::Mutex<ReadCache>,
+    mcp: Option<&dyn crate::McpBackend>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    match resource::parse_and_route_read(root, cache, mcp, arguments).await? {
+        resource::RoutedReadPlan::Single(read) => {
+            let resource::RoutedRead {
+                source,
+                offset,
+                limit,
+                ..
+            } = read;
+            let content = source.read(cache).await?;
+            Ok(crate::ToolOutcome::plain_read(
+                format_read_for_output(&content, offset, limit),
+                content.len() as u64,
+            ))
         }
-        if paths.len() > MAX_MULTI_READ_PATHS {
-            bail!("`paths` may contain at most {MAX_MULTI_READ_PATHS} files per call");
-        }
-        let targets = paths
-            .iter()
-            .map(|path| Ok((path.clone(), resolve(root, path)?)))
-            .collect::<Result<Vec<_>>>()?;
-        let reads =
-            futures_util::stream::iter(targets.into_iter().map(|(path, target)| async move {
-                let body = read_one(cache, &target).await;
-                (path, body)
+        resource::RoutedReadPlan::Multiple(reads) => {
+            let reads = futures_util::stream::iter(reads.into_iter().map(|read| async move {
+                let resource::RoutedRead {
+                    display,
+                    source,
+                    offset,
+                    limit,
+                } = read;
+                let body = source.read(cache).await;
+                (display, offset, limit, body)
             }))
             .buffered(MULTI_READ_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
-        let mut out = String::new();
-        let mut remaining_budget = read_output_budget();
-        let mut remaining_files = reads.len();
-        let mut source_bytes = 0u64;
-        for (path, body) in reads {
-            let body = body?;
-            let header = format!("──── {path} ────\n");
-            out.push_str(&header);
-            let body_budget = remaining_budget
-                .saturating_sub(header.chars().count() + 1)
-                .checked_div(remaining_files.max(1))
-                .unwrap_or(0);
-            let formatted =
-                format_read_with_budget(&body, args.offset, args.limit, Some(body_budget));
-            source_bytes = source_bytes.saturating_add(body.len() as u64);
-            let used = header.chars().count() + formatted.chars().count() + 1;
-            out.push_str(&formatted);
-            out.push('\n');
-            remaining_budget = remaining_budget.saturating_sub(used);
-            remaining_files = remaining_files.saturating_sub(1);
+            let mut out = String::new();
+            let mut remaining_budget = read_output_budget();
+            let mut remaining_files = reads.len();
+            let mut source_bytes = 0u64;
+            for (display, offset, limit, body) in reads {
+                let body = body?;
+                let header = format!("──── {display} ────\n");
+                out.push_str(&header);
+                let body_budget = remaining_budget
+                    .saturating_sub(header.chars().count() + 1)
+                    .checked_div(remaining_files.max(1))
+                    .unwrap_or(0);
+                let formatted = format_read_with_budget(&body, offset, limit, Some(body_budget));
+                source_bytes = source_bytes.saturating_add(body.len() as u64);
+                let used = header.chars().count() + formatted.chars().count() + 1;
+                out.push_str(&formatted);
+                out.push('\n');
+                remaining_budget = remaining_budget.saturating_sub(used);
+                remaining_files = remaining_files.saturating_sub(1);
+            }
+            Ok(crate::ToolOutcome::plain_read(out, source_bytes))
         }
-        return Ok(crate::ToolOutcome::plain_read(out, source_bytes));
     }
-    // Single-file mode.
-    let path = args
-        .path
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("`read` requires `path` or `paths`"))?;
-    let target = resolve(root, path)?;
-    let content = read_one(cache, &target).await?;
-    Ok(crate::ToolOutcome::plain_read(
-        format_read_for_output(&content, args.offset, args.limit),
-        content.len() as u64,
-    ))
 }
 
 /// Read one file as UTF-8 text, using the per-turn cache and bailing clearly
 /// on binary files. Shared by the single- and multi-path read paths.
-async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) -> Result<String> {
+pub(super) async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) -> Result<String> {
     let cached = match cache.lock() {
         Ok(mut cache) => cache.get(&cache_key(std::path::Path::new(path))).cloned(),
         // Poisoned lock — treat as a cache miss and re-read the file, rather than
@@ -398,26 +407,6 @@ pub(crate) async fn read_text_file(path: &str) -> Result<String> {
             e.utf8_error().valid_up_to()
         )
     })
-}
-
-#[derive(Deserialize)]
-pub(crate) struct ReadArgs {
-    /// Path to a single file. Optional if `paths` is given instead.
-    #[serde(default)]
-    pub path: Option<String>,
-    /// Multiple paths to read in one call. Each is returned under a header.
-    /// Use this to pull a whole directory of files at once instead of one
-    /// call per file.
-    #[serde(default)]
-    pub paths: Option<Vec<String>>,
-    /// 1-based first line to return (default: start of file). Applied to
-    /// every file when `paths` is used.
-    #[serde(default)]
-    pub offset: Option<usize>,
-    /// Max number of lines to return per file (default: 2000, i.e. the whole
-    /// file for most source files). Page with a smaller `limit` + `offset`.
-    #[serde(default)]
-    pub limit: Option<usize>,
 }
 
 #[derive(Deserialize)]

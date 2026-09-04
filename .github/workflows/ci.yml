@@ -33,7 +33,8 @@ jobs:
       - name: Clippy (0.2 core only)
         run: >-
           cargo clippy
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-pipefs
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace
+          -p hi-control -p hi-pipefs -p hi-shell
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
           --all-targets -- -A clippy::large-enum-variant -D warnings
@@ -41,14 +42,16 @@ jobs:
       - name: Core tests
         run: >-
           cargo nextest run
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-pipefs
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace
+          -p hi-control -p hi-pipefs -p hi-shell
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
 
       - name: Core doctests
         run: >-
           cargo test --doc
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-pipefs
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace
+          -p hi-control -p hi-pipefs -p hi-shell
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
 
@@ -72,11 +75,22 @@ jobs:
 
       - name: Orchestration concurrency and chaos tests
         run: >-
+          cargo nextest run -p hi-tools background --no-default-features &&
           cargo nextest run -p hi-tools background_tasks --no-default-features &&
           cargo nextest run -p hi-agent tests::background_task --no-default-features &&
+          cargo nextest run -p hi-agent cancellation_settlement --no-default-features &&
+          cargo nextest run -p hi-agent live_writer_reconciliation --no-default-features &&
           cargo nextest run -p hi resource_governor::tests --no-default-features &&
           cargo nextest run -p hi delegate_tests --no-default-features &&
           cargo nextest run -p hi bestof::tests --no-default-features
+
+      # This PR-only, provider-free suite includes schema v1 -> v2 upgrade and
+      # rollback tests plus the normalized local/fake-PipeFS lifecycle trace.
+      - name: Schema upgrade and local/fake-PipeFS settlement acceptance
+        run: >-
+          cargo nextest run
+          -p hi-workspace -p hi-control -p hi-pipefs
+          --no-default-features
 
       - name: Orchestration regression benchmark
         env:

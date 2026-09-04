@@ -1469,6 +1469,7 @@ mod tests {
             canonical_objective: None,
             messages: vec![Message::user("hello")].into(),
             tools: Vec::new().into(),
+            tool_envelope: None,
             max_tokens: 32,
             temperature: None,
             top_p: None,

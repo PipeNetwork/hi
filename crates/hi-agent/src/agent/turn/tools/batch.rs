@@ -12,12 +12,15 @@ use feedback::{PendingCheck, append_fast_feedback};
 pub(in crate::agent::turn) use outcome::ToolBatchOutcome;
 use outcome::{append_tool_images, emit_capability_request};
 use policy::{
-    dry_run_message, parked_or_denied_delegate, parked_or_denied_shell, wait_flavored_call,
+    dry_run_message, parked_or_denied_delegate, parked_or_denied_shell,
+    terminal_background_requires_reconciliation, wait_flavored_call, workspace_execution_report,
+    workspace_mutation_intent, workspace_operation_requires_settlement,
+    workspace_program_execution_report, workspace_program_intent,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use futures_util::StreamExt;
 use hi_tools::protocol::{
     execute_in_runtime_shared_with_runner, execute_prepared_in_runtime,
@@ -82,6 +85,7 @@ struct ProgramToolRunner {
 #[derive(Clone)]
 pub(crate) struct ProgramSpeculator {
     runner: ProgramToolRunner,
+    allowed_tools: std::sync::Arc<BTreeSet<String>>,
     turn_id: String,
     enabled: bool,
     external_allowed: bool,
@@ -105,6 +109,9 @@ impl ProgramSpeculator {
             .into_iter()
             .take(self.max_calls)
         {
+            if !self.allowed_tools.contains(&call.name) {
+                continue;
+            }
             let external = matches!(
                 hi_tools::speculation_class(&call.name),
                 hi_tools::SpeculationClass::IdempotentExternal
@@ -373,6 +380,7 @@ impl crate::Agent {
         calls: &[(String, String, String)],
         completion_content: &mut Vec<Content>,
         tool_specs: &[hi_ai::ToolSpec],
+        tool_envelope: &hi_tools::envelope::ToolEnvelope,
         read_only_intent: Option<crate::steering::ReviewIntent>,
         max_parallel_tools: usize,
         task_contract: &TaskContract,
@@ -394,6 +402,12 @@ impl crate::Agent {
         fast_feedback: &mut super::super::fast_feedback::FastFeedbackState,
         ui: &mut dyn Ui,
     ) -> Result<ToolBatchOutcome> {
+        // The negotiated provider limit is part of the sealed request. Even if
+        // the session is configured for wider fan-out, execution may never
+        // exceed what the request advertised and audited.
+        let max_parallel_tools = max_parallel_tools
+            .min(usize::from(tool_envelope.payload.limits.max_parallel_calls))
+            .max(1);
         // The batch has not announced any of its tools yet, so an interrupt
         // already present here can only belong to the previously visible tool
         // (most notably a preflight whose result was still queued in the TUI).
@@ -403,7 +417,7 @@ impl crate::Agent {
         if calls.iter().any(|(_, name, _)| {
             hi_tools::is_filesystem_mutating(name)
                 || name == "bash"
-                || (self.workspace_durability_enabled()
+                || (self.pipefs_workspace_active()
                     && matches!(name.as_str(), "bash_output" | "bash_kill" | "use_tool"))
         }) {
             // A real mutation changes the meaning of every shadow read. Drop
@@ -419,6 +433,8 @@ impl crate::Agent {
                 .execute_program_batch(
                     calls,
                     completion_content,
+                    tool_specs,
+                    tool_envelope,
                     read_only_intent,
                     progress_tracker,
                     tool_timeline,
@@ -455,18 +471,14 @@ impl crate::Agent {
         let mut interrupted_calls = 0usize;
         let mut interrupted_coordination_calls = 0usize;
         let mut protocol_validation_errors = Vec::new();
-        let batch_may_mutate_workspace = !self.config.gates.dry_run
+        let batch_requires_settlement = !self.config.gates.dry_run
             && calls.iter().any(|(_, name, arguments)| {
-                implementation_tool_call_mutates(name, arguments)
-                    || hi_tools::is_filesystem_mutating(name)
-                    || name == "bash"
-                    || (self.workspace_durability_enabled()
-                        && matches!(name.as_str(), "bash_output" | "bash_kill" | "use_tool"))
+                workspace_operation_requires_settlement(name, arguments)
             });
-        if batch_may_mutate_workspace {
+        let mut workspace_intent = if batch_requires_settlement {
             let opaque = calls.iter().any(|(_, name, _)| {
                 matches!(name.as_str(), "bash" | "bash_output" | "bash_kill")
-                    || (self.workspace_durability_enabled() && name == "use_tool")
+                    || (self.pipefs_workspace_active() && name == "use_tool")
             });
             let paths = (!opaque).then(|| {
                 calls
@@ -474,8 +486,13 @@ impl crate::Agent {
                     .filter_map(|(_, name, arguments)| hi_tools::target_path(name, arguments))
                     .collect::<Vec<_>>()
             });
-            self.begin_durable_workspace_mutation(paths).await?;
-        }
+            let intent = workspace_mutation_intent(calls, paths);
+            self.begin_classified_workspace_operation(intent.clone())
+                .await?;
+            Some(intent)
+        } else {
+            None
+        };
         // Infer within-batch dependencies (a read of a file a mutating
         // call earlier in the batch targeted must observe that mutation;
         // mutating calls serialize). The scheduler below runs ready
@@ -597,24 +614,46 @@ impl crate::Agent {
         // local execution boundary. Validate the declared Draft
         // 2020-12 schema here: malformed model output receives a typed tool
         // result and can never reach a workspace-mutating executor.
-        let batch_validation_error = hi_ai::validate_client_tool_batch_limits(
+        let envelope_error = if !tool_envelope.digest_is_valid() {
+            Some("tool envelope digest does not match its payload".to_string())
+        } else if !tool_envelope.matches_specs(tool_specs) {
+            Some("execution schemas do not match the sealed tool envelope".to_string())
+        } else {
+            None
+        };
+        let batch_validation_error = hi_ai::validate_client_tool_batch_limits_with(
             calls
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| !completed[*index])
                 .map(|(_, (_, _, arguments))| arguments.as_str()),
+            tool_envelope.payload.limits.max_tool_argument_bytes as usize,
         )
         .err();
         for (i, (id, name, arguments)) in calls.iter().enumerate().take(permitted_prefix) {
             if completed[i] {
                 continue;
             }
-            let error = match batch_validation_error.clone() {
-                Some(error) => error,
-                None => match hi_ai::validate_client_tool_call(id, name, arguments, tool_specs) {
+            let error = if let Some(error) = envelope_error.clone() {
+                error
+            } else if !tool_envelope.admits(name) {
+                format!(
+                    "tool `{name}` is outside the model request's sealed envelope {}",
+                    tool_envelope.digest
+                )
+            } else if let Some(error) = batch_validation_error.clone() {
+                error.to_string()
+            } else {
+                match hi_ai::validate_client_tool_call_with_limit(
+                    id,
+                    name,
+                    arguments,
+                    tool_specs,
+                    tool_envelope.payload.limits.max_tool_argument_bytes as usize,
+                ) {
                     Ok(()) => continue,
-                    Err(error) => error,
-                },
+                    Err(error) => error.to_string(),
+                }
             };
             ui.tool_call_id(id, name, arguments);
             let content = serde_json::json!({
@@ -2063,6 +2102,10 @@ impl crate::Agent {
                 ui.tool_call_id(&calls[i].0, name, &calls[i].2);
                 let path = hi_tools::target_path(name, &calls[i].2).unwrap_or_default();
                 self.record_tool_effects(&output.effects)?;
+                // Poll/kill outcomes are authoritative durability notifications.
+                if let Some(background) = &output.background {
+                    self.observe_durable_background_process(background).await?;
+                }
                 for change in &output.effects.file_changes {
                     batch_mutated_paths.insert(change.path.clone());
                 }
@@ -2186,7 +2229,7 @@ impl crate::Agent {
                 // `bash` also invalidates but always runs alone (above).
                 if hi_tools::is_filesystem_mutating(&calls[i].1)
                     || calls[i].1 == "bash"
-                    || (self.workspace_durability_enabled() && calls[i].1 == "use_tool")
+                    || (self.pipefs_workspace_active() && calls[i].1 == "use_tool")
                 {
                     self.invalidate_snapshot();
                     // Proactive per-edit verify: kick off a background
@@ -2240,6 +2283,23 @@ impl crate::Agent {
             completion_order
         );
         let mut results: Vec<(String, String)> = results.into_iter().flatten().collect();
+        if workspace_intent.is_none() {
+            let pending = self.runtime.background().pending_job_settlements().await;
+            let retained = tool_timeline.as_slice();
+            let batch_entries = retained
+                .len()
+                .checked_sub(calls.len())
+                .and_then(|start| retained.get(start..))
+                .unwrap_or(&[]);
+            if terminal_background_requires_reconciliation(batch_entries, &pending) {
+                speculation_registry.invalidate_all();
+                let intent = hi_workspace::MutationIntent::reconciliation();
+                self.workspace_coordination
+                    .begin_intent(self.workspace_durability.clone(), intent.clone())
+                    .await?;
+                workspace_intent = Some(intent);
+            }
+        }
         append_fast_feedback(
             self,
             calls,
@@ -2252,12 +2312,43 @@ impl crate::Agent {
             ui,
         )
         .await;
-        // Do not commit successful mutating tool results to the provider
-        // transcript until the materialized workspace is durably represented
-        // by a remote PipeFS head. A failure leaves the controller's recovery
-        // marker and blocks subsequent mutations until `/pipefs retry`.
-        if batch_may_mutate_workspace {
-            self.checkpoint_durable_workspace().await?;
+        // Stage the exact result before remote settlement, then publish it to
+        // the live/provider transcript only after the workspace controller has
+        // returned a receipt. This prevents both a one-step-behind causal batch
+        // and a locally visible false-success result after an ambiguous commit.
+        let retained = tool_timeline.as_slice();
+        let batch_entries = retained
+            .len()
+            .checked_sub(calls.len())
+            .and_then(|start| retained.get(start..))
+            .unwrap_or(&[]);
+        if let Some(intent) = workspace_intent.as_ref() {
+            let execution = workspace_execution_report(intent, batch_entries, calls.len());
+            if let Err(stage_error) = self.stage_active_workspace_execution(
+                calls,
+                completion_content,
+                &results,
+                &execution,
+            ) {
+                let mut indeterminate = execution;
+                indeterminate.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
+                indeterminate.detail = Some(format!(
+                    "workspace effects ran, but their transcript could not be staged: {stage_error:#}"
+                ));
+                return match self
+                    .checkpoint_durable_workspace_with_execution(indeterminate)
+                    .await
+                {
+                    Err(settlement_error) => Err(settlement_error).context(format!(
+                        "workspace transcript staging failed before settlement: {stage_error:#}"
+                    )),
+                    Ok(()) => Err(stage_error).context(
+                        "workspace transcript staging failed; execution remains indeterminate",
+                    ),
+                };
+            }
+            self.checkpoint_durable_workspace_with_execution(execution)
+                .await?;
         }
         self.messages
             .push_assistant_with_results(std::mem::take(completion_content), results);
@@ -2334,6 +2425,8 @@ impl crate::Agent {
         &mut self,
         calls: &[(String, String, String)],
         completion_content: &mut Vec<Content>,
+        tool_specs: &[hi_ai::ToolSpec],
+        tool_envelope: &hi_tools::envelope::ToolEnvelope,
         read_only_intent: Option<crate::steering::ReviewIntent>,
         progress_tracker: &mut ProgressTracker,
         tool_timeline: &mut ToolTimeline,
@@ -2353,7 +2446,21 @@ impl crate::Agent {
             .find(|(_, (_, name, _))| name == "run_program")
             .expect("program batch is entered with at least one program call");
         let mut outer_status = hi_tools::ToolStatus::Succeeded;
-        let (outcome, program_mutated_workspace) = if calls.len() != 1 {
+        let envelope_error = if !tool_envelope.digest_is_valid() {
+            Some("tool envelope digest does not match its payload".to_string())
+        } else if !tool_envelope.matches_specs(tool_specs) {
+            Some("execution schemas do not match the sealed tool envelope".to_string())
+        } else if !tool_envelope.admits("run_program") {
+            Some(format!(
+                "run_program is outside the model request's sealed envelope {}",
+                tool_envelope.digest
+            ))
+        } else {
+            hi_ai::validate_client_tool_call(id, "run_program", arguments, tool_specs)
+                .err()
+                .map(|error| error.to_string())
+        };
+        let (outcome, program_effect_may_have_occurred, workspace_intent) = if calls.len() != 1 {
             outer_status = hi_tools::ToolStatus::Failed;
             (
                 ProgramOutcome::Failed {
@@ -2361,6 +2468,17 @@ impl crate::Agent {
                     calls: Vec::new(),
                 },
                 false,
+                None,
+            )
+        } else if let Some(error) = envelope_error {
+            outer_status = hi_tools::ToolStatus::Denied;
+            (
+                ProgramOutcome::Failed {
+                    error,
+                    calls: Vec::new(),
+                },
+                false,
+                None,
             )
         } else if !self.config.program.mode_enabled() {
             outer_status = hi_tools::ToolStatus::Denied;
@@ -2370,6 +2488,7 @@ impl crate::Agent {
                     calls: Vec::new(),
                 },
                 false,
+                None,
             )
         } else {
             match serde_json::from_str::<serde_json::Value>(arguments)
@@ -2381,21 +2500,53 @@ impl crate::Agent {
                         .map(str::to_owned)
                 }) {
                 Some(source) => {
-                    if self.config.program.speculation_enabled() {
-                        self.launch_program_speculation(speculation_registry, id, &source);
+                    // The nested tool set is selected dynamically. Admit one
+                    // conservative outer operation before the program can
+                    // dispatch any effect, then settle it once with the exact
+                    // provider-facing aggregate result.
+                    let intent = workspace_program_intent("run_program", arguments, None);
+                    match self
+                        .begin_classified_workspace_operation(intent.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            if self.config.program.speculation_enabled() {
+                                self.launch_program_speculation(
+                                    speculation_registry,
+                                    id,
+                                    &source,
+                                    tool_envelope,
+                                );
+                            }
+                            let remaining_calls = self.max_tool_calls_cap().map(|_| {
+                                self.config
+                                    .loop_limits
+                                    .remaining_tool_calls(*sched_tool_calls)
+                                    .saturating_sub(1) as usize
+                            });
+                            let (outcome, effect_may_have_occurred) = self
+                                .run_program_host(
+                                    source,
+                                    id,
+                                    speculation_registry,
+                                    remaining_calls,
+                                    tool_envelope,
+                                    ui,
+                                )
+                                .await;
+                            speculation_registry.cancel_all();
+                            let _ = speculation_registry.telemetry();
+                            (outcome, effect_may_have_occurred, Some(intent))
+                        }
+                        Err(error) => (
+                            ProgramOutcome::Failed {
+                                error: format!("workspace operation blocked: {error:#}"),
+                                calls: Vec::new(),
+                            },
+                            false,
+                            None,
+                        ),
                     }
-                    let remaining_calls = self.max_tool_calls_cap().map(|_| {
-                        self.config
-                            .loop_limits
-                            .remaining_tool_calls(*sched_tool_calls)
-                            .saturating_sub(1) as usize
-                    });
-                    let outcome = self
-                        .run_program_host(source, id, speculation_registry, remaining_calls, ui)
-                        .await;
-                    speculation_registry.cancel_all();
-                    let _ = speculation_registry.telemetry();
-                    outcome
                 }
                 None => {
                     outer_status = hi_tools::ToolStatus::Failed;
@@ -2405,6 +2556,7 @@ impl crate::Agent {
                             calls: Vec::new(),
                         },
                         false,
+                        None,
                     )
                 }
             }
@@ -2412,7 +2564,9 @@ impl crate::Agent {
         if matches!(outcome, ProgramOutcome::Cancelled { .. }) {
             outer_status = hi_tools::ToolStatus::Cancelled;
         } else if matches!(outcome, ProgramOutcome::Failed { .. }) {
-            outer_status = hi_tools::ToolStatus::Failed;
+            if outer_status != hi_tools::ToolStatus::Denied {
+                outer_status = hi_tools::ToolStatus::Failed;
+            }
             // Give the model one ordinary-tool recovery request. This flag is
             // consumed while shaping that next request, so a repeated model
             // failure cannot create an unbounded fallback loop.
@@ -2444,13 +2598,6 @@ impl crate::Agent {
             "{\"status\":\"failed\",\"error\":\"program result was not serializable\"}".into()
         });
         let (content, _) = hi_tools::bound_tool_content(raw);
-        // Nested program calls use the same native tools as ordinary batches,
-        // but their effects are hidden behind one provider-facing envelope.
-        // Reconcile before publishing that envelope so successful program
-        // output never gets ahead of the durable PipeFS head.
-        if program_mutated_workspace {
-            self.checkpoint_durable_workspace().await?;
-        }
         if calls.len() != 1 {
             // The provider cannot receive an assistant tool-use without a
             // matching result. Keep only the rejected program envelope in
@@ -2459,6 +2606,43 @@ impl crate::Agent {
             let program_id = &calls[program_index].0;
             completion_content
                 .retain(|block| !matches!(block, Content::ToolCall { id, .. } if id != program_id));
+        }
+        // Nested program calls use the same native tools as ordinary batches,
+        // but their effects are hidden behind one provider-facing envelope.
+        // Stage that exact envelope before settlement so neither workspace
+        // bytes nor a no-head-change external receipt can get one turn ahead
+        // of the transcript that explains it.
+        if let Some(intent) = workspace_intent.as_ref() {
+            let execution = workspace_program_execution_report(
+                intent,
+                &outcome,
+                program_effect_may_have_occurred,
+            );
+            let results = vec![(id.clone(), content.clone())];
+            if let Err(stage_error) = self.stage_active_workspace_execution(
+                calls,
+                completion_content,
+                &results,
+                &execution,
+            ) {
+                let mut indeterminate = execution;
+                indeterminate.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
+                indeterminate.detail = Some(format!(
+                    "program effects ran, but their transcript could not be staged: {stage_error:#}"
+                ));
+                return match self
+                    .checkpoint_durable_workspace_with_execution(indeterminate)
+                    .await
+                {
+                    Err(settlement_error) => Err(settlement_error).context(format!(
+                        "program transcript staging failed before settlement: {stage_error:#}"
+                    )),
+                    Ok(()) => Err(stage_error)
+                        .context("program transcript staging failed; execution is indeterminate"),
+                };
+            }
+            self.checkpoint_durable_workspace_with_execution(execution)
+                .await?;
         }
         let output = synthetic_tool_outcome(content.clone(), outer_status);
         ui.tool_call_id(id, "run_program", arguments);
@@ -2523,14 +2707,26 @@ impl crate::Agent {
         speculation_registry: &SpeculationRegistry,
         program_id: &str,
         source: &str,
+        tool_envelope: &hi_tools::envelope::ToolEnvelope,
     ) {
-        self.program_speculator()
+        self.program_speculator(tool_envelope)
             .launch(speculation_registry, program_id, source);
     }
 
-    pub(crate) fn program_speculator(&self) -> ProgramSpeculator {
+    pub(crate) fn program_speculator(
+        &self,
+        tool_envelope: &hi_tools::envelope::ToolEnvelope,
+    ) -> ProgramSpeculator {
         ProgramSpeculator {
             runner: self.program_tool_runner(),
+            allowed_tools: std::sync::Arc::new(
+                tool_envelope
+                    .payload
+                    .program_tools
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect(),
+            ),
             turn_id: format!("turn-{}", self.turn_count),
             enabled: self.config.program.speculation_enabled()
                 && self.provider.capabilities().streamed_tool_call_deltas,
@@ -2559,8 +2755,10 @@ impl crate::Agent {
         program_call_id: &str,
         speculation_registry: &SpeculationRegistry,
         max_calls: Option<usize>,
+        tool_envelope: &hi_tools::envelope::ToolEnvelope,
         ui: &mut dyn Ui,
     ) -> (ProgramOutcome, bool) {
+        let tool_specs = tool_envelope.program_specs();
         let cancel = CancellationToken::new();
         let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
         let params = ProgramRunParams {
@@ -2614,27 +2812,13 @@ impl crate::Agent {
                         };
                         match request {
                             ProgramHostRequest::ExecuteTool { call, reply } => {
-                                let authorized = self.authorize_program_call(&call, ui).await;
-                                let (mutates, durability_denied) = if authorized.is_some() {
-                                    (false, None)
-                                } else {
-                                    match self.fence_program_mutation(&call).await {
-                                        Ok(mutates) => {
-                                            mutated_workspace |= mutates;
-                                            (mutates, None)
-                                        }
-                                        Err(error) => (
-                                            false,
-                                            Some(program_failed_result(
-                                                &call,
-                                                format!("PipeFS mutation blocked: {error:#}"),
-                                            )),
-                                        ),
-                                    }
-                                };
+                                let authorized = self
+                                    .authorize_program_call(&call, &tool_specs, tool_envelope, ui)
+                                    .await;
+                                let mutates = authorized.is_none()
+                                    && self.program_call_requires_settlement(&call);
+                                mutated_workspace |= mutates;
                                 let resolved = if let Some(denied) = authorized {
-                                    denied
-                                } else if let Some(denied) = durability_denied {
                                     denied
                                 } else {
                                     self.resolve_program_call(
@@ -2646,7 +2830,7 @@ impl crate::Agent {
                                     .await
                                 };
                                 let (result, output) = self
-                                    .checkpoint_program_mutation(&call, mutates, resolved)
+                                    .observe_program_effect(&call, mutates, resolved)
                                     .await;
                                 ui.tool_call_id(&format!("program:{}", call.occurrence), &call.name, &serde_json::to_string(&call.arguments).unwrap_or_default());
                                 emit_tool_output(ui, &format!("program:{}", call.occurrence), &call.name, &output);
@@ -2659,44 +2843,40 @@ impl crate::Agent {
                                 // several concurrent futures.
                                 let mut authorized_calls = Vec::with_capacity(calls.len());
                                 for call in calls {
-                                    let denied = self.authorize_program_call(&call, ui).await;
+                                    let denied = self
+                                        .authorize_program_call(
+                                            &call,
+                                            &tool_specs,
+                                            tool_envelope,
+                                            ui,
+                                        )
+                                        .await;
                                     authorized_calls.push((call, denied));
                                 }
                                 let agent = &*self;
-                                let serialize_for_durability = agent.workspace_durability_enabled()
-                                    && authorized_calls.iter().any(|(call, denied)| {
-                                        denied.is_none() && agent.program_call_mutates(call)
-                                    });
+                                let serialize_for_durability = authorized_calls.iter().any(|(call, denied)| {
+                                    denied.is_none() && agent.program_call_requires_settlement(call)
+                                });
                                 let outputs = if serialize_for_durability {
                                     let mut outputs = Vec::with_capacity(authorized_calls.len());
                                     for (call, denied) in authorized_calls {
                                         let (mutates, resolved) = if let Some(denied) = denied {
                                             (false, denied)
                                         } else {
-                                            match agent.fence_program_mutation(&call).await {
-                                                Ok(mutates) => {
-                                                    mutated_workspace |= mutates;
-                                                    let resolved = agent
-                                                        .resolve_program_call(
-                                                            &call,
-                                                            program_call_id,
-                                                            speculation_registry,
-                                                            &cancel,
-                                                        )
-                                                        .await;
-                                                    (mutates, resolved)
-                                                }
-                                                Err(error) => (
-                                                    false,
-                                                    program_failed_result(
-                                                        &call,
-                                                        format!("PipeFS mutation blocked: {error:#}"),
-                                                    ),
-                                                ),
-                                            }
+                                            let mutates = agent.program_call_requires_settlement(&call);
+                                            mutated_workspace |= mutates;
+                                            let resolved = agent
+                                                .resolve_program_call(
+                                                    &call,
+                                                    program_call_id,
+                                                    speculation_registry,
+                                                    &cancel,
+                                                )
+                                                .await;
+                                            (mutates, resolved)
                                         };
                                         let resolved = agent
-                                            .checkpoint_program_mutation(&call, mutates, resolved)
+                                            .observe_program_effect(&call, mutates, resolved)
                                             .await;
                                         outputs.push((call, resolved));
                                     }
@@ -2832,11 +3012,34 @@ impl crate::Agent {
     async fn authorize_program_call(
         &mut self,
         call: &ProgramCall,
+        tool_specs: &[hi_ai::ToolSpec],
+        tool_envelope: &hi_tools::envelope::ToolEnvelope,
         ui: &mut dyn Ui,
     ) -> Option<(
         std::result::Result<hi_workflow::ProgramToolResult, String>,
         hi_tools::ToolOutcome,
     )> {
+        let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
+        if !tool_envelope.digest_is_valid()
+            || !tool_envelope.matches_program_specs(tool_specs)
+            || !tool_envelope.admits_program(&call.name)
+        {
+            return Some(program_denied_result(
+                call,
+                format!(
+                    "tool `{}` is outside the model request's sealed envelope {}",
+                    call.name, tool_envelope.digest
+                ),
+            ));
+        }
+        if let Err(error) = hi_ai::validate_client_tool_call(
+            &format!("program_{}", call.occurrence),
+            &call.name,
+            &arguments,
+            tool_specs,
+        ) {
+            return Some(program_denied_result(call, error.to_string()));
+        }
         if !egress_confirm_required(
             self.permission_mode,
             self.config.gates.confirm_edits,
@@ -2847,7 +3050,6 @@ impl crate::Agent {
         if self.approval_parked {
             return Some(program_denied_result(call, PARKED_TOOL_RESULT.to_string()));
         }
-        let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
         let decision = ui
             .confirm(confirmation_for_egress_tool(&call.name, &arguments))
             .await;
@@ -2869,34 +3071,15 @@ impl crate::Agent {
         Some(program_denied_result(call, message))
     }
 
-    async fn fence_program_mutation(&self, call: &ProgramCall) -> Result<bool> {
-        let mutates = self.program_call_mutates(call);
-        if !mutates {
-            return Ok(false);
-        }
-        let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
-        let paths = (!matches!(
-            call.name.as_str(),
-            "bash" | "bash_output" | "bash_kill" | "use_tool"
-        ))
-        .then(|| hi_tools::target_paths(&call.name, &arguments));
-        self.begin_durable_workspace_mutation(paths).await?;
-        Ok(true)
-    }
-
-    fn program_call_mutates(&self, call: &ProgramCall) -> bool {
+    fn program_call_requires_settlement(&self, call: &ProgramCall) -> bool {
         if self.config.gates.dry_run {
             return false;
         }
         let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
-        implementation_tool_call_mutates(&call.name, &arguments)
-            || hi_tools::is_filesystem_mutating(&call.name)
-            || call.name == "bash"
-            || (self.workspace_durability_enabled()
-                && matches!(call.name.as_str(), "bash_output" | "bash_kill" | "use_tool"))
+        workspace_operation_requires_settlement(&call.name, &arguments)
     }
 
-    async fn checkpoint_program_mutation(
+    async fn observe_program_effect(
         &self,
         call: &ProgramCall,
         mutates: bool,
@@ -2911,15 +3094,17 @@ impl crate::Agent {
         if !mutates {
             return resolved;
         }
-        match self.checkpoint_durable_workspace().await {
-            Ok(()) => resolved,
-            Err(error) => program_failed_result(
+        if let Some(background) = &resolved.1.background
+            && let Err(error) = self.observe_durable_background_process(background).await
+        {
+            return program_failed_result(
                 call,
                 format!(
-                    "local bytes changed but the PipeFS revision was not committed: {error:#}; run /pipefs retry"
+                    "background process state could not be durably recorded: {error:#}; run /pipefs retry"
                 ),
-            ),
+            );
         }
+        resolved
     }
 
     async fn execute_program_tool(
@@ -2986,195 +3171,4 @@ fn external_freshness_epoch(ttl_seconds: u64) -> u64 {
 }
 
 #[cfg(test)]
-mod scheduler_count_tests {
-    use super::{
-        ProgramRunGuard, normalize_unsupported_plan_completion,
-        plan_step_requires_execution_evidence, saturating_add_scheduler_count,
-    };
-    use hi_tools::{PlanStatus, PlanStep};
-
-    fn step(title: &str, status: PlanStatus) -> PlanStep {
-        PlanStep {
-            title: title.into(),
-            status,
-        }
-    }
-
-    #[test]
-    fn implementation_plan_completion_requires_execution_evidence() {
-        let title = "Build VoteInstruction::Vote transaction from tower decision";
-        assert!(plan_step_requires_execution_evidence(title));
-        assert!(plan_step_requires_execution_evidence(
-            "Wire vote transaction signing"
-        ));
-        assert!(plan_step_requires_execution_evidence(
-            "Persist vote state in SQLite"
-        ));
-        assert!(plan_step_requires_execution_evidence(
-            "Run the final test suite"
-        ));
-        assert!(
-            !plan_step_requires_execution_evidence("Understand fixture behavior"),
-            "a substring of a read-only subject must not look like an implementation verb"
-        );
-        let current = vec![step(title, PlanStatus::Active)];
-        let mut proposed = vec![step(title, PlanStatus::Done)];
-        let arguments = serde_json::json!({
-            "steps": [{"title": title, "status": "done"}]
-        })
-        .to_string();
-
-        assert_eq!(
-            normalize_unsupported_plan_completion(&current, &mut proposed, &arguments, false,),
-            vec![0]
-        );
-        assert_eq!(proposed[0].status, PlanStatus::Active);
-
-        let mut with_execution = vec![step(title, PlanStatus::Done)];
-        assert_eq!(
-            normalize_unsupported_plan_completion(&current, &mut with_execution, &arguments, true,),
-            Vec::<usize>::new()
-        );
-        assert_eq!(with_execution[0].status, PlanStatus::Done);
-
-        let current = vec![
-            step("Build parser", PlanStatus::Active),
-            step("Persist parser state", PlanStatus::Pending),
-        ];
-        let mut bulk_done = vec![
-            step("Build parser", PlanStatus::Done),
-            step("Persist parser state", PlanStatus::Done),
-        ];
-        let arguments = serde_json::json!({
-            "steps": [
-                {"title": "Build parser", "status": "done"},
-                {"title": "Persist parser state", "status": "done"}
-            ]
-        })
-        .to_string();
-        assert_eq!(
-            normalize_unsupported_plan_completion(&current, &mut bulk_done, &arguments, true,),
-            vec![1],
-            "one turn-global mutation must not self-certify every plan step"
-        );
-        assert_eq!(bulk_done[0].status, PlanStatus::Done);
-        assert_eq!(bulk_done[1].status, PlanStatus::Pending);
-    }
-
-    #[test]
-    fn explicit_per_step_no_change_evidence_can_complete_implementation() {
-        let title = "Implement compatibility shim";
-        let current = vec![step(title, PlanStatus::Active)];
-        let mut proposed = vec![step(title, PlanStatus::Done)];
-        let arguments = serde_json::json!({
-            "steps": [{
-                "title": title,
-                "status": "done",
-                "completion_evidence": "Existing implementation already handles both formats; focused test passed."
-            }]
-        })
-        .to_string();
-
-        assert_eq!(
-            normalize_unsupported_plan_completion(&current, &mut proposed, &arguments, false,),
-            Vec::<usize>::new()
-        );
-        assert_eq!(proposed[0].status, PlanStatus::Done);
-
-        for generic in ["done", "already done", "no changes required"] {
-            let mut unsupported = vec![step(title, PlanStatus::Done)];
-            let arguments = serde_json::json!({
-                "steps": [{
-                    "title": title,
-                    "status": "done",
-                    "completion_evidence": generic
-                }]
-            })
-            .to_string();
-            assert_eq!(
-                normalize_unsupported_plan_completion(
-                    &current,
-                    &mut unsupported,
-                    &arguments,
-                    false,
-                ),
-                vec![0],
-                "generic evidence {generic:?} bypassed the guard"
-            );
-            assert_eq!(unsupported[0].status, PlanStatus::Active);
-        }
-    }
-
-    #[test]
-    fn read_only_or_previously_done_steps_are_not_reopened() {
-        let mut inspection = vec![step("Inspect the vote path", PlanStatus::Done)];
-        assert_eq!(
-            normalize_unsupported_plan_completion(
-                &[step("Inspect the vote path", PlanStatus::Active)],
-                &mut inspection,
-                r#"{"steps":[{"title":"Inspect the vote path","status":"done"}]}"#,
-                false,
-            ),
-            Vec::<usize>::new()
-        );
-
-        let title = "Build vote transaction";
-        let mut retained = vec![step(title, PlanStatus::Done)];
-        assert_eq!(
-            normalize_unsupported_plan_completion(
-                &[step(title, PlanStatus::Done)],
-                &mut retained,
-                r#"{"steps":[{"title":"Build vote transaction","status":"done"}]}"#,
-                false,
-            ),
-            Vec::<usize>::new()
-        );
-    }
-
-    #[test]
-    fn scheduler_count_saturates_instead_of_wrapping() {
-        let mut total = u32::MAX - 1;
-        saturating_add_scheduler_count(&mut total, 2);
-        assert_eq!(total, u32::MAX);
-
-        saturating_add_scheduler_count(&mut total, 1);
-        assert_eq!(total, u32::MAX);
-    }
-
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn scheduler_count_clamps_oversized_host_counts() {
-        let mut total = 0;
-        saturating_add_scheduler_count(&mut total, (u32::MAX as usize) + 1);
-        assert_eq!(total, u32::MAX);
-    }
-
-    #[tokio::test]
-    async fn dropping_program_run_guard_cancels_unlimited_blocking_worker() {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let (host_tx, _host_rx) = tokio::sync::mpsc::unbounded_channel();
-        let params = hi_workflow::ProgramRunParams {
-            source: "loop {}".into(),
-            host_tx,
-            cancel: cancel.clone(),
-            max_ops: hi_workflow::ProgramRunParams::DEFAULT_MAX_OPS,
-            max_calls: None,
-        };
-        let worker = tokio::task::spawn_blocking(move || hi_workflow::run_program(params));
-        let watcher = tokio::spawn(std::future::pending::<()>());
-        let guard = ProgramRunGuard::new(cancel.clone(), watcher);
-
-        tokio::task::yield_now().await;
-        drop(guard);
-
-        assert!(cancel.is_cancelled());
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), worker)
-            .await
-            .expect("drop cancellation should stop the unlimited program")
-            .expect("program worker should join cleanly");
-        assert!(matches!(
-            outcome,
-            hi_workflow::ProgramOutcome::Cancelled { .. }
-        ));
-    }
-}
+mod scheduler_count_tests;

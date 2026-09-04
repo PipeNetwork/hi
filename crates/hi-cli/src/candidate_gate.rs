@@ -11,15 +11,14 @@ use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use hi_workspace::ResolvedHarnessSettings as Harness;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const VERIFY_LOCK_POLL_MILLIS: u64 = 25;
 /// Regenerable build/dependency artifacts excluded from candidate diffs and
-/// merges. The child's change ledger prunes these by name, so leaving them in
-/// the exact-diff comparison makes any repo without a `.gitignore` (fresh
-/// bootstrap workspaces) fail the report-vs-diff match the moment a build
-/// runs — and merging build output to the destination is never wanted anyway.
+/// merges. The child ledger prunes the same names; otherwise a build in a repo
+/// without `.gitignore` fails report-vs-diff. Build output is never merged.
 const PYCACHE_EXCLUDES: &[&str] = &[
     ":(exclude,glob)**/__pycache__/**",
     ":(exclude,glob)**/*.pyc",
@@ -712,7 +711,7 @@ pub(crate) fn run_verifier_sync_cancellable(
     }
     let root = root.to_path_buf();
     let command = command.to_string();
-    let timeout = hi_tools::check_timeout();
+    let timeout = hi_tools::check_timeout().or(Some(Harness::default().jobs.verifier_timeout));
     hi_tools::prepare_verify_workdir(&root);
     run_async_thread(move || async move {
         let runner = hi_tools::ProcessRunner::new(&root)?;

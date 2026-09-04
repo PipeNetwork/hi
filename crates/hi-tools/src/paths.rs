@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Canonicalize a not-yet-existing path by resolving its nearest existing
 /// ancestor and re-joining the not-yet-existing tail. Canonicalizing the
@@ -97,6 +97,13 @@ pub(crate) const READ_CACHE_MAX: usize = 50;
 /// Bound total cached text as well as entry count. Without a byte budget, the
 /// per-file read limit allowed 50 large files to retain roughly 800 MiB.
 pub(crate) const READ_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Host-provided resource bodies share a separate bounded cache. They are not
+/// invalidated when workspace files change: an `artifact://`, `session://`, or
+/// `job://` identity is immutable (or explicitly refreshed by its owner), not
+/// an alias for a workspace path.
+const RESOURCE_CACHE_MAX: usize = 128;
+const RESOURCE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const RESOURCE_BODY_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// LRU-ordered file-read cache: a HashMap for O(1) lookup
 /// paired with a VecDeque tracking access order. On `get`, the key is
@@ -109,6 +116,10 @@ pub struct ReadCache {
     map: HashMap<String, String>,
     order: std::collections::VecDeque<String>,
     bytes: usize,
+    resources: HashMap<hi_workspace::ResourceUri, String>,
+    resource_order: std::collections::VecDeque<hi_workspace::ResourceUri>,
+    resource_bytes: usize,
+    resource_state_root: Option<PathBuf>,
 }
 
 impl ReadCache {
@@ -117,7 +128,101 @@ impl ReadCache {
             map: HashMap::new(),
             order: std::collections::VecDeque::new(),
             bytes: 0,
+            resources: HashMap::new(),
+            resource_order: std::collections::VecDeque::new(),
+            resource_bytes: 0,
+            resource_state_root: None,
         }
+    }
+
+    /// Bind lazy, content-addressed resource resolution to this runtime's
+    /// private state directory. Rebinding replaces the old root rather than
+    /// allowing resource identities to cross workspace epochs.
+    pub fn set_resource_state_root(&mut self, state_root: PathBuf) {
+        self.resource_state_root = Some(state_root);
+        self.resources
+            .retain(|uri, _| uri.scheme() != hi_workspace::ResourceScheme::Artifact);
+        self.resource_order
+            .retain(|uri| uri.scheme() != hi_workspace::ResourceScheme::Artifact);
+        self.resource_bytes = self.resources.values().map(String::len).sum();
+    }
+
+    /// Register a bounded, host-resolved resource body for the `read` tool.
+    ///
+    /// The host remains responsible for authorization and for refreshing
+    /// mutable `session://` / `job://` references. Workspace resources are
+    /// deliberately excluded because they must pass the filesystem resolver.
+    pub fn register_resource(
+        &mut self,
+        uri: hi_workspace::ResourceUri,
+        body: String,
+    ) -> Result<(), ResourceRegistrationError> {
+        if uri.scheme() == hi_workspace::ResourceScheme::Workspace {
+            return Err(ResourceRegistrationError::WorkspaceAlias);
+        }
+        if body.len() > RESOURCE_BODY_MAX_BYTES {
+            return Err(ResourceRegistrationError::BodyTooLarge {
+                size: body.len(),
+                limit: RESOURCE_BODY_MAX_BYTES,
+            });
+        }
+
+        if let Some(previous) = self.resources.remove(&uri) {
+            self.resource_bytes = self.resource_bytes.saturating_sub(previous.len());
+            self.resource_order.retain(|entry| entry != &uri);
+        }
+        while self.resources.len() >= RESOURCE_CACHE_MAX
+            || self.resource_bytes.saturating_add(body.len()) > RESOURCE_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self.resource_order.pop_front() else {
+                break;
+            };
+            if let Some(previous) = self.resources.remove(&oldest) {
+                self.resource_bytes = self.resource_bytes.saturating_sub(previous.len());
+            }
+        }
+        self.resource_bytes = self.resource_bytes.saturating_add(body.len());
+        self.resources.insert(uri.clone(), body);
+        self.resource_order.push_back(uri);
+        Ok(())
+    }
+
+    /// Return a registered resource without exposing an unbounded borrow from
+    /// the cache mutex. Reads promote the identity to most-recently-used.
+    pub fn resource(&mut self, uri: &hi_workspace::ResourceUri) -> Option<String> {
+        if let Some(body) = self.resources.get(uri).cloned() {
+            self.resource_order.retain(|entry| entry != uri);
+            self.resource_order.push_back(uri.clone());
+            return Some(body);
+        }
+        let body = match uri.scheme() {
+            hi_workspace::ResourceScheme::Artifact => {
+                crate::candidate_workspace::read_candidate_artifact_resource(
+                    self.resource_state_root.as_deref()?,
+                    uri.reference(),
+                )
+                .ok()
+                .flatten()?
+            }
+            _ => return None,
+        };
+        self.register_resource(uri.clone(), body.clone()).ok()?;
+        Some(body)
+    }
+
+    /// Explicitly invalidate a host-provided resource. Ordinary file-cache
+    /// clears intentionally leave registered resources intact.
+    pub fn remove_resource(&mut self, uri: &hi_workspace::ResourceUri) {
+        if let Some(previous) = self.resources.remove(uri) {
+            self.resource_bytes = self.resource_bytes.saturating_sub(previous.len());
+            self.resource_order.retain(|entry| entry != uri);
+        }
+    }
+
+    pub fn clear_resources(&mut self) {
+        self.resources.clear();
+        self.resource_order.clear();
+        self.resource_bytes = 0;
     }
 
     /// Get a cached entry, promoting it to most-recently-used.
@@ -183,12 +288,22 @@ impl ReadCache {
         }
     }
 
-    /// Clear all entries (between turns).
+    /// Clear cached workspace files (between turns or after a mutation).
+    /// Host-registered resource identities survive until their owner removes
+    /// or refreshes them.
     pub fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
         self.bytes = 0;
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ResourceRegistrationError {
+    #[error("workspace:// resources must use the workspace path resolver")]
+    WorkspaceAlias,
+    #[error("resource body is {size} bytes; limit is {limit} bytes")]
+    BodyTooLarge { size: usize, limit: usize },
 }
 
 impl Default for ReadCache {
@@ -199,7 +314,11 @@ impl Default for ReadCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{READ_CACHE_MAX_BYTES, ReadCache, cache_key, lexical_abs};
+    use super::{
+        READ_CACHE_MAX_BYTES, RESOURCE_BODY_MAX_BYTES, ReadCache, ResourceRegistrationError,
+        cache_key, lexical_abs,
+    };
+    use hi_workspace::ResourceUri;
     use std::path::Path;
 
     #[test]
@@ -260,6 +379,41 @@ mod tests {
         }
         assert_eq!(cache.map.len(), 50);
         assert!(cache.map.contains_key("b"));
+    }
+
+    #[test]
+    fn registered_resources_are_bounded_explicit_and_not_file_cache_entries() {
+        let mut cache = ReadCache::new();
+        let artifact = ResourceUri::parse("artifact://candidate/abc").unwrap();
+        cache
+            .register_resource(artifact.clone(), "sealed evidence".into())
+            .unwrap();
+        cache.insert("/workspace/a".into(), "workspace bytes".into());
+
+        cache.clear();
+        assert!(cache.get("/workspace/a").is_none());
+        assert_eq!(
+            cache.resource(&artifact).as_deref(),
+            Some("sealed evidence")
+        );
+
+        assert!(matches!(
+            cache.register_resource(
+                ResourceUri::parse("workspace://src/lib.rs").unwrap(),
+                "not an alias".into()
+            ),
+            Err(ResourceRegistrationError::WorkspaceAlias)
+        ));
+        assert!(matches!(
+            cache.register_resource(
+                ResourceUri::parse("job://large/output").unwrap(),
+                "x".repeat(RESOURCE_BODY_MAX_BYTES + 1)
+            ),
+            Err(ResourceRegistrationError::BodyTooLarge { .. })
+        ));
+
+        cache.remove_resource(&artifact);
+        assert!(cache.resource(&artifact).is_none());
     }
 
     #[test]

@@ -1957,8 +1957,8 @@ fn to_profile_env_var_name_that_is_not_set_stored_as_literal() {
     assert_eq!(p.api_key.as_deref(), Some(name));
     assert!(p.api_key_env.is_none());
 
-    // Saving and loading runs the legacy migration. It must preserve the
-    // explicit field identity rather than guessing from the key's spelling.
+    // The in-memory form preserves the explicit literal identity. Persistence
+    // seals that literal into the private credential store.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let mut config = Config::default();
@@ -1968,9 +1968,24 @@ fn to_profile_env_var_name_that_is_not_set_stored_as_literal() {
     let loaded_profile = loaded.profiles.get("work").unwrap();
     assert_eq!(loaded_profile.api_key.as_deref(), Some(name));
     assert!(loaded_profile.api_key_env.is_none());
+    let persisted = read_config_file(&path).unwrap();
+    let persisted_profile = persisted.profiles.get("work").unwrap();
+    assert!(persisted_profile.api_key.is_none());
+    assert!(persisted_profile.api_key_env.is_none());
+    let reference = persisted_profile
+        .api_key_ref
+        .as_deref()
+        .expect("credential-store reference");
+    let key = reference
+        .strip_prefix("auth-store://")
+        .expect("private credential-store reference");
+    assert_eq!(
+        hi_ai::auth_store::load(key).map(|credential| credential.access),
+        Some(name.into())
+    );
     let text = std::fs::read_to_string(path).unwrap();
-    assert!(text.contains("api_key = \"HI_NEVER_SET_KEY_999\""));
-    assert!(!text.contains("api_key_env"));
+    assert!(!text.contains(name), "literal leaked into config: {text}");
+    hi_ai::auth_store::delete(key).unwrap();
 }
 
 #[test]
@@ -1990,48 +2005,6 @@ fn reading_untrusted_project_config_never_runs_write_back_migration() {
         original,
         "inspecting repository config rewrote untrusted project state"
     );
-}
-
-#[test]
-fn set_profile_model_updates_only_model() {
-    use super::{Config, Profile, set_profile_model};
-    let dir = std::env::temp_dir().join(format!(
-        "hi-set-model-test-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("config.toml");
-    let mut config = Config {
-        default_profile: Some("default".into()),
-        profiles: {
-            let mut m = std::collections::HashMap::new();
-            m.insert(
-                "default".into(),
-                Profile {
-                    provider: Some(ProviderName::Pipenetwork),
-                    model: Some("pipe/auto-coder".into()),
-                    api_key: Some("test-key".into()),
-                    ..Default::default()
-                },
-            );
-            m
-        },
-        ..Default::default()
-    };
-
-    set_profile_model(&mut config, "default", "ipop/coder-balanced", Some(&path))
-        .expect("set model");
-
-    let p = config.profiles.get("default").unwrap();
-    assert_eq!(p.model.as_deref(), Some("ipop/coder-balanced"));
-    assert_eq!(p.api_key.as_deref(), Some("test-key"));
-    let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.contains("model = \"ipop/coder-balanced\""));
-    assert!(text.contains("api_key = \"test-key\""));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn layered_test_dir(tag: &str) -> std::path::PathBuf {
@@ -2163,8 +2136,9 @@ fn rmw_creates_missing_file_with_only_the_delta() {
 #[test]
 fn migrate_moves_bogus_api_key_env_to_literal() {
     // Simulate a config written by the old buggy wizard: a literal key
-    // stored under api_key_env. The migration should move it to api_key.
-    use super::{Config, Profile, migrate_api_key_env_to_literal};
+    // stored under api_key_env. Loading repairs the runtime projection and
+    // seals the persistent copy into the private credential store.
+    use super::{Config, Profile, read_config, save_config_to};
     let dir = std::env::temp_dir().join(format!(
         "hi-migrate-test-{}",
         std::time::SystemTime::now()
@@ -2174,7 +2148,7 @@ fn migrate_moves_bogus_api_key_env_to_literal() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.toml");
-    let mut config = Config {
+    let config = Config {
         default_profile: Some("default".into()),
         profiles: {
             let mut m = std::collections::HashMap::new();
@@ -2193,20 +2167,33 @@ fn migrate_moves_bogus_api_key_env_to_literal() {
     };
     // No env var named "api_c55ffaeda6574cdb" is set, so this is bogus.
     assert!(std::env::var("api_c55ffaeda6574cdb").is_err());
-    migrate_api_key_env_to_literal(&mut config, &path);
-    let p = config.profiles.get("default").unwrap();
+    save_config_to(&config, &path).unwrap();
+    let loaded = read_config(&path).unwrap();
+    let p = loaded.profiles.get("default").unwrap();
     assert_eq!(p.api_key.as_deref(), Some("api_c55ffaeda6574cdb"));
     assert!(p.api_key_env.is_none(), "bogus env ref must be cleared");
-    // The config file should have been rewritten with the repair.
+
+    let persisted = super::read_config_file(&path).unwrap();
+    let p = persisted.profiles.get("default").unwrap();
+    assert!(p.api_key.is_none());
+    assert!(p.api_key_env.is_none());
+    let reference = p
+        .api_key_ref
+        .as_deref()
+        .expect("credential-store reference");
+    let key = reference
+        .strip_prefix("auth-store://")
+        .expect("private credential-store reference");
+    assert_eq!(
+        hi_ai::auth_store::load(key).map(|credential| credential.access),
+        Some("api_c55ffaeda6574cdb".into())
+    );
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(
-        text.contains("api_key ="),
-        "file should have literal api_key"
+        !text.contains("api_c55ffaeda6574cdb"),
+        "literal leaked: {text}"
     );
-    assert!(
-        !text.contains("api_key_env"),
-        "file should not have api_key_env: {text}"
-    );
+    hi_ai::auth_store::delete(key).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2518,6 +2505,10 @@ fn set_rsi_config_persists_controls_without_erasing_other_config() {
                 ..Default::default()
             },
         )]),
+        rsi: Some(RsiSection {
+            api_key_env: Some("HI_TEST_RSI_KEY".into()),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     save_config_to(&config, &path).unwrap();
@@ -2538,6 +2529,9 @@ fn set_rsi_config_persists_controls_without_erasing_other_config() {
     assert_eq!(rsi.enabled, Some(true));
     assert_eq!(rsi.maximum_cost_microusd, Some(2_500_000));
     assert_eq!(rsi.channel.as_deref(), Some("beta"));
+    assert_eq!(rsi.api_key_ref.as_deref(), Some("env://HI_TEST_RSI_KEY"));
+    assert!(rsi.api_key.is_none());
+    assert!(rsi.api_key_env.is_none());
 
     set_rsi_config(&mut config, None, Some(4_000_000), None, Some(&path)).unwrap();
     let saved = read_config_file(&path).unwrap();

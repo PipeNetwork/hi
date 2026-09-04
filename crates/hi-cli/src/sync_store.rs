@@ -9,13 +9,13 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+pub(crate) mod records;
 
 const MAX_EVENTS: i64 = 10_000;
 const MAX_EVENT_BYTES: i64 = 25 * 1024 * 1024;
 const MAX_EVENT_AGE_SECS: i64 = 15 * 60;
 static PROCESS_MODE_OVERRIDE: OnceLock<SyncMode> = OnceLock::new();
 static PROCESS_MODE_DEFAULT: OnceLock<SyncMode> = OnceLock::new();
-
 pub fn set_process_mode_override(mode: SyncMode) {
     let _ = PROCESS_MODE_OVERRIDE.set(mode);
 }
@@ -161,6 +161,11 @@ impl SyncStore {
                last_success_unix INTEGER, last_error TEXT, lease_token TEXT,
                lease_generation INTEGER NOT NULL DEFAULT 0, lease_owner TEXT,
                lease_expiry_unix INTEGER NOT NULL DEFAULT 0, event_drops INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS pipefs_workspace_execution_acks (
+               session_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+               execution_digest TEXT NOT NULL, server_cursor INTEGER NOT NULL,
+               PRIMARY KEY(session_id, operation_id, execution_digest)
              );",
         );
         Self {
@@ -279,6 +284,13 @@ impl SyncStore {
                lease_expiry_unix INTEGER NOT NULL DEFAULT 0,
                event_drops INTEGER NOT NULL DEFAULT 0
              );
+             CREATE TABLE IF NOT EXISTS pipefs_workspace_execution_acks (
+               session_id TEXT NOT NULL,
+               operation_id TEXT NOT NULL,
+               execution_digest TEXT NOT NULL,
+               server_cursor INTEGER NOT NULL,
+               PRIMARY KEY(session_id, operation_id, execution_digest)
+             );
              -- Every pre-v2 drop count included one false drop per successful
              -- enqueue, so none of those counters are trustworthy. Reset them
              -- once, then seal the migration before using the corrected delta.
@@ -289,7 +301,7 @@ impl SyncStore {
                );
              INSERT INTO sync_settings(key,value) VALUES('live_event_drop_formula','2')
                ON CONFLICT(key) DO UPDATE SET value=excluded.value;
-             PRAGMA user_version = 2;
+             PRAGMA user_version = 3;
              COMMIT;",
         )?;
         Ok(Self {
@@ -652,21 +664,7 @@ impl SyncStore {
     }
 
     pub fn acknowledge_records(&self, session_id: &str, ids: &[i64], cursor: u64) -> Result<()> {
-        let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for id in ids {
-            transaction.execute("DELETE FROM record_outbox WHERE id=?1", [id])?;
-        }
-        transaction.execute(
-            "INSERT INTO session_sync(session_id,server_cursor,last_success_unix,last_error)
-             VALUES(?1,?2,?3,NULL)
-             ON CONFLICT(session_id) DO UPDATE SET
-               server_cursor=MAX(server_cursor,excluded.server_cursor),
-               last_success_unix=excluded.last_success_unix,last_error=NULL",
-            params![session_id, cursor, now()],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        records::acknowledge(self, session_id, ids, cursor)
     }
 
     /// Give quarantined records another chance. Called once per process (per
@@ -836,7 +834,8 @@ impl SyncStore {
 
     pub fn purge(&self) -> Result<()> {
         self.connection.lock().unwrap().execute_batch(
-            "DELETE FROM record_outbox; DELETE FROM live_event_queue; DELETE FROM session_sync;",
+            "DELETE FROM record_outbox; DELETE FROM live_event_queue; DELETE FROM session_sync;
+             DELETE FROM pipefs_workspace_execution_acks;",
         )?;
         Ok(())
     }

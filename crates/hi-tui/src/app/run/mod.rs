@@ -10,10 +10,10 @@ mod turn_execution;
 
 use auth::{apply_tui_auth, parse_tui_auth_arg};
 pub(crate) use drive::drive;
-pub(crate) use helpers::review_next_hunk;
 #[cfg(test)]
 pub(crate) use helpers::search_transcript;
 use helpers::{ChordPipeline, expand_file_mentions, run_chord_pipeline, run_shell_escape_async};
+pub(crate) use helpers::{handle_normal_mode, review_next_hunk};
 use queue::reconcile_queue_with_interjections;
 use turn_execution::run_agent_turn;
 
@@ -176,10 +176,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         race_defaults,
         race_setup_saver,
     );
+    app.configure_session_projection_v2(agent.harness_settings().features.session_projection_v2);
     // Install lifecycle tracing before startup restoration can enqueue a plan
-    // or goal drive.  Those prompts are real queue members just like input
-    // accepted after first paint, so their enqueue must precede the matching
-    // dequeue in the diagnostic stream.
+    // or goal drive. Those real queue members must be traced before dequeue.
     app.tui_event_trace = tui_event_trace.clone();
     app.session_remember = session_remember;
     app.x402_broker = x402_broker;
@@ -354,7 +353,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     let mut fire_lock = None;
     let mut may_manage_loops =
         ensure_owned_loop_fire_lock(fleet_launcher.loops_file.as_deref(), &mut fire_lock);
-    if agent.workspace_durability_enabled() {
+    if agent.pipefs_workspace_active() {
         // Loop children capture the launch workspace and cannot join this
         // process's PipeFS lease/durability fence. In particular, persisted
         // autofix loops must never re-arm against the directory that PipeFS
@@ -2152,7 +2151,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     let may_activate = matches!(operation.as_str(), "on" | "enable" | "retry");
                     let turning_off = matches!(operation.as_str(), "off" | "disable");
 
-                    if may_activate && !agent.workspace_durability_enabled() {
+                    if may_activate && !agent.pipefs_workspace_active() {
                         may_manage_loops = ensure_owned_loop_fire_lock(
                             fleet_launcher.loops_file.as_deref(),
                             &mut fire_lock,
@@ -2216,7 +2215,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     }
 
                     app.handle_command(agent, Command::Pipefs(arg)).await;
-                    let pipefs_active = agent.workspace_durability_enabled();
+                    let pipefs_active = agent.pipefs_workspace_active();
                     let launch_workspace_active =
                         agent.workspace_root() == fleet_launcher.workspace_root;
                     if turning_off && !pipefs_active && launch_workspace_active {
@@ -2266,7 +2265,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 // `/loop`: recurring agent turns on a cadence (manager task).
                 Command::Loop(arg) => {
                     if app.loops.is_none() {
-                        let message = if agent.workspace_durability_enabled() {
+                        let message = if agent.pipefs_workspace_active() {
                             "loops are suspended while PipeFS is active; /pipefs off re-arms them when this TUI owns the fire lock"
                         } else {
                             "loops are managed by a background daemon — stop it to manage them here, or use /digest to see what they've noticed"
@@ -3066,7 +3065,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 // over the same terminal/input/ticker; rows persist on `app.fleet`.
                 // `/fleet status` lists this project's resumable fleet sessions.
                 Command::Dashboard(arg) => {
-                    if agent.workspace_durability_enabled() {
+                    if agent.pipefs_workspace_active() {
                         app.push(Line::styled(
                             "/fleet is unavailable while PipeFS is active because its launcher is bound to the launch workspace",
                             Style::default().fg(crate::theme::theme().warning),
@@ -3172,7 +3171,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 // list/show/validate print to the transcript; run launches the
                 // engine with a live host bridge that spawns real FleetRows.
                 Command::Workflow(arg) => {
-                    if agent.workspace_durability_enabled() {
+                    if agent.pipefs_workspace_active() {
                         app.push(Line::styled(
                             "/workflow is unavailable while PipeFS is active because its child launcher is bound to the launch workspace",
                             Style::default().fg(crate::theme::theme().warning),
@@ -3350,7 +3349,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 Command::Goal(arg)
                     if hi_agent::command::parse_goal_objective_flags(&arg).workflow =>
                 {
-                    if agent.workspace_durability_enabled() {
+                    if agent.pipefs_workspace_active() {
                         app.push(Line::styled(
                             "/goal --workflow is unavailable while PipeFS is active because its child launcher is bound to the launch workspace",
                             Style::default().fg(crate::theme::theme().warning),
@@ -3606,7 +3605,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     // Fleet rows own launch-workspace worktrees.  A PipeFS session never
     // starts them, and must not clean a stale launch-root callback after its
     // portable cache has been acknowledged and removed.
-    if !agent.workspace_durability_enabled() {
+    if !agent.pipefs_workspace_active() {
         crate::dashboard::cleanup_fleet(&mut app);
     }
 

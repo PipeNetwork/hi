@@ -275,8 +275,7 @@ impl Provider for HangAfterMainProvider {
         if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
             Ok(completion(vec![Content::Text("done".into())], 1, 1))
         } else {
-            // Simulate a provider whose primary response completed but whose
-            // optional next-prompt request never produces a response.
+            // Keep the optional next-prompt request pending after the primary response.
             std::future::pending().await
         }
     }
@@ -354,8 +353,9 @@ impl Provider for ReviewMutationProvider {
         }
         Ok(self.responses.lock().unwrap().remove(0))
     }
-}
 
+    super::common::native_tool_test_provider!();
+}
 #[test]
 fn agent_construction_reports_runtime_and_verification_configuration_errors() {
     let provider = || std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
@@ -1410,9 +1410,9 @@ async fn hygiene_gate_reenters_model_on_unreferenced_creates() {
         bash_completion("true # hygiene repair"),
         completion(vec![Content::Text("repaired".into())], 1, 1),
     ];
-    let mut agent = agent(responses, cfg);
+    let mut a = agent(responses, cfg);
     let mut ui = RecUi::default();
-    let outcome = agent.run_turn("fix src/parser.rs", &mut ui).await.unwrap();
+    let outcome = a.run_turn("create src/parser.rs", &mut ui).await.unwrap();
     assert!(
         ui.statuses.iter().any(|s| s.contains("diff hygiene")),
         "hygiene should re-enter the model: {:?}",

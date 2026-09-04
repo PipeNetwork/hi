@@ -4,15 +4,18 @@ pub mod agent_path;
 pub mod backends;
 pub mod config;
 pub mod differential;
+mod identity;
 pub mod judge;
 pub mod platform;
+
+pub use identity::*;
 
 pub use platform::{
     ArtifactSpec, AttemptRecord, AttemptStatus, CasePlan, ClaimLevel, DatasetPlan, DatasetSource,
     DifferentialArm, DifferentialArmConfig, DifferentialComparison, EnvironmentSpec, EvalAttempt,
     EvalBackend, EvalEvidence, EvalInput, EvalManifest, EvalOutput, EvalProfile, EvalScore,
-    EvalStateStore, EvidencePolicy, IdentityDetails, ImportStore, ImportedDataset, ImportedTask,
-    McpServerSpec, NetworkPolicy, PLATFORM_SCHEMA_VERSION, PreparationReceipt, ProgressEvent,
-    ResourceSpec, RunIdentity, RunRecord, RunStatus, ScoringPolicy, SourceIdentity, TaskPackage,
-    TimedOutput, TranscriptMessage, VerifierSpec, command_output_with_timeout,
+    EvalStateStore, EvidencePolicy, ImportStore, ImportedDataset, ImportedTask, McpServerSpec,
+    NetworkPolicy, PLATFORM_SCHEMA_VERSION, PreparationReceipt, ProgressEvent, ResourceSpec,
+    RunIdentity, RunRecord, RunStatus, ScoringPolicy, SourceIdentity, TaskPackage, TimedOutput,
+    TranscriptMessage, VerifierSpec, command_output_with_timeout,
 };

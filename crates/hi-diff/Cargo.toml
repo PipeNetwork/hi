@@ -8,6 +8,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 hi-ai.workspace = true
+hi-tools.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

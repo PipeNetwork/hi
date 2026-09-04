@@ -11,6 +11,9 @@ use uuid::Uuid;
 
 use crate::RevisionKind;
 
+mod validation;
+use validation::validate_remote_state;
+
 const API_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug)]
@@ -32,7 +35,7 @@ impl PipeFsClientConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipeFsLease {
     pub token: String,
     pub generation: u64,
@@ -90,6 +93,13 @@ pub struct PipeFsCapabilities {
     pub maximum_workspace_bytes: u64,
     pub maximum_delta_chain: u32,
     pub transfer_expiry_seconds: u64,
+    /// Versioned optional features advertised by newer servers.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub writer_protocols: Vec<u16>,
+    #[serde(default)]
+    pub writer_protocol: Option<u16>,
 }
 
 impl PipeFsCapabilities {
@@ -105,14 +115,33 @@ impl PipeFsCapabilities {
     pub fn restore_available(&self) -> bool {
         self.restore_enabled.unwrap_or(self.enabled)
     }
+
+    pub fn causal_commit_available(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|value| value == crate::CAUSAL_COMMIT_CAPABILITY)
+            && self.supports_writer_protocol(crate::CAUSAL_WRITER_PROTOCOL)
+    }
+
+    pub fn supports_writer_protocol(&self, protocol: u16) -> bool {
+        self.writer_protocol == Some(protocol) || self.writer_protocols.contains(&protocol)
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArtifactDescriptor {
     pub blake3: String,
     pub size_bytes: u64,
     #[serde(default)]
     pub media_type: String,
+}
+
+/// Immutable revision uploaded for a protocol-2 causal commit but not yet
+/// installed as the workspace head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadedRevision {
+    pub revision_id: Uuid,
+    pub artifact: ArtifactDescriptor,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -161,10 +190,10 @@ pub enum PipeFsError {
 
 #[derive(Clone)]
 pub struct PipeFsClient {
-    config: PipeFsClientConfig,
-    base_url: Url,
+    pub(crate) config: PipeFsClientConfig,
+    pub(crate) base_url: Url,
     cache_scope: PipeFsCacheScope,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -257,13 +286,15 @@ impl PipeFsClient {
     }
 
     pub async fn state(&self, session_id: &str) -> Result<PipeFsRemoteState, PipeFsError> {
-        self.api_json(
-            Method::GET,
-            &format!("hi/sessions/{session_id}/pipefs"),
-            None,
-            None,
-        )
-        .await
+        let state = self
+            .api_json(
+                Method::GET,
+                &format!("hi/sessions/{session_id}/pipefs"),
+                None,
+                None,
+            )
+            .await?;
+        validate_remote_state(session_id, state)
     }
 
     pub async fn set_enabled(
@@ -272,13 +303,71 @@ impl PipeFsClient {
         lease: &PipeFsLease,
         enabled: bool,
     ) -> Result<PipeFsRemoteState, PipeFsError> {
-        self.api_json(
-            Method::PUT,
-            &format!("hi/sessions/{session_id}/pipefs"),
-            Some(lease),
-            Some(serde_json::json!({ "enabled": enabled })),
-        )
-        .await
+        let state = self
+            .api_json(
+                Method::PUT,
+                &format!("hi/sessions/{session_id}/pipefs"),
+                Some(lease),
+                Some(serde_json::json!({ "enabled": enabled })),
+            )
+            .await?;
+        validate_remote_state(session_id, state)
+    }
+
+    /// Atomically publish a workspace operation and its transcript records.
+    /// Transport retries are safe because the server deduplicates by the
+    /// operation ID embedded in `request`.
+    pub async fn causal_commit(
+        &self,
+        session_id: &str,
+        lease: &PipeFsLease,
+        request: &crate::CausalCommitRequest,
+    ) -> Result<crate::CausalCommitReceipt, PipeFsError> {
+        request.validate(lease)?;
+        let body = serde_json::to_value(request)
+            .map_err(|error| PipeFsError::Protocol(error.to_string()))?;
+        let receipt: crate::CausalCommitReceipt = self
+            .api_json_with_timeout(
+                Method::POST,
+                &format!(
+                    "hi/sessions/{session_id}/pipefs/operations/{}/commit",
+                    request.operation.operation_id
+                ),
+                Some(lease),
+                Some(body),
+                self.config.transfer_timeout,
+            )
+            .await?;
+        // The workspace layer repeats this validation with its persisted
+        // previous cursor. This zero-baseline check still rejects malformed
+        // acknowledgements before they can leave the transport boundary.
+        receipt.validate_for_request(request, 0)?;
+        Ok(receipt)
+    }
+
+    pub async fn acknowledge_operation_intent(
+        &self,
+        session_id: &str,
+        lease: &PipeFsLease,
+        request: &crate::CausalIntentRequest,
+    ) -> Result<crate::CausalIntentReceipt, PipeFsError> {
+        request.validate(lease)?;
+        let receipt: crate::CausalIntentReceipt = self
+            .api_json_with_timeout(
+                Method::POST,
+                &format!(
+                    "hi/sessions/{session_id}/pipefs/operations/{}/intent",
+                    request.operation_id
+                ),
+                Some(lease),
+                Some(serde_json::to_value(request).map_err(|error| {
+                    PipeFsError::Protocol(format!("encoding operation intent: {error}"))
+                })?),
+                self.config.transfer_timeout,
+            )
+            .await?;
+        receipt.validate(request, lease)?;
+        Ok(receipt)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -325,7 +414,7 @@ impl PipeFsClient {
         let upload = self
             .upload_transfer(session_id, lease, &prepared, archive)
             .await;
-        let commit = self
+        let commit: Result<PipeFsRemoteState, PipeFsError> = self
             .api_json_with_timeout(
                 Method::POST,
                 &format!(
@@ -338,8 +427,8 @@ impl PipeFsClient {
             )
             .await;
         match (upload, commit) {
-            (Ok(()), result) => result,
-            (Err(_), Ok(state)) => Ok(state),
+            (Ok(()), result) => result.and_then(|state| validate_remote_state(session_id, state)),
+            (Err(_), Ok(state)) => validate_remote_state(session_id, state),
             (Err(upload_error), Err(PipeFsError::MissingRevision(_)))
             | (Err(upload_error), Err(PipeFsError::Storage(_))) => Err(upload_error),
             (Err(_), Err(commit_error)) => Err(commit_error),
@@ -362,11 +451,103 @@ impl PipeFsClient {
         logical_size_bytes: u64,
         idempotency_key: &str,
     ) -> Result<PipeFsRemoteState, PipeFsError> {
+        let (prepared, upload) = self
+            .prepare_and_upload_archive_file(
+                session_id,
+                lease,
+                expected_base_revision_id,
+                revision_type,
+                archive_path,
+                archive_size_bytes,
+                archive_blake3,
+                manifest_digest,
+                logical_size_bytes,
+                idempotency_key,
+            )
+            .await?;
+        // Commit is deliberately attempted even if the transfer returned an
+        // ambiguous network error: the immutable object may already exist.
+        let commit: Result<PipeFsRemoteState, PipeFsError> = self
+            .api_json_with_timeout(
+                Method::POST,
+                &format!(
+                    "hi/sessions/{session_id}/pipefs/revisions/{}/commit",
+                    prepared.revision_id
+                ),
+                Some(lease),
+                None,
+                self.config.transfer_timeout,
+            )
+            .await;
+        match (upload, commit) {
+            (Ok(()), result) => result.and_then(|state| validate_remote_state(session_id, state)),
+            (Err(_), Ok(state)) => validate_remote_state(session_id, state),
+            (Err(upload_error), Err(PipeFsError::MissingRevision(_)))
+            | (Err(upload_error), Err(PipeFsError::Storage(_))) => Err(upload_error),
+            (Err(_), Err(commit_error)) => Err(commit_error),
+        }
+    }
+
+    /// Upload an immutable revision without moving the workspace head. Only a
+    /// subsequent causal operation commit may publish this revision.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_archive_file(
+        &self,
+        session_id: &str,
+        lease: &PipeFsLease,
+        expected_base_revision_id: Option<Uuid>,
+        revision_type: RevisionKind,
+        archive_path: &Path,
+        archive_size_bytes: u64,
+        archive_blake3: &str,
+        manifest_digest: &str,
+        logical_size_bytes: u64,
+        idempotency_key: &str,
+    ) -> Result<UploadedRevision, PipeFsError> {
+        let (prepared, upload) = self
+            .prepare_and_upload_archive_file(
+                session_id,
+                lease,
+                expected_base_revision_id,
+                revision_type,
+                archive_path,
+                archive_size_bytes,
+                archive_blake3,
+                manifest_digest,
+                logical_size_bytes,
+                idempotency_key,
+            )
+            .await?;
+        upload?;
+        Ok(UploadedRevision {
+            revision_id: prepared.revision_id,
+            artifact: ArtifactDescriptor {
+                blake3: archive_blake3.to_owned(),
+                size_bytes: archive_size_bytes,
+                media_type: String::new(),
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_and_upload_archive_file(
+        &self,
+        session_id: &str,
+        lease: &PipeFsLease,
+        expected_base_revision_id: Option<Uuid>,
+        revision_type: RevisionKind,
+        archive_path: &Path,
+        archive_size_bytes: u64,
+        archive_blake3: &str,
+        manifest_digest: &str,
+        logical_size_bytes: u64,
+        idempotency_key: &str,
+    ) -> Result<(PreparedRevision, Result<(), PipeFsError>), PipeFsError> {
         let request = PrepareRequest {
             expected_base_revision_id,
             revision_type,
             artifact: ArtifactDescriptor {
-                blake3: archive_blake3.to_string(),
+                blake3: archive_blake3.to_owned(),
                 size_bytes: archive_size_bytes,
                 media_type: String::new(),
             },
@@ -387,7 +568,7 @@ impl PipeFsClient {
             .await?;
         if prepared.revision_type != revision_type {
             return Err(PipeFsError::Protocol(
-                "server changed the prepared revision type".to_string(),
+                "server changed the prepared revision type".to_owned(),
             ));
         }
         let upload = self
@@ -399,27 +580,7 @@ impl PipeFsClient {
                 archive_size_bytes,
             )
             .await;
-        // Commit is deliberately attempted even if the transfer returned an
-        // ambiguous network error: the immutable object may already exist.
-        let commit = self
-            .api_json_with_timeout(
-                Method::POST,
-                &format!(
-                    "hi/sessions/{session_id}/pipefs/revisions/{}/commit",
-                    prepared.revision_id
-                ),
-                Some(lease),
-                None,
-                self.config.transfer_timeout,
-            )
-            .await;
-        match (upload, commit) {
-            (Ok(()), result) => result,
-            (Err(_), Ok(state)) => Ok(state),
-            (Err(upload_error), Err(PipeFsError::MissingRevision(_)))
-            | (Err(upload_error), Err(PipeFsError::Storage(_))) => Err(upload_error),
-            (Err(_), Err(commit_error)) => Err(commit_error),
-        }
+        Ok((prepared, upload))
     }
 
     pub async fn download_revision(
@@ -1139,6 +1300,7 @@ mod tests {
         assert!(old.enrollment_available());
         assert!(old.writes_available());
         assert!(old.restore_available());
+        assert!(!old.causal_commit_available());
 
         let draining: PipeFsCapabilities = serde_json::from_value(serde_json::json!({
             "enabled": true,
@@ -1157,5 +1319,19 @@ mod tests {
         assert!(!draining.enrollment_available());
         assert!(!draining.writes_available());
         assert!(draining.restore_available());
+
+        let protocol_two: PipeFsCapabilities = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "archive_version": 1,
+            "transfer_modes": ["proxy"],
+            "maximum_revision_bytes": 1024,
+            "maximum_workspace_bytes": 4096,
+            "maximum_delta_chain": 20,
+            "transfer_expiry_seconds": 60,
+            "capabilities": ["causal_commit_v1"],
+            "writer_protocols": [1, 2]
+        }))
+        .unwrap();
+        assert!(protocol_two.causal_commit_available());
     }
 }

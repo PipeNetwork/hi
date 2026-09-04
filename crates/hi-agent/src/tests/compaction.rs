@@ -1,5 +1,32 @@
 use super::common::*;
 use super::*;
+struct RejectingCompactionSession;
+
+impl SessionSink for RejectingCompactionSession {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _messages: &[Message]) -> anyhow::Result<()> {
+        anyhow::bail!("injected compaction boundary failure")
+    }
+}
+
+struct PendingCompactionProvider {
+    entered: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Provider for PendingCompactionProvider {
+    async fn stream(
+        &self,
+        _request: hi_ai::ChatRequest,
+        _sink: &mut (dyn FnMut(hi_ai::StreamEvent) + Send),
+    ) -> anyhow::Result<Completion> {
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+}
 
 #[tokio::test]
 async fn compact_replaces_history_with_summary() {
@@ -61,6 +88,134 @@ async fn compact_replaces_history_with_summary() {
         }],
         "manual compaction persists summarization usage before writing the durable boundary"
     );
+}
+
+#[tokio::test]
+async fn compaction_is_a_read_only_unified_job_sealed_after_publication() {
+    let mut agent = agent(
+        vec![completion(
+            vec![Content::Text("durable summary".into())],
+            2,
+            1,
+        )],
+        config(),
+    );
+    agent.messages_mut().push(Message::user("old task"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text("old answer".into())]));
+    let state_root = agent.state_root().to_path_buf();
+    let binding = agent.workspace_controller_binding();
+
+    agent
+        .compact_with(CompactionKind::Summarize, &mut NullUi)
+        .await
+        .unwrap();
+
+    let store = hi_control::ControlStore::open_for_state(state_root).unwrap();
+    let jobs = store.jobs_for_binding(binding.binding_id.as_str()).unwrap();
+    let compaction = jobs
+        .iter()
+        .find(|job| job.kind == hi_control::ControlJobKind::Compaction)
+        .expect("compaction job projection");
+    assert_eq!(
+        compaction.effect_scope,
+        hi_control::ControlEffectScope::ReadOnly
+    );
+    assert_eq!(compaction.state, hi_control::ControlJobState::Succeeded);
+    assert!(agent.workspace_controller_status().active_jobs.is_empty());
+    assert!(agent.messages()[1].text().contains("durable summary"));
+}
+
+#[tokio::test]
+async fn compaction_boundary_failure_leaves_live_transcript_untouched() {
+    let mut agent = agent(
+        vec![completion(
+            vec![Content::Text("unpublished summary".into())],
+            2,
+            1,
+        )],
+        config(),
+    );
+    agent
+        .messages_mut()
+        .push(Message::user("keep this exact task"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text(
+            "keep this answer".into(),
+        )]));
+    let before = serde_json::to_value(agent.messages()).unwrap();
+    let state_root = agent.state_root().to_path_buf();
+    let binding = agent.workspace_controller_binding();
+    agent.set_session(Box::new(RejectingCompactionSession));
+
+    let error = agent
+        .compact_with(CompactionKind::Summarize, &mut NullUi)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("speculative compaction boundary")
+    );
+    assert_eq!(serde_json::to_value(agent.messages()).unwrap(), before);
+    let store = hi_control::ControlStore::open_for_state(state_root).unwrap();
+    let jobs = store.jobs_for_binding(binding.binding_id.as_str()).unwrap();
+    let compaction = jobs
+        .iter()
+        .find(|job| job.kind == hi_control::ControlJobKind::Compaction)
+        .expect("failed compaction job projection");
+    assert_eq!(compaction.state, hi_control::ControlJobState::Failed);
+}
+
+#[tokio::test]
+async fn cancelled_compaction_seals_its_read_only_job() {
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let config = config();
+    let _state_guard = config.test_state_root.clone();
+    let mut agent = Agent::new(
+        std::sync::Arc::new(PendingCompactionProvider {
+            entered: entered.clone(),
+        }),
+        config,
+    )
+    .unwrap();
+    agent.messages_mut().push(Message::user("old task"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text("old answer".into())]));
+    let state_root = agent.state_root().to_path_buf();
+    let binding = agent.workspace_controller_binding();
+    let worker = tokio::spawn(async move {
+        agent
+            .compact_with(CompactionKind::Summarize, &mut NullUi)
+            .await
+    });
+    entered.notified().await;
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let store = hi_control::ControlStore::open_for_state(&state_root).unwrap();
+            let jobs = store.jobs_for_binding(binding.binding_id.as_str()).unwrap();
+            if jobs.iter().any(|job| {
+                job.kind == hi_control::ControlJobKind::Compaction
+                    && job.state == hi_control::ControlJobState::Cancelled
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if settled.is_err() {
+        let store = hi_control::ControlStore::open_for_state(&state_root).unwrap();
+        let jobs = store.jobs_for_binding(binding.binding_id.as_str()).unwrap();
+        panic!("cancelled compaction lifecycle callback timed out: {jobs:?}");
+    }
 }
 
 #[tokio::test]
@@ -463,7 +618,17 @@ async fn read_only_safety_window_preserves_history_within_real_window() {
     agent.messages_mut().push(Message::user("x".repeat(60_000))); // ~15k tokens
     let before = agent.messages().len();
     let pre = agent
-        .ensure_request_fits_context("review this module", 2, 100, 0, Some(12_000), &mut NullUi)
+        .ensure_request_fits_context(
+            "review this module",
+            2,
+            100,
+            0,
+            crate::agent::ContextWindowLimits {
+                safety: Some(12_000),
+                provider: None,
+            },
+            &mut NullUi,
+        )
         .expect("must not hard-fail within the real window");
     assert!(
         !pre.dropped_prior_context,
@@ -489,7 +654,14 @@ async fn context_preflight_still_drops_when_real_window_exceeded() {
         .messages_mut()
         .push(Message::user("y".repeat(1_000_000))); // ~250k tokens
     let pre = agent
-        .ensure_request_fits_context("continue", 2, 100, 0, None, &mut NullUi)
+        .ensure_request_fits_context(
+            "continue",
+            2,
+            100,
+            0,
+            crate::agent::ContextWindowLimits::default(),
+            &mut NullUi,
+        )
         .expect("dropping history brings the request under the window");
     assert!(
         pre.dropped_prior_context,

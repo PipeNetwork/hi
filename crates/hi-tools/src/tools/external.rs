@@ -46,6 +46,15 @@ pub trait McpBackend: Send + Sync {
     /// Call a tool on a specific MCP server with the given JSON arguments.
     async fn call(&self, server: &str, tool: &str, arguments: &Value) -> Result<String>;
 
+    /// Read one resource URI advertised by a connected MCP server.
+    ///
+    /// The default keeps existing embedders source-compatible while making an
+    /// unsupported resource route explicit. Hosts with an MCP client should
+    /// delegate to its `resources/read` implementation.
+    async fn read_resource(&self, server: &str, uri: &str) -> Result<String> {
+        bail!("MCP resource reads are unavailable for server `{server}` ({uri})")
+    }
+
     /// Workspace MCP status table (`/mcp`). Default: empty (no host).
     async fn workspace_status(&self) -> String {
         String::new()

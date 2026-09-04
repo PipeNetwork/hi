@@ -19,17 +19,23 @@ const PIPENETWORK_DEFAULT_MAX_TOKENS: u32 = DEFAULT_MAX_TOKENS;
 const LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS: u32 = 2048;
 
 mod cli;
+mod credential_refs;
 mod file;
+mod harness;
 mod profile_edit;
 mod quality;
 mod session;
 mod settings;
 
 #[cfg(test)]
+mod credential_refs_tests;
+#[cfg(test)]
 mod tests;
 
 pub use cli::*;
+pub(crate) use credential_refs::{migrate_api_key_env_to_literal, resolve_credential_reference};
 pub use file::*;
+pub use harness::*;
 pub use profile_edit::*;
 pub use quality::*;
 pub use session::*;

@@ -49,10 +49,7 @@ impl XaiProvider {
 #[async_trait]
 impl Provider for XaiProvider {
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            native_tool_calls: true,
-            streamed_tool_call_deltas: true,
-        }
+        ProviderCapabilities::native_tools(true)
     }
 
     async fn stream(
@@ -302,6 +299,7 @@ mod tests {
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
             tools: tools.into(),
+            tool_envelope: None,
             max_tokens: 16,
             temperature: None,
             top_p: None,

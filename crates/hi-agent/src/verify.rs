@@ -15,11 +15,14 @@
 //! one small type instead of entangled with the main loop's locals and the
 //! `Agent`'s shared mutable fields.
 
+use anyhow::Context;
+
 use crate::config::VerifyStage;
 use crate::snapshot::{
     FileFingerprint, SnapshotCache, changed_files_between, workspace_snapshot_meta,
 };
 use crate::ui::Ui;
+use crate::workspace_coordination::WorkspaceCoordination;
 
 const VERIFICATION_EXECUTION_LIMIT: usize = 256;
 const VERIFICATION_EXECUTION_HEAD: usize = 32;
@@ -104,6 +107,11 @@ pub(crate) struct VerifyWorkspace<'a> {
     skip_affected_checks: Option<&'a std::collections::BTreeSet<String>>,
     /// Packages mid-turn `cargo test` already sealed green — skip `affected-test:`.
     skip_affected_tests: Option<&'a std::collections::BTreeSet<String>>,
+    /// The always-present controller used by live agent turns. Small verifier
+    /// unit tests may omit it; they never model a remotely authoritative
+    /// workspace.
+    coordination: Option<WorkspaceCoordination>,
+    durability: Option<std::sync::Arc<dyn crate::WorkspaceDurability>>,
 }
 
 impl<'a> VerifyWorkspace<'a> {
@@ -123,6 +131,8 @@ impl<'a> VerifyWorkspace<'a> {
             mutation_seen: false,
             skip_affected_checks: None,
             skip_affected_tests: None,
+            coordination: None,
+            durability: None,
         }
     }
 
@@ -158,6 +168,18 @@ impl<'a> VerifyWorkspace<'a> {
     ) -> Self {
         self.skip_affected_checks = Some(checks);
         self.skip_affected_tests = Some(tests);
+        self
+    }
+
+    /// Bind native verifier process execution to the same admission and
+    /// settlement path used by model-authored tools.
+    pub(crate) fn with_workspace_coordination(
+        mut self,
+        coordination: WorkspaceCoordination,
+        durability: Option<std::sync::Arc<dyn crate::WorkspaceDurability>>,
+    ) -> Self {
+        self.coordination = Some(coordination);
+        self.durability = durability;
         self
     }
 }
@@ -210,6 +232,224 @@ fn verification_runner(
     {
         hi_tools::ProcessRunner::new(root)
     }
+}
+
+/// Commands proven to be pure workspace reads do not need mutation admission.
+/// Every other native verifier command is opaque process execution: build and
+/// test tools routinely write caches, run hooks, or reach external services.
+fn native_verifier_intent(stage: &VerifyStage) -> Option<hi_workspace::MutationIntent> {
+    let classification = hi_tools::protocol::classify_shell_command(&stage.command);
+    if classification.is_proven_read_only() {
+        return None;
+    }
+    Some(hi_workspace::MutationIntent {
+        effect_scope: hi_workspace::EffectScope::LiveWriter,
+        replay_class: hi_workspace::ReplayClass::NonReplayableExternal,
+        dirty_paths: None,
+        description: Some(format!(
+            "native verifier `{}` ({:?})",
+            stage.name, classification.basis
+        )),
+    })
+}
+
+/// RAII fence for native verifier admission. If the verifier future is
+/// cancelled before it hands execution evidence to shielded settlement, the
+/// live permit is dropped and the controller enters recovery-required instead
+/// of remaining silently mutating forever.
+struct NativeVerifierAdmission {
+    coordination: WorkspaceCoordination,
+    durability: Option<std::sync::Arc<dyn crate::WorkspaceDurability>>,
+    operation_id: hi_workspace::OperationId,
+    intent: hi_workspace::MutationIntent,
+    armed: bool,
+}
+
+impl NativeVerifierAdmission {
+    async fn begin(
+        workspace: &VerifyWorkspace<'_>,
+        stage: &VerifyStage,
+    ) -> anyhow::Result<Option<Self>> {
+        let Some(intent) = native_verifier_intent(stage) else {
+            return Ok(None);
+        };
+        let Some(coordination) = workspace.coordination.clone() else {
+            // Direct verifier unit tests deliberately omit the live Agent
+            // harness. Production turns always install coordination in
+            // `run_workspace_repair_verification`.
+            return Ok(None);
+        };
+        coordination
+            .begin_intent(workspace.durability.clone(), intent.clone())
+            .await?;
+        let operation_id = coordination
+            .active_parent_operation()
+            .ok_or_else(|| anyhow::anyhow!("native verifier admission produced no operation"))?;
+        Ok(Some(Self {
+            coordination,
+            durability: workspace.durability.clone(),
+            operation_id,
+            intent,
+            armed: true,
+        }))
+    }
+
+    async fn settle(
+        mut self,
+        stage: &VerifyStage,
+        round: u32,
+        result: String,
+        mut execution: hi_workspace::ExecutionReport,
+    ) -> anyhow::Result<()> {
+        if matches!(
+            self.coordination.binding().authority,
+            hi_workspace::WorkspaceAuthority::PipeFs { .. }
+        ) {
+            let durability = self.durability.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "PipeFS native verifier has no durability backend for transcript staging"
+                )
+            })?;
+            let call_id = format!("native-verifier:{}", self.operation_id);
+            let arguments = serde_json::json!({
+                "round": round,
+                "stage": stage.name,
+                "command": stage.command,
+            })
+            .to_string();
+            let record = crate::WorkspaceTranscriptExecution {
+                schema_version: crate::WorkspaceTranscriptExecution::SCHEMA_VERSION,
+                operation_id: self.operation_id.clone(),
+                assistant_content: vec![hi_ai::Content::ToolCall {
+                    id: call_id.clone(),
+                    name: "native_verify".to_owned(),
+                    arguments,
+                }],
+                calls: vec![crate::WorkspaceTranscriptCall {
+                    call_id,
+                    name: "native_verify".to_owned(),
+                    result,
+                }],
+                execution: execution.clone(),
+            };
+            if let Err(stage_error) = durability.stage_workspace_execution(&record) {
+                let execution_detail = execution.detail.take();
+                execution.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
+                execution.content_digest = None;
+                execution.detail = Some(match execution_detail {
+                    Some(detail) => format!(
+                        "{detail}; native verifier transcript staging is ambiguous: {stage_error:#}"
+                    ),
+                    None => {
+                        format!("native verifier transcript staging is ambiguous: {stage_error:#}")
+                    }
+                });
+                let settlement = self
+                    .coordination
+                    .checkpoint(self.durability.clone(), execution)
+                    .await;
+                self.armed = false;
+                return match settlement {
+                    Ok(()) => Err(stage_error)
+                        .context("staging native verifier execution for PipeFS settlement"),
+                    Err(settlement_error) => Err(anyhow::anyhow!(
+                        "native verifier transcript staging failed: {stage_error:#}; recovery settlement also failed: {settlement_error:#}"
+                    )),
+                };
+            }
+        }
+        self.coordination
+            .checkpoint(self.durability.clone(), execution)
+            .await?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for NativeVerifierAdmission {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.coordination.abandon_active();
+        }
+    }
+}
+
+fn native_verifier_execution_report(
+    stage: &VerifyStage,
+    intent: &hi_workspace::MutationIntent,
+    execution: Option<&hi_tools::ProcessExecution>,
+    changed_paths: Vec<String>,
+    infrastructure_error: Option<&str>,
+) -> hi_workspace::ExecutionReport {
+    let mut disposition = match execution.map(|execution| execution.status) {
+        Some(hi_tools::ToolStatus::Succeeded) => hi_workspace::ExecutionDisposition::Succeeded,
+        Some(hi_tools::ToolStatus::Cancelled | hi_tools::ToolStatus::TimedOut) => {
+            hi_workspace::ExecutionDisposition::Cancelled
+        }
+        Some(hi_tools::ToolStatus::Failed | hi_tools::ToolStatus::Denied) => {
+            hi_workspace::ExecutionDisposition::Failed
+        }
+        None => hi_workspace::ExecutionDisposition::Indeterminate,
+    };
+    if disposition == hi_workspace::ExecutionDisposition::Succeeded && !changed_paths.is_empty() {
+        disposition = hi_workspace::ExecutionDisposition::Failed;
+    }
+    let effect_could_have_started = !matches!(
+        execution.map(|execution| execution.status),
+        Some(hi_tools::ToolStatus::Denied)
+    );
+    let detail = infrastructure_error.map(str::to_owned).or_else(|| {
+        (disposition != hi_workspace::ExecutionDisposition::Succeeded).then(|| {
+            if execution.is_some_and(|execution| {
+                execution.status == hi_tools::ToolStatus::Succeeded && !changed_paths.is_empty()
+            }) {
+                format!(
+                    "native verifier `{}` (`{}`) modified {} relevant workspace path(s)",
+                    stage.name,
+                    stage.command,
+                    changed_paths.len()
+                )
+            } else {
+                format!(
+                    "native verifier `{}` (`{}`) finished with {disposition:?}",
+                    stage.name, stage.command
+                )
+            }
+        })
+    });
+    hi_workspace::ExecutionReport {
+        disposition,
+        workspace_may_have_changed: effect_could_have_started
+            && intent.effect_scope == hi_workspace::EffectScope::LiveWriter,
+        external_effect_may_have_occurred: effect_could_have_started
+            && intent.replay_class != hi_workspace::ReplayClass::PureWorkspace,
+        content_digest: None,
+        changed_paths: changed_paths.into_iter().map(Into::into).collect(),
+        artifacts: Vec::new(),
+        detail,
+    }
+}
+
+async fn settle_native_verifier_execution(
+    admission: Option<NativeVerifierAdmission>,
+    stage: &VerifyStage,
+    round: u32,
+    result: String,
+    execution: Option<&hi_tools::ProcessExecution>,
+    changed_paths: Vec<String>,
+    infrastructure_error: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(admission) = admission else {
+        return Ok(());
+    };
+    let report = native_verifier_execution_report(
+        stage,
+        &admission.intent,
+        execution,
+        changed_paths,
+        infrastructure_error,
+    );
+    admission.settle(stage, round, result, report).await
 }
 
 /// The outcome of one verify check.
@@ -271,6 +511,7 @@ pub(crate) struct WorkspaceRepairVerifier {
         std::collections::BTreeMap<String, (usize, std::collections::BTreeSet<String>)>,
     max_rounds: u32,
     round: u32,
+    pub(crate) timeout_override: Option<std::time::Duration>,
 }
 
 /// Historical name — prefer [`WorkspaceRepairVerifier`].
@@ -291,6 +532,7 @@ impl WorkspaceRepairVerifier {
             previous_failures: std::collections::BTreeMap::new(),
             max_rounds,
             round: 0,
+            timeout_override: None,
         }
     }
 
@@ -586,7 +828,22 @@ impl WorkspaceRepairVerifier {
             } else {
                 None
             };
-            let verification_timeout = hi_tools::check_timeout();
+            let admission = match NativeVerifierAdmission::begin(workspace, stage).await {
+                Ok(admission) => admission,
+                Err(error) => {
+                    self.record_execution(VerificationExecution::infrastructure_failure(
+                        round, stage,
+                    ));
+                    return VerifyOutcome::InfrastructureError {
+                        stage: stage.clone(),
+                        output: format!(
+                            "native verifier workspace admission failed before execution: {error:#}"
+                        ),
+                        round,
+                    };
+                }
+            };
+            let verification_timeout = self.timeout_override.or_else(hi_tools::check_timeout);
             let mut execution = match run_check_for_workspace(
                 workspace,
                 &stage.command,
@@ -599,21 +856,40 @@ impl WorkspaceRepairVerifier {
                     self.record_execution(VerificationExecution::infrastructure_failure(
                         round, stage,
                     ));
+                    let output = format!("verification process infrastructure failed: {error:#}");
+                    if let Err(settlement_error) = settle_native_verifier_execution(
+                        admission,
+                        stage,
+                        round,
+                        output.clone(),
+                        None,
+                        Vec::new(),
+                        Some(&output),
+                    )
+                    .await
+                    {
+                        return VerifyOutcome::InfrastructureError {
+                            stage: stage.clone(),
+                            output: format!(
+                                "{output}; workspace settlement also failed: {settlement_error:#}"
+                            ),
+                            round,
+                        };
+                    }
                     return VerifyOutcome::InfrastructureError {
                         stage: stage.clone(),
-                        output: format!("verification process infrastructure failed: {error:#}"),
+                        output,
                         round,
                     };
                 }
             };
             self.record_execution(VerificationExecution::shell(round, stage, &execution));
-            if execution.status == hi_tools::ToolStatus::TimedOut {
-                // A cold target dir routinely needs more than one budget for
-                // its first build. One bounded retry with a doubled budget
-                // separates "cold" from "genuinely oversized stage" before
-                // the infrastructure path below ends the turn unverified — a
-                // live turn was branded `failed · infrastructure failure`
-                // purely because its first post-edit build was cold.
+            let mut exact_results = vec![execution.model_content()];
+            if execution.status == hi_tools::ToolStatus::TimedOut && self.timeout_override.is_none()
+            {
+                // One doubled-budget retry distinguishes a cold first build
+                // from a genuinely oversized stage before ending the turn as
+                // unverified infrastructure.
                 ui.status(&format!(
                     "verify stage `{}` timed out — one retry with a doubled budget (cold build?)",
                     stage.name
@@ -632,18 +908,39 @@ impl WorkspaceRepairVerifier {
                         self.record_execution(VerificationExecution::infrastructure_failure(
                             round, stage,
                         ));
+                        let output =
+                            format!("verification process infrastructure failed: {error:#}");
+                        exact_results.push(output.clone());
+                        if let Err(settlement_error) = settle_native_verifier_execution(
+                            admission,
+                            stage,
+                            round,
+                            exact_results.join("\n\n--- retry ---\n\n"),
+                            None,
+                            Vec::new(),
+                            Some(&output),
+                        )
+                        .await
+                        {
+                            return VerifyOutcome::InfrastructureError {
+                                stage: stage.clone(),
+                                output: format!(
+                                    "{output}; workspace settlement also failed: {settlement_error:#}"
+                                ),
+                                round,
+                            };
+                        }
                         return VerifyOutcome::InfrastructureError {
                             stage: stage.clone(),
-                            output: format!(
-                                "verification process infrastructure failed: {error:#}"
-                            ),
+                            output,
                             round,
                         };
                     }
                 };
                 self.record_execution(VerificationExecution::shell(round, stage, &execution));
+                exact_results.push(execution.model_content());
             }
-            let stage_changes = if let Some(ledger) = ledger.as_ref() {
+            let all_stage_changes = if let Some(ledger) = ledger.as_ref() {
                 // Ledger path: reconcile (cheap via dir-stamp fast path when
                 // nothing changed) and diff against the pre-stage revision.
                 // The reconcile still walks the filesystem on a cold stamp, so
@@ -662,7 +959,6 @@ impl WorkspaceRepairVerifier {
                         changes
                             .into_iter()
                             .map(|change| change.path)
-                            .filter(|path| verification_relevant_path(path))
                             .collect::<Vec<_>>()
                     };
                     Ok::<Vec<String>, anyhow::Error>(paths)
@@ -674,9 +970,32 @@ impl WorkspaceRepairVerifier {
                         self.record_execution(VerificationExecution::infrastructure_failure(
                             round, stage,
                         ));
+                        let output = format!("post-stage ledger reconcile failed: {error:#}");
+                        if let Err(settlement_error) = settle_native_verifier_execution(
+                            admission,
+                            stage,
+                            round,
+                            format!(
+                                "{}\n\n--- reconcile ---\n\n{output}",
+                                exact_results.join("\n\n--- retry ---\n\n")
+                            ),
+                            None,
+                            Vec::new(),
+                            Some(&output),
+                        )
+                        .await
+                        {
+                            return VerifyOutcome::InfrastructureError {
+                                stage: stage.clone(),
+                                output: format!(
+                                    "{output}; workspace settlement also failed: {settlement_error:#}"
+                                ),
+                                round,
+                            };
+                        }
                         return VerifyOutcome::InfrastructureError {
                             stage: stage.clone(),
-                            output: format!("post-stage ledger reconcile failed: {error:#}"),
+                            output,
                             round,
                         };
                     }
@@ -684,9 +1003,32 @@ impl WorkspaceRepairVerifier {
                         self.record_execution(VerificationExecution::infrastructure_failure(
                             round, stage,
                         ));
+                        let output = format!("post-stage ledger worker failed: {error}");
+                        if let Err(settlement_error) = settle_native_verifier_execution(
+                            admission,
+                            stage,
+                            round,
+                            format!(
+                                "{}\n\n--- reconcile ---\n\n{output}",
+                                exact_results.join("\n\n--- retry ---\n\n")
+                            ),
+                            None,
+                            Vec::new(),
+                            Some(&output),
+                        )
+                        .await
+                        {
+                            return VerifyOutcome::InfrastructureError {
+                                stage: stage.clone(),
+                                output: format!(
+                                    "{output}; workspace settlement also failed: {settlement_error:#}"
+                                ),
+                                round,
+                            };
+                        }
                         return VerifyOutcome::InfrastructureError {
                             stage: stage.clone(),
-                            output: format!("post-stage ledger worker failed: {error}"),
+                            output,
                             round,
                         };
                     }
@@ -698,9 +1040,32 @@ impl WorkspaceRepairVerifier {
                         self.record_execution(VerificationExecution::infrastructure_failure(
                             round, stage,
                         ));
+                        let output = format!("post-stage workspace snapshot failed: {error:#}");
+                        if let Err(settlement_error) = settle_native_verifier_execution(
+                            admission,
+                            stage,
+                            round,
+                            format!(
+                                "{}\n\n--- reconcile ---\n\n{output}",
+                                exact_results.join("\n\n--- retry ---\n\n")
+                            ),
+                            None,
+                            Vec::new(),
+                            Some(&output),
+                        )
+                        .await
+                        {
+                            return VerifyOutcome::InfrastructureError {
+                                stage: stage.clone(),
+                                output: format!(
+                                    "{output}; workspace settlement also failed: {settlement_error:#}"
+                                ),
+                                round,
+                            };
+                        }
                         return VerifyOutcome::InfrastructureError {
                             stage: stage.clone(),
-                            output: format!("post-stage workspace snapshot failed: {error:#}"),
+                            output,
                             round,
                         };
                     }
@@ -709,10 +1074,32 @@ impl WorkspaceRepairVerifier {
                     before_stage.as_ref().expect("set when ledger is None"),
                     &after_stage,
                 )
-                .into_iter()
-                .filter(|path| verification_relevant_path(path))
-                .collect::<Vec<_>>()
             };
+            let stage_changes = all_stage_changes
+                .iter()
+                .filter(|path| verification_relevant_path(path))
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Err(error) = settle_native_verifier_execution(
+                admission,
+                stage,
+                round,
+                exact_results.join("\n\n--- retry ---\n\n"),
+                Some(&execution),
+                stage_changes.clone(),
+                None,
+            )
+            .await
+            {
+                self.record_execution(VerificationExecution::infrastructure_failure(round, stage));
+                return VerifyOutcome::InfrastructureError {
+                    stage: stage.clone(),
+                    output: format!(
+                        "native verifier completed but workspace settlement failed: {error:#}"
+                    ),
+                    round,
+                };
+            }
             if !stage_changes.is_empty() {
                 snapshot_cache.invalidate();
                 let mutation_count = self
@@ -758,7 +1145,7 @@ impl WorkspaceRepairVerifier {
                 return VerifyOutcome::InfrastructureError {
                     stage: stage.clone(),
                     output: format!(
-                        "stage `{}` (`{}`) exceeded its configured time budget twice (including one retry at double the budget) and was killed, so this revision is unverified — this is not a code failure. Raise or unset HI_VERIFY_TIMEOUT_SECS (configured {}s), or narrow the stage to something that fits the budget (for example a package-local check instead of a whole-workspace test run).",
+                        "stage `{}` (`{}`) exceeded its configured time budget and was killed, so this revision is unverified — this is not a code failure. Raise the verification timeout or narrow the stage to something that fits the budget (configured {}s).",
                         stage.name,
                         stage.command,
                         verification_timeout
@@ -1353,1266 +1740,13 @@ pub(crate) fn is_internal_runtime_artifact_path(path: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::snapshot::workspace_snapshot;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    struct NullUi;
-
-    impl Ui for NullUi {
-        fn assistant_text(&mut self, _: &str) {}
-        fn assistant_reasoning(&mut self, _: &str) {}
-        fn assistant_end(&mut self) {}
-        fn tool_call(&mut self, _: &str, _: &str) {}
-        fn tool_result(&mut self, _: &str, _: &str) {}
-        fn status(&mut self, _: &str) {}
-        fn turn_end(&mut self, _: &str) {}
-    }
-
-    #[test]
-    fn verification_execution_diagnostics_are_bounded_but_test_evidence_is_sticky() {
-        let mut verifier = WorkspaceRepairVerifier::new(Vec::new(), u32::MAX);
-        for index in 0..300_u32 {
-            verifier.record_execution(VerificationExecution {
-                round: index + 1,
-                name: if index == 100 {
-                    "unit-test".into()
-                } else {
-                    "check".into()
-                },
-                command: if index == 100 {
-                    "cargo test".into()
-                } else {
-                    "cargo check".into()
-                },
-                status: hi_tools::ToolStatus::Succeeded,
-                process: None,
-                truncation: None,
-            });
-        }
-
-        assert_eq!(verifier.executions().len(), VERIFICATION_EXECUTION_LIMIT);
-        assert_eq!(verifier.executions_dropped(), 44);
-        assert_eq!(verifier.execution_count(), 300);
-        assert!(
-            verifier.successful_test_stage(),
-            "the successful test was compacted from the middle but must remain correctness evidence"
-        );
-        assert_eq!(verifier.executions().first().unwrap().round, 1);
-        assert_eq!(verifier.executions().last().unwrap().round, 300);
-
-        let mut telemetry = crate::TurnTelemetry::default();
-        telemetry.replace_verification_diagnostics(
-            verifier.executions(),
-            verifier.executions_dropped(),
-            verifier.execution_count(),
-            verifier.successful_test_stage(),
-        );
-        assert_eq!(
-            telemetry.verification_executions,
-            verifier.executions(),
-            "immediate post-check telemetry retains the bounded execution trail"
-        );
-        assert_eq!(
-            telemetry
-                .diagnostic_retention
-                .verification_executions_dropped,
-            44
-        );
-        assert_eq!(
-            telemetry.diagnostic_retention.verification_executions_total,
-            300
-        );
-        assert!(telemetry.diagnostic_retention.successful_test_verification);
-    }
-
-    fn roots(label: &str) -> (PathBuf, PathBuf, PathBuf) {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let base = std::env::temp_dir().join(format!(
-            "hi-verifier-{label}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let root = base.join("workspace");
-        let state = base.join("state");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&state).unwrap();
-        (base, root, state)
-    }
-
-    async fn checkpoint(root: &Path, state: &Path) -> String {
-        match hi_tools::checkpoint::create_detailed_with_state(root, state).await {
-            hi_tools::checkpoint::CreateResult::Created(id) => id,
-            other => panic!("checkpoint failed: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn saturated_unlimited_round_continues_without_final_attribution() {
-        let (base, root, state) = roots("unlimited-saturated-round");
-        std::fs::write(root.join("state.txt"), "changed\n").unwrap();
-        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        let changed = vec!["state.txt".to_string()];
-        let lsp = hi_lsp::LspManager::new(&root).unwrap();
-        let mut verifier = WorkspaceRepairVerifier::new(
-            vec![VerifyStage::new("test", "exit 7")],
-            crate::UNLIMITED_REPAIR_CYCLES,
-        );
-        verifier.round = u32::MAX;
-        let mut cache = SnapshotCache::default();
-        let mut ui = NullUi;
-
-        let outcome = verifier
-            .check(
-                &VerifyWorkspace::new(&root, &state, None, &lsp).with_changed_files(&changed),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-
-        match outcome {
-            VerifyOutcome::Failed { output, round, .. } => {
-                assert_eq!(round, u32::MAX);
-                assert!(
-                    !output.contains("Pre-turn attribution"),
-                    "the unlimited sentinel must not be treated as the final repair round"
-                );
-            }
-            other => panic!("expected a productive verification attempt, got {other:?}"),
-        }
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn sandbox_denial_is_not_treated_as_a_preexisting_code_failure() {
-        let execution = hi_tools::ProcessExecution {
-            status: hi_tools::ToolStatus::Failed,
-            outcome: hi_tools::ProcessOutcome {
-                exit_code: Some(1),
-                stdout_summary: String::new(),
-                stderr_summary: "cargo: Operation not permitted while creating target".into(),
-                duration_ms: 1,
-            },
-            truncation: hi_tools::TruncationState::Complete,
-        };
-
-        assert!(baseline_failure_is_infrastructure(&execution));
-    }
-
-    #[test]
-    fn verifier_is_off_when_no_stages() {
-        let v = RepairVerifier::new(Vec::new(), 2);
-        assert!(!v.is_on());
-        assert_eq!(v.round(), 0);
-    }
-
-    #[test]
-    fn verifier_is_on_with_stages() {
-        let v = RepairVerifier::new(vec![VerifyStage::new("check", "true")], 2);
-        assert!(v.is_on());
-    }
-
-    #[test]
-    fn lsp_execution_evidence_does_not_invent_process_data() {
-        let record = VerificationExecution::lsp(3, hi_tools::ToolStatus::Failed);
-        let value = serde_json::to_value(&record).unwrap();
-
-        assert_eq!(value["round"], 3);
-        assert_eq!(value["name"], "lsp");
-        assert_eq!(value["command"], "diagnostics");
-        assert_eq!(value["status"], "failed");
-        assert!(value.get("process").is_none());
-        assert!(value.get("truncation").is_none());
-    }
-
-    #[test]
-    fn shell_execution_evidence_strips_terminal_control_sequences() {
-        let execution = hi_tools::ProcessExecution {
-            status: hi_tools::ToolStatus::Succeeded,
-            outcome: hi_tools::ProcessOutcome {
-                exit_code: Some(0),
-                stdout_summary: "\u{1b}[32mok\u{1b}[0m".into(),
-                stderr_summary: String::new(),
-                duration_ms: 4,
-            },
-            truncation: hi_tools::TruncationState::Complete,
-        };
-        let record =
-            VerificationExecution::shell(1, &VerifyStage::new("check", "cargo check"), &execution);
-
-        assert_eq!(record.process.unwrap().stdout_summary, "ok");
-    }
-
-    #[test]
-    fn stage_guidance_differs_tests_vs_compile() {
-        let test_stage = VerifyStage::new("test", "pytest");
-        let compile_stage = VerifyStage::new("check", "cargo check");
-        assert_ne!(stage_guidance(&test_stage), stage_guidance(&compile_stage));
-        assert!(stage_guidance(&test_stage).contains("required behavior"));
-        assert!(stage_guidance(&compile_stage).contains("root cause"));
-    }
-
-    #[test]
-    fn prose_only_path_detection_is_conservative() {
-        assert!(is_prose_only_path("README.md"));
-        assert!(is_prose_only_path("docs/guide.rst"));
-        assert!(is_prose_only_path("LICENSE"));
-        assert!(is_prose_only_path(".hi/memory.md"));
-        assert!(is_prose_only_path(".hi/memory.undo.md"));
-        assert!(!is_prose_only_path("package.json"));
-        assert!(!is_prose_only_path("docs/example.ts"));
-        assert!(!is_prose_only_path(".github/workflows/test.yml"));
-    }
-
-    #[test]
-    fn only_known_runtime_artifacts_are_hidden_from_project_changes() {
-        assert!(is_internal_runtime_artifact_path(".hi/history"));
-        assert!(is_internal_runtime_artifact_path("./.hi/memory.undo.md"));
-        assert!(is_internal_runtime_artifact_path(".hi\\history"));
-        assert!(!is_internal_runtime_artifact_path(".hi/memory.md"));
-        assert!(!is_internal_runtime_artifact_path(".hi/config.toml"));
-        assert!(!is_internal_runtime_artifact_path("src/main.rs"));
-    }
-
-    #[test]
-    fn verification_mutation_filter_keeps_source_and_ignores_generated_noise() {
-        assert!(verification_relevant_path("src/lib.rs"));
-        assert!(verification_relevant_path("Cargo.lock"));
-        assert!(!verification_relevant_path("pkg/__pycache__/mod.pyc"));
-        assert!(!verification_relevant_path("README.md"));
-        assert!(!verification_relevant_path(".hi/state.json"));
-        // Caches the verification stages write themselves must never read as
-        // workspace mutation — that path reports stable stages as unstable.
-        assert!(!verification_relevant_path(
-            "vectorops/.pytest_cache/v/cache/nodeids"
-        ));
-        assert!(!verification_relevant_path(
-            "vectorops/.pytest_cache/CACHEDIR.TAG"
-        ));
-        assert!(!verification_relevant_path(
-            "vectorops/vectorops.egg-info/PKG-INFO"
-        ));
-        assert!(!verification_relevant_path("app/node_modules/pkg/index.js"));
-        assert!(!verification_relevant_path(
-            ".cargo-home/registry/src/dep/Cargo.lock"
-        ));
-        assert!(!verification_relevant_path(".mypy_cache/3.12/foo.json"));
-        // A source file that merely lives near a cache stays relevant.
-        assert!(verification_relevant_path("src/pytest_cache_helper.py"));
-    }
-
-    #[test]
-    fn dependent_crates_get_compile_check_stages() {
-        let root = std::env::temp_dir().join(format!("hi-verify-deps-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for member in ["core", "consumer"] {
-            std::fs::create_dir_all(root.join(format!("crates/{member}/src"))).unwrap();
-            std::fs::write(root.join(format!("crates/{member}/src/lib.rs")), "").unwrap();
-        }
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"crates/*\"]\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("crates/core/Cargo.toml"),
-            "[package]\nname = \"core\"\nversion = \"0.0.1\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("crates/consumer/Cargo.toml"),
-            "[package]\nname = \"consumer\"\nversion = \"0.0.1\"\n[dependencies]\ncore = { path = \"../core\" }\n",
-        )
-        .unwrap();
-
-        let changed = vec!["crates/core/src/lib.rs".to_string()];
-        let stages = affected_cargo_stages(&root, &changed);
-        let names: Vec<&str> = stages.iter().map(|stage| stage.name.as_str()).collect();
-        assert!(names.contains(&"affected-test:crates/core"), "{names:?}");
-        assert!(
-            names.contains(&"affected-dependent-check:crates/consumer"),
-            "consumer compile-checks after core changes: {names:?}"
-        );
-        assert!(
-            !names
-                .iter()
-                .any(|n| n.contains("dependent-check:crates/core")),
-            "the changed crate is not its own dependent: {names:?}"
-        );
-        // Dependent checks run after the changed package's own stages.
-        let own = names
-            .iter()
-            .position(|n| *n == "affected-test:crates/core")
-            .unwrap();
-        let dependent = names
-            .iter()
-            .position(|n| *n == "affected-dependent-check:crates/consumer")
-            .unwrap();
-        assert!(own < dependent);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn skip_affected_stage_matches_sealed_package_labels() {
-        let mut checks = std::collections::BTreeSet::new();
-        checks.insert("crates/library".into());
-        checks.insert("web".into());
-        checks.insert("svc".into());
-        let tests = std::collections::BTreeSet::new();
-        assert!(should_skip_affected_stage(
-            &VerifyStage::new(
-                "affected-check:crates/library",
-                "cargo check --quiet --manifest-path 'crates/library/Cargo.toml'",
-            ),
-            &checks,
-            &tests,
-        ));
-        // Phase O: polyglot check seals cover typecheck/build/lint stages.
-        assert!(should_skip_affected_stage(
-            &VerifyStage::new(
-                "affected-typecheck:web",
-                "npm --prefix 'web' exec -- tsc --noEmit",
-            ),
-            &checks,
-            &tests,
-        ));
-        assert!(should_skip_affected_stage(
-            &VerifyStage::new("affected-build:svc", "go -C 'svc' build ./..."),
-            &checks,
-            &tests,
-        ));
-        assert!(should_skip_affected_stage(
-            &VerifyStage::new("affected-lint:pkg", "ruff check 'pkg'"),
-            &{
-                let mut c = checks.clone();
-                c.insert("pkg".into());
-                c
-            },
-            &tests,
-        ));
-        assert!(!should_skip_affected_stage(
-            &VerifyStage::new(
-                "affected-test:crates/library",
-                "cargo test --quiet --manifest-path 'crates/library/Cargo.toml'",
-            ),
-            &checks,
-            &tests,
-        ));
-        // Root pipeline is never skipped via this path.
-        assert!(!should_skip_affected_stage(
-            &VerifyStage::new("check", "cargo check --quiet"),
-            &checks,
-            &tests,
-        ));
-        let mut test_set = std::collections::BTreeSet::new();
-        test_set.insert("crates/library".into());
-        assert!(should_skip_affected_stage(
-            &VerifyStage::new(
-                "affected-test:crates/library",
-                "cargo test --quiet --manifest-path 'crates/library/Cargo.toml'",
-            ),
-            &checks,
-            &test_set,
-        ));
-    }
-
-    #[test]
-    fn affected_cargo_packages_precede_the_root_pipeline() {
-        let (base, root, _) = roots("affected-cargo");
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"crates/*\"]\ndefault-members = [\"crates/app\"]\n",
-        )
-        .unwrap();
-        for package in ["app", "library"] {
-            let package_root = root.join("crates").join(package);
-            std::fs::create_dir_all(package_root.join("src")).unwrap();
-            std::fs::write(
-                package_root.join("Cargo.toml"),
-                format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\n"),
-            )
-            .unwrap();
-        }
-        let stages = effective_stages(
-            &root,
-            &[
-                "crates/library/src/lib.rs".into(),
-                "crates/library/src/other.rs".into(),
-            ],
-            &[
-                VerifyStage::new("check", "cargo check --quiet"),
-                VerifyStage::new("test", "cargo test --quiet"),
-            ],
-            true,
-        );
-        assert_eq!(
-            stages
-                .iter()
-                .map(|stage| (stage.name.as_str(), stage.command.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(
-                "affected-test:crates/library",
-                "cargo test --quiet --manifest-path 'crates/library/Cargo.toml'",
-            ),]
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn package_local_tests_supersede_the_whole_workspace_test_run() {
-        // Measured on a 24-crate workspace: `cargo test` 811s vs `cargo check`
-        // 114s, against a 600s stage timeout. Every turn ended unjudged however
-        // small the edit, because the gate's cost tracked the project rather
-        // than the change.
-        let (base, root, _) = roots("supersede-workspace-test");
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"crates/*\"]\n",
-        )
-        .unwrap();
-        let package_root = root.join("crates").join("library");
-        std::fs::create_dir_all(package_root.join("src")).unwrap();
-        std::fs::write(
-            package_root.join("Cargo.toml"),
-            "[package]\nname = \"library\"\nversion = \"0.1.0\"\n",
-        )
-        .unwrap();
-        let configured = vec![
-            VerifyStage::new("check", "cargo check --quiet"),
-            VerifyStage::new("test", "cargo test --quiet"),
-        ];
-        let changed = ["crates/library/src/lib.rs".to_string()];
-
-        let auto = effective_stages(&root, &changed, &configured, true);
-        assert!(
-            !auto.iter().any(|s| s.command == "cargo test --quiet"),
-            "the whole-workspace test run must be superseded: {auto:?}"
-        );
-        assert!(
-            !auto.iter().any(|s| s.command == "cargo check --quiet"),
-            "the whole-workspace check is also superseded when package tests cover the edit: {auto:?}"
-        );
-        assert!(
-            auto.iter()
-                .any(|s| s.name == "affected-test:crates/library"),
-            "package-local coverage must actually be present: {auto:?}"
-        );
-
-        // Explicit configuration is the user's decision and is run as written —
-        // this refinement applies only to the auto-detected pipeline.
-        let explicit = effective_stages(&root, &changed, &configured, false);
-        assert_eq!(explicit, configured, "explicit stages must be untouched");
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn only_unscoped_cargo_test_commands_are_superseded() {
-        assert!(is_whole_workspace_cargo_test("cargo test"));
-        assert!(is_whole_workspace_cargo_test("cargo test --quiet"));
-        assert!(is_whole_workspace_cargo_test("  cargo test --workspace  "));
-        // Already narrowed by the caller — leave it alone.
-        assert!(!is_whole_workspace_cargo_test("cargo test -p library"));
-        assert!(!is_whole_workspace_cargo_test(
-            "cargo test --package library"
-        ));
-        assert!(!is_whole_workspace_cargo_test(
-            "cargo test --manifest-path 'a/Cargo.toml'"
-        ));
-        assert!(!is_whole_workspace_cargo_test(
-            "cargo test --test integration"
-        ));
-        // Not a plain `cargo test` at all.
-        assert!(!is_whole_workspace_cargo_test("cargo testsuite"));
-        assert!(!is_whole_workspace_cargo_test("cargo test && ./extra.sh"));
-        assert!(!is_whole_workspace_cargo_test("cargo check --quiet"));
-        assert!(!is_whole_workspace_cargo_test("make test"));
-
-        assert!(is_whole_workspace_cargo_check("cargo check"));
-        assert!(is_whole_workspace_cargo_check("cargo check --quiet"));
-        assert!(!is_whole_workspace_cargo_check("cargo check -p library"));
-        assert!(!is_whole_workspace_cargo_check(
-            "cargo check --manifest-path 'a/Cargo.toml'"
-        ));
-        assert!(!is_whole_workspace_cargo_check("cargo test --quiet"));
-        assert!(is_package_local_cargo_test(
-            "cargo test --quiet --manifest-path 'crates/library/Cargo.toml'"
-        ));
-        assert!(!is_package_local_cargo_test("cargo test --quiet"));
-    }
-
-    #[test]
-    fn root_cargo_changes_do_not_duplicate_the_root_pipeline() {
-        let (base, root, _) = roots("root-cargo");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"single\"\nversion = \"0.1.0\"\n",
-        )
-        .unwrap();
-        let configured = vec![VerifyStage::new("test", "cargo test --quiet")];
-        assert_eq!(
-            effective_stages(&root, &["src/lib.rs".into()], &configured, true),
-            configured
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn affected_javascript_package_precedes_root_pipeline_and_deduplicates_changes() {
-        let (base, root, _) = roots("affected-javascript");
-        std::fs::write(
-            root.join("package.json"),
-            r#"{"scripts":{"test":"root-test"}}"#,
-        )
-        .unwrap();
-        let package = root.join("apps/web");
-        std::fs::create_dir_all(package.join("src")).unwrap();
-        std::fs::write(
-            package.join("package.json"),
-            r#"{"scripts":{"typecheck":"tsc --noEmit","test":"vitest"}}"#,
-        )
-        .unwrap();
-        std::fs::write(package.join("tsconfig.json"), "{}\n").unwrap();
-
-        let stages = effective_stages(
-            &root,
-            &[
-                "apps/web/src/index.ts".into(),
-                "apps/web/src/other.ts".into(),
-            ],
-            &[
-                VerifyStage::new("typecheck", "npx --no-install tsc --noEmit"),
-                VerifyStage::new("test", "npm test --silent"),
-            ],
-            true,
-        );
-
-        assert_eq!(
-            stages
-                .iter()
-                .map(|stage| (stage.name.as_str(), stage.command.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    "affected-typecheck:apps/web",
-                    "npm --prefix 'apps/web' run typecheck --silent",
-                ),
-                (
-                    "affected-test:apps/web",
-                    "npm --prefix 'apps/web' test --silent",
-                ),
-                ("typecheck", "npx --no-install tsc --noEmit"),
-                ("test", "npm test --silent"),
-            ]
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn affected_go_modules_are_sorted_before_the_root_pipeline() {
-        let (base, root, _) = roots("affected-go");
-        std::fs::write(root.join("go.mod"), "module example.test/root\n").unwrap();
-        for module in ["services/zeta", "services/alpha"] {
-            let module_root = root.join(module);
-            std::fs::create_dir_all(module_root.join("pkg")).unwrap();
-            std::fs::write(
-                module_root.join("go.mod"),
-                format!("module example.test/{module}\n"),
-            )
-            .unwrap();
-        }
-
-        let stages = effective_stages(
-            &root,
-            &[
-                "services/zeta/pkg/z.go".into(),
-                "services/alpha/pkg/a.go".into(),
-            ],
-            &[VerifyStage::new("test", "go test ./...")],
-            true,
-        );
-
-        assert_eq!(
-            stages
-                .iter()
-                .map(|stage| stage.command.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                // Package-local `go build` is dropped when `go test` for the
-                // same module will run — test already compiles.
-                "go -C 'services/alpha' test ./...",
-                "go -C 'services/zeta' test ./...",
-                "go test ./...",
-            ]
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn affected_python_package_uses_pyproject_tools_before_root_pipeline() {
-        let (base, root, _) = roots("affected-python");
-        std::fs::write(root.join("pyproject.toml"), "[project]\nname='root'\n").unwrap();
-        let package = root.join("packages/service");
-        std::fs::create_dir_all(package.join("service")).unwrap();
-        std::fs::write(
-            package.join("pyproject.toml"),
-            "[project]\nname='service'\n[tool.ruff]\nline-length=100\n",
-        )
-        .unwrap();
-        std::fs::write(package.join("service").join("test_api.py"), "\n").unwrap();
-
-        let stages = effective_stages(
-            &root,
-            &["packages/service/service/api.py".into()],
-            &[
-                VerifyStage::new("lint", "ruff check ."),
-                VerifyStage::new("test", "pytest -q"),
-            ],
-            true,
-        );
-
-        assert_eq!(
-            stages
-                .iter()
-                .map(|stage| (stage.name.as_str(), stage.command.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    "affected-lint:packages/service",
-                    "ruff check 'packages/service'",
-                ),
-                (
-                    "affected-test:packages/service",
-                    "pytest -q 'packages/service'",
-                ),
-                ("lint", "ruff check ."),
-                ("test", "pytest -q"),
-            ]
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn python_setup_and_pytest_markers_define_nested_package_roots() {
-        let (base, root, _) = roots("python-markers");
-        for (package, marker) in [
-            ("packages/legacy", "setup.py"),
-            ("packages/tests-only", "pytest.ini"),
-        ] {
-            let package_root = root.join(package);
-            std::fs::create_dir_all(package_root.join("src")).unwrap();
-            std::fs::write(package_root.join(marker), "\n").unwrap();
-            std::fs::write(package_root.join("src").join("test_module.py"), "\n").unwrap();
-        }
-
-        let stages = effective_stages(
-            &root,
-            &[
-                "packages/tests-only/src/test_api.py".into(),
-                "packages/legacy/src/module.py".into(),
-            ],
-            &[],
-            true,
-        );
-
-        assert_eq!(
-            stages
-                .iter()
-                .map(|stage| stage.command.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "pytest -q 'packages/legacy'",
-                "pytest -q 'packages/tests-only'",
-            ]
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn affected_python_package_without_tests_omits_pytest_stage() {
-        let (base, root, _) = roots("python-no-tests");
-        std::fs::write(root.join("pyproject.toml"), "[project]\nname='root'\n").unwrap();
-        let package = root.join("packages/adapter");
-        std::fs::create_dir_all(package.join("src/hi_terminal_bench")).unwrap();
-        // pyproject.toml with a build backend but NO test files — mirrors
-        // bench/terminal-bench, which must not generate a pytest stage.
-        std::fs::write(
-            package.join("pyproject.toml"),
-            "[project]\nname='adapter'\n[build-system]\nrequires=['hatchling']\n",
-        )
-        .unwrap();
-        std::fs::write(
-            package.join("src/hi_terminal_bench/__init__.py"),
-            "\"\"\"adapter package\"\"\"\n",
-        )
-        .unwrap();
-        std::fs::write(package.join("src/hi_terminal_bench/agent.py"), "x = 1\n").unwrap();
-
-        let stages = effective_stages(
-            &root,
-            &["packages/adapter/src/hi_terminal_bench/agent.py".into()],
-            &[VerifyStage::new("test", "pytest -q")],
-            true,
-        );
-
-        // No affected-test stage for the testless package; the root pipeline
-        // still runs.
-        assert!(
-            !stages
-                .iter()
-                .any(|stage| stage.name.starts_with("affected-test:")),
-            "testless Python package should not emit an affected-test stage: {:?}",
-            stages.iter().map(|s| &s.name).collect::<Vec<_>>()
-        );
-        assert!(
-            stages
-                .iter()
-                .any(|stage| stage.name == "test" && stage.command == "pytest -q")
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn root_javascript_go_and_python_changes_do_not_duplicate_root_stages() {
-        let (base, root, _) = roots("root-polyglot");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("package.json"), "{}\n").unwrap();
-        std::fs::write(root.join("go.mod"), "module example.test/root\n").unwrap();
-        std::fs::write(root.join("pyproject.toml"), "[project]\nname='root'\n").unwrap();
-        let configured = vec![VerifyStage::new("root", "./root-verify")];
-
-        assert_eq!(
-            effective_stages(
-                &root,
-                &[
-                    "src/index.ts".into(),
-                    "src/main.go".into(),
-                    "src/main.py".into(),
-                ],
-                &configured,
-                true,
-            ),
-            configured
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn root_cargo_package_changes_check_member_consumers() {
-        let (base, root, _) = roots("root-cargo-dependent");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::create_dir_all(root.join("crates/consumer/src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub fn api() {}\n").unwrap();
-        std::fs::write(
-            root.join("crates/consumer/src/lib.rs"),
-            "pub fn use_api() {}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname='root-app'\nversion='0.1.0'\n\n[workspace]\nmembers=['crates/consumer']\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("crates/consumer/Cargo.toml"),
-            "[package]\nname='consumer'\nversion='0.1.0'\n[dependencies]\nroot-app={path='../..'}\n",
-        )
-        .unwrap();
-
-        let stages = affected_cargo_stages(&root, &["src/lib.rs".into()]);
-        assert!(
-            stages
-                .iter()
-                .any(|stage| stage.name == "affected-dependent-check:crates/consumer"),
-            "root-package consumers should be compile-checked: {stages:?}"
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn automatic_mode_finds_nested_packages_without_a_root_manifest() {
-        let (base, root, _) = roots("nested-only");
-        let package = root.join("nested/app");
-        std::fs::create_dir_all(package.join("src")).unwrap();
-        std::fs::write(package.join("package.json"), "{}\n").unwrap();
-
-        let stages = effective_stages(&root, &["nested/app/src/index.js".into()], &[], true);
-
-        assert_eq!(
-            stages,
-            vec![VerifyStage::new(
-                "affected-test:nested/app",
-                "npm --prefix 'nested/app' test --silent",
-            )]
-        );
-        assert!(RepairVerifier::automatic(Vec::new(), 1).is_on());
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn explicit_pipeline_is_exact_even_for_nested_package_changes() {
-        let (base, root, _) = roots("explicit-exact");
-        let package = root.join("apps/web");
-        std::fs::create_dir_all(package.join("src")).unwrap();
-        std::fs::write(package.join("package.json"), "{}\n").unwrap();
-        let explicit = vec![VerifyStage::new("custom", "./verify-exactly")];
-
-        assert_eq!(
-            effective_stages(&root, &["apps/web/src/index.ts".into()], &explicit, false,),
-            explicit
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn explicit_documentation_pipeline_is_not_skipped_as_prose_only() {
-        let (base, root, state) = roots("explicit-docs");
-        std::fs::write(root.join("README.md"), "before\n").unwrap();
-        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        std::fs::write(root.join("README.md"), "after\n").unwrap();
-        let mut verifier = RepairVerifier::new(vec![VerifyStage::new("docs", "false")], 1);
-        let lsp = hi_lsp::LspManager::new(&root).unwrap();
-        let mut cache = SnapshotCache::default();
-        let mut ui = NullUi;
-
-        let outcome = verifier
-            .check(
-                &VerifyWorkspace::new(&root, &state, None, &lsp),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-
-        assert!(matches!(outcome, VerifyOutcome::Failed { .. }));
-        assert_eq!(verifier.executions().len(), 1);
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn failed_stage_output_carries_digest_and_convergence_note() {
-        let (base, root, state) = roots("digest-convergence");
-        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
-        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        std::fs::write(root.join("main.rs"), "fn main() { broken }\n").unwrap();
-        std::fs::write(
-            root.join("diag.txt"),
-            "error[E0425]: cannot find value `broken` in this scope\n  --> main.rs:1:13\n",
-        )
-        .unwrap();
-        let stage = VerifyStage::new("check", "cat diag.txt >&2; false");
-        let mut verifier = RepairVerifier::new(vec![stage], 3);
-        let lsp = hi_lsp::LspManager::new(&root).unwrap();
-        let mut cache = SnapshotCache::default();
-        let mut ui = NullUi;
-        let workspace = VerifyWorkspace::new(&root, &state, None, &lsp);
-
-        let first = verifier
-            .check(&workspace, &turn_snapshot, &mut cache, None, &mut ui)
-            .await;
-        let VerifyOutcome::Failed { output, .. } = first else {
-            panic!("expected failure, got {first:?}");
-        };
-        assert!(output.contains("failure digest"), "{output}");
-        assert!(output.contains("error[E0425]"), "{output}");
-        assert!(
-            output.contains("source (main.rs:"),
-            "digest should inline the span: {output}"
-        );
-        assert!(
-            !output.contains("No progress"),
-            "first round has no history: {output}"
-        );
-
-        let second = verifier
-            .check(&workspace, &turn_snapshot, &mut cache, None, &mut ui)
-            .await;
-        let VerifyOutcome::Failed { output, .. } = second else {
-            panic!("expected failure, got {second:?}");
-        };
-        assert!(
-            output.contains("No progress since the previous repair attempt"),
-            "identical failure set should be called out: {output}"
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn applied_net_zero_mutation_still_runs_explicit_verification() {
-        let (base, root, state) = roots("net-zero-mutation");
-        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", "false")], 1);
-        let lsp = hi_lsp::LspManager::new(&root).unwrap();
-        let mut cache = SnapshotCache::default();
-        let mut ui = NullUi;
-
-        let outcome = verifier
-            .check(
-                &VerifyWorkspace::new(&root, &state, None, &lsp)
-                    .with_changed_files(&[])
-                    .with_mutation_seen(true),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-
-        assert!(matches!(outcome, VerifyOutcome::Failed { .. }));
-        assert_eq!(verifier.executions().len(), 1);
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn gitignored_inputs_still_trigger_verification() {
-        let (base, root, state) = roots("ignored-input");
-        std::fs::write(root.join(".gitignore"), ".env\n").unwrap();
-        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        std::fs::write(root.join(".env"), "MODE=test\n").unwrap();
-        let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", "test -f .env")], 1);
-        let lsp = hi_lsp::LspManager::new(&root).unwrap();
-        let mut cache = SnapshotCache::default();
-        let mut ui = NullUi;
-
-        let outcome = verifier
-            .check(
-                &VerifyWorkspace::new(&root, &state, None, &lsp),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-
-        assert!(matches!(outcome, VerifyOutcome::Passed));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn final_failure_is_classified_against_internal_pre_turn_checkpoint() {
-        let (base, root, state) = roots("preexisting");
-        std::fs::write(root.join("source.rs"), "before\n").unwrap();
-        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        let checkpoint = checkpoint(&root, &state).await;
-        std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
-
-        let mut verifier = RepairVerifier::new(
-            vec![VerifyStage::new(
-                "test",
-                "printf 'baseline failure\\n' >&2; exit 7",
-            )],
-            1,
-        );
-        let lsp = hi_lsp::LspManager::new(&root).unwrap();
-        let mut cache = SnapshotCache::default();
-        let mut ui = NullUi;
-        let outcome = verifier
-            .check(
-                &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-        let VerifyOutcome::Failed { output, round, .. } = outcome else {
-            panic!("expected classified failure");
-        };
-        assert_eq!(round, 1);
-        assert!(output.contains("already failed this verification stage before the turn"));
-        assert!(output.contains("Baseline output:\nbaseline failure"));
-        assert_eq!(
-            std::fs::read_to_string(root.join("source.rs")).unwrap(),
-            "current changed contents\n",
-            "baseline attribution must never restore over the destination"
-        );
-        assert!(!state.join("verification-sandboxes").exists());
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn final_failure_absent_from_pre_turn_checkpoint_is_identified() {
-        let (base, root, state) = roots("introduced");
-        std::fs::write(root.join("state.toml"), "ok\n").unwrap();
-        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        let checkpoint = checkpoint(&root, &state).await;
-        std::fs::write(root.join("state.toml"), "broken now\n").unwrap();
-
-        let mut verifier = RepairVerifier::new(
-            vec![VerifyStage::new("test", "test \"$(cat state.toml)\" = ok")],
-            1,
-        );
-        let lsp = hi_lsp::LspManager::new(&root).unwrap();
-        let mut cache = SnapshotCache::default();
-        let mut ui = NullUi;
-        let outcome = verifier
-            .check(
-                &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-        let VerifyOutcome::Failed { output, .. } = outcome else {
-            panic!("expected classified failure");
-        };
-        assert!(output.contains("current failure was not present at the turn baseline"));
-        assert_eq!(
-            std::fs::read_to_string(root.join("state.toml")).unwrap(),
-            "broken now\n"
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn baseline_attribution_runs_only_after_last_allowed_check() {
-        let (base, root, state) = roots("final-only");
-        std::fs::write(root.join("state.toml"), "ok\n").unwrap();
-        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        let checkpoint = checkpoint(&root, &state).await;
-        std::fs::write(root.join("state.toml"), "broken now\n").unwrap();
-
-        let mut verifier = RepairVerifier::new(
-            vec![VerifyStage::new("test", "test \"$(cat state.toml)\" = ok")],
-            2,
-        );
-        let lsp = hi_lsp::LspManager::new(&root).unwrap();
-        let mut cache = SnapshotCache::default();
-        let mut ui = NullUi;
-        let first = verifier
-            .check(
-                &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-        let VerifyOutcome::Failed { output, round, .. } = first else {
-            panic!("expected first failure");
-        };
-        assert_eq!(round, 1);
-        assert!(!output.contains("Pre-turn attribution"));
-
-        let second = verifier
-            .check(
-                &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-        let VerifyOutcome::Failed { output, round, .. } = second else {
-            panic!("expected final failure");
-        };
-        assert_eq!(round, 2);
-        assert!(output.contains("Pre-turn attribution"));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn repair_budgets_zero_one_two_run_one_two_three_checks() {
-        for repairs in 0..=2 {
-            let (base, root, state) = roots(&format!("budget-{repairs}"));
-            let counter = base.join("runs");
-            std::fs::write(root.join("source.rs"), "before\n").unwrap();
-            let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-            std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
-            let command = format!("printf x >> {}; exit 1", counter.display());
-            let mut verifier =
-                RepairVerifier::new(vec![VerifyStage::new("test", command)], repairs + 1);
-            let lsp = hi_lsp::LspManager::new(&root).unwrap();
-            let mut cache = SnapshotCache::default();
-            let mut ui = NullUi;
-            for expected_round in 1..=(repairs + 1) {
-                let outcome = verifier
-                    .check(
-                        &VerifyWorkspace::new(&root, &state, None, &lsp),
-                        &turn_snapshot,
-                        &mut cache,
-                        None,
-                        &mut ui,
-                    )
-                    .await;
-                assert!(matches!(
-                    outcome,
-                    VerifyOutcome::Failed { round, .. } if round == expected_round
-                ));
-            }
-            assert!(matches!(
-                verifier
-                    .check(
-                        &VerifyWorkspace::new(&root, &state, None, &lsp),
-                        &turn_snapshot,
-                        &mut cache,
-                        None,
-                        &mut ui,
-                    )
-                    .await,
-                VerifyOutcome::NotRun
-            ));
-            assert_eq!(
-                std::fs::read(&counter).unwrap().len(),
-                (repairs + 1) as usize
-            );
-            assert_eq!(verifier.executions().len(), (repairs + 1) as usize);
-            for (index, execution) in verifier.executions().iter().enumerate() {
-                assert_eq!(execution.round, index as u32 + 1);
-                assert_eq!(execution.name, "test");
-                assert_eq!(execution.status, hi_tools::ToolStatus::Failed);
-                assert_eq!(
-                    execution
-                        .process
-                        .as_ref()
-                        .and_then(|process| process.exit_code),
-                    Some(1)
-                );
-                assert_eq!(
-                    execution.truncation,
-                    Some(hi_tools::TruncationState::Complete)
-                );
-            }
-            let _ = std::fs::remove_dir_all(base);
-        }
-    }
-
-    #[tokio::test]
-    async fn late_mutation_requires_a_fresh_current_revision_pass() {
-        let (base, root, state) = roots("late-mutation");
-        std::fs::write(root.join("state.txt"), "ok\n").unwrap();
-        std::fs::write(root.join("source.rs"), "before\n").unwrap();
-        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        let checkpoint = checkpoint(&root, &state).await;
-        std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
-
-        let mut verifier = RepairVerifier::new(
-            vec![VerifyStage::new("test", "test \"$(cat state.txt)\" = ok")],
-            1,
-        );
-        let lsp = hi_lsp::LspManager::new(&root).unwrap();
-        let mut cache = SnapshotCache::default();
-        let mut ui = NullUi;
-        assert!(matches!(
-            verifier
-                .check(
-                    &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
-                    &turn_snapshot,
-                    &mut cache,
-                    None,
-                    &mut ui,
-                )
-                .await,
-            VerifyOutcome::Passed
-        ));
-
-        std::fs::write(root.join("state.txt"), "late mutation broke it\n").unwrap();
-        cache.invalidate();
-        verifier.allow_review_revalidation();
-        let outcome = verifier
-            .check(
-                &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-        assert!(
-            matches!(outcome, VerifyOutcome::Failed { round: 2, .. }),
-            "expected the late mutation to fail a fresh verification round, got {outcome:?}"
-        );
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn broken_attribution_checkpoint_is_infrastructure_error() {
-        let (base, root, state) = roots("infra");
-        std::fs::write(root.join("source.rs"), "before\n").unwrap();
-        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
-        let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", "exit 1")], 1);
-        let lsp = hi_lsp::LspManager::new(&root).unwrap();
-        let mut cache = SnapshotCache::default();
-        let mut ui = NullUi;
-        let outcome = verifier
-            .check(
-                &VerifyWorkspace::new(
-                    &root,
-                    &state,
-                    Some("internal:v1:not-this-workspace:missing"),
-                    &lsp,
-                ),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-        assert!(matches!(
-            outcome,
-            VerifyOutcome::InfrastructureError { round: 1, .. }
-        ));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn repeatedly_mutating_verification_stage_is_unstable_not_a_pass() {
-        let (base, root, state) = roots("unstable");
-        std::fs::write(root.join("source.rs"), "before\n").unwrap();
-        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
-        let mut verifier = RepairVerifier::new(
-            vec![VerifyStage::new(
-                "formatter",
-                "printf mutation >> source.rs; exit 0",
-            )],
-            2,
-        );
-        let lsp = hi_lsp::LspManager::new(&root).unwrap();
-        let mut cache = SnapshotCache::default();
-        let mut ui = NullUi;
-        let first = verifier
-            .check(
-                &VerifyWorkspace::new(&root, &state, None, &lsp),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-        assert!(matches!(
-            first,
-            VerifyOutcome::Failed {
-                round: 1,
-                ref output,
-                ..
-            } if output.contains("modified relevant source files")
-        ));
-        let outcome = verifier
-            .check(
-                &VerifyWorkspace::new(&root, &state, None, &lsp),
-                &turn_snapshot,
-                &mut cache,
-                None,
-                &mut ui,
-            )
-            .await;
-        assert!(matches!(
-            outcome,
-            VerifyOutcome::Unstable {
-                round: 2,
-                ref changed_files,
-                ..
-            } if changed_files == &["source.rs"]
-        ));
-        let _ = std::fs::remove_dir_all(base);
-    }
-}
+#[path = "verify_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "verify_tests_more.rs"]
+mod tests_more;
+
+#[cfg(test)]
+#[path = "verify_test_support.rs"]
+mod verify_test_support;

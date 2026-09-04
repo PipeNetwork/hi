@@ -41,6 +41,10 @@ done < <(
       "$ROOT/crates/hi-rsi-runtime/src" \
       "$ROOT/crates/hi-trace/src" \
       "$ROOT/crates/hi-agent/src" \
+      "$ROOT/crates/hi-workspace/src" \
+      "$ROOT/crates/hi-control/src" \
+      "$ROOT/crates/hi-pipefs/src" \
+      "$ROOT/crates/hi-engine-host/src" \
       "$ROOT/crates/hi-tui/src" \
       "$ROOT/crates/hi-cli/src" \
       "$ROOT/crates/hi-eval/src" \

@@ -731,6 +731,7 @@ mod tests {
             canonical_objective: Some("test cancellation accounting".into()),
             messages: Arc::new(vec![Message::user("hello")]),
             tools: Vec::new().into(),
+            tool_envelope: None,
             max_tokens: 40,
             temperature: None,
             top_p: None,

@@ -181,6 +181,15 @@ fn outcome_credentials(file: &Config, settings: &Settings) -> (String, String) {
 }
 
 fn outcome_section_api_key(section: &crate::config::OutcomeSection) -> Option<String> {
+    if let Some(reference) = section.api_key_ref.as_deref() {
+        return crate::config::resolve_credential_reference(
+            reference,
+            section.project_local,
+            section.project_local,
+        )
+        .ok()
+        .filter(|key| !key.trim().is_empty());
+    }
     let literal = section.api_key.clone().filter(|key| !key.trim().is_empty());
     if literal.is_some() {
         return literal;

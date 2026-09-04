@@ -59,6 +59,9 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Build the immediately preceding revision as the paired control.
+          fetch-depth: 2
       - name: Install Linux build dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -66,6 +69,14 @@ jobs:
 
       - name: Build core binaries
         run: cargo build --release -p hi -p hi-eval
+
+      - name: Build preceding harness binary
+        run: |
+          git worktree add --detach "${RUNNER_TEMP}/hi-harness-baseline" HEAD^
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/hi-harness-baseline-target" \
+            cargo build \
+            --manifest-path "${RUNNER_TEMP}/hi-harness-baseline/Cargo.toml" \
+            --release -p hi
 
       - name: Run harness suite (verify, one trial)
         env:
@@ -81,6 +92,21 @@ jobs:
           --configs=verify
           --artifacts=artifacts/harness
 
+      - name: Run paired two-binary harness evaluation
+        env:
+          HI_MODEL: ${{ vars.HI_EVAL_MODEL }}
+          HI_API_KEY: ${{ secrets.HI_EVAL_API_KEY }}
+          HI_BASE_URL: ${{ vars.HI_EVAL_BASE_URL }}
+          HI_STATE_DIR: ${{ runner.temp }}/hi-state-ab
+          HI_EVAL_CONCURRENCY: "2"
+        run: >-
+          target/release/hi-eval ab bench/harness
+          --baseline-bin="${RUNNER_TEMP}/hi-harness-baseline-target/release/hi"
+          --candidate-bin="${GITHUB_WORKSPACE}/target/release/hi"
+          --trials=1
+          --configs=verify
+          --artifacts=artifacts/harness-ab
+
       - name: Enforce harness process/budget gates
         run: scripts/check_harness_regression.sh artifacts/harness eval-baseline/harness.json
 
@@ -89,7 +115,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: harness-eval-${{ github.run_id }}
-          path: artifacts/harness
+          path: |
+            artifacts/harness
+            artifacts/harness-ab
           if-no-files-found: error
           retention-days: 90
 

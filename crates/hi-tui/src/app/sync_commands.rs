@@ -177,7 +177,7 @@ impl crate::App {
         // its durable revision commits.  Pausing or disabling transcript sync
         // beneath an active materialization would strand the cache without its
         // control plane, so do not permit either transition.
-        if agent.workspace_durability_enabled() && matches!(arg.trim(), "paused" | "off") {
+        if agent.pipefs_workspace_active() && matches!(arg.trim(), "paused" | "off") {
             self.push(Line::styled(
                 "sync cannot be paused or disabled while PipeFS is active; run /pipefs off first",
                 Style::default().fg(crate::theme::theme().warning),
@@ -479,7 +479,7 @@ impl crate::App {
 
         match result {
             Ok(switched) => {
-                self.transcript.clear();
+                self.reset_session_projection_v2();
                 self.event_log.clear();
                 self.pending = None;
                 self.code_lang = None;

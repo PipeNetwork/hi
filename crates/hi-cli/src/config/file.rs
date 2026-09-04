@@ -22,8 +22,7 @@ pub struct Config {
     pub profiles: HashMap<String, Profile>,
     #[serde(default)]
     pub sync: Option<SyncSection>,
-    /// Default for newly-created portable workspaces. Existing remote session
-    /// state takes precedence when attaching or resuming.
+    /// Default for new portable workspaces; restored remote state wins.
     #[serde(default)]
     pub pipefs: PipeFsSection,
     #[serde(default)]
@@ -41,6 +40,8 @@ pub struct Config {
     /// Inject-gated `browser_exec` (default on; advertised on page/login/UI tasks).
     #[serde(default)]
     pub browser: BrowserSection,
+    #[serde(default)]
+    pub harness: HarnessConfig,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -52,6 +53,10 @@ pub struct OutcomeSection {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Opaque credential-store/environment reference used by new writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<String>,
+    /// Legacy read-only credential fields; writers migrate them to `api_key_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +74,10 @@ pub struct RsiSection {
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Opaque credential-store/environment reference used by new writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<String>,
+    /// Legacy read-only credential fields; writers migrate them to `api_key_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,6 +275,10 @@ pub struct SyncSection {
     pub(crate) project_local: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Opaque credential-store/environment reference used by new writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<String>,
+    /// Legacy read-only credential fields; writers migrate them to `api_key_ref`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -298,7 +311,7 @@ impl serde::Serialize for Config {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Config", 13)?;
+        let mut s = serializer.serialize_struct("Config", 14)?;
         if let Some(v) = &self.default_profile {
             s.serialize_field("default_profile", v)?;
         }
@@ -340,27 +353,22 @@ impl serde::Serialize for Config {
         if self.browser != BrowserSection::default() {
             s.serialize_field("browser", &self.browser)?;
         }
+        if !self.harness.is_empty() {
+            s.serialize_field("harness", &self.harness)?;
+        }
         s.end()
     }
 }
 
-// Serialized with `skip_serializing_if` on every field so a saved config omits
-// unset keys instead of filling with `model = ""` lines. Keep the attribute on
-// each new field: a field missing it is fine, but a field missing from
-// serialization entirely (as with the old hand-written `Serialize` impl) is
-// silently deleted from the user's config file on every save.
+// Omit unset profile fields so saving never materializes defaults.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Profile {
-    /// Runtime-only provenance: this profile came from the automatically
-    /// merged repository `hi.toml`, not the user's global/explicit config.
-    /// Project files may contain literal test credentials, but must never name
-    /// an ambient environment variable to be read from the user's process.
+    /// Runtime-only provenance for an automatically merged repository profile.
+    /// Such profiles may never name an ambient credential variable.
     #[serde(skip)]
     pub(crate) project_local: bool,
-    /// Whether the automatically merged project had a persisted folder-trust
-    /// grant when it was loaded. This never follows the development-build
-    /// auto-trust shortcut: redirecting model/repository data requires an
-    /// explicit durable grant.
+    /// Persisted folder trust for the merged project. Development auto-trust
+    /// never authorizes redirecting model or repository data.
     #[serde(skip)]
     pub(crate) project_trusted: bool,
     /// Per-profile execution mode. Durable mode checkpoints progress at task
@@ -376,10 +384,15 @@ pub struct Profile {
     /// MCP endpoint used for metadata discovery, when supported by the provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_url: Option<String>,
-    /// A literal API key (written by the setup wizard).
+    /// Opaque credential-store or environment reference used by new profile
+    /// writes. Examples: `auth-store://profile-api-key/...` and `env://NAME`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<String>,
+    /// Legacy literal API key. It remains readable so existing profiles do not
+    /// break, but production profile writers migrate it to `api_key_ref`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Name of an env var holding the API key for this profile.
+    /// Legacy name of an env var holding the API key for this profile.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -435,6 +448,8 @@ pub struct Profile {
     /// recreate it after a restart without persisting a process id or port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<LocalRuntimeProfile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub harness: HarnessOverrides,
 }
 
 /// Persisted intent for a local runtime. `kind` is currently `mlx`; the
@@ -521,6 +536,7 @@ pub(crate) fn read_config(path: &Path) -> Result<Config> {
         .validate()
         .with_context(|| format!("validating MoA config {}", path.display()))?;
     migrate_api_key_env_to_literal(&mut config, path);
+    super::credential_refs::migrate_persisted_credentials(&config, path);
     Ok(config)
 }
 
@@ -550,6 +566,7 @@ pub(crate) fn merge_config_with_project_trust(
     mut overlay: Config,
     trusted: bool,
 ) {
+    base.harness.merge_project(&mut overlay.harness, trusted);
     for profile in overlay.profiles.values_mut() {
         profile.project_local = true;
         profile.project_trusted = trusted;
@@ -662,10 +679,15 @@ fn merge_project_sync(base: &mut Option<SyncSection>, project: Option<SyncSectio
         // inherited global credential instead of forwarding it.
         target.api_key = project.api_key;
         target.api_key_env = project.api_key_env;
+        target.api_key_ref = project.api_key_ref;
         target.project_local = true;
-    } else if project.api_key.is_some() || project.api_key_env.is_some() {
+    } else if project.api_key_ref.is_some()
+        || project.api_key.is_some()
+        || project.api_key_env.is_some()
+    {
         target.api_key = project.api_key;
         target.api_key_env = project.api_key_env;
+        target.api_key_ref = project.api_key_ref;
         target.project_local = true;
     }
     if project.machine_id.is_some() {
@@ -725,10 +747,15 @@ fn merge_project_outcome(
     }
     if project.base_url.is_some() {
         target.base_url = project.base_url;
+        target.api_key_ref = project.api_key_ref;
         target.api_key = project.api_key;
         target.api_key_env = project.api_key_env;
         target.project_local = true;
-    } else if project.api_key.is_some() || project.api_key_env.is_some() {
+    } else if project.api_key_ref.is_some()
+        || project.api_key.is_some()
+        || project.api_key_env.is_some()
+    {
+        target.api_key_ref = project.api_key_ref;
         target.api_key = project.api_key;
         target.api_key_env = project.api_key_env;
         target.project_local = true;
@@ -791,42 +818,6 @@ fn merge_restrictive_lists(
         if !base_exclude.contains(&item) {
             base_exclude.push(item);
         }
-    }
-}
-
-/// Repair the one unambiguous legacy shape: `api_key_env` contains a value
-/// that is not a plausible environment-variable name, no variable by that
-/// name exists, and there is no explicit `api_key`. Older setup code could put
-/// a pasted literal in that field.
-///
-/// Never reinterpret `api_key`. Its field identity is explicit and literal
-/// keys are allowed to look exactly like environment-variable names. Likewise,
-/// an unset, plausible `api_key_env` remains an env reference: guessing from
-/// whether the process currently has that variable would make configuration
-/// change meaning across machines and launches.
-pub(crate) fn migrate_api_key_env_to_literal(config: &mut Config, path: &Path) {
-    let mut changed = false;
-    for profile in config.profiles.values_mut() {
-        let Some(env_name) = profile.api_key_env.clone() else {
-            continue;
-        };
-        if profile.api_key.is_some()
-            || looks_like_env_var_name(&env_name)
-            || std::env::vars_os()
-                .any(|(name, _)| name.as_os_str() == std::ffi::OsStr::new(&env_name))
-        {
-            continue;
-        }
-        profile.api_key_env = None;
-        profile.api_key = Some(env_name);
-        changed = true;
-    }
-    if changed {
-        // Best-effort rewrite; if it fails we've still repaired the in-memory
-        // config so this run works, just not the next one. Route through
-        // `save_config_to` so the file keeps 0600 (a bare `fs::write` would drop
-        // permissions, leaving keys world-readable).
-        let _ = save_config_to(config, path);
     }
 }
 
@@ -1116,8 +1107,18 @@ pub fn set_rsi_config(
         );
         section.channel = Some(channel);
     }
-    let section = section.clone();
+    let mut section = section.clone();
     let path =
         writable_config_path(explicit).context("could not determine a writable hi config path")?;
+    (section.api_key_ref, section.api_key, section.api_key_env) =
+        super::credential_refs::seal_credential_fields(
+            "config-api-key/rsi",
+            "rsi",
+            &path,
+            section.api_key_ref.take(),
+            section.api_key.take(),
+            section.api_key_env.take(),
+        )?;
+    config.rsi = Some(section.clone());
     rmw_config_file(&path, |target| target.rsi = Some(section))
 }

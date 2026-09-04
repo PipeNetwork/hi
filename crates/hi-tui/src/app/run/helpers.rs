@@ -21,7 +21,7 @@ pub(super) use crate::file_mentions::expand_file_mentions;
 /// to insert mode; `j`/`k` scroll; `u`/`d` half-page; `g`/`G` top/bottom; `/`
 /// starts a transcript search; `n`/`N` jump to next/previous match; `y` copies
 /// the last code block (mirroring Ctrl-Y).
-pub(super) fn handle_normal_mode(app: &mut App, key: &KeyEvent) {
+pub(crate) fn handle_normal_mode(app: &mut App, key: &KeyEvent) {
     // If we're collecting a search query, handle search-mode keys.
     if let Some(search_slot) = app.mode.normal_search_mut() {
         match key.code {

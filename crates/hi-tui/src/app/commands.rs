@@ -7,106 +7,12 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use std::time::Instant;
 
+use super::command_helpers::{
+    on_off, parse_race_arg, race_setup_lines, toggle_arg, tui_mcp_agent_check,
+};
 use crate::render::dim;
 use crate::util::{copy_to_clipboard, goal_feedback};
 use crate::{TurnState, diff_for_files_sync, working_tree_diff_sync};
-
-fn toggle_arg(current: bool, arg: &str) -> bool {
-    match arg.trim() {
-        "on" | "enable" | "yes" | "true" => true,
-        "off" | "disable" | "no" | "false" => false,
-        "status" => current,
-        _ => !current,
-    }
-}
-
-fn on_off(value: bool) -> &'static str {
-    if value { "on" } else { "off" }
-}
-
-fn tui_mcp_agent_check(
-    table: Option<&str>,
-    mcp_url: Option<&str>,
-    api_key: &str,
-) -> hi_agent::DoctorCheck {
-    if let Some(table) = table {
-        let first_party = table.lines().any(|line| {
-            let mut parts = line.split_whitespace();
-            parts.next() == Some("pipe") && parts.next() == Some("pipe")
-        });
-        if first_party {
-            return hi_agent::DoctorCheck::pass(
-                "mcp agent attach",
-                "pipe (allowlist: pipe.models.list, pipe.models.health)",
-            );
-        }
-        let workspace_pipe = table.lines().any(|line| {
-            line.split_whitespace()
-                .next()
-                .is_some_and(|name| name == "pipe")
-        });
-        if workspace_pipe {
-            return hi_agent::DoctorCheck::pass(
-                "mcp agent attach",
-                "skipped: workspace already defines a server named 'pipe'",
-            );
-        }
-    }
-    if mcp_url.map(str::trim).is_none_or(|url| url.is_empty()) {
-        return hi_agent::DoctorCheck::pass(
-            "mcp agent attach",
-            "skipped: no mcp_url for this provider",
-        );
-    }
-    if api_key.trim().is_empty() {
-        return hi_agent::DoctorCheck::fail(
-            "mcp agent attach",
-            "mcp_url is set but no API key",
-            "set a project API key, or disable with [mcp.pipe] enabled = false",
-        );
-    }
-    hi_agent::DoctorCheck::pass(
-        "mcp agent attach",
-        "off ([mcp.pipe] enabled = false, or attach did not register)",
-    )
-}
-
-fn parse_race_arg(arg: &str) -> (String, bool) {
-    let mut judge_model = false;
-    let mut rest = Vec::new();
-    let mut tokens = arg.split_whitespace().peekable();
-    while let Some(token) = tokens.next() {
-        if token == "--judge" {
-            if tokens
-                .next()
-                .is_some_and(|value| value.eq_ignore_ascii_case("model"))
-            {
-                judge_model = true;
-            }
-        } else {
-            rest.push(token);
-        }
-    }
-    (rest.join(" "), judge_model)
-}
-
-fn race_setup_lines(defaults: &crate::RaceDefaults) -> Line<'static> {
-    let targets = if defaults.targets.is_empty() {
-        "<none configured>".to_string()
-    } else {
-        defaults
-            .targets
-            .iter()
-            .map(|target| format!("{}={}:{}", target.name, target.profile, target.model))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    Line::raw(format!(
-        "race targets: {targets} · max candidates {} · fuzz {} · edit .hi/config.toml [race]",
-        defaults.max_candidates,
-        defaults.fuzz.as_ref().map(|_| "on").unwrap_or("off")
-    ))
-}
 
 impl crate::App {
     /// Apply a pure editing/navigation key to the input line, shared by the
@@ -1977,11 +1883,13 @@ impl crate::App {
                     }
                 } else {
                     let queued: Vec<String> = self.queue.iter().cloned().collect();
-                    if let Some(effect) = hi_agent::handle_session_command(
+                    if let Some(effect) = hi_agent::handle_session_command_coordinated(
                         agent,
                         &Command::Jump(arg.to_string()),
                         &queued,
-                    ) {
+                    )
+                    .await
+                    {
                         for line in effect.message.lines() {
                             self.push(Line::styled(line.to_string(), dim()));
                         }
@@ -1995,11 +1903,13 @@ impl crate::App {
                     self.open_rewind_picker(agent);
                 } else if let Ok(n) = trimmed.parse::<usize>() {
                     let queued: Vec<String> = self.queue.iter().cloned().collect();
-                    if let Some(effect) = hi_agent::handle_session_command(
+                    if let Some(effect) = hi_agent::handle_session_command_coordinated(
                         agent,
                         &Command::Rewind(arg.clone()),
                         &queued,
-                    ) {
+                    )
+                    .await
+                    {
                         let failed = effect.message.starts_with("rewind failed");
                         for line in effect.message.lines() {
                             self.push(Line::styled(line.to_string(), dim()));
@@ -2033,7 +1943,8 @@ impl crate::App {
                     self.open_plan_approval();
                 } else {
                     let queued: Vec<String> = self.queue.iter().cloned().collect();
-                    if let Some(effect) = hi_agent::handle_session_command(agent, &command, &queued)
+                    if let Some(effect) =
+                        hi_agent::handle_session_command_coordinated(agent, &command, &queued).await
                     {
                         for line in effect.message.lines() {
                             self.push(Line::styled(line.to_string(), dim()));
@@ -2073,7 +1984,9 @@ impl crate::App {
             | Command::Rename(_)
             | Command::Resume(_) => {
                 let queued: Vec<String> = self.queue.iter().cloned().collect();
-                if let Some(effect) = hi_agent::handle_session_command(agent, &command, &queued) {
+                if let Some(effect) =
+                    hi_agent::handle_session_command_coordinated(agent, &command, &queued).await
+                {
                     for line in effect.message.lines() {
                         self.push(Line::styled(line.to_string(), dim()));
                     }
@@ -2254,7 +2167,7 @@ impl crate::App {
                     .count();
                 match agent.clear_history() {
                     Ok(()) => {
-                        self.transcript.clear();
+                        self.reset_session_projection_v2();
                         self.bump_transcript();
                         self.event_log.clear();
                         self.pending = None;
@@ -2592,7 +2505,7 @@ impl crate::App {
                 ));
             }
             Command::Race(arg) => {
-                if agent.workspace_durability_enabled() {
+                if agent.pipefs_workspace_active() {
                     self.push(Line::styled(
                         "/race is unavailable while PipeFS is active because the race runner is bound to the launch workspace",
                         Style::default().fg(crate::theme::theme().warning),
@@ -2672,23 +2585,16 @@ impl crate::App {
             }
             Command::Commit => {
                 let paths = agent.session_touched_paths();
-                if let Err(error) = agent.begin_durable_workspace_mutation(None).await {
-                    self.push(Line::styled(
-                        format!("commit blocked: {error:#}"),
-                        Style::default().fg(crate::theme::theme().warning),
-                    ));
-                    return;
-                }
-                let out = hi_tools::commit_in(agent.workspace_root(), &paths).await;
-                if let Err(error) = agent.checkpoint_durable_workspace().await {
-                    self.push(Line::styled(
-                        format!(
-                            "commit completed locally but PipeFS persistence failed: {error:#}; run /pipefs retry"
-                        ),
-                        Style::default().fg(crate::theme::theme().warning),
-                    ));
-                    return;
-                }
+                let out = match agent.commit_session_changes(&paths).await {
+                    Ok(out) => out,
+                    Err(error) => {
+                        self.push(Line::styled(
+                            format!("commit failed or was not durably published: {error:#}"),
+                            Style::default().fg(crate::theme::theme().warning),
+                        ));
+                        return;
+                    }
+                };
                 for line in out.lines() {
                     self.push(Line::styled(format!("── {line} ──"), dim()));
                 }
@@ -2860,7 +2766,7 @@ impl crate::App {
                 self.push(Line::styled(msg, dim()));
             }
             Command::Export(arg) => {
-                if agent.workspace_durability_enabled() {
+                if agent.pipefs_workspace_active() {
                     self.push(Line::styled(
                         "/export is unavailable while PipeFS is active because it writes outside the workspace durability fence",
                         Style::default().fg(crate::theme::theme().warning),

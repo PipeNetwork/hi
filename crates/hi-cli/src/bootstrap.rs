@@ -53,6 +53,37 @@ fn normalize_resume_command(mut args: Vec<OsString>) -> Vec<OsString> {
     args
 }
 
+pub(crate) fn validate_tui_event_trace_request(
+    cli: &Cli,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<()> {
+    if cli.tui_events_jsonl.is_none() {
+        return Ok(());
+    }
+    let headless_mode = cli.prompt.is_some()
+        || cli.plain
+        || cli.subagent
+        || cli.goal.is_some()
+        || cli.workflow.is_some()
+        || cli.list_sessions
+        || cli.show_config
+        || cli.loops_daemon
+        || cli.daemon
+        || cli.attach.is_some()
+        || cli.benchmark_orchestration
+        || cli.judge.is_some()
+        || cli.report.is_some()
+        || cli.eval_input.is_some()
+        || cli.eval_output.is_some()
+        || cli.quiet
+        || cli.skeptic_review;
+    if headless_mode || !stdin_is_tty || !stdout_is_tty {
+        anyhow::bail!("usage: --tui-events-jsonl is valid only for a full interactive TUI session");
+    }
+    Ok(())
+}
+
 /// Handle `--show-config` / `--list-sessions` before the heavy agent path.
 ///
 /// Returns `Some(result)` when the process should exit after the short-circuit.
@@ -84,6 +115,7 @@ async fn print_show_config(cli: &Cli) -> Result<()> {
                     context_window: None,
                     max_output_tokens: None,
                     price: None,
+                    provider_capabilities: None,
                 }
             };
             let effective_max_tokens =

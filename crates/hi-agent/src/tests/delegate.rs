@@ -10,6 +10,7 @@ use super::*;
 fn delegate_config() -> AgentConfig {
     let mut cfg = config();
     cfg.subagents.write_subagents = crate::WriteSubagentPolicy::On;
+    cfg.harness.features.candidate_jobs_v2 = true;
     cfg
 }
 
@@ -20,6 +21,12 @@ struct StubRunner {
 
 struct WritingStubRunner {
     root: std::path::PathBuf,
+}
+
+struct BoundStubRunner {
+    workspace_root: std::path::PathBuf,
+    state_root: std::path::PathBuf,
+    called: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct LimitTrackingRunner {
@@ -76,6 +83,27 @@ impl crate::DelegateRunner for WritingStubRunner {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::DelegateRunner for BoundStubRunner {
+    fn is_bound_to_workspace(
+        &self,
+        workspace_root: &std::path::Path,
+        state_root: &std::path::Path,
+    ) -> bool {
+        self.workspace_root == workspace_root && self.state_root == state_root
+    }
+
+    async fn run(&self, _task: &str, _verify: Option<&str>) -> crate::DelegateOutcome {
+        self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::DelegateOutcome {
+            status: hi_tools::ToolStatus::Failed,
+            applied: false,
+            changed_files: Vec::new(),
+            summary: "bound runner executed in its candidate root".into(),
+        }
+    }
+}
+
 #[test]
 fn delegate_tool_is_not_read_only_and_not_in_global_set() {
     // Depth ≤ 1 is structural: `delegate` is out of the read-only set and the
@@ -116,6 +144,9 @@ fn delegate_advertised_only_when_enabled_and_not_read_only() {
 async fn pipefs_hides_and_rejects_delegate_even_with_a_runner() {
     let mut agent = agent(Vec::new(), delegate_config());
     agent.set_delegate_runner(std::sync::Arc::new(StubRunner { applied: true }));
+    agent
+        .activate_pipefs_workspace_controller("session-stale-runner", 1, false)
+        .unwrap();
     agent.set_workspace_durability(Some(std::sync::Arc::new(TestWorkspaceDurability)));
 
     assert!(
@@ -131,6 +162,43 @@ async fn pipefs_hides_and_rejects_delegate_even_with_a_runner() {
     assert_eq!(outcome.status, hi_tools::ToolStatus::Denied);
     assert!(outcome.content.contains("PipeFS"), "{}", outcome.content);
     assert_eq!(agent.subagents.delegate_subagents_used, 0);
+}
+
+#[tokio::test]
+async fn pipefs_protocol_one_allows_a_synchronous_runner_bound_to_the_active_destination() {
+    let mut agent = agent(Vec::new(), delegate_config());
+    agent
+        .activate_pipefs_workspace_controller("session-bound-runner", 1, false)
+        .unwrap();
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    agent.set_delegate_runner(std::sync::Arc::new(BoundStubRunner {
+        workspace_root: agent.workspace_root().to_path_buf(),
+        state_root: agent.state_root().to_path_buf(),
+        called: called.clone(),
+    }));
+    agent.set_workspace_durability(Some(std::sync::Arc::new(TestWorkspaceDurability)));
+    assert!(agent.workspace_controller_capabilities().candidate_apply);
+    assert!(
+        agent
+            .subagents
+            .delegate_runner
+            .as_ref()
+            .unwrap()
+            .is_bound_to_workspace(agent.workspace_root(), agent.state_root(),)
+    );
+    assert!(agent.delegate_runner_matches_workspace());
+
+    assert!(
+        agent
+            .request_tools_for(hi_ai::ToolMode::Auto)
+            .iter()
+            .any(|tool| tool.name == "delegate")
+    );
+    let outcome = agent
+        .handle_delegate(r#"{"task":"write a file"}"#, &mut NullUi)
+        .await;
+    assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    assert_ne!(outcome.status, hi_tools::ToolStatus::Denied);
 }
 
 #[test]

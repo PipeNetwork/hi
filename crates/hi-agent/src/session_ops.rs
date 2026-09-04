@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::Command;
 use crate::memory::{global_memory_file, memory_file_at, read_global_memory};
@@ -19,9 +19,8 @@ fn canonical_workspace(workspace: &Path) -> PathBuf {
 }
 
 pub fn workspace_trusted(workspace: &Path) -> bool {
-    // Release builds require a persisted grant. Self-built/dev binaries make
-    // the trust feature deliberately inert, so every hook admission call must
-    // honor that same decision (not merely query the on-disk store).
+    // Every build requires a persisted grant. The only bypass is the explicit
+    // operator setting, which `/trust status` surfaces below.
     hi_tools::folder_trust::folder_trust_inert()
         || hi_tools::folder_trust::folder_trust_granted(workspace)
 }
@@ -47,12 +46,13 @@ pub fn trust_command(workspace: &Path, arg: &str) -> String {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<unavailable; trust fails closed>".to_string());
             format!(
-                "folder trust: {}\n  workspace: {}\n  store: {store}",
+                "folder trust: {}\n  policy: {}\n  workspace: {}\n  store: {store}",
                 if workspace_trusted(workspace) {
                     "trusted"
                 } else {
                     "untrusted"
                 },
+                hi_tools::folder_trust::policy_description(),
                 canonical_workspace(workspace).display(),
             )
         }
@@ -83,12 +83,164 @@ pub struct SessionCommandEffect {
     pub follow_up_prompt: Option<String>,
 }
 
+/// Execute a session command through the same admission, reconciliation, and
+/// publication boundary used by tools. Read-only and in-memory commands keep
+/// the synchronous fast path; commands which can touch workspace or external
+/// state are never run until the always-present controller admits them.
+pub async fn handle_session_command_coordinated(
+    agent: &mut crate::Agent,
+    command: &Command,
+    frontend_queue: &[String],
+) -> Option<SessionCommandEffect> {
+    if !session_command_mutates_workspace(command) {
+        return handle_session_command_inner(agent, command, frontend_queue, false);
+    }
+
+    let name = command_name(command);
+    let intent = hi_workspace::MutationIntent {
+        effect_scope: hi_workspace::EffectScope::LiveWriter,
+        replay_class: session_command_replay_class(command),
+        dirty_paths: None,
+        description: Some(format!("session command: /{name}")),
+    };
+    if let Err(error) = agent.begin_classified_workspace_operation(intent).await {
+        return Some(SessionCommandEffect {
+            message: format!(
+                "/{name} was not run because the workspace controller refused admission: {error:#}"
+            ),
+            follow_up_prompt: None,
+        });
+    }
+
+    let ledger_revision = agent.runtime.ledger().revision();
+    let handled = handle_session_command_inner(agent, command, frontend_queue, true);
+    let raw_result = handled
+        .as_ref()
+        .map(|effect| effect.message.clone())
+        .unwrap_or_else(|| format!("/{name} was not handled"));
+    let reconciliation = agent.reconcile_workspace_changes().await;
+    let changes = if reconciliation.is_ok() {
+        agent.runtime.ledger().changes_since(ledger_revision)
+    } else {
+        Vec::new()
+    };
+    let command_disposition = handled
+        .as_ref()
+        .map_or(hi_workspace::ExecutionDisposition::Failed, |effect| {
+            session_command_execution_disposition(command, &effect.message)
+        });
+    let mut execution = hi_workspace::ExecutionReport {
+        disposition: if reconciliation.is_err() {
+            hi_workspace::ExecutionDisposition::Indeterminate
+        } else {
+            command_disposition
+        },
+        workspace_may_have_changed: reconciliation.is_err() || !changes.is_empty(),
+        // Admission precedes the synchronous helper. Even a failure string can
+        // follow a partially applied external operation, so settlement records
+        // that execution may have happened.
+        external_effect_may_have_occurred: true,
+        content_digest: reconciliation
+            .is_ok()
+            .then(|| agent.runtime.ledger().workspace_revision()),
+        changed_paths: changes
+            .iter()
+            .map(|change| PathBuf::from(&change.path))
+            .collect(),
+        artifacts: Vec::new(),
+        detail: reconciliation.as_ref().err().map_or_else(
+            || {
+                (command_disposition != hi_workspace::ExecutionDisposition::Succeeded)
+                    .then(|| format!("/{name} execution failed: {raw_result}"))
+            },
+            |error| {
+                Some(format!(
+                    "/{name} effects could not be reconciled: {error:#}"
+                ))
+            },
+        ),
+    };
+
+    let operation_id = agent.workspace_coordination.active_parent_operation();
+    let call_id = operation_id.map_or_else(
+        || format!("session-command:{}", uuid::Uuid::new_v4()),
+        |operation| format!("session-command:{operation}"),
+    );
+    let arguments = serde_json::json!({
+        "command": name,
+        "parsed": format!("{command:?}"),
+    })
+    .to_string();
+    let calls = [(
+        call_id.clone(),
+        "session_command".to_owned(),
+        arguments.clone(),
+    )];
+    let assistant_content = [hi_ai::Content::ToolCall {
+        id: call_id.clone(),
+        name: "session_command".to_owned(),
+        arguments,
+    }];
+    let results = [(call_id, raw_result.clone())];
+    let stage_error = agent
+        .stage_active_workspace_execution(&calls, &assistant_content, &results, &execution)
+        .err();
+    if let Some(error) = &stage_error {
+        execution.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
+        execution.content_digest = None;
+        execution.detail = Some(match execution.detail.take() {
+            Some(detail) => {
+                format!("{detail}; /{name} transcript evidence could not be staged: {error:#}")
+            }
+            None => format!("/{name} transcript evidence could not be staged: {error:#}"),
+        });
+    }
+    let settlement = agent
+        .checkpoint_durable_workspace_with_execution(execution)
+        .await;
+
+    match (handled, reconciliation.err(), stage_error, settlement) {
+        (Some(effect), None, None, Ok(())) => Some(effect),
+        (effect, reconcile, stage, settle) => {
+            let mut failures = Vec::new();
+            if effect.is_none() {
+                failures.push("the command was not handled".to_owned());
+            }
+            if let Some(error) = reconcile {
+                failures.push(format!("workspace reconciliation failed: {error:#}"));
+            }
+            if let Some(error) = stage {
+                failures.push(format!("transcript staging failed: {error:#}"));
+            }
+            if let Err(error) = settle {
+                failures.push(format!("durable settlement failed: {error:#}"));
+            }
+            Some(SessionCommandEffect {
+                message: format!(
+                    "/{name} ran, but its result was not published as successful: {}\nheld result: {raw_result}",
+                    failures.join("; ")
+                ),
+                follow_up_prompt: None,
+            })
+        }
+    }
+}
+
 /// Handle session-orchestration commands against a live agent.
 /// Returns `None` when `command` is not one of these.
 pub fn handle_session_command(
     agent: &mut crate::Agent,
     command: &Command,
     frontend_queue: &[String],
+) -> Option<SessionCommandEffect> {
+    handle_session_command_inner(agent, command, frontend_queue, false)
+}
+
+fn handle_session_command_inner(
+    agent: &mut crate::Agent,
+    command: &Command,
+    frontend_queue: &[String],
+    coordinated: bool,
 ) -> Option<SessionCommandEffect> {
     // These commands use synchronous filesystem helpers.  A materialized
     // PipeFS workspace must never be changed outside the async durability
@@ -97,7 +249,11 @@ pub fn handle_session_command(
     // available, but fail closed for the forms that write the workspace (or
     // create/remove a worktree from it) until they can participate in that
     // fence.
-    if agent.workspace_durability_enabled() && session_command_mutates_workspace(command) {
+    let pipefs_authoritative = matches!(
+        agent.workspace_controller_binding().authority,
+        hi_workspace::WorkspaceAuthority::PipeFs { .. }
+    );
+    if pipefs_authoritative && session_command_mutates_workspace(command) && !coordinated {
         return Some(SessionCommandEffect {
             message: format!(
                 "/{} is unavailable while PipeFS is active because it cannot yet commit through the workspace durability fence; use normal file tools or /pipefs off first",
@@ -273,7 +429,11 @@ pub fn handle_session_command(
         Command::Memory => format_memory_dump(agent.workspace_root()),
         Command::ImportClaude(_) => import_claude_report(agent.workspace_root()),
         Command::Hooks(arg) => hooks_command(agent.workspace_root(), arg),
-        Command::Trust(arg) => trust_command(agent.workspace_root(), arg),
+        Command::Trust(arg) => {
+            let message = trust_command(agent.workspace_root(), arg);
+            update_workspace_context_trust(agent, arg, &message);
+            message
+        }
         Command::Marketplace(arg) => marketplace_report(agent.workspace_root(), arg),
         Command::Worktree(arg) => worktree_command(agent.workspace_root(), arg),
         Command::Inspect(arg) => {
@@ -419,12 +579,98 @@ fn session_command_mutates_workspace(command: &Command) -> bool {
                 || arg.trim_start().starts_with("remove ")
         }
         Command::Inspect(arg) => matches!(arg.trim(), "bundle" | "support-bundle"),
+        Command::Agents(arg) => {
+            let arg = arg.trim_start();
+            arg.starts_with("add ") || arg.starts_with("remove ")
+        }
+        // `/share` always materializes a local bundle before optionally
+        // printing a portal URL.
+        Command::Share(_) => true,
         // `/cd` saves a dashboard cwd hint below `.hi/`.
         Command::Cd(arg) => !arg.trim().is_empty(),
         // A portable restore starts untrusted.  Do not let a command grant a
         // trust record to the transient materialization.
-        Command::Trust(arg) => matches!(arg.trim(), "on" | "grant" | "trust"),
+        Command::Trust(arg) => matches!(
+            arg.trim(),
+            "on" | "grant" | "trust" | "off" | "revoke" | "untrust"
+        ),
         _ => false,
+    }
+}
+
+fn session_command_replay_class(command: &Command) -> hi_workspace::ReplayClass {
+    // Grant/revoke are idempotent local policy writes. Classifying them as
+    // such lets a compatibility PipeFS session publish a no-head-change
+    // transcript receipt; all other compatibility helpers remain fenced as
+    // non-replayable external effects.
+    if matches!(
+        command,
+        Command::Trust(arg)
+            if matches!(arg.trim(), "on" | "grant" | "trust" | "off" | "revoke" | "untrust")
+    ) {
+        return hi_workspace::ReplayClass::IdempotentExternal {
+            key: hi_workspace::IdempotencyKey::new(uuid::Uuid::new_v4().to_string()),
+        };
+    }
+    hi_workspace::ReplayClass::NonReplayableExternal
+}
+
+fn update_workspace_context_trust(agent: &mut crate::Agent, arg: &str, message: &str) {
+    let promote =
+        matches!(arg.trim(), "on" | "grant" | "trust") && message.starts_with("trusted workspace:");
+    let demote = matches!(arg.trim(), "off" | "revoke" | "untrust")
+        && message.starts_with("revoked workspace trust:");
+    if !promote && !demote {
+        return;
+    }
+    let context = agent.config.memory.project_context.clone().map(|context| {
+        if promote {
+            crate::promote_repository_context(context)
+        } else {
+            crate::mark_repository_context_untrusted(context)
+        }
+    });
+    agent.set_workspace_project_context(context);
+}
+
+fn session_command_execution_disposition(
+    command: &Command,
+    message: &str,
+) -> hi_workspace::ExecutionDisposition {
+    let succeeded = match command {
+        Command::Fork(_) => !message.contains(" failed:"),
+        Command::Remember(_) => !message.starts_with("remember failed:"),
+        Command::UndoMemory => !message.starts_with("undo-memory:"),
+        Command::Marketplace(_) => message.starts_with("installed plugin skill:"),
+        Command::Worktree(arg) if matches!(arg.trim(), "gc" | "clean" | "cleanup") => {
+            message.starts_with("cleaned ")
+        }
+        Command::Worktree(arg) if arg.trim_start().starts_with("remove ") => {
+            message.starts_with("removed ")
+        }
+        Command::Inspect(_) => message.starts_with("wrote redacted inspect bundle:"),
+        Command::Agents(arg) if arg.trim_start().starts_with("add ") => {
+            message.starts_with("added agent persona:")
+        }
+        Command::Agents(arg) if arg.trim_start().starts_with("remove ") => {
+            message.starts_with("removed ")
+        }
+        Command::Share(_) => {
+            message.starts_with("share bundle:") || message.starts_with("{\"path\":")
+        }
+        Command::Cd(_) => message.starts_with("dashboard workspace "),
+        Command::Trust(arg) if matches!(arg.trim(), "on" | "grant" | "trust") => {
+            message.starts_with("trusted workspace:")
+        }
+        Command::Trust(arg) if matches!(arg.trim(), "off" | "revoke" | "untrust") => {
+            message.starts_with("revoked workspace trust:")
+        }
+        _ => false,
+    };
+    if succeeded {
+        hi_workspace::ExecutionDisposition::Succeeded
+    } else {
+        hi_workspace::ExecutionDisposition::Failed
     }
 }
 
@@ -436,6 +682,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Marketplace(_) => "marketplace install",
         Command::Worktree(_) => "worktree",
         Command::Inspect(_) => "inspect bundle",
+        Command::Agents(_) => "agents",
+        Command::Share(_) => "share",
         Command::Cd(_) => "cd",
         Command::Trust(_) => "trust",
         _ => "command",
@@ -929,263 +1177,18 @@ fn migration_hint(path: &Path, kind: &str) -> Option<String> {
     }
 }
 
-/// Versioned structured hook response. Hook stdout may be this JSON; plain text
-/// remains a backwards-compatible informational response.
-#[derive(Debug, Deserialize)]
-struct HookResponse {
-    #[serde(default)]
-    version: Option<u32>,
-    #[serde(default)]
-    decision: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-}
+#[path = "session_ops_hooks.rs"]
+mod lifecycle_hooks;
 
-/// Run a lifecycle hook script from `.hi/hooks/<name>`.
-///
-/// Input is passed on stdin; stdout is returned as a user-visible report. A
-/// non-zero exit is a gate failure (callers decide whether to block an action).
-pub async fn run_hook(workspace: &Path, name: &str, input: &str) -> Result<String> {
-    if !workspace_trusted(workspace) {
-        bail!("workspace is untrusted; run `/trust on` before executing project hooks");
-    }
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-    {
-        bail!("invalid hook name {name:?}");
-    }
-    let path = workspace.join(".hi").join("hooks").join(name);
-    if !path.is_file() {
-        bail!("hook not found: {}", path.display());
-    }
-    run_hook_process(workspace, name, input, hook_timeout()).await
-}
-
-fn hook_timeout_from_value(value: Option<&str>) -> Option<std::time::Duration> {
-    value
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(std::time::Duration::from_secs)
-}
-
-/// Optional operator-selected lifecycle-hook timeout. Hooks are trusted,
-/// productive project work and therefore have no wall-clock ceiling by
-/// default. Whole-turn cancellation still tears down their process group.
-fn hook_timeout() -> Option<std::time::Duration> {
-    let configured = std::env::var("HI_HOOK_TIMEOUT_SECS").ok();
-    hook_timeout_from_value(configured.as_deref())
-}
-
-async fn run_hook_process(
-    workspace: &Path,
-    name: &str,
-    input: &str,
-    timeout: Option<std::time::Duration>,
-) -> Result<String> {
-    let path = workspace.join(".hi").join("hooks").join(name);
-    let mut command = tokio::process::Command::new(&path);
-    command
-        .current_dir(workspace)
-        .env("HI_HOOK", name)
-        .env("HI_WORKSPACE", workspace)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    command.kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawning hook {}", path.display()))?;
-    let mut process_group = HookProcessGroupGuard::for_child(&child);
-    let mut stdin_task = child.stdin.take().map(|mut stdin| {
-        let input = input.as_bytes().to_vec();
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt as _;
-            tolerate_closed_hook_stdin(stdin.write_all(&input).await)?;
-            tolerate_closed_hook_stdin(stdin.shutdown().await)
-        })
-    });
-    let stdout = child.stdout.take().context("hook stdout was not piped")?;
-    let stderr = child.stderr.take().context("hook stderr was not piped")?;
-    let mut stdout_task = tokio::spawn(read_hook_output(stdout));
-    let mut stderr_task = tokio::spawn(read_hook_output(stderr));
-
-    let execution = async {
-        let status = child.wait().await;
-        // A hook may daemonize after its direct script exits. The lifecycle
-        // action is complete at the script boundary, so reap any remaining
-        // descendants before waiting for inherited output pipes to close.
-        process_group.terminate();
-        let status = status.context("waiting for hook process")?;
-
-        let drains = tokio::time::timeout(HOOK_PIPE_DRAIN_GRACE, async {
-            if let Some(task) = stdin_task.as_mut() {
-                task.await.context("joining hook stdin writer")??;
-            }
-            let stdout = (&mut stdout_task)
-                .await
-                .context("joining hook stdout reader")??;
-            let stderr = (&mut stderr_task)
-                .await
-                .context("joining hook stderr reader")??;
-            Ok::<_, anyhow::Error>((stdout, stderr))
-        })
-        .await;
-        let (stdout, stderr) = match drains {
-            Ok(result) => result?,
-            Err(_) => {
-                if let Some(task) = stdin_task.as_ref() {
-                    task.abort();
-                }
-                stdout_task.abort();
-                stderr_task.abort();
-                bail!("hook output pipes did not close after process-group cleanup");
-            }
-        };
-        Ok::<_, anyhow::Error>((status, stdout, stderr))
-    };
-
-    let (status, stdout, stderr) = match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, execution)
-            .await
-            .with_context(|| format!("hook {name} timed out after {}s", timeout.as_secs()))??,
-        None => execution.await?,
-    };
-    let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
-    if !status.success() {
-        bail!(
-            "hook {name} failed ({}): {}",
-            status.code().unwrap_or(-1),
-            if stderr.is_empty() { stdout } else { stderr }
-        );
-    }
-    if let Ok(response) = serde_json::from_str::<HookResponse>(&stdout) {
-        if response.version.unwrap_or(1) != 1 {
-            bail!("hook {name} returned unsupported protocol version");
-        }
-        let message = response.message.unwrap_or_default();
-        match response.decision.as_deref().unwrap_or("allow") {
-            "allow" | "warn" => {
-                return Ok(if message.is_empty() {
-                    format!("hook {name}: ok")
-                } else {
-                    format!("hook {name}: {message}")
-                });
-            }
-            "deny" | "block" => bail!(
-                "hook {name} denied action{}",
-                if message.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {message}")
-                }
-            ),
-            other => bail!("hook {name} returned unknown decision {other:?}"),
-        }
-    }
-    Ok(if stdout.is_empty() {
-        format!("hook {name}: ok")
-    } else {
-        format!("hook {name}:\n{stdout}")
-    })
-}
-
-const MAX_HOOK_OUTPUT_BYTES: usize = 1024 * 1024;
-const HOOK_PIPE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-
-fn tolerate_closed_hook_stdin(result: std::io::Result<()>) -> std::io::Result<()> {
-    match result {
-        // Hooks are allowed to ignore their input. A short-lived hook can
-        // close fd 0 before the asynchronous writer is scheduled, so EPIPE is
-        // successful delivery of the lifecycle boundary rather than a hook
-        // execution failure.
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        result => result,
-    }
-}
-
-async fn read_hook_output(
-    mut reader: impl tokio::io::AsyncRead + Unpin,
-) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    const HEAD_BYTES: usize = MAX_HOOK_OUTPUT_BYTES / 2;
-    const TAIL_BYTES: usize = MAX_HOOK_OUTPUT_BYTES - HEAD_BYTES;
-    const OMITTED: &[u8] = b"\n[... hook output truncated ...]\n";
-    let mut head = Vec::with_capacity(HEAD_BYTES);
-    let mut tail = std::collections::VecDeque::with_capacity(TAIL_BYTES);
-    let mut total = 0usize;
-    let mut buffer = [0u8; 8 * 1024];
-    loop {
-        let count = reader.read(&mut buffer).await?;
-        if count == 0 {
-            break;
-        }
-        total = total.saturating_add(count);
-        for &byte in &buffer[..count] {
-            if head.len() < HEAD_BYTES {
-                head.push(byte);
-            } else {
-                if tail.len() == TAIL_BYTES {
-                    tail.pop_front();
-                }
-                tail.push_back(byte);
-            }
-        }
-    }
-    if total > MAX_HOOK_OUTPUT_BYTES {
-        head.extend_from_slice(OMITTED);
-    }
-    head.extend(tail);
-    Ok(head)
-}
-
-#[cfg(unix)]
-struct HookProcessGroupGuard {
-    process_group: Option<libc::pid_t>,
-}
-
-#[cfg(unix)]
-impl HookProcessGroupGuard {
-    fn for_child(child: &tokio::process::Child) -> Self {
-        Self {
-            process_group: child.id().map(|pid| pid as libc::pid_t),
-        }
-    }
-
-    fn terminate(&mut self) {
-        if let Some(process_group) = self.process_group.take() {
-            // SAFETY: the child was spawned as leader of a private process
-            // group; a negative PID targets only that group. ESRCH is benign.
-            unsafe {
-                libc::kill(-process_group, libc::SIGKILL);
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for HookProcessGroupGuard {
-    fn drop(&mut self) {
-        self.terminate();
-    }
-}
-
-#[cfg(not(unix))]
-struct HookProcessGroupGuard;
-
-#[cfg(not(unix))]
-impl HookProcessGroupGuard {
-    fn for_child(_child: &tokio::process::Child) -> Self {
-        Self
-    }
-
-    fn terminate(&mut self) {}
-}
+pub use lifecycle_hooks::run_hook;
+#[cfg(test)]
+pub(crate) use lifecycle_hooks::run_hook_process_cancellable_for_test;
+#[cfg(test)]
+use lifecycle_hooks::{
+    HOOK_PIPE_DRAIN_GRACE, MAX_HOOK_OUTPUT_BYTES, hook_timeout_from_value, run_hook_process,
+    tolerate_closed_hook_stdin,
+};
+pub(crate) use lifecycle_hooks::{HookExecution, run_hook_cancellable};
 
 pub fn hooks_command(workspace: &Path, arg: &str) -> String {
     let arg = arg.trim();
@@ -1634,6 +1637,14 @@ mod tests {
         ] {
             assert!(!session_command_mutates_workspace(&command), "{command:?}");
         }
+        assert!(matches!(
+            session_command_replay_class(&Command::Trust("on".into())),
+            hi_workspace::ReplayClass::IdempotentExternal { .. }
+        ));
+        assert!(matches!(
+            session_command_replay_class(&Command::Remember("note".into())),
+            hi_workspace::ReplayClass::NonReplayableExternal
+        ));
     }
 
     fn u(t: &str) -> Message {

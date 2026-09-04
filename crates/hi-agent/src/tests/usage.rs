@@ -200,7 +200,13 @@ async fn last_turn_usage_resets_each_turn() {
     assert_eq!(agent.last_turn_usage().output_tokens, 3);
     assert_eq!(agent.last_turn_telemetry().model_requests, 1);
     assert_eq!(agent.last_turn_telemetry().requests.len(), 1);
-    assert!(agent.last_turn_telemetry().wire_audit.is_empty());
+    assert!(
+        agent.last_turn_telemetry().wire_audit.iter().all(|audit| {
+            audit.get("provider").and_then(serde_json::Value::as_str) == Some("request_admission")
+        }),
+        "new-turn telemetry should contain only its sealed request admission audit: {:?}",
+        agent.last_turn_telemetry().wire_audit
+    );
     assert_eq!(
         agent
             .last_turn_telemetry()

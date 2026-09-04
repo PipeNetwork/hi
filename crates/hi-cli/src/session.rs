@@ -1,8 +1,7 @@
 //! JSONL session persistence: one message per line, appended after each turn.
 //!
 //! Sessions live under `$XDG_DATA_HOME/hi/sessions` (or `~/.local/share/...`).
-//! Resuming loads every line back as conversation history. Branching/tree
-//! sessions (pi-style) are a future extension; this is a linear log.
+//! Resuming loads every line back as conversation history.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -14,6 +13,9 @@ use anyhow::{Context, Result};
 use hi_agent::SessionSink;
 use hi_ai::{Message, Role, Usage};
 use serde::{Deserialize, Serialize};
+
+#[path = "session_shadow.rs"]
+pub(crate) mod session_shadow;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -392,6 +394,7 @@ pub struct LoadedSession {
     pub messages: Vec<Message>,
     pub usage: Usage,
     pub checkpoint_refs: Vec<String>,
+    pub harness_settings: hi_workspace::SettingLayer,
     /// Canonical IPOP session identity when this file is a local continuation
     /// cache created by `--attach --resume-local`.
     pub remote_session_id: Option<String>,
@@ -423,39 +426,7 @@ pub struct LoadedSession {
     pub goal_drive_evidence: Vec<String>,
 }
 
-/// Replace an already-running agent with every durable part of a loaded
-/// session. In-place session switches and remote `resume-local` must restore
-/// the drive latches and evidence ledgers too, not only conversation history.
-pub fn apply_loaded_session(agent: &mut hi_agent::Agent, loaded: LoadedSession) -> Result<()> {
-    let LoadedSession {
-        messages,
-        usage,
-        checkpoint_refs,
-        remote_session_id: _,
-        pipefs_enabled: _,
-        name: _,
-        goal,
-        decisions,
-        plan,
-        plan_drive_paused,
-        plan_drive_resume_on_user_input,
-        plan_approval_parked,
-        plan_drive_stall,
-        goal_drive_stall,
-        plan_drive_evidence,
-        goal_drive_evidence,
-    } = loaded;
-    agent.apply_loaded_session(messages, usage, checkpoint_refs, goal, decisions, plan)?;
-    agent.restore_plan_drive_with_policy(
-        plan_drive_paused,
-        plan_drive_resume_on_user_input,
-        plan_drive_stall,
-        plan_drive_evidence,
-    );
-    agent.restore_plan_approval_parked(plan_approval_parked);
-    agent.restore_goal_drive(goal_drive_stall, goal_drive_evidence);
-    Ok(())
-}
+pub(crate) use crate::session_harness::apply_loaded_session;
 
 /// Atomically cache reconstructed session state at `path`. A failed restore
 /// never leaves a partial JSONL file that could later masquerade as a complete
@@ -477,6 +448,7 @@ pub fn cache_loaded_session(path: &Path, loaded: &LoadedSession) -> Result<()> {
         )?;
         session.record(&[], loaded.usage)?;
         session.record_checkpoints(&loaded.checkpoint_refs)?;
+        crate::session_harness::append(&temp, &loaded.harness_settings)?;
         if let Some(session_id) = &loaded.remote_session_id {
             session.record_remote_session_identity(session_id)?;
         }
@@ -1153,9 +1125,11 @@ impl LegacyPlanPauseMigration {
 pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let mut reader = session_snapshot_reader(path)
         .with_context(|| format!("opening session {}", path.display()))?;
+    let mut reducer_shadow = session_shadow::SessionReducerShadow::new();
     let mut messages = Vec::new();
     let mut usage = Usage::default();
     let mut checkpoint_refs = Vec::new();
+    let mut harness_settings = crate::session_harness::empty_layer();
     let mut remote_session_id = None;
     let mut pipefs_enabled = None;
     let mut loaded_goal: Option<hi_agent::Goal> = None;
@@ -1187,13 +1161,17 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
             record.pop();
         }
         let Ok(line) = std::str::from_utf8(&record) else {
-            // A concurrent/crashed append may leave an incomplete UTF-8 tail.
-            // Treat it like any other corrupted record and retain later valid
-            // records when the corruption is in the middle of an old log.
+            reducer_shadow.observe_opaque_boundary();
             legacy_plan_pause.invalidate();
             continue;
         };
         if line.trim().is_empty() {
+            continue;
+        }
+        reducer_shadow.observe_legacy_json(line);
+        if let Some(layer) = crate::session_harness::parse_record(line)? {
+            legacy_plan_pause.clear_boundary();
+            harness_settings = layer;
             continue;
         }
         if let Ok(meta) = serde_json::from_str::<SessionMeta>(line) {
@@ -1342,10 +1320,6 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         let message: Message = match serde_json::from_str(line) {
             Ok(m) => m,
             Err(_) => {
-                // Skip a corrupted/unparseable line (e.g. a partially-written
-                // last line from a crash mid-flush) rather than failing the
-                // entire resume. The session is still usable up to the last
-                // complete line; a truncated final line carries no real content.
                 legacy_plan_pause.invalidate();
                 continue;
             }
@@ -1359,10 +1333,11 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     {
         loaded_plan.clear();
     }
-    Ok(LoadedSession {
+    let loaded = LoadedSession {
         messages,
         usage,
         checkpoint_refs,
+        harness_settings,
         remote_session_id,
         pipefs_enabled,
         name: loaded_name,
@@ -1376,7 +1351,8 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         goal_drive_stall: loaded_goal_drive_stall,
         plan_drive_evidence: loaded_plan_drive_evidence.into_iter().collect(),
         goal_drive_evidence: loaded_goal_drive_evidence.into_iter().collect(),
-    })
+    };
+    reducer_shadow.finish(loaded, "local_jsonl")
 }
 
 /// A remote session record: `(record_type, payload_json)`, as fetched from
@@ -1394,9 +1370,11 @@ pub struct RemoteRecord {
 /// This lets `hi --attach --resume-local` boot a local agent from the remote
 /// session history when the daemon is down.
 pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSession> {
+    let mut reducer_shadow = session_shadow::SessionReducerShadow::new();
     let mut messages = Vec::new();
     let mut usage = Usage::default();
     let mut checkpoint_refs = Vec::new();
+    let mut harness_settings = crate::session_harness::empty_layer();
     let mut remote_session_id = None;
     let mut pipefs_enabled = None;
     let mut loaded_goal: Option<hi_agent::Goal> = None;
@@ -1413,6 +1391,13 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
     let mut loaded_goal_drive_evidence = BTreeSet::new();
 
     for record in records {
+        reducer_shadow.observe_remote(&record.record_type, &record.payload_json);
+        if record.record_type == crate::session_harness::RECORD_TYPE {
+            harness_settings = crate::session_harness::parse_record(&record.payload_json)?
+                .context("remote harness_settings record omitted its type tag")?;
+            legacy_plan_pause.clear_boundary();
+            continue;
+        }
         if record.record_type == "message" {
             if let Ok(message) = serde_json::from_str::<Message>(&record.payload_json) {
                 legacy_plan_pause.note_message(&message);
@@ -1422,7 +1407,6 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
             }
             continue;
         }
-        // Metadata records: parse the payload as a SessionMeta.
         if let Ok(meta) = serde_json::from_str::<SessionMeta>(&record.payload_json) {
             match meta {
                 SessionMeta::RemoteSessionIdentity { session_id } => {
@@ -1560,8 +1544,6 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
                 }
             }
         } else {
-            // Do not let an unknown or malformed record bridge a rollback to
-            // a later, unrelated manual pause.
             legacy_plan_pause.invalidate();
         }
     }
@@ -1572,10 +1554,11 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
     {
         loaded_plan.clear();
     }
-    Ok(LoadedSession {
+    let loaded = LoadedSession {
         messages,
         usage,
         checkpoint_refs,
+        harness_settings,
         remote_session_id,
         pipefs_enabled,
         name: loaded_name,
@@ -1589,9 +1572,9 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
         goal_drive_stall: loaded_goal_drive_stall,
         plan_drive_evidence: loaded_plan_drive_evidence.into_iter().collect(),
         goal_drive_evidence: loaded_goal_drive_evidence.into_iter().collect(),
-    })
+    };
+    reducer_shadow.finish(loaded, "remote_records")
 }
-///
 /// Walks every project bucket under the data root (sessions are namespaced
 /// per-directory) and lists them newest-first, annotating each with a short
 /// project-digest prefix so you can tell which directory a session belongs to.
@@ -1870,6 +1853,13 @@ mod tests {
                 ..Usage::default()
             },
             checkpoint_refs: vec!["checkpoint-1".into()],
+            harness_settings: hi_workspace::SettingLayer {
+                source: hi_workspace::SettingSource::Session,
+                values: std::collections::BTreeMap::from([(
+                    hi_workspace::JOB_MAX_ACTIVE.to_string(),
+                    hi_workspace::SettingValue::Integer(7),
+                )]),
+            },
             remote_session_id: Some("canonical-remote-session".into()),
             pipefs_enabled: Some(true),
             name: Some("Restored session".into()),
@@ -1893,6 +1883,7 @@ mod tests {
         assert_eq!(loaded.usage.input_tokens, expected.usage.input_tokens);
         assert_eq!(loaded.usage.output_tokens, expected.usage.output_tokens);
         assert_eq!(loaded.checkpoint_refs, expected.checkpoint_refs);
+        assert_eq!(loaded.harness_settings, expected.harness_settings);
         assert_eq!(loaded.remote_session_id, expected.remote_session_id);
         assert_eq!(loaded.pipefs_enabled, expected.pipefs_enabled);
         assert_eq!(loaded.name, expected.name);
@@ -1932,6 +1923,7 @@ mod tests {
             messages: vec![Message::system("restored")],
             usage: Usage::default(),
             checkpoint_refs: Vec::new(),
+            harness_settings: crate::session_harness::empty_layer(),
             remote_session_id: None,
             pipefs_enabled: None,
             name: None,

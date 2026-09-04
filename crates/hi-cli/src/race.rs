@@ -357,16 +357,24 @@ async fn apply_saved_candidate(
     let workspace_root = workspace_root.to_path_buf();
     let state_root = state_root.to_path_buf();
     let candidate_id = candidate_id.to_string();
+    let expected_workspace_digest = request
+        .expected_workspace_digest
+        .clone()
+        .context("reviewed race is missing its workspace digest")?;
     let applied = tokio::task::spawn_blocking(move || -> Result<()> {
-        let repository = crate::candidate_gate::repository_root(&workspace_root)?.canonicalize()?;
-        let base = crate::bestof::resolve_revision(&repository, "HEAD")?;
-        let worktree = hi_tools::worktree::worktree_path("race-apply", index as u32);
-        hi_tools::worktree::add_worktree(&repository, &worktree, &base)?;
-        let snapshot = hi_race::capture_workspace_snapshot(&workspace_root)?;
-        let workspace_relative = workspace_root.strip_prefix(&repository)?.to_path_buf();
-        let candidate_root = worktree.join(&workspace_relative);
-        snapshot.materialize_into(&candidate_root)?;
-        let candidate_base = crate::bestof::materialize_snapshot_base(&worktree, &base, &snapshot)?;
+        // Preserve the reviewed-race Git-only compatibility contract while
+        // materializing the candidate into wholly private Git metadata.
+        crate::candidate_gate::repository_root(&workspace_root)?.canonicalize()?;
+        ensure!(
+            hi_race::capture_workspace_snapshot(&workspace_root)?.digest
+                == expected_workspace_digest,
+            "workspace changed before reviewed race application"
+        );
+        let owner = hi_tools::worktree::worktree_path("race-apply", index as u32);
+        let candidate = prepare_reviewed_race_candidate(&workspace_root, &state_root, &owner)?;
+        let candidate_root = candidate.root().to_path_buf();
+        let candidate_base = candidate.baseline_commit().to_string();
+        let source_snapshot_id = candidate.source_snapshot_id().to_string();
         let mut child = Command::new("git")
             .current_dir(&candidate_root)
             .args(["apply", "--whitespace=nowarn"])
@@ -381,20 +389,20 @@ async fn apply_saved_candidate(
             .write_all(&patch)?;
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            hi_tools::worktree::cleanup(&repository, &[worktree]);
             bail!(
                 "reviewed race patch conflicts with the current workspace: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let result = crate::candidate_merge::apply_candidate_and_reverify(
+        let result = crate::candidate_merge::apply_candidate_and_reverify_cancellable_at_base(
             &candidate_root,
             &candidate_base,
             &workspace_root,
             &state_root,
             &verify,
+            Some(&source_snapshot_id),
+            None,
         );
-        hi_tools::worktree::cleanup(&repository, &[worktree]);
         result.map(|_| ())
     })
     .await
@@ -422,6 +430,15 @@ async fn apply_saved_candidate(
         ActivityState::Succeeded,
     );
     Ok(snapshot)
+}
+
+fn prepare_reviewed_race_candidate(
+    workspace_root: &Path,
+    state_root: &Path,
+    owner: &Path,
+) -> Result<hi_tools::candidate_workspace::CandidateWorkspace> {
+    crate::bestof::prepare_detached_candidate(workspace_root, state_root, owner)
+        .context("preparing reviewed race candidate")
 }
 
 #[allow(clippy::too_many_arguments)] // race apply approval passes each gate/session handle explicitly
@@ -692,4 +709,68 @@ fn publish_race_event(
         },
     );
     let _ = publish_best_effort(Some(sink), event);
+}
+
+#[cfg(test)]
+mod candidate_materialization_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    #[test]
+    fn reviewed_race_preparation_never_registers_a_source_worktree() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let state = temporary.path().join("state");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        git(&source, &["init", "--quiet"]);
+        std::fs::write(source.join("tracked.txt"), "base\n").unwrap();
+        git(&source, &["add", "tracked.txt"]);
+        git(
+            &source,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+        );
+        std::fs::write(source.join("tracked.txt"), "dirty\n").unwrap();
+        std::fs::write(source.join("untracked.txt"), "new\n").unwrap();
+        let before = git(&source, &["worktree", "list", "--porcelain"]);
+
+        let candidate = prepare_reviewed_race_candidate(
+            &source,
+            &state,
+            &temporary.path().join("reviewed-candidate"),
+        )
+        .unwrap();
+        assert_eq!(git(&source, &["worktree", "list", "--porcelain"]), before);
+        assert!(candidate.root().join(".git").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(candidate.root().join("tracked.txt")).unwrap(),
+            "dirty\n"
+        );
+        assert!(candidate.root().join("untracked.txt").is_file());
+        drop(candidate);
+        assert_eq!(git(&source, &["worktree", "list", "--porcelain"]), before);
+    }
 }

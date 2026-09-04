@@ -1,5 +1,4 @@
 #![recursion_limit = "256"]
-
 mod agent_build;
 mod announcements;
 mod approval_store;
@@ -19,6 +18,8 @@ mod delegate_events;
 mod diff_lab;
 mod doctor;
 mod eval;
+mod eval_identity;
+mod eval_report;
 mod event_store;
 mod feedback;
 mod goal_drive;
@@ -28,6 +29,7 @@ mod learning_ledger;
 mod local_runtime;
 mod mcp_host;
 mod mcp_serve;
+mod operator_override_audit;
 mod orchestration;
 mod orchestration_benchmark;
 mod orchestration_metrics;
@@ -56,6 +58,7 @@ mod pipefs;
 mod rsi_stage_model;
 mod scheduler_ops;
 mod session;
+mod session_harness;
 mod setup;
 mod skeptic_review;
 mod sync;
@@ -63,11 +66,11 @@ mod sync_store;
 mod ui;
 mod workflow;
 mod workflow_cmd;
+mod workspace_cmd;
 mod x402;
 
 #[cfg(test)]
 mod delegate_tests;
-
 /// Serializes tests that read or mutate the process-wide current directory.
 /// `set_current_dir` is global to the test binary, so a test that changes it
 /// races every concurrent test that reads it — `cwd_digest`, and anything
@@ -75,7 +78,6 @@ mod delegate_tests;
 /// not just the call.
 #[cfg(test)]
 pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -84,6 +86,7 @@ use anyhow::{Context, Result, anyhow};
 use hi_agent::{ObservationSink, VerificationMode};
 use hi_ai::Provider;
 
+pub(crate) use bootstrap::validate_tui_event_trace_request;
 use config::{ProviderName, RsiRequested};
 use landing::{effective_prompt, print_landing, profile_infos, resolve_session};
 use orchestration::{build_sync_config, run_best_of, run_hf_cli, run_mcp_cli};
@@ -193,9 +196,7 @@ fn completed_session_switch(canonical_id: String, summary: String) -> hi_tui::Se
 }
 
 async fn run() -> Result<()> {
-    // Startup phase tracing: `HI_STARTUP_TRACE=1 hi …` prints elapsed-at-
-    // milestone lines to stderr, so slow-start regressions get measured
-    // instead of guessed at. Zero cost when the variable is unset.
+    // `HI_STARTUP_TRACE=1` prints elapsed milestones for startup regressions.
     let startup_began = std::time::Instant::now();
     let startup_trace_on = std::env::var_os("HI_STARTUP_TRACE").is_some();
     macro_rules! startup_trace {
@@ -207,17 +208,16 @@ async fn run() -> Result<()> {
     }
 
     let raw_args = std::env::args().collect::<Vec<_>>();
-    if raw_args.get(1).map(String::as_str) == Some("announcements") {
-        return announcements::run_cli(&raw_args[2..]).await;
-    }
-    if raw_args.get(1).map(String::as_str) == Some("hf") {
-        return run_hf_cli(&raw_args[2..]).await;
-    }
-    if raw_args.get(1).map(String::as_str) == Some("mcp") {
-        return run_mcp_cli(&raw_args[2..]).await;
-    }
-    if raw_args.get(1).map(String::as_str) == Some("doctor") {
-        return doctor::run_doctor_cli(&raw_args[2..]).await;
+    match raw_args.get(1).map(String::as_str) {
+        Some("workspace") => return workspace_cmd::run_cli(&raw_args[2..]).await,
+        Some("announcements") => return announcements::run_cli(&raw_args[2..]).await,
+        Some("hf") => return run_hf_cli(&raw_args[2..]).await,
+        Some("mcp") => return run_mcp_cli(&raw_args[2..]).await,
+        Some("doctor") => return doctor::run_doctor_cli(&raw_args[2..]).await,
+        Some("debug") if raw_args.get(2).map(String::as_str) == Some("tui") => {
+            return hi_tui::debug_harness::run_cli(&raw_args[3..]);
+        }
+        _ => {}
     }
     if raw_args.get(1).map(String::as_str) == Some("diff-lab") {
         return diff_lab::run_cli(&raw_args[2..]).await;
@@ -316,10 +316,22 @@ async fn run() -> Result<()> {
     // once setup finishes.
     let settings = if config::needs_setup(&cli, &file) && std::io::stdin().is_terminal() {
         let mut settings = setup::run(&mut file).await?;
-        // The wizard returns a complete Settings value before the ordinary
-        // resolver runs. Apply the same contextual default here so a first
+        // Apply the ordinary contextual default after the wizard so a first
         // saved session is durable while first-run `--no-save` remains valid.
         settings.execution = config::resolve_execution_mode(&cli, None, file.execution)?;
+        let session_harness = config::resolve_session_harness(&cli)?;
+        let profile = cli
+            .profile
+            .as_ref()
+            .or(file.default_profile.as_ref())
+            .and_then(|name| file.profiles.get(name));
+        settings.harness = config::resolve_harness(
+            &file,
+            profile,
+            Some(session_harness.clone()),
+            &cli.harness_settings,
+        )?;
+        settings.session_harness = session_harness;
         settings
     } else {
         // Otherwise print config/onboarding guidance plainly (no "Error:" prefix).
@@ -331,6 +343,10 @@ async fn run() -> Result<()> {
             }
         }
     };
+    session::session_shadow::configure(
+        settings.harness.features.session_reducer_v2,
+        settings.harness.features.session_projection_v2,
+    );
     if settings.execution.is_durable() && cli.no_save && !cli.subagent {
         anyhow::bail!(
             "durable execution requires a persisted session; remove --no-save or disable durable mode"
@@ -442,6 +458,7 @@ async fn run() -> Result<()> {
     let (workspace_root, state_root) =
         resolve_runtime_roots().inspect_err(|error| report_init_failure(error, None))?;
     startup_trace!("runtime roots resolved");
+    operator_override_audit::record_folder_trust_override(&workspace_root, &state_root);
     // Canonical interactive lifecycle events are local-first and best-effort
     // for ordinary progress. The store is independent from the RSI trace
     // path and is safe to omit if state storage is unavailable.
@@ -566,6 +583,20 @@ async fn run() -> Result<()> {
     // Resolve which session file to use and any history to resume.
     let (session_path, resolved_loaded) =
         resolve_session(&cli).inspect_err(|error| report_init_failure(error, None))?;
+    let observed_session_harness = config::merge_session_harness(
+        resolved_loaded
+            .as_ref()
+            .map(|loaded| loaded.harness_settings.clone())
+            .unwrap_or_else(session_harness::empty_layer),
+        &cli.session_harness_settings,
+    )?;
+    if observed_session_harness != settings.session_harness {
+        anyhow::bail!("session harness settings changed during startup; retry the command");
+    }
+    if !cli.session_harness_settings.is_empty() {
+        session_harness::append(&session_path, &observed_session_harness)
+            .context("persisting session harness settings")?;
+    }
     let existing_session = resolved_loaded.is_some();
     let persisted_remote_session_id = resolved_loaded
         .as_ref()
@@ -750,7 +781,7 @@ async fn run() -> Result<()> {
         settings.mcp_pipe_allow.clone(),
     )
     .ok();
-    if !defer_launch_workspace_runtime {
+    if !defer_launch_workspace_runtime && !cli.subagent {
         let (mcp, _pipe_status) = mcp_host::connect_workspace_mcp_with_policies(
             &workspace_root,
             &file.mcp_import.to_policy(),
@@ -1370,7 +1401,8 @@ async fn run() -> Result<()> {
             Ok(summary) => summary,
             Err(error) if rsi_requested == RsiRequested::Managed => {
                 eprintln!("\x1b[31mmanaged RSI trace error: {error:#}\x1b[0m");
-                std::process::exit(3);
+                result = Err(error.context("managed RSI trace failed"));
+                None
             }
             Err(error) => {
                 eprintln!("\x1b[33mRSI trace warning: {error:#}\x1b[0m");
@@ -1419,10 +1451,10 @@ async fn run() -> Result<()> {
         // deliverable is a service that must outlive this process.
         if cli.keep_background {
             agent.release_background_services();
+            agent.background_task_registry().kill_all().await;
         } else {
-            agent.kill_background_processes();
+            agent.settle_workspace_for_exit().await?;
         }
-        agent.background_task_registry().kill_all().await;
         // Flush any pending sync records and live events to ipop before
         // exiting. Silent on failure by design: sync is best-effort mirroring
         // of a local-first session — everything unsent stays queued in the
@@ -2118,8 +2150,7 @@ async fn run() -> Result<()> {
                 if let Some(rui) = &active_remote_ui {
                     let _ = rui.flush().await;
                 }
-                agent.kill_background_processes();
-                agent.background_task_registry().kill_all().await;
+                agent.settle_workspace_for_exit().await?;
                 if let Some(host) = &pipefs_host {
                     host.clean_exit(&mut agent)
                         .await
@@ -2134,6 +2165,7 @@ async fn run() -> Result<()> {
             Err(err) => {
                 x402::clear_confirmer();
                 if cli.tui_events_jsonl.is_some() {
+                    agent.settle_workspace_for_exit().await?;
                     return Err(err.context("interactive TUI trace session failed"));
                 }
                 eprintln!("\x1b[33mTUI error ({err:#}); falling back to plain mode\x1b[0m");
@@ -2205,8 +2237,7 @@ async fn run() -> Result<()> {
     if let Some(rui) = &remote_ui {
         let _ = rui.flush().await;
     }
-    agent.kill_background_processes();
-    agent.background_task_registry().kill_all().await;
+    agent.settle_workspace_for_exit().await?;
     if let Some(host) = &pipefs_host {
         host.clean_exit(&mut agent)
             .await
@@ -2217,37 +2248,6 @@ async fn run() -> Result<()> {
     }
     finish_interactive_trace(rsi.observer.as_ref(), &agent)?;
     repl_result
-}
-
-fn validate_tui_event_trace_request(
-    cli: &config::Cli,
-    stdin_is_tty: bool,
-    stdout_is_tty: bool,
-) -> Result<()> {
-    if cli.tui_events_jsonl.is_none() {
-        return Ok(());
-    }
-    let headless_mode = cli.prompt.is_some()
-        || cli.plain
-        || cli.subagent
-        || cli.goal.is_some()
-        || cli.workflow.is_some()
-        || cli.list_sessions
-        || cli.show_config
-        || cli.loops_daemon
-        || cli.daemon
-        || cli.attach.is_some()
-        || cli.benchmark_orchestration
-        || cli.judge.is_some()
-        || cli.report.is_some()
-        || cli.eval_input.is_some()
-        || cli.eval_output.is_some()
-        || cli.quiet
-        || cli.skeptic_review;
-    if headless_mode || !stdin_is_tty || !stdout_is_tty {
-        anyhow::bail!("usage: --tui-events-jsonl is valid only for a full interactive TUI session");
-    }
-    Ok(())
 }
 
 fn automatic_workflow_plan_path(

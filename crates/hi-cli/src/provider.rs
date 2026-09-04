@@ -229,11 +229,14 @@ fn bounded_env_usize(name: &str, default: usize, min: usize, max: usize) -> usiz
         .clamp(min, max.max(min))
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct LiveModelMetadata {
     pub(crate) context_window: Option<u32>,
     pub(crate) max_output_tokens: Option<u32>,
     pub(crate) price: Option<(f64, f64)>,
+    /// Successful discovery evidence that can seed the request-time registry
+    /// without causing a second provider call.
+    pub(crate) provider_capabilities: Option<hi_ai::ProviderCapabilities>,
 }
 
 /// Metadata used while preparing startup. Live discovery is deliberately not
@@ -270,25 +273,43 @@ pub(crate) async fn resolve_live_model_metadata_with_timeout(
     model: &str,
     timeout: std::time::Duration,
 ) -> LiveModelMetadata {
+    let declared = provider.capabilities();
     match tokio::time::timeout(timeout, provider.list_models()).await {
         Ok(Ok(served)) => served
             .into_iter()
             .find(|m| m.id == model)
-            .map(|m| LiveModelMetadata {
-                context_window: m.context_window,
-                max_output_tokens: m.max_output_tokens,
-                price: m.price,
-            })
-            .unwrap_or(LiveModelMetadata {
-                context_window: None,
-                max_output_tokens: None,
-                price: None,
-            }),
-        Ok(Err(_)) | Err(_) => LiveModelMetadata {
-            context_window: None,
-            max_output_tokens: None,
-            price: None,
-        },
+            .map(|m| live_model_metadata(m, declared))
+            .unwrap_or_default(),
+        Ok(Err(_)) | Err(_) => LiveModelMetadata::default(),
+    }
+}
+
+fn live_model_metadata(
+    model: hi_ai::ServedModel,
+    mut capabilities: hi_ai::ProviderCapabilities,
+) -> LiveModelMetadata {
+    capabilities.request_limits.max_input_tokens = model.context_window;
+    capabilities.request_limits.max_output_tokens = model.max_output_tokens;
+    // `/models` identifiers are routable names, not immutable revision
+    // evidence. Preserve a revision asserted by the provider capability
+    // record, but never manufacture one from the requested/served model ID.
+    for tag in &model.capabilities {
+        match tag.trim().to_ascii_lowercase().as_str() {
+            "tools" | "tool_calls" | "function_calling" => capabilities.native_tool_calls = true,
+            "parallel_tool_calls" => capabilities.parallel_tool_calls = true,
+            "structured_output" | "json_schema" => capabilities.structured_output = true,
+            "vision" | "image_input" => capabilities.modalities.image_input = true,
+            "audio_input" => capabilities.modalities.audio_input = true,
+            "image_output" => capabilities.modalities.image_output = true,
+            "audio_output" => capabilities.modalities.audio_output = true,
+            _ => {}
+        }
+    }
+    LiveModelMetadata {
+        context_window: model.context_window,
+        max_output_tokens: model.max_output_tokens,
+        price: model.price,
+        provider_capabilities: Some(capabilities),
     }
 }
 
@@ -328,5 +349,29 @@ mod tests {
             credential_safe_base_url("http://169.254.169.254/latest", ProviderName::Openai),
             "https://openrouter.ai/api/v1"
         );
+    }
+
+    #[test]
+    fn live_metadata_seeds_limits_without_inventing_a_revision() {
+        let metadata = live_model_metadata(
+            hi_ai::ServedModel {
+                id: "model@revision-7".into(),
+                context_window: Some(128_000),
+                max_output_tokens: Some(16_384),
+                price: None,
+                provider_label: Some("test".into()),
+                status: Some("available".into()),
+                available: true,
+                availability_reason: None,
+                capabilities: vec!["parallel_tool_calls".into(), "vision".into()],
+            },
+            hi_ai::ProviderCapabilities::native_tools(true),
+        );
+        let capabilities = metadata.provider_capabilities.unwrap();
+        assert_eq!(capabilities.actual_model_revision, None);
+        assert_eq!(capabilities.request_limits.max_input_tokens, Some(128_000));
+        assert_eq!(capabilities.request_limits.max_output_tokens, Some(16_384));
+        assert!(capabilities.parallel_tool_calls);
+        assert!(capabilities.modalities.image_input);
     }
 }

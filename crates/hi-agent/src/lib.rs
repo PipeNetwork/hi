@@ -1,5 +1,4 @@
-//! The agent loop: user message → model → tool calls → results → repeat
-//! until the model stops calling tools, with a configurable runaway-step guard.
+//! Agent loop: user message → model → tools → results until the model stops calling tools.
 
 mod agent;
 mod census;
@@ -33,8 +32,13 @@ pub mod prerequisites;
 mod prompt;
 mod session;
 pub mod session_ops;
+mod session_projection;
+mod session_reducer;
+mod session_reducer_compat;
+mod session_transcript;
 pub mod skills;
 mod snapshot;
+mod speculative_compaction;
 mod steering;
 mod subagent;
 mod subagent_progress;
@@ -45,6 +49,8 @@ mod transcript;
 pub mod ui;
 mod verify;
 mod verify_digest;
+mod workspace_context;
+mod workspace_coordination;
 mod workspace_durability;
 mod workspace_runtime;
 
@@ -63,7 +69,6 @@ pub trait RsiControl: Send + Sync {
     async fn validate(&self) -> anyhow::Result<()>;
     async fn command(&self, argument: &str) -> anyhow::Result<String>;
     async fn status(&self) -> anyhow::Result<String>;
-
     /// Current public-RSI per-run spend ceiling, in millionths of a US dollar.
     fn maximum_cost_microusd(&self) -> u64 {
         15_000_000
@@ -78,7 +83,6 @@ pub trait RsiControl: Send + Sync {
     fn persist_enabled(&self, _enabled: bool) -> anyhow::Result<()> {
         Ok(())
     }
-
     fn channel(&self) -> &'static str {
         "stable"
     }
@@ -125,22 +129,25 @@ pub use plan_drive::{
     goal_drive_status, next_plan_drive_stall, plan_drive_made_progress, plan_drive_park_message,
     plan_drive_status,
 };
-pub use session::SessionSink;
+pub use session::{SessionSink, WorkspaceTranscriptCall, WorkspaceTranscriptExecution};
 pub use session_ops::{
     PermissionMode, SessionCommandEffect, UserTurn, agents_report, fork_summary, fork_worktree,
-    format_plan, format_tasks_report, format_user_turns, handle_session_command, hooks_command,
-    import_claude_report, inspect_report, list_user_turns, local_recap, marketplace_report,
-    mcp_admin_report, parse_fork_args, parse_remember_args, plan_mode_prompt,
-    plugins_and_hooks_report, remember_note, rewind_len_before_user_turn, run_hook,
-    search_messages, set_workspace_trusted, share_report, trust_command, workspace_trusted,
-    worktree_command,
+    format_plan, format_tasks_report, format_user_turns, handle_session_command,
+    handle_session_command_coordinated, hooks_command, import_claude_report, inspect_report,
+    list_user_turns, local_recap, marketplace_report, mcp_admin_report, parse_fork_args,
+    parse_remember_args, plan_mode_prompt, plugins_and_hooks_report, remember_note,
+    rewind_len_before_user_turn, run_hook, search_messages, set_workspace_trusted, share_report,
+    trust_command, workspace_trusted, worktree_command,
 };
+pub use session_projection::*;
+pub use session_reducer::*;
+pub use session_transcript::*;
 pub use skills::{
     build_learn_prompt, build_skill_use_prompt, learned_skills_context, list_skills, read_skill,
     skill_roots,
 };
-/// Return whether `content` is one of the exact low-information completion
-/// placeholders rejected by answer steering.
+pub use speculative_compaction::*;
+/// Return whether `content` is an exact low-information completion placeholder rejected by answer steering.
 pub fn answer_is_generic_completion_placeholder(content: &str) -> bool {
     steering::answer_is_generic_completion_placeholder(content)
 }
@@ -157,6 +164,9 @@ pub use ui::{
     tool_label, try_claim_approved_confirmation,
 };
 pub use verify::VerificationExecution;
+pub use workspace_context::{
+    mark_repository_context_untrusted, promote_repository_context, repository_context_is_untrusted,
+};
 pub use workspace_durability::WorkspaceDurability;
 pub use workspace_runtime::WorkspaceRuntime;
 
@@ -205,7 +215,6 @@ impl TurnCancellation {
     pub fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::Acquire) != TURN_CANCELLATION_ACTIVE
     }
-
     pub(crate) fn abort_reason(&self) -> Option<hi_agent_lifecycle::TurnAbortReason> {
         match self.state.load(Ordering::Acquire) {
             TURN_CANCELLATION_ACTIVE => None,
@@ -251,6 +260,7 @@ pub use goal::{
     REGRESSION_NOTE, SkepticStatus, SubGoal, UNATTENDED_DRIVE_WARNING, auto_budget_for,
 };
 pub use heuristics::leftover_plan_summary;
+pub use hi_engine_host::NATIVE_DIRECTOR_VERSION;
 pub use plan_ingest::{
     IngestedPlan, PlanItem, actionability_issues, goal_workflow_plan_path, ingest_plan_document,
     is_solid_checklist, objective_is_actionable, one_shot_workflow_plan_path, parse_objectives,
@@ -1042,9 +1052,8 @@ fn apply_plan_to_goal(goal: &mut Goal, plan: &[PlanStep], turn_start_active: Opt
 }
 
 pub struct Agent {
-    // `Arc` (not `Box`) so a read-only `explore` subagent can cheaply share the
-    // parent's provider (same HTTP client / connection pool) instead of rebuilding one.
     pub(crate) provider: Arc<dyn Provider>,
+    pub(crate) provider_capability_registry: hi_ai::ProviderCapabilityRegistry,
     /// Optional separate provider for the `/goal` skeptic review (built from
     /// `config.subagents.skeptic_endpoint`). `None` = the skeptic uses the main provider,
     /// as it always has. Lets the frequent, fail-open review loop run on a local
@@ -1066,14 +1075,12 @@ pub struct Agent {
     /// Module lifecycle manager. The turn engine takes a generation lease at
     /// turn start, so reloads can never mutate an active turn.
     pub(crate) engine_runtime: std::sync::Arc<hi_engine_host::EngineRuntime>,
-    /// Optional explicit deadline for auxiliary provider work (summaries,
-    /// reviews, suggestions, and other non-primary calls). Ordinary sessions
-    /// leave this unset and rely on provider transport policy plus turn
+    /// Optional deadline for auxiliary provider work. Ordinary sessions leave this unset and rely on provider transport policy plus turn
     /// cancellation, so productive work has no hidden wall-clock ceiling.
     pub(crate) side_call_timeout: Option<std::time::Duration>,
     pub(crate) runtime: WorkspaceRuntime,
-    /// Optional host-owned durability fence for an ephemeral materialization.
-    /// It is intentionally separate from the filesystem/tool abstractions.
+    pub(crate) workspace_coordination: crate::workspace_coordination::WorkspaceCoordination,
+    /// Host-owned durability fence, separate from filesystem/tool abstractions.
     pub(crate) workspace_durability: Option<Arc<dyn WorkspaceDurability>>,
     /// Per-turn ranked task/memory prompt assembly.
     pub(crate) task: crate::domain::TaskContextState,
@@ -1245,19 +1252,17 @@ pub struct Agent {
     pub(crate) memory: Option<Arc<dyn hi_tools::MemoryBackend>>,
 }
 
-/// A cloneable handle to an agent's mid-turn interjection queue. The frontend
-/// pushes user messages typed while a turn runs; the turn loop drains them at
-/// safe points. Cheap to clone (shared queue).
+/// Cloneable mid-turn interjection queue, drained by the turn loop at safe points.
+/// Cheap to clone because the queue is shared.
 #[derive(Clone, Default)]
 pub struct InterjectionInbox(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
 
-/// Prefix tagging an interjected message as a `/btw` side question (rather than
-/// mid-turn steering). Preferred path is [`Agent::btw_dispatcher`] →
+/// Prefix tagging an interjected message as a `/btw` side question. The preferred
+/// path is [`Agent::btw_dispatcher`] →
 /// [`BtwDispatcher::ask`] which answers **immediately** with its own model
 /// calls. The inbox tag remains for tests and frontends that only have the
-/// interjection queue; the turn loop still drains it as a fallback.
-/// A control char keeps it out of the visible transcript and collision-free
-/// with real user text.
+/// interjection queue; the loop drains it as a fallback. A control char keeps
+/// it out of the visible transcript and collision-free with real user text.
 pub const BTW_INTERJECTION_PREFIX: &str = "\u{1}btw:";
 
 pub use crate::agent::turn::btw::{BtwDispatcher, BtwSideEvent};
@@ -1291,7 +1296,6 @@ impl InterjectionInbox {
             .unwrap_or_default()
     }
 
-    /// Whether any message is waiting.
     pub fn has_pending(&self) -> bool {
         self.0
             .lock()

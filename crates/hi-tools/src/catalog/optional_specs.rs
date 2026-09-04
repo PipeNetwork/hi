@@ -3,6 +3,27 @@
 use hi_ai::ToolSpec;
 use serde_json::json;
 
+/// The provider-facing envelope for a restricted Rhai program. It is kept out
+/// of the global specs so providers without native tool calling see no schema.
+pub fn run_program_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "run_program".into(),
+        description: "Execute a bounded Rhai program. The final expression is returned. Use `tool(name, #{...})` for existing tools and `parallel([#{name: \"read\", args: #{path: \"src/lib.rs\"}}])` for independent calls. No filesystem, process, network, imports, dynamic evaluation, time, sleep, or exit functions are available; only approved host tools may run.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "maxLength": 262144,
+                    "description": "Rhai source whose final expression is the program result."
+                }
+            },
+            "required": ["source"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 /// The `explore` read-only subagent tool. Deliberately kept OUT of [`super::TOOL_SPECS`]
 /// and out of [`super::is_read_only`]: it's only advertised when the agent explicitly
 /// injects it (for a capable parent via `explore_subagents`), and because it's not
@@ -68,7 +89,7 @@ pub fn delegate_tool_spec() -> ToolSpec {
 pub fn task_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "task".into(),
-        description: "Spawn a background subagent that runs asynchronously while you continue working. Returns immediately with a task_id — poll results with `get_task_output`, wait for multiple with `wait_tasks`, cancel with `kill_task`. Use `subagent_type` to choose a built-in kind: \"explore\" (fast read-only investigation), \"plan\" (read-only architecture/implementation planning), or \"general-purpose\" (write-capable multi-step work on the live working tree — unlike sync `delegate`, no worktree isolation or automatic rollback). Give ONE self-contained task with enough detail to complete standalone. Prefer sequential or depends_on-ordered GP tasks when they touch the same paths. Background subagents survive parent-turn cancellation. The subagent cannot itself spawn subagents.".into(),
+        description: "Spawn a background subagent that runs asynchronously while you continue working. Returns immediately with a task_id — poll results with `get_task_output`, wait for multiple with `wait_tasks`, cancel with `kill_task`. Use `subagent_type` to choose \"explore\" (fast read-only investigation), \"plan\" (read-only architecture/implementation planning), or \"general-purpose\" (write-capable detached candidate). General-purpose children never edit the live workspace: the parent verifies their exact base and applies them transactionally at a safe turn boundary. Give ONE self-contained task with enough detail to complete standalone. Background subagents survive parent-turn cancellation. The subagent cannot itself spawn subagents.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -83,7 +104,7 @@ pub fn task_tool_spec() -> ToolSpec {
                 "subagent_type": {
                     "type": "string",
                     "enum": ["explore", "plan", "general-purpose"],
-                    "description": "Built-in subagent type (grok-build naming): \"explore\" (read-only investigation), \"plan\" (read-only planning), or \"general-purpose\" (write-capable on the live tree). Default: \"explore\"."
+                    "description": "Built-in subagent type: \"explore\" (read-only investigation), \"plan\" (read-only planning), or \"general-purpose\" (verified detached write candidate). Default: \"explore\"."
                 },
                 "depends_on": {
                     "type": "array",
@@ -97,7 +118,7 @@ pub fn task_tool_spec() -> ToolSpec {
                 },
                 "verify": {
                     "type": "string",
-                    "description": "For general-purpose only: shell command that must pass for the task to be marked successful. If omitted, the session's verify command is used when configured. Failure marks the task Failed but does not roll back live-tree edits."
+                    "description": "Optional verification command required before a general-purpose candidate can become ready to merge."
                 }
             },
             "required": ["description", "prompt"]

@@ -458,8 +458,9 @@ pub struct AgentConfig {
     pub routing: AgentRouting,
     /// Verification, review, LSP, and mutation safety gates.
     pub gates: AgentGates,
-    /// Per-turn step / retry / parallelism caps.
     pub loop_limits: AgentLoopLimits,
+    pub harness: hi_workspace::ResolvedHarnessSettings,
+    pub harness_session: Option<hi_workspace::SettingLayer>,
     /// Compaction, finalize, project context, tool-set selection.
     pub memory: AgentMemory,
     /// Explore/delegate/planner/skeptic subagent policy.
@@ -487,19 +488,18 @@ pub struct AgentConfig {
     /// checkout while remaining inside the agent's workspace boundary.
     #[cfg(test)]
     pub(crate) _test_workspace_root: Option<std::sync::Arc<tempfile::TempDir>>,
-    /// Test-only explicit process policy. Tests must not mutate `HI_SANDBOX`
-    /// because Rust's process environment is shared by all parallel tests.
-    #[cfg(test)]
-    pub(crate) sandbox_policy: Option<hi_tools::sandbox::SandboxPolicy>,
-    /// Per-session ceiling on how many turns the agent may run before it
-    /// stops with [`crate::TurnStopReason::TurnLimit`]. `None` (the default)
-    /// means **no limit** — the session runs until the user stops it. Set live
-    /// with `/turns <n>` (or `/turns off`). Distinct from the per-turn
-    /// [`AgentLoopLimits::max_steps`] model-call cap and from a goal's
-    /// [`crate::Goal::step_limit`] plan-size cap.
+    /// Internal process policy; isolated children override ambient opt-outs.
+    #[doc(hidden)]
+    pub sandbox_policy: Option<hi_tools::sandbox::SandboxPolicy>,
+    /// Internal profile overrides for hermetic embedded children. Ordinary
+    /// agents leave this unset so their existing sandbox behavior is unchanged.
+    #[doc(hidden)]
+    pub sandbox_config: Option<hi_tools::sandbox::SandboxConfig>,
+    pub verification_timeout: Option<std::time::Duration>,
+    /// Per-session ceiling before [`crate::TurnStopReason::TurnLimit`]; `None`
+    /// is unlimited and `/turns` changes it live, separate from per-turn and goal caps.
     pub max_turns: Option<u32>,
 }
-
 /// Explicit workspace and durable-state roots.
 #[derive(Clone, Debug)]
 pub struct AgentPaths {

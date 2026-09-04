@@ -73,8 +73,16 @@ async fn start_recording_server(
                 } else {
                     if is_records {
                         bodies.lock().unwrap().push(request.clone());
+                        let cursor = post_lines.lock().unwrap().len().saturating_mul(1_000);
+                        let body = serde_json::json!({ "record_count": cursor }).to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string()
                     }
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string()
                 };
                 let _ = sock.write_all(response.as_bytes()).await;
                 let _ = sock.shutdown().await;
@@ -82,6 +90,177 @@ async fn start_recording_server(
         }
     });
     (format!("http://{addr}"), accepted_bodies, posts)
+}
+
+/// Models a protocol-1 records endpoint: legacy record types are accepted,
+/// but the newer native workspace-execution type is rejected.
+async fn start_protocol_one_server() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted_bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let bodies = accepted_bodies.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(connection) => connection,
+                Err(_) => break,
+            };
+            let bodies = bodies.clone();
+            tokio::spawn(async move {
+                let Ok(request) = read_mock_http_request(&mut socket).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&request).to_string();
+                let is_records = request.starts_with("POST") && request.contains("/records");
+                let rejects_native_type =
+                    is_records && request.contains(r#""record_type":"workspace_execution""#);
+                let response = if rejects_native_type {
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 37\r\nConnection: close\r\n\r\n{\"error\":\"unsupported record_type\"}\n"
+                        .to_string()
+                } else {
+                    if is_records {
+                        bodies.lock().unwrap().push(request);
+                    }
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"record_count\":1}"
+                        .to_string()
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), accepted_bodies)
+}
+
+#[tokio::test]
+async fn protocol_one_flushes_workspace_execution_as_invisible_legacy_record() {
+    let (base_url, accepted) = start_protocol_one_server().await;
+    let session_id = format!("protocol-one-workspace-{}", std::process::id());
+    let store = unique_test_sync_store();
+    let config = SyncConfig {
+        base_url,
+        api_key: "test-key".to_string(),
+        machine_id: None,
+        cwd_digest: None,
+    };
+    let sink = RemoteSessionSink::with_store(
+        config.clone(),
+        session_id.clone(),
+        None,
+        remote_session_http_client(),
+        store.clone(),
+    );
+    sink.set_pipefs_sync_required(true);
+    let record = hi_agent::WorkspaceTranscriptExecution {
+        schema_version: hi_agent::WorkspaceTranscriptExecution::SCHEMA_VERSION,
+        operation_id: hi_workspace::OperationId::new("legacy-operation"),
+        assistant_content: vec![hi_ai::Content::Text("edited".into())],
+        calls: Vec::new(),
+        execution: hi_workspace::ExecutionReport::succeeded(Some("digest".into())),
+    };
+
+    sink.stage_workspace_execution(&record).unwrap();
+    drop(sink);
+    let restarted = RemoteSessionSink::with_store(
+        config,
+        session_id.clone(),
+        None,
+        remote_session_http_client(),
+        store.clone(),
+    );
+    restarted.set_pipefs_sync_required(true);
+    restarted.stage_workspace_execution(&record).unwrap();
+    restarted
+        .flush_required()
+        .await
+        .expect("a protocol-1 server accepts the compatibility carrier");
+
+    let uploaded = accepted.lock().unwrap().join("\n");
+    assert!(uploaded.contains(r#""record_type":"usage""#));
+    assert!(!uploaded.contains(r#""record_type":"workspace_execution""#));
+    assert!(!uploaded.contains(r#""record_type":"message""#));
+    assert!(uploaded.contains(r#"\"type\":\"workspace_execution\""#));
+    assert_eq!(accepted.lock().unwrap().len(), 1, "retry is idempotent");
+    assert!(store.ready_records(&session_id, 10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn malformed_success_ack_keeps_transcript_outbox_evidence() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _request = read_mock_http_request(&mut socket).await.unwrap();
+                let body = "{}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    let store = unique_test_sync_store();
+    let session_id = format!("malformed-ack-{}", std::process::id());
+    let sink = RemoteSessionSink::with_store(
+        SyncConfig {
+            base_url: format!("http://{addr}"),
+            api_key: "test-key".into(),
+            machine_id: None,
+            cwd_digest: None,
+        },
+        session_id.clone(),
+        None,
+        remote_session_http_client(),
+        store.clone(),
+    );
+    sink.set_pipefs_sync_required(true);
+    sink.push("message", r#"{"role":"assistant","text":"durable"}"#);
+
+    let error = sink.flush_required().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("typed transcript acknowledgement")
+    );
+    assert_eq!(store.ready_records(&session_id, 10).unwrap().len(), 1);
+    assert_eq!(store.status(Some(&session_id)).unwrap().server_cursor, 0);
+}
+
+#[tokio::test]
+async fn causal_admission_preflushes_a_backlog_larger_than_one_commit_batch() {
+    let (base_url, _accepted) =
+        start_poison_rejecting_server(Arc::new(AtomicBool::new(false))).await;
+    let store = unique_test_sync_store();
+    let session_id = format!("causal-preflight-{}", std::process::id());
+    let sink = RemoteSessionSink::with_store(
+        SyncConfig {
+            base_url,
+            api_key: "test-key".into(),
+            machine_id: None,
+            cwd_digest: None,
+        },
+        session_id.clone(),
+        None,
+        remote_session_http_client(),
+        store.clone(),
+    );
+    sink.set_pipefs_sync_required(true);
+    for index in 0..513 {
+        sink.push("usage", &serde_json::json!({"index": index}).to_string());
+    }
+    assert_eq!(store.status(Some(&session_id)).unwrap().queue_rows, 513);
+
+    sink.prepare_causal_pipefs_mutation().await.unwrap();
+    assert_eq!(store.status(Some(&session_id)).unwrap().queue_rows, 0);
+    assert!(
+        sink.causal_pipefs_transcript_batch()
+            .unwrap()
+            .records
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -339,10 +518,46 @@ async fn synchronous_lease_confirmation_fails_closed_and_marks_takeover() {
         store,
     );
 
+    let mut lease_status = sink.subscribe_writer_lease_status();
     let error = sink.confirm_writer_lease().await.unwrap_err();
     assert!(error.to_string().contains("409"));
     assert!(sink.writer_lease_is_lost());
+    lease_status.changed().await.unwrap();
+    assert_eq!(*lease_status.borrow(), hi_pipefs::PipeFsLeaseStatus::Lost);
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_lease_confirmation_publishes_uncertainty() {
+    let store = unique_test_sync_store();
+    let session_id = format!("lease-uncertain-{}", std::process::id());
+    store
+        .store_lease(&session_id, "test-token", 3, "test-owner", 4_000_000_000)
+        .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let sink = RemoteSessionSink::with_store(
+        SyncConfig {
+            base_url: format!("http://{addr}"),
+            api_key: "test-key".into(),
+            machine_id: None,
+            cwd_digest: None,
+        },
+        session_id,
+        None,
+        remote_session_http_client(),
+        store,
+    );
+    let mut lease_status = sink.subscribe_writer_lease_status();
+
+    sink.confirm_writer_lease().await.unwrap_err();
+    lease_status.changed().await.unwrap();
+    assert_eq!(
+        *lease_status.borrow(),
+        hi_pipefs::PipeFsLeaseStatus::Uncertain
+    );
+    assert!(!sink.writer_lease_is_lost());
 }
 
 #[tokio::test]

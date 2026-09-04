@@ -77,7 +77,19 @@ impl MockServer {
                     // socket. Advertise that lifecycle explicitly so the
                     // pooled reqwest client never races a follow-up request
                     // against a socket the task has already dropped.
-                    let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                    let body = if request.contains("/records") {
+                        serde_json::json!({
+                            "record_count": count.load(Ordering::SeqCst).saturating_mul(1_000)
+                        })
+                        .to_string()
+                    } else {
+                        "{}".to_string()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
                     let _ = sock.write_all(response.as_bytes()).await;
                     let _ = sock.shutdown().await;
                 });

@@ -196,6 +196,8 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
         browser_allow_private: false,
         mcp_pipe_enabled: true,
         mcp_pipe_allow: Vec::new(),
+        session_harness: crate::session_harness::empty_layer(),
+        harness: hi_workspace::ResolvedHarnessSettings::default(),
     })
 }
 
@@ -223,7 +225,9 @@ fn prompt(message: &str) -> Result<String> {
 }
 
 /// `api_key: None` writes a profile with no key — used when the credential
-/// lives in `auth.json` instead (subscription login) or is not needed (Ollama).
+/// already lives in the private credential store (subscription login) or is
+/// not needed (Ollama). `upsert_profile_as_default` seals any supplied static
+/// key into that store and persists only its `api_key_ref`.
 fn save_config(
     config: &mut Config,
     provider: ProviderName,

@@ -44,6 +44,10 @@ XAI_API_KEY=xai-... hi --provider xai "…"
 ```
 
 Profiles live in `./hi.toml` or `~/.config/hi/config.toml`. `/provider` switches mid-session.
+User-owned config stores credentials by reference (`env://...` or the private
+`auth-store://...` store); profile/config writers seal pasted keys and migrate
+legacy literal fields best-effort. Repository config is never rewritten merely
+because it was inspected.
 
 ## Named modes (when you need them)
 
@@ -90,6 +94,7 @@ Default is YOLO with a seatbelt: no nag prompts, a denylist for irreversible com
 - [Architecture](docs/architecture.md) — interactive agent vs RSI control plane
 - [Fleet](docs/fleet-dashboard.md)
 - [PipeFS](docs/pipefs.md) — opt-in portable session workspaces
+- [Harness v2](docs/harness-v2.md) — workspace settlement, jobs, candidates, and recovery
 - [Sandbox](docs/sandbox.md)
 - [0.2 migration](docs/0.2-migration.md)
 

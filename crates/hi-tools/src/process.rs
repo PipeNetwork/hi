@@ -9,6 +9,8 @@ use crate::{ProcessOutcome, ToolStatus, TruncationState};
 
 mod environment;
 mod execution;
+mod foreground;
+mod hermetic;
 
 use environment::{SECRET_ENV_VARS, sensitive_environment_name, workspace_cargo_home};
 pub(crate) use execution::kill_group;
@@ -16,6 +18,7 @@ pub(crate) use execution::kill_group;
 use execution::kill_process_group;
 pub use execution::{AdoptableOutcome, RunningChild, preserve_detached_descendants};
 use execution::{capture_child, capture_child_adoptable, capture_child_maybe_timeout};
+pub use foreground::ForegroundProcessRegistry;
 
 /// The structured result returned by [`ProcessRunner`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,20 +120,18 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Hardened process runner bound to one explicit workspace root.
-///
-/// Every child gets a closed stdin, bounded/drained stdout and stderr, a
-/// sanitized environment, kill-on-drop, and (on Unix) its own process group so
-/// cancellation and timeout remove descendants as well as the shell.
+/// Hardened process runner bound to one explicit workspace root. Children get
+/// closed stdin, bounded output, a sanitized environment, kill-on-drop, and on
+/// Unix their own process group for complete cancellation.
 #[derive(Clone, Debug)]
 pub struct ProcessRunner {
     root: PathBuf,
-    /// Resolved OS sandbox for shell commands (`HI_SANDBOX`). Workspace by
-    /// default so agent shells cannot write outside the project. Shared
-    /// toolchain caches are protected against dependency-cache poisoning;
-    /// Cargo uses a per-workspace home under that policy.
+    foreground: ForegroundProcessRegistry,
+    /// Resolved OS sandbox (`HI_SANDBOX`), workspace-confined by default with a
+    /// per-workspace Cargo home to protect shared toolchain caches.
     sandbox: crate::sandbox::SandboxProfile,
     cargo_home: Option<PathBuf>,
+    private_temp: Option<PathBuf>,
 }
 
 impl ProcessRunner {
@@ -139,51 +140,22 @@ impl ProcessRunner {
         Self::new_with_policy(root, policy)
     }
 
-    /// Construct a runner with an explicit sandbox policy.
-    ///
-    /// Embedded callers should use this when they already own configuration
-    /// state. Keeping the policy out of the process environment makes multiple
-    /// agents safe to construct concurrently and prevents test fixtures from
-    /// changing another runner's security settings.
+    /// Construct with a caller-owned policy, avoiding process-environment
+    /// coupling between embedded agents and test fixtures.
     pub fn new_with_policy(
         root: impl AsRef<Path>,
         policy: crate::sandbox::SandboxPolicy,
     ) -> Result<Self> {
-        let root = root.as_ref();
-        let metadata = std::fs::metadata(root)
-            .with_context(|| format!("reading workspace root {}", root.display()))?;
-        anyhow::ensure!(
-            metadata.is_dir(),
-            "workspace root is not a directory: {}",
-            root.display()
-        );
-        let root = root
-            .canonicalize()
-            .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
-        let cargo_home = workspace_cargo_home(&root, policy)
-            .filter(|cargo_home| std::fs::create_dir_all(cargo_home).is_ok());
-        let mut writable = vec![root.as_path()];
-        if let Some(cargo_home) = cargo_home.as_deref()
-            && !cargo_home.starts_with(&root)
-        {
-            writable.push(cargo_home);
-        }
-        let sandbox = crate::sandbox::SandboxProfile::new(policy, &writable);
-        if sandbox.requested_but_unenforced() {
-            // Once per process so parallel runners don't spam stderr.
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                eprintln!(
-                    "warning: {}",
-                    crate::sandbox::SandboxProfile::unenforced_warning()
-                );
-            });
-        }
-        Ok(Self {
-            root,
-            sandbox,
-            cargo_home,
-        })
+        Self::new_with_policy_and_config(root, policy, crate::sandbox::SandboxConfig::default())
+    }
+
+    /// Construct with caller-owned policy and hermetic profile configuration.
+    pub fn new_with_policy_and_config(
+        root: impl AsRef<Path>,
+        policy: crate::sandbox::SandboxPolicy,
+        sandbox_config: crate::sandbox::SandboxConfig,
+    ) -> Result<Self> {
+        hermetic::build_process_runner(root.as_ref(), policy, sandbox_config)
     }
 
     /// Whether shell commands from this runner are OS-sandboxed on this platform.
@@ -215,6 +187,10 @@ impl ProcessRunner {
         &self.root
     }
 
+    pub fn foreground_registry(&self) -> ForegroundProcessRegistry {
+        self.foreground.clone()
+    }
+
     pub async fn run_shell(&self, command: &str, timeout: Duration) -> Result<ProcessExecution> {
         self.run_shell_streaming(command, timeout, &mut |_| {})
             .await
@@ -240,7 +216,7 @@ impl ProcessRunner {
     ) -> Result<ProcessExecution> {
         let started = Instant::now();
         let child = self.spawn_shell(command)?;
-        capture_child(child, timeout, on_line, started).await
+        capture_child(child, timeout, on_line, started, &self.foreground).await
     }
 
     /// Streaming variant of [`Self::run_shell_maybe_timeout`].
@@ -252,7 +228,7 @@ impl ProcessRunner {
     ) -> Result<ProcessExecution> {
         let started = Instant::now();
         let child = self.spawn_shell(command)?;
-        capture_child_maybe_timeout(child, timeout, on_line, started).await
+        capture_child_maybe_timeout(child, timeout, on_line, started, &self.foreground).await
     }
 
     /// Run a shell command in the foreground up to `foreground_budget`; if it is
@@ -268,7 +244,7 @@ impl ProcessRunner {
     ) -> Result<AdoptableOutcome> {
         let started = Instant::now();
         let child = self.spawn_shell(command)?;
-        capture_child_adoptable(child, foreground_budget, on_line, started).await
+        capture_child_adoptable(child, foreground_budget, on_line, started, &self.foreground).await
     }
 
     /// Run an executable directly, keeping filesystem-derived arguments out of
@@ -312,7 +288,7 @@ impl ProcessRunner {
             command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
         }
         let child = command.spawn().context("failed to spawn program")?;
-        capture_child_maybe_timeout(child, timeout, &mut |_| {}, started).await
+        capture_child_maybe_timeout(child, timeout, &mut |_| {}, started, &self.foreground).await
     }
 
     /// Run a trusted executable directly with explicit environment overrides.
@@ -345,7 +321,7 @@ impl ProcessRunner {
             command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
         }
         let child = command.spawn().context("failed to spawn program")?;
-        capture_child(child, timeout, &mut |_| {}, started).await
+        capture_child(child, timeout, &mut |_| {}, started, &self.foreground).await
     }
 
     /// Run a trusted executable with explicit environment overrides and an
@@ -376,7 +352,7 @@ impl ProcessRunner {
             command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
         }
         let child = command.spawn().context("failed to spawn program")?;
-        capture_child_maybe_timeout(child, timeout, &mut |_| {}, started).await
+        capture_child_maybe_timeout(child, timeout, &mut |_| {}, started, &self.foreground).await
     }
 
     /// Spawn a long-lived direct child with piped stdin/stdout. This is the
@@ -434,6 +410,12 @@ impl ProcessRunner {
             .env("PYTHONDONTWRITEBYTECODE", "1");
         if let Some(cargo_home) = &self.cargo_home {
             command.env("CARGO_HOME", cargo_home);
+        }
+        if let Some(private_temp) = &self.private_temp {
+            command
+                .env("TMPDIR", private_temp)
+                .env("TMP", private_temp)
+                .env("TEMP", private_temp);
         }
         // Pager neutralization: point every pager a common tool might launch at
         // a passthrough (`cat`) and blank the ones with no passthrough form, so

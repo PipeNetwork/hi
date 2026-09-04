@@ -19,6 +19,11 @@ use anyhow::{Result, bail};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 
+#[path = "background_names.rs"]
+mod names;
+use names::handle_id;
+pub use names::shell_title;
+
 /// Cap on retained per-process output. Beyond this we drop the oldest bytes (a
 /// ring buffer): a chatty server left unpolled can't grow memory without bound.
 const MAX_BG_BUFFER: usize = 256 * 1024;
@@ -63,6 +68,7 @@ struct BgProc {
     pgid: Option<i32>,
     origin: BgOrigin,
     effect_baseline: Option<Arc<EffectBaseline>>,
+    managed_job: Option<crate::job_lifecycle::ManagedBackgroundJob>,
     inner: Mutex<BgInner>,
     reaped: Notify,
     /// Woken on every output append and lifecycle transition, so a blocking
@@ -117,6 +123,7 @@ pub struct BackgroundRegistry {
     /// registry-local value keeps timing controls out of process-global
     /// environment state.
     poll_wait_base_secs: AtomicU64,
+    lifecycle: crate::job_lifecycle::BackgroundJobLifecycleSlot,
 }
 
 /// Cap on remembered unknown handles. Bounded so a guessing loop cannot grow
@@ -133,6 +140,7 @@ impl Default for BackgroundRegistry {
             quiescing: std::sync::atomic::AtomicBool::new(false),
             unknown_handles: Mutex::new(VecDeque::new()),
             poll_wait_base_secs: AtomicU64::new(POLL_WAIT_USE_ENV),
+            lifecycle: crate::job_lifecycle::BackgroundJobLifecycleSlot::default(),
         }
     }
 }
@@ -206,11 +214,29 @@ pub(crate) fn spawn(command: &str) -> Result<String> {
 }
 
 impl BackgroundRegistry {
+    pub fn set_job_lifecycle(&self, lifecycle: Arc<dyn crate::BackgroundJobLifecycle>) {
+        self.lifecycle.set(lifecycle);
+    }
+
+    pub async fn pending_job_settlements(&self) -> Vec<crate::BackgroundJobId> {
+        self.lifecycle.pending().await
+    }
+
+    pub async fn settle_jobs_after_workspace(
+        &self,
+        pending: &[crate::BackgroundJobId],
+    ) -> Result<()> {
+        self.lifecycle
+            .settle_after_workspace(pending)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+
     pub fn spawn(&self, runner: &crate::ProcessRunner, command: &str) -> Result<String> {
         self.spawn_with_baseline(runner, command, None)
     }
 
-    pub(crate) fn spawn_tracked(
+    pub(crate) async fn spawn_tracked(
         &self,
         runner: &crate::ProcessRunner,
         command: &str,
@@ -218,7 +244,7 @@ impl BackgroundRegistry {
         state_root: &Path,
         snapshot: crate::effects::WorkspaceSnapshot,
     ) -> Result<String> {
-        self.spawn_with_baseline(
+        self.spawn_managed(
             runner,
             command,
             Some(EffectBaseline {
@@ -226,7 +252,27 @@ impl BackgroundRegistry {
                 state_root: state_root.to_path_buf(),
                 snapshot,
             }),
+            None,
         )
+        .await
+    }
+
+    /// Start a known live writer only after the workspace job lifecycle has
+    /// admitted it. Callers that cannot take a complete workspace snapshot
+    /// still use the same admission and terminal-settlement path; registration
+    /// denial happens before `ProcessRunner::spawn_shell` is reached.
+    pub(crate) async fn spawn_managed_live_writer(
+        &self,
+        runner: &crate::ProcessRunner,
+        command: &str,
+    ) -> Result<String> {
+        self.spawn_managed(
+            runner,
+            command,
+            None,
+            Some(crate::BackgroundJobEffect::LiveWriter),
+        )
+        .await
     }
 
     /// Adopt an already-running child that a foreground command handed off
@@ -238,7 +284,7 @@ impl BackgroundRegistry {
     /// child over — this registry now owns its lifecycle. `pgid` is the
     /// child's process-group id for tree-kill.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn adopt(
+    pub(crate) async fn adopt(
         &self,
         command: &str,
         child: tokio::process::Child,
@@ -257,12 +303,13 @@ impl BackgroundRegistry {
             seed_output,
             Some(baseline),
         )
+        .await
     }
 
     /// Adopt a definitely read-only command without retaining a workspace
     /// snapshot. It still gets the same lifecycle/output handling, but a
     /// terminal poll cannot attribute unrelated file changes to it.
-    pub(crate) fn adopt_read_only(
+    pub(crate) async fn adopt_read_only(
         &self,
         command: &str,
         child: tokio::process::Child,
@@ -272,10 +319,11 @@ impl BackgroundRegistry {
         seed_output: String,
     ) -> Result<String> {
         self.adopt_with_baseline(command, child, stdout, stderr, pgid, seed_output, None)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn adopt_with_baseline(
+    async fn adopt_with_baseline(
         &self,
         command: &str,
         child: tokio::process::Child,
@@ -300,6 +348,38 @@ impl BackgroundRegistry {
             return Err(error);
         }
         let id = handle_id(command, self.counter.fetch_add(1, Ordering::Relaxed));
+        let effect = if baseline.is_some() {
+            crate::BackgroundJobEffect::LiveWriter
+        } else {
+            crate::BackgroundJobEffect::ReadOnly
+        };
+        let managed_job = match self
+            .lifecycle
+            .register(&id, crate::BackgroundJobKind::Process, effect, command)
+            .await
+        {
+            Ok(job) => job,
+            Err(error) => {
+                stop_and_reap(child, pgid).await;
+                self.release_slot();
+                return Err(anyhow::Error::msg(error));
+            }
+        };
+        if let Err(error) =
+            hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::JobAfterSpawn)
+        {
+            stop_and_reap(child, pgid).await;
+            if let Some(job) = &managed_job {
+                let _ = job
+                    .observe(
+                        crate::BackgroundJobTerminal::Failed,
+                        Some(error.to_string()),
+                    )
+                    .await;
+            }
+            self.release_slot();
+            return Err(error.into());
+        }
         let proc = Arc::new(BgProc {
             command: command.to_string(),
             title: shell_title(command),
@@ -312,6 +392,7 @@ impl BackgroundRegistry {
                     snapshot,
                 })
             }),
+            managed_job,
             inner: Mutex::new(BgInner::running(seed_output)),
             reaped: Notify::new(),
             changed: Notify::new(),
@@ -365,6 +446,7 @@ impl BackgroundRegistry {
             pgid,
             origin: BgOrigin::Requested,
             effect_baseline: effect_baseline.map(Arc::new),
+            managed_job: None,
             inner: Mutex::new(BgInner::running(String::new())),
             reaped: Notify::new(),
             changed: Notify::new(),
@@ -387,6 +469,103 @@ impl BackgroundRegistry {
         Ok(id)
     }
 
+    async fn spawn_managed(
+        &self,
+        runner: &crate::ProcessRunner,
+        command: &str,
+        effect_baseline: Option<EffectBaseline>,
+        effect_override: Option<crate::BackgroundJobEffect>,
+    ) -> Result<String> {
+        if let Some(reason) = crate::guard::catastrophic_op(command) {
+            bail!("refused: this command {reason}");
+        }
+        self.reserve_slot()?;
+        let id = handle_id(command, self.counter.fetch_add(1, Ordering::Relaxed));
+        let effect = effect_override.unwrap_or_else(|| {
+            if crate::shell_policy::classify_shell_command(command).is_proven_read_only() {
+                crate::BackgroundJobEffect::ReadOnly
+            } else {
+                crate::BackgroundJobEffect::LiveWriter
+            }
+        });
+        let managed_job = match self
+            .lifecycle
+            .register(&id, crate::BackgroundJobKind::Process, effect, command)
+            .await
+        {
+            Ok(job) => job,
+            Err(error) => {
+                self.release_slot();
+                return Err(anyhow::Error::msg(error));
+            }
+        };
+        if let Err(error) =
+            hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::ToolBeforeStart)
+        {
+            if let Some(job) = &managed_job {
+                let _ = job
+                    .observe(
+                        crate::BackgroundJobTerminal::FailedBeforeStart,
+                        Some(error.to_string()),
+                    )
+                    .await;
+            }
+            self.release_slot();
+            return Err(error.into());
+        }
+        let mut child = match runner.spawn_shell(command) {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(job) = &managed_job {
+                    let _ = job
+                        .observe(
+                            crate::BackgroundJobTerminal::FailedBeforeStart,
+                            Some(error.to_string()),
+                        )
+                        .await;
+                }
+                self.release_slot();
+                return Err(error);
+            }
+        };
+        let pgid = child.id().map(|pid| pid as i32);
+        if let Err(error) =
+            hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::JobAfterSpawn)
+        {
+            stop_and_reap(child, pgid).await;
+            if let Some(job) = &managed_job {
+                let _ = job
+                    .observe(
+                        crate::BackgroundJobTerminal::Failed,
+                        Some(error.to_string()),
+                    )
+                    .await;
+            }
+            self.release_slot();
+            return Err(error.into());
+        }
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let proc = Arc::new(BgProc {
+            command: command.to_string(),
+            title: shell_title(command),
+            pgid,
+            origin: BgOrigin::Requested,
+            effect_baseline: effect_baseline.map(Arc::new),
+            managed_job,
+            inner: Mutex::new(BgInner::running(String::new())),
+            reaped: Notify::new(),
+            changed: Notify::new(),
+        });
+        self.processes
+            .lock()
+            .unwrap()
+            .insert(id.clone(), proc.clone());
+        self.release_slot();
+        tokio::spawn(async move { drive(proc, child, stdout, stderr).await });
+        Ok(id)
+    }
+
     /// Reserve a retained-process slot before starting a child. Exited
     /// entries are reclaimed first; live entries are never evicted because
     /// doing so would lose the only handle capable of stopping their process
@@ -400,7 +579,8 @@ impl BackgroundRegistry {
         let reserved = self.reserved_slots.load(Ordering::Acquire);
         if reg.len().saturating_add(reserved) >= MAX_BG_PROCS {
             bail!(
-                "background process capacity reached ({MAX_BG_PROCS} live or starting); +                 stop a running background process before starting another"
+                "background process capacity reached ({MAX_BG_PROCS} live or starting); \
+                 stop a running background process before starting another"
             );
         }
         self.reserved_slots.fetch_add(1, Ordering::Release);
@@ -531,6 +711,16 @@ impl BackgroundRegistry {
 
     pub fn kill(&self, id: &str) -> Result<String> {
         kill_from(self, id)
+    }
+
+    /// Request process-group cancellation and do not report the stop complete
+    /// until the child is reaped and its workspace-job callback has run.
+    pub async fn kill_and_reap(&self, id: &str) -> Result<String> {
+        let result = kill_from(self, id)?;
+        let process = lookup(self, id)?;
+        let deadline = tokio::time::Instant::now() + QUIESCENT_REAP_TIMEOUT;
+        wait_for_terminal_reap(&process, id, deadline).await?;
+        Ok(result)
     }
 
     /// Verify that no tracked process is live and wait for every terminal child
@@ -760,6 +950,49 @@ impl BackgroundRegistry {
     pub fn kill_started_after(&self, before: &[String]) -> usize {
         kill_started_after_from(self, before)
     }
+
+    /// Stop auto-backgrounded processes created after `before` and wait until
+    /// their detached drivers have reaped the native children and completed
+    /// workspace-job lifecycle callbacks.
+    ///
+    /// Turn cancellation uses this stronger form before reconciling workspace
+    /// bytes. Merely observing the public `Killed` state is insufficient: the
+    /// child can still execute a final write until its driver has reaped it.
+    pub async fn kill_started_after_and_reap(&self, before: &[String]) -> Result<usize> {
+        let before: HashSet<&str> = before.iter().map(String::as_str).collect();
+        let targets = {
+            let processes = self.processes.lock().unwrap();
+            processes
+                .iter()
+                .filter(|(id, process)| {
+                    if before.contains(id.as_str()) || process.origin != BgOrigin::AutoBackgrounded
+                    {
+                        return false;
+                    }
+                    let inner = process.inner.lock().unwrap();
+                    matches!(inner.state, BgState::Running) || !inner.reaped
+                })
+                .map(|(id, process)| (id.clone(), Arc::clone(process)))
+                .collect::<Vec<_>>()
+        };
+
+        let mut signalled = 0;
+        for (id, process) in &targets {
+            let running = {
+                let inner = process.inner.lock().unwrap();
+                matches!(inner.state, BgState::Running)
+            };
+            if running && kill_from(self, id).is_ok() {
+                signalled += 1;
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + QUIESCENT_REAP_TIMEOUT;
+        for (id, process) in targets {
+            wait_for_terminal_reap(&process, &id, deadline).await?;
+        }
+        Ok(signalled)
+    }
 }
 
 fn emit_stream_chunk(on_line: &mut dyn FnMut(&str), chunk: &str) {
@@ -926,104 +1159,6 @@ pub(crate) fn kill(id: &str) -> Result<String> {
     kill_from(&TEST_REGISTRY, id)
 }
 
-/// Short auto-name for a shell command (UI / status lines). Not the full
-/// command string — just enough to recognize the job (`cargo test`, `sleep`,
-/// `npm run build`). Never includes JSON.
-pub fn shell_title(command: &str) -> String {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    if tokens.is_empty() {
-        return "shell".into();
-    }
-    // Skip env assignments (`FOO=bar cmd …`).
-    let mut i = 0usize;
-    while i < tokens.len() && tokens[i].contains('=') && !tokens[i].starts_with('-') {
-        i += 1;
-    }
-    if i >= tokens.len() {
-        return "shell".into();
-    }
-    let head = tokens[i];
-    let base = std::path::Path::new(head)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(head);
-    // Keep a small useful phrase: `cargo test`, `npm run build`, `python -m pytest`.
-    let mut parts = vec![base.to_string()];
-    let mut j = i + 1;
-    while j < tokens.len() && parts.len() < 3 {
-        let t = tokens[j];
-        if t.starts_with('-') && t != "-m" && t != "-c" {
-            break;
-        }
-        // Stop before shell operators / paths that bloat the label.
-        if matches!(t, "|" | "||" | "&&" | ";" | ">" | ">>" | "<") {
-            break;
-        }
-        if t.contains('/') || t.contains('\\') {
-            break;
-        }
-        // Skip bare numbers/timeouts (`sleep 600`) — they make status lines look
-        // like the full command was re-echoed.
-        if t.chars().all(|c| c.is_ascii_digit()) {
-            j += 1;
-            continue;
-        }
-        parts.push(t.to_string());
-        j += 1;
-        // After `run`/`test`/`build` take one more token if short.
-        if parts.len() == 2 && matches!(parts[1].as_str(), "run" | "test" | "build" | "exec") {
-            continue;
-        }
-        if parts.len() >= 2
-            && !matches!(
-                parts[0].as_str(),
-                "npm" | "pnpm" | "yarn" | "cargo" | "go" | "python" | "python3" | "pip" | "uv"
-            )
-        {
-            break;
-        }
-    }
-    let title = parts.join(" ");
-    const MAX: usize = 40;
-    if title.chars().count() <= MAX {
-        title
-    } else {
-        let kept: String = title.chars().take(MAX).collect();
-        format!("{kept}…")
-    }
-}
-
-/// Handle id for a background shell: a command-derived slug plus the
-/// registry's monotonic counter (`cargo-test_3`, `git-push_7`). Real names
-/// beat an opaque `sh_N`: polls, status lines, and kill calls read as the
-/// job they name, and a model can't cold-guess a plausible handle the way
-/// it guessed `sh_1` in live runs. The numeric suffix keeps ids unique and
-/// preserves insertion order for pruning; the slug is never `task`, so a
-/// handle can't collide with agent task ids (`task_N`).
-fn handle_id(command: &str, n: u64) -> String {
-    let mut slug = String::new();
-    let mut prev_dash = true; // suppress a leading dash
-    for c in shell_title(command).chars() {
-        if slug.len() >= 24 {
-            break;
-        }
-        if c.is_ascii_alphanumeric() {
-            slug.push(c.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            slug.push('-');
-            prev_dash = true;
-        }
-    }
-    let slug = slug.trim_end_matches('-');
-    let slug = if slug.is_empty() || slug == "task" {
-        "sh"
-    } else {
-        slug
-    };
-    format!("{slug}_{n}")
-}
-
 fn kill_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
     let proc = lookup(registry, id)?;
     {
@@ -1045,6 +1180,7 @@ fn kill_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
         crate::tools::kill_group(pgid);
     }
     proc.changed.notify_waiters();
+    hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::JobAfterCancelRequest)?;
     Ok(format!("[{id} · {}] stopped", proc.title))
 }
 
@@ -1195,7 +1331,7 @@ fn prune(reg: &mut HashMap<String, Arc<BgProc>>) {
     }
     let mut exited: Vec<(u64, String)> = reg
         .iter()
-        .filter(|(_, p)| !matches!(p.inner.lock().unwrap().state, BgState::Running))
+        .filter(|(_, process)| process.inner.lock().unwrap().reaped)
         .map(|(id, _)| (id_num(id), id.clone()))
         .collect();
     exited.sort_by_key(|(n, _)| *n);
@@ -1224,18 +1360,58 @@ async fn drive(
     stderr: Option<tokio::process::ChildStderr>,
 ) {
     tokio::join!(pump(stdout, &proc), pump(stderr, &proc));
-    let state = match child.wait().await {
+    let raw_state = match child.wait().await {
         Ok(status) => BgState::Exited(status.code()),
         Err(_) => BgState::Failed,
     };
+    let cancelled = matches!(proc.inner.lock().unwrap().state, BgState::Killed);
+    let failpoint_error = (!cancelled)
+        .then(|| {
+            hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::JobAfterNaturalExit)
+                .err()
+        })
+        .flatten();
+    let terminal = if cancelled {
+        crate::BackgroundJobTerminal::Cancelled
+    } else if failpoint_error.is_some() {
+        crate::BackgroundJobTerminal::Failed
+    } else {
+        match raw_state {
+            BgState::Exited(Some(0)) => crate::BackgroundJobTerminal::Succeeded,
+            _ => crate::BackgroundJobTerminal::Failed,
+        }
+    };
+    let detail = failpoint_error.as_ref().map(ToString::to_string);
+    let lifecycle_error = match &proc.managed_job {
+        Some(job) => job.observe(terminal, detail).await.err(),
+        None => None,
+    };
     let mut inner = proc.inner.lock().unwrap();
-    if inner.state == BgState::Running {
-        inner.state = state;
+    inner.state = if cancelled {
+        BgState::Killed
+    } else if lifecycle_error.is_some() || failpoint_error.is_some() {
+        BgState::Failed
+    } else {
+        raw_state
+    };
+    if let Some(error) = lifecycle_error {
+        inner
+            .output
+            .push_str(&format!("workspace job settlement failed: {error}\n"));
+        trim_output_to_cap(&mut inner);
     }
     inner.reaped = true;
     drop(inner);
     proc.reaped.notify_waiters();
     proc.changed.notify_waiters();
+}
+
+async fn stop_and_reap(mut child: tokio::process::Child, pgid: Option<i32>) {
+    if let Some(pgid) = pgid {
+        crate::tools::kill_group(pgid);
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 /// Append every line from one pipe into the shared buffer, enforcing the size
@@ -1312,648 +1488,5 @@ fn char_boundary_at_or_after(s: &str, mut idx: usize) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn running_effect_snapshot_is_not_sealed_when_process_exits_during_scan() {
-        let inner = BgInner {
-            output: String::new(),
-            dropped_bytes: 0,
-            read_position: 0,
-            state: BgState::Exited(Some(0)),
-            reaped: true,
-            terminal_effects: None,
-            empty_polls: 0,
-        };
-        assert!(should_seal_terminal_effects(&inner, true));
-        assert!(
-            !should_seal_terminal_effects(&inner, false),
-            "a snapshot begun while running must be recomputed after reap"
-        );
-    }
-
-    #[test]
-    fn background_capacity_rejects_new_reservations() {
-        let registry = BackgroundRegistry::default();
-        registry
-            .reserved_slots
-            .store(MAX_BG_PROCS, Ordering::Relaxed);
-
-        let error = registry
-            .reserve_slot()
-            .expect_err("a full registry must reject another child");
-        assert!(error.to_string().contains("capacity reached"));
-    }
-
-    /// Poll until the process reports it is no longer running, or time out.
-    async fn poll_until_done(id: &str) -> String {
-        for _ in 0..200 {
-            let out = poll(id).unwrap();
-            if !out.contains("running") {
-                return out;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("background process {id} never finished");
-    }
-
-    #[tokio::test]
-    async fn background_captures_output_and_exit_code() {
-        let _guard = TEST_LOCK.lock().await;
-        let id = spawn("echo hi-bg").unwrap();
-        let combined = poll_until_done(&id).await;
-        // `poll_until_done` returns the poll that observed the exit; the echoed
-        // line should be in that same drain (output is flushed before exit).
-        assert!(
-            combined.contains("hi-bg") || poll(&id).unwrap().contains("hi-bg"),
-            "expected output, got: {combined:?}"
-        );
-        assert!(combined.contains("exited with code 0"), "got: {combined:?}");
-        assert_eq!(outcome(&id).unwrap().state, crate::BackgroundState::Exited);
-        assert_eq!(outcome(&id).unwrap().exit_code, Some(0));
-    }
-
-    #[tokio::test]
-    async fn drained_terminal_poll_restates_output_tail() {
-        let _guard = TEST_LOCK.lock().await;
-        let id = spawn("echo tail-marker").unwrap();
-        let first = poll_until_done(&id).await;
-        // Drain any straggling flush so the next poll is genuinely empty.
-        if !first.contains("tail-marker") {
-            poll(&id).unwrap();
-        }
-        let drained = poll(&id).unwrap();
-        assert!(drained.contains("exited with code 0"), "got: {drained:?}");
-        assert!(
-            drained.contains("already delivered") && drained.contains("tail-marker"),
-            "a drained terminal poll must restate the output tail so the \
-             caller can conclude without re-polling: {drained:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn drained_terminal_poll_of_silent_process_says_so() {
-        let _guard = TEST_LOCK.lock().await;
-        let id = spawn("true").unwrap();
-        poll_until_done(&id).await;
-        let drained = poll(&id).unwrap();
-        assert!(drained.contains("produced no output"), "got: {drained:?}");
-    }
-
-    #[test]
-    fn output_tail_bounds_and_aligns_to_line_start() {
-        assert_eq!(output_tail("short\n"), "short");
-        let long = format!("{}\nlast line", "x".repeat(5000));
-        let tail = output_tail(&long);
-        assert!(tail.starts_with("… (earlier output elided)\n"));
-        assert!(tail.ends_with("last line"));
-        assert!(tail.len() < 2100, "tail stays bounded: {}", tail.len());
-    }
-
-    #[test]
-    fn handle_ids_name_the_job_and_order_by_suffix() {
-        // Real names, not opaque `sh_N`: a live run showed the model
-        // cold-guessing `sh_1` with nothing running; a slug it cannot
-        // predict is not guessable, and polls/kills read as the job.
-        assert_eq!(
-            handle_id("cargo test --quiet -p hi-tools", 3),
-            "cargo-test_3"
-        );
-        assert_eq!(
-            handle_id("RUST_LOG=debug git push origin main", 7),
-            "git-push_7"
-        );
-        assert_eq!(handle_id("sleep 600", 1), "sleep_1");
-        // Unparseable → shell_title's generic label, never empty.
-        assert_eq!(handle_id("", 2), "shell_2");
-        assert_eq!(handle_id("---", 5), "sh_5");
-        // A bare `task` command must not mint ids in the task_ namespace.
-        assert_eq!(handle_id("task", 4), "sh_4");
-        // The slug is bounded and the counter still parses for prune order.
-        let long = handle_id("extraordinarily-long-command-name-beyond-any-cap xyz", 12);
-        assert!(long.len() <= 28, "bounded: {long}");
-        assert_eq!(id_num(&long), 12);
-        assert_eq!(id_num("cargo-test_9"), 9);
-        assert_eq!(id_num("sh_1"), 1);
-        assert_eq!(id_num("bg_5"), 5);
-    }
-
-    #[tokio::test]
-    async fn background_returns_immediately_for_long_process() {
-        let _guard = TEST_LOCK.lock().await;
-        // A 600s sleep must not block spawn; it returns an id at once.
-        let id = tokio::time::timeout(Duration::from_secs(2), async { spawn("sleep 600") })
-            .await
-            .expect("spawn must not block")
-            .unwrap();
-        let out = poll(&id).unwrap();
-        assert!(out.contains("running"), "got: {out:?}");
-        assert_eq!(outcome(&id).unwrap().state, crate::BackgroundState::Running);
-        kill(&id).unwrap();
-    }
-
-    #[tokio::test]
-    async fn idle_running_poll_does_not_re_echo_command() {
-        let _guard = TEST_LOCK.lock().await;
-        let id = spawn("sleep 600").unwrap();
-        let out = poll(&id).unwrap();
-        assert!(
-            out.contains("still running — no new output"),
-            "idle poll status: {out:?}"
-        );
-        assert!(
-            !out.contains("`sleep 600`") && !out.contains("sleep 600"),
-            "idle running polls must not re-echo the full command (looks like a hung UI loop): {out:?}"
-        );
-        // Auto-name may include the program (`sleep`) — that is the title, not a dump.
-        kill(&id).unwrap();
-    }
-
-    #[tokio::test]
-    async fn snapshot_lists_each_job_with_command_and_status() {
-        let _guard = TEST_LOCK.lock().await;
-        let registry = BackgroundRegistry::default();
-        let runner = crate::ProcessRunner::from_current_dir().unwrap();
-        let id = registry.spawn(&runner, "sleep 600").unwrap();
-
-        let snap = registry.snapshot();
-        let entry = snap.iter().find(|(eid, _, _)| *eid == id);
-        assert!(
-            entry.is_some(),
-            "snapshot includes the spawned job: {snap:?}"
-        );
-        let (_, command, status) = entry.unwrap();
-        assert_eq!(command, "sleep 600");
-        assert_eq!(status, "running");
-
-        // Snapshot is non-consuming: polling afterwards still returns fresh output.
-        registry.kill(&id).unwrap();
-        let snap_after = registry.snapshot();
-        let (_, _, status_after) = snap_after.iter().find(|(eid, _, _)| *eid == id).unwrap();
-        assert_eq!(status_after, "killed");
-    }
-
-    #[tokio::test]
-    async fn quiescent_barrier_rejects_live_children_and_waits_after_kill() {
-        let _guard = TEST_LOCK.lock().await;
-        let registry = BackgroundRegistry::default();
-        let runner = crate::ProcessRunner::from_current_dir().unwrap();
-        let id = registry.spawn(&runner, "sleep 600").unwrap();
-
-        let error = registry
-            .ensure_quiescent_and_reaped()
-            .await
-            .expect_err("a running child must block workspace teardown");
-        assert!(error.to_string().contains(&id), "{error:#}");
-
-        registry.kill(&id).unwrap();
-        registry
-            .ensure_quiescent_and_reaped()
-            .await
-            .expect("a killed child must be fully reaped before teardown returns");
-        let (_, _, status) = registry
-            .snapshot()
-            .into_iter()
-            .find(|(candidate, _, _)| candidate == &id)
-            .unwrap();
-        assert_eq!(status, "killed");
-    }
-
-    #[tokio::test]
-    async fn background_kill_stops_the_process() {
-        let _guard = TEST_LOCK.lock().await;
-        let id = spawn("sleep 600").unwrap();
-        let killed = kill(&id).unwrap();
-        assert!(killed.contains("stopped"), "got: {killed:?}");
-        // After the kill propagates, a poll reports it is no longer running.
-        let out = poll_until_done(&id).await;
-        assert!(out.contains("stopped"), "got: {out:?}");
-        // Killing again is idempotent.
-        assert!(kill(&id).unwrap().contains("already"), "second kill");
-    }
-
-    #[tokio::test]
-    async fn kill_started_after_reaps_auto_backgrounded_but_spares_deliberate_jobs() {
-        let _guard = TEST_LOCK.lock().await;
-        let runner = crate::ProcessRunner::from_current_dir().unwrap();
-        let registry = BackgroundRegistry::default();
-        let before = registry.ids();
-        // Deliberate `run_in_background` work started after the baseline —
-        // an 800 GB download must not die because its turn ended.
-        let download = registry.spawn(&runner, "sleep 600").unwrap();
-        // Auto-backgrounded: a foreground command adopted after outgrowing
-        // its budget — incidental turn state, still reaped.
-        let mut child = runner.spawn_shell("sleep 600").unwrap();
-        let pgid = child.id().map(|p| p as i32);
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let root = std::env::current_dir().unwrap();
-        let state = std::env::temp_dir().join(format!("hi-origin-state-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&state);
-        let snapshot = crate::effects::workspace_snapshot(&root, &state)
-            .await
-            .unwrap();
-        let adopted = registry
-            .adopt(
-                "sleep 600",
-                child,
-                stdout,
-                stderr,
-                pgid,
-                String::new(),
-                (root, state, snapshot),
-            )
-            .unwrap();
-
-        let killed = registry.kill_started_after(&before);
-
-        assert_eq!(killed, 1, "only the auto-backgrounded process is reaped");
-        assert_eq!(
-            registry.outcome(&download).unwrap().state,
-            crate::BackgroundState::Running,
-            "a deliberate run_in_background job survives turn-scoped cleanup"
-        );
-        assert_eq!(
-            registry.outcome(&adopted).unwrap().state,
-            crate::BackgroundState::Killed
-        );
-        registry.kill_all();
-    }
-
-    #[tokio::test]
-    async fn poll_unknown_id_errors() {
-        assert!(poll("sh_does_not_exist").is_err());
-        assert!(kill("sh_does_not_exist").is_err());
-    }
-
-    #[tokio::test]
-    async fn unknown_handles_are_recorded_with_registry_emptiness() {
-        let registry = BackgroundRegistry::default();
-        // Empty registry: the id cannot have been pruned — it was guessed.
-        assert!(registry.poll("ghost_1").is_err());
-        let unknown = registry.unknown_handles();
-        assert_eq!(unknown.len(), 1);
-        assert_eq!(unknown[0].id, "ghost_1");
-        assert!(unknown[0].registry_was_empty);
-
-        // A real process makes later misses ambiguous (possibly pruned).
-        let runner = crate::ProcessRunner::from_current_dir().unwrap();
-        let id = registry.spawn(&runner, "sleep 600").unwrap();
-        assert!(registry.poll("ghost_2").is_err());
-        let unknown = registry.unknown_handles();
-        assert_eq!(unknown.len(), 2);
-        assert_eq!(unknown[0].id, "ghost_2");
-        assert!(!unknown[0].registry_was_empty);
-        assert_eq!(unknown[1].id, "ghost_1");
-        assert!(unknown[1].registry_was_empty);
-        registry.kill(&id).unwrap();
-    }
-
-    #[tokio::test]
-    async fn unknown_handle_log_is_bounded() {
-        let registry = BackgroundRegistry::default();
-        for n in 0..(MAX_UNKNOWN_HANDLES + 5) {
-            assert!(registry.poll(&format!("ghost_{n}")).is_err());
-        }
-        let unknown = registry.unknown_handles();
-        assert_eq!(unknown.len(), MAX_UNKNOWN_HANDLES);
-        // Oldest misses are dropped first; the most recent is kept.
-        assert_eq!(unknown[0].id, format!("ghost_{}", MAX_UNKNOWN_HANDLES + 4));
-        assert_eq!(unknown[MAX_UNKNOWN_HANDLES - 1].id, format!("ghost_{}", 5));
-    }
-
-    #[test]
-    fn default_wait_budget_escalates_and_caps() {
-        assert_eq!(
-            default_poll_wait_budget(0, Some(15)),
-            Duration::from_secs(15)
-        );
-        assert_eq!(
-            default_poll_wait_budget(1, Some(15)),
-            Duration::from_secs(30)
-        );
-        assert_eq!(
-            default_poll_wait_budget(2, Some(15)),
-            Duration::from_secs(60)
-        );
-        assert_eq!(
-            default_poll_wait_budget(4, Some(15)),
-            Duration::from_secs(240)
-        );
-        assert_eq!(
-            default_poll_wait_budget(63, Some(15)),
-            Duration::from_secs(240),
-            "cap holds for arbitrary streaks"
-        );
-        assert_eq!(
-            default_poll_wait_budget(3, Some(0)),
-            Duration::ZERO,
-            "0 = instant"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_poll_parks_on_the_watcher_until_output() {
-        let _guard = TEST_LOCK.lock().await;
-        let registry = BackgroundRegistry::default();
-        let runner = crate::ProcessRunner::from_current_dir().unwrap();
-        // Quiet for 400ms, then emits: the defaulted poll must park on the
-        // change notification and wake with the output — not return an
-        // instant "no new output" that costs the caller a round-trip.
-        let id = registry
-            .spawn(&runner, "sleep 0.4; echo woke-the-watcher; sleep 600")
-            .unwrap();
-
-        let started = std::time::Instant::now();
-        let out = registry.poll_wait_default(&id).await.unwrap();
-
-        assert!(
-            out.contains("woke-the-watcher"),
-            "default poll returns the awaited output: {out:?}"
-        );
-        assert!(
-            started.elapsed() >= Duration::from_millis(300),
-            "must actually have parked: {:?}",
-            started.elapsed()
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "must wake on output, not sleep out the budget: {:?}",
-            started.elapsed()
-        );
-        registry.kill(&id).unwrap();
-    }
-
-    #[tokio::test]
-    async fn empty_polls_escalate_and_fresh_output_resets() {
-        let _guard = TEST_LOCK.lock().await;
-        let registry = BackgroundRegistry::default();
-        let runner = crate::ProcessRunner::from_current_dir().unwrap();
-        let id = registry.spawn(&runner, "echo first; sleep 600").unwrap();
-        let strikes = |registry: &BackgroundRegistry, id: &str| {
-            let processes = registry.processes.lock().unwrap();
-            let proc = processes.get(id).unwrap();
-            let inner = proc.inner.lock().unwrap();
-            inner.empty_polls
-        };
-
-        // Wait for the first line, then drain it: counter resets on output.
-        let drained = registry
-            .poll_wait(&id, Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert!(drained.contains("first"), "got: {drained:?}");
-        assert_eq!(strikes(&registry, &id), 0);
-
-        // Two instant empty peeks escalate the streak.
-        let _ = registry.poll(&id).unwrap();
-        let _ = registry.poll(&id).unwrap();
-        assert_eq!(strikes(&registry, &id), 2);
-        registry.kill(&id).unwrap();
-    }
-
-    #[tokio::test]
-    async fn poll_wait_blocks_until_new_output_arrives() {
-        let _guard = TEST_LOCK.lock().await;
-        let registry = BackgroundRegistry::default();
-        let runner = crate::ProcessRunner::from_current_dir().unwrap();
-        let id = registry
-            .spawn(&runner, "sleep 0.4; echo late-line; sleep 600")
-            .unwrap();
-
-        let started = std::time::Instant::now();
-        let out = registry
-            .poll_wait(&id, Duration::from_secs(10))
-            .await
-            .unwrap();
-
-        assert!(
-            out.contains("late-line"),
-            "the wait should return the fresh output: {out:?}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(8),
-            "must wake on output, not sleep out the full wait: {:?}",
-            started.elapsed()
-        );
-        registry.kill(&id).unwrap();
-    }
-
-    #[tokio::test]
-    async fn poll_wait_streaming_emits_output_before_return() {
-        let _guard = TEST_LOCK.lock().await;
-        let registry = BackgroundRegistry::default();
-        let runner = crate::ProcessRunner::from_current_dir().unwrap();
-        let id = registry
-            .spawn(&runner, "sleep 0.3; echo streamed-line; sleep 600")
-            .unwrap();
-
-        let mut seen = String::new();
-        let out = registry
-            .poll_wait_streaming(&id, Duration::from_secs(10), &mut |line| {
-                seen.push_str(line);
-                seen.push('\n');
-            })
-            .await
-            .unwrap();
-
-        assert!(
-            seen.contains("streamed-line"),
-            "live callback should see output before the poll returns: seen={seen:?} out={out:?}"
-        );
-        registry.kill(&id).unwrap();
-    }
-
-    #[tokio::test]
-    async fn poll_wait_times_out_to_idle_status_on_a_quiet_process() {
-        let _guard = TEST_LOCK.lock().await;
-        let registry = BackgroundRegistry::default();
-        let runner = crate::ProcessRunner::from_current_dir().unwrap();
-        let id = registry.spawn(&runner, "sleep 600").unwrap();
-
-        let started = std::time::Instant::now();
-        let out = registry
-            .poll_wait(&id, Duration::from_millis(200))
-            .await
-            .unwrap();
-
-        assert!(
-            out.contains("still running — no new output"),
-            "a timed-out wait reports genuine idleness: {out:?}"
-        );
-        assert!(started.elapsed() >= Duration::from_millis(180));
-        registry.kill(&id).unwrap();
-    }
-
-    #[tokio::test]
-    async fn poll_wait_wakes_promptly_when_the_process_is_killed() {
-        let _guard = TEST_LOCK.lock().await;
-        let registry = std::sync::Arc::new(BackgroundRegistry::default());
-        let runner = crate::ProcessRunner::from_current_dir().unwrap();
-        let id = registry.spawn(&runner, "sleep 600").unwrap();
-
-        let waiter = {
-            let registry = registry.clone();
-            let id = id.clone();
-            tokio::spawn(async move { registry.poll_wait(&id, Duration::from_secs(30)).await })
-        };
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        registry.kill(&id).unwrap();
-
-        let out = tokio::time::timeout(Duration::from_secs(5), waiter)
-            .await
-            .expect("kill must wake the waiter")
-            .unwrap()
-            .unwrap();
-        assert!(out.contains("stopped"), "got: {out:?}");
-    }
-
-    #[tokio::test]
-    async fn adopt_keeps_child_running_and_seeds_output() {
-        let _guard = TEST_LOCK.lock().await;
-        let runner = crate::ProcessRunner::from_current_dir().unwrap();
-        // Simulate the auto-background handoff: spawn a still-running child and
-        // adopt it with a seed capturing the "foreground" output so far.
-        let mut child = runner.spawn_shell("sleep 600").unwrap();
-        let pgid = child.id().map(|p| p as i32);
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let root = std::env::current_dir().unwrap();
-        let state = std::env::temp_dir().join(format!("hi-adopt-state-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&state);
-        let snapshot = crate::effects::workspace_snapshot(&root, &state)
-            .await
-            .unwrap();
-        let id = TEST_REGISTRY
-            .adopt(
-                "sleep 600",
-                child,
-                stdout,
-                stderr,
-                pgid,
-                "already-printed\n".to_string(),
-                (root, state.clone(), snapshot),
-            )
-            .unwrap();
-
-        let polled = poll(&id).unwrap();
-        assert!(polled.contains("running"), "adopted child runs: {polled:?}");
-        assert!(
-            polled.contains("already-printed"),
-            "seed output is visible on first poll: {polled:?}"
-        );
-        assert_eq!(outcome(&id).unwrap().state, crate::BackgroundState::Running);
-        kill(&id).unwrap();
-        let done = poll_until_done(&id).await;
-        assert!(done.contains("stopped"), "got: {done:?}");
-    }
-
-    #[test]
-    fn char_boundary_helper_lands_on_boundaries() {
-        let s = "a😀b"; // 😀 is 4 bytes at index 1..5
-        assert_eq!(char_boundary_at_or_after(s, 2), 5);
-        assert_eq!(char_boundary_at_or_after(s, 1), 1);
-        assert_eq!(char_boundary_at_or_after(s, 99), s.len());
-    }
-
-    fn registry_with_retained_output(output: String) -> (BackgroundRegistry, String) {
-        let registry = BackgroundRegistry::default();
-        let id = "overflow-test_1".to_string();
-        let proc = Arc::new(BgProc {
-            command: "overflow-test".to_string(),
-            title: "overflow-test".to_string(),
-            pgid: None,
-            origin: BgOrigin::Requested,
-            effect_baseline: None,
-            inner: Mutex::new(BgInner::running(output)),
-            reaped: Notify::new(),
-            changed: Notify::new(),
-        });
-        registry.processes.lock().unwrap().insert(id.clone(), proc);
-        (registry, id)
-    }
-
-    #[test]
-    fn overflow_reports_exact_unread_bytes_once() {
-        let excess = 37usize;
-        let output = format!("{}{}", "d".repeat(excess), "r".repeat(MAX_BG_BUFFER));
-        let (registry, id) = registry_with_retained_output(output);
-
-        let first = registry.poll(&id).unwrap();
-        assert!(
-            first.contains(&format!("{excess} unread bytes")),
-            "first poll must name the exact unavailable span: {first:?}"
-        );
-        assert!(first.ends_with(&"r".repeat(MAX_BG_BUFFER)));
-
-        let second = registry.poll(&id).unwrap();
-        assert!(
-            !second.contains("background output omitted"),
-            "an acknowledged omission must not repeat: {second:?}"
-        );
-        assert!(second.contains("still running — no new output"));
-    }
-
-    #[test]
-    fn overflow_counts_only_unread_bytes() {
-        let mut inner = BgInner::running("a".repeat(MAX_BG_BUFFER));
-        inner.read_position = output_end(&inner);
-        inner.output.push_str(&"b".repeat(73));
-        trim_output_to_cap(&mut inner);
-
-        let (omitted, fresh, end) = output_since(&inner, inner.read_position);
-        assert_eq!(
-            omitted, 0,
-            "evicting already-delivered bytes is not data loss"
-        );
-        assert_eq!(fresh, "b".repeat(73));
-        assert_eq!(end, MAX_BG_BUFFER as u64 + 73);
-    }
-
-    #[test]
-    fn overflow_preserves_utf8_and_reports_actual_boundary_cut() {
-        // The nominal two-byte overflow lands inside the leading four-byte
-        // scalar. The ring must discard the whole scalar and report four bytes.
-        let output = format!("😀{}", "x".repeat(MAX_BG_BUFFER - 2));
-        assert_eq!(output.len(), MAX_BG_BUFFER + 2);
-        let (registry, id) = registry_with_retained_output(output);
-
-        let first = registry.poll(&id).unwrap();
-        assert!(first.contains("4 unread bytes"), "got: {first:?}");
-        assert!(first.ends_with(&"x".repeat(MAX_BG_BUFFER - 2)));
-    }
-
-    #[tokio::test]
-    async fn streaming_poll_surfaces_overflow_to_callback_and_result() {
-        let excess = 19usize;
-        let output = format!("{}{}", "d".repeat(excess), "r".repeat(MAX_BG_BUFFER));
-        let (registry, id) = registry_with_retained_output(output);
-        let mut streamed = Vec::new();
-
-        let result = registry
-            .poll_wait_streaming(&id, Duration::ZERO, &mut |line| {
-                streamed.push(line.to_string());
-            })
-            .await
-            .unwrap();
-
-        assert!(
-            streamed
-                .iter()
-                .any(|line| line.contains(&format!("{excess} unread bytes"))),
-            "live view must disclose overflow: {streamed:?}"
-        );
-        assert!(
-            result.contains(&format!("{excess} unread bytes")),
-            "model-facing poll result must disclose overflow: {result:?}"
-        );
-        assert!(
-            !registry
-                .poll(&id)
-                .unwrap()
-                .contains("background output omitted")
-        );
-    }
-}
+#[path = "background_tests.rs"]
+mod tests;

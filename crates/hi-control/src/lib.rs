@@ -18,7 +18,18 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CONTROL_SCHEMA_VERSION: i64 = 1;
+mod projections;
+mod schema;
+mod workspace_journal;
+mod workspace_projection;
+mod workspace_restart;
+
+pub use projections::*;
+pub use schema::CONTROL_SCHEMA_VERSION;
+pub use workspace_journal::*;
+pub use workspace_projection::*;
+pub use workspace_restart::*;
+
 pub const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
 
 #[derive(Debug, Error)]
@@ -29,6 +40,8 @@ pub enum ControlError {
     Serialization(#[from] serde_json::Error),
     #[error("control store io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("control store schema {found} is newer than supported schema {supported}")]
+    IncompatibleSchema { found: i64, supported: i64 },
     #[error("run not found: {0}")]
     RunNotFound(String),
     #[error("attempt not found: {0}")]
@@ -338,11 +351,11 @@ impl std::fmt::Debug for ControlStore {
 impl ControlStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let connection = hi_sqlite_journal::JournalMode::for_db_path(&path)
+        let mut connection = hi_sqlite_journal::JournalMode::for_db_path(&path)
             .open(&path)
             .map_err(|error| ControlError::Invalid(error.to_string()))?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        migrate(&connection)?;
+        schema::migrate(&mut connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             path,
@@ -355,6 +368,18 @@ impl ControlStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        let connection = self.lock()?;
+        let value: String = connection.query_row(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        value
+            .parse()
+            .map_err(|_| ControlError::Invalid(format!("invalid control schema version {value:?}")))
     }
 
     pub fn create_run(&self, mut new_run: NewRun) -> Result<RunRecord> {
@@ -1365,141 +1390,6 @@ fn approval_state_name(state: &ApprovalState) -> &'static str {
     }
 }
 
-fn migrate(connection: &Connection) -> Result<()> {
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS control_meta (
-           key TEXT PRIMARY KEY,
-           value TEXT NOT NULL
-         );
-         INSERT OR IGNORE INTO control_meta(key, value)
-           VALUES ('schema_version', '1');
-         CREATE TABLE IF NOT EXISTS control_runs (
-           run_id TEXT PRIMARY KEY,
-           kind TEXT NOT NULL,
-           workspace_id TEXT,
-           scope_json TEXT,
-           session_id TEXT,
-           parent_run_id TEXT,
-           status TEXT NOT NULL,
-           desired_state TEXT NOT NULL,
-           policy_json TEXT,
-           route_json TEXT,
-           provenance_json TEXT,
-           created_at_ms INTEGER NOT NULL,
-           updated_at_ms INTEGER NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS control_runs_status ON control_runs(status, updated_at_ms);
-         CREATE TABLE IF NOT EXISTS control_attempts (
-           attempt_id TEXT PRIMARY KEY,
-           run_id TEXT NOT NULL REFERENCES control_runs(run_id),
-           number INTEGER NOT NULL,
-           worker_id TEXT NOT NULL,
-           status TEXT NOT NULL,
-           lease_generation INTEGER NOT NULL,
-           lease_expires_at_ms INTEGER NOT NULL,
-           last_heartbeat_at_ms INTEGER NOT NULL,
-           started_at_ms INTEGER NOT NULL,
-           finished_at_ms INTEGER,
-           error TEXT,
-           UNIQUE(run_id, number)
-         );
-         CREATE INDEX IF NOT EXISTS control_attempts_lease
-           ON control_attempts(status, lease_expires_at_ms);
-         CREATE TABLE IF NOT EXISTS control_effects (
-           effect_id TEXT PRIMARY KEY,
-           run_id TEXT NOT NULL REFERENCES control_runs(run_id),
-           attempt_id TEXT NOT NULL REFERENCES control_attempts(attempt_id),
-           fencing_token INTEGER NOT NULL,
-           capability TEXT NOT NULL,
-           tool TEXT NOT NULL,
-           operation_digest TEXT NOT NULL,
-           idempotency_key TEXT NOT NULL UNIQUE,
-           scope_json TEXT,
-           provenance_json TEXT,
-           status TEXT NOT NULL,
-           input_ref_json TEXT,
-           output_ref_json TEXT,
-           mutation_ref_json TEXT,
-           external_ref TEXT,
-           error TEXT,
-           created_at_ms INTEGER NOT NULL,
-           updated_at_ms INTEGER NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS control_effects_attempt
-           ON control_effects(attempt_id, created_at_ms);
-         CREATE TABLE IF NOT EXISTS control_audit (
-           audit_id TEXT PRIMARY KEY,
-           decision TEXT NOT NULL,
-           actor_json TEXT NOT NULL,
-           source TEXT NOT NULL,
-           scope_json TEXT,
-           provenance_json TEXT,
-           policy_json TEXT,
-           operation_digest TEXT,
-           approval_id TEXT,
-           route_json TEXT,
-           effect_id TEXT,
-           event_id TEXT,
-           detail TEXT,
-           created_at_ms INTEGER NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS control_audit_created ON control_audit(created_at_ms);
-         CREATE TABLE IF NOT EXISTS control_scopes (
-           scope_id TEXT PRIMARY KEY,
-           kind TEXT NOT NULL,
-           parent_scope_id TEXT,
-           workspace_id TEXT,
-           owner_id TEXT NOT NULL,
-           inherited INTEGER NOT NULL,
-           expires_at_ms INTEGER
-         );
-         CREATE INDEX IF NOT EXISTS control_scopes_parent ON control_scopes(parent_scope_id);
-         CREATE TABLE IF NOT EXISTS control_resources (
-           resource_id TEXT PRIMARY KEY,
-           kind TEXT NOT NULL,
-           scope_id TEXT NOT NULL,
-           owner_id TEXT NOT NULL,
-           digest TEXT NOT NULL,
-           sensitivity TEXT NOT NULL,
-           provenance_json TEXT,
-           expires_at_ms INTEGER
-         );
-         CREATE INDEX IF NOT EXISTS control_resources_scope ON control_resources(scope_id, kind);
-         CREATE TABLE IF NOT EXISTS control_artifacts (
-           artifact_hash TEXT PRIMARY KEY,
-           media_type TEXT NOT NULL,
-           size_bytes INTEGER,
-           scope_id TEXT,
-           sensitivity TEXT NOT NULL,
-           producer_run_id TEXT,
-           producer_attempt_id TEXT,
-           created_at_ms INTEGER NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS control_artifacts_scope ON control_artifacts(scope_id, sensitivity);
-         CREATE TABLE IF NOT EXISTS approvals (
-           approval_id TEXT PRIMARY KEY,
-           run_id TEXT,
-           request_json TEXT NOT NULL,
-           state TEXT NOT NULL,
-           created_at_ms INTEGER NOT NULL,
-           expires_at_ms INTEGER NOT NULL,
-           decided_at_ms INTEGER,
-           consumed_at_ms INTEGER
-         );
-         CREATE INDEX IF NOT EXISTS approvals_pending ON approvals(state, expires_at_ms);
-         CREATE INDEX IF NOT EXISTS approvals_run ON approvals(run_id, state);
-         CREATE TABLE IF NOT EXISTS run_events (
-           sequence INTEGER PRIMARY KEY,
-           event_id TEXT NOT NULL UNIQUE,
-           occurred_at_ms INTEGER NOT NULL,
-           event_json TEXT NOT NULL,
-           event_bytes INTEGER NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS run_events_event_id ON run_events(event_id);",
-    )?;
-    Ok(())
-}
-
 fn append_event_locked(connection: &mut Connection, event: &mut RunEvent) -> Result<EventReceipt> {
     if event.schema_version != hi_events::EVENT_SCHEMA_VERSION {
         return Err(ControlError::Invalid(format!(
@@ -1508,6 +1398,15 @@ fn append_event_locked(connection: &mut Connection, event: &mut RunEvent) -> Res
         )));
     }
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let receipt = append_event_in_transaction(&tx, event)?;
+    tx.commit()?;
+    Ok(receipt)
+}
+
+pub(crate) fn append_event_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    event: &mut RunEvent,
+) -> Result<EventReceipt> {
     let existing: Option<i64> = tx
         .query_row(
             "SELECT sequence FROM run_events WHERE event_id = ?1",
@@ -1516,7 +1415,6 @@ fn append_event_locked(connection: &mut Connection, event: &mut RunEvent) -> Res
         )
         .optional()?;
     if let Some(sequence) = existing {
-        tx.commit()?;
         event.sequence = sequence as u64;
         return Ok(EventReceipt {
             event_id: event.event_id.clone(),
@@ -1541,7 +1439,6 @@ fn append_event_locked(connection: &mut Connection, event: &mut RunEvent) -> Res
             json.len() as i64
         ],
     )?;
-    tx.commit()?;
     Ok(EventReceipt {
         event_id: event.event_id.clone(),
         sequence: sequence as u64,

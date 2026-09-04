@@ -18,6 +18,7 @@ hi-agent-runtime.workspace = true
 hi-rsi-runtime.workspace = true
 hi-verifier.workspace = true
 hi-tools.workspace = true
+hi-workspace.workspace = true
 hi-mcp.workspace = true
 hi-lsp.workspace = true
 hi-tui.workspace = true

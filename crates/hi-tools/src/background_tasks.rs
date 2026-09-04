@@ -3,14 +3,10 @@
 //! Tracks subagent tasks spawned via the `task` tool. Each task runs on one
 //! of N dedicated worker threads, each with its own Tokio `LocalSet` (so
 //! non-`Send` futures — like child `Agent` turns — can run without `Send`
-//! bounds). Using N threads instead of one gives true OS-thread parallelism
-//! among background subagents: up to `BG_WORKER_THREADS` tasks run
-//! concurrently on separate threads. The parent agent polls results with
+//! bounds). The worker pool gives true OS-thread parallelism. The parent polls with
 //! `get_task_output`, waits with `wait_tasks`, and cancels with `kill_task`.
 //!
-//! Communication between the registry (on the agent's thread) and the workers
-//! is via per-worker channels, so the registry itself is `Send` and `Sync` —
-//! it stores only `Send` handles (channels + shared state). A shared `Notify`
+//! Per-worker channels keep the registry `Send` and `Sync`. A shared `Notify`
 //! replaces the old 200ms busy-poll loop in `wait_all`/`wait_any` with
 //! event-driven waking.
 
@@ -22,36 +18,34 @@ use std::sync::{
 use std::time::Duration;
 
 use futures_util::{FutureExt, future::join_all};
-use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Notify, oneshot, watch};
+use tokio::sync::{Mutex, Notify, Semaphore, oneshot, watch};
 use tokio::task::AbortHandle;
 
-/// Maximum number of concurrent background subagent tasks per session.
+#[path = "background_task_candidates.rs"]
+mod candidates;
+#[path = "background_task_lifecycle.rs"]
+mod lifecycle;
+#[path = "background_task_limits.rs"]
+mod limits;
+#[path = "background_task_teardown.rs"]
+mod teardown;
+#[path = "background_task_types.rs"]
+mod types;
+use candidates::CandidateQueue;
+pub use limits::BackgroundTaskLimits;
+use limits::{queue_timeout_outcome, run_with_execution_slot};
+pub use teardown::BackgroundTaskTeardown;
+use types::not_found_outcome;
+pub use types::{
+    BackgroundTaskCapacityError, BackgroundTaskOutcome, BackgroundTaskState, BgFuture,
+    DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
+};
+
 const MAX_BG_TASKS: usize = 16;
+const MAX_CONCURRENT_PREPARATIONS: usize = 4;
+const BACKGROUND_QUEUE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// Admission failure when every registry slot is still live or owns a terminal
-/// result that the caller has not observed yet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BackgroundTaskCapacityError {
-    pub maximum: usize,
-    pub running: usize,
-    pub unobserved_terminal: usize,
-}
-
-impl std::fmt::Display for BackgroundTaskCapacityError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "background task capacity reached (max {}): {} running and {} completed/failed result(s) not yet observed; call get_task_output or wait_tasks for existing task IDs, then retry (or use kill_task for work no longer needed)",
-            self.maximum, self.running, self.unobserved_terminal
-        )
-    }
-}
-
-impl std::error::Error for BackgroundTaskCapacityError {}
-
-/// A worker normally acknowledges a queued command in the same scheduler
-/// tick. Bound this wait so a non-yielding LocalSet task cannot make registry
+/// Bound acknowledgment so a non-yielding LocalSet task cannot make registry
 /// operations wait forever behind the worker's command loop.
 const WORKER_HANDLE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -70,113 +64,8 @@ fn worker_threads() -> usize {
 /// Legacy maximum used by saturation tests; runtime defaults are configured by
 /// [`worker_threads`] and may be lower.
 #[cfg(test)]
-const BG_WORKER_THREADS: usize = MAX_BG_TASKS - 1;
+const BG_WORKER_THREADS: usize = MAX_CONCURRENT_PREPARATIONS;
 
-/// Maximum wait timeout for `get_task_output` / `wait_tasks` (~10 min).
-pub const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// Default wait timeout for `wait_tasks` (30s).
-pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Lifecycle state of a background subagent task.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackgroundTaskState {
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-impl BackgroundTaskState {
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
-    }
-}
-
-/// The outcome produced by a background subagent task when it finishes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BackgroundTaskOutcome {
-    pub id: String,
-    pub description: String,
-    pub subagent_type: String,
-    pub state: BackgroundTaskState,
-    pub output: String,
-    pub applied: bool,
-    pub changed_files: Vec<String>,
-}
-
-impl BackgroundTaskOutcome {
-    pub fn running(id: &str, description: &str, subagent_type: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            description: description.to_string(),
-            subagent_type: subagent_type.to_string(),
-            state: BackgroundTaskState::Running,
-            output: String::new(),
-            applied: false,
-            changed_files: Vec::new(),
-        }
-    }
-
-    /// Fill registry identity onto a worker-produced outcome.
-    ///
-    /// Background workers often leave `id` / `description` empty (they don't know
-    /// the registry handle). Call this before caching a terminal result so polls
-    /// and status lines keep the human label.
-    pub fn with_registry_identity(
-        mut self,
-        id: &str,
-        description: &str,
-        subagent_type: &str,
-    ) -> Self {
-        if self.id.is_empty() {
-            self.id = id.to_string();
-        }
-        if self.description.is_empty() {
-            self.description = description.to_string();
-        }
-        if self.subagent_type.is_empty() {
-            self.subagent_type = subagent_type.to_string();
-        }
-        self
-    }
-
-    pub fn tool_status(&self) -> crate::ToolStatus {
-        match self.state {
-            // Still running is not success — callers that treat Succeeded as
-            // "done" must check `state` (or `is_terminal`) separately.
-            BackgroundTaskState::Completed => crate::ToolStatus::Succeeded,
-            BackgroundTaskState::Running => crate::ToolStatus::Succeeded,
-            BackgroundTaskState::Cancelled => crate::ToolStatus::Cancelled,
-            BackgroundTaskState::Failed => crate::ToolStatus::Failed,
-        }
-    }
-}
-
-/// Outcome returned when a polled/waited task ID is not in the registry.
-///
-/// Uses [`BackgroundTaskState::Failed`] (not `Running`) so the caller learns the
-/// task doesn't exist rather than waiting forever, and carries an explicit
-/// message instead of an empty description + `"unknown"` type that rendered as
-/// the confusing `(/unknown)` fragment.
-fn not_found_outcome(id: &str) -> BackgroundTaskOutcome {
-    BackgroundTaskOutcome {
-        id: id.to_string(),
-        description: String::new(),
-        subagent_type: String::new(),
-        state: BackgroundTaskState::Failed,
-        output: format!("no task with id \"{id}\""),
-        applied: false,
-        changed_files: Vec::new(),
-    }
-}
-
-/// A boxed future that produces a background task outcome.
-/// Stored on a worker thread's `LocalSet` — never crosses threads, so it
-/// does not need to be `Send`.
-pub type BgFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = BackgroundTaskOutcome> + 'static>>;
 type BgFutureFactory = Box<dyn FnOnce() -> BgFuture + Send + 'static>;
 type SharedBgFutureFactory = Arc<std::sync::Mutex<Option<BgFutureFactory>>>;
 
@@ -190,15 +79,18 @@ enum WorkerCommand {
         future_factory: SharedBgFutureFactory,
         result_tx: oneshot::Sender<BackgroundTaskOutcome>,
         handle_tx: oneshot::Sender<AbortHandle>,
-        activation_rx: oneshot::Receiver<()>,
+        activation_rx: oneshot::Receiver<Option<crate::job_lifecycle::ManagedBackgroundJob>>,
         dispatch_cancelled: Arc<AtomicBool>,
         task_id: String,
         task_notify: Arc<Notify>,
+        lifecycle_gate: Arc<Mutex<()>>,
         terminal_outcome: Arc<std::sync::Mutex<Option<BackgroundTaskOutcome>>>,
         outcomes: Arc<std::sync::Mutex<HashMap<String, BackgroundTaskOutcome>>>,
         completed_notify: Arc<Notify>,
         shutdown: watch::Receiver<bool>,
         abort_handles: Arc<std::sync::Mutex<HashMap<String, AbortHandle>>>,
+        candidates: CandidateQueue,
+        teardown: crate::BackgroundTaskTeardown,
     },
 }
 
@@ -210,7 +102,7 @@ struct PendingWorkerDispatch {
     id: String,
     description: String,
     subagent_type: String,
-    activation_tx: Option<oneshot::Sender<()>>,
+    activation_tx: Option<oneshot::Sender<Option<crate::job_lifecycle::ManagedBackgroundJob>>>,
     dispatch_cancelled: Arc<AtomicBool>,
     future_factory: SharedBgFutureFactory,
     terminal_outcome: Arc<std::sync::Mutex<Option<BackgroundTaskOutcome>>>,
@@ -277,11 +169,14 @@ impl PendingWorkerDispatch {
         self.finished = true;
     }
 
-    fn activate(&mut self) -> bool {
+    fn activate(
+        &mut self,
+        managed_job: Option<crate::job_lifecycle::ManagedBackgroundJob>,
+    ) -> bool {
         let activated = self
             .activation_tx
             .take()
-            .is_some_and(|activation_tx| activation_tx.send(()).is_ok());
+            .is_some_and(|activation_tx| activation_tx.send(managed_job).is_ok());
         if activated {
             self.finished = true;
         } else {
@@ -318,6 +213,10 @@ struct BgTaskEntry {
     abort_handle: Option<AbortHandle>,
     /// Notify for `wait_tasks` — signalled when the task reaches a terminal state.
     notify: Arc<Notify>,
+    managed_job: Option<crate::job_lifecycle::ManagedBackgroundJob>,
+    lifecycle_gate: Arc<Mutex<()>>,
+    cancel_requested: bool,
+    teardown: crate::BackgroundTaskTeardown,
 }
 
 #[derive(Clone)]
@@ -379,6 +278,10 @@ pub struct BackgroundTaskRegistry {
     /// Drop cannot await `tasks`, so retain a synchronous abort index as the
     /// hard backstop for every LocalSet task owned by this registry.
     abort_handles: Arc<std::sync::Mutex<HashMap<String, AbortHandle>>>,
+    lifecycle: crate::job_lifecycle::BackgroundJobLifecycleSlot,
+    candidates: CandidateQueue,
+    execution_slots: Arc<Semaphore>,
+    limits: BackgroundTaskLimits,
 }
 
 async fn wait_for_registry_shutdown(shutdown: &mut watch::Receiver<bool>) {
@@ -440,11 +343,14 @@ fn dispatch_worker_command(local_set: &tokio::task::LocalSet, cmd: WorkerCommand
         dispatch_cancelled,
         task_id,
         task_notify,
+        lifecycle_gate,
         terminal_outcome,
         outcomes,
         completed_notify,
         mut shutdown,
         abort_handles,
+        candidates,
+        teardown,
     } = cmd;
 
     // A command can remain queued after its bounded acknowledgment wait has
@@ -459,11 +365,14 @@ fn dispatch_worker_command(local_set: &tokio::task::LocalSet, cmd: WorkerCommand
         // The registry activates the task only after it has installed the
         // worker handle into the provisional entry. A timed-out or dropped
         // dispatcher closes this channel, so late commands cannot execute.
-        if activation_rx.await.is_err() || dispatch_cancelled.load(Ordering::Acquire) {
+        let Ok(managed_job) = activation_rx.await else {
             worker_abort_handles
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&worker_task_id);
+            return;
+        };
+        if dispatch_cancelled.load(Ordering::Acquire) {
             return;
         }
 
@@ -478,7 +387,20 @@ fn dispatch_worker_command(local_set: &tokio::task::LocalSet, cmd: WorkerCommand
                 .remove(&worker_task_id);
             return;
         };
-        let outcome = if *shutdown.borrow() {
+        let started_failure =
+            hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::JobAfterSpawn)
+                .err();
+        let mut outcome = if let Some(error) = started_failure {
+            BackgroundTaskOutcome {
+                id: worker_task_id.clone(),
+                description: String::new(),
+                subagent_type: String::new(),
+                state: BackgroundTaskState::Failed,
+                output: error.to_string(),
+                applied: false,
+                changed_files: Vec::new(),
+            }
+        } else if *shutdown.borrow() {
             registry_dropped_outcome(&worker_task_id)
         } else {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(future_factory)) {
@@ -505,6 +427,24 @@ fn dispatch_worker_command(local_set: &tokio::task::LocalSet, cmd: WorkerCommand
                 }
             }
         };
+        if let Err(error) = teardown.wait().await {
+            outcome.state = BackgroundTaskState::Failed;
+            outcome.output = format!("child process teardown was not proven: {error}");
+            outcome.applied = false;
+            outcome.changed_files.clear();
+        }
+        let publication = {
+            let _settlement = lifecycle_gate.lock().await;
+            lifecycle::observe_natural_exit(
+                managed_job,
+                &mut outcome,
+                candidates.artifacts(&worker_task_id),
+            )
+            .await
+        };
+        candidates
+            .settle_worker(&worker_task_id, &mut outcome, publication)
+            .await;
         worker_abort_handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -592,16 +532,38 @@ fn global_workers() -> &'static [tokio::sync::mpsc::UnboundedSender<WorkerComman
 
 impl BackgroundTaskRegistry {
     pub fn new() -> Self {
+        Self::new_with_limits(BackgroundTaskLimits::default())
+    }
+
+    pub fn new_with_limits(mut limits: BackgroundTaskLimits) -> Self {
+        limits.max_tasks = limits.max_tasks.max(1);
+        limits.max_concurrent_preparations = limits.max_concurrent_preparations.max(1);
+        if limits.queue_timeout.is_zero() {
+            limits.queue_timeout = Duration::from_millis(1);
+        }
         let (shutdown, _) = watch::channel(false);
+        let completed_notify = Arc::new(Notify::new());
         Self {
             tasks: Mutex::new(HashMap::new()),
             counter: std::sync::atomic::AtomicU64::new(0),
             next_worker: std::sync::atomic::AtomicU64::new(0),
-            completed_notify: Arc::new(Notify::new()),
+            completed_notify: completed_notify.clone(),
             outcomes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shutdown,
             abort_handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            lifecycle: crate::job_lifecycle::BackgroundJobLifecycleSlot::default(),
+            candidates: CandidateQueue::new(completed_notify),
+            execution_slots: Arc::new(Semaphore::new(limits.max_concurrent_preparations)),
+            limits,
         }
+    }
+
+    pub fn limits(&self) -> BackgroundTaskLimits {
+        self.limits
+    }
+
+    pub fn set_job_lifecycle(&self, lifecycle: Arc<dyn crate::BackgroundJobLifecycle>) {
+        self.lifecycle.set(lifecycle);
     }
 
     /// Permanently stop this registry and synchronously request cancellation
@@ -615,6 +577,7 @@ impl BackgroundTaskRegistry {
         // currently no receivers. A surviving `Arc` must not be able to start
         // new work after its owning Agent has gone away.
         self.shutdown.send_replace(true);
+        self.candidates.clear();
         let handles = self
             .abort_handles
             .lock()
@@ -773,19 +736,18 @@ impl BackgroundTaskRegistry {
         dependencies: &[String],
         future_factory: Box<dyn FnOnce() -> BgFuture + Send + 'static>,
     ) -> anyhow::Result<String> {
-        let worker = self.next_worker_tx().clone();
-        self.spawn_after_on_worker(
+        self.spawn_after_with_teardown(
             description,
             subagent_type,
             dependencies,
+            crate::BackgroundTaskTeardown::new(),
             future_factory,
-            worker,
-            WORKER_HANDLE_ACK_TIMEOUT,
         )
         .await
     }
 
     async fn rollback_provisional_dispatch(&self, id: &str) {
+        self.candidates.discard(id);
         let removed = self.tasks.lock().await.remove(id);
         self.outcomes
             .lock()
@@ -812,6 +774,7 @@ impl BackgroundTaskRegistry {
         subagent_type: &str,
         dependencies: &[String],
         future_factory: Box<dyn FnOnce() -> BgFuture + Send + 'static>,
+        teardown: crate::BackgroundTaskTeardown,
         worker: tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
         worker_ack_timeout: Duration,
     ) -> anyhow::Result<String> {
@@ -855,7 +818,7 @@ impl BackgroundTaskRegistry {
         // Reclaim only terminal results that were explicitly returned to a
         // caller. Worker publication is not acknowledgement: removing an unread
         // result here would make its task ID resolve to `not found` forever.
-        if tasks.len() >= MAX_BG_TASKS {
+        if tasks.len() >= self.limits.max_tasks {
             let cached_terminal = self
                 .outcomes
                 .lock()
@@ -881,7 +844,7 @@ impl BackgroundTaskRegistry {
                     outcomes.remove(key);
                 }
             }
-            if tasks.len() >= MAX_BG_TASKS {
+            if tasks.len() >= self.limits.max_tasks {
                 let terminal = tasks
                     .iter()
                     .filter(|(key, entry)| {
@@ -889,7 +852,7 @@ impl BackgroundTaskRegistry {
                     })
                     .count();
                 return Err(BackgroundTaskCapacityError {
-                    maximum: MAX_BG_TASKS,
+                    maximum: self.limits.max_tasks,
                     running: tasks.len().saturating_sub(terminal),
                     unobserved_terminal: terminal,
                 }
@@ -899,33 +862,52 @@ impl BackgroundTaskRegistry {
 
         let (tx, rx) = oneshot::channel::<BackgroundTaskOutcome>();
         let (handle_tx, handle_rx) = oneshot::channel::<AbortHandle>();
-        let (activation_tx, activation_rx) = oneshot::channel::<()>();
+        let (activation_tx, activation_rx) = oneshot::channel();
         let dispatch_cancelled = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(Notify::new());
         let terminal_outcome = Arc::new(std::sync::Mutex::new(None));
+        let lifecycle_gate = Arc::new(Mutex::new(()));
 
+        let execution_slots = self.execution_slots.clone();
+        let queue_timeout = self.limits.queue_timeout;
         let gated_factory: Box<dyn FnOnce() -> BgFuture + Send + 'static> = if dependency_gates
             .is_empty()
         {
-            future_factory
+            Box::new(move || {
+                Box::pin(run_with_execution_slot(
+                    execution_slots,
+                    queue_timeout,
+                    future_factory,
+                ))
+            })
         } else {
             Box::new(move || {
                 Box::pin(async move {
-                    if let Err((dependency, state)) = wait_for_dependencies(dependency_gates).await
+                    match tokio::time::timeout(
+                        queue_timeout,
+                        wait_for_dependencies(dependency_gates),
+                    )
+                    .await
                     {
-                        // Identity is stamped by the registry on poll;
-                        // leave id/description empty here deliberately.
-                        return BackgroundTaskOutcome {
-                            id: String::new(),
-                            description: String::new(),
-                            subagent_type: String::new(),
-                            state: BackgroundTaskState::Failed,
-                            output: format!("Dependency {dependency} did not succeed ({state:?})."),
-                            applied: false,
-                            changed_files: Vec::new(),
-                        };
+                        Ok(Ok(())) => {}
+                        Ok(Err((dependency, state))) => {
+                            // Identity is stamped by the registry on poll;
+                            // leave id/description empty here deliberately.
+                            return BackgroundTaskOutcome {
+                                id: String::new(),
+                                description: String::new(),
+                                subagent_type: String::new(),
+                                state: BackgroundTaskState::Failed,
+                                output: format!(
+                                    "Dependency {dependency} did not succeed ({state:?})."
+                                ),
+                                applied: false,
+                                changed_files: Vec::new(),
+                            };
+                        }
+                        Err(_) => return queue_timeout_outcome(queue_timeout),
                     }
-                    future_factory().await
+                    run_with_execution_slot(execution_slots, queue_timeout, future_factory).await
                 })
             })
         };
@@ -945,6 +927,10 @@ impl BackgroundTaskRegistry {
                 terminal_outcome: terminal_outcome.clone(),
                 abort_handle: None,
                 notify: notify.clone(),
+                managed_job: None,
+                lifecycle_gate: lifecycle_gate.clone(),
+                cancel_requested: false,
+                teardown: teardown.clone(),
             },
         );
         drop(tasks);
@@ -979,11 +965,14 @@ impl BackgroundTaskRegistry {
                 dispatch_cancelled,
                 task_id: id.clone(),
                 task_notify: notify,
+                lifecycle_gate,
                 terminal_outcome,
                 outcomes: self.outcomes.clone(),
                 completed_notify: self.completed_notify.clone(),
                 shutdown: self.shutdown.subscribe(),
                 abort_handles: self.abort_handles.clone(),
+                candidates: self.candidates.clone(),
+                teardown,
             })
             .is_err()
         {
@@ -1009,6 +998,37 @@ impl BackgroundTaskRegistry {
             }
         };
 
+        let (kind, effect) = lifecycle::contract(subagent_type);
+        let managed_job = match self
+            .lifecycle
+            .register(&id, kind, effect, description)
+            .await
+        {
+            Ok(job) => job,
+            Err(error) => {
+                abort_handle.abort();
+                pending_dispatch.cancel();
+                self.rollback_provisional_dispatch(&id).await;
+                anyhow::bail!("workspace job admission failed: {error}");
+            }
+        };
+        if let Err(error) =
+            hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::ToolBeforeStart)
+        {
+            abort_handle.abort();
+            if let Some(job) = &managed_job {
+                let _ = job
+                    .observe(
+                        crate::BackgroundJobTerminal::FailedBeforeStart,
+                        Some(error.to_string()),
+                    )
+                    .await;
+            }
+            pending_dispatch.cancel();
+            self.rollback_provisional_dispatch(&id).await;
+            return Err(error.into());
+        }
+
         let can_activate = {
             let mut tasks = self.tasks.lock().await;
             tasks.get_mut(&id).is_some_and(|entry| {
@@ -1016,11 +1036,12 @@ impl BackgroundTaskRegistry {
                     false
                 } else {
                     entry.abort_handle = Some(abort_handle.clone());
+                    entry.managed_job = managed_job.clone();
                     true
                 }
             })
         };
-        if !can_activate || !pending_dispatch.activate() {
+        if !can_activate || !pending_dispatch.activate(managed_job) {
             abort_handle.abort();
             pending_dispatch.cancel();
             self.rollback_provisional_dispatch(&id).await;
@@ -1092,6 +1113,12 @@ impl BackgroundTaskRegistry {
                 entry.final_outcome = Some(outcome.clone());
                 entry.observed |= observed;
                 entry.notify.notify_waiters();
+                return Some(outcome);
+            }
+            if entry.cancel_requested {
+                let mut outcome =
+                    BackgroundTaskOutcome::running(id, &entry.description, &entry.subagent_type);
+                outcome.output = "Task cancellation is still settling.".into();
                 return Some(outcome);
             }
         }
@@ -1250,7 +1277,7 @@ impl BackgroundTaskRegistry {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let results = self.poll_many_inner(ids, Duration::ZERO, false).await;
-            if results.iter().all(|outcome| outcome.state.is_terminal()) {
+            if self.candidates.all_actionable(ids, &results) {
                 self.acknowledge_terminal_results(ids, &results).await;
                 return results;
             }
@@ -1276,10 +1303,7 @@ impl BackgroundTaskRegistry {
             notified.as_mut().enable();
             // Snapshot all tasks non-blockingly.
             let all_snapshots = self.poll_many_inner(ids, Duration::ZERO, false).await;
-            if all_snapshots
-                .iter()
-                .any(|outcome| outcome.state.is_terminal())
-            {
+            if self.candidates.any_actionable(ids, &all_snapshots) {
                 self.acknowledge_terminal_results(ids, &all_snapshots).await;
                 return all_snapshots;
             }
@@ -1293,50 +1317,6 @@ impl BackgroundTaskRegistry {
             // Replaces the old 200ms busy-poll loop.
             let _ = tokio::time::timeout(remaining, notified).await;
         }
-    }
-
-    pub async fn kill(&self, id: &str) -> Option<BackgroundTaskOutcome> {
-        let mut tasks = self.tasks.lock().await;
-        let entry = tasks.get_mut(id)?;
-
-        if let Some(outcome) = entry.final_outcome.clone() {
-            entry.observed = true;
-            return Some(outcome);
-        }
-
-        // Drop the result receiver — the worker task will eventually finish.
-        entry.result_rx.take();
-        let indexed_handle = self
-            .abort_handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(id);
-        if let Some(handle) = entry.abort_handle.take().or(indexed_handle) {
-            handle.abort();
-        }
-
-        let outcome = BackgroundTaskOutcome {
-            id: id.to_string(),
-            description: entry.description.clone(),
-            subagent_type: entry.subagent_type.clone(),
-            state: BackgroundTaskState::Cancelled,
-            output: "Task cancelled by kill_task.".to_string(),
-            applied: false,
-            changed_files: Vec::new(),
-        };
-        *entry
-            .terminal_outcome
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome.clone());
-        entry.final_outcome = Some(outcome.clone());
-        entry.observed = true;
-        self.outcomes
-            .lock()
-            .expect("outcome cache poisoned")
-            .insert(id.to_string(), outcome.clone());
-        entry.notify.notify_waiters();
-        self.completed_notify.notify_waiters();
-        Some(outcome)
     }
 
     pub fn list_now(&self) -> Vec<String> {
@@ -1479,6 +1459,7 @@ mod tests {
                             }
                         })
                     }),
+                    crate::BackgroundTaskTeardown::new(),
                     worker_tx,
                     Duration::from_millis(250),
                 )
@@ -1845,7 +1826,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn kill_remains_authoritative_after_poll_takes_completed_receiver() {
+    async fn completed_worker_is_not_rewritten_by_late_kill() {
         let registry = Arc::new(BackgroundTaskRegistry::new());
         let release = Arc::new(Notify::new());
         let release_in_task = release.clone();
@@ -1888,7 +1869,8 @@ mod tests {
         // Let the poll future take exclusive ownership of result_rx, then
         // keep this single-thread executor occupied while the OS worker sends
         // its result. This deterministically places kill between the worker
-        // send and poll's terminal-result commit.
+        // send and poll's task-map commit. Worker publication is now the
+        // exactly-once lifecycle boundary, so a later kill cannot rewrite it.
         loop {
             let receiver_taken = registry
                 .tasks
@@ -1921,12 +1903,12 @@ mod tests {
         }
 
         let killed = registry.kill(&id).await.unwrap();
-        assert_eq!(killed.state, BackgroundTaskState::Cancelled);
+        assert_eq!(killed.state, BackgroundTaskState::Completed);
         let polled = poll.await.unwrap();
-        assert_eq!(polled.state, BackgroundTaskState::Cancelled);
+        assert_eq!(polled.state, BackgroundTaskState::Completed);
         assert_eq!(
             registry.poll(&id, Duration::ZERO).await.unwrap().state,
-            BackgroundTaskState::Cancelled
+            BackgroundTaskState::Completed
         );
     }
 
@@ -2087,14 +2069,15 @@ mod tests {
     async fn dispatches_up_to_worker_count_concurrently() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        assert_eq!(BG_WORKER_THREADS, MAX_BG_TASKS - 1);
+        assert_eq!(BG_WORKER_THREADS, MAX_CONCURRENT_PREPARATIONS);
 
         let registry = BackgroundTaskRegistry::new();
         let started = Arc::new(AtomicUsize::new(0));
-        let release = Arc::new(Notify::new());
-        let mut ids = Vec::with_capacity(BG_WORKER_THREADS);
+        let release = Arc::new(Semaphore::new(0));
+        let task_count = BG_WORKER_THREADS + 1;
+        let mut ids = Vec::with_capacity(task_count);
 
-        for task_idx in 0..BG_WORKER_THREADS {
+        for task_idx in 0..task_count {
             let started = started.clone();
             let release = release.clone();
             ids.push(
@@ -2105,7 +2088,7 @@ mod tests {
                         Box::new(move || {
                             Box::pin(async move {
                                 started.fetch_add(1, Ordering::SeqCst);
-                                release.notified().await;
+                                release.acquire().await.unwrap().forget();
                                 BackgroundTaskOutcome {
                                     id: format!("worker-{task_idx}"),
                                     description: format!("worker-{task_idx}"),
@@ -2130,10 +2113,20 @@ mod tests {
         })
         .await
         .expect("all configured workers should start a task");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(started.load(Ordering::SeqCst), BG_WORKER_THREADS);
 
-        release.notify_waiters();
+        release.add_permits(BG_WORKER_THREADS);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while started.load(Ordering::SeqCst) < task_count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued task should start after a preparation slot is released");
+        release.add_permits(1);
         let outcomes = registry.wait_all(&ids, Duration::from_secs(5)).await;
-        assert_eq!(outcomes.len(), BG_WORKER_THREADS);
+        assert_eq!(outcomes.len(), task_count);
         assert!(
             outcomes
                 .iter()
@@ -2666,3 +2659,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "background_task_lifecycle_tests.rs"]
+mod lifecycle_tests;

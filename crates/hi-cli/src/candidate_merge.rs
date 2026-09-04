@@ -32,6 +32,7 @@ pub(crate) struct AppliedCandidate {
 
 /// Apply through the transaction engine and verify the exact destination
 /// revision. A failure restores the sealed pre-apply checkpoint.
+#[cfg(test)]
 pub(crate) fn apply_candidate_and_reverify(
     worktree: &Path,
     base: &str,
@@ -42,12 +43,37 @@ pub(crate) fn apply_candidate_and_reverify(
     apply_candidate_and_reverify_cancellable(worktree, base, destination, state_root, verify, None)
 }
 
+#[cfg(test)]
 pub(crate) fn apply_candidate_and_reverify_cancellable(
     worktree: &Path,
     base: &str,
     destination: &Path,
     state_root: &Path,
     verify: &str,
+    cancellation: Option<hi_agent::TurnCancellation>,
+) -> Result<AppliedCandidate> {
+    apply_candidate_and_reverify_cancellable_at_base(
+        worktree,
+        base,
+        destination,
+        state_root,
+        verify,
+        None,
+        cancellation,
+    )
+}
+
+/// Exact-base apply. The internal snapshot is checked after
+/// acquiring exclusive merge capacity and again immediately before the
+/// transaction commit. Production candidate publishers always provide it;
+/// the optional form remains only for lower-level transaction tests.
+pub(crate) fn apply_candidate_and_reverify_cancellable_at_base(
+    worktree: &Path,
+    base: &str,
+    destination: &Path,
+    state_root: &Path,
+    verify: &str,
+    expected_snapshot_id: Option<&str>,
     cancellation: Option<hi_agent::TurnCancellation>,
 ) -> Result<AppliedCandidate> {
     ensure!(!verify.trim().is_empty(), "destination verifier is empty");
@@ -76,14 +102,43 @@ pub(crate) fn apply_candidate_and_reverify_cancellable(
     if stop() {
         return Err(VerifierCancelled.into());
     }
+    if let Some(snapshot_id) = expected_snapshot_id {
+        hi_tools::candidate_workspace::ensure_workspace_matches(
+            destination,
+            state_root,
+            snapshot_id,
+        )?;
+    }
     let pre_apply = create_checkpoint_sync(destination, state_root)
         .context("creating the destination pre-apply checkpoint")?;
     if stop() {
         return Err(VerifierCancelled.into());
     }
 
-    let applied = apply_candidate_transactionally(worktree, base, destination, state_root)
-        .context("transactional candidate apply failed")?;
+    let applied = match apply_candidate_transactionally(
+        worktree,
+        base,
+        destination,
+        state_root,
+        expected_snapshot_id,
+    )
+    .context("transactional candidate apply failed")
+    {
+        Ok(applied) => applied,
+        Err(error)
+            if matches!(
+                error.downcast_ref::<hi_workspace::FailpointError>(),
+                Some(hi_workspace::FailpointError::Injected { point, .. })
+                    if *point == hi_workspace::HarnessFailpoint::CandidateAfterApply.as_str()
+            ) =>
+        {
+            let rollback = create_checkpoint_sync(destination, state_root).and_then(|current| {
+                restore_checkpoint_sealed_sync(destination, &pre_apply, &current, state_root)
+            });
+            return Err(combine_rollback_error(error, rollback));
+        }
+        Err(error) => return Err(error),
+    };
     let post_apply = match create_checkpoint_sync(destination, state_root) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
@@ -181,10 +236,17 @@ fn queue_timeout(name: &str) -> Option<Duration> {
 }
 
 fn queue_timeout_from_value(value: Option<&str>) -> Option<Duration> {
-    value
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
+    Some(
+        value
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| {
+                hi_workspace::ResolvedHarnessSettings::default()
+                    .jobs
+                    .queue_timeout
+            }),
+    )
 }
 
 fn combine_rollback_error(error: anyhow::Error, rollback: Result<usize>) -> anyhow::Error {
@@ -207,7 +269,9 @@ fn apply_candidate_transactionally(
     base: &str,
     destination: &Path,
     state_root: &Path,
+    expected_snapshot_id: Option<&str>,
 ) -> Result<Vec<String>> {
+    hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::CandidateBeforeApply)?;
     let diff = staged_candidate_diff(worktree, base)?;
     ensure!(!diff.paths.is_empty(), "candidate diff is empty");
 
@@ -254,11 +318,19 @@ fn apply_candidate_transactionally(
         !plan.is_noop(),
         "candidate patch produces no new destination changes"
     );
+    if let Some(snapshot_id) = expected_snapshot_id {
+        hi_tools::candidate_workspace::ensure_workspace_matches(
+            destination,
+            state_root,
+            snapshot_id,
+        )?;
+    }
     let changes = plan.commit()?;
     ensure!(
         !changes.is_empty(),
         "candidate transaction committed no changes"
     );
+    hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::CandidateAfterApply)?;
     Ok(changes.into_iter().map(|change| change.path).collect())
 }
 
@@ -426,6 +498,7 @@ fn restore_checkpoint_sealed_sync(
     expected: &str,
     state_root: &Path,
 ) -> Result<usize> {
+    hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::RollbackBeforeRestore)?;
     let root = root.to_path_buf();
     let target = target.to_string();
     let expected = expected.to_string();
@@ -469,10 +542,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn candidate_capacity_waits_are_unlimited_by_default() {
-        assert_eq!(queue_timeout_from_value(None), None);
-        assert_eq!(queue_timeout_from_value(Some("0")), None);
-        assert_eq!(queue_timeout_from_value(Some("invalid")), None);
+    fn candidate_capacity_waits_are_finite_by_default() {
+        let default = hi_workspace::ResolvedHarnessSettings::default()
+            .jobs
+            .queue_timeout;
+        assert_eq!(queue_timeout_from_value(None), Some(default));
+        assert_eq!(queue_timeout_from_value(Some("0")), Some(default));
+        assert_eq!(queue_timeout_from_value(Some("invalid")), Some(default));
         assert_eq!(
             queue_timeout_from_value(Some("7")),
             Some(Duration::from_secs(7))

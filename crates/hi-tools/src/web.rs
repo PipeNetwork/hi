@@ -23,6 +23,10 @@ use serde_json::json;
 use crate::ToolOutcome;
 use crate::condense::truncate;
 
+#[cfg(test)]
+#[path = "web/managed_download_tests.rs"]
+mod managed_download_tests;
+
 /// DNS and connection establishment are fault boundaries. Once connected, a
 /// healthy fetch/search/redirect response has no default lifetime ceiling and
 /// stays attached until completion or caller cancellation. Operators can opt
@@ -556,8 +560,7 @@ pub(crate) async fn run_web_download_in(
     // Runs in the background so large files don't block the turn.
     let command = download_command(&url, &resolved_output.to_string_lossy());
 
-    let runner = crate::ProcessRunner::new(root)?;
-    let id = background.spawn(&runner, &command)?;
+    let id = spawn_download_process(root, background, &command).await?;
     let mut outcome = ToolOutcome::plain(format!(
         "Downloading {url}\n→ {output_path}\n\
          Started download ({id}). Use bash_output with id {id} for progress; bash_kill with id {id} to stop.{aria2c_note}"
@@ -569,6 +572,15 @@ pub(crate) async fn run_web_download_in(
     });
     outcome.effects.mutation_attempted = true;
     Ok(outcome)
+}
+
+async fn spawn_download_process(
+    root: &std::path::Path,
+    background: &crate::BackgroundRegistry,
+    command: &str,
+) -> Result<String> {
+    let runner = crate::ProcessRunner::new(root)?;
+    background.spawn_managed_live_writer(&runner, command).await
 }
 
 /// Whether `aria2c` is on PATH and runnable.
@@ -1525,23 +1537,6 @@ mod tests {
     #[test]
     fn is_root_returns_bool_without_panicking() {
         let _ = is_root();
-    }
-
-    #[tokio::test]
-    async fn web_download_empty_source_rejected() {
-        let out = run_web_download(r#"{"source":""}"#).await;
-        assert!(out.is_err());
-    }
-
-    #[tokio::test]
-    async fn web_download_full_url_resolves_directly() {
-        let (target, name) = resolve_download("https://example.com/file.gguf", None)
-            .await
-            .unwrap();
-        assert!(
-            matches!(target, DownloadTarget::Url(ref u) if u == "https://example.com/file.gguf")
-        );
-        assert_eq!(name, "file.gguf");
     }
 
     #[tokio::test]
