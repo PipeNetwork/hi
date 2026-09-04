@@ -90,6 +90,22 @@ pub fn handle_session_command(
     command: &Command,
     frontend_queue: &[String],
 ) -> Option<SessionCommandEffect> {
+    // These commands use synchronous filesystem helpers.  A materialized
+    // PipeFS workspace must never be changed outside the async durability
+    // fence, because a successful-looking command could otherwise leave bytes
+    // behind that have not reached the remote revision.  Keep read-only forms
+    // available, but fail closed for the forms that write the workspace (or
+    // create/remove a worktree from it) until they can participate in that
+    // fence.
+    if agent.workspace_durability_enabled() && session_command_mutates_workspace(command) {
+        return Some(SessionCommandEffect {
+            message: format!(
+                "/{} is unavailable while PipeFS is active because it cannot yet commit through the workspace durability fence; use normal file tools or /pipefs off first",
+                command_name(command)
+            ),
+            follow_up_prompt: None,
+        });
+    }
     let message = match command {
         Command::ViewPlan => format_plan(agent.current_plan()),
         Command::Plan(arg) => {
@@ -391,6 +407,39 @@ pub fn handle_session_command(
         message,
         follow_up_prompt: None,
     })
+}
+
+fn session_command_mutates_workspace(command: &Command) -> bool {
+    match command {
+        // `/fork` always writes a transcript export and may create a worktree.
+        Command::Fork(_) | Command::Remember(_) | Command::UndoMemory => true,
+        Command::Marketplace(arg) => arg.trim_start().starts_with("install "),
+        Command::Worktree(arg) => {
+            matches!(arg.trim(), "gc" | "clean" | "cleanup")
+                || arg.trim_start().starts_with("remove ")
+        }
+        Command::Inspect(arg) => matches!(arg.trim(), "bundle" | "support-bundle"),
+        // `/cd` saves a dashboard cwd hint below `.hi/`.
+        Command::Cd(arg) => !arg.trim().is_empty(),
+        // A portable restore starts untrusted.  Do not let a command grant a
+        // trust record to the transient materialization.
+        Command::Trust(arg) => matches!(arg.trim(), "on" | "grant" | "trust"),
+        _ => false,
+    }
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Fork(_) => "fork",
+        Command::Remember(_) => "remember",
+        Command::UndoMemory => "undo-memory",
+        Command::Marketplace(_) => "marketplace install",
+        Command::Worktree(_) => "worktree",
+        Command::Inspect(_) => "inspect bundle",
+        Command::Cd(_) => "cd",
+        Command::Trust(_) => "trust",
+        _ => "command",
+    }
 }
 
 fn apply_permissions(agent: &mut crate::Agent, arg: &str) -> String {
@@ -1561,6 +1610,31 @@ pub(crate) fn normal_mode_prompt(user_request: &str) -> String {
 mod tests {
     use super::*;
     use hi_ai::{Message, Role};
+
+    #[test]
+    fn pipefs_write_forms_are_identified_before_sync_helpers_run() {
+        for command in [
+            Command::Fork(String::new()),
+            Command::Remember("note".into()),
+            Command::UndoMemory,
+            Command::Marketplace("install /tmp/skill.md".into()),
+            Command::Worktree("gc".into()),
+            Command::Inspect("bundle".into()),
+            Command::Cd("nested".into()),
+            Command::Trust("on".into()),
+        ] {
+            assert!(session_command_mutates_workspace(&command), "{command:?}");
+        }
+        for command in [
+            Command::Marketplace("status".into()),
+            Command::Worktree("list".into()),
+            Command::Inspect("json".into()),
+            Command::Cd(String::new()),
+            Command::Trust("status".into()),
+        ] {
+            assert!(!session_command_mutates_workspace(&command), "{command:?}");
+        }
+    }
 
     fn u(t: &str) -> Message {
         Message::user(t)

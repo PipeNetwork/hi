@@ -27,6 +27,7 @@ pub(crate) async fn repl(
     config_path: Option<PathBuf>,
     after_turn: Option<Arc<dyn Fn() + Send + Sync>>,
     approval_store: Option<Arc<dyn hi_policy::ApprovalStore>>,
+    pipefs: Option<Arc<crate::pipefs::PipeFsHost>>,
 ) -> Result<()> {
     agent.set_interactive_session(true);
     use hi_agent::Command;
@@ -120,6 +121,28 @@ pub(crate) async fn repl(
                 {
                     match command {
                         Command::Quit => break,
+                        Command::Pipefs(argument) => {
+                            let Some(host) = &pipefs else {
+                                eprintln!(
+                                    "\x1b[33mPipeFS requires a saved interactive session\x1b[0m"
+                                );
+                                continue;
+                            };
+                            let result = match argument.trim().to_ascii_lowercase().as_str() {
+                                "" | "status" => Ok(host.status().await),
+                                "on" => host.enable(agent).await,
+                                "off" => host.disable(agent).await,
+                                "retry" => host.retry(agent).await,
+                                _ => Err(anyhow::anyhow!("usage: /pipefs on|off|status|retry")),
+                            };
+                            match result {
+                                Ok(message) => println!("\x1b[2m{message}\x1b[0m"),
+                                Err(error) => {
+                                    eprintln!("\x1b[33mPipeFS error: {error:#}\x1b[0m")
+                                }
+                            }
+                            continue;
+                        }
                         Command::Prompt(prompt) => prompt,
                         // `/btw` is a mid-turn side channel. The CLI repl is
                         // turn-synchronous (no in-flight inbox), so idle use is
@@ -294,7 +317,17 @@ pub(crate) async fn repl(
                                     println!("\x1b[2m  … {} more line(s)\x1b[0m", total - 20);
                                 }
                             }
+                            if let Err(error) = agent.begin_durable_workspace_mutation(None).await {
+                                eprintln!("\x1b[33mcommit blocked: {error:#}\x1b[0m");
+                                continue;
+                            }
                             let out = hi_tools::commit_in(agent.workspace_root(), &paths).await;
+                            if let Err(error) = agent.checkpoint_durable_workspace().await {
+                                eprintln!(
+                                    "\x1b[33mcommit completed locally but PipeFS persistence failed: {error:#}; run /pipefs retry\x1b[0m"
+                                );
+                                continue;
+                            }
                             for line in out.lines() {
                                 println!("\x1b[2m── {line} ──\x1b[0m");
                             }
@@ -1169,12 +1202,17 @@ pub(crate) async fn repl(
     let profile = active_profile
         .as_deref()
         .filter(|name| config.profiles.contains_key(*name));
-    let _ = config::remember_session(
-        Path::new("."),
-        profile,
-        &active_provider_label,
-        agent.model(),
-    );
+    // This callback is rooted at the process launch directory. While PipeFS
+    // is active, writing there would violate the promise that enabling from a
+    // local project leaves that project untouched.
+    if !agent.workspace_durability_enabled() {
+        let _ = config::remember_session(
+            Path::new("."),
+            profile,
+            &active_provider_label,
+            agent.model(),
+        );
+    }
     Ok(())
 }
 

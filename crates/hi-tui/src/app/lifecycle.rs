@@ -256,6 +256,7 @@ impl crate::App {
             queued_team_assignments: Vec::new(),
             auto_setup_skeptic: false,
             sync_control: None,
+            pipefs_command: None,
             tui_event_trace: None,
             remote_event_tap: None,
             base_event_tap: None,
@@ -436,7 +437,14 @@ impl crate::App {
 
     /// Persist the current provider/model (and profile, when set) so the next
     /// bare `hi` in this workspace restores the same routing.
-    pub(crate) fn remember_session_routing(&self) {
+    pub(crate) fn remember_session_routing(&self, agent: &hi_agent::Agent) {
+        // The supplied callback is deliberately rooted at the launch
+        // workspace.  Do not invoke it after a PipeFS rebind, where that would
+        // silently mutate the original local project instead of the active
+        // materialization (and outside its durability fence).
+        if agent.workspace_durability_enabled() {
+            return;
+        }
         let Some(cb) = &self.session_remember else {
             return;
         };

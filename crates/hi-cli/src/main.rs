@@ -51,6 +51,7 @@ mod trace_cmd;
 mod tuning_report;
 // Wired by the managed RSI entry once descriptor-driven workflow launch lands;
 // composition and contracts are complete and tested.
+mod pipefs;
 #[allow(dead_code)]
 mod rsi_stage_model;
 mod scheduler_ops;
@@ -339,6 +340,18 @@ async fn run() -> Result<()> {
         .as_deref()
         .map(landing::load_eval_input)
         .transpose()?;
+    if cli.pipefs
+        && (cli.no_save
+            || cli.subagent
+            || eval_input.is_some()
+            || cli.best_of > 1
+            || cli.benchmark_orchestration
+            || cli.skeptic_review)
+    {
+        anyhow::bail!(
+            "--pipefs requires a persisted HI session and cannot be used with --no-save, subagent, eval, benchmark, or best-of execution"
+        );
+    }
     if let Some(mode) = cli.eval_output.as_deref()
         && !matches!(mode, "workspace" | "final_message")
     {
@@ -523,6 +536,22 @@ async fn run() -> Result<()> {
     // Resolve which session file to use and any history to resume.
     let (session_path, resolved_loaded) =
         resolve_session(&cli).inspect_err(|error| report_init_failure(error, None))?;
+    let existing_session = resolved_loaded.is_some();
+    // Internal subagents/evals and isolated best-of workers deliberately do
+    // not inherit the user's PipeFS default: none owns a persistent session
+    // whose workspace can be committed and resumed.
+    let pipefs_requested_for_new_session = cli.pipefs
+        || (file.pipefs.is_enabled()
+            && !cli.no_save
+            && !cli.subagent
+            && eval_input.is_none()
+            && cli.best_of <= 1
+            && !cli.benchmark_orchestration
+            && !cli.skeptic_review);
+    let defer_launch_workspace_runtime = existing_session
+        || cli.sync_session_id.is_some()
+        || cli.attach.is_some()
+        || pipefs_requested_for_new_session;
     let loaded = if let Some(input) = &eval_input {
         landing::eval_loaded_session(input)?
     } else {
@@ -658,6 +687,7 @@ async fn run() -> Result<()> {
         rsi_remote_switch.clone(),
         loaded,
         ledger_scan,
+        defer_launch_workspace_runtime,
     ) {
         Ok(built) => built,
         Err(error) => {
@@ -679,15 +709,17 @@ async fn run() -> Result<()> {
         settings.mcp_pipe_allow.clone(),
     )
     .ok();
-    let (mcp, _pipe_status) = mcp_host::connect_workspace_mcp_with_policies(
-        &workspace_root,
-        &file.mcp_import.to_policy(),
-        pipe_attach.as_ref(),
-        &file.mcp.server_allowlists(),
-    )
-    .await;
-    if let Some(mcp) = mcp {
-        agent.attach_mcp(mcp);
+    if !defer_launch_workspace_runtime {
+        let (mcp, _pipe_status) = mcp_host::connect_workspace_mcp_with_policies(
+            &workspace_root,
+            &file.mcp_import.to_policy(),
+            pipe_attach.as_ref(),
+            &file.mcp.server_allowlists(),
+        )
+        .await;
+        if let Some(mcp) = mcp {
+            agent.attach_mcp(mcp);
+        }
     }
     if !cli.no_memory && !cli.no_save {
         agent.attach_memory(std::sync::Arc::new(hi_agent::MarkdownMemory::new(
@@ -747,8 +779,11 @@ async fn run() -> Result<()> {
     let daemon_session_path = session_path.clone();
     let legacy_enabled = file.sync.as_ref().is_some_and(|section| section.enabled);
     let configured_sync_mode = file.sync.as_ref().and_then(|section| section.mode);
-    let explicit_sync =
-        cli.sync || cli.sync_session_id.is_some() || cli.daemon || cli.attach.is_some();
+    let explicit_sync = cli.sync
+        || cli.sync_session_id.is_some()
+        || cli.daemon
+        || cli.attach.is_some()
+        || pipefs_requested_for_new_session;
     let persist_local_session = !cli.no_save && !cli.subagent && cli.eval_input.is_none();
     let pipenetwork_default_on =
         settings.provider == ProviderName::Pipenetwork && !settings.api_key.is_empty();
@@ -796,7 +831,7 @@ async fn run() -> Result<()> {
     };
     // CLI flags are process-only overrides and never rewrite the persisted
     // global policy.
-    if cli.sync || cli.sync_session_id.is_some() {
+    if cli.sync || cli.sync_session_id.is_some() || pipefs_requested_for_new_session {
         sync_store::set_process_mode_override(sync_store::SyncMode::On);
     }
     // A pipenetwork pairing syncs by default: the console is the product,
@@ -808,7 +843,7 @@ async fn run() -> Result<()> {
     }
     let sync_enabled = sync_session_enabled(
         durable_sync_available,
-        cli.sync || cli.sync_session_id.is_some(),
+        cli.sync || cli.sync_session_id.is_some() || pipefs_requested_for_new_session,
         persisted_sync_mode,
         pipenetwork_default_on,
     );
@@ -832,6 +867,69 @@ async fn run() -> Result<()> {
         }
         (None, None)
     };
+    let pipefs_sync_handle: pipefs::SharedSyncHandle =
+        std::sync::Arc::new(std::sync::Mutex::new(sync_handle.clone()));
+    let mut pipefs_startup_checked = false;
+    let pipefs_host = if persist_local_session {
+        let sync_config = build_sync_config(&settings, &cli, &file);
+        let session_id = cli
+            .sync_session_id
+            .clone()
+            .unwrap_or_else(|| feedback::session_id_from_path(&daemon_session_path));
+        let local_pipefs_hint = hi_pipefs::local_state_requires_remote_probe(&session_id);
+        let host = std::sync::Arc::new(pipefs::PipeFsHost::new(
+            sync_config,
+            session_id,
+            daemon_session_path.clone(),
+            pipefs_sync_handle.clone(),
+            workspace_root.clone(),
+            state_root.clone(),
+            pipefs::PipeFsMcpConfig::resolve(&settings, &file),
+        )?);
+        if pipefs_requested_for_new_session || (existing_session && local_pipefs_hint) {
+            host.activate_for_startup(
+                &mut agent,
+                pipefs_requested_for_new_session,
+                local_pipefs_hint,
+            )
+            .await?;
+            // Startup may have lazily upgraded a saved local session to the
+            // shared transcript/lease transport after discovering a remote
+            // PipeFS head.
+            sync_handle = pipefs_sync_handle.lock().unwrap().clone();
+            pipefs_startup_checked = true;
+        }
+        Some(host)
+    } else {
+        None
+    };
+    if defer_launch_workspace_runtime && !pipefs_startup_checked && cli.attach.is_none() {
+        // A local resume can be a PipeFS startup candidate before persisted
+        // sync policy is resolved. If no remote session sink exists, finish
+        // the deferred ordinary runtime now rather than leaving LSP, project
+        // hooks, and repository MCP silently disabled for the whole session.
+        // Do not rebind the same root here: that would discard resumed task
+        // state and durable checkpoint references.
+        agent.activate_deferred_local_workspace_runtime();
+        let (mcp, _) = mcp_host::connect_workspace_mcp_with_policies(
+            &workspace_root,
+            &file.mcp_import.to_policy(),
+            pipe_attach.as_ref(),
+            &file.mcp.server_allowlists(),
+        )
+        .await;
+        if let Some(mcp) = mcp {
+            agent.attach_mcp(mcp);
+        }
+    }
+    if cli.keep_background
+        && let Some(host) = &pipefs_host
+        && host.is_active().await
+    {
+        anyhow::bail!(
+            "--keep-background cannot be used with PipeFS because the local materialization is removed on clean exit"
+        );
+    }
     // Records earlier runs left behind (a one-shot that exited under an open
     // breaker, an interrupted session) belong to sessions no process will
     // ever flush again. Drain them in the background; the one-shot exit path
@@ -1269,6 +1367,7 @@ async fn run() -> Result<()> {
         } else {
             agent.kill_background_processes();
         }
+        agent.background_task_registry().kill_all().await;
         // Flush any pending sync records and live events to ipop before
         // exiting. Silent on failure by design: sync is best-effort mirroring
         // of a local-first session — everything unsent stays queued in the
@@ -1276,6 +1375,17 @@ async fn run() -> Result<()> {
         // surface as an error in the coding workflow.
         if let Some(handle) = &sync_handle {
             let _ = handle.flush().await;
+        }
+        if let Some(host) = &pipefs_host {
+            let result = host.clean_exit(&agent).await;
+            if let Err(error) = result {
+                eprintln!(
+                    "\x1b[31mPipeFS exit blocked: {error:#}; recovery cache was retained\x1b[0m"
+                );
+                std::process::exit(3);
+            }
+        }
+        if let Some(handle) = &sync_handle {
             handle.end_session().await;
         }
         if let Some(rui) = &remote_ui {
@@ -1326,11 +1436,11 @@ async fn run() -> Result<()> {
     // callback is synchronous because both frontends own their event loops;
     // the async flush is serialized by the sinks and retried on failure.
     let mut sync_flush_callback: Option<hi_tui::RemoteFlushCallback> =
-        if sync_handle.is_some() || remote_ui.is_some() {
-            let handle = sync_handle.clone();
+        if sync_handle.is_some() || remote_ui.is_some() || pipefs_host.is_some() {
+            let handles = pipefs_sync_handle.clone();
             let rui = remote_ui.clone();
             Some(std::sync::Arc::new(move || {
-                let handle = handle.clone();
+                let handle = handles.lock().unwrap().clone();
                 let rui = rui.clone();
                 tokio::spawn(async move {
                     if let Some(handle) = handle {
@@ -1358,7 +1468,7 @@ async fn run() -> Result<()> {
         // indirection here makes live events, per-turn flushes, and shutdown
         // flushing follow the newly selected session instead of the one that
         // happened to be active at process startup.
-        let tui_sync_handle = std::sync::Arc::new(std::sync::Mutex::new(sync_handle.clone()));
+        let tui_sync_handle = pipefs_sync_handle.clone();
         let tui_remote_ui = std::sync::Arc::new(std::sync::Mutex::new(remote_ui.clone()));
         let tui_active_session_id =
             std::sync::Arc::new(std::sync::Mutex::new(feedback_session_id.clone()));
@@ -1611,7 +1721,7 @@ async fn run() -> Result<()> {
                 }) as hi_tui::RemoteEventTap
             });
         let tui_sync_flush_callback: Option<hi_tui::RemoteFlushCallback> =
-            sync_handle.is_some().then(|| {
+            (sync_handle.is_some() || pipefs_host.is_some()).then(|| {
                 let handles = tui_sync_handle.clone();
                 let events = tui_remote_ui.clone();
                 std::sync::Arc::new(move || {
@@ -1661,6 +1771,7 @@ async fn run() -> Result<()> {
                 let events = tui_remote_ui.clone();
                 let active_session_id = tui_active_session_id.clone();
                 let runtime_publisher = tui_runtime_publisher.clone();
+                let pipefs = pipefs_host.clone();
                 let switch_sync_config =
                     sync_enabled.then(|| build_sync_config(&settings, &cli, &file));
                 let switcher: hi_tui::SessionSwitcher = Box::new(move |id, agent| {
@@ -1669,16 +1780,27 @@ async fn run() -> Result<()> {
                     let events = events.clone();
                     let active_session_id = active_session_id.clone();
                     let runtime_publisher = runtime_publisher.clone();
+                    let pipefs = pipefs.clone();
                     let switch_sync_config = switch_sync_config.clone();
                     Box::pin(async move {
                         sync::validate_session_id(&id)?;
+                        if let Some(pipefs) = &pipefs {
+                            pipefs.prepare_session_switch(&id).await?;
+                        }
                         let path = session::session_path(&id)?;
                         if !path.is_file() {
                             let config = switch_sync_config.as_ref().ok_or_else(|| {
                                 anyhow!("session '{id}' is unavailable while sync is disabled")
                             })?;
-                            let restored = sync::fetch_session_history(config, &id).await?;
-                            session::cache_loaded_session(&path, &restored)?;
+                            let fetched = sync::fetch_session_history(config, &id).await?;
+                            if fetched.pipefs.as_ref().is_some_and(|pipefs| {
+                                pipefs.enabled || pipefs.restoration_required
+                            }) {
+                                anyhow::bail!(
+                                    "session '{id}' uses PipeFS; resume it with `hi --attach {id} --resume-local` so its workspace is restored before activation"
+                                );
+                            }
+                            session::cache_loaded_session(&path, &fetched.loaded)?;
                         }
                         let loaded = session::load_history(&path)?;
                         let summary = session::resume_summary(&loaded);
@@ -1715,7 +1837,12 @@ async fn run() -> Result<()> {
                             handles.lock().unwrap().replace(next_handle);
                             events.lock().unwrap().replace(next_events);
                         } else {
-                            agent.set_session(Box::new(JsonlSession::new(path)));
+                            agent.set_session(Box::new(JsonlSession::new(path.clone())));
+                            handles.lock().unwrap().take();
+                            events.lock().unwrap().take();
+                        }
+                        if let Some(pipefs) = &pipefs {
+                            pipefs.complete_session_switch(id.clone(), path.clone());
                         }
                         *active_session_id.lock().unwrap() = id.clone();
                         *runtime_publisher.lock().unwrap() =
@@ -1828,6 +1955,23 @@ async fn run() -> Result<()> {
             }),
             purge: std::sync::Arc::new(|| sync_store::SyncStore::open()?.purge()),
         };
+        let pipefs_command: Option<hi_tui::PipeFsCommand> = pipefs_host.clone().map(|host| {
+            let command: hi_tui::PipeFsCommand =
+                std::sync::Arc::new(move |argument: String, agent: &mut hi_agent::Agent| {
+                    let host = host.clone();
+                    let argument = argument.trim().to_ascii_lowercase();
+                    Box::pin(async move {
+                        match argument.as_str() {
+                            "" | "status" => Ok(host.status().await),
+                            "on" => host.enable(agent).await,
+                            "off" => host.disable(agent).await,
+                            "retry" => host.retry(agent).await,
+                            _ => anyhow::bail!("usage: /pipefs on|off|status|retry"),
+                        }
+                    })
+                });
+            command
+        });
         let x402_broker = std::sync::Arc::new(hi_ai::X402ConfirmBroker::new());
         if use_tui && !settings.x402.auto_confirm {
             x402::set_confirmer(x402_broker.clone());
@@ -1894,6 +2038,7 @@ async fn run() -> Result<()> {
                 session_renamer,
                 session_host,
                 sync_control: Some(sync_control),
+                pipefs_command,
                 x402_broker: Some(x402_broker.clone()),
             },
         )
@@ -1914,13 +2059,21 @@ async fn run() -> Result<()> {
                 let active_handle = tui_sync_handle.lock().unwrap().clone();
                 if let Some(handle) = &active_handle {
                     let _ = handle.flush().await;
-                    handle.end_session().await;
                 }
                 let active_remote_ui = tui_remote_ui.lock().unwrap().clone();
                 if let Some(rui) = &active_remote_ui {
                     let _ = rui.flush().await;
                 }
                 agent.kill_background_processes();
+                agent.background_task_registry().kill_all().await;
+                if let Some(host) = &pipefs_host {
+                    host.clean_exit(&agent)
+                        .await
+                        .context("persisting PipeFS workspace during TUI shutdown")?;
+                }
+                if let Some(handle) = &active_handle {
+                    handle.end_session().await;
+                }
                 finish_interactive_trace(rsi.observer.as_ref(), &agent)?;
                 return Ok(());
             }
@@ -1984,18 +2137,29 @@ async fn run() -> Result<()> {
         cli.config.clone(),
         sync_flush_callback,
         approval_store.clone(),
+        pipefs_host.clone(),
     )
     .await;
+    sync_handle = pipefs_sync_handle.lock().unwrap().clone();
     if repl_result.is_ok() {
         feedback::maybe_prompt_and_submit(&settings, &feedback_session_id).await;
     }
     // Best-effort exit flush: silent by design — see the TUI exit path.
     if let Some(handle) = &sync_handle {
         let _ = handle.flush().await;
-        handle.end_session().await;
     }
     if let Some(rui) = &remote_ui {
         let _ = rui.flush().await;
+    }
+    agent.kill_background_processes();
+    agent.background_task_registry().kill_all().await;
+    if let Some(host) = &pipefs_host {
+        host.clean_exit(&agent)
+            .await
+            .context("persisting PipeFS workspace during REPL shutdown")?;
+    }
+    if let Some(handle) = &sync_handle {
+        handle.end_session().await;
     }
     finish_interactive_trace(rsi.observer.as_ref(), &agent)?;
     repl_result

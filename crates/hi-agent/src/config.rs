@@ -470,6 +470,13 @@ pub struct AgentConfig {
     pub engine: AgentEngineConfig,
     /// Optional RSI control-plane hooks (interactive path stays thin).
     pub rsi: AgentRsi,
+    /// Suppress repository-provided executable hooks while constructing the
+    /// launch-directory runtime. Startup paths that may restore PipeFS set
+    /// this until the remote workspace mode is known.
+    pub suppress_initial_project_hooks: bool,
+    /// Construct the launch-directory runtime with LSP disabled. A subsequent
+    /// controlled workspace rebind still uses `gates.lsp_mode`.
+    pub defer_initial_lsp: bool,
     /// Test-only owner for the temporary state root used by unit-test
     /// fixtures. Keeping the guard in the config makes it live as long as the
     /// test agent and removes all state recursively when the last clone drops.

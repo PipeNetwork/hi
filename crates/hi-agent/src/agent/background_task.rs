@@ -143,6 +143,12 @@ impl crate::Agent {
                 hi_tools::ToolStatus::Failed,
             );
         };
+        if !kind.is_read_only() && self.workspace_durability_enabled() {
+            return bg_tool_outcome(
+                "task error: write-capable background subagents are unavailable while PipeFS is active because concurrent child writes cannot be covered by the foreground durability fence; use explore/plan or perform the change in the parent agent",
+                hi_tools::ToolStatus::Denied,
+            );
+        }
         let subagent_type = kind.as_str().to_string();
         let cost = parsed
             .get("cost")

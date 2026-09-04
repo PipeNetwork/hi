@@ -104,7 +104,7 @@ pub struct RemoteSessionSink {
     registered: Mutex<bool>,
     /// The per-session input token returned by ipop at registration.
     input_token: Mutex<Option<String>>,
-    lease_lost: AtomicBool,
+    lease_lost: std::sync::Arc<AtomicBool>,
     heartbeat_started: std::sync::Arc<AtomicBool>,
     /// Shared with the heartbeat task; written by the agent via the session
     /// sink, read on every heartbeat tick.
@@ -140,6 +140,12 @@ pub struct RemoteSessionSink {
     /// drain must not, or it would steal the lease from a live hi in another
     /// terminal that merely has not flushed yet.
     lease_takeover: AtomicBool,
+    /// PipeFS turns transcript synchronization into a durability dependency:
+    /// while it is set, this one live sink keeps queuing and transporting even
+    /// if another process persists `/sync off` in the shared SQLite store.
+    /// This is deliberately session-local rather than a SyncStore setting so
+    /// disabling PipeFS restores the user's normal global sync preference.
+    pipefs_sync_required: std::sync::Arc<AtomicBool>,
 }
 
 impl RemoteSessionSink {
@@ -212,7 +218,7 @@ impl RemoteSessionSink {
             store,
             registered: Mutex::new(false),
             input_token: Mutex::new(None),
-            lease_lost: AtomicBool::new(false),
+            lease_lost: std::sync::Arc::new(AtomicBool::new(false)),
             heartbeat_started: std::sync::Arc::new(AtomicBool::new(false)),
             telemetry: std::sync::Arc::new(std::sync::Mutex::new(HeartbeatTelemetry::default())),
             accepts_input: AtomicBool::new(false),
@@ -224,7 +230,24 @@ impl RemoteSessionSink {
             flush_singly: AtomicBool::new(false),
             requeued_quarantined: AtomicBool::new(false),
             lease_takeover: AtomicBool::new(true),
+            pipefs_sync_required: std::sync::Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Pin this sink's transport while PipeFS is restoring or active.  The
+    /// caller must clear it only after the remote workspace has been durably
+    /// disabled (or its cache is retained on a failed disable).
+    pub fn set_pipefs_sync_required(&self, required: bool) {
+        self.pipefs_sync_required.store(required, Ordering::Release);
+    }
+
+    pub fn pipefs_sync_required(&self) -> bool {
+        self.pipefs_sync_required.load(Ordering::Acquire)
+    }
+
+    fn transport_enabled(&self) -> Result<bool> {
+        Ok(self.pipefs_sync_required()
+            || self.store.effective_mode()? == crate::sync_store::SyncMode::On)
     }
 
     /// Push a record to the pending buffer. `&self` because it uses interior
@@ -237,9 +260,12 @@ impl RemoteSessionSink {
             .map(|wire| wire.len())
             .unwrap_or(usize::MAX);
         if wire_bytes <= MAX_RECORD_WIRE_BYTES {
-            let _ = self
-                .store
-                .enqueue_record(&self.session_id, record_type, payload_json);
+            let _ = self.store.enqueue_record_with_sync_pin(
+                &self.session_id,
+                record_type,
+                payload_json,
+                self.pipefs_sync_required(),
+            );
             return;
         }
 
@@ -288,8 +314,12 @@ impl RemoteSessionSink {
                 "parts": parts.len(),
                 "data": data,
             });
-            self.store
-                .enqueue_record(&self.session_id, "chunk_part", &part.to_string())?;
+            self.store.enqueue_record_with_sync_pin(
+                &self.session_id,
+                "chunk_part",
+                &part.to_string(),
+                self.pipefs_sync_required(),
+            )?;
         }
         let commit = serde_json::json!({
             "logical_id": logical_id,
@@ -298,8 +328,12 @@ impl RemoteSessionSink {
             "sha256": format!("{:x}", Sha256::digest(payload_json.as_bytes())),
             "bytes": payload_json.len(),
         });
-        self.store
-            .enqueue_record(&self.session_id, "chunk_commit", &commit.to_string())?;
+        self.store.enqueue_record_with_sync_pin(
+            &self.session_id,
+            "chunk_commit",
+            &commit.to_string(),
+            self.pipefs_sync_required(),
+        )?;
         Ok(())
     }
 
@@ -377,11 +411,12 @@ impl RemoteSessionSink {
     fn enqueue_reconciled(&self, base_id: &str, record_type: &str, payload: &str) -> Result<()> {
         use sha2::{Digest, Sha256};
         if serde_json::to_string(payload)?.len() <= MAX_RECORD_WIRE_BYTES {
-            return self.store.enqueue_record_with_id(
+            return self.store.enqueue_record_with_id_and_sync_pin(
                 &self.session_id,
                 base_id,
                 record_type,
                 payload,
+                self.pipefs_sync_required(),
             );
         }
         let mut chunks = Vec::new();
@@ -398,22 +433,24 @@ impl RemoteSessionSink {
             let part = serde_json::json!({
                 "logical_id": base_id, "index": index, "parts": chunks.len(), "data": data,
             });
-            self.store.enqueue_record_with_id(
+            self.store.enqueue_record_with_id_and_sync_pin(
                 &self.session_id,
                 &format!("{base_id}.p{index}"),
                 "chunk_part",
                 &part.to_string(),
+                self.pipefs_sync_required(),
             )?;
         }
         let commit = serde_json::json!({
             "logical_id": base_id, "record_type": record_type, "parts": chunks.len(),
             "sha256": format!("{:x}", Sha256::digest(payload.as_bytes())), "bytes": payload.len(),
         });
-        self.store.enqueue_record_with_id(
+        self.store.enqueue_record_with_id_and_sync_pin(
             &self.session_id,
             &format!("{base_id}.commit"),
             "chunk_commit",
             &commit.to_string(),
+            self.pipefs_sync_required(),
         )
     }
 
@@ -605,7 +642,7 @@ impl RemoteSessionSink {
     /// first flush. A failed registration is retried on the next flush; marking
     /// it successful after a network error permanently strands the session.
     async fn ensure_registered(&self) -> Result<()> {
-        if self.store.effective_mode()? != crate::sync_store::SyncMode::On {
+        if !self.transport_enabled()? {
             return Ok(());
         }
         // Endpoint cooling down after connect failures: fail fast instead of
@@ -828,6 +865,7 @@ impl RemoteSessionSink {
             &client_instance_id,
             expiry,
         )?;
+        self.lease_lost.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -851,6 +889,30 @@ impl RemoteSessionSink {
     /// Writer lease token for authenticated long-polls (GET input / heartbeat).
     pub fn writer_lease_token(&self) -> Option<String> {
         self.lease_token()
+    }
+
+    /// Session identity shared by transcript sync and PipeFS. PipeFS checks
+    /// this before using the lease so a live session switch cannot persist
+    /// workspace bytes under the previously active transcript.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Generation paired with [`writer_lease_token`](Self::writer_lease_token).
+    /// PipeFS uses the same writer identity rather than inventing a parallel
+    /// session or lock namespace.
+    pub fn writer_lease_generation(&self) -> u64 {
+        self.store
+            .status(Some(&self.session_id))
+            .map(|status| status.lease_generation)
+            .unwrap_or_default()
+    }
+
+    /// True once any lease-authenticated sync operation learns that another
+    /// machine took over this session. PipeFS consults the same flag before
+    /// admitting a native filesystem mutation.
+    pub fn writer_lease_is_lost(&self) -> bool {
+        self.lease_lost.load(Ordering::Acquire)
     }
 
     pub fn lease_token(&self) -> Option<String> {
@@ -887,7 +949,9 @@ impl RemoteSessionSink {
         let api_key = self.config.api_key.clone();
         let session_id = self.session_id.clone();
         let store = self.store.clone();
+        let pipefs_sync_required = self.pipefs_sync_required.clone();
         let heartbeat_started = self.heartbeat_started.clone();
+        let lease_lost = self.lease_lost.clone();
         let telemetry = self.telemetry.clone();
         tokio::spawn(async move {
             struct Reset(std::sync::Arc<AtomicBool>);
@@ -900,7 +964,9 @@ impl RemoteSessionSink {
             let mut consecutive_failures = 0_u8;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                if store.effective_mode().ok() != Some(crate::sync_store::SyncMode::On) {
+                if !pipefs_sync_required.load(Ordering::Acquire)
+                    && store.effective_mode().ok() != Some(crate::sync_store::SyncMode::On)
+                {
                     continue;
                 }
                 let Some(token) = store.lease_token(&session_id).ok().flatten() else {
@@ -925,7 +991,10 @@ impl RemoteSessionSink {
                     .send()
                     .await;
                 match response {
-                    Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => break,
+                    Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => {
+                        lease_lost.store(true, Ordering::Release);
+                        break;
+                    }
                     Ok(response) if response.status().is_success() => consecutive_failures = 0,
                     Ok(_) | Err(_) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
@@ -967,8 +1036,26 @@ impl RemoteSessionSink {
     /// Flush all pending records to ipop. Called after each turn. Best-effort:
     /// on failure, records stay buffered for the next attempt.
     pub async fn flush(&self) -> Result<()> {
+        self.flush_with_requirement(false).await
+    }
+
+    /// Flush every transcript record as a required PipeFS durability barrier.
+    /// Unlike ordinary best-effort sync, this performs a real attempt through
+    /// an open circuit breaker and errors while any delayed/quarantined row
+    /// remains, so callers cannot delete a recovery cache prematurely.
+    pub async fn flush_required(&self) -> Result<()> {
+        if !self.pipefs_sync_required() {
+            anyhow::bail!("PipeFS transcript durability is not pinned for this session");
+        }
+        self.flush_with_requirement(true).await
+    }
+
+    async fn flush_with_requirement(&self, require_complete: bool) -> Result<()> {
         let _flush = self.flush_lock.lock().await;
-        if self.store.effective_mode()? != crate::sync_store::SyncMode::On {
+        if !self.transport_enabled()? {
+            if require_complete {
+                anyhow::bail!("transcript synchronization is disabled");
+            }
             return Ok(());
         }
         // Endpoint cooling down after connect failures: skip silently —
@@ -976,7 +1063,20 @@ impl RemoteSessionSink {
         // keeps a dead portal from stacking timeouts onto startups, turn
         // ends, and exits (observed: 36s added to a sub-second one-shot).
         if sync_breaker_open(&self.store) {
-            return Ok(());
+            if !require_complete {
+                return Ok(());
+            }
+            // A required flush is itself the explicit retry. Clear only the
+            // local cooldown; the attempted request will trip it again if the
+            // endpoint is still unreachable.
+            self.store.reset_breaker()?;
+        }
+        if require_complete {
+            let forced = self.store.force_retry_records(&self.session_id)?;
+            if forced > 0 {
+                self.flush_singly.store(true, Ordering::Release);
+            }
+            self.requeued_quarantined.store(true, Ordering::Release);
         }
         self.ensure_registered().await?;
         // The heartbeat task gives up after sustained failures (e.g. a portal
@@ -1001,6 +1101,16 @@ impl RemoteSessionSink {
             if records.is_empty() {
                 // The queue drained clean; the next flush may batch again.
                 self.flush_singly.store(false, Ordering::Release);
+                if require_complete {
+                    let status = self.store.status(Some(&self.session_id))?;
+                    if status.queue_rows != 0 {
+                        anyhow::bail!(
+                            "transcript flush left {} buffered record(s), including {} quarantined; recovery cache retained",
+                            status.queue_rows,
+                            status.quarantined_records
+                        );
+                    }
+                }
                 return Ok(());
             }
             let mut bytes = 0usize;
@@ -2855,10 +2965,29 @@ async fn fetch_remote_records(
 /// Fetch and reconstruct a synced session's durable state. Shared by startup
 /// resume and in-TUI `/sessions switch`, so a session has the same behavior
 /// whether or not this machine already has its JSONL cache.
+pub struct FetchedSessionHistory {
+    pub loaded: crate::session::LoadedSession,
+    pub pipefs: Option<RemotePipeFsSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RemotePipeFsSummary {
+    pub enabled: bool,
+    pub restoration_required: bool,
+}
+
+#[derive(Deserialize)]
+struct RemoteSessionDetail {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    pipefs: Option<RemotePipeFsSummary>,
+}
+
 pub async fn fetch_session_history(
     sync_config: &SyncConfig,
     session_id: &str,
-) -> Result<crate::session::LoadedSession> {
+) -> Result<FetchedSessionHistory> {
     validate_session_id(session_id)?;
     let client = sync_http_builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -2869,19 +2998,28 @@ pub async fn fetch_session_history(
     // The rename endpoint updates session metadata without appending a durable
     // record, so fetch the current title separately when restoring a session.
     let detail_url = format!("{}/hi/sessions/{session_id}", sync_config.base_url);
-    if let Ok(response) = client
+    let response = client
         .get(detail_url)
         .header("x-api-key", &sync_config.api_key)
         .send()
         .await
-        && response.status().is_success()
-        && let Ok(detail) = response.json::<serde_json::Value>().await
-        && let Some(title) = detail.get("title").and_then(|value| value.as_str())
-        && !title.trim().is_empty()
-    {
+        .context("fetching session detail from ipop")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("failed to fetch session detail: HTTP {status} {body}");
+    }
+    let detail: RemoteSessionDetail = response
+        .json()
+        .await
+        .context("parsing session detail from ipop")?;
+    if let Some(title) = detail.title.filter(|title| !title.trim().is_empty()) {
         loaded.name = Some(title.trim().to_string());
     }
-    Ok(loaded)
+    Ok(FetchedSessionHistory {
+        loaded,
+        pipefs: detail.pipefs,
+    })
 }
 
 fn reassemble_remote_records(
@@ -3029,7 +3167,12 @@ pub async fn run_resume_local(
     agent: &mut hi_agent::Agent,
 ) -> Result<()> {
     // 1. Fetch and reconstruct the synced session.
-    let loaded = fetch_session_history(&sync_config, &session_id).await?;
+    let fetched = fetch_session_history(&sync_config, &session_id).await?;
+    let remote_requires_pipefs = fetched
+        .pipefs
+        .as_ref()
+        .is_some_and(|pipefs| pipefs.enabled || pipefs.restoration_required);
+    let loaded = fetched.loaded;
 
     let n_messages = loaded.messages.len();
     let has_goal = loaded.goal.is_some();
@@ -3048,7 +3191,7 @@ pub async fn run_resume_local(
         .unwrap_or("continuation")
         .to_string();
     crate::session::cache_loaded_session(&local_path, &loaded)?;
-    let local = crate::session::JsonlSession::new(local_path);
+    let local = crate::session::JsonlSession::new(local_path.clone());
     let remote = RemoteSessionSink::new(sync_config.clone(), session_id.clone());
     remote.seed_snapshot(&loaded)?;
     // Take the writer lease (and re-register) *before* any continued turn can
@@ -3067,8 +3210,35 @@ pub async fn run_resume_local(
     crate::session::apply_loaded_session(agent, loaded)?;
     let sync_session = SyncSession::new(local, remote);
     let sync_handle = sync_session.remote_handle();
+    let pipefs_sync_handle: crate::pipefs::SharedSyncHandle =
+        std::sync::Arc::new(std::sync::Mutex::new(Some(sync_handle.clone())));
     agent.set_session(Box::new(sync_session));
     println!("\x1b[2m  local continuation: {local_id} (writer lease claimed)\x1b[0m");
+
+    // The remote session is the authority for PipeFS mode when resuming on a
+    // different machine. Restore and verify the workspace before accepting a
+    // prompt; a failed restore must leave the launch directory inactive rather
+    // than silently continuing against the wrong files.
+    let pipefs_host = std::sync::Arc::new(crate::pipefs::PipeFsHost::new(
+        sync_config.clone(),
+        session_id.clone(),
+        local_path,
+        pipefs_sync_handle,
+        agent.workspace_root().to_path_buf(),
+        agent.state_root().to_path_buf(),
+        crate::pipefs::PipeFsMcpConfig::resolve(
+            settings,
+            &crate::config::load_config(cli.config.as_deref()).unwrap_or_default(),
+        ),
+    )?);
+    let pipefs_activated = pipefs_host
+        .activate_for_startup(agent, false, remote_requires_pipefs)
+        .await
+        .context("restoring PipeFS workspace for resume-local")?;
+    anyhow::ensure!(
+        !remote_requires_pipefs || pipefs_activated,
+        "the session summary requires PipeFS restoration, but the workspace service did not return an enabled workspace; refusing to continue in the launch directory"
+    );
 
     // 4. Run a local interactive REPL (plain mode — no TUI since we're in
     //    attach context). The user continues the conversation locally.
@@ -3083,11 +3253,16 @@ pub async fn run_resume_local(
         if result.is_err() {
             let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
         }
+        agent.kill_background_processes();
+        agent.background_task_registry().kill_all().await;
         if let Err(err) = sync_handle.flush().await {
             eprintln!("\x1b[33msync: {err:#}\x1b[0m");
         }
+        pipefs_host
+            .clean_exit(agent)
+            .await
+            .context("persisting PipeFS workspace during resume-local shutdown")?;
         sync_handle.end_session().await;
-        agent.kill_background_processes();
         return result.map(|_| ());
     }
 
@@ -3115,11 +3290,18 @@ pub async fn run_resume_local(
         cli.config.clone(),
         Some(after_turn),
         None,
+        Some(pipefs_host.clone()),
     )
     .await;
     if let Err(err) = sync_handle.flush().await {
         eprintln!("\x1b[33msync: {err:#}\x1b[0m");
     }
+    agent.kill_background_processes();
+    agent.background_task_registry().kill_all().await;
+    pipefs_host
+        .clean_exit(agent)
+        .await
+        .context("persisting PipeFS workspace during resume-local shutdown")?;
     sync_handle.end_session().await;
     result
 }

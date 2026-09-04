@@ -112,6 +112,27 @@ fn delegate_advertised_only_when_enabled_and_not_read_only() {
     );
 }
 
+#[tokio::test]
+async fn pipefs_hides_and_rejects_delegate_even_with_a_runner() {
+    let mut agent = agent(Vec::new(), delegate_config());
+    agent.set_delegate_runner(std::sync::Arc::new(StubRunner { applied: true }));
+    agent.set_workspace_durability(Some(std::sync::Arc::new(TestWorkspaceDurability)));
+
+    assert!(
+        !agent
+            .request_tools_for(hi_ai::ToolMode::Auto)
+            .iter()
+            .any(|tool| tool.name == "delegate"),
+        "a stale launch-directory delegate runner must not be advertised after rebind"
+    );
+    let outcome = agent
+        .handle_delegate(r#"{"task":"write a file"}"#, &mut NullUi)
+        .await;
+    assert_eq!(outcome.status, hi_tools::ToolStatus::Denied);
+    assert!(outcome.content.contains("PipeFS"), "{}", outcome.content);
+    assert_eq!(agent.subagents.delegate_subagents_used, 0);
+}
+
 #[test]
 fn subagent_never_gets_delegate() {
     // Depth ≤ 1: a subagent is never advertised delegate, in any mode.

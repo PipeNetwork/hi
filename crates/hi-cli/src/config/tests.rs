@@ -140,6 +140,39 @@ fn quality_defaults_to_automatic_safe_policy() {
 }
 
 #[test]
+fn pipefs_is_opt_in_and_headless_flag_requires_session_persistence() {
+    let config = Config::default();
+    assert!(!config.pipefs.is_enabled());
+
+    let default = Cli::try_parse_from(["hi"]).unwrap();
+    assert!(!default.pipefs);
+    let enabled = Cli::try_parse_from(["hi", "--pipefs"]).unwrap();
+    assert!(enabled.pipefs);
+    assert!(Cli::try_parse_from(["hi", "--pipefs", "--no-save"]).is_err());
+    assert!(Cli::try_parse_from(["hi", "--pipefs", "--subagent"]).is_err());
+    assert!(Cli::try_parse_from(["hi", "--pipefs", "--eval-input", "case.json"]).is_err());
+}
+
+#[test]
+fn pipefs_config_round_trips_and_project_overlay_can_only_disable() {
+    let configured: Config = toml::from_str("[pipefs]\nenabled = true\n").unwrap();
+    assert!(configured.pipefs.is_enabled());
+    let encoded = toml::to_string(&configured).unwrap();
+    assert!(encoded.contains("[pipefs]"));
+    assert!(encoded.contains("enabled = true"));
+
+    let mut disabled = Config::default();
+    let project_enable: Config = toml::from_str("[pipefs]\nenabled = true\n").unwrap();
+    super::merge_config(&mut disabled, project_enable);
+    assert!(!disabled.pipefs.is_enabled());
+
+    let mut enabled = configured;
+    let project_disable: Config = toml::from_str("[pipefs]\nenabled = false\n").unwrap();
+    super::merge_config(&mut enabled, project_disable);
+    assert!(!enabled.pipefs.is_enabled());
+}
+
+#[test]
 fn model_round_limit_is_opt_in_on_the_cli() {
     let default = Cli::try_parse_from(["hi"]).unwrap();
     assert_eq!(default.max_steps, None);

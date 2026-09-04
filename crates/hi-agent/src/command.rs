@@ -20,6 +20,8 @@ pub enum Command {
     /// The TUI presents this as the primary control; startup config and
     /// `--durable` select the initial mode for automation and scripted runs.
     Durable(String),
+    /// Materialize or manage the opt-in portable IPOP-backed workspace.
+    Pipefs(String),
     /// Inspect and recover public remote RSI runs.
     Rsi(String),
     /// Run exactly one turn through the conservative MoA virtual route.
@@ -270,6 +272,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "engine" | "logic" => Command::Engine(arg),
         "config" | "cfg" | "set" => Command::Config(arg),
         "durable" | "durability" => Command::Durable(arg),
+        "pipefs" => Command::Pipefs(arg),
         "rsi" => Command::Rsi(arg),
         "moa" => Command::Moa(arg),
         "team" | "roles" => Command::Team(arg),
@@ -1640,6 +1643,26 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
+        name: "pipefs",
+        args: "[on|off|status|retry]",
+        help: "portable IPOP-backed workspace (native tools use an ephemeral local cache)",
+        arg_values: &[
+            (
+                "on",
+                "restore or activate this session's portable workspace",
+            ),
+            (
+                "off",
+                "commit, return to the original workspace, and remove the cache",
+            ),
+            (
+                "status",
+                "show head, dirty paths, retries, and recovery state",
+            ),
+            ("retry", "retry a failed revision upload or commit"),
+        ],
+    },
+    CommandSpec {
         name: "rsi",
         args: "[list|status RUN|cancel RUN|apply RUN|artifacts RUN|feedback [RUN] good|bad [reason]]",
         help: "inspect or recover remote RSI runs",
@@ -2703,6 +2726,11 @@ mod tests {
         assert_eq!(parse("/verify"), Some(Command::Verify(String::new())));
         assert_eq!(parse("/status"), Some(Command::Status));
         assert_eq!(parse("/durable on"), Some(Command::Durable("on".into())));
+        assert_eq!(parse("/pipefs"), Some(Command::Pipefs(String::new())));
+        assert_eq!(
+            parse("/pipefs retry"),
+            Some(Command::Pipefs("retry".into()))
+        );
         assert_eq!(parse("/doctor"), Some(Command::Doctor));
         assert_eq!(parse("/plan"), Some(Command::Plan(String::new())));
         assert_eq!(

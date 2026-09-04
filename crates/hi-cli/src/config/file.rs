@@ -22,6 +22,10 @@ pub struct Config {
     pub profiles: HashMap<String, Profile>,
     #[serde(default)]
     pub sync: Option<SyncSection>,
+    /// Default for newly-created portable workspaces. Existing remote session
+    /// state takes precedence when attaching or resuming.
+    #[serde(default)]
+    pub pipefs: PipeFsSection,
     #[serde(default)]
     pub rsi: Option<RsiSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -276,13 +280,25 @@ pub struct SyncSection {
     pub enabled: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipeFsSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl PipeFsSection {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+}
+
 impl serde::Serialize for Config {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Config", 12)?;
+        let mut s = serializer.serialize_struct("Config", 13)?;
         if let Some(v) = &self.default_profile {
             s.serialize_field("default_profile", v)?;
         }
@@ -302,6 +318,9 @@ impl serde::Serialize for Config {
         }
         if let Some(sync) = &self.sync {
             s.serialize_field("sync", sync)?;
+        }
+        if self.pipefs != PipeFsSection::default() {
+            s.serialize_field("pipefs", &self.pipefs)?;
         }
         if let Some(rsi) = &self.rsi {
             s.serialize_field("rsi", rsi)?;
@@ -554,6 +573,11 @@ pub(crate) fn merge_config_with_project_trust(
     }
     base.profiles.extend(overlay.profiles);
     merge_project_sync(&mut base.sync, overlay.sync, trusted);
+    // Repository input can opt out but cannot cause a workspace upload. A
+    // global/explicit config remains the authority for the default-on choice.
+    if overlay.pipefs.enabled == Some(false) {
+        base.pipefs.enabled = Some(false);
+    }
     merge_project_rsi(&mut base.rsi, overlay.rsi);
     merge_project_outcome(&mut base.outcome, overlay.outcome, trusted);
     merge_project_x402(&mut base.x402, overlay.x402);

@@ -141,12 +141,18 @@ impl crate::Agent {
         let sandbox_policy = config.sandbox_policy;
         #[cfg(not(test))]
         let sandbox_policy = None;
-        let runtime = WorkspaceRuntime::new_with_scan_and_sandbox(
+        let initial_lsp_mode = if config.defer_initial_lsp {
+            crate::LspMode::Off
+        } else {
+            config.gates.lsp_mode
+        };
+        let runtime = WorkspaceRuntime::new_with_scan_sandbox_and_project_hooks(
             &config.paths.workspace_root,
             &config.paths.state_root,
-            config.gates.lsp_mode,
+            initial_lsp_mode,
             scan,
             sandbox_policy,
+            !config.suppress_initial_project_hooks,
         )?;
         let tools = advertised_tools(&config, None);
         let last_effective_route = crate::EffectiveModelRoute {
@@ -205,6 +211,7 @@ impl crate::Agent {
             engine_runtime,
             side_call_timeout: crate::agent::turn::DEFAULT_SIDE_CALL_TIMEOUT,
             runtime,
+            workspace_durability: None,
             task: crate::domain::TaskContextState::default(),
             messages,
             tools,
@@ -302,6 +309,25 @@ impl crate::Agent {
     /// checkpoint. Returns `None` if there's nothing to undo, else the number of
     /// files restored or removed.
     pub async fn undo(&mut self) -> Result<Option<usize>> {
+        if self.workspace.checkpoints.is_empty() {
+            return Ok(None);
+        }
+        self.begin_durable_workspace_mutation(None).await?;
+        let operation = self.undo_inner().await;
+        let durability = self.checkpoint_durable_workspace().await;
+        match (operation, durability) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error.context(
+                "undo changed local bytes but the PipeFS revision was not committed; run /pipefs retry",
+            )),
+            (Err(error), Err(durability_error)) => Err(error.context(format!(
+                "undo failed and PipeFS reconciliation also failed: {durability_error:#}"
+            ))),
+        }
+    }
+
+    async fn undo_inner(&mut self) -> Result<Option<usize>> {
         let Some(reference) = self.workspace.checkpoints.last().cloned() else {
             return Ok(None);
         };
@@ -596,6 +622,14 @@ impl crate::Agent {
         .iter()
         .cloned()
         .collect();
+        if self.workspace_durability_enabled() {
+            // The CLI delegate runner is bound to the root where it was
+            // constructed. Until runners can be atomically rebound together
+            // with this runtime, advertising it in PipeFS risks applying a
+            // verified diff to the launch directory instead of the portable
+            // materialization. Read-only `task` roles remain available.
+            specs.retain(|spec| spec.name != "delegate");
+        }
         // `run_program` is negotiated at the provider boundary rather than
         // inserted into the global catalog. This keeps ordinary providers and
         // text-only routes byte-for-byte on the existing tool set.
@@ -1982,7 +2016,13 @@ impl crate::Agent {
                     .map(|canonical_root| canonical_root == cwd)
             })
             .unwrap_or(false);
-        if !is_cwd_default && let Some(goal) = &self.goals.structured {
+        // Goal snapshots are UI/runtime state, not user workspace content.
+        // They cannot use the asynchronous PipeFS durability fence from this
+        // synchronous state update, so never emit them into a portable root.
+        if !self.workspace_durability_enabled()
+            && !is_cwd_default
+            && let Some(goal) = &self.goals.structured
+        {
             let _ = goal.export_markdown_to(&root);
         }
     }

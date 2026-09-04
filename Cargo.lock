@@ -3737,6 +3737,7 @@ dependencies = [
  "hi-mcp",
  "hi-observability",
  "hi-outcome",
+ "hi-pipefs",
  "hi-policy",
  "hi-protocol",
  "hi-provider-config",
@@ -4157,6 +4158,26 @@ dependencies = [
  "tokio",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "hi-pipefs"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "filetime",
+ "reqwest",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "unicode-normalization",
+ "uuid",
+ "zstd",
 ]
 
 [[package]]

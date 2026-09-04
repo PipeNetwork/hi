@@ -7,6 +7,19 @@ use hi_ai::{
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, Weak};
 
+pub(crate) struct TestWorkspaceDurability;
+
+#[async_trait]
+impl crate::WorkspaceDurability for TestWorkspaceDurability {
+    async fn mutation_started(&self, _dirty_paths: Option<Vec<String>>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn checkpoint(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 fn test_workspace() -> Arc<tempfile::TempDir> {
     // libtest reuses worker threads, and a background task can briefly retain
     // an older fixture after its test returns. Keying the weak lease by the

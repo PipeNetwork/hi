@@ -38,6 +38,7 @@ pub(crate) fn build_agent(
     rsi_remote_switch: Option<Arc<std::sync::atomic::AtomicBool>>,
     loaded: Option<LoadedAgentSession>,
     ledger_scan: Option<hi_agent::BackgroundScan>,
+    defer_launch_workspace_runtime: bool,
 ) -> Result<BuiltAgent> {
     hi_tools::configure_browser(settings.browser_enabled, settings.browser_allow_private);
     let measured = session_measured(cli.eval_input.is_some(), cli.report.is_some());
@@ -168,6 +169,8 @@ pub(crate) fn build_agent(
             remote_switch: rsi_remote_switch.clone(),
             control: rsi_control,
         },
+        suppress_initial_project_hooks: defer_launch_workspace_runtime,
+        defer_initial_lsp: defer_launch_workspace_runtime,
         ..AgentConfig::default()
     };
     let resume_summary = loaded.as_ref().and_then(|l| l.resume_summary.clone());

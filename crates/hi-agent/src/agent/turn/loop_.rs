@@ -1415,6 +1415,14 @@ impl crate::Agent {
                 self.reconcile_workspace_changes().await?;
             }
         }
+        // Deterministic verification and settlement callbacks may execute
+        // native commands after the last model tool batch. Seal those bytes in
+        // the remote PipeFS head before this turn is allowed to report success.
+        // The host implementation scans the full tree, so opaque verifier
+        // effects are covered even when the ledger has no targeted path list.
+        self.checkpoint_durable_workspace()
+            .await
+            .context("persisting the settled workspace after verification")?;
         if let Some((revision, _)) = self.report.verify.bound_revision_digest() {
             self.runtime.ledger().retain_verification_baseline(revision);
         }

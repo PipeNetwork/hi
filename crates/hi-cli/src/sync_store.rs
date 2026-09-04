@@ -501,13 +501,28 @@ impl SyncStore {
             .map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub fn enqueue_record(
         &self,
         session_id: &str,
         record_type: &str,
         payload_json: &str,
     ) -> Result<()> {
-        if self.effective_mode()? == SyncMode::Off {
+        self.enqueue_record_with_sync_pin(session_id, record_type, payload_json, false)
+    }
+
+    /// Enqueue a durable record, optionally for a session whose transport is
+    /// temporarily required by PipeFS.  The pin belongs to the caller's live
+    /// session handle, not this shared store: changing `/sync off` must still
+    /// stop ordinary sessions immediately once PipeFS has been disabled.
+    pub fn enqueue_record_with_sync_pin(
+        &self,
+        session_id: &str,
+        record_type: &str,
+        payload_json: &str,
+        sync_pinned: bool,
+    ) -> Result<()> {
+        if !sync_pinned && self.effective_mode()? == SyncMode::Off {
             return Ok(());
         }
         let mut connection = self.connection.lock().unwrap();
@@ -538,14 +553,16 @@ impl SyncStore {
         Ok(())
     }
 
-    pub fn enqueue_record_with_id(
+    /// Idempotent variant of [`Self::enqueue_record_with_sync_pin`].
+    pub fn enqueue_record_with_id_and_sync_pin(
         &self,
         session_id: &str,
         client_record_id: &str,
         record_type: &str,
         payload_json: &str,
+        sync_pinned: bool,
     ) -> Result<()> {
-        if self.effective_mode()? == SyncMode::Off {
+        if !sync_pinned && self.effective_mode()? == SyncMode::Off {
             return Ok(());
         }
         self.connection.lock().unwrap().execute(
@@ -665,6 +682,18 @@ impl SyncStore {
             [session_id],
         )?;
         Ok(requeued)
+    }
+
+    /// Make every buffered record for one session immediately retryable. This
+    /// is reserved for an explicit durability barrier (PipeFS off/exit), where
+    /// returning success with delayed or quarantined transcript rows would let
+    /// the caller remove its last recovery cache too early.
+    pub fn force_retry_records(&self, session_id: &str) -> Result<usize> {
+        let changed = self.connection.lock().unwrap().execute(
+            "UPDATE record_outbox SET quarantined=0, next_retry_unix=0 WHERE session_id=?1",
+            [session_id],
+        )?;
+        Ok(changed)
     }
 
     pub fn fail_records(

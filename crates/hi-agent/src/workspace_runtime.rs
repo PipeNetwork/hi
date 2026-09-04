@@ -25,7 +25,12 @@ pub struct WorkspaceRuntime {
     repo_map: Arc<Mutex<hi_tools::RepoMapCache>>,
     ledger: Arc<Mutex<ChangeLedger>>,
     context_generation: std::sync::atomic::AtomicU64,
-    hooks: Option<hi_hooks::HookRegistry>,
+    // A deferred launch-root runtime is initially constructed without
+    // repository hooks.  Keep this behind a lock so, once PipeFS authority
+    // says that the ordinary local root is safe to use, we can populate the
+    // trusted hook snapshot without rebuilding the agent and losing its
+    // resumed task/checkpoint state.
+    hooks: std::sync::RwLock<Option<Arc<hi_hooks::HookRegistry>>>,
 }
 
 impl WorkspaceRuntime {
@@ -59,6 +64,28 @@ impl WorkspaceRuntime {
         lsp_mode: LspMode,
         scan: Option<crate::change_ledger::BackgroundScan>,
         sandbox_policy: Option<hi_tools::sandbox::SandboxPolicy>,
+    ) -> Result<Self> {
+        Self::new_with_scan_sandbox_and_project_hooks(
+            root,
+            state_root,
+            lsp_mode,
+            scan,
+            sandbox_policy,
+            true,
+        )
+    }
+
+    /// Construct a runtime while optionally suppressing all repository-provided
+    /// executable configuration. Portable workspaces restore untrusted bytes
+    /// from another machine, so their `.hi/hooks` must not be admitted (or even
+    /// trigger an stdin trust prompt) during a live root switch.
+    pub fn new_with_scan_sandbox_and_project_hooks(
+        root: impl AsRef<Path>,
+        state_root: impl AsRef<Path>,
+        lsp_mode: LspMode,
+        scan: Option<crate::change_ledger::BackgroundScan>,
+        sandbox_policy: Option<hi_tools::sandbox::SandboxPolicy>,
+        allow_project_hooks: bool,
     ) -> Result<Self> {
         let root = root.as_ref().canonicalize().with_context(|| {
             format!("canonicalizing workspace root {}", root.as_ref().display())
@@ -103,24 +130,7 @@ impl WorkspaceRuntime {
                 manager.set_enabled(true).await;
             });
         }
-        // Discover hooks from ~/.hi/hooks and .hi/hooks in the workspace.
-        // Folder trust gates repo-local hooks: if the workspace is untrusted,
-        // .hi/hooks/ is not loaded (prevents arbitrary command execution in
-        // untrusted repos).
-        let home = std::env::var("HOME")
-            .ok()
-            .map(|h| std::path::Path::new(&h).join(".hi/hooks"));
-        let project_hooks = root.join(".hi/hooks");
-        let trust = hi_tools::folder_trust::resolve_trust(&root);
-        let (project_hooks_dir, _) = match trust {
-            hi_tools::folder_trust::TrustOutcome::Trusted => (Some(project_hooks.as_path()), true),
-            hi_tools::folder_trust::TrustOutcome::Untrusted => (None, false),
-            hi_tools::folder_trust::TrustOutcome::Prompt => (None, false), // shouldn't happen after resolve
-        };
-        let (hooks, hook_errors) = hi_hooks::discover_hooks(home.as_deref(), project_hooks_dir);
-        for err in &hook_errors {
-            eprintln!("hook load warning: {err}");
-        }
+        let hooks = discover_hooks(&root, allow_project_hooks);
         Ok(Self {
             root: root.clone(),
             state_root,
@@ -136,7 +146,7 @@ impl WorkspaceRuntime {
             repo_map: Arc::new(Mutex::new(hi_tools::RepoMapCache::new())),
             ledger: Arc::new(Mutex::new(ledger)),
             context_generation: std::sync::atomic::AtomicU64::new(0),
-            hooks: if hooks.is_empty() { None } else { Some(hooks) },
+            hooks: std::sync::RwLock::new(hooks),
         })
     }
 
@@ -153,8 +163,26 @@ impl WorkspaceRuntime {
     }
 
     /// The loaded hook registry, if any hooks were discovered.
-    pub fn hooks(&self) -> Option<&hi_hooks::HookRegistry> {
-        self.hooks.as_ref()
+    pub fn hooks(&self) -> Option<Arc<hi_hooks::HookRegistry>> {
+        self.hooks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Finish a deferred launch-root runtime after the PipeFS control plane
+    /// has authoritatively selected the ordinary local workspace.  This does
+    /// not replace workspace-scoped state, so a resumed transcript keeps its
+    /// task context and undo/checkpoint references intact.
+    pub fn activate_trusted_local_integrations(&self, lsp_mode: LspMode) {
+        let hooks = discover_hooks(&self.root, true);
+        *self
+            .hooks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hooks;
+        if !matches!(lsp_mode, LspMode::Off) {
+            self.set_lsp_enabled(true);
+        }
     }
 
     pub fn lsp(&self) -> Arc<hi_lsp::LspManager> {
@@ -317,6 +345,31 @@ fn new_ledger(
         let _ = scan; // tests always scan synchronously
         ChangeLedger::new_with_state(root, Some(state_root))
     }
+}
+
+/// Load global hooks and, when explicitly permitted, the local hook directory
+/// only after folder trust has been resolved for this machine.  Keeping this in
+/// one helper makes the initial and deferred runtime paths use identical trust
+/// rules.
+fn discover_hooks(root: &Path, allow_project_hooks: bool) -> Option<Arc<hi_hooks::HookRegistry>> {
+    let home = std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::Path::new(&h).join(".hi/hooks"));
+    let project_hooks = root.join(".hi/hooks");
+    let project_hooks_dir = if allow_project_hooks {
+        match hi_tools::folder_trust::resolve_trust(root) {
+            hi_tools::folder_trust::TrustOutcome::Trusted => Some(project_hooks.as_path()),
+            hi_tools::folder_trust::TrustOutcome::Untrusted
+            | hi_tools::folder_trust::TrustOutcome::Prompt => None,
+        }
+    } else {
+        None
+    };
+    let (hooks, hook_errors) = hi_hooks::discover_hooks(home.as_deref(), project_hooks_dir);
+    for err in &hook_errors {
+        eprintln!("hook load warning: {err}");
+    }
+    (!hooks.is_empty()).then(|| Arc::new(hooks))
 }
 
 fn absolute_state_root(root: &Path, state_root: &Path) -> PathBuf {

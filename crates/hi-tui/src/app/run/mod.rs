@@ -96,6 +96,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         session_renamer,
         session_host,
         sync_control,
+        pipefs_command,
         startup_local_runtime,
         startup_fallback_profile,
         x402_broker,
@@ -211,6 +212,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     app.session_renamer = session_renamer;
     app.session_host = session_host;
     app.sync_control = sync_control;
+    app.pipefs_command = pipefs_command;
     let remote_event_tap =
         crate::tui_event_trace::compose_remote_event_tap(remote_event_tap, tui_event_trace.clone());
     app.base_event_tap = remote_event_tap.clone();
@@ -1444,7 +1446,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     app.active_profile = Some(run.profile_name.clone());
                                     app.profiles = switched.profiles;
                                     app.apply_model(agent, &model);
-                                    app.remember_session_routing();
+                                    app.remember_session_routing(agent);
                                     app.push(Line::styled(
                                         format!(
                                             "using local MLX profile '{}' — model: {model}",
@@ -1954,7 +1956,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             app.local_startup_spec = None;
                             app.context_window = None;
                             app.served.clear();
-                            app.remember_session_routing();
+                            app.remember_session_routing(agent);
                             // Say "profile" only when it is one: `/provider xai`
                             // selects a provider preset, and calling that a
                             // profile sends people looking for config that
@@ -2897,6 +2899,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 // over the same terminal/input/ticker; rows persist on `app.fleet`.
                 // `/fleet status` lists this project's resumable fleet sessions.
                 Command::Dashboard(arg) => {
+                    if agent.workspace_durability_enabled() {
+                        app.push(Line::styled(
+                            "/fleet is unavailable while PipeFS is active because its launcher is bound to the launch workspace",
+                            Style::default().fg(crate::theme::theme().warning),
+                        ));
+                        app.follow();
+                        continue;
+                    }
                     match arg.trim() {
                         "" => {
                             crate::dashboard::run_dashboard(
@@ -2995,6 +3005,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 // list/show/validate print to the transcript; run launches the
                 // engine with a live host bridge that spawns real FleetRows.
                 Command::Workflow(arg) => {
+                    if agent.workspace_durability_enabled() {
+                        app.push(Line::styled(
+                            "/workflow is unavailable while PipeFS is active because its child launcher is bound to the launch workspace",
+                            Style::default().fg(crate::theme::theme().warning),
+                        ));
+                        app.follow();
+                        continue;
+                    }
                     let arg = arg.trim();
                     // `/workflow plan …` drives the local plan-objectives
                     // engine as a detached `hi workflow run` child.
@@ -3165,6 +3183,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 Command::Goal(arg)
                     if hi_agent::command::parse_goal_objective_flags(&arg).workflow =>
                 {
+                    if agent.workspace_durability_enabled() {
+                        app.push(Line::styled(
+                            "/goal --workflow is unavailable while PipeFS is active because its child launcher is bound to the launch workspace",
+                            Style::default().fg(crate::theme::theme().warning),
+                        ));
+                        app.follow();
+                        continue;
+                    }
                     let flags = hi_agent::command::parse_goal_objective_flags(&arg);
                     match hi_agent::goal_workflow_plan_path(
                         false,
@@ -3398,9 +3424,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     }
     // Snapshot provider/model so the next bare `hi` in this workspace resumes
     // with the same routing (also written on /model and /provider changes).
-    app.remember_session_routing();
-    // Remove any remaining fleet worktrees (sessions stay on disk, resumable).
-    crate::dashboard::cleanup_fleet(&mut app);
+    app.remember_session_routing(agent);
+    // Fleet rows own launch-workspace worktrees.  A PipeFS session never
+    // starts them, and must not clean a stale launch-root callback after its
+    // portable cache has been acknowledged and removed.
+    if !agent.workspace_durability_enabled() {
+        crate::dashboard::cleanup_fleet(&mut app);
+    }
 
     app.trace_session_ended(agent)?;
 

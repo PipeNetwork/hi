@@ -102,7 +102,7 @@ impl crate::App {
             }
         }
         // Always snapshot the live selection for the next workspace launch.
-        self.remember_session_routing();
+        self.remember_session_routing(agent);
     }
 
     /// Percent of the context window currently occupied, when the window is known.

@@ -111,6 +111,9 @@ pub(crate) fn handle_command(
                 ),
             }
         }
+        Command::Pipefs(_) => {
+            eprintln!("\x1b[33mPipeFS command requires an async frontend\x1b[0m")
+        }
         Command::Turns(arg) => handle_turns(agent, hi_agent::command::parse_turns_arg(&arg)),
         // `/doctor` needs async settings/MCP probes; handled inline by REPL/TUI.
         Command::Doctor => {}
@@ -209,11 +212,9 @@ pub(crate) fn handle_command(
                 agent.verify_summary(),
                 agent.checkpoint_count(),
             );
-            match hi_agent::ui::write_private_debug_log(
-                std::path::Path::new(".hi-debug.log"),
-                &body,
-            ) {
-                Ok(()) => println!("\x1b[2mwrote redacted debug log: .hi-debug.log\x1b[0m"),
+            let path = agent.state_root().join("hi-debug.log");
+            match hi_agent::ui::write_private_debug_log(&path, &body) {
+                Ok(()) => println!("\x1b[2mwrote redacted debug log: {}\x1b[0m", path.display()),
                 Err(err) => eprintln!("\x1b[33mlog failed: {err}\x1b[0m"),
             }
         }
@@ -755,6 +756,12 @@ pub(crate) fn handle_command(
             println!("hi {}", hi_agent::VERSION);
         }
         Command::Export(arg) => {
+            if agent.workspace_durability_enabled() {
+                eprintln!(
+                    "\x1b[33m/export is unavailable while PipeFS is active because it writes outside the workspace durability fence\x1b[0m"
+                );
+                return false;
+            }
             let path = if arg.trim().is_empty() {
                 "transcript.md"
             } else {

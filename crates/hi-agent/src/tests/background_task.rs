@@ -188,6 +188,23 @@ async fn handle_task_unknown_subagent_type_fails() {
 }
 
 #[tokio::test]
+async fn pipefs_rejects_write_capable_background_tasks_before_spawn() {
+    let mut agent = agent(Vec::new(), bg_config());
+    agent.set_workspace_durability(Some(std::sync::Arc::new(TestWorkspaceDurability)));
+    let mut ui = NullUi;
+    let outcome = agent
+        .handle_task(
+            r#"{"description":"writer","prompt":"write a file","subagent_type":"general-purpose"}"#,
+            &mut ui,
+        )
+        .await;
+
+    assert_eq!(outcome.status, hi_tools::ToolStatus::Denied);
+    assert!(outcome.content.contains("PipeFS"), "{}", outcome.content);
+    assert!(agent.background_task_registry().list().await.is_empty());
+}
+
+#[tokio::test]
 async fn handle_task_reports_registry_capacity_as_actionable_denial() {
     let mut agent = agent(Vec::new(), bg_config());
     let registry = agent.background_task_registry();

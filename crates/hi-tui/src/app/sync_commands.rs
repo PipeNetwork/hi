@@ -172,7 +172,19 @@ impl crate::App {
     }
 
     /// `/sync on|off|status` — toggle or query session sync to ipop.
-    pub(crate) async fn handle_sync_command(&mut self, arg: &str) {
+    pub(crate) async fn handle_sync_command(&mut self, agent: &hi_agent::Agent, arg: &str) {
+        // PipeFS uses this authenticated session for both its writer lease and
+        // its durable revision commits.  Pausing or disabling transcript sync
+        // beneath an active materialization would strand the cache without its
+        // control plane, so do not permit either transition.
+        if agent.workspace_durability_enabled() && matches!(arg.trim(), "paused" | "off") {
+            self.push(Line::styled(
+                "sync cannot be paused or disabled while PipeFS is active; run /pipefs off first",
+                Style::default().fg(crate::theme::theme().warning),
+            ));
+            self.follow();
+            return;
+        }
         match arg.trim() {
             "on" => {
                 if let Some(control) = &self.sync_control
@@ -351,7 +363,7 @@ impl crate::App {
             "" => self.list_sessions().await,
             value if value == "sync" || value.starts_with("sync ") => {
                 let sync_arg = value.strip_prefix("sync").unwrap_or("").trim();
-                self.handle_sync_command(sync_arg).await;
+                self.handle_sync_command(agent, sync_arg).await;
             }
             value if value == "attach" || value.starts_with("attach ") => {
                 let session_id = value.strip_prefix("attach").unwrap_or("").trim();
@@ -2733,7 +2745,7 @@ impl crate::App {
         self.local_startup_error = None;
         self.local_startup_spec = None;
         self.apply_model(agent, &model);
-        self.remember_session_routing();
+        self.remember_session_routing(agent);
         self.push(Line::styled(
             format!("using local MLX profile '{profile}' — model: {model}"),
             dim(),

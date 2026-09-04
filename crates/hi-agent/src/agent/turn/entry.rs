@@ -419,11 +419,16 @@ impl crate::Agent {
         // `pre-turn` is a gate; `post-turn` and `stop` are best-effort notices.
         let hooks = self.workspace_root().join(".hi/hooks");
         let hooks_trusted = crate::workspace_trusted(self.workspace_root());
-        if hooks.join("pre-turn").is_file() && hooks_trusted {
+        let portable_workspace = self.workspace_durability_enabled();
+        if hooks.join("pre-turn").is_file() && hooks_trusted && !portable_workspace {
             let report = crate::run_hook(self.workspace_root(), "pre-turn", input)
                 .await
                 .map_err(|e| anyhow::anyhow!("pre-turn hook blocked turn: {e:#}"))?;
             ui.status(&report);
+        } else if hooks.join("pre-turn").is_file() && portable_workspace {
+            ui.status(
+                "project hooks skipped in PipeFS; trust and execute restored code explicitly",
+            );
         } else if hooks.join("pre-turn").is_file() {
             ui.status("project hooks skipped: workspace untrusted (run /trust on to enable)");
         }
@@ -581,7 +586,8 @@ impl crate::Agent {
         };
         let hooks = self.workspace_root().join(".hi/hooks");
         let hooks_trusted = crate::workspace_trusted(self.workspace_root());
-        if hooks.join("post-turn").is_file() && hooks_trusted {
+        let portable_workspace = self.workspace_durability_enabled();
+        if hooks.join("post-turn").is_file() && hooks_trusted && !portable_workspace {
             match run_hook_cancellable(self.workspace_root(), "post-turn", &summary, cancellation)
                 .await
             {
@@ -590,7 +596,7 @@ impl crate::Agent {
                 None => return,
             }
         }
-        if hooks.join("stop").is_file() && hooks_trusted {
+        if hooks.join("stop").is_file() && hooks_trusted && !portable_workspace {
             match run_hook_cancellable(self.workspace_root(), "stop", &summary, cancellation).await
             {
                 Some(Ok(report)) => ui.status(&report),

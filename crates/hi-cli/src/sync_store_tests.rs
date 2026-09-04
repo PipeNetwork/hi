@@ -122,6 +122,59 @@ fn mode_outbox_and_purge_survive_reopen() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn session_sync_pin_bypasses_off_without_changing_global_mode() {
+    let path = temp_store_path("pipefs-sync-pin");
+    let store = SyncStore::open_at(path.clone()).unwrap();
+    store.set_mode(SyncMode::Off).unwrap();
+
+    // A normal session still honors the user's global choice.
+    store.enqueue_record("ordinary", "message", "{}").unwrap();
+    assert!(store.ready_records("ordinary", 10).unwrap().is_empty());
+
+    // A live PipeFS sink can pin only its own session while it has a remote
+    // workspace lease to maintain.
+    store
+        .enqueue_record_with_sync_pin("pipefs", "message", "{}", true)
+        .unwrap();
+    assert_eq!(store.ready_records("pipefs", 10).unwrap().len(), 1);
+    assert_eq!(store.effective_mode().unwrap(), SyncMode::Off);
+
+    // Once the host clears the per-sink pin, the same global off choice takes
+    // effect again; it was never changed by the PipeFS escape hatch.
+    store
+        .enqueue_record_with_sync_pin("pipefs", "message", "{}", false)
+        .unwrap();
+    assert_eq!(store.ready_records("pipefs", 10).unwrap().len(), 1);
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn required_flush_can_make_delayed_and_quarantined_rows_retryable() {
+    let path = temp_store_path("pipefs-required-retry");
+    let store = SyncStore::open_at(path.clone()).unwrap();
+    store.set_mode(SyncMode::On).unwrap();
+    store.enqueue_record("pipefs", "message", "{}").unwrap();
+    let rows = store.ready_records("pipefs", 10).unwrap();
+    store
+        .fail_records("pipefs", &rows, "temporary", Some(600), false)
+        .unwrap();
+    assert!(store.ready_records("pipefs", 10).unwrap().is_empty());
+    let delayed = store.force_retry_records("pipefs").unwrap();
+    assert_eq!(delayed, 1);
+    let rows = store.ready_records("pipefs", 10).unwrap();
+    store
+        .fail_records("pipefs", &rows, "permanent", None, true)
+        .unwrap();
+    assert!(store.ready_records("pipefs", 10).unwrap().is_empty());
+    let quarantined = store.force_retry_records("pipefs").unwrap();
+    assert_eq!(quarantined, 1);
+    assert_eq!(store.ready_records("pipefs", 10).unwrap().len(), 1);
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
 /// A peer holding the write lock while another process opens the store
 /// must delay the open, not fail it — the "database is locked" turn
 /// failures came from lock-taking setup running before any busy_timeout

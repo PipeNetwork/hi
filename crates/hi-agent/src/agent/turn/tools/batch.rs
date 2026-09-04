@@ -400,10 +400,12 @@ impl crate::Agent {
         // Never let that stale signal cancel the model's next action.
         self.interrupt
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        if calls
-            .iter()
-            .any(|(_, name, _)| hi_tools::is_filesystem_mutating(name) || name == "bash")
-        {
+        if calls.iter().any(|(_, name, _)| {
+            hi_tools::is_filesystem_mutating(name)
+                || name == "bash"
+                || (self.workspace_durability_enabled()
+                    && matches!(name.as_str(), "bash_output" | "bash_kill" | "use_tool"))
+        }) {
             // A real mutation changes the meaning of every shadow read. Drop
             // those entries before dispatching the batch so no stale result
             // can be claimed by a later program call.
@@ -453,6 +455,27 @@ impl crate::Agent {
         let mut interrupted_calls = 0usize;
         let mut interrupted_coordination_calls = 0usize;
         let mut protocol_validation_errors = Vec::new();
+        let batch_may_mutate_workspace = !self.config.gates.dry_run
+            && calls.iter().any(|(_, name, arguments)| {
+                implementation_tool_call_mutates(name, arguments)
+                    || hi_tools::is_filesystem_mutating(name)
+                    || name == "bash"
+                    || (self.workspace_durability_enabled()
+                        && matches!(name.as_str(), "bash_output" | "bash_kill" | "use_tool"))
+            });
+        if batch_may_mutate_workspace {
+            let opaque = calls.iter().any(|(_, name, _)| {
+                matches!(name.as_str(), "bash" | "bash_output" | "bash_kill")
+                    || (self.workspace_durability_enabled() && name == "use_tool")
+            });
+            let paths = (!opaque).then(|| {
+                calls
+                    .iter()
+                    .filter_map(|(_, name, arguments)| hi_tools::target_path(name, arguments))
+                    .collect::<Vec<_>>()
+            });
+            self.begin_durable_workspace_mutation(paths).await?;
+        }
         // Infer within-batch dependencies (a read of a file a mutating
         // call earlier in the batch targeted must observe that mutation;
         // mutating calls serialize). The scheduler below runs ready
@@ -964,6 +987,9 @@ impl crate::Agent {
                 .await;
                 let duration_ms = started.elapsed().as_millis() as u64;
                 self.record_tool_effects(&output.effects)?;
+                if let Some(background) = &output.background {
+                    self.observe_durable_background_process(background).await?;
+                }
                 // Typed mutations already report exact paths. A foreground
                 // bash command reports its opaque effects from the before/after
                 // snapshot inside the tool; a final turn reconciliation covers
@@ -2158,7 +2184,10 @@ impl crate::Agent {
                 // invalidate the snapshot cache so a dependent read
                 // (guaranteed to run after by the dep graph) re-walks.
                 // `bash` also invalidates but always runs alone (above).
-                if hi_tools::is_filesystem_mutating(&calls[i].1) || calls[i].1 == "bash" {
+                if hi_tools::is_filesystem_mutating(&calls[i].1)
+                    || calls[i].1 == "bash"
+                    || (self.workspace_durability_enabled() && calls[i].1 == "use_tool")
+                {
                     self.invalidate_snapshot();
                     // Proactive per-edit verify: kick off a background
                     // fast check for the edited file so a syntax/lint
@@ -2223,6 +2252,13 @@ impl crate::Agent {
             ui,
         )
         .await;
+        // Do not commit successful mutating tool results to the provider
+        // transcript until the materialized workspace is durably represented
+        // by a remote PipeFS head. A failure leaves the controller's recovery
+        // marker and blocks subsequent mutations until `/pipefs retry`.
+        if batch_may_mutate_workspace {
+            self.checkpoint_durable_workspace().await?;
+        }
         self.messages
             .push_assistant_with_results(std::mem::take(completion_content), results);
         if !vision.is_empty() {
@@ -2317,18 +2353,24 @@ impl crate::Agent {
             .find(|(_, (_, name, _))| name == "run_program")
             .expect("program batch is entered with at least one program call");
         let mut outer_status = hi_tools::ToolStatus::Succeeded;
-        let outcome = if calls.len() != 1 {
+        let (outcome, program_mutated_workspace) = if calls.len() != 1 {
             outer_status = hi_tools::ToolStatus::Failed;
-            ProgramOutcome::Failed {
-                error: "run_program must be the only tool call in a completion; retry with ordinary structured tools".into(),
-                calls: Vec::new(),
-            }
+            (
+                ProgramOutcome::Failed {
+                    error: "run_program must be the only tool call in a completion; retry with ordinary structured tools".into(),
+                    calls: Vec::new(),
+                },
+                false,
+            )
         } else if !self.config.program.mode_enabled() {
             outer_status = hi_tools::ToolStatus::Denied;
-            ProgramOutcome::Failed {
-                error: "run_program is disabled; retry with ordinary structured tools".into(),
-                calls: Vec::new(),
-            }
+            (
+                ProgramOutcome::Failed {
+                    error: "run_program is disabled; retry with ordinary structured tools".into(),
+                    calls: Vec::new(),
+                },
+                false,
+            )
         } else {
             match serde_json::from_str::<serde_json::Value>(arguments)
                 .ok()
@@ -2357,10 +2399,13 @@ impl crate::Agent {
                 }
                 None => {
                     outer_status = hi_tools::ToolStatus::Failed;
-                    ProgramOutcome::Failed {
-                        error: "run_program requires a string `source` argument; retry with ordinary structured tools".into(),
-                        calls: Vec::new(),
-                    }
+                    (
+                        ProgramOutcome::Failed {
+                            error: "run_program requires a string `source` argument; retry with ordinary structured tools".into(),
+                            calls: Vec::new(),
+                        },
+                        false,
+                    )
                 }
             }
         };
@@ -2399,6 +2444,13 @@ impl crate::Agent {
             "{\"status\":\"failed\",\"error\":\"program result was not serializable\"}".into()
         });
         let (content, _) = hi_tools::bound_tool_content(raw);
+        // Nested program calls use the same native tools as ordinary batches,
+        // but their effects are hidden behind one provider-facing envelope.
+        // Reconcile before publishing that envelope so successful program
+        // output never gets ahead of the durable PipeFS head.
+        if program_mutated_workspace {
+            self.checkpoint_durable_workspace().await?;
+        }
         if calls.len() != 1 {
             // The provider cannot receive an assistant tool-use without a
             // matching result. Keep only the rejected program envelope in
@@ -2508,7 +2560,7 @@ impl crate::Agent {
         speculation_registry: &SpeculationRegistry,
         max_calls: Option<usize>,
         ui: &mut dyn Ui,
-    ) -> ProgramOutcome {
+    ) -> (ProgramOutcome, bool) {
         let cancel = CancellationToken::new();
         let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
         let params = ProgramRunParams {
@@ -2535,13 +2587,15 @@ impl crate::Agent {
         });
         let _run_guard = ProgramRunGuard::new(cancel.clone(), watcher);
         let program = async {
+            let mut mutated_workspace = false;
             loop {
                 tokio::select! {
                     joined = &mut task => {
-                        break match joined {
+                        let outcome = match joined {
                             Ok(outcome) => outcome,
                             Err(error) => ProgramOutcome::Failed { error: format!("program worker failed: {error}"), calls: Vec::new() },
                         };
+                        break (outcome, mutated_workspace);
                     }
                     request = host_rx.recv() => {
                         let Some(request) = request else {
@@ -2549,19 +2603,38 @@ impl crate::Agent {
                             // closure normally races with its successful task
                             // settlement. Join it instead of manufacturing a
                             // failure based on which ready select branch won.
-                            break match (&mut task).await {
+                            let outcome = match (&mut task).await {
                                 Ok(outcome) => outcome,
                                 Err(error) => ProgramOutcome::Failed {
                                     error: format!("program worker failed: {error}"),
                                     calls: Vec::new(),
                                 },
                             };
+                            break (outcome, mutated_workspace);
                         };
                         match request {
                             ProgramHostRequest::ExecuteTool { call, reply } => {
-                                let (result, output) = if let Some(denied) =
-                                    self.authorize_program_call(&call, ui).await
-                                {
+                                let authorized = self.authorize_program_call(&call, ui).await;
+                                let (mutates, durability_denied) = if authorized.is_some() {
+                                    (false, None)
+                                } else {
+                                    match self.fence_program_mutation(&call).await {
+                                        Ok(mutates) => {
+                                            mutated_workspace |= mutates;
+                                            (mutates, None)
+                                        }
+                                        Err(error) => (
+                                            false,
+                                            Some(program_failed_result(
+                                                &call,
+                                                format!("PipeFS mutation blocked: {error:#}"),
+                                            )),
+                                        ),
+                                    }
+                                };
+                                let resolved = if let Some(denied) = authorized {
+                                    denied
+                                } else if let Some(denied) = durability_denied {
                                     denied
                                 } else {
                                     self.resolve_program_call(
@@ -2572,6 +2645,9 @@ impl crate::Agent {
                                     )
                                     .await
                                 };
+                                let (result, output) = self
+                                    .checkpoint_program_mutation(&call, mutates, resolved)
+                                    .await;
                                 ui.tool_call_id(&format!("program:{}", call.occurrence), &call.name, &serde_json::to_string(&call.arguments).unwrap_or_default());
                                 emit_tool_output(ui, &format!("program:{}", call.occurrence), &call.name, &output);
                                 let _ = reply.send(result);
@@ -2587,29 +2663,69 @@ impl crate::Agent {
                                     authorized_calls.push((call, denied));
                                 }
                                 let agent = &*self;
-                                let parallelism = agent.config.loop_limits.max_parallel_tools.clamp(1, 8);
-                                let outputs = futures_util::stream::iter(authorized_calls.into_iter().map(|(call, denied)| {
-                                    let registry = speculation_registry.clone();
-                                    let cancel = cancel.clone();
-                                    let program_call_id = program_call_id.to_string();
-                                    async move {
-                                        let result = match denied {
-                                            Some(denied) => denied,
-                                            None => agent
-                                                .resolve_program_call(
-                                                    &call,
-                                                    &program_call_id,
-                                                    &registry,
-                                                    &cancel,
-                                                )
-                                                .await,
+                                let serialize_for_durability = agent.workspace_durability_enabled()
+                                    && authorized_calls.iter().any(|(call, denied)| {
+                                        denied.is_none() && agent.program_call_mutates(call)
+                                    });
+                                let outputs = if serialize_for_durability {
+                                    let mut outputs = Vec::with_capacity(authorized_calls.len());
+                                    for (call, denied) in authorized_calls {
+                                        let (mutates, resolved) = if let Some(denied) = denied {
+                                            (false, denied)
+                                        } else {
+                                            match agent.fence_program_mutation(&call).await {
+                                                Ok(mutates) => {
+                                                    mutated_workspace |= mutates;
+                                                    let resolved = agent
+                                                        .resolve_program_call(
+                                                            &call,
+                                                            program_call_id,
+                                                            speculation_registry,
+                                                            &cancel,
+                                                        )
+                                                        .await;
+                                                    (mutates, resolved)
+                                                }
+                                                Err(error) => (
+                                                    false,
+                                                    program_failed_result(
+                                                        &call,
+                                                        format!("PipeFS mutation blocked: {error:#}"),
+                                                    ),
+                                                ),
+                                            }
                                         };
-                                        (call, result)
+                                        let resolved = agent
+                                            .checkpoint_program_mutation(&call, mutates, resolved)
+                                            .await;
+                                        outputs.push((call, resolved));
                                     }
-                                }))
-                                .buffer_unordered(parallelism)
-                                .collect::<Vec<_>>()
-                                .await;
+                                    outputs
+                                } else {
+                                    let parallelism = agent.config.loop_limits.max_parallel_tools.clamp(1, 8);
+                                    futures_util::stream::iter(authorized_calls.into_iter().map(|(call, denied)| {
+                                        let registry = speculation_registry.clone();
+                                        let cancel = cancel.clone();
+                                        let program_call_id = program_call_id.to_string();
+                                        async move {
+                                            let result = match denied {
+                                                Some(denied) => denied,
+                                                None => agent
+                                                    .resolve_program_call(
+                                                        &call,
+                                                        &program_call_id,
+                                                        &registry,
+                                                        &cancel,
+                                                    )
+                                                    .await,
+                                            };
+                                            (call, result)
+                                        }
+                                    }))
+                                    .buffer_unordered(parallelism)
+                                    .collect::<Vec<_>>()
+                                    .await
+                                };
                                 let mut outputs = outputs;
                                 outputs.sort_by_key(|(call, _)| call.occurrence);
                                 let mut results = Vec::with_capacity(outputs.len());
@@ -2753,6 +2869,59 @@ impl crate::Agent {
         Some(program_denied_result(call, message))
     }
 
+    async fn fence_program_mutation(&self, call: &ProgramCall) -> Result<bool> {
+        let mutates = self.program_call_mutates(call);
+        if !mutates {
+            return Ok(false);
+        }
+        let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
+        let paths = (!matches!(
+            call.name.as_str(),
+            "bash" | "bash_output" | "bash_kill" | "use_tool"
+        ))
+        .then(|| hi_tools::target_paths(&call.name, &arguments));
+        self.begin_durable_workspace_mutation(paths).await?;
+        Ok(true)
+    }
+
+    fn program_call_mutates(&self, call: &ProgramCall) -> bool {
+        if self.config.gates.dry_run {
+            return false;
+        }
+        let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
+        implementation_tool_call_mutates(&call.name, &arguments)
+            || hi_tools::is_filesystem_mutating(&call.name)
+            || call.name == "bash"
+            || (self.workspace_durability_enabled()
+                && matches!(call.name.as_str(), "bash_output" | "bash_kill" | "use_tool"))
+    }
+
+    async fn checkpoint_program_mutation(
+        &self,
+        call: &ProgramCall,
+        mutates: bool,
+        resolved: (
+            std::result::Result<hi_workflow::ProgramToolResult, String>,
+            hi_tools::ToolOutcome,
+        ),
+    ) -> (
+        std::result::Result<hi_workflow::ProgramToolResult, String>,
+        hi_tools::ToolOutcome,
+    ) {
+        if !mutates {
+            return resolved;
+        }
+        match self.checkpoint_durable_workspace().await {
+            Ok(()) => resolved,
+            Err(error) => program_failed_result(
+                call,
+                format!(
+                    "local bytes changed but the PipeFS revision was not committed: {error:#}; run /pipefs retry"
+                ),
+            ),
+        }
+    }
+
     async fn execute_program_tool(
         &self,
         call: &ProgramCall,
@@ -2795,6 +2964,17 @@ fn program_denied_result(
         }),
         output,
     )
+}
+
+fn program_failed_result(
+    call: &ProgramCall,
+    message: String,
+) -> (
+    std::result::Result<hi_workflow::ProgramToolResult, String>,
+    hi_tools::ToolOutcome,
+) {
+    let output = synthetic_tool_outcome(message.clone(), hi_tools::ToolStatus::Failed);
+    (Err(format!("{}: {message}", call.name)), output)
 }
 
 fn external_freshness_epoch(ttl_seconds: u64) -> u64 {

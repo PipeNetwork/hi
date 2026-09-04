@@ -89,6 +89,7 @@ Default is YOLO with a seatbelt: no nag prompts, a denylist for irreversible com
 - [Handbook](docs/handbook.md) — full CLI, TUI, loops, RSI, local GPU, eval
 - [Architecture](docs/architecture.md) — interactive agent vs RSI control plane
 - [Fleet](docs/fleet-dashboard.md)
+- [PipeFS](docs/pipefs.md) — opt-in portable session workspaces
 - [Sandbox](docs/sandbox.md)
 - [0.2 migration](docs/0.2-migration.md)
 

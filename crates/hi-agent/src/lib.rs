@@ -45,6 +45,7 @@ mod transcript;
 pub mod ui;
 mod verify;
 mod verify_digest;
+mod workspace_durability;
 mod workspace_runtime;
 
 use std::{
@@ -156,6 +157,7 @@ pub use ui::{
     tool_label, try_claim_approved_confirmation,
 };
 pub use verify::VerificationExecution;
+pub use workspace_durability::WorkspaceDurability;
 pub use workspace_runtime::WorkspaceRuntime;
 
 /// Cloneable, turn-scoped cancellation signal for frontends and protocol adapters.
@@ -1070,6 +1072,9 @@ pub struct Agent {
     /// cancellation, so productive work has no hidden wall-clock ceiling.
     pub(crate) side_call_timeout: Option<std::time::Duration>,
     pub(crate) runtime: WorkspaceRuntime,
+    /// Optional host-owned durability fence for an ephemeral materialization.
+    /// It is intentionally separate from the filesystem/tool abstractions.
+    pub(crate) workspace_durability: Option<Arc<dyn WorkspaceDurability>>,
     /// Per-turn ranked task/memory prompt assembly.
     pub(crate) task: crate::domain::TaskContextState,
     /// Conversation history, shared with in-flight `ChatRequest`s via the

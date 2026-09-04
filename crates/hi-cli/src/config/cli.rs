@@ -153,6 +153,20 @@ pub struct Cli {
     #[arg(long)]
     pub durable: bool,
 
+    /// Start a new session in the portable IPOP-backed workspace. This also
+    /// enables transcript sync and requires a saved session.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "no_save",
+            "subagent",
+            "eval_input",
+            "benchmark_orchestration",
+            "skeptic_review"
+        ]
+    )]
+    pub pipefs: bool,
+
     /// Sync this session to an ipop API endpoint for cross-machine resume.
     /// Reads `HI_SYNC_BASE_URL` and `HI_SYNC_API_KEY` (or uses the provider's
     /// base_url/api_key if those aren't set). Implied by `--sync-session-id`.

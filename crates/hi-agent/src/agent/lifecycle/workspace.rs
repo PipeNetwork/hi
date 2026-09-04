@@ -2,12 +2,148 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use hi_ai::Provider;
 
 use crate::AgentConfig;
 
 impl crate::Agent {
+    /// Install or clear the host-provided durability fence used by PipeFS.
+    pub fn set_workspace_durability(
+        &mut self,
+        durability: Option<Arc<dyn crate::WorkspaceDurability>>,
+    ) {
+        self.workspace_durability = durability;
+        // Portable workspaces currently deny write-capable child agents: the
+        // frontend delegate runner captures a concrete root, and background
+        // writers cannot participate in the parent's durability fence. Refresh
+        // the advertised set immediately so `delegate` is not offered there.
+        self.set_advertised_tools(None);
+    }
+
+    pub fn workspace_durability_enabled(&self) -> bool {
+        self.workspace_durability.is_some()
+    }
+
+    /// Replace repository-supplied prompt context after a controlled root
+    /// switch. Standing user rules remain session-scoped; only files from the
+    /// newly materialized workspace are re-read by the frontend.
+    pub fn set_workspace_project_context(&mut self, context: Option<String>) {
+        self.config.memory.project_context = context;
+        self.refresh_system_message();
+    }
+
+    pub async fn begin_durable_workspace_mutation(
+        &self,
+        dirty_paths: Option<Vec<String>>,
+    ) -> Result<()> {
+        if let Some(durability) = &self.workspace_durability {
+            durability.mutation_started(dirty_paths).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn checkpoint_durable_workspace(&self) -> Result<()> {
+        if let Some(durability) = &self.workspace_durability {
+            durability.checkpoint().await?;
+        }
+        Ok(())
+    }
+
+    /// Recreate all workspace-scoped runtime state against a materialized root.
+    /// Switching is only legal while idle; callers perform remote preparation
+    /// before invoking this method and retain the old runtime on any failure.
+    pub async fn rebind_workspace(
+        &mut self,
+        workspace_root: impl AsRef<std::path::Path>,
+        state_root: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        self.rebind_workspace_with_project_hooks(workspace_root, state_root, true)
+            .await
+    }
+
+    /// Rebind to an untrusted portable materialization without loading any
+    /// repository-provided hooks. The caller may still reconnect explicitly
+    /// trusted, non-workspace services after the switch.
+    pub async fn rebind_portable_workspace(
+        &mut self,
+        workspace_root: impl AsRef<std::path::Path>,
+        state_root: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        self.rebind_workspace_with_project_hooks(workspace_root, state_root, false)
+            .await
+    }
+
+    /// Complete a launch-root runtime whose executable integrations were
+    /// deferred until PipeFS authority was known.  Unlike a rebind this keeps
+    /// the agent's restored task state, workspace checkpoints, and transcript
+    /// bookkeeping intact.
+    pub fn activate_deferred_local_workspace_runtime(&mut self) {
+        self.runtime
+            .activate_trusted_local_integrations(self.config.gates.lsp_mode);
+    }
+
+    async fn rebind_workspace_with_project_hooks(
+        &mut self,
+        workspace_root: impl AsRef<std::path::Path>,
+        state_root: impl AsRef<std::path::Path>,
+        allow_project_hooks: bool,
+    ) -> Result<()> {
+        self.runtime
+            .background()
+            .ensure_quiescent_and_reaped()
+            .await
+            .context("cannot switch workspaces before background processes are fully stopped")?;
+        let background_tasks = self.bg_tasks.active_ids().await;
+        anyhow::ensure!(
+            background_tasks.is_empty(),
+            "cannot switch workspaces while background tasks remain active: {}",
+            background_tasks.join(", ")
+        );
+
+        #[cfg(test)]
+        let sandbox_policy = self.config.sandbox_policy;
+        #[cfg(not(test))]
+        let sandbox_policy = None;
+        let replacement = crate::WorkspaceRuntime::new_with_scan_sandbox_and_project_hooks(
+            workspace_root.as_ref(),
+            state_root.as_ref(),
+            self.config.gates.lsp_mode,
+            None,
+            sandbox_policy,
+            allow_project_hooks,
+        )?;
+        // Do not disable the old runtime until every fallible replacement
+        // construction step has succeeded. This keeps a failed rebind atomic
+        // from the caller's perspective.
+        self.runtime.lsp().set_enabled(false).await;
+        self.config.paths.workspace_root = replacement.root().to_path_buf();
+        self.config.paths.state_root = replacement.state_root().to_path_buf();
+        self.runtime = replacement;
+        if self.memory.is_some() {
+            self.memory = Some(Arc::new(crate::MarkdownMemory::new(
+                self.config.paths.workspace_root.clone(),
+                true,
+            )));
+        }
+        // Workspace MCP processes and imported repository configuration were
+        // resolved for the old root. Do not carry those executable connections
+        // across a trust boundary; the frontend may reconnect them explicitly.
+        self.mcp = None;
+        self.config.memory.offer_mcp = false;
+        self.task = crate::domain::TaskContextState::default();
+        self.workspace = crate::domain::WorkspaceTurnState::default();
+        self.snapshot_cache = crate::snapshot::SnapshotCache::default();
+        self.prefix_stability = crate::prefix_stability::PrefixStability::default();
+        *self
+            .btw_git_facts_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.set_advertised_tools(None);
+        self.refresh_system_message();
+        Ok(())
+    }
+
     /// Number of git checkpoints created so far (for `/undo`).
     pub fn checkpoint_count(&self) -> usize {
         self.workspace.checkpoints.len()
@@ -34,9 +170,66 @@ impl crate::Agent {
         self.runtime.background().ids()
     }
 
+    /// Background handles whose native process is still live. Completed
+    /// handles remain queryable for output, but must not block workspace
+    /// switching or a final PipeFS checkpoint.
+    pub fn active_background_process_ids(&self) -> Vec<String> {
+        self.runtime
+            .background()
+            .snapshot()
+            .into_iter()
+            .filter(|(_, _, status)| status == "running")
+            .map(|(id, _, _)| id)
+            .collect()
+    }
+
+    /// Cloneable native-process registry for host durability controllers. The
+    /// handle is workspace-runtime scoped and is acquired only after a PipeFS
+    /// rebind, so lease loss can terminate processes still mutating that cache.
+    pub fn background_process_registry(&self) -> Arc<hi_tools::BackgroundRegistry> {
+        self.runtime.background_arc()
+    }
+
+    /// Require all native background processes to be terminal and fully reaped.
+    /// A process marked killed can still execute its final write until its
+    /// detached driver has observed exit, so lifecycle callers must await this
+    /// barrier before removing a PipeFS materialization.
+    pub fn ensure_background_processes_quiescent(
+        &self,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
+        let background = self.runtime.background_arc();
+        async move { background.ensure_quiescent_and_reaped().await }
+    }
+
+    pub async fn observe_durable_background_process(
+        &self,
+        outcome: &hi_tools::BackgroundOutcome,
+    ) -> Result<()> {
+        if let Some(durability) = &self.workspace_durability {
+            let running = matches!(
+                outcome.state,
+                hi_tools::BackgroundState::Started | hi_tools::BackgroundState::Running
+            );
+            durability
+                .background_process_state(&outcome.id, running)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Registry ids for in-process background subagent tasks (`task` tool).
     pub fn background_task_ids(&self) -> Vec<String> {
         self.bg_tasks.list_now()
+    }
+
+    /// In-process subagent tasks that have not reached a terminal outcome.
+    /// This async snapshot is authoritative and must be used for lifecycle
+    /// decisions; `background_task_ids` intentionally includes retained history.
+    pub fn active_background_task_ids(
+        &self,
+    ) -> impl std::future::Future<Output = Vec<String>> + Send + 'static {
+        let tasks = Arc::clone(&self.bg_tasks);
+        async move { tasks.active_ids().await }
     }
 
     /// Cloneable handle to the background-task registry. Frontends use this to

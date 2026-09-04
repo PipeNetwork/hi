@@ -183,6 +183,53 @@ async fn unreachable_endpoint_trips_breaker_and_later_flushes_skip_silently() {
 }
 
 #[tokio::test]
+async fn pipefs_sync_pin_keeps_a_live_sink_flushing_after_global_sync_off() {
+    let reject = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (base_url, accepted) = start_poison_rejecting_server(reject).await;
+    let store = unique_test_sync_store();
+    store
+        .set_mode(crate::sync_store::SyncMode::Off)
+        .expect("turning global sync off");
+    let session_id = format!("pipefs-sync-pin-{}", std::process::id());
+    let sink = RemoteSessionSink::with_store(
+        SyncConfig {
+            base_url,
+            api_key: "test-key".to_string(),
+            machine_id: None,
+            cwd_digest: None,
+        },
+        session_id.clone(),
+        None,
+        remote_session_http_client(),
+        store.clone(),
+    );
+
+    // Without the pin, an ordinary sink obeys the persisted mode.
+    sink.push("message", r#"{"role":"user","n":0}"#);
+    assert!(store.ready_records(&session_id, 10).unwrap().is_empty());
+
+    sink.set_pipefs_sync_required(true);
+    sink.push("message", r#"{"role":"user","n":1}"#);
+    sink.flush()
+        .await
+        .expect("PipeFS pin must keep the transcript transport alive");
+    assert!(
+        accepted.lock().unwrap().join("\n").contains(r#"\"n\":1"#),
+        "the pinned record reached the server"
+    );
+    assert_eq!(
+        store.effective_mode().unwrap(),
+        crate::sync_store::SyncMode::Off
+    );
+
+    // Removing the pin restores normal per-process behavior without changing
+    // the persisted preference.
+    sink.set_pipefs_sync_required(false);
+    sink.push("message", r#"{"role":"user","n":2}"#);
+    assert!(store.ready_records(&session_id, 10).unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn lease_acquisition_retries_a_timeout_with_the_same_token() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -446,8 +446,11 @@ impl crate::App {
         }
     }
 
-    pub(crate) fn write_debug_log(&mut self) {
-        let path = std::path::Path::new(".hi-debug.log");
+    pub(crate) fn write_debug_log(&mut self, agent: &Agent) {
+        // Debug output is runtime state, never workspace content.  In
+        // particular, a PipeFS rebind must not leave this file in the process
+        // launch directory or accidentally include it in a revision.
+        let path = agent.state_root().join("hi-debug.log");
         let mut body = String::new();
         body.push_str("# hi debug log (redacted; best-effort secret detection)\n\n");
         body.push_str("## status\n");
@@ -488,9 +491,9 @@ impl crate::App {
             }
         }
         let body = hi_agent::ui::redact_debug_text(&body, &[self.api_key.as_str()]);
-        match hi_agent::ui::write_private_debug_log(path, &body) {
+        match hi_agent::ui::write_private_debug_log(&path, &body) {
             Ok(()) => self.push(Line::styled(
-                "wrote redacted debug log: .hi-debug.log",
+                format!("wrote redacted debug log: {}", path.display()),
                 dim(),
             )),
             Err(err) => self.push(Line::styled(
@@ -1923,6 +1926,37 @@ impl crate::App {
                 }
             }
             Command::Durable(arg) => self.handle_durable(agent, &arg),
+            Command::Pipefs(arg) => {
+                if matches!(arg.trim(), "on" | "enable")
+                    && (self.race.as_ref().is_some_and(|race| race.task.is_some())
+                        || self.plan_workflow_child.is_some())
+                {
+                    self.push(Line::styled(
+                        "finish or cancel active race/workflow children before enabling PipeFS; their launchers are bound to the launch workspace",
+                        Style::default().fg(crate::theme::theme().warning),
+                    ));
+                    return;
+                }
+                let Some(command) = self.pipefs_command.clone() else {
+                    self.push(Line::styled(
+                        "PipeFS requires a saved interactive session".to_string(),
+                        dim(),
+                    ));
+                    return;
+                };
+                match command(arg, agent).await {
+                    Ok(message) => {
+                        self.workspace_root = agent.workspace_root().to_path_buf();
+                        self.git_branch = crate::chrome::git_branch(&self.workspace_root);
+                        for line in message.lines() {
+                            self.push(Line::styled(line.to_string(), dim()));
+                        }
+                    }
+                    Err(error) => {
+                        self.push(Line::styled(format!("PipeFS error: {error:#}"), dim()))
+                    }
+                }
+            }
             Command::Turns(arg) => {
                 self.handle_turns(agent, hi_agent::command::parse_turns_arg(&arg));
             }
@@ -2192,7 +2226,7 @@ impl crate::App {
                     self.push(Line::styled(line.to_string(), dim()));
                 }
             }
-            Command::Log => self.write_debug_log(),
+            Command::Log => self.write_debug_log(agent),
             Command::Model(id) => {
                 if id.is_empty() {
                     // Open the interactive picker (filter + arrow-select) on the
@@ -2558,6 +2592,13 @@ impl crate::App {
                 ));
             }
             Command::Race(arg) => {
+                if agent.workspace_durability_enabled() {
+                    self.push(Line::styled(
+                        "/race is unavailable while PipeFS is active because the race runner is bound to the launch workspace",
+                        Style::default().fg(crate::theme::theme().warning),
+                    ));
+                    return;
+                }
                 if matches!(arg.trim(), "setup" | "config") {
                     let targets = self
                         .profiles
@@ -2631,7 +2672,23 @@ impl crate::App {
             }
             Command::Commit => {
                 let paths = agent.session_touched_paths();
+                if let Err(error) = agent.begin_durable_workspace_mutation(None).await {
+                    self.push(Line::styled(
+                        format!("commit blocked: {error:#}"),
+                        Style::default().fg(crate::theme::theme().warning),
+                    ));
+                    return;
+                }
                 let out = hi_tools::commit_in(agent.workspace_root(), &paths).await;
+                if let Err(error) = agent.checkpoint_durable_workspace().await {
+                    self.push(Line::styled(
+                        format!(
+                            "commit completed locally but PipeFS persistence failed: {error:#}; run /pipefs retry"
+                        ),
+                        Style::default().fg(crate::theme::theme().warning),
+                    ));
+                    return;
+                }
                 for line in out.lines() {
                     self.push(Line::styled(format!("── {line} ──"), dim()));
                 }
@@ -2803,6 +2860,13 @@ impl crate::App {
                 self.push(Line::styled(msg, dim()));
             }
             Command::Export(arg) => {
+                if agent.workspace_durability_enabled() {
+                    self.push(Line::styled(
+                        "/export is unavailable while PipeFS is active because it writes outside the workspace durability fence",
+                        Style::default().fg(crate::theme::theme().warning),
+                    ));
+                    return;
+                }
                 let path = if arg.trim().is_empty() {
                     "transcript.md"
                 } else {
@@ -2825,7 +2889,7 @@ impl crate::App {
                     )),
                 }
             }
-            Command::Sync(arg) => self.handle_sync_command(&arg).await,
+            Command::Sync(arg) => self.handle_sync_command(agent, &arg).await,
             Command::Sessions(arg) => self.handle_sessions_command(agent, &arg).await,
             Command::Attach(arg) => self.handle_attach_command(agent, &arg).await,
             Command::Daemon(arg) => self.handle_daemon_command(&arg).await,

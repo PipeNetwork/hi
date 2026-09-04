@@ -347,6 +347,18 @@ pub struct SyncControl {
     pub purge: SyncPurger,
 }
 
+/// Host callback for `/pipefs on|off|status|retry`. The controller lives in
+/// hi-cli because it reuses that frontend's authenticated session-sync lease.
+pub type PipeFsCommand = std::sync::Arc<
+    dyn for<'a> Fn(
+            String,
+            &'a mut hi_agent::Agent,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>,
+        > + Send
+        + Sync,
+>;
+
 #[derive(Clone, Debug)]
 pub struct SessionSwitchInfo {
     pub id: String,
@@ -553,6 +565,7 @@ pub struct RunOptions {
     pub session_renamer: Option<SessionRenamer>,
     pub session_host: Option<SessionHostController>,
     pub sync_control: Option<SyncControl>,
+    pub pipefs_command: Option<PipeFsCommand>,
     /// Shared x402 confirm/paste prompts while a turn's provider hop is blocked.
     pub x402_broker: Option<std::sync::Arc<hi_ai::X402ConfirmBroker>>,
 }
@@ -1621,6 +1634,7 @@ pub(crate) struct App {
     pub(crate) pending_host_enable:
         Option<tokio::task::JoinHandle<anyhow::Result<Option<crate::SessionHostEnable>>>>,
     pub(crate) sync_control: Option<crate::SyncControl>,
+    pub(crate) pipefs_command: Option<crate::PipeFsCommand>,
     /// Handle for typed interactive lifecycle records and propagation of a
     /// write failure observed inside the composed `RemoteEventTap`.
     pub(crate) tui_event_trace: Option<crate::TuiEventTrace>,

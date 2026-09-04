@@ -29,6 +29,7 @@ hi-events.workspace = true
 hi-policy.workspace = true
 hi-control.workspace = true
 hi-routing.workspace = true
+hi-pipefs.workspace = true
 hi-protocol.workspace = true
 hi-provider-config.workspace = true
 hi-observability.workspace = true

@@ -1351,6 +1351,34 @@ impl BackgroundTaskRegistry {
         tasks.keys().cloned().collect()
     }
 
+    /// Return only tasks that have not reached a stable terminal outcome.
+    ///
+    /// Unlike [`Self::list_now`], this waits for the registry lock instead of
+    /// treating contention as an empty registry. Completed task entries remain
+    /// addressable for later polling, but must not indefinitely block workspace
+    /// switching or clean shutdown.
+    pub async fn active_ids(&self) -> Vec<String> {
+        let tasks = self.tasks.lock().await;
+        let mut ids = tasks
+            .iter()
+            .filter_map(|(id, entry)| {
+                let final_terminal = entry
+                    .final_outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.state.is_terminal());
+                let shared_terminal = entry
+                    .terminal_outcome
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.state.is_terminal());
+                (!final_terminal && !shared_terminal).then(|| id.clone())
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
     /// Whether this session has ever registered a background task. The
     /// advertisement path is synchronous, so use a non-blocking probe; if a
     /// concurrent spawn holds the lock, fail open and keep the polling tools.
@@ -1382,6 +1410,43 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn active_ids_excludes_terminal_history_without_losing_it() {
+        let registry = BackgroundTaskRegistry::new();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let id = registry
+            .spawn(
+                "liveness",
+                "explore",
+                Box::new(move || {
+                    Box::pin(async move {
+                        let _ = release_rx.await;
+                        BackgroundTaskOutcome {
+                            id: String::new(),
+                            description: String::new(),
+                            subagent_type: String::new(),
+                            state: BackgroundTaskState::Completed,
+                            output: "done".into(),
+                            applied: false,
+                            changed_files: Vec::new(),
+                        }
+                    })
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(registry.active_ids().await, vec![id.clone()]);
+        release_tx.send(()).unwrap();
+        let outcome = registry.poll(&id, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(outcome.state, BackgroundTaskState::Completed);
+        assert!(registry.active_ids().await.is_empty());
+        assert!(
+            registry.list().await.contains(&id),
+            "terminal task history should remain pollable"
+        );
     }
 
     #[tokio::test]

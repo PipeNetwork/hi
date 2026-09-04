@@ -29,6 +29,9 @@ const MAX_BG_LINE_BYTES: usize = 64 * 1024;
 /// Cap on retained processes. When exceeded, already-exited entries are pruned
 /// oldest-first so a long session that starts many servers can't leak handles.
 const MAX_BG_PROCS: usize = 64;
+/// Workspace teardown must not race a killed process that still owns open
+/// descriptors or can execute a final filesystem write while being reaped.
+const QUIESCENT_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BgState {
@@ -100,6 +103,12 @@ pub struct BackgroundRegistry {
     /// map lock makes reservation and insertion a single capacity decision,
     /// so concurrent background launches cannot race past `MAX_BG_PROCS`.
     reserved_slots: AtomicUsize,
+    /// Blocks new reservations while a workspace lifecycle operation takes a
+    /// stable, fully-reaped snapshot.  Reservation always acquires the
+    /// process-map lock before observing this flag; the quiescence path sets
+    /// it before taking that same lock, closing the otherwise possible gap
+    /// between the reserved-slot and map checks.
+    quiescing: std::sync::atomic::AtomicBool,
     /// Handles named by callers that were not in the registry, with whether
     /// the registry was empty at the time. Bounded FIFO so a model that
     /// guesses ids in a loop cannot grow this without bound.
@@ -121,6 +130,7 @@ impl Default for BackgroundRegistry {
             processes: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
             reserved_slots: AtomicUsize::new(0),
+            quiescing: std::sync::atomic::AtomicBool::new(false),
             unknown_handles: Mutex::new(VecDeque::new()),
             poll_wait_base_secs: AtomicU64::new(POLL_WAIT_USE_ENV),
         }
@@ -383,6 +393,9 @@ impl BackgroundRegistry {
     /// group.
     fn reserve_slot(&self) -> Result<()> {
         let mut reg = self.processes.lock().unwrap();
+        if self.quiescing.load(Ordering::Acquire) {
+            bail!("workspace lifecycle operation is waiting for background processes to stop");
+        }
         prune(&mut reg);
         let reserved = self.reserved_slots.load(Ordering::Acquire);
         if reg.len().saturating_add(reserved) >= MAX_BG_PROCS {
@@ -518,6 +531,79 @@ impl BackgroundRegistry {
 
     pub fn kill(&self, id: &str) -> Result<String> {
         kill_from(self, id)
+    }
+
+    /// Verify that no tracked process is live and wait for every terminal child
+    /// to be fully reaped before its workspace can be switched or removed.
+    ///
+    /// `kill` records the public `Killed` state before the detached driver has
+    /// necessarily drained pipes and reaped the child. Looking only at that
+    /// state leaves a small but real last-write race with a workspace rebind.
+    pub async fn ensure_quiescent_and_reaped(&self) -> Result<()> {
+        if self
+            .quiescing
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            bail!("another workspace lifecycle operation is waiting for background processes");
+        }
+        let result = self.ensure_quiescent_and_reaped_inner().await;
+        self.quiescing.store(false, Ordering::Release);
+        result
+    }
+
+    async fn ensure_quiescent_and_reaped_inner(&self) -> Result<()> {
+        // `reserve_slot` acquires `processes` and then observes `quiescing`.
+        // Setting the flag before acquiring this lock means either an already
+        // in-flight reservation is visible below or every later one is
+        // rejected; never a hidden reservation between the two snapshots.
+        if self.reserved_slots.load(Ordering::Acquire) != 0 {
+            bail!("a background process is still being started");
+        }
+
+        let processes = self
+            .processes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, process)| (id.clone(), process.clone()))
+            .collect::<Vec<_>>();
+        let running = processes
+            .iter()
+            .filter(|(_, process)| matches!(process.inner.lock().unwrap().state, BgState::Running))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        if !running.is_empty() {
+            bail!("background processes remain active: {}", running.join(", "));
+        }
+
+        let deadline = tokio::time::Instant::now() + QUIESCENT_REAP_TIMEOUT;
+        for (id, process) in processes {
+            wait_for_terminal_reap(&process, &id, deadline).await?;
+        }
+
+        // New reservations remain blocked until the outer method clears the
+        // lifecycle gate, so this final snapshot only needs to account for
+        // processes already present in the registry.
+        if self.reserved_slots.load(Ordering::Acquire) != 0 {
+            bail!("a background process started while waiting for workspace quiescence");
+        }
+        let running = self
+            .processes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, process)| {
+                let inner = process.inner.lock().unwrap();
+                (matches!(inner.state, BgState::Running) || !inner.reaped).then(|| id.clone())
+            })
+            .collect::<Vec<_>>();
+        if !running.is_empty() {
+            bail!(
+                "background processes changed while waiting for workspace quiescence: {}",
+                running.join(", ")
+            );
+        }
+        Ok(())
     }
 
     pub fn outcome(&self, id: &str) -> Result<crate::BackgroundOutcome> {
@@ -1074,6 +1160,32 @@ fn lookup(registry: &BackgroundRegistry, id: &str) -> Result<Arc<BgProc>> {
     }
 }
 
+async fn wait_for_terminal_reap(
+    process: &BgProc,
+    id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    loop {
+        // Register before inspecting state so `notify_waiters` cannot land in
+        // the check-to-await gap and strand teardown until the timeout.
+        let notified = process.reaped.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
+            let inner = process.inner.lock().unwrap();
+            if matches!(inner.state, BgState::Running) {
+                bail!("background process {id} is still running");
+            }
+            if inner.reaped {
+                return Ok(());
+            }
+        }
+        tokio::time::timeout_at(deadline, notified)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting to reap background process {id}"))?;
+    }
+}
+
 /// Drop already-exited entries oldest-first once the registry is at capacity.
 /// Ids end in the monotonic counter (`{slug}_{N}`), so ordering by that
 /// number is insertion order.
@@ -1381,6 +1493,32 @@ mod tests {
         let snap_after = registry.snapshot();
         let (_, _, status_after) = snap_after.iter().find(|(eid, _, _)| *eid == id).unwrap();
         assert_eq!(status_after, "killed");
+    }
+
+    #[tokio::test]
+    async fn quiescent_barrier_rejects_live_children_and_waits_after_kill() {
+        let _guard = TEST_LOCK.lock().await;
+        let registry = BackgroundRegistry::default();
+        let runner = crate::ProcessRunner::from_current_dir().unwrap();
+        let id = registry.spawn(&runner, "sleep 600").unwrap();
+
+        let error = registry
+            .ensure_quiescent_and_reaped()
+            .await
+            .expect_err("a running child must block workspace teardown");
+        assert!(error.to_string().contains(&id), "{error:#}");
+
+        registry.kill(&id).unwrap();
+        registry
+            .ensure_quiescent_and_reaped()
+            .await
+            .expect("a killed child must be fully reaped before teardown returns");
+        let (_, _, status) = registry
+            .snapshot()
+            .into_iter()
+            .find(|(candidate, _, _)| candidate == &id)
+            .unwrap();
+        assert_eq!(status, "killed");
     }
 
     #[tokio::test]
