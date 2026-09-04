@@ -2335,6 +2335,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_approval_path_names_actual_single_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::create_dir(dir.path().join("private")).unwrap();
+        std::fs::write(dir.path().join("private/config.txt"), "original\n").unwrap();
+
+        for requested in ["src/../private/config.txt", "private/config.txt"] {
+            let args = serde_json::json!({"path": requested, "content": "original\n"});
+            let prepared = crate::prepare_mutation_in_with_state(
+                dir.path(),
+                state.path(),
+                "write",
+                &args.to_string(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                prepared.single_target_path().as_deref(),
+                Some("private/config.txt")
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("../private/config.txt", dir.path().join("src/alias.txt"))
+                .unwrap();
+            let prepared = crate::prepare_mutation_in_with_state(
+                dir.path(),
+                state.path(),
+                "write",
+                r#"{"path":"src/alias.txt","content":"updated\n"}"#,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                prepared.single_target_path().as_deref(),
+                Some("private/config.txt")
+            );
+        }
+
+        let single = serde_json::json!({"patch": "*** Begin Patch\n*** Update File: src/../private/config.txt\n-original\n+updated\n*** End Patch"});
+        let prepared = crate::prepare_mutation_in_with_state(
+            dir.path(),
+            state.path(),
+            "apply_patch",
+            &single.to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prepared.single_target_path().as_deref(),
+            Some("private/config.txt")
+        );
+
+        let multiple = serde_json::json!({"patch": "*** Begin Patch\n*** Add File: first.txt\n+first\n*** Add File: second.txt\n+second\n*** End Patch"});
+        let prepared = crate::prepare_mutation_in_with_state(
+            dir.path(),
+            state.path(),
+            "apply_patch",
+            &multiple.to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.single_target_path(), None);
+    }
+
+    #[tokio::test]
     async fn prepared_edit_refuses_an_edit_made_after_preview() {
         let dir =
             std::env::temp_dir().join(format!("hi-prepared-preview-race-{}", std::process::id()));

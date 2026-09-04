@@ -69,6 +69,25 @@ pub(crate) struct DriveCompletion<T> {
     pub(crate) value: Option<T>,
 }
 
+/// Turn outcomes own transcript settlement. A typed cancellation rewinds
+/// consumed steering, while completed/blocked/failed turns keep their messages
+/// even if a late frontend interrupt raced their committed result.
+pub(crate) trait DriveResult {
+    fn interjections_committed(&self, frontend_cancelled: bool) -> bool;
+}
+
+impl DriveResult for hi_agent::TurnOutcome {
+    fn interjections_committed(&self, _frontend_cancelled: bool) -> bool {
+        self.status != hi_agent::TurnStatus::Cancelled
+    }
+}
+
+impl DriveResult for () {
+    fn interjections_committed(&self, frontend_cancelled: bool) -> bool {
+        !frontend_cancelled
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TurnCancellationSettlement {
     /// The frontend should present cancellation and, if needed, clean up.
@@ -148,6 +167,7 @@ pub(crate) async fn drive<T, B>(
     bg_tasks: Arc<hi_tools::BackgroundTaskRegistry>,
 ) -> Result<DriveCompletion<T>>
 where
+    T: DriveResult,
     B: Backend,
     B::Error: Send + Sync + 'static,
 {
@@ -687,10 +707,13 @@ where
             .send(hi_agent::ConfirmationResult::Cancelled);
     }
     // Reconcile the visible queue with mid-turn steering: drop entries the
-    // agent injected only after a successful drive result. Provider errors and
-    // cancellation retain offered user work for the next turn.
+    // agent injected only after a result that retained the turn transcript.
+    // Errors and typed cancellation retain offered user work for the next turn.
     if let Some(inbox) = interject.as_ref() {
-        reconcile_queue_with_interjections(app, inbox, value.is_some() && !cancelled);
+        let committed = value
+            .as_ref()
+            .is_some_and(|value| value.interjections_committed(cancelled));
+        reconcile_queue_with_interjections(app, inbox, committed);
     } else {
         app.mid_turn_offered.clear();
     }
@@ -753,6 +776,90 @@ fn x402_prompt_to_control(prompt: hi_ai::X402UserPrompt) -> ConfirmationControl 
 mod cancellation_settlement_tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    #[tokio::test]
+    async fn typed_settlement_controls_consumed_steering_even_when_cancel_key_races() {
+        for status in [
+            hi_agent::TurnStatus::Completed,
+            hi_agent::TurnStatus::Cancelled,
+            hi_agent::TurnStatus::Blocked,
+            hi_agent::TurnStatus::Failed,
+        ] {
+            for frontend_cancelled in [false, true] {
+                let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+                let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+                if frontend_cancelled {
+                    input_tx
+                        .send(Event::Key(crossterm::event::KeyEvent::new(
+                            KeyCode::Char('c'),
+                            KeyModifiers::CONTROL,
+                        )))
+                        .unwrap();
+                }
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                let mut app = crate::tests::test_app("openai", "gpt-4o");
+                let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+                let (_confirmation_tx, confirmation_rx) = mpsc::unbounded_channel();
+                let inbox = hi_agent::InterjectionInbox::default();
+                app.queue.push_back("preserve the public API".into());
+                app.mid_turn_offered
+                    .push_back("preserve the public API".into());
+                // The model drained this instruction before its terminal result.
+                inbox.push("preserve the public API");
+                inbox.drain();
+                let cancellation = hi_agent::TurnCancellation::new();
+                let future_cancellation = cancellation.clone();
+                let future = async move {
+                    while frontend_cancelled && !future_cancellation.is_cancelled() {
+                        tokio::task::yield_now().await;
+                    }
+                    let mut outcome = hi_agent::TurnOutcome::infrastructure_failure(
+                        "test-model",
+                        None,
+                        Vec::new(),
+                    );
+                    outcome.status = status;
+                    if status == hi_agent::TurnStatus::Cancelled {
+                        future_cancellation.cancel();
+                        outcome.stop_reason = hi_agent::TurnStopReason::Cancelled;
+                    }
+                    Ok(outcome)
+                };
+
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    drive(
+                        &mut terminal,
+                        &mut input_rx,
+                        &mut ticker,
+                        &mut app,
+                        ui_rx,
+                        confirmation_rx,
+                        future,
+                        true,
+                        Some(inbox),
+                        None,
+                        ui_tx,
+                        Some(cancellation),
+                        Arc::new(hi_tools::BackgroundTaskRegistry::new()),
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+
+                assert_eq!(result.value.as_ref().unwrap().status, status);
+                assert_eq!(result.cancelled, frontend_cancelled);
+                assert_eq!(
+                    app.queue.front().map(String::as_str),
+                    (status == hi_agent::TurnStatus::Cancelled)
+                        .then_some("preserve the public API"),
+                    "status={status:?}, frontend_cancelled={frontend_cancelled}"
+                );
+                assert!(app.mid_turn_offered.is_empty());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn closed_terminal_input_is_reported_instead_of_silently_exiting() {

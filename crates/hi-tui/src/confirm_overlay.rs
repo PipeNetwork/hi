@@ -40,13 +40,14 @@ pub(crate) enum ConfirmDecision {
 
 fn perm_actions(request: &ConfirmationRequest) -> Vec<PermAction> {
     match request {
-        ConfirmationRequest::FileEdit { .. } => vec![
-            PermAction::Approve,
-            PermAction::AlwaysSession,
-            PermAction::AlwaysPath,
-            PermAction::Reject,
-            PermAction::RejectFollowup,
-        ],
+        ConfirmationRequest::FileEdit { path, .. } => {
+            let mut actions = vec![PermAction::Approve, PermAction::AlwaysSession];
+            if App::can_scope_auto_approve_path(path) {
+                actions.push(PermAction::AlwaysPath);
+            }
+            actions.extend([PermAction::Reject, PermAction::RejectFollowup]);
+            actions
+        }
         ConfirmationRequest::DelegateApply { .. } => {
             vec![
                 PermAction::Approve,
@@ -270,7 +271,7 @@ fn handle_perm(
                 }
             }
             KeyCode::Char('p') if !ctrl => {
-                if matches!(request, ConfirmationRequest::FileEdit { .. }) {
+                if actions.contains(&PermAction::AlwaysPath) {
                     ConfirmDecision::AlwaysPath
                 } else {
                     ConfirmDecision::Redraw
@@ -306,6 +307,10 @@ fn handle_perm(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "approval_scope_tests.rs"]
+mod approval_scope_tests;
 
 fn handle_ask(
     app: &mut App,

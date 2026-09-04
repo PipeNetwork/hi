@@ -1384,6 +1384,7 @@ async fn plan_drive_expected_mutation_repeat_never_forces_chat_only() {
 #[derive(Default)]
 struct DenyEditsUi {
     confirm_calls: usize,
+    confirmations: Vec<crate::ConfirmationRequest>,
     tool_results: Vec<(String, String)>,
     turn_end: Option<String>,
 }
@@ -1392,8 +1393,9 @@ impl Ui for DenyEditsUi {
     fn assistant_text(&mut self, _: &str) {}
     fn assistant_reasoning(&mut self, _: &str) {}
     fn assistant_end(&mut self) {}
-    fn confirm(&mut self, _: crate::ConfirmationRequest) -> crate::ConfirmationFuture<'_> {
+    fn confirm(&mut self, request: crate::ConfirmationRequest) -> crate::ConfirmationFuture<'_> {
         self.confirm_calls += 1;
+        self.confirmations.push(request);
         Box::pin(async { crate::ConfirmationResult::Rejected })
     }
     fn tool_call(&mut self, _: &str, _: &str) {}
@@ -2034,6 +2036,64 @@ async fn confirmation_surfaces_preparation_errors_without_a_blank_prompt_or_repa
         .expect("typed edit failure");
     assert!(edit_result.1.contains("invalid tool arguments"));
     assert!(!edit_result.1.contains("Edit skipped by user"));
+}
+
+#[tokio::test]
+async fn confirmation_uses_prepared_targets_for_path_grants_and_auto_permissions() {
+    for (name, arguments, expected_path) in [
+        (
+            "write",
+            serde_json::json!({"path": "src/../.env", "content": "TOKEN=private\n"}),
+            ".env",
+        ),
+        (
+            "apply_patch",
+            serde_json::json!({"patch": "*** Begin Patch\n*** Add File: src/../.env\n+TOKEN=private\n*** End Patch"}),
+            ".env",
+        ),
+        (
+            "apply_patch",
+            serde_json::json!({"patch": "*** Begin Patch\n*** Add File: src/public.rs\n+pub fn public() {}\n*** Add File: .env\n+TOKEN=private\n*** End Patch"}),
+            "(multiple files)",
+        ),
+    ] {
+        let workspace = IsolatedWorkspace::new("confirmation-paths");
+        std::fs::create_dir(workspace.path("src")).unwrap();
+        let mut cfg = workspace.config();
+        cfg.gates.confirm_edits = true;
+        let mut agent = agent(
+            vec![
+                completion(
+                    vec![Content::ToolCall {
+                        id: "edit".into(),
+                        name: name.into(),
+                        arguments: arguments.to_string(),
+                    }],
+                    1,
+                    1,
+                ),
+                completion(vec![Content::Text("The edit was rejected.".into())], 1, 1),
+            ],
+            cfg,
+        );
+        let mut ui = DenyEditsUi::default();
+
+        agent.run_turn("check it", &mut ui).await.unwrap();
+
+        assert_eq!(
+            ui.confirmations.len(),
+            1,
+            "tool results: {:?}",
+            ui.tool_results
+        );
+        let request = &ui.confirmations[0];
+        let crate::ConfirmationRequest::FileEdit { path, .. } = request else {
+            panic!("expected file edit approval");
+        };
+        assert_eq!(path, expected_path);
+        assert!(!request.safe_for_auto());
+        assert!(!workspace.path(".env").exists());
+    }
 }
 
 struct EditDuringConfirmationUi {

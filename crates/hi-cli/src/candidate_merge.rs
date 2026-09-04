@@ -31,7 +31,8 @@ pub(crate) struct AppliedCandidate {
 }
 
 /// Apply through the transaction engine and verify the exact destination
-/// revision. A failure restores the sealed pre-apply checkpoint.
+/// revision. A failure restores the pre-apply checkpoint only while the
+/// destination still matches our sealed post-apply state.
 #[cfg(test)]
 pub(crate) fn apply_candidate_and_reverify(
     worktree: &Path,
@@ -142,11 +143,11 @@ pub(crate) fn apply_candidate_and_reverify_cancellable_at_base(
     let post_apply = match create_checkpoint_sync(destination, state_root) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
-            let rollback = restore_checkpoint_sync(destination, &pre_apply, state_root);
-            return Err(combine_rollback_error(
-                error.context("checkpointing the applied destination revision failed"),
-                rollback,
-            ));
+            // No post-apply seal exists, so a whole-workspace restore could
+            // erase concurrent edits. Retain the changes for manual recovery.
+            return Err(error.context(format!(
+                "checkpointing the applied destination revision failed; changes retained to avoid overwriting concurrent edits (pre-apply checkpoint: {pre_apply})"
+            )));
         }
     };
 
@@ -186,7 +187,8 @@ pub(crate) fn apply_candidate_and_reverify_cancellable_at_base(
     let post_verify = match create_checkpoint_sync(destination, state_root) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
-            let rollback = restore_checkpoint_sync(destination, &pre_apply, state_root);
+            let rollback =
+                restore_checkpoint_sealed_sync(destination, &pre_apply, &post_apply, state_root);
             return Err(combine_rollback_error(
                 error.context("checkpointing the destination after verification failed"),
                 rollback,
@@ -197,7 +199,7 @@ pub(crate) fn apply_candidate_and_reverify_cancellable_at_base(
         Ok(stable) => stable,
         Err(error) => {
             let rollback =
-                restore_checkpoint_sealed_sync(destination, &pre_apply, &post_verify, state_root);
+                restore_checkpoint_sealed_sync(destination, &pre_apply, &post_apply, state_root);
             return Err(combine_rollback_error(
                 error.context("comparing destination verification revisions failed"),
                 rollback,
@@ -223,10 +225,12 @@ pub(crate) fn apply_candidate_and_reverify_cancellable_at_base(
             error.context(format!("destination verification `{verify}` failed"))
         }
     } else {
-        anyhow!("destination verifier modified relevant files (verification unstable)")
+        anyhow!("destination files changed during verification (verification unstable)")
     };
-    let rollback =
-        restore_checkpoint_sealed_sync(destination, &pre_apply, &post_verify, state_root);
+    // A post-verification snapshot may contain independent user edits. It
+    // cannot authorize replacing those bytes with the pre-apply checkpoint.
+    // Only the revision we applied is safe to restore automatically.
+    let rollback = restore_checkpoint_sealed_sync(destination, &pre_apply, &post_apply, state_root);
     Err(combine_rollback_error(reason, rollback))
 }
 
@@ -480,15 +484,6 @@ fn create_checkpoint_sync(root: &Path, state_root: &Path) -> Result<String> {
             hi_tools::checkpoint::CreateResult::Unavailable(reason)
             | hi_tools::checkpoint::CreateResult::Failed(reason) => bail!(reason),
         }
-    })
-}
-
-fn restore_checkpoint_sync(root: &Path, target: &str, state_root: &Path) -> Result<usize> {
-    let root = root.to_path_buf();
-    let target = target.to_string();
-    let state_root = state_root.to_path_buf();
-    run_async_thread(move || async move {
-        hi_tools::checkpoint::restore_with_state(&root, &target, &state_root).await
     })
 }
 

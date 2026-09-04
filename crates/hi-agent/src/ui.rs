@@ -62,6 +62,13 @@ impl ConfirmationRequest {
     pub fn safe_for_auto(&self) -> bool {
         match self {
             Self::FileEdit { path, diff } => {
+                if matches!(path.trim(), "" | "." | "(unknown)" | "(multiple files)")
+                    || std::path::Path::new(path)
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    return false;
+                }
                 let lower = path.to_ascii_lowercase();
                 let secretish = [".env", "credential", "secret", "token", "key.pem"]
                     .iter()
@@ -1425,6 +1432,16 @@ mod tests {
 
     #[test]
     fn auto_classifier_is_conservative() {
+        for path in ["", ".", "(unknown)", "(multiple files)", "src/../config"] {
+            assert!(
+                !ConfirmationRequest::FileEdit {
+                    path: path.into(),
+                    diff: "+small edit\n".into(),
+                }
+                .safe_for_auto(),
+                "ambiguous or unnormalized target must require approval: {path}"
+            );
+        }
         assert!(
             ConfirmationRequest::FileEdit {
                 path: "src/lib.rs".into(),

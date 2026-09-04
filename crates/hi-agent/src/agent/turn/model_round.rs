@@ -644,14 +644,16 @@ impl crate::Agent {
         // end the turn on a half-finished output and leave the model
         // "picking up where it stopped" on the next prompt). This uses a
         // *dedicated* truncation policy (separate from `empty_retries`). The
-        // ordinary policy is unlimited because every truncated response is
-        // valid productive output; bounded integrations can still opt into a
-        // finite retry count.
+        // ordinary policy is unlimited while fragments remain productive;
+        // bounded integrations can still opt into a finite retry count.
         let truncated = matches!(
             completion.stop_reason.as_deref(),
             Some("length" | "max_tokens")
         );
+        let truncation_stalled = truncated
+            && retry_state.truncated_output_stalled(&completion.content);
         if truncated
+            && !truncation_stalled
             && self
                 .config
                 .loop_limits
@@ -721,10 +723,12 @@ impl crate::Agent {
             self.clean_text_tool_calls_from_content(&mut completion.content);
             self.messages
                 .push_assistant_text_only(std::mem::take(&mut completion.content));
-            ui.status(
-                "⚠ output truncated — the model remained incomplete after the retry budget; stopping with the partial response",
-            );
-            if self.try_no_progress_recovery(
+            ui.status(if truncation_stalled {
+                "⚠ repeated truncated output — the model stopped making progress; stopping with the partial response"
+            } else {
+                "⚠ output truncated — the model remained incomplete after the retry budget; stopping with the partial response"
+            });
+            if !truncation_stalled && self.try_no_progress_recovery(
                 &mut progress_tracker,
                 &mut force_tools_next,
                 Some(&mut continue_total_nudges),
@@ -732,6 +736,7 @@ impl crate::Agent {
             ) {
                 return Ok(ModelRoundControl::Continue);
             }
+            provider_exhausted = true;
             return Ok(ModelRoundControl::BreakInner(false));
         }
         // A public RSI response is terminal, not a local planning round to nudge.
@@ -1511,6 +1516,7 @@ If the task is already complete, stop and give your final recap."
         empty_retries = 0;
         retry_state.protocol_retries = 0;
         truncation_retries = 0;
+        retry_state.reset_truncation_progress();
 
         if calls.is_empty() {
             // When a mutation already landed and a deterministic turn-end

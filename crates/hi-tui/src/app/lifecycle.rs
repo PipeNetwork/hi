@@ -491,20 +491,37 @@ impl crate::App {
     }
 
     pub(crate) fn path_auto_approved(&self, path: &str) -> bool {
-        if self.auto_approve_paths.is_empty() {
+        if self.auto_approve_paths.is_empty() || !Self::can_scope_auto_approve_path(path) {
             return false;
         }
         let path = path.replace('\\', "/");
         self.auto_approve_paths.iter().any(|prefix| {
             let p = prefix.replace('\\', "/");
-            path == p || path.starts_with(&format!("{p}/"))
+            Self::can_scope_auto_approve_path(&p)
+                && (path == p || path.starts_with(&format!("{p}/")))
         })
+    }
+
+    /// Path grants require a concrete normalized target. The agent supplies
+    /// prepared canonical paths; legacy or unknown paths must not broaden a
+    /// prefix grant through traversal or a shared multi-file placeholder.
+    pub(crate) fn can_scope_auto_approve_path(path: &str) -> bool {
+        let normalized = path.replace('\\', "/");
+        !matches!(
+            normalized.as_str(),
+            "" | "/" | "(unknown)" | "(multiple files)"
+        ) && !normalized
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
     }
 
     /// Remember a path prefix for session-scoped auto-approve (`p` on confirm).
     /// Uses the parent directory of a file path, or the path itself if it looks
     /// like a directory (no extension / trailing slash).
     pub(crate) fn add_auto_approve_path(&mut self, path: &str) {
+        if !Self::can_scope_auto_approve_path(path) {
+            return;
+        }
         let normalized = path.replace('\\', "/");
         let prefix = {
             let trimmed = normalized.trim_end_matches('/');

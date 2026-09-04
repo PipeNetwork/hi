@@ -1820,8 +1820,6 @@ impl crate::Agent {
                         name.as_str(),
                         "write" | "edit" | "multi_edit" | "apply_patch"
                     ) {
-                        let path = hi_tools::target_path(name, &calls[i].2)
-                            .unwrap_or_else(|| "(unknown)".to_string());
                         // Parse and materialize the complete mutation before
                         // confirmation. Approval consumes this same digest-sealed
                         // plan; it is never reparsed or rebuilt afterward.
@@ -1844,6 +1842,12 @@ impl crate::Agent {
                                 continue;
                             }
                         };
+                        // Grants must cover the prepared canonical target,
+                        // never an alias such as `src/../.env`. Multi-file
+                        // patches have no single path that can grant the lot.
+                        let path = prepared
+                            .single_target_path()
+                            .unwrap_or_else(|| "(multiple files)".to_string());
                         let preview = prepared.preview();
                         let decision = ui
                             .confirm(ConfirmationRequest::FileEdit {

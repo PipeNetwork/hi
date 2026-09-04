@@ -19,6 +19,8 @@ pub(crate) struct GoalTurnState<'a> {
     /// The turn ended because verification itself could not run to a verdict
     /// (timed out, snapshot failed), not because the work was wrong.
     pub(crate) verification_infrastructure_error: bool,
+    /// Provider recovery ended without a usable completion of the work.
+    pub(crate) provider_exhausted: bool,
 }
 
 impl crate::Agent {
@@ -64,6 +66,7 @@ impl crate::Agent {
             verified_at,
             turn_ledger_revision,
             verification_infrastructure_error,
+            provider_exhausted,
         } = state;
         // Drafting a plan is not an execution attempt. In particular, a capped
         // planning turn must not consume the approved goal's retries or mark
@@ -82,6 +85,17 @@ impl crate::Agent {
         {
             baseline.block_active(prerequisite);
             blocked_this_turn = true;
+        }
+        // Verification can pass for a partial edit even when the provider
+        // failed before finishing the milestone. Keep that work and its pass,
+        // but neither advance the goal nor charge a failed-work attempt.
+        if provider_exhausted {
+            self.goals.structured = goal_before;
+            self.refresh_system_message();
+            if blocked_this_turn {
+                self.persist_goal(ui);
+            }
+            return false;
         }
         let Some(start_goal) = goal_before.as_ref() else {
             return false;

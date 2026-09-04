@@ -5,9 +5,10 @@
 //! [`crate::verify::WorkspaceRepairVerifier`] under
 //! [`super::phase::TurnPhase::WorkspaceRepair`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
-use hi_ai::OutputCapError;
+use hi_ai::{Content, OutputCapError};
+use sha2::{Digest, Sha256};
 
 use crate::steering::{AnswerRepairMode, EvidenceTracker};
 use crate::transcript::NudgeKind;
@@ -25,6 +26,9 @@ pub(super) const MAX_CAPACITY_RETRIES: u32 = 6;
 pub(super) const CAPACITY_RETRY_DELAYS: [u64; 6] = [2, 4, 8, 15, 30, 45];
 pub(super) const MAX_CAPACITY_RETRY_DELAY_SECS: u64 = 60;
 pub(super) const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
+/// Productive truncation can continue indefinitely, but repeated fragments
+/// must not bypass the ordinary no-progress guards indefinitely.
+const MAX_REPEATED_TRUNCATIONS: u32 = 4;
 
 impl crate::Agent {
     /// Give a no-progress path one bounded chance to choose a different action.
@@ -157,9 +161,41 @@ pub(super) struct TurnRetryState {
     /// A plain-text tool-call recovery response contained narration/empty text
     /// instead of an executable call. Reset after a successfully parsed call.
     pub(super) text_tool_fallback_misses: u32,
+    truncated_fragments: HashSet<[u8; 32]>,
+    repeated_truncations: u32,
 }
 
 impl TurnRetryState {
+    pub(super) fn truncated_output_stalled(&mut self, content: &[Content]) -> bool {
+        let mut digest = Sha256::new();
+        for block in content {
+            let parts: &[&str] = match block {
+                Content::Text(text) => &["text", text.trim()],
+                // Provider call ids change on retries even when the attempted
+                // operation and incomplete arguments are identical.
+                Content::ToolCall {
+                    name, arguments, ..
+                } => &["tool", name, arguments.trim()],
+                _ => continue,
+            };
+            for part in parts {
+                digest.update((part.len() as u64).to_le_bytes());
+                digest.update(part.as_bytes());
+            }
+        }
+        if self.truncated_fragments.insert(digest.finalize().into()) {
+            self.repeated_truncations = 0;
+        } else {
+            self.repeated_truncations = self.repeated_truncations.saturating_add(1);
+        }
+        self.repeated_truncations >= MAX_REPEATED_TRUNCATIONS
+    }
+
+    pub(super) fn reset_truncation_progress(&mut self) {
+        self.truncated_fragments.clear();
+        self.repeated_truncations = 0;
+    }
+
     pub(super) fn request_id(&mut self) -> String {
         self.request_id
             .get_or_insert_with(|| format!("hi_{}", uuid::Uuid::new_v4().simple()))

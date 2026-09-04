@@ -191,20 +191,9 @@ pub(super) async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) ->
     if let Some(cached) = cached {
         return Ok(cached);
     }
-    let size = tokio::fs::metadata(path)
-        .await
-        .with_context(|| format!("reading metadata for {path}"))?
-        .len();
-    if size > MAX_READ_FILE_BYTES {
-        bail!(
-            "{path} is too large to load into the read cache ({size} bytes; limit {MAX_READ_FILE_BYTES}). Use `bash` with a bounded command such as `sed` or `head` to inspect it."
-        );
-    }
     // Read as bytes first so we can detect binary files and
     // give a clear message instead of an opaque UTF-8 error.
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("reading {path}"))?;
+    let bytes = read_regular_file_bytes_async(path).await?;
     if is_binary(&bytes) {
         bail!(
             "{path} is a binary file ({} bytes) — the `read` tool is for text. \
@@ -374,6 +363,59 @@ pub(crate) fn is_binary(bytes: &[u8]) -> bool {
     probe.contains(&0)
 }
 
+/// Read a bounded regular file through one descriptor. Inspecting the opened
+/// file closes the stat/read race, and the read cap still holds if it grows.
+/// Nonblocking open prevents a FIFO from consuming a blocking worker forever
+/// before we can reject its descriptor type.
+pub(crate) fn read_regular_file_bytes(path: &std::path::Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "{} is not a regular file; text tools cannot read special files or directories",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_READ_FILE_BYTES {
+        bail!(
+            "{} is too large for text tools ({} bytes; limit {MAX_READ_FILE_BYTES}). Use `bash` with a bounded command to inspect or modify it.",
+            path.display(),
+            metadata.len()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_READ_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() as u64 > MAX_READ_FILE_BYTES {
+        bail!(
+            "{} grew too large while reading (limit {MAX_READ_FILE_BYTES} bytes)",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+async fn read_regular_file_bytes_async(path: &str) -> Result<Vec<u8>> {
+    let path = std::path::PathBuf::from(path);
+    tokio::task::spawn_blocking(move || read_regular_file_bytes(&path))
+        .await
+        .context("text file reader failed")?
+}
+
 /// Read a file as UTF-8 text, bailing with a clear message if it's binary
 /// (same heuristic as `read`) or not valid UTF-8. Used by the preserving-edit
 /// paths (`edit`/`multi_edit`/`apply_patch`), which write the decoded string
@@ -381,18 +423,7 @@ pub(crate) fn is_binary(bytes: &[u8]) -> bool {
 /// byte in the whole file with U+FFFD on the write-back, corrupting e.g.
 /// Latin-1 files even on lines the edit never touched.
 pub(crate) async fn read_text_file(path: &str) -> Result<String> {
-    let size = tokio::fs::metadata(path)
-        .await
-        .with_context(|| format!("reading metadata for {path}"))?
-        .len();
-    if size > MAX_READ_FILE_BYTES {
-        bail!(
-            "{path} is too large to edit in place ({size} bytes; limit {MAX_READ_FILE_BYTES}). Use `bash` with a bounded command such as `sed` to modify it."
-        );
-    }
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("reading {path}"))?;
+    let bytes = read_regular_file_bytes_async(path).await?;
     if is_binary(&bytes) {
         bail!(
             "{path} is a binary file ({} bytes) — the `edit`/`multi_edit` tools are for text. \
@@ -552,6 +583,59 @@ mod tests {
             .expect_err("edit path must reject the same oversized file");
         assert!(edit_err.to_string().contains("too large"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_tools_reject_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.pipe");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid, NUL-terminated path owned by this test.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let reader_path = path.clone();
+        let mut reader =
+            tokio::task::spawn_blocking(move || super::read_regular_file_bytes(&reader_path));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut reader).await;
+        if result.is_err() {
+            // Release an incorrectly blocking reader before failing, otherwise
+            // the Tokio runtime would wait forever for its blocking worker.
+            std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let _ = reader.await;
+            panic!("text file reader blocked opening a FIFO");
+        }
+        let error = result.unwrap().unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "{error:#}"
+        );
+
+        let cache = std::sync::Mutex::new(crate::paths::ReadCache::new());
+        assert!(
+            run_read(root.path(), &cache, r#"{"path":"source.pipe"}"#)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+        assert!(
+            super::read_text_file(path.to_str().unwrap())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+        let state = tempfile::tempdir().unwrap();
+        let error = crate::edit::plan_multi_patch(
+            root.path(),
+            state.path(),
+            "*** Begin Patch\n*** Update File: source.pipe\n-old\n+new\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("not a regular file"));
     }
 
     #[tokio::test]

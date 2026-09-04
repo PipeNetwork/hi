@@ -1991,6 +1991,53 @@ fn completed_turn_with_pending_plan_still_auto_drives() {
 }
 
 #[test]
+fn loaded_session_drops_previous_turn_failure_and_planning_controls() {
+    for (status, stop_reason, permission) in [
+        (
+            TurnStatus::Failed,
+            TurnStopReason::InfrastructureFailure,
+            PermissionMode::Always,
+        ),
+        (
+            TurnStatus::Cancelled,
+            TurnStopReason::Cancelled,
+            PermissionMode::Auto,
+        ),
+    ] {
+        let mut agent = goal_agent();
+        agent.set_plan_mode(true);
+        agent.set_permission_mode(permission);
+        agent.approval_parked = true;
+        let mut outcome = completed_outcome(None);
+        outcome.status = status;
+        outcome.stop_reason = stop_reason;
+        agent.report.last_turn_outcome = Some(outcome);
+        assert!(!agent.tools.iter().any(|tool| tool.name == "write"));
+
+        agent
+            .apply_loaded_session(
+                vec![Message::user("continue this session's work")],
+                Usage::default(),
+                Vec::new(),
+                Some(Goal::new("new session goal", vec!["implement it".into()])),
+                crate::DecisionLog::default(),
+                Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            agent.drive_decision(None),
+            crate::DriveAction::Enqueue(crate::DriveKind::Goal)
+        );
+        assert!(agent.last_turn_outcome().is_none());
+        assert!(!agent.plan_mode());
+        assert!(!agent.approval_parked());
+        assert!(agent.tools.iter().any(|tool| tool.name == "write"));
+        assert_eq!(agent.permission_mode(), permission);
+    }
+}
+
+#[test]
 fn terminal_turn_with_pending_work_never_auto_drives_without_explicit_resume() {
     let mut agent = goal_agent();
     agent.restore_plan(vec![pending_step("wire the scheduler")]);

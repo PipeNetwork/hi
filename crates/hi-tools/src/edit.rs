@@ -122,15 +122,7 @@ pub(crate) fn plan_multi_patch(
             "update" => {
                 ensure!(!body.is_empty(), "update operation for {path} has no hunks");
                 let target = resolve_workspace_target(root, Path::new(path))?;
-                let size = std::fs::metadata(&target)
-                    .with_context(|| format!("reading {path} (use *** Add File: to create)"))?
-                    .len();
-                ensure!(
-                    size <= crate::read::MAX_READ_FILE_BYTES,
-                    "{path} is too large to patch in place ({size} bytes; limit {})",
-                    crate::read::MAX_READ_FILE_BYTES
-                );
-                let bytes = std::fs::read(&target)
+                let bytes = crate::read::read_regular_file_bytes(&target)
                     .with_context(|| format!("reading {path} (use *** Add File: to create)"))?;
                 ensure!(!crate::read::is_binary(&bytes), "{path} is a binary file");
                 let original = String::from_utf8(bytes)
@@ -258,6 +250,11 @@ fn apply_hunk_patch_text(original: &str, patch_lines: &[&str]) -> Result<String>
         let mut source_index = start;
         for line in hunk {
             if let Some(added) = line.strip_prefix('+') {
+                // A context anchor may be the original unterminated EOF line.
+                // Appending a new line must terminate that anchor first.
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push_str(newline);
+                }
                 out.push_str(added);
                 out.push_str(
                     removed_endings
@@ -731,9 +728,21 @@ pub(crate) fn reindent(new: &str, old_indent: &str, file_indent: &str) -> String
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_edit, apply_hunk_patch, apply_multi_patch_at, diff, edit_not_found_help,
-        plan_multi_patch,
+        apply_edit, apply_hunk_patch, apply_hunk_patch_text, apply_multi_patch_at, diff,
+        edit_not_found_help, plan_multi_patch,
     };
+
+    #[test]
+    fn patch_append_after_unterminated_context_preserves_line_boundary() {
+        assert_eq!(
+            apply_hunk_patch_text("alpha", &[" alpha", "+beta", "+gamma"]).unwrap(),
+            "alpha\nbeta\ngamma"
+        );
+        assert_eq!(
+            apply_hunk_patch_text("header\r\nalpha", &[" alpha", "+beta"]).unwrap(),
+            "header\r\nalpha\r\nbeta"
+        );
+    }
 
     #[test]
     fn edit_not_found_points_at_similar_lines() {

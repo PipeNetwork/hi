@@ -1330,6 +1330,7 @@ impl crate::Agent {
                     verified_at: self.report.verify.bound_revision_digest().as_ref(),
                     turn_ledger_revision: turn.turn_ledger_revision,
                     verification_infrastructure_error: turn.verification_infrastructure_error,
+                    provider_exhausted: turn.flags.provider_exhausted,
                 },
                 ui,
             )

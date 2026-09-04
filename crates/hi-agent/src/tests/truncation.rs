@@ -126,7 +126,7 @@ async fn truncation_gives_up_after_retry_budget() {
     ];
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
-    agent.run_turn("big task", &mut ui).await.unwrap();
+    let outcome = agent.run_turn("big task", &mut ui).await.unwrap();
     // One "continuing" retry warning, then one exhaustion warning.
     assert_eq!(
         ui.statuses
@@ -145,6 +145,99 @@ async fn truncation_gives_up_after_retry_budget() {
         ui.statuses
     );
     assert!(ui.turn_end.is_some(), "turn ended after budget exhausted");
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::InfrastructureFailure);
+}
+
+#[tokio::test]
+async fn repeated_truncated_output_cannot_retry_forever_with_default_limits() {
+    for partial_tool_call in [false, true] {
+        let cfg = config();
+        assert_eq!(cfg.loop_limits.max_truncation_retries, u32::MAX);
+        let responses = (0..12)
+            .map(|index| Completion {
+                content: if partial_tool_call {
+                    vec![Content::ToolCall {
+                        id: format!("new-provider-id-{index}"),
+                        name: "write".into(),
+                        arguments: r#"{"path":"unfinished.rs","content":"pub fn "#.into(),
+                    }]
+                } else {
+                    // Alternating old fragments is no more productive than
+                    // repeating one cutoff verbatim.
+                    vec![Content::Text(format!("unfinished fragment {}", index % 2))]
+                },
+                usage: Usage::default(),
+                stop_reason: Some("length".into()),
+                ..Completion::default()
+            })
+            .collect();
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+
+        let outcome = agent
+            .run_turn("explain the implementation", &mut ui)
+            .await
+            .expect("repeated output must settle before exhausting the scripted provider");
+
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        assert_eq!(outcome.stop_reason, TurnStopReason::InfrastructureFailure);
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("repeated truncated output"))
+        );
+        assert!(outcome.changed_files.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn truncated_goal_turn_keeps_its_milestone_after_verifying_partial_work() {
+    let workspace = IsolatedWorkspace::new("truncated-goal");
+    let mut cfg = workspace.config();
+    cfg.subagents.long_horizon = true;
+    cfg.loop_limits.max_truncation_retries = 0;
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    let path = workspace.path("partial.rs");
+    let mut agent = agent(
+        vec![
+            write_content_completion(&path.to_string_lossy(), "pub fn first_part() {}\n"),
+            Completion {
+                content: vec![Content::Text("The remaining implementation needs".into())],
+                stop_reason: Some("length".into()),
+                ..Completion::default()
+            },
+            completion(vec![Content::Text("done".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let mut goal = Goal::new(
+        "implement both parts",
+        vec!["first part".into(), "second part".into()],
+    );
+    goal.team = false;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    let outcome = agent.run_turn("go", &mut ui).await.unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::InfrastructureFailure);
+    assert!(
+        agent.report.verify.passed(),
+        "the partial edit itself passed verification"
+    );
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(
+        goal.active_index(),
+        Some(0),
+        "cutoff is not milestone completion"
+    );
+    assert_eq!(
+        goal.sub_goals[0].attempts, 0,
+        "provider failure is not failed work"
+    );
 }
 
 #[tokio::test]

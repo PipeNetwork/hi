@@ -56,6 +56,14 @@ impl PreparedMutation {
     pub fn preview(&self) -> String {
         self.plan.preview()
     }
+
+    /// The exact canonical workspace-relative target for a single-file request.
+    /// Approval scopes must use this sealed target instead of model arguments,
+    /// which may contain parent traversal or symlink aliases. Multi-file plans
+    /// return `None` and require approval for the complete operation.
+    pub fn single_target_path(&self) -> Option<String> {
+        self.plan.single_target_path()
+    }
 }
 /// Refuse `write` overwrites of existing files larger than this (bytes). Forces
 /// the model onto `edit` / `multi_edit` / `apply_patch` for real source rewrites.

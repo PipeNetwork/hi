@@ -495,8 +495,16 @@ impl crate::App {
                     self.trace_prompt_removed(&prompt);
                 }
                 self.mid_turn_offered.clear();
-                self.plan = agent.current_plan().to_vec();
-                self.goal = agent.structured_goal().cloned();
+                // Standing grants and unsaved approval/mode choices belong to
+                // the previous session. Never apply them to the newly loaded
+                // agent or let its first tool reuse an unrelated authorization.
+                self.auto_approve_session = false;
+                self.auto_approve_paths.clear();
+                self.auto_approve_mcp.clear();
+                self.plan_approval = None;
+                self.session_face_dirty = false;
+                self.plan_drive_pause_dirty = false;
+                self.refresh_goal(agent);
                 self.usage = (0, 0);
                 self.usage_estimated = false;
                 self.context_used = 0;
@@ -1837,6 +1845,10 @@ impl crate::App {
         Ok(sessions)
     }
 }
+
+#[cfg(test)]
+#[path = "session_switch_tests.rs"]
+mod session_switch_tests;
 
 fn shellexpand_path(raw: &str, workspace_root: &std::path::Path) -> std::path::PathBuf {
     let expanded = if let Some(rest) = raw.strip_prefix("~/") {

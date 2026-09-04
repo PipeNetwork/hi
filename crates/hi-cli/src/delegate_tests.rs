@@ -411,7 +411,7 @@ fn scoped_workspace_diff_and_merge_paths_remain_relative() {
 }
 
 #[test]
-fn verifier_mutation_is_unstable_and_rolls_back() {
+fn verifier_mutation_is_unstable_and_preserved_for_review() {
     let (root, worktree) = candidate_fixture("unstable");
     std::fs::write(worktree.join("value.txt"), "after\n").unwrap();
 
@@ -424,13 +424,47 @@ fn verifier_mutation_is_unstable_and_rolls_back() {
     )
     .expect_err("a verifier-mutated revision must not be accepted");
     assert!(format!("{error:#}").contains("unstable"));
+    assert!(format!("{error:#}").contains("rollback was refused"));
     assert_eq!(
         std::fs::read_to_string(root.join("value.txt")).unwrap(),
-        "before\n"
+        "verifier mutation\n"
     );
 
     hi_tools::worktree::cleanup(&root, &[worktree]);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn candidate_rollback_preserves_concurrent_user_edit() {
+    let (root, worktree) = candidate_fixture("concurrent-verifier-edit");
+    std::fs::write(worktree.join("value.txt"), "candidate\n").unwrap();
+    std::fs::create_dir_all(root.join(".hi")).unwrap();
+    let writer_root = root.clone();
+    let writer = std::thread::spawn(move || {
+        let started = Instant::now();
+        while !writer_root.join(".hi/verification-started").exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "verifier did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(writer_root.join("value.txt"), "user's concurrent edit\n").unwrap();
+        std::fs::write(writer_root.join(".hi/verification-continue"), "").unwrap();
+    });
+    let result = apply_candidate_and_reverify(
+        &worktree,
+        "HEAD",
+        &root,
+        &root.join(".hi-test-state"),
+        "touch .hi/verification-started; n=0; while test ! -f .hi/verification-continue && test $n -lt 500; do n=$((n+1)); sleep 0.01; done; false",
+    );
+    writer.join().unwrap();
+    let content = std::fs::read_to_string(root.join("value.txt")).unwrap();
+    hi_tools::worktree::cleanup(&root, &[worktree]);
+    let _ = std::fs::remove_dir_all(root);
+    assert!(result.is_err());
+    assert_eq!(content, "user's concurrent edit\n");
 }
 
 #[test]

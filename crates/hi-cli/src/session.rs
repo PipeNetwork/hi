@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Take, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Take, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 
 #[path = "session_shadow.rs"]
 pub(crate) mod session_shadow;
+
+#[cfg(test)]
+#[path = "session_append_tests.rs"]
+mod append_tests;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -152,6 +156,35 @@ pub(crate) fn session_snapshot_reader(path: &Path) -> std::io::Result<BufReader<
     Ok(BufReader::new(file.take(snapshot_len)))
 }
 
+/// Serialize appenders and separate an interrupted final record from new
+/// records. Preserve the old bytes for recovery, including a valid final
+/// record that simply lacks its newline. The lock covers both the tail check
+/// and every partial write, so concurrent writers cannot interleave records.
+pub(crate) fn append_session_records(path: &Path, payload: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("locking {} for append", path.display()))?;
+    if file.metadata()?.len() > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut tail = [0];
+        file.read_exact(&mut tail)?;
+        if tail[0] != b'\n' {
+            file.write_all(b"\n")
+                .with_context(|| format!("separating interrupted record in {}", path.display()))?;
+        }
+    }
+    file.write_all(payload.as_bytes())
+        .with_context(|| format!("appending to {}", path.display()))
+}
+
 /// Count JSONL records with fixed memory. A final unterminated record still
 /// counts, matching `str::lines()` and making crash-truncated tails visible in
 /// session listings without allocating their contents.
@@ -191,24 +224,9 @@ impl JsonlSession {
         &self.path
     }
 
-    /// Append a fully-formatted payload (one or more `\n`-terminated JSONL
-    /// lines) with a single `write_all` on the `O_APPEND` fd. A buffered
-    /// writer would split records larger than its buffer across multiple
-    /// `write()` calls, letting a concurrent appender (a second `hi -c` in the
-    /// same project, or a fleet child on `--session-file`) interleave mid-line
-    /// — and `load_history` silently drops unparseable lines.
+    /// Append a fully formatted payload of newline-terminated JSONL records.
     fn append(&self, payload: &str) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("opening {}", self.path.display()))?;
-        file.write_all(payload.as_bytes())
-            .with_context(|| format!("appending to {}", self.path.display()))?;
-        Ok(())
+        append_session_records(&self.path, payload)
     }
 
     fn append_meta(&self, meta: &SessionMeta) -> Result<()> {

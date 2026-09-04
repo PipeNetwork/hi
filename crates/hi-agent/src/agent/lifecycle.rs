@@ -589,7 +589,13 @@ impl crate::Agent {
         self.goals.set_plan_if_pending(plan);
         self.workspace.last_changed_files = Vec::new();
         self.report.last_turn_telemetry = TurnTelemetry::default();
+        self.report.last_turn_outcome = None;
         self.report.verify = VerifyEvidence::none();
+        self.approval_parked = false;
+        // Mode and terminal-outcome latches belong to the old session. Restore
+        // the normal tool catalog without changing process permission settings;
+        // the caller restores the new session's durable approval/drive gates.
+        self.set_plan_mode(false);
         // Re-seed the context gauge for the switched-in transcript (see
         // `resume`): carrying the previous session's value either disables
         // graceful compaction or triggers it spuriously.

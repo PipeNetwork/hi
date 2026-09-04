@@ -368,6 +368,13 @@ impl MutationPlan {
         &self.root
     }
 
+    pub(crate) fn single_target_path(&self) -> Option<String> {
+        let [change] = self.changes.as_slice() else {
+            return None;
+        };
+        Some(workspace_display_path(&self.root, &change.target))
+    }
+
     /// Exact metadata that will be returned after a successful commit.
     pub fn file_changes(&self) -> Vec<FileChange> {
         self.changes

@@ -1,8 +1,7 @@
 //! Typed, versioned harness overrides carried by an append-only session.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -74,14 +73,33 @@ pub(crate) fn parse_record(payload: &str) -> Result<Option<SettingLayer>> {
 /// session. Missing files and sessions without a record have an empty layer.
 pub(crate) fn load(path: &Path) -> Result<SettingLayer> {
     let mut layer = empty_layer();
-    let reader = match crate::session::session_snapshot_reader(path) {
+    let mut reader = match crate::session::session_snapshot_reader(path) {
         Ok(reader) => reader,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(layer),
         Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
     };
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("reading {}", path.display()))?;
-        if let Some(next) = parse_record(&line)
+    let mut record = Vec::new();
+    loop {
+        record.clear();
+        if reader
+            .read_until(b'\n', &mut record)
+            .with_context(|| format!("reading {}", path.display()))?
+            == 0
+        {
+            break;
+        }
+        if record.last() == Some(&b'\n') {
+            record.pop();
+        }
+        if record.last() == Some(&b'\r') {
+            record.pop();
+        }
+        // Match the session history loader: a crash can cut a UTF-8 codepoint
+        // in an unrelated record without invalidating earlier settings.
+        let Ok(line) = std::str::from_utf8(&record) else {
+            continue;
+        };
+        if let Some(next) = parse_record(line)
             .with_context(|| format!("reading harness settings from {}", path.display()))?
         {
             layer = next;
@@ -108,21 +126,11 @@ pub(crate) fn encode(layer: &SettingLayer) -> Result<String> {
     Ok(encoded)
 }
 
-/// Append one complete last-write-wins session layer with a single write.
+/// Append one complete last-write-wins session layer using the shared writer.
 pub(crate) fn append(path: &Path, layer: &SettingLayer) -> Result<()> {
     let mut encoded = encode(layer)?;
     encoded.push('\n');
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    file.write_all(encoded.as_bytes())
-        .with_context(|| format!("appending harness settings to {}", path.display()))
+    crate::session::append_session_records(path, &encoded)
 }
 
 pub(crate) fn ensure_agent_compatible(agent: &hi_agent::Agent, layer: &SettingLayer) -> Result<()> {
@@ -195,6 +203,25 @@ mod tests {
         append(&path, &layer(7)).unwrap();
         append(&path, &layer(3)).unwrap();
         assert_eq!(load(&path).unwrap(), layer(3));
+    }
+
+    #[test]
+    fn settings_survive_interrupted_utf8_record_and_subsequent_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        append(&path, &layer(7)).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"text\":\"\xf0\x9f");
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(load(&path).unwrap(), layer(7));
+        append(&path, &layer(3)).unwrap();
+        assert_eq!(load(&path).unwrap(), layer(3));
+        assert_eq!(
+            crate::session::load_history(&path)
+                .unwrap()
+                .harness_settings,
+            layer(3)
+        );
     }
 
     #[test]
