@@ -51,6 +51,15 @@ impl crate::Agent {
         self.workspace_durability.is_some()
     }
 
+    /// Record the remote workspace-authority bit alongside the durable
+    /// transcript so a later resume still probes IPOP after OS cache cleanup.
+    pub fn record_pipefs_mode(&mut self, enabled: bool) -> Result<()> {
+        if let Some(session) = self.session.as_mut() {
+            session.record_pipefs_mode(enabled)?;
+        }
+        Ok(())
+    }
+
     /// Replace repository-supplied prompt context after a controlled root
     /// switch. Standing user rules remain session-scoped; only files from the
     /// newly materialized workspace are re-read by the frontend.
@@ -84,7 +93,7 @@ impl crate::Agent {
         workspace_root: impl AsRef<std::path::Path>,
         state_root: impl AsRef<std::path::Path>,
     ) -> Result<()> {
-        self.rebind_workspace_with_project_hooks(workspace_root, state_root, true)
+        self.rebind_workspace_with_project_hooks(workspace_root, state_root, true, true)
             .await
     }
 
@@ -96,7 +105,32 @@ impl crate::Agent {
         workspace_root: impl AsRef<std::path::Path>,
         state_root: impl AsRef<std::path::Path>,
     ) -> Result<()> {
-        self.rebind_workspace_with_project_hooks(workspace_root, state_root, false)
+        self.rebind_workspace_with_project_hooks(workspace_root, state_root, false, true)
+            .await
+    }
+
+    /// Persist the last-write-wins checkpoint boundary which separates two
+    /// concrete workspace roots. Hosts which require a remote durability
+    /// barrier before changing roots can record and flush this boundary first,
+    /// then call [`Self::rebind_workspace_after_durable_boundary`].
+    pub fn record_workspace_checkpoint_boundary(&mut self) -> Result<()> {
+        if let Some(session) = self.session.as_mut() {
+            session
+                .record_checkpoints(&[])
+                .context("persisting the workspace checkpoint-generation boundary")?;
+        }
+        Ok(())
+    }
+
+    /// Rebind after [`Self::record_workspace_checkpoint_boundary`] has already
+    /// been durably flushed. This avoids creating an unacknowledged transcript
+    /// record after a remote workspace has been disabled.
+    pub async fn rebind_workspace_after_durable_boundary(
+        &mut self,
+        workspace_root: impl AsRef<std::path::Path>,
+        state_root: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        self.rebind_workspace_with_project_hooks(workspace_root, state_root, true, false)
             .await
     }
 
@@ -114,6 +148,7 @@ impl crate::Agent {
         workspace_root: impl AsRef<std::path::Path>,
         state_root: impl AsRef<std::path::Path>,
         allow_project_hooks: bool,
+        record_checkpoint_boundary: bool,
     ) -> Result<()> {
         self.runtime
             .background()
@@ -142,6 +177,13 @@ impl crate::Agent {
         // Do not disable the old runtime until every fallible replacement
         // construction step has succeeded. This keeps a failed rebind atomic
         // from the caller's perspective.
+        // Checkpoint references address snapshots of one concrete workspace.
+        // Append an explicit empty, last-write-wins boundary before switching
+        // roots so a crash or later resume can never apply an old root's undo
+        // snapshot to the newly activated workspace.
+        if record_checkpoint_boundary {
+            self.record_workspace_checkpoint_boundary()?;
+        }
         self.runtime.lsp().set_enabled(false).await;
         self.config.paths.workspace_root = replacement.root().to_path_buf();
         self.config.paths.state_root = replacement.state_root().to_path_buf();

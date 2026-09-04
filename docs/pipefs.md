@@ -9,6 +9,13 @@ durable.
 PipeFS is disabled by default. It requires an IPOP deployment with PipeFS enabled, authenticated
 session sync, and the current session writer lease.
 
+## Platform support
+
+PipeFS archive version 1 is supported on Linux and macOS only. Windows is unsupported: do not
+enable `[pipefs] enabled` or pass `--pipefs` on a Windows client. The v1 format accepts Unix
+filenames (while rejecting traversal, control characters, and names that collide under common
+macOS case/Unicode normalization), and relies on Unix symlink, mode, and atomic-rename semantics.
+
 ## Enabling it
 
 For a new headless or one-shot session, pass `--pipefs`. To make new sessions request it by
@@ -26,6 +33,10 @@ Interactive sessions expose these commands:
 /pipefs off
 /pipefs status
 /pipefs retry
+/pipefs recover list
+/pipefs recover inspect <cache-id>
+/pipefs recover export <cache-id> <destination.tar.zst>
+/pipefs recover discard <cache-id> --confirm <same-cache-id>
 ```
 
 The effective startup setting is chosen in this order:
@@ -65,6 +76,12 @@ continues in the launch directory as a fallback.
 An interrupted process leaves a private recovery marker with its dirty cache. A later process on
 the same machine can retry it only when its recorded base is still the remote head. Conflicting
 remote work is never overwritten or automatically merged.
+
+Local caches and mode hints are namespaced by the normalized IPOP origin and a non-secret
+fingerprint of the authenticated credential, in addition to the session and lease generation.
+Changing accounts, credentials, or IPOP deployments never exposes or automatically adopts another
+authority's recovery bytes. Caches created by older clients before authority scoping remain on disk
+for explicit manual salvage, but current clients do not automatically list, restore, or delete them.
 
 ## What “diskless” means
 

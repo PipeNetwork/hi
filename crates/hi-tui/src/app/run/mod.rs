@@ -58,6 +58,38 @@ impl Drop for LocalServerGuard {
     }
 }
 
+fn rearm_owned_loop_manager(
+    app: &mut App,
+    launcher: &std::sync::Arc<crate::FleetLauncher>,
+    event_sink: &Option<std::sync::Arc<dyn hi_events::EventSink>>,
+    fire_lock: Option<std::sync::Arc<crate::lock::FireLock>>,
+) -> bool {
+    if app.loops.is_some() {
+        return false;
+    }
+    app.loops = Some(crate::loops::start_with_fire_lock(
+        launcher.clone(),
+        launcher.loops_file.clone(),
+        event_sink.clone(),
+        fire_lock,
+    ));
+    true
+}
+
+fn ensure_owned_loop_fire_lock(
+    loops_file: Option<&std::path::Path>,
+    fire_lock: &mut Option<std::sync::Arc<crate::lock::FireLock>>,
+) -> bool {
+    let Some(loops_file) = loops_file else {
+        return true;
+    };
+    if fire_lock.is_none() {
+        *fire_lock =
+            crate::lock::try_acquire(&crate::lock::lock_path(loops_file)).map(std::sync::Arc::new);
+    }
+    fire_lock.is_some()
+}
+
 pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     agent.set_interactive_session(true);
     let crate::RunOptions {
@@ -319,42 +351,53 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     // second manager would double-fire every loop. Held for the session.
     let fleet_launcher = std::sync::Arc::new(fleet_launcher);
     let mut fleet_runtime = crate::dashboard::FleetRuntime::new();
-    let _fire_lock;
-    match &fleet_launcher.loops_file {
-        Some(lf) => {
-            let lp = crate::lock::lock_path(lf);
-            match crate::lock::try_acquire(&lp) {
-                Some(guard) => {
-                    _fire_lock = Some(guard);
-                    app.loops = Some(crate::loops::start(
-                        fleet_launcher.clone(),
-                        fleet_launcher.loops_file.clone(),
-                        event_sink.clone(),
-                    ));
-                }
-                None => {
-                    _fire_lock = None;
-                    let who = crate::lock::live_holder(&lp)
-                        .map(|p| format!(" (pid {p})"))
-                        .unwrap_or_default();
-                    app.push(Line::styled(
-                        format!(
-                            "⟳ loops are firing in a daemon{who} — /digest shows results; stop it to manage loops here"
-                        ),
-                        Style::default().fg(crate::theme::theme().accent_system),
-                    ));
-                }
-            }
-        }
-        None => {
-            // No persisted loops location: run the manager unlocked.
-            _fire_lock = None;
-            app.loops = Some(crate::loops::start(
-                fleet_launcher.clone(),
-                fleet_launcher.loops_file.clone(),
-                event_sink.clone(),
-            ));
-        }
+    let mut fire_lock = None;
+    let mut may_manage_loops =
+        ensure_owned_loop_fire_lock(fleet_launcher.loops_file.as_deref(), &mut fire_lock);
+    if agent.workspace_durability_enabled() {
+        // Loop children capture the launch workspace and cannot join this
+        // process's PipeFS lease/durability fence. In particular, persisted
+        // autofix loops must never re-arm against the directory that PipeFS
+        // promised to leave untouched. Keep any acquired fire lock while
+        // suspended so `/pipefs off` can safely re-arm this TUI's manager.
+        let (message, color) = if may_manage_loops {
+            (
+                "⟳ recurring loops are suspended while PipeFS is active".to_string(),
+                crate::theme::theme().accent_system,
+            )
+        } else {
+            let holder = fleet_launcher
+                .loops_file
+                .as_deref()
+                .and_then(|path| crate::lock::live_holder(&crate::lock::lock_path(path)))
+                .map(|pid| format!(" (pid {pid})"))
+                .unwrap_or_default();
+            (
+                format!(
+                    "⚠ recurring loops continue in an external daemon{holder} against the isolated launch workspace; stop that daemon before switching a local session into PipeFS"
+                ),
+                crate::theme::theme().warning,
+            )
+        };
+        app.push(Line::styled(message, Style::default().fg(color)));
+    } else if may_manage_loops {
+        app.loops = Some(crate::loops::start_with_fire_lock(
+            fleet_launcher.clone(),
+            fleet_launcher.loops_file.clone(),
+            event_sink.clone(),
+            fire_lock.clone(),
+        ));
+    } else if let Some(loops_file) = &fleet_launcher.loops_file {
+        let lock_path = crate::lock::lock_path(loops_file);
+        let who = crate::lock::live_holder(&lock_path)
+            .map(|pid| format!(" (pid {pid})"))
+            .unwrap_or_default();
+        app.push(Line::styled(
+            format!(
+                "⟳ loops are firing in a daemon{who} — /digest shows results; stop it to manage loops here"
+            ),
+            Style::default().fg(crate::theme::theme().accent_system),
+        ));
     }
     // Startup timing checkpoint for `HI_STARTUP_TRACE=1`: everything above is
     // the blocking path to the first frame; everything network-shaped beyond
@@ -2100,13 +2143,135 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     }
                     continue;
                 }
+                Command::Pipefs(arg) => {
+                    let operation = arg
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let may_activate = matches!(operation.as_str(), "on" | "enable" | "retry");
+                    let turning_off = matches!(operation.as_str(), "off" | "disable");
+
+                    if may_activate && !agent.workspace_durability_enabled() {
+                        may_manage_loops = ensure_owned_loop_fire_lock(
+                            fleet_launcher.loops_file.as_deref(),
+                            &mut fire_lock,
+                        );
+                        if !may_manage_loops {
+                            let holder = fleet_launcher
+                                .loops_file
+                                .as_deref()
+                                .and_then(|path| {
+                                    crate::lock::live_holder(&crate::lock::lock_path(path))
+                                })
+                                .map(|pid| format!(" (pid {pid})"))
+                                .unwrap_or_default();
+                            app.push(Line::styled(
+                                format!(
+                                    "PipeFS activation blocked: recurring loops are running in another HI process{holder}; stop it and retry"
+                                ),
+                                Style::default().fg(crate::theme::theme().warning),
+                            ));
+                            continue;
+                        }
+                    }
+
+                    if may_activate
+                        && (app.race.as_ref().is_some_and(|race| race.task.is_some())
+                            || app.plan_workflow_child.is_some()
+                            || !fleet_runtime.is_idle(&app))
+                    {
+                        app.push(Line::styled(
+                            "finish or cancel active race, fleet, and workflow children before enabling or recovering PipeFS; their launchers are bound to the launch workspace",
+                            Style::default().fg(crate::theme::theme().warning),
+                        ));
+                        continue;
+                    }
+
+                    let mut manager_stopped = false;
+                    if may_activate && let Some(loops) = app.loops.take() {
+                        app.push(Line::styled(
+                            "⟳ stopping recurring-loop children before switching workspaces…",
+                            Style::default().fg(crate::theme::theme().accent_system),
+                        ));
+                        terminal.draw(|frame| app.render(frame))?;
+                        // Drain completed notices before consuming the handle;
+                        // shutdown then cancels and joins every manager-owned
+                        // firing, trigger, and auto-fix child.
+                        for (line, _) in loops.drain() {
+                            app.push(Line::styled(line, dim()));
+                        }
+                        match loops.shutdown().await {
+                            Ok(()) => manager_stopped = true,
+                            Err(error) => {
+                                app.push(Line::styled(
+                                    format!(
+                                        "PipeFS activation blocked: recurring-loop shutdown was not acknowledged ({error})"
+                                    ),
+                                    Style::default().fg(crate::theme::theme().warning),
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+
+                    app.handle_command(agent, Command::Pipefs(arg)).await;
+                    let pipefs_active = agent.workspace_durability_enabled();
+                    let launch_workspace_active =
+                        agent.workspace_root() == fleet_launcher.workspace_root;
+                    if turning_off && !pipefs_active && launch_workspace_active {
+                        may_manage_loops = ensure_owned_loop_fire_lock(
+                            fleet_launcher.loops_file.as_deref(),
+                            &mut fire_lock,
+                        );
+                    }
+                    if may_activate && manager_stopped {
+                        if pipefs_active {
+                            app.push(Line::styled(
+                                "⟳ recurring loops suspended while PipeFS is active; /pipefs off will re-arm them",
+                                Style::default().fg(crate::theme::theme().accent_system),
+                            ));
+                        } else if launch_workspace_active
+                            && may_manage_loops
+                            && rearm_owned_loop_manager(
+                                &mut app,
+                                &fleet_launcher,
+                                &event_sink,
+                                fire_lock.clone(),
+                            )
+                        {
+                            app.push(Line::styled(
+                                "⟳ PipeFS was not activated; recurring loops re-armed",
+                                Style::default().fg(crate::theme::theme().accent_system),
+                            ));
+                        }
+                    } else if turning_off
+                        && !pipefs_active
+                        && launch_workspace_active
+                        && may_manage_loops
+                        && rearm_owned_loop_manager(
+                            &mut app,
+                            &fleet_launcher,
+                            &event_sink,
+                            fire_lock.clone(),
+                        )
+                    {
+                        app.push(Line::styled(
+                            "⟳ PipeFS is off; recurring loops re-armed in the original workspace",
+                            Style::default().fg(crate::theme::theme().accent_system),
+                        ));
+                    }
+                    continue;
+                }
                 // `/loop`: recurring agent turns on a cadence (manager task).
                 Command::Loop(arg) => {
                     if app.loops.is_none() {
-                        app.push(Line::styled(
-                            "loops are managed by a background daemon — stop it to manage them here, or use /digest to see what they've noticed".to_string(),
-                            dim(),
-                        ));
+                        let message = if agent.workspace_durability_enabled() {
+                            "loops are suspended while PipeFS is active; /pipefs off re-arms them when this TUI owns the fire lock"
+                        } else {
+                            "loops are managed by a background daemon — stop it to manage them here, or use /digest to see what they've noticed"
+                        };
+                        app.push(Line::styled(message.to_string(), dim()));
                         app.follow();
                         continue;
                     }
@@ -3417,6 +3582,17 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         app.set_working(false);
     }
 
+    // Do not release the per-project fire lock while a detached loop child can
+    // still be writing the launch workspace. The same acknowledged shutdown
+    // used by `/pipefs on` also closes this ordinary TUI-exit race.
+    if let Some(loops) = app.loops.take() {
+        loops
+            .shutdown()
+            .await
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("stopping recurring-loop children before TUI exit")?;
+    }
+
     // Persist input history for next time.
     if let Some(path) = &history_path {
         if let Some(parent) = path.parent() {
@@ -3440,8 +3616,28 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{expand_file_mentions, reconcile_queue_with_interjections};
+    use super::{
+        ensure_owned_loop_fire_lock, expand_file_mentions, reconcile_queue_with_interjections,
+    };
     use crate::tests::test_app;
+
+    #[test]
+    fn pipefs_loop_fence_requires_exclusive_fire_lock_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let loops_file = dir.path().join("loops.json");
+        let external_lock = crate::lock::try_acquire(&crate::lock::lock_path(&loops_file)).unwrap();
+        let mut owned_lock = None;
+
+        assert!(!ensure_owned_loop_fire_lock(
+            Some(&loops_file),
+            &mut owned_lock
+        ));
+        drop(external_lock);
+        assert!(ensure_owned_loop_fire_lock(
+            Some(&loops_file),
+            &mut owned_lock
+        ));
+    }
 
     #[test]
     fn expand_file_mentions_reads_existing_file() {

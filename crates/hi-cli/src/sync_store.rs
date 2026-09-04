@@ -823,6 +823,17 @@ impl SyncStore {
             .flatten())
     }
 
+    /// Record the conservative local freshness horizon established by a
+    /// successful authenticated heartbeat. The server's lease remains the
+    /// authority; this timestamp is only status/recovery evidence.
+    pub fn renew_lease_expiry(&self, session_id: &str, expiry: u64) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE session_sync SET lease_expiry_unix=?2 WHERE session_id=?1",
+            params![session_id, expiry],
+        )?;
+        Ok(())
+    }
+
     pub fn purge(&self) -> Result<()> {
         self.connection.lock().unwrap().execute_batch(
             "DELETE FROM record_outbox; DELETE FROM live_event_queue; DELETE FROM session_sync;",

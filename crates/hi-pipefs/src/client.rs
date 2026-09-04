@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
-use reqwest::{Method, StatusCode, Url};
+use reqwest::{Method, StatusCode, Url, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::RevisionKind;
@@ -35,15 +38,73 @@ pub struct PipeFsLease {
     pub generation: u64,
 }
 
+/// Opaque, non-secret identity for the authenticated IPOP authority that owns
+/// a local PipeFS cache.
+///
+/// The scope deliberately combines the normalized URL origin with a
+/// fingerprint of the credential. Session IDs are caller-selected and are not
+/// globally unique across IPOP deployments or billing accounts, so they cannot
+/// safely name recovery data on their own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PipeFsCacheScope(String);
+
+impl PipeFsCacheScope {
+    fn from_authority(base_url: &Url, api_key: &str) -> Self {
+        let mut credential =
+            blake3::Hasher::new_derive_key("hi.pipefs.cache-credential-fingerprint.v1");
+        credential.update(api_key.as_bytes());
+        let credential = credential.finalize();
+
+        let mut authority = blake3::Hasher::new_derive_key("hi.pipefs.cache-authority-scope.v1");
+        authority.update(base_url.origin().ascii_serialization().as_bytes());
+        authority.update(&[0]);
+        authority.update(credential.as_bytes());
+        Self(format!("v1-{}", authority.finalize().to_hex()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn directory_name(&self) -> String {
+        format!("authority-{}", self.0)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct PipeFsCapabilities {
     pub enabled: bool,
+    /// Independently-drainable rollout controls. `None` means an older server
+    /// whose aggregate `enabled` bit governs that operation.
+    #[serde(default)]
+    pub enrollment_enabled: Option<bool>,
+    #[serde(default)]
+    pub writes_enabled: Option<bool>,
+    #[serde(default)]
+    pub restore_enabled: Option<bool>,
+    #[serde(default)]
+    pub garbage_collection_enabled: Option<bool>,
     pub archive_version: u16,
     pub transfer_modes: Vec<String>,
     pub maximum_revision_bytes: u64,
     pub maximum_workspace_bytes: u64,
     pub maximum_delta_chain: u32,
     pub transfer_expiry_seconds: u64,
+}
+
+impl PipeFsCapabilities {
+    pub fn enrollment_available(&self) -> bool {
+        self.enrollment_enabled.unwrap_or(self.enabled)
+            && self.writes_enabled.unwrap_or(self.enabled)
+    }
+
+    pub fn writes_available(&self) -> bool {
+        self.writes_enabled.unwrap_or(self.enabled)
+    }
+
+    pub fn restore_available(&self) -> bool {
+        self.restore_enabled.unwrap_or(self.enabled)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -102,6 +163,7 @@ pub enum PipeFsError {
 pub struct PipeFsClient {
     config: PipeFsClientConfig,
     base_url: Url,
+    cache_scope: PipeFsCacheScope,
     http: reqwest::Client,
 }
 
@@ -150,6 +212,20 @@ impl PipeFsClient {
                 "IPOP URL must use http or https".to_string(),
             ));
         }
+        if !safe_transport_url(&base_url) {
+            return Err(PipeFsError::Protocol(
+                "IPOP URL must use HTTPS unless it is a loopback development endpoint".to_string(),
+            ));
+        }
+        if !base_url.username().is_empty()
+            || base_url.password().is_some()
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+        {
+            return Err(PipeFsError::Protocol(
+                "IPOP URL cannot contain credentials, a query, or a fragment".to_string(),
+            ));
+        }
         if config.api_key.trim().is_empty() {
             return Err(PipeFsError::Authentication(
                 "an IPOP API key is required".to_string(),
@@ -159,11 +235,20 @@ impl PipeFsClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| PipeFsError::Protocol(error.to_string()))?;
+        let cache_scope = PipeFsCacheScope::from_authority(&base_url, &config.api_key);
         Ok(Self {
             config,
             base_url,
+            cache_scope,
             http,
         })
+    }
+
+    /// Return the opaque cache identity for this authenticated IPOP authority.
+    /// It is safe to persist; neither the origin nor credential can be recovered
+    /// from it.
+    pub fn cache_scope(&self) -> PipeFsCacheScope {
+        self.cache_scope.clone()
     }
 
     pub async fn capabilities(&self) -> Result<PipeFsCapabilities, PipeFsError> {
@@ -261,6 +346,82 @@ impl PipeFsClient {
         }
     }
 
+    /// Commit a staged archive by streaming it from disk for every upload
+    /// attempt. This keeps retry memory bounded by the HTTP transport buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_archive_file(
+        &self,
+        session_id: &str,
+        lease: &PipeFsLease,
+        expected_base_revision_id: Option<Uuid>,
+        revision_type: RevisionKind,
+        archive_path: &Path,
+        archive_size_bytes: u64,
+        archive_blake3: &str,
+        manifest_digest: &str,
+        logical_size_bytes: u64,
+        idempotency_key: &str,
+    ) -> Result<PipeFsRemoteState, PipeFsError> {
+        let request = PrepareRequest {
+            expected_base_revision_id,
+            revision_type,
+            artifact: ArtifactDescriptor {
+                blake3: archive_blake3.to_string(),
+                size_bytes: archive_size_bytes,
+                media_type: String::new(),
+            },
+            manifest_digest,
+            logical_size_bytes,
+            idempotency_key,
+        };
+        let prepared: PreparedRevision = self
+            .api_json(
+                Method::POST,
+                &format!("hi/sessions/{session_id}/pipefs/revisions"),
+                Some(lease),
+                Some(
+                    serde_json::to_value(request)
+                        .map_err(|error| PipeFsError::Protocol(error.to_string()))?,
+                ),
+            )
+            .await?;
+        if prepared.revision_type != revision_type {
+            return Err(PipeFsError::Protocol(
+                "server changed the prepared revision type".to_string(),
+            ));
+        }
+        let upload = self
+            .upload_file_transfer(
+                session_id,
+                lease,
+                &prepared,
+                archive_path,
+                archive_size_bytes,
+            )
+            .await;
+        // Commit is deliberately attempted even if the transfer returned an
+        // ambiguous network error: the immutable object may already exist.
+        let commit = self
+            .api_json_with_timeout(
+                Method::POST,
+                &format!(
+                    "hi/sessions/{session_id}/pipefs/revisions/{}/commit",
+                    prepared.revision_id
+                ),
+                Some(lease),
+                None,
+                self.config.transfer_timeout,
+            )
+            .await;
+        match (upload, commit) {
+            (Ok(()), result) => result,
+            (Err(_), Ok(state)) => Ok(state),
+            (Err(upload_error), Err(PipeFsError::MissingRevision(_)))
+            | (Err(upload_error), Err(PipeFsError::Storage(_))) => Err(upload_error),
+            (Err(_), Err(commit_error)) => Err(commit_error),
+        }
+    }
+
     pub async fn download_revision(
         &self,
         session_id: &str,
@@ -318,6 +479,58 @@ impl PipeFsClient {
         Ok(bytes)
     }
 
+    /// Download and verify a revision directly into a newly-created file.
+    /// Partial files are removed and transient transfer failures retry from
+    /// byte zero, so a caller never observes an unverified archive.
+    pub async fn download_revision_to_file(
+        &self,
+        session_id: &str,
+        revision: &RestoreRevision,
+        maximum_bytes: u64,
+        destination: &Path,
+    ) -> Result<(), PipeFsError> {
+        if revision.artifact.size_bytes > maximum_bytes {
+            return Err(PipeFsError::Corruption(format!(
+                "revision {} declares {} bytes, exceeding the negotiated limit of {}",
+                revision.revision_id, revision.artifact.size_bytes, maximum_bytes
+            )));
+        }
+        if destination.exists() {
+            return Err(PipeFsError::Protocol(format!(
+                "download destination already exists: {}",
+                destination.display()
+            )));
+        }
+        let authorization: DownloadAuthorization = self
+            .api_json(
+                Method::POST,
+                &format!(
+                    "hi/sessions/{session_id}/pipefs/revisions/{}/download",
+                    revision.revision_id
+                ),
+                None,
+                None,
+            )
+            .await?;
+        if authorization.revision_id != revision.revision_id
+            || authorization.artifact.blake3 != revision.artifact.blake3
+            || authorization.artifact.size_bytes != revision.artifact.size_bytes
+        {
+            return Err(PipeFsError::Protocol(
+                "download authorization does not match restore-chain metadata".to_string(),
+            ));
+        }
+        self.download_transfer_to_file(
+            session_id,
+            revision.revision_id,
+            &authorization.transfer,
+            &revision.artifact,
+            maximum_bytes,
+            destination,
+        )
+        .await
+    }
+
     async fn upload_transfer(
         &self,
         session_id: &str,
@@ -371,6 +584,88 @@ impl PipeFsClient {
         // accidental cross-session transfer reuse difficult to hide in callers.
         let _ = session_id;
         Ok(())
+    }
+
+    async fn upload_file_transfer(
+        &self,
+        session_id: &str,
+        lease: &PipeFsLease,
+        prepared: &PreparedRevision,
+        archive_path: &Path,
+        archive_size_bytes: u64,
+    ) -> Result<(), PipeFsError> {
+        self.ensure_transfer_fresh(&prepared.transfer)?;
+        if prepared.transfer.method != "PUT" {
+            return Err(PipeFsError::Protocol(
+                "upload authorization did not use PUT".to_string(),
+            ));
+        }
+        let proxy = prepared.transfer.transfer == "proxy";
+        let url = self.transfer_url(&prepared.transfer, proxy)?;
+        if proxy {
+            let expected_suffix = format!(
+                "/hi/sessions/{session_id}/pipefs/uploads/{}",
+                prepared.upload_session_id
+            );
+            if !url.path().ends_with(&expected_suffix) {
+                return Err(PipeFsError::Protocol(
+                    "proxy upload URL does not match the prepared upload session".to_string(),
+                ));
+            }
+        }
+        let metadata = std::fs::symlink_metadata(archive_path)
+            .map_err(|error| PipeFsError::Storage(error.to_string()))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() != archive_size_bytes
+        {
+            return Err(PipeFsError::Corruption(
+                "staged PipeFS archive changed before upload".to_string(),
+            ));
+        }
+
+        let mut delay = Duration::from_millis(150);
+        let mut last = None;
+        for attempt in 0..API_ATTEMPTS {
+            self.ensure_transfer_fresh(&prepared.transfer)?;
+            let file = tokio::fs::File::open(archive_path)
+                .await
+                .map_err(|error| PipeFsError::Storage(error.to_string()))?;
+            let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+            let mut request = self
+                .http
+                .put(url.clone())
+                .timeout(self.config.transfer_timeout)
+                .body(body)
+                .header(header::CONTENT_LENGTH, archive_size_bytes);
+            for (name, value) in &prepared.transfer.required_headers {
+                request = request.header(name, value);
+            }
+            if proxy {
+                request = request
+                    .header("x-api-key", &self.config.api_key)
+                    .header("x-hi-lease-token", &lease.token);
+            }
+            match request.send().await {
+                Ok(response) => {
+                    return consume_empty(response, "uploading PipeFS revision")
+                        .await
+                        .map_err(|error| self.classify(error));
+                }
+                Err(error) if error.is_connect() || error.is_timeout() || error.is_body() => {
+                    last = Some(error);
+                    if attempt + 1 < API_ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay *= 2;
+                    }
+                }
+                Err(error) => return Err(PipeFsError::Network(error.to_string())),
+            }
+        }
+        Err(PipeFsError::Network(last.map_or_else(
+            || "upload failed".to_string(),
+            |error| error.to_string(),
+        )))
     }
 
     async fn download_transfer(
@@ -442,6 +737,136 @@ impl PipeFsClient {
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
+    }
+
+    async fn download_transfer_to_file(
+        &self,
+        session_id: &str,
+        revision_id: Uuid,
+        transfer: &Transfer,
+        artifact: &ArtifactDescriptor,
+        maximum_bytes: u64,
+        destination: &Path,
+    ) -> Result<(), PipeFsError> {
+        self.ensure_transfer_fresh(transfer)?;
+        if transfer.method != "GET" {
+            return Err(PipeFsError::Protocol(
+                "download authorization did not use GET".to_string(),
+            ));
+        }
+        let proxy = transfer.transfer == "proxy";
+        let url = self.transfer_url(transfer, proxy)?;
+        if proxy {
+            let expected_suffix =
+                format!("/hi/sessions/{session_id}/pipefs/revisions/{revision_id}/content");
+            if !url.path().ends_with(&expected_suffix) {
+                return Err(PipeFsError::Protocol(
+                    "proxy download URL does not match the authorized revision".to_string(),
+                ));
+            }
+        }
+        let mut delay = Duration::from_millis(150);
+        let mut last = None;
+        for attempt in 0..API_ATTEMPTS {
+            self.ensure_transfer_fresh(transfer)?;
+            let _ = tokio::fs::remove_file(destination).await;
+            match self
+                .download_transfer_to_file_once(
+                    &url,
+                    transfer,
+                    proxy,
+                    artifact,
+                    maximum_bytes,
+                    destination,
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error @ PipeFsError::Network(_)) if attempt + 1 < API_ATTEMPTS => {
+                    last = Some(error);
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(destination).await;
+                    return Err(error);
+                }
+            }
+        }
+        let _ = tokio::fs::remove_file(destination).await;
+        Err(last.unwrap_or_else(|| PipeFsError::Network("download failed".to_string())))
+    }
+
+    async fn download_transfer_to_file_once(
+        &self,
+        url: &Url,
+        transfer: &Transfer,
+        proxy: bool,
+        artifact: &ArtifactDescriptor,
+        maximum_bytes: u64,
+        destination: &Path,
+    ) -> Result<(), PipeFsError> {
+        let mut request = self
+            .http
+            .get(url.clone())
+            .timeout(self.config.transfer_timeout);
+        for (name, value) in &transfer.required_headers {
+            request = request.header(name, value);
+        }
+        if proxy {
+            request = request.header("x-api-key", &self.config.api_key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| PipeFsError::Network(error.to_string()))?;
+        let mut response = checked_response(response, "downloading PipeFS revision")
+            .await
+            .map_err(|error| self.classify(error))?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum_bytes || length != artifact.size_bytes)
+        {
+            return Err(PipeFsError::Corruption(
+                "download response length does not match revision metadata".to_string(),
+            ));
+        }
+        let mut file = create_private_download(destination)?;
+        let mut size = 0_u64;
+        let mut hasher = blake3::Hasher::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| PipeFsError::Network(error.to_string()))?
+        {
+            size = size
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| PipeFsError::Corruption("download size overflow".to_string()))?;
+            if size > maximum_bytes || size > artifact.size_bytes {
+                return Err(PipeFsError::Corruption(format!(
+                    "download response exceeds the negotiated limit of {maximum_bytes} bytes"
+                )));
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| PipeFsError::Storage(error.to_string()))?;
+        }
+        if size != artifact.size_bytes {
+            return Err(PipeFsError::Corruption(format!(
+                "download has size {size}, expected {}",
+                artifact.size_bytes
+            )));
+        }
+        if hasher.finalize().to_hex().as_str() != artifact.blake3 {
+            return Err(PipeFsError::Corruption(
+                "download failed BLAKE3 verification".to_string(),
+            ));
+        }
+        file.sync_all()
+            .await
+            .map_err(|error| PipeFsError::Storage(error.to_string()))?;
+        Ok(())
     }
 
     async fn api_json<T: DeserializeOwned>(
@@ -522,24 +947,33 @@ impl PipeFsClient {
     }
 
     fn transfer_url(&self, transfer: &Transfer, proxy: bool) -> Result<Url, PipeFsError> {
-        match Url::parse(&transfer.url) {
+        let url = match Url::parse(&transfer.url) {
             Ok(url) if proxy => {
                 if url.origin() != self.base_url.origin() {
                     return Err(PipeFsError::Protocol(
                         "proxy transfer URL changed origin".to_string(),
                     ));
                 }
-                Ok(url)
+                url
             }
-            Ok(url) => Ok(url),
+            Ok(url) => url,
             Err(_) if proxy => self
                 .base_url
                 .join(transfer.url.trim_start_matches('/'))
-                .map_err(|error| PipeFsError::Protocol(error.to_string())),
-            Err(error) => Err(PipeFsError::Protocol(format!(
-                "invalid presigned transfer URL: {error}"
-            ))),
+                .map_err(|error| PipeFsError::Protocol(error.to_string()))?,
+            Err(error) => {
+                return Err(PipeFsError::Protocol(format!(
+                    "invalid presigned transfer URL: {error}"
+                )));
+            }
+        };
+        if !safe_transport_url(&url) {
+            return Err(PipeFsError::Protocol(
+                "PipeFS transfer URL must use HTTPS unless it is a loopback development endpoint"
+                    .to_string(),
+            ));
         }
+        Ok(url)
     }
 
     fn ensure_transfer_fresh(&self, transfer: &Transfer) -> Result<(), PipeFsError> {
@@ -581,6 +1015,37 @@ impl PipeFsClient {
     }
 }
 
+fn safe_transport_url(url: &Url) -> bool {
+    if url.scheme() == "https" {
+        return true;
+    }
+    if url.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn create_private_download(path: &Path) -> Result<tokio::fs::File, PipeFsError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| PipeFsError::Storage(error.to_string()))?;
+    Ok(tokio::fs::File::from_std(file))
+}
+
 #[derive(Debug)]
 struct HttpFailure {
     status: StatusCode,
@@ -611,8 +1076,86 @@ mod tests {
     fn rejects_credentials_without_a_safe_endpoint() {
         let mut config = PipeFsClientConfig::new("file:///tmp/api", "secret");
         assert!(PipeFsClient::new(config.clone()).is_err());
+        config.base_url = "http://example.test/v1".into();
+        assert!(PipeFsClient::new(config.clone()).is_err());
+        config.base_url = "http://127.0.0.1:8080/v1".into();
+        assert!(PipeFsClient::new(config.clone()).is_ok());
         config.base_url = "https://example.test/v1".into();
         config.api_key.clear();
         assert!(PipeFsClient::new(config).is_err());
+    }
+
+    #[test]
+    fn cache_scope_normalizes_origin_and_separates_credentials() {
+        let scope = |base_url, api_key| {
+            PipeFsClient::new(PipeFsClientConfig::new(base_url, api_key))
+                .unwrap()
+                .cache_scope()
+        };
+
+        assert_eq!(
+            scope("https://EXAMPLE.test/v1", "account-a"),
+            scope("https://example.test:443/another/api/path", "account-a")
+        );
+        assert_ne!(
+            scope("https://example.test/v1", "account-a"),
+            scope("https://example.test/v1", "account-b")
+        );
+        assert_ne!(
+            scope("https://example.test/v1", "account-a"),
+            scope("https://other.example.test/v1", "account-a")
+        );
+    }
+
+    #[test]
+    fn refuses_plaintext_non_loopback_transfer_urls() {
+        let client = PipeFsClient::new(PipeFsClientConfig::new(
+            "https://api.example.test/v1",
+            "secret",
+        ))
+        .unwrap();
+        let transfer = Transfer {
+            transfer: "presigned".to_string(),
+            method: "GET".to_string(),
+            url: "http://storage.example.test/object".to_string(),
+            required_headers: BTreeMap::new(),
+            expires_at_unix: i64::MAX,
+        };
+        assert!(client.transfer_url(&transfer, false).is_err());
+    }
+
+    #[test]
+    fn split_capabilities_fall_back_to_legacy_enabled_for_old_servers() {
+        let old: PipeFsCapabilities = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "archive_version": 1,
+            "transfer_modes": ["proxy"],
+            "maximum_revision_bytes": 1024,
+            "maximum_workspace_bytes": 4096,
+            "maximum_delta_chain": 20,
+            "transfer_expiry_seconds": 60
+        }))
+        .unwrap();
+        assert!(old.enrollment_available());
+        assert!(old.writes_available());
+        assert!(old.restore_available());
+
+        let draining: PipeFsCapabilities = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "enrollment_enabled": false,
+            "writes_enabled": false,
+            "restore_enabled": true,
+            "garbage_collection_enabled": false,
+            "archive_version": 1,
+            "transfer_modes": ["presigned"],
+            "maximum_revision_bytes": 1024,
+            "maximum_workspace_bytes": 4096,
+            "maximum_delta_chain": 20,
+            "transfer_expiry_seconds": 60
+        }))
+        .unwrap();
+        assert!(!draining.enrollment_available());
+        assert!(!draining.writes_available());
+        assert!(draining.restore_available());
     }
 }

@@ -33,7 +33,7 @@ jobs:
       - name: Clippy (0.2 core only)
         run: >-
           cargo clippy
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-pipefs
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
           --all-targets -- -A clippy::large-enum-variant -D warnings
@@ -41,14 +41,14 @@ jobs:
       - name: Core tests
         run: >-
           cargo nextest run
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-pipefs
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
 
       - name: Core doctests
         run: >-
           cargo test --doc
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-pipefs
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
 

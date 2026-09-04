@@ -1,5 +1,6 @@
 use super::{
-    automatic_workflow_plan_path, sync_session_enabled, top_level_error_code,
+    automatic_workflow_plan_path, canonical_session_identity, completed_session_switch,
+    pipefs_startup_authority_required, sync_session_enabled, top_level_error_code,
     validate_tui_event_trace_request,
 };
 use crate::config::{Cli, ProviderName, Settings};
@@ -18,6 +19,43 @@ use async_trait::async_trait;
 use clap::Parser;
 use hi_ai::{ChatRequest, CompatMode, Completion, Provider, ServedModel, StreamEvent, ToolMode};
 use std::path::PathBuf;
+
+#[test]
+fn canonical_remote_session_identity_survives_a_random_local_cache_name() {
+    let local = std::path::Path::new("/tmp/random-local-continuation.jsonl");
+    assert_eq!(
+        canonical_session_identity(None, Some("remote-session"), local),
+        "remote-session"
+    );
+    assert_eq!(
+        canonical_session_identity(Some("explicit-session"), Some("remote-session"), local),
+        "explicit-session"
+    );
+    assert_eq!(
+        canonical_session_identity(None, None, local),
+        "random-local-continuation"
+    );
+    assert_eq!(
+        completed_session_switch("remote-session".to_string(), "summary".to_string()).id,
+        "remote-session"
+    );
+}
+
+#[test]
+fn resumed_remote_identity_always_requires_authoritative_pipefs_probe() {
+    assert!(pipefs_startup_authority_required(
+        true, false, false, true, false
+    ));
+    assert!(pipefs_startup_authority_required(
+        true, false, false, false, true
+    ));
+    assert!(!pipefs_startup_authority_required(
+        false, false, false, true, false
+    ));
+    assert!(!pipefs_startup_authority_required(
+        true, false, false, false, false
+    ));
+}
 
 #[test]
 fn tui_event_trace_accepts_only_the_full_interactive_frontend() {

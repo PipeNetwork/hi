@@ -128,13 +128,7 @@ pub(crate) async fn repl(
                                 );
                                 continue;
                             };
-                            let result = match argument.trim().to_ascii_lowercase().as_str() {
-                                "" | "status" => Ok(host.status().await),
-                                "on" => host.enable(agent).await,
-                                "off" => host.disable(agent).await,
-                                "retry" => host.retry(agent).await,
-                                _ => Err(anyhow::anyhow!("usage: /pipefs on|off|status|retry")),
-                            };
+                            let result = host.command(&argument, agent).await;
                             match result {
                                 Ok(message) => println!("\x1b[2m{message}\x1b[0m"),
                                 Err(error) => {

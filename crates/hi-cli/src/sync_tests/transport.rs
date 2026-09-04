@@ -301,6 +301,88 @@ async fn lease_acquisition_retries_a_timeout_with_the_same_token() {
     server.abort();
 }
 
+#[tokio::test]
+async fn synchronous_lease_confirmation_fails_closed_and_marks_takeover() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_mock_http_request(&mut socket).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&request).contains("x-hi-lease-token: test-token"),
+            "confirmation must authenticate with the writer lease"
+        );
+        let body = r#"{"error":"lease_lost: replaced"}"#;
+        let response = format!(
+            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let store = unique_test_sync_store();
+    let session_id = format!("lease-confirm-{}", std::process::id());
+    store
+        .store_lease(&session_id, "test-token", 3, "test-owner", 4_000_000_000)
+        .unwrap();
+    let sink = RemoteSessionSink::with_store(
+        SyncConfig {
+            base_url: format!("http://{addr}"),
+            api_key: "test-key".to_string(),
+            machine_id: Some("test-machine".to_string()),
+            cwd_digest: None,
+        },
+        session_id,
+        None,
+        remote_session_http_client(),
+        store,
+    );
+
+    let error = sink.confirm_writer_lease().await.unwrap_err();
+    assert!(error.to_string().contains("409"));
+    assert!(sink.writer_lease_is_lost());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn synchronous_lease_confirmation_renews_local_freshness_evidence() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_mock_http_request(&mut socket).await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+    });
+
+    let store = unique_test_sync_store();
+    let session_id = format!("lease-renew-{}", std::process::id());
+    store
+        .store_lease(&session_id, "test-token", 3, "test-owner", 1)
+        .unwrap();
+    let sink = RemoteSessionSink::with_store(
+        SyncConfig {
+            base_url: format!("http://{addr}"),
+            api_key: "test-key".to_string(),
+            machine_id: Some("test-machine".to_string()),
+            cwd_digest: None,
+        },
+        session_id.clone(),
+        None,
+        remote_session_http_client(),
+        store.clone(),
+    );
+
+    sink.confirm_writer_lease().await.unwrap();
+    assert!(store.status(Some(&session_id)).unwrap().lease_expiry_unix > unix_now().max(0) as u64);
+    server.await.unwrap();
+}
+
 #[test]
 fn attach_stream_deduplicates_replayed_cursor_events() {
     let mut cursor = 41;

@@ -469,6 +469,19 @@ impl FleetRuntime {
             }
         }
     }
+
+    /// Whether no dashboard/workflow child or follow-up mutation remains.
+    /// Workspace rebinding must not strand a launcher that captured the prior
+    /// root, even when the dashboard view itself is closed.
+    pub(crate) fn is_idle(&self, app: &App) -> bool {
+        self.in_flight.is_empty()
+            && self.wf_join_handles.is_empty()
+            && !app
+                .fleet
+                .iter()
+                .any(|row| row.state == RowState::Working || row.kill.is_some())
+            && app.workflow_runs.values().all(|run| run.outcome.is_some())
+    }
 }
 
 /// Service all fleet work that is immediately ready without waiting for it.
@@ -3901,6 +3914,28 @@ mod tests {
             store: None,
             ownership: None,
         }
+    }
+
+    #[test]
+    fn fleet_runtime_idle_gate_covers_hidden_rows_and_workflows() {
+        let mut app = crate::tests::test_app("openai", "gpt-4o");
+        let runtime = FleetRuntime::new();
+        assert!(runtime.is_idle(&app));
+
+        app.fleet.push(row());
+        assert!(
+            !runtime.is_idle(&app),
+            "a working row remains active after the dashboard closes"
+        );
+        app.fleet[0].state = RowState::Idle;
+        assert!(runtime.is_idle(&app));
+
+        app.workflow_runs
+            .insert("active".to_string(), workflow_run("active", 1, 0));
+        assert!(
+            !runtime.is_idle(&app),
+            "an unterminated workflow must block workspace rebinding"
+        );
     }
 
     #[test]

@@ -59,6 +59,13 @@ pub trait SessionSink: Send {
         Ok(())
     }
 
+    /// Persist whether the remote PipeFS workspace is authoritative for this
+    /// session. Last write wins. Implementations that predate PipeFS may keep
+    /// the default no-op; the host also maintains a cache-local safety hint.
+    fn record_pipefs_mode(&mut self, _enabled: bool) -> Result<()> {
+        Ok(())
+    }
+
     /// Persist a long-horizon goal's state so a resumed session picks it up at
     /// its active sub-goal. Last write wins (the goal is replaced wholesale).
     /// Default no-op so existing mock sinks don't need to implement it.

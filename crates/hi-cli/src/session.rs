@@ -18,6 +18,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SessionMeta {
+    /// Canonical IPOP identity for a locally cached continuation of a remote
+    /// session. The local filename remains an implementation detail; all
+    /// future sync and PipeFS operations must keep using this identifier.
+    RemoteSessionIdentity {
+        session_id: String,
+    },
+    /// Whether IPOP's PipeFS workspace is the authoritative root for this
+    /// session. Last write wins; this survives cleanup of ephemeral caches.
+    PipeFsMode {
+        enabled: bool,
+    },
     /// User-defined display name. Last write wins; an empty name restores the
     /// automatic first-prompt title.
     Name {
@@ -204,12 +215,20 @@ impl JsonlSession {
         self.append(&line)
     }
 
+    pub fn record_remote_session_identity(&mut self, session_id: &str) -> Result<()> {
+        crate::sync::validate_session_id(session_id)?;
+        self.append_meta(&SessionMeta::RemoteSessionIdentity {
+            session_id: session_id.to_string(),
+        })
+    }
+
+    pub fn record_pipefs_mode(&mut self, enabled: bool) -> Result<()> {
+        self.append_meta(&SessionMeta::PipeFsMode { enabled })
+    }
+
     /// Persist checkpoint refs so a resumed session knows where it branched.
     #[allow(dead_code)]
     pub fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
-        if refs.is_empty() {
-            return Ok(());
-        }
         self.append_meta(&SessionMeta::Checkpoints {
             refs: refs.to_vec(),
         })
@@ -225,6 +244,10 @@ impl SessionSink for JsonlSession {
 
     fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
         JsonlSession::record_checkpoints(self, refs)
+    }
+
+    fn record_pipefs_mode(&mut self, enabled: bool) -> Result<()> {
+        JsonlSession::record_pipefs_mode(self, enabled)
     }
 
     fn record(&mut self, messages: &[Message], usage: Usage) -> Result<()> {
@@ -369,6 +392,12 @@ pub struct LoadedSession {
     pub messages: Vec<Message>,
     pub usage: Usage,
     pub checkpoint_refs: Vec<String>,
+    /// Canonical IPOP session identity when this file is a local continuation
+    /// cache created by `--attach --resume-local`.
+    pub remote_session_id: Option<String>,
+    /// Last locally observed remote PipeFS authority bit. `None` identifies
+    /// session files written before this metadata record existed.
+    pub pipefs_enabled: Option<bool>,
     /// User-defined display name, if one has been assigned (last write wins).
     pub name: Option<String>,
     /// A long-horizon goal persisted across sessions, if any (last write wins).
@@ -402,6 +431,8 @@ pub fn apply_loaded_session(agent: &mut hi_agent::Agent, loaded: LoadedSession) 
         messages,
         usage,
         checkpoint_refs,
+        remote_session_id: _,
+        pipefs_enabled: _,
         name: _,
         goal,
         decisions,
@@ -446,6 +477,12 @@ pub fn cache_loaded_session(path: &Path, loaded: &LoadedSession) -> Result<()> {
         )?;
         session.record(&[], loaded.usage)?;
         session.record_checkpoints(&loaded.checkpoint_refs)?;
+        if let Some(session_id) = &loaded.remote_session_id {
+            session.record_remote_session_identity(session_id)?;
+        }
+        if let Some(enabled) = loaded.pipefs_enabled {
+            session.record_pipefs_mode(enabled)?;
+        }
         if loaded.plan_drive_paused
             || loaded.plan_drive_stall > 0
             || !loaded.plan_drive_evidence.is_empty()
@@ -1119,6 +1156,8 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let mut messages = Vec::new();
     let mut usage = Usage::default();
     let mut checkpoint_refs = Vec::new();
+    let mut remote_session_id = None;
+    let mut pipefs_enabled = None;
     let mut loaded_goal: Option<hi_agent::Goal> = None;
     let mut loaded_decisions = hi_agent::DecisionLog::default();
     let mut loaded_plan = Vec::new();
@@ -1159,6 +1198,15 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         }
         if let Ok(meta) = serde_json::from_str::<SessionMeta>(line) {
             match meta {
+                SessionMeta::RemoteSessionIdentity { session_id } => {
+                    crate::sync::validate_session_id(&session_id).with_context(|| {
+                        format!("invalid remote session identity in {}", path.display())
+                    })?;
+                    remote_session_id = Some(session_id);
+                }
+                SessionMeta::PipeFsMode { enabled } => {
+                    pipefs_enabled = Some(enabled);
+                }
                 SessionMeta::Name { name } => {
                     legacy_plan_pause.clear_boundary();
                     loaded_name = (!name.trim().is_empty()).then(|| name.trim().to_string());
@@ -1315,6 +1363,8 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         messages,
         usage,
         checkpoint_refs,
+        remote_session_id,
+        pipefs_enabled,
         name: loaded_name,
         goal: loaded_goal,
         decisions: loaded_decisions,
@@ -1347,6 +1397,8 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
     let mut messages = Vec::new();
     let mut usage = Usage::default();
     let mut checkpoint_refs = Vec::new();
+    let mut remote_session_id = None;
+    let mut pipefs_enabled = None;
     let mut loaded_goal: Option<hi_agent::Goal> = None;
     let mut loaded_decisions = hi_agent::DecisionLog::default();
     let mut loaded_plan = Vec::new();
@@ -1373,6 +1425,14 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
         // Metadata records: parse the payload as a SessionMeta.
         if let Ok(meta) = serde_json::from_str::<SessionMeta>(&record.payload_json) {
             match meta {
+                SessionMeta::RemoteSessionIdentity { session_id } => {
+                    crate::sync::validate_session_id(&session_id)
+                        .context("invalid canonical identity in remote session records")?;
+                    remote_session_id = Some(session_id);
+                }
+                SessionMeta::PipeFsMode { enabled } => {
+                    pipefs_enabled = Some(enabled);
+                }
                 SessionMeta::Name { name } => {
                     legacy_plan_pause.clear_boundary();
                     loaded_name = (!name.trim().is_empty()).then(|| name.trim().to_string());
@@ -1516,6 +1576,8 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
         messages,
         usage,
         checkpoint_refs,
+        remote_session_id,
+        pipefs_enabled,
         name: loaded_name,
         goal: loaded_goal,
         decisions: loaded_decisions,
@@ -1808,6 +1870,8 @@ mod tests {
                 ..Usage::default()
             },
             checkpoint_refs: vec!["checkpoint-1".into()],
+            remote_session_id: Some("canonical-remote-session".into()),
+            pipefs_enabled: Some(true),
             name: Some("Restored session".into()),
             goal: None,
             decisions: hi_agent::DecisionLog::default(),
@@ -1829,6 +1893,8 @@ mod tests {
         assert_eq!(loaded.usage.input_tokens, expected.usage.input_tokens);
         assert_eq!(loaded.usage.output_tokens, expected.usage.output_tokens);
         assert_eq!(loaded.checkpoint_refs, expected.checkpoint_refs);
+        assert_eq!(loaded.remote_session_id, expected.remote_session_id);
+        assert_eq!(loaded.pipefs_enabled, expected.pipefs_enabled);
         assert_eq!(loaded.name, expected.name);
         assert_eq!(loaded.plan_drive_evidence, expected.plan_drive_evidence);
         assert_eq!(loaded.goal_drive_evidence, expected.goal_drive_evidence);
@@ -1866,6 +1932,8 @@ mod tests {
             messages: vec![Message::system("restored")],
             usage: Usage::default(),
             checkpoint_refs: Vec::new(),
+            remote_session_id: None,
+            pipefs_enabled: None,
             name: None,
             goal: None,
             decisions: hi_agent::DecisionLog::default(),
@@ -2103,7 +2171,7 @@ fix the parser";
     }
 
     #[test]
-    fn jsonl_session_round_trips_checkpoint_refs_last_write_wins() {
+    fn jsonl_session_round_trips_checkpoint_refs_and_empty_boundary_last_write_wins() {
         let mut path = std::env::temp_dir();
         path.push(format!(
             "hi-session-checkpoints-{}-{}.jsonl",
@@ -2119,11 +2187,12 @@ fix the parser";
             .record_checkpoints(&["old".to_string(), "older".to_string()])
             .unwrap();
         session.record_checkpoints(&["new".to_string()]).unwrap();
+        session.record_checkpoints(&[]).unwrap();
 
         let loaded = load_history(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(loaded.checkpoint_refs, vec!["new".to_string()]);
+        assert!(loaded.checkpoint_refs.is_empty());
     }
 
     #[test]

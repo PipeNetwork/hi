@@ -1644,7 +1644,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "pipefs",
-        args: "[on|off|status|retry]",
+        args: "[on|off|status|retry|recover list|inspect|export|discard]",
         help: "portable IPOP-backed workspace (native tools use an ephemeral local cache)",
         arg_values: &[
             (
@@ -1660,6 +1660,10 @@ pub const COMMANDS: &[CommandSpec] = &[
                 "show head, dirty paths, retries, and recovery state",
             ),
             ("retry", "retry a failed revision upload or commit"),
+            (
+                "recover",
+                "list, inspect, export, or explicitly discard crash-recovery caches",
+            ),
         ],
     },
     CommandSpec {

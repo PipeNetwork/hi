@@ -23,6 +23,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
 
+      - name: Verify PipeFS archives and native Git on macOS
+        run: cargo test -p hi-pipefs --all-targets
+
       - name: Build release TUI smoke binaries
         run: cargo build --release -p hi -p hi-smoke --no-default-features
 

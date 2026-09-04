@@ -227,6 +227,8 @@ fn session_snapshot_backfills_state_and_title() {
             ..Usage::default()
         },
         checkpoint_refs: vec!["checkpoint-1".into()],
+        remote_session_id: None,
+        pipefs_enabled: Some(true),
         name: Some("Named portal session".into()),
         goal: None,
         decisions: hi_agent::DecisionLog::default(),
@@ -296,6 +298,8 @@ fn session_snapshot_emits_default_drive_state_to_clear_remote_stale_values() {
         messages: Vec::new(),
         usage: Usage::default(),
         checkpoint_refs: Vec::new(),
+        remote_session_id: None,
+        pipefs_enabled: None,
         name: None,
         goal: None,
         decisions: hi_agent::DecisionLog::default(),

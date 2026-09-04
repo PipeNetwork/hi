@@ -1544,6 +1544,127 @@ impl hi_tools::McpBackend for PanicMcp {
     }
 }
 
+struct RecordingAdminMcp(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+#[async_trait::async_trait]
+impl hi_tools::McpBackend for RecordingAdminMcp {
+    async fn search(&self, _: Option<&str>) -> anyhow::Result<Vec<hi_tools::McpToolInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn call(&self, _: &str, _: &str, _: &serde_json::Value) -> anyhow::Result<String> {
+        unreachable!()
+    }
+
+    async fn workspace_admin(&self, _: &str) -> anyhow::Result<String> {
+        self.0.lock().unwrap().push("admin");
+        Ok("saved".to_string())
+    }
+}
+
+struct RecordingAdminDurability(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+#[async_trait::async_trait]
+impl crate::WorkspaceDurability for RecordingAdminDurability {
+    async fn mutation_started(&self, _: Option<Vec<String>>) -> anyhow::Result<()> {
+        self.0.lock().unwrap().push("admit");
+        Ok(())
+    }
+
+    async fn checkpoint(&self) -> anyhow::Result<()> {
+        self.0.lock().unwrap().push("checkpoint");
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn workspace_mcp_admin_is_wrapped_in_the_durability_fence() {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut subject = agent(Vec::new(), config());
+    subject.attach_mcp(std::sync::Arc::new(RecordingAdminMcp(events.clone())));
+    subject.set_workspace_durability(Some(std::sync::Arc::new(RecordingAdminDurability(
+        events.clone(),
+    ))));
+
+    let result = subject
+        .mcp_workspace_admin("add docs --http https://example.test")
+        .await
+        .expect("MCP attached")
+        .unwrap();
+
+    assert_eq!(result, "saved");
+    assert_eq!(&*events.lock().unwrap(), &["admit", "admin", "checkpoint"]);
+}
+
+#[test]
+fn remote_rsi_cannot_be_enabled_after_pipefs_durability_is_installed() {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut subject = agent(Vec::new(), config());
+    subject.set_workspace_durability(Some(std::sync::Arc::new(RecordingAdminDurability(events))));
+
+    let error = subject.set_rsi_enabled(true).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unavailable while PipeFS is active")
+    );
+}
+
+struct CheckpointBoundarySession(std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>);
+
+impl crate::SessionSink for CheckpointBoundarySession {
+    fn record(&mut self, _: &[hi_ai::Message], _: hi_ai::Usage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _: &[hi_ai::Message]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_checkpoints(&mut self, refs: &[String]) -> anyhow::Result<()> {
+        self.0.lock().unwrap().push(refs.to_vec());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn workspace_rebind_persists_an_empty_checkpoint_generation_boundary() {
+    let boundaries = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut subject = agent(Vec::new(), config());
+    subject.workspace.checkpoints = vec!["old-root-checkpoint".to_string()];
+    subject.set_session(Box::new(CheckpointBoundarySession(boundaries.clone())));
+    let next = tempfile::tempdir().unwrap();
+    let next_state = next.path().join("state");
+
+    subject
+        .rebind_workspace(next.path(), &next_state)
+        .await
+        .unwrap();
+
+    assert_eq!(&*boundaries.lock().unwrap(), &[Vec::<String>::new()]);
+    assert_eq!(subject.checkpoint_count(), 0);
+}
+
+#[tokio::test]
+async fn workspace_rebind_accepts_a_preflushed_checkpoint_boundary_without_duplication() {
+    let boundaries = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut subject = agent(Vec::new(), config());
+    subject.workspace.checkpoints = vec!["portable-root-checkpoint".to_string()];
+    subject.set_session(Box::new(CheckpointBoundarySession(boundaries.clone())));
+    let next = tempfile::tempdir().unwrap();
+    let next_state = next.path().join("state");
+
+    subject.record_workspace_checkpoint_boundary().unwrap();
+    // PipeFS flushes the explicit record before disabling the remote root.
+    subject
+        .rebind_workspace_after_durable_boundary(next.path(), &next_state)
+        .await
+        .unwrap();
+
+    assert_eq!(&*boundaries.lock().unwrap(), &[Vec::<String>::new()]);
+    assert_eq!(subject.checkpoint_count(), 0);
+}
+
 #[tokio::test]
 async fn denied_browser_exec_does_not_launch() {
     let response = completion(

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,13 +10,16 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    ARCHIVE_VERSION, ArchiveArtifact, PipeFsCapabilities, PipeFsClient, PipeFsError, PipeFsLease,
-    PipeFsRemoteState, RevisionKind, Snapshot, apply_archive, build_revision, scan_workspace,
+    ARCHIVE_VERSION, PipeFsCacheScope, PipeFsCapabilities, PipeFsClient, PipeFsError, PipeFsLease,
+    PipeFsRemoteState, RevisionKind, Snapshot, StagedArchiveArtifact, apply_archive_file,
+    build_revision_from_snapshot_to_file_bounded, revision_archive_size_upper_bound,
+    scan_workspace,
 };
 
 #[derive(Clone, Debug)]
 pub struct PipeFsWorkspaceConfig {
     pub session_id: String,
+    pub cache_scope: PipeFsCacheScope,
     pub original_workspace_root: PathBuf,
     pub original_state_root: PathBuf,
     pub cache_base: Option<PathBuf>,
@@ -49,6 +52,25 @@ pub struct PipeFsStatus {
     pub last_committed_revision: Option<Uuid>,
     pub last_error: Option<String>,
     pub recovery_caches: Vec<PathBuf>,
+    pub materialized_logical_bytes: u64,
+    pub pending_archive_bytes: u64,
+    pub available_cache_bytes: Option<u64>,
+}
+
+/// A crash-recovery cache that has not yet been proven durable remotely.
+///
+/// `id` is the exact, session-scoped identifier accepted by the recovery
+/// export/discard APIs. It is intentionally unrelated to the user or session
+/// identity and cannot address paths outside this session's cache directory.
+#[derive(Clone, Debug)]
+pub struct PipeFsRecoveryCache {
+    pub id: String,
+    pub path: PathBuf,
+    pub workspace_root: Option<PathBuf>,
+    pub phase: Option<WorkspacePhase>,
+    pub logical_size_bytes: u64,
+    pub pending_archive_bytes: u64,
+    pub last_error: Option<String>,
 }
 
 impl std::fmt::Display for PipeFsStatus {
@@ -89,6 +111,15 @@ impl std::fmt::Display for PipeFsStatus {
                     .join(", ")
             )?;
         }
+        writeln!(
+            formatter,
+            "local cache: {} logical bytes, {} pending archive bytes, {} available",
+            self.materialized_logical_bytes,
+            self.pending_archive_bytes,
+            self.available_cache_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "unknown".to_string())
+        )?;
         Ok(())
     }
 }
@@ -101,6 +132,7 @@ pub struct PipeFsWorkspace {
 struct Inner {
     client: PipeFsClient,
     session_id: String,
+    cache_scope: PipeFsCacheScope,
     lease: Mutex<PipeFsLease>,
     original_workspace_root: PathBuf,
     original_state_root: PathBuf,
@@ -114,8 +146,84 @@ struct Inner {
     state: Mutex<ControllerState>,
 }
 
+/// Owns one UUID-named temporary immediately beneath a private generation
+/// cache. Remaining armed across `.await` points makes cancellation and panic
+/// cleanup automatic without ever covering a source recovery cache or a
+/// controller-acknowledged materialized root.
+struct OwnedCacheTemporary {
+    scope: PathBuf,
+    path: PathBuf,
+    recursive: bool,
+    armed: bool,
+}
+
+impl OwnedCacheTemporary {
+    fn archive(scope: &Path, purpose: &str) -> Self {
+        Self::new(
+            scope,
+            format!(".{purpose}-{}.tar.zst", Uuid::new_v4().simple()),
+            false,
+        )
+    }
+
+    fn directory(scope: &Path, purpose: &str) -> Self {
+        Self::new(
+            scope,
+            format!("{purpose}-{}", Uuid::new_v4().simple()),
+            true,
+        )
+    }
+
+    fn new(scope: &Path, file_name: String, recursive: bool) -> Self {
+        debug_assert!(
+            file_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        );
+        Self {
+            scope: scope.to_path_buf(),
+            path: scope.join(file_name),
+            recursive,
+            armed: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OwnedCacheTemporary {
+    fn drop(&mut self) {
+        if !self.armed || self.path.parent() != Some(self.scope.as_path()) {
+            return;
+        }
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata)
+                if self.recursive && metadata.is_dir() && !metadata.file_type().is_symlink() =>
+            {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                let _ = fs::remove_file(&self.path);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ControllerState {
+    /// `None` is a legacy, unscoped controller and must never be adopted by an
+    /// authenticated automatic-recovery path.
+    #[serde(default)]
+    cache_authority_scope: Option<String>,
     phase: WorkspacePhase,
     remote: Option<PipeFsRemoteStateDisk>,
     snapshot: Option<Snapshot>,
@@ -132,6 +240,7 @@ struct ControllerState {
 impl Default for ControllerState {
     fn default() -> Self {
         Self {
+            cache_authority_scope: None,
             phase: WorkspacePhase::Disabled,
             remote: None,
             snapshot: None,
@@ -144,6 +253,22 @@ impl Default for ControllerState {
             capabilities: None,
         }
     }
+}
+
+impl ControllerState {
+    fn for_cache_scope(scope: &PipeFsCacheScope) -> Self {
+        Self {
+            cache_authority_scope: Some(scope.as_str().to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ModeHint {
+    version: u8,
+    cache_authority_scope: String,
+    enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -191,6 +316,14 @@ struct CapabilitiesDisk {
     maximum_revision_bytes: u64,
     maximum_workspace_bytes: u64,
     maximum_delta_chain: u32,
+    #[serde(default = "default_true")]
+    writes_available: bool,
+    #[serde(default = "default_true")]
+    restore_available: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl From<&PipeFsCapabilities> for CapabilitiesDisk {
@@ -199,6 +332,8 @@ impl From<&PipeFsCapabilities> for CapabilitiesDisk {
             maximum_revision_bytes: value.maximum_revision_bytes,
             maximum_workspace_bytes: value.maximum_workspace_bytes,
             maximum_delta_chain: value.maximum_delta_chain,
+            writes_available: value.writes_available(),
+            restore_available: value.restore_available(),
         }
     }
 }
@@ -208,6 +343,8 @@ struct PendingRevision {
     expected_base_revision_id: Option<Uuid>,
     revision_type: RevisionKind,
     archive_blake3: String,
+    #[serde(default)]
+    archive_size_bytes: u64,
     manifest_digest: String,
     logical_size_bytes: u64,
     idempotency_key: String,
@@ -220,7 +357,12 @@ impl PipeFsWorkspace {
         lease: PipeFsLease,
         config: PipeFsWorkspaceConfig,
     ) -> Result<Self> {
+        ensure_supported_platform()?;
         validate_session_id(&config.session_id)?;
+        ensure!(
+            config.cache_scope == client.cache_scope(),
+            "PipeFS cache authority scope does not match the authenticated client"
+        );
         let original_workspace_root =
             config
                 .original_workspace_root
@@ -233,20 +375,29 @@ impl PipeFsWorkspace {
                 })?;
         let original_state_root = absolute_path(&config.original_state_root)?;
         let base = config.cache_base.unwrap_or_else(default_cache_base);
+        let authority_cache_root = prepare_authority_cache_root(&base, &config.cache_scope)?;
         let session_digest = blake3::hash(config.session_id.as_bytes())
             .to_hex()
             .to_string();
-        let generation_digest =
-            blake3::hash(format!("{}\0{}", config.session_id, lease.generation).as_bytes())
-                .to_hex()
-                .to_string();
-        let session_cache_root = base.join(&session_digest[..32]);
+        let generation_digest = blake3::hash(
+            format!(
+                "{}\0{}\0{}",
+                config.cache_scope.as_str(),
+                config.session_id,
+                lease.generation
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        let session_cache_root = authority_cache_root.join(&session_digest[..32]);
         create_private_dir(&session_cache_root)?;
         let mode_hint_file = session_cache_root.join("remote-mode");
         let generation_cache_root = session_cache_root.join(&generation_digest[..32]);
         let generation_needs_recovery = mark_cache_for_recovery_if_drifted(
             &generation_cache_root,
             &generation_cache_root.join("recovery-required"),
+            &config.cache_scope,
         )?;
         // A crashed process can reacquire the same lease generation (for
         // example a PID-1 container restart). Never reuse and overwrite a
@@ -268,15 +419,18 @@ impl PipeFsWorkspace {
         let recovery_marker = cache_root.join("recovery-required");
         let pending_archive = cache_root.join("pending.tar.zst");
         let state = if state_file.exists() {
-            serde_json::from_slice(&fs::read(&state_file)?)
-                .context("reading existing PipeFS controller state")?
+            let state: ControllerState = serde_json::from_slice(&fs::read(&state_file)?)
+                .context("reading existing PipeFS controller state")?;
+            validate_controller_cache_scope(&state, &config.cache_scope)?;
+            state
         } else {
-            ControllerState::default()
+            ControllerState::for_cache_scope(&config.cache_scope)
         };
         Ok(Self {
             inner: Arc::new(Inner {
                 client,
                 session_id: config.session_id,
+                cache_scope: config.cache_scope,
                 lease: Mutex::new(lease),
                 original_workspace_root,
                 original_state_root,
@@ -290,6 +444,12 @@ impl PipeFsWorkspace {
                 state: Mutex::new(state),
             }),
         })
+    }
+
+    fn temporary_archive_path(&self, purpose: &str) -> PathBuf {
+        self.inner
+            .cache_root
+            .join(format!(".{purpose}-{}.tar.zst", Uuid::new_v4().simple()))
     }
 
     /// Refresh the shared HI writer lease used by subsequent control-plane
@@ -336,9 +496,38 @@ impl PipeFsWorkspace {
     pub async fn enable(&self) -> Result<Activation> {
         let capabilities = self.inner.client.capabilities().await?;
         ensure!(
-            capabilities.enabled,
-            "PipeFS is disabled on this IPOP server"
+            capabilities.enrollment_available(),
+            "new PipeFS enrollment is disabled on this IPOP server"
         );
+        self.validate_capabilities(&capabilities)?;
+        let lease = self.inner.lease.lock().await.clone();
+        let remote = self
+            .inner
+            .client
+            .set_enabled(&self.inner.session_id, &lease, true)
+            .await?;
+        self.activate_remote(capabilities, remote).await
+    }
+
+    /// Restore an already-enabled remote workspace without issuing a mode
+    /// mutation. Rollout may intentionally disable new enrollment/writes while
+    /// retaining restore access so users can drain existing sessions safely.
+    pub async fn restore_existing(&self) -> Result<Activation> {
+        let capabilities = self.inner.client.capabilities().await?;
+        ensure!(
+            capabilities.restore_available(),
+            "PipeFS restore is disabled on this IPOP server"
+        );
+        self.validate_capabilities(&capabilities)?;
+        let remote = self.inner.client.state(&self.inner.session_id).await?;
+        ensure!(
+            remote.enabled,
+            "the remote PipeFS workspace is no longer enabled"
+        );
+        self.activate_remote(capabilities, remote).await
+    }
+
+    fn validate_capabilities(&self, capabilities: &PipeFsCapabilities) -> Result<()> {
         ensure!(
             capabilities.archive_version == ARCHIVE_VERSION,
             "unsupported PipeFS archive version {} (client supports {})",
@@ -352,14 +541,21 @@ impl PipeFsWorkspace {
                 .any(|mode| mode == "proxy" || mode == "presigned"),
             "server advertises no supported PipeFS transfer mode"
         );
-        let lease = self.inner.lease.lock().await.clone();
-        let mut remote = self
-            .inner
-            .client
-            .set_enabled(&self.inner.session_id, &lease, true)
-            .await?;
+        Ok(())
+    }
+
+    async fn activate_remote(
+        &self,
+        capabilities: PipeFsCapabilities,
+        mut remote: PipeFsRemoteState,
+    ) -> Result<Activation> {
         self.record_mode_hint(true)?;
         self.cleanup_stale_clean_caches(&remote);
+        ensure_cache_capacity(
+            &self.inner.cache_root,
+            remote.logical_size_bytes,
+            "restoring the remote workspace",
+        )?;
 
         {
             let mut state = self.inner.state.lock().await;
@@ -370,18 +566,14 @@ impl PipeFsWorkspace {
             self.persist_locked(&state)?;
         }
 
-        let staging = self
-            .inner
-            .cache_root
-            .join(format!("restore-{}", Uuid::new_v4().simple()));
-        create_private_dir(&staging)?;
+        let staging = OwnedCacheTemporary::directory(&self.inner.cache_root, "restore");
+        create_private_dir(staging.path())?;
         let restore_result = self
-            .restore_into(&staging, &remote, capabilities.maximum_revision_bytes)
+            .restore_into(staging.path(), &remote, capabilities.maximum_revision_bytes)
             .await;
         let snapshot = match restore_result {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                let _ = fs::remove_dir_all(&staging);
                 let mut state = self.inner.state.lock().await;
                 state.phase = WorkspacePhase::Disabled;
                 state.last_error = Some(format!("restore failed: {error:#}"));
@@ -390,12 +582,11 @@ impl PipeFsWorkspace {
             }
         };
         let (staging, snapshot, recovered_cache) = match self
-            .recover_local_cache(staging.clone(), snapshot, &mut remote)
+            .recover_local_cache(staging, snapshot, &mut remote)
             .await
         {
             Ok(recovered) => recovered,
             Err(error) => {
-                let _ = remove_cache_directory(&self.inner.cache_root, &staging);
                 let mut state = self.inner.state.lock().await;
                 state.phase = WorkspacePhase::Disabled;
                 state.snapshot = None;
@@ -409,19 +600,18 @@ impl PipeFsWorkspace {
                 return Err(error);
             }
         };
-        let materialized = self
-            .inner
-            .cache_root
-            .join(format!("workspace-{}", Uuid::new_v4().simple()));
-        fs::rename(&staging, &materialized).with_context(|| {
-            format!(
-                "atomically activating PipeFS workspace {}",
-                materialized.display()
-            )
-        })?;
+        let mut materialized = OwnedCacheTemporary::directory(&self.inner.cache_root, "workspace");
+        let materialized_path = materialized.path().to_path_buf();
         let old_materialized = {
             let mut state = self.inner.state.lock().await;
-            let old = state.materialized_root.replace(materialized.clone());
+            fs::rename(staging.path(), materialized.path()).with_context(|| {
+                format!(
+                    "atomically activating PipeFS workspace {}",
+                    materialized.path().display()
+                )
+            })?;
+            let previous_state = state.clone();
+            let old = state.materialized_root.replace(materialized_path.clone());
             state.snapshot = Some(snapshot);
             state.pending = None;
             state.phase = WorkspacePhase::Clean;
@@ -429,10 +619,18 @@ impl PipeFsWorkspace {
             state.dirty_paths.clear();
             state.retry_count = 0;
             state.last_error = None;
-            self.persist_locked(&state)?;
+            if let Err(error) = self.persist_locked(&state) {
+                *state = previous_state;
+                // Restore the previously durable path when possible. The
+                // destination guard remains armed as a safe fallback.
+                let _ = fs::rename(materialized.path(), staging.path());
+                return Err(error);
+            }
             old
         };
-        if let Some(old) = old_materialized.filter(|old| *old != materialized) {
+        // From this point the controller durably owns the activated root.
+        materialized.disarm();
+        if let Some(old) = old_materialized.filter(|old| *old != materialized_path) {
             remove_cache_directory(&self.inner.cache_root, &old)?;
         }
         let _ = fs::remove_file(&self.inner.recovery_marker);
@@ -444,17 +642,17 @@ impl PipeFsWorkspace {
             let _ = remove_cache_directory(&self.inner.session_cache_root, &recovered_cache);
         }
         Ok(Activation {
-            workspace_root: materialized,
+            workspace_root: materialized_path,
             state_root: self.inner.runtime_state_root.clone(),
         })
     }
 
     async fn recover_local_cache(
         &self,
-        staging: PathBuf,
+        staging: OwnedCacheTemporary,
         restored_snapshot: Snapshot,
         remote: &mut PipeFsRemoteState,
-    ) -> Result<(PathBuf, Snapshot, Option<PathBuf>)> {
+    ) -> Result<(OwnedCacheTemporary, Snapshot, Option<PathBuf>)> {
         let candidates =
             recovery_caches(&self.inner.session_cache_root, Some(&self.inner.cache_root));
         if candidates.is_empty() {
@@ -470,11 +668,30 @@ impl PipeFsWorkspace {
                 .join(", ")
         );
         let candidate = candidates.into_iter().next().expect("checked non-empty");
+        let controller_path = candidate.join("controller.json");
+        let controller_metadata = fs::symlink_metadata(&controller_path).with_context(|| {
+            format!(
+                "reading recovery controller metadata from {}",
+                candidate.display()
+            )
+        })?;
+        ensure!(
+            controller_metadata.is_file() && !controller_metadata.file_type().is_symlink(),
+            "recovery cache controller is not a regular non-symlink file"
+        );
         let old_state: ControllerState = serde_json::from_slice(
-            &fs::read(candidate.join("controller.json"))
+            &fs::read(&controller_path)
                 .with_context(|| format!("reading recovery state from {}", candidate.display()))?,
         )
         .with_context(|| format!("parsing recovery state from {}", candidate.display()))?;
+        validate_controller_cache_scope(&old_state, &self.inner.cache_scope).with_context(
+            || {
+                format!(
+                    "recovery cache {} belongs to a different PipeFS authority",
+                    candidate.display()
+                )
+            },
+        )?;
         let old_root = old_state
             .materialized_root
             .clone()
@@ -497,12 +714,25 @@ impl PipeFsWorkspace {
         if recovered_snapshot.entries == restored_snapshot.entries {
             return Ok((staging, restored_snapshot, Some(candidate)));
         }
-        let expected_base = old_state
+        // A crash can land after the server advanced its head but before the
+        // client persisted that acknowledgement. Matching the pending
+        // manifest and logical size proves that revision is now the remote
+        // head; treat it as acknowledged and rebase any still-newer local
+        // bytes on that head instead of manufacturing a false conflict.
+        let pending_landed = old_state
             .pending
             .as_ref()
-            .map(|pending| pending.expected_base_revision_id)
-            .or_else(|| old_state.remote.as_ref().map(|state| state.current_head))
-            .ok_or_else(|| anyhow!("recovery cache has no recorded remote base"))?;
+            .is_some_and(|pending| pending_matches_remote_head(pending, remote));
+        let expected_base = if pending_landed {
+            remote.current_head
+        } else {
+            old_state
+                .pending
+                .as_ref()
+                .map(|pending| pending.expected_base_revision_id)
+                .or_else(|| old_state.remote.as_ref().map(|state| state.current_head))
+                .ok_or_else(|| anyhow!("recovery cache has no recorded remote base"))?
+        };
         ensure!(
             expected_base == remote.current_head,
             "recovery_conflict: dirty cache was based on {}, but the remote head is {}; the cache was preserved for manual reconciliation",
@@ -516,54 +746,141 @@ impl PipeFsWorkspace {
             let state = self.inner.state.lock().await;
             must_write_full(&state)
         };
+        let capabilities = self
+            .inner
+            .state
+            .lock()
+            .await
+            .capabilities
+            .clone()
+            .ok_or_else(|| anyhow!("PipeFS capabilities are unavailable during recovery"))?;
+        ensure_archive_build_capacity(
+            &self.inner.cache_root,
+            &recovered_snapshot,
+            Some(&restored_snapshot),
+            force_full,
+            &capabilities,
+            "staging interrupted workspace recovery",
+        )?;
         let build_root = old_root.clone();
         let base = restored_snapshot.clone();
+        let recovered_for_build = recovered_snapshot.clone();
+        let mut artifact_temporary =
+            OwnedCacheTemporary::archive(&self.inner.cache_root, "recover-delta");
+        let build_path_for_task = artifact_temporary.path().to_path_buf();
+        let maximum_revision_bytes = capabilities.maximum_revision_bytes;
         let mut artifact = tokio::task::spawn_blocking(move || {
-            build_revision(&build_root, Some(&base), force_full)
+            build_revision_from_snapshot_to_file_bounded(
+                &build_root,
+                recovered_for_build,
+                Some(&base),
+                force_full,
+                &build_path_for_task,
+                maximum_revision_bytes,
+            )
         })
         .await
         .context("PipeFS recovery archive task panicked")??;
         {
             let state = self.inner.state.lock().await;
             if artifact.manifest.revision_type == RevisionKind::Delta
-                && cumulative_delta_would_exceed_full(&state, artifact.bytes.len() as u64)
+                && cumulative_delta_would_exceed_full(&state, artifact.size_bytes)
             {
                 drop(state);
                 let build_root = old_root.clone();
-                artifact =
-                    tokio::task::spawn_blocking(move || build_revision(&build_root, None, true))
-                        .await
-                        .context("PipeFS recovery compaction task panicked")??;
+                let recovered_for_build = recovered_snapshot.clone();
+                let replacement_temporary =
+                    OwnedCacheTemporary::archive(&self.inner.cache_root, "recover-full");
+                ensure_archive_build_capacity(
+                    &self.inner.cache_root,
+                    &recovered_for_build,
+                    None,
+                    true,
+                    &capabilities,
+                    "staging a full interrupted-workspace compaction",
+                )?;
+                let maximum_revision_bytes = capabilities.maximum_revision_bytes;
+                let build_path = replacement_temporary.path().to_path_buf();
+                artifact = tokio::task::spawn_blocking(move || {
+                    build_revision_from_snapshot_to_file_bounded(
+                        &build_root,
+                        recovered_for_build,
+                        None,
+                        true,
+                        &build_path,
+                        maximum_revision_bytes,
+                    )
+                })
+                .await
+                .context("PipeFS recovery compaction task panicked")??;
+                artifact_temporary = replacement_temporary;
             }
         }
 
         // Materialize the recovered bytes independently from the remote
         // staging tree. A full archive validates the complete local tree and
         // avoids filesystem-dependent recursive copy behavior.
-        let recovered_staging = self
-            .inner
-            .cache_root
-            .join(format!("recovery-{}", Uuid::new_v4().simple()));
-        create_private_dir(&recovered_staging)?;
-        let full_for_restore = if artifact.manifest.revision_type == RevisionKind::Full {
-            artifact.clone()
+        let mut recovered_staging =
+            OwnedCacheTemporary::directory(&self.inner.cache_root, "recovery");
+        ensure_cache_capacity(
+            &self.inner.cache_root,
+            recovered_snapshot.logical_size_bytes,
+            "materializing interrupted workspace recovery",
+        )?;
+        create_private_dir(recovered_staging.path())?;
+        let materialization_archive = if artifact.manifest.revision_type == RevisionKind::Full {
+            None
         } else {
             let build_root = old_root;
-            tokio::task::spawn_blocking(move || build_revision(&build_root, None, true))
-                .await
-                .context("PipeFS full recovery archive task panicked")??
+            let recovered_for_build = recovered_snapshot;
+            let temporary =
+                OwnedCacheTemporary::archive(&self.inner.cache_root, "recover-materialize");
+            ensure_archive_build_capacity(
+                &self.inner.cache_root,
+                &recovered_for_build,
+                None,
+                true,
+                &capabilities,
+                "building the interrupted-workspace materialization archive",
+            )?;
+            let maximum_revision_bytes = capabilities.maximum_revision_bytes;
+            let build_path = temporary.path().to_path_buf();
+            let full = tokio::task::spawn_blocking(move || {
+                build_revision_from_snapshot_to_file_bounded(
+                    &build_root,
+                    recovered_for_build,
+                    None,
+                    true,
+                    &build_path,
+                    maximum_revision_bytes,
+                )
+            })
+            .await
+            .context("PipeFS full recovery archive task panicked")??;
+            debug_assert_eq!(full.path, temporary.path());
+            Some(temporary)
         };
-        let restore_root = recovered_staging.clone();
-        let restore_bytes = full_for_restore.bytes;
-        let mut materialized_snapshot =
-            tokio::task::spawn_blocking(move || apply_archive(&restore_root, &restore_bytes, None))
-                .await
-                .context("PipeFS local recovery extraction task panicked")??;
+        let restore_root = recovered_staging.path().to_path_buf();
+        let restore_archive_for_task = materialization_archive
+            .as_ref()
+            .map_or_else(|| artifact_temporary.path(), OwnedCacheTemporary::path)
+            .to_path_buf();
+        let materialize_result = tokio::task::spawn_blocking(move || {
+            apply_archive_file(&restore_root, &restore_archive_for_task, None)
+        })
+        .await
+        .context("PipeFS local recovery extraction task panicked")?;
+        let mut materialized_snapshot = materialize_result?;
 
+        // Acquire the lease generation before publishing a controller which
+        // owns the recovered directory. Once the pending revision is durably
+        // staged, that directory is recovery state rather than a disposable
+        // temporary and must survive cancellation during remote I/O.
+        let generation = self.inner.lease.lock().await.generation;
         let commit_result = {
             let mut state = self.inner.state.lock().await;
             state.snapshot = Some(restored_snapshot);
-            state.materialized_root = Some(recovered_staging.clone());
+            state.materialized_root = Some(recovered_staging.path().to_path_buf());
             state.phase = WorkspacePhase::Dirty;
             state
                 .dirty_paths
@@ -573,8 +890,8 @@ impl PipeFsWorkspace {
                 b"recovering interrupted workspace changes\n",
             )?;
             self.persist_locked(&state)?;
-            let generation = self.inner.lease.lock().await.generation;
             self.stage_pending_locked(&mut state, artifact, generation)?;
+            recovered_staging.disarm();
             self.retry_locked(&mut state).await
         };
         let committed_remote = match commit_result {
@@ -590,7 +907,7 @@ impl PipeFsWorkspace {
                 self.persist_locked(&state)?;
                 let _ = fs::remove_file(&self.inner.pending_archive);
                 let _ = fs::remove_file(&self.inner.recovery_marker);
-                let _ = remove_cache_directory(&self.inner.cache_root, &recovered_staging);
+                let _ = remove_cache_directory(&self.inner.cache_root, recovered_staging.path());
                 return Err(error.context(
                     "persisting the interrupted PipeFS cache; the older recovery cache was retained",
                 ));
@@ -598,7 +915,6 @@ impl PipeFsWorkspace {
         };
         materialized_snapshot.manifest_digest = committed_remote.manifest_digest.clone();
         *remote = committed_remote;
-        let _ = remove_cache_directory(&self.inner.cache_root, &staging);
         Ok((recovered_staging, materialized_snapshot, Some(candidate)))
     }
 
@@ -637,14 +953,33 @@ impl PipeFsWorkspace {
                     || (index > 0 && revision.revision_type == RevisionKind::Delta),
                 "missing_revision: restore chain must be one full revision followed by deltas"
             );
-            let bytes = self
+            ensure_cache_capacity(
+                &self.inner.cache_root,
+                revision.artifact.size_bytes,
+                "downloading a workspace revision",
+            )?;
+            let archive = OwnedCacheTemporary::archive(&self.inner.cache_root, "restore");
+            let download_result = self
                 .inner
                 .client
-                .download_revision(&self.inner.session_id, revision, maximum_revision_bytes)
+                .download_revision_to_file(
+                    &self.inner.session_id,
+                    revision,
+                    maximum_revision_bytes,
+                    archive.path(),
+                )
                 .await
-                .map_err(classified_restore_error)?;
-            let restored = apply_archive(staging, &bytes, snapshot.as_ref())
-                .with_context(|| format!("restoring PipeFS revision {}", revision.revision_id))?;
+                .map_err(classified_restore_error);
+            download_result?;
+            let restore_root = staging.to_path_buf();
+            let restore_archive = archive.path().to_path_buf();
+            let expected_base = snapshot.clone();
+            let restore_result = tokio::task::spawn_blocking(move || {
+                apply_archive_file(&restore_root, &restore_archive, expected_base.as_ref())
+            })
+            .await
+            .context("PipeFS restore extraction task panicked");
+            let restored = restore_result??;
             ensure!(
                 restored.manifest_digest.as_deref() == Some(&revision.manifest_digest),
                 "corruption_error: manifest digest mismatch for revision {}",
@@ -684,6 +1019,13 @@ impl PipeFsWorkspace {
 
     pub async fn mutation_started(&self, paths: Option<Vec<String>>) -> Result<()> {
         let mut state = self.inner.state.lock().await;
+        ensure!(
+            state
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.writes_available),
+            "PipeFS writes are temporarily disabled by the server; this restored workspace is read-only"
+        );
         match state.phase {
             WorkspacePhase::Clean => {}
             WorkspacePhase::Dirty if state.last_error.is_none() => {}
@@ -818,39 +1160,91 @@ impl PipeFsWorkspace {
         }
 
         let force_full = must_write_full(&state);
+        let capabilities = state
+            .capabilities
+            .clone()
+            .ok_or_else(|| anyhow!("PipeFS capabilities are unavailable"))?;
+        if let Err(error) = ensure_archive_build_capacity(
+            &self.inner.cache_root,
+            &current,
+            prior.as_ref(),
+            force_full,
+            &capabilities,
+            "staging a workspace revision",
+        ) {
+            self.record_checkpoint_failure_locked(&mut state, &error)?;
+            return Err(error);
+        }
         let root_for_build = root;
         let base_for_build = prior.clone();
+        let build_path = self.temporary_archive_path("checkpoint");
+        let build_path_for_task = build_path.clone();
+        let maximum_revision_bytes = capabilities.maximum_revision_bytes;
         let mut artifact = match tokio::task::spawn_blocking(move || {
-            build_revision(&root_for_build, base_for_build.as_ref(), force_full)
+            build_revision_from_snapshot_to_file_bounded(
+                &root_for_build,
+                current,
+                base_for_build.as_ref(),
+                force_full,
+                &build_path_for_task,
+                maximum_revision_bytes,
+            )
         })
         .await
         {
             Ok(Ok(artifact)) => artifact,
             Ok(Err(error)) => {
+                let _ = fs::remove_file(&build_path);
                 self.record_checkpoint_failure_locked(&mut state, &error)?;
                 return Err(error);
             }
             Err(join_error) => {
+                let _ = fs::remove_file(&build_path);
                 let error = anyhow!("PipeFS archive task panicked: {join_error}");
                 self.record_checkpoint_failure_locked(&mut state, &error)?;
                 return Err(error);
             }
         };
         if artifact.manifest.revision_type == RevisionKind::Delta
-            && cumulative_delta_would_exceed_full(&state, artifact.bytes.len() as u64)
+            && cumulative_delta_would_exceed_full(&state, artifact.size_bytes)
         {
+            let current = artifact.snapshot.clone();
+            let _ = fs::remove_file(&artifact.path);
             let root_for_build = state.materialized_root.clone().expect("checked above");
+            let build_path = self.temporary_archive_path("checkpoint-full");
+            let build_path_for_task = build_path.clone();
+            if let Err(error) = ensure_archive_build_capacity(
+                &self.inner.cache_root,
+                &current,
+                None,
+                true,
+                &capabilities,
+                "staging a full workspace compaction",
+            ) {
+                self.record_checkpoint_failure_locked(&mut state, &error)?;
+                return Err(error);
+            }
+            let maximum_revision_bytes = capabilities.maximum_revision_bytes;
             artifact = match tokio::task::spawn_blocking(move || {
-                build_revision(&root_for_build, None, true)
+                build_revision_from_snapshot_to_file_bounded(
+                    &root_for_build,
+                    current,
+                    None,
+                    true,
+                    &build_path_for_task,
+                    maximum_revision_bytes,
+                )
             })
             .await
             {
                 Ok(Ok(artifact)) => artifact,
                 Ok(Err(error)) => {
+                    let _ = fs::remove_file(&build_path);
                     self.record_checkpoint_failure_locked(&mut state, &error)?;
                     return Err(error);
                 }
                 Err(join_error) => {
+                    let _ = fs::remove_file(&build_path);
                     let error = anyhow!("PipeFS compaction archive task panicked: {join_error}");
                     self.record_checkpoint_failure_locked(&mut state, &error)?;
                     return Err(error);
@@ -885,46 +1279,59 @@ impl PipeFsWorkspace {
     fn stage_pending_locked(
         &self,
         state: &mut ControllerState,
-        artifact: ArchiveArtifact,
+        artifact: StagedArchiveArtifact,
         lease_generation: u64,
     ) -> Result<()> {
-        let capabilities = state
-            .capabilities
-            .as_ref()
-            .ok_or_else(|| anyhow!("PipeFS capabilities are unavailable"))?;
-        ensure!(
-            artifact.bytes.len() as u64 <= capabilities.maximum_revision_bytes,
-            "PipeFS revision is {} bytes, exceeding the server limit of {}",
-            artifact.bytes.len(),
-            capabilities.maximum_revision_bytes
-        );
-        ensure!(
-            artifact.snapshot.logical_size_bytes <= capabilities.maximum_workspace_bytes,
-            "PipeFS workspace is {} bytes, exceeding the server limit of {}",
-            artifact.snapshot.logical_size_bytes,
-            capabilities.maximum_workspace_bytes
-        );
-        write_private(&self.inner.pending_archive, &artifact.bytes)?;
-        let expected_base_revision_id =
-            state.remote.as_ref().and_then(|remote| remote.current_head);
-        let idempotency_key = revision_idempotency_key(
-            lease_generation,
-            expected_base_revision_id,
-            artifact.manifest.revision_type,
-            &artifact.blake3,
-        );
-        state.pending = Some(PendingRevision {
-            expected_base_revision_id,
-            revision_type: artifact.manifest.revision_type,
-            archive_blake3: artifact.blake3,
-            manifest_digest: artifact.manifest_digest,
-            logical_size_bytes: artifact.snapshot.logical_size_bytes,
-            idempotency_key,
-            snapshot: artifact.snapshot,
-        });
-        state.phase = WorkspacePhase::Pending;
-        state.last_error = None;
-        self.persist_locked(state)
+        let staged_path = artifact.path.clone();
+        let result = (|| {
+            let capabilities = state
+                .capabilities
+                .as_ref()
+                .ok_or_else(|| anyhow!("PipeFS capabilities are unavailable"))?;
+            ensure!(
+                artifact.size_bytes <= capabilities.maximum_revision_bytes,
+                "PipeFS revision is {} bytes, exceeding the server limit of {}",
+                artifact.size_bytes,
+                capabilities.maximum_revision_bytes
+            );
+            ensure!(
+                artifact.snapshot.logical_size_bytes <= capabilities.maximum_workspace_bytes,
+                "PipeFS workspace is {} bytes, exceeding the server limit of {}",
+                artifact.snapshot.logical_size_bytes,
+                capabilities.maximum_workspace_bytes
+            );
+            ensure_cache_capacity(
+                &self.inner.cache_root,
+                artifact.size_bytes,
+                "staging a workspace revision",
+            )?;
+            install_private_archive(&artifact.path, &self.inner.pending_archive)?;
+            let expected_base_revision_id =
+                state.remote.as_ref().and_then(|remote| remote.current_head);
+            let idempotency_key = revision_idempotency_key(
+                lease_generation,
+                expected_base_revision_id,
+                artifact.manifest.revision_type,
+                &artifact.blake3,
+            );
+            state.pending = Some(PendingRevision {
+                expected_base_revision_id,
+                revision_type: artifact.manifest.revision_type,
+                archive_blake3: artifact.blake3,
+                archive_size_bytes: artifact.size_bytes,
+                manifest_digest: artifact.manifest_digest,
+                logical_size_bytes: artifact.snapshot.logical_size_bytes,
+                idempotency_key,
+                snapshot: artifact.snapshot,
+            });
+            state.phase = WorkspacePhase::Pending;
+            state.last_error = None;
+            self.persist_locked(state)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(staged_path);
+        }
+        result
     }
 
     async fn retry_locked(&self, state: &mut ControllerState) -> Result<(Uuid, PipeFsRemoteState)> {
@@ -932,24 +1339,43 @@ impl PipeFsWorkspace {
             .pending
             .clone()
             .ok_or_else(|| anyhow!("PipeFS has no staged revision to retry"))?;
-        let bytes = fs::read(&self.inner.pending_archive)
-            .context("reading staged PipeFS revision for retry")?;
-        ensure!(
-            blake3::hash(&bytes).to_hex().as_str() == pending.archive_blake3,
-            "local recovery archive failed BLAKE3 verification"
-        );
         state.retry_count = state.retry_count.saturating_add(1);
         self.persist_locked(state)?;
+        let archive_path = self.inner.pending_archive.clone();
+        let expected_hash = pending.archive_blake3.clone();
+        let expected_size = pending.archive_size_bytes;
+        let archive_size_bytes = match tokio::task::spawn_blocking(move || {
+            verify_staged_archive(&archive_path, expected_size, &expected_hash)
+        })
+        .await
+        {
+            Ok(Ok(size)) => size,
+            Ok(Err(error)) => {
+                state.phase = WorkspacePhase::Pending;
+                state.last_error = Some(error.to_string());
+                self.persist_locked(state)?;
+                return Err(error);
+            }
+            Err(join_error) => {
+                let error =
+                    anyhow!("PipeFS staged archive verification task panicked: {join_error}");
+                state.phase = WorkspacePhase::Pending;
+                state.last_error = Some(error.to_string());
+                self.persist_locked(state)?;
+                return Err(error);
+            }
+        };
         let lease = self.inner.lease.lock().await.clone();
         let result = self
             .inner
             .client
-            .commit_archive(
+            .commit_archive_file(
                 &self.inner.session_id,
                 &lease,
                 pending.expected_base_revision_id,
                 pending.revision_type,
-                &bytes,
+                &self.inner.pending_archive,
+                archive_size_bytes,
                 &pending.archive_blake3,
                 &pending.manifest_digest,
                 pending.logical_size_bytes,
@@ -1026,9 +1452,36 @@ impl PipeFsWorkspace {
             .materialized_root
             .clone()
             .ok_or_else(|| anyhow!("PipeFS materialized root is missing for compaction"))?;
-        let artifact = tokio::task::spawn_blocking(move || build_revision(&root, None, true))
+        let capabilities = state
+            .capabilities
+            .clone()
+            .ok_or_else(|| anyhow!("PipeFS capabilities are unavailable for compaction"))?;
+        let root_for_scan = root.clone();
+        let snapshot = tokio::task::spawn_blocking(move || scan_workspace(&root_for_scan))
             .await
-            .context("PipeFS server-requested compaction archive task panicked")??;
+            .context("PipeFS compaction scan task panicked")??;
+        ensure_archive_build_capacity(
+            &self.inner.cache_root,
+            &snapshot,
+            None,
+            true,
+            &capabilities,
+            "staging a server-requested full compaction",
+        )?;
+        let build_path = self.temporary_archive_path("compact");
+        let maximum_revision_bytes = capabilities.maximum_revision_bytes;
+        let artifact = tokio::task::spawn_blocking(move || {
+            build_revision_from_snapshot_to_file_bounded(
+                &root,
+                snapshot,
+                None,
+                true,
+                &build_path,
+                maximum_revision_bytes,
+            )
+        })
+        .await
+        .context("PipeFS server-requested compaction archive task panicked")??;
         ensure!(
             artifact.manifest.revision_type == RevisionKind::Full,
             "PipeFS compaction did not produce a full revision"
@@ -1095,27 +1548,43 @@ impl PipeFsWorkspace {
         remove_cache_directory(&self.inner.session_cache_root, &self.inner.cache_root)
     }
 
+    /// Idempotently reconcile remote authority to enabled before an active
+    /// runtime retries durability. This is valid even when a disable response
+    /// was lost before the local controller reached `Disabled`: the remote
+    /// request is authoritative, while dirty and pending local state must be
+    /// preserved exactly for the following checkpoint/commit retry.
+    pub async fn ensure_remote_enabled(&self) -> Result<()> {
+        let mut state = self.inner.state.lock().await;
+        let previous_phase = state.phase;
+        let enabled_phase = phase_after_remote_enable(previous_phase)?;
+        let lease = self.inner.lease.lock().await.clone();
+        // Avoid turning an already-enabled restore-only workspace into a
+        // write operation during a rollout drain. A mode PUT is required only
+        // when the authoritative read proves an ambiguous disable applied.
+        let remote = match self.inner.client.state(&self.inner.session_id).await? {
+            remote if remote.enabled => remote,
+            _ => {
+                self.inner
+                    .client
+                    .set_enabled(&self.inner.session_id, &lease, true)
+                    .await?
+            }
+        };
+        self.record_mode_hint(true)?;
+        state.remote = Some((&remote).into());
+        state.phase = enabled_phase;
+        if previous_phase == WorkspacePhase::Disabled {
+            state.last_error = None;
+        }
+        self.persist_locked(&state)
+    }
+
     /// Restore the enabled controller state when the frontend could not rebind
     /// to its original local root after the remote disable transaction. No
     /// workspace bytes changed during that window, so the existing clean
     /// materialization remains authoritative and can safely stay active.
     pub async fn rollback_disable(&self) -> Result<()> {
-        let lease = self.inner.lease.lock().await.clone();
-        let remote = self
-            .inner
-            .client
-            .set_enabled(&self.inner.session_id, &lease, true)
-            .await?;
-        self.record_mode_hint(true)?;
-        let mut state = self.inner.state.lock().await;
-        ensure!(
-            state.phase == WorkspacePhase::Disabled,
-            "PipeFS disable is not awaiting a frontend rebind"
-        );
-        state.remote = Some((&remote).into());
-        state.phase = WorkspacePhase::Clean;
-        state.last_error = None;
-        self.persist_locked(&state)
+        self.ensure_remote_enabled().await
     }
 
     /// Clean process exit leaves the remote workspace enabled for resume but
@@ -1148,8 +1617,7 @@ impl PipeFsWorkspace {
     /// knows that it must ask IPOP before activating the launch directory.
     /// This is a safety hint, not authority; IPOP remains the source of truth.
     pub fn record_mode_hint(&self, enabled: bool) -> Result<()> {
-        let value: &[u8] = if enabled { b"enabled\n" } else { b"disabled\n" };
-        write_private(&self.inner.mode_hint_file, value)
+        write_mode_hint(&self.inner.mode_hint_file, &self.inner.cache_scope, enabled)
     }
 
     pub async fn status(&self) -> PipeFsStatus {
@@ -1172,6 +1640,14 @@ impl PipeFsWorkspace {
             last_committed_revision: state.remote.as_ref().and_then(|remote| remote.current_head),
             last_error: state.last_error.clone(),
             recovery_caches,
+            materialized_logical_bytes: state
+                .snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.logical_size_bytes),
+            pending_archive_bytes: fs::metadata(&self.inner.pending_archive)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            available_cache_bytes: available_space_bytes(&self.inner.cache_root),
         }
     }
 
@@ -1224,6 +1700,9 @@ impl PipeFsWorkspace {
             let Ok(state) = serde_json::from_slice::<ControllerState>(&bytes) else {
                 continue;
             };
+            if validate_controller_cache_scope(&state, &self.inner.cache_scope).is_err() {
+                continue;
+            }
             let clean = matches!(
                 state.phase,
                 WorkspacePhase::Clean | WorkspacePhase::Disabled
@@ -1251,16 +1730,32 @@ impl PipeFsWorkspace {
     }
 }
 
-fn mark_cache_for_recovery_if_drifted(cache_root: &Path, marker: &Path) -> Result<bool> {
-    if marker.is_file() {
-        return Ok(true);
+fn validate_controller_cache_scope(
+    state: &ControllerState,
+    expected: &PipeFsCacheScope,
+) -> Result<()> {
+    match state.cache_authority_scope.as_deref() {
+        Some(actual) if actual == expected.as_str() => Ok(()),
+        Some(_) => bail!(
+            "PipeFS controller cache authority mismatch; refusing automatic recovery or reuse"
+        ),
+        None => bail!(
+            "legacy unscoped PipeFS controller requires explicit manual recovery; refusing automatic adoption"
+        ),
     }
+}
+
+fn mark_cache_for_recovery_if_drifted(
+    cache_root: &Path,
+    marker: &Path,
+    cache_scope: &PipeFsCacheScope,
+) -> Result<bool> {
     if !cache_root.exists() {
         return Ok(false);
     }
     let state_file = cache_root.join("controller.json");
     if !state_file.exists() {
-        return Ok(false);
+        return Ok(marker.is_file());
     }
     let state = match fs::read(&state_file)
         .ok()
@@ -1272,6 +1767,15 @@ fn mark_cache_for_recovery_if_drifted(cache_root: &Path, marker: &Path) -> Resul
             return Ok(true);
         }
     };
+    validate_controller_cache_scope(&state, cache_scope).with_context(|| {
+        format!(
+            "refusing to reuse PipeFS cache with mismatched authority metadata at {}",
+            cache_root.display()
+        )
+    })?;
+    if marker.is_file() {
+        return Ok(true);
+    }
     let explicitly_dirty = matches!(state.phase, WorkspacePhase::Dirty | WorkspacePhase::Pending)
         || state.pending.is_some()
         || !state.active_background_processes.is_empty();
@@ -1347,6 +1851,12 @@ fn is_compaction_required(error: &PipeFsError) -> bool {
     matches!(error, PipeFsError::Conflict(detail) if detail.contains("pipefs_compaction_required"))
 }
 
+fn pending_matches_remote_head(pending: &PendingRevision, remote: &PipeFsRemoteState) -> bool {
+    remote.current_head.is_some()
+        && remote.manifest_digest.as_deref() == Some(pending.manifest_digest.as_str())
+        && remote.logical_size_bytes == pending.logical_size_bytes
+}
+
 /// Stable per-artifact request identity. Including the revision kind ensures a
 /// server-requested full compaction never reuses the rejected delta's upload
 /// preparation, even if a future archive encoding happens to share a digest.
@@ -1379,6 +1889,17 @@ fn classified_restore_error(error: PipeFsError) -> anyhow::Error {
     })
 }
 
+fn ensure_supported_platform() -> Result<()> {
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        bail!("PipeFS v1 requires a Unix host (Linux or macOS); Windows is not supported")
+    }
+}
+
 fn validate_session_id(id: &str) -> Result<()> {
     ensure!(
         !id.is_empty()
@@ -1392,11 +1913,89 @@ fn validate_session_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn phase_after_remote_enable(phase: WorkspacePhase) -> Result<WorkspacePhase> {
+    match phase {
+        WorkspacePhase::Clean | WorkspacePhase::Dirty | WorkspacePhase::Pending => Ok(phase),
+        WorkspacePhase::Disabled => Ok(WorkspacePhase::Clean),
+        WorkspacePhase::Restoring | WorkspacePhase::LeaseLost => bail!(
+            "PipeFS workspace cannot reconcile remote authority from phase {:?}",
+            phase
+        ),
+    }
+}
+
 fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
     } else {
         Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+const CACHE_FREE_SPACE_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn ensure_archive_build_capacity(
+    cache_root: &Path,
+    snapshot: &Snapshot,
+    base: Option<&Snapshot>,
+    force_full: bool,
+    capabilities: &CapabilitiesDisk,
+    operation: &str,
+) -> Result<()> {
+    ensure!(
+        snapshot.logical_size_bytes <= capabilities.maximum_workspace_bytes,
+        "PipeFS workspace is {} bytes, exceeding the server limit of {}",
+        snapshot.logical_size_bytes,
+        capabilities.maximum_workspace_bytes
+    );
+    let worst_case = revision_archive_size_upper_bound(snapshot, base, force_full)?;
+    // Never reserve more than can be emitted: the encoder below is hard
+    // bounded at the negotiated revision limit and removes partial output.
+    ensure_cache_capacity(
+        cache_root,
+        worst_case.min(capabilities.maximum_revision_bytes),
+        operation,
+    )
+}
+
+fn ensure_cache_capacity(path: &Path, operation_bytes: u64, operation: &str) -> Result<()> {
+    let Some(available) = available_space_bytes(path) else {
+        return Ok(());
+    };
+    let required = operation_bytes.saturating_add(CACHE_FREE_SPACE_RESERVE_BYTES);
+    ensure!(
+        available >= required,
+        "insufficient PipeFS cache space for {operation}: {} available, {} required (including safety reserve); remove stale recovery caches only after exporting/reconciling them",
+        format_bytes(available),
+        format_bytes(required)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn available_space_bytes(path: &Path) -> Option<u64> {
+    let mut existing = path;
+    while !existing.exists() {
+        existing = existing.parent()?;
+    }
+    let stats = rustix::fs::statvfs(existing).ok()?;
+    Some(stats.f_bavail.saturating_mul(stats.f_frsize))
+}
+
+#[cfg(not(unix))]
+fn available_space_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -1417,59 +2016,400 @@ fn default_cache_base() -> PathBuf {
 /// Whether local evidence says startup must resolve the remote PipeFS state
 /// before using the launch directory. A dirty recovery cache is always a
 /// positive hint; a corrupt/unreadable hint fails closed.
-pub fn local_state_requires_remote_probe(session_id: &str) -> bool {
-    local_state_requires_remote_probe_at(&default_cache_base(), session_id)
+pub fn local_state_requires_remote_probe(cache_scope: &PipeFsCacheScope, session_id: &str) -> bool {
+    local_state_requires_remote_probe_at(&default_cache_base(), cache_scope, session_id)
 }
 
 /// Update the default-cache mode hint after an authoritative read observes a
 /// remote disable performed by another machine.
-pub fn record_local_mode_hint(session_id: &str, enabled: bool) -> Result<()> {
+pub fn record_local_mode_hint(
+    cache_scope: &PipeFsCacheScope,
+    session_id: &str,
+    enabled: bool,
+) -> Result<()> {
     validate_session_id(session_id)?;
-    let session_digest = blake3::hash(session_id.as_bytes()).to_hex().to_string();
-    let session_root = default_cache_base().join(&session_digest[..32]);
+    let base = default_cache_base();
+    prepare_authority_cache_root(&base, cache_scope)?;
+    let session_root = session_cache_root(&base, cache_scope, session_id)?;
     create_private_dir(&session_root)?;
-    let value: &[u8] = if enabled { b"enabled\n" } else { b"disabled\n" };
-    write_private(&session_root.join("remote-mode"), value)
+    write_mode_hint(&session_root.join("remote-mode"), cache_scope, enabled)
 }
 
-fn local_state_requires_remote_probe_at(base: &Path, session_id: &str) -> bool {
+fn local_state_requires_remote_probe_at(
+    base: &Path,
+    cache_scope: &PipeFsCacheScope,
+    session_id: &str,
+) -> bool {
     if validate_session_id(session_id).is_err() {
         return true;
     }
-    if local_recovery_required_at(base, session_id) {
+    if local_recovery_required_at(base, cache_scope, session_id) {
         return true;
     }
-    let session_digest = blake3::hash(session_id.as_bytes()).to_hex().to_string();
-    let session_root = base.join(&session_digest[..32]);
+    let Ok(session_root) = session_cache_root(base, cache_scope, session_id) else {
+        return true;
+    };
     match fs::read(session_root.join("remote-mode")) {
-        Ok(value) if value == b"enabled\n" => true,
-        Ok(value) if value == b"disabled\n" => false,
-        Ok(_) => true,
+        Ok(value) => serde_json::from_slice::<ModeHint>(&value).map_or(true, |hint| {
+            hint.version != 1 || hint.cache_authority_scope != cache_scope.as_str() || hint.enabled
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => true,
     }
+}
+
+fn write_mode_hint(path: &Path, cache_scope: &PipeFsCacheScope, enabled: bool) -> Result<()> {
+    let hint = ModeHint {
+        version: 1,
+        cache_authority_scope: cache_scope.as_str().to_string(),
+        enabled,
+    };
+    write_private(path, &serde_json::to_vec(&hint)?)
 }
 
 /// A prior process left materialized bytes that were not proven represented by
 /// the remote head. Startup uses this stronger signal to re-enter PipeFS even
 /// if the last mode transaction reached "disabled" before the process died.
-pub fn local_recovery_required(session_id: &str) -> bool {
-    local_recovery_required_at(&default_cache_base(), session_id)
+pub fn local_recovery_required(cache_scope: &PipeFsCacheScope, session_id: &str) -> bool {
+    local_recovery_required_at(&default_cache_base(), cache_scope, session_id)
 }
 
-fn local_recovery_required_at(base: &Path, session_id: &str) -> bool {
+/// List crash-recovery caches for one canonical remote session.
+///
+/// Only real generation directories containing a real `recovery-required`
+/// marker are returned. Corrupt controller metadata is reported on the entry
+/// instead of causing the cache to disappear from recovery UX.
+pub fn list_recovery_caches(
+    cache_scope: &PipeFsCacheScope,
+    session_id: &str,
+) -> Result<Vec<PipeFsRecoveryCache>> {
+    list_recovery_caches_at(&default_cache_base(), cache_scope, session_id)
+}
+
+/// Inspect one exact, session-scoped recovery cache identifier.
+pub fn inspect_recovery_cache(
+    cache_scope: &PipeFsCacheScope,
+    session_id: &str,
+    cache_id: &str,
+) -> Result<PipeFsRecoveryCache> {
+    validate_recovery_cache_id(cache_id)?;
+    let cache = list_recovery_caches(cache_scope, session_id)?
+        .into_iter()
+        .find(|cache| cache.id == cache_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "PipeFS recovery cache {cache_id:?} was not found for this authority and session"
+            )
+        })?;
+    validate_recovery_cache_scope(&cache.path, cache_scope)?;
+    Ok(cache)
+}
+
+/// Export the materialized tree from a recovery cache as a deterministic full
+/// PipeFS archive. The source cache is deliberately retained.
+pub fn export_recovery_cache(
+    cache_scope: &PipeFsCacheScope,
+    session_id: &str,
+    cache_id: &str,
+    destination: &Path,
+) -> Result<PathBuf> {
+    let cache = inspect_recovery_cache(cache_scope, session_id, cache_id)?;
+    let workspace_root = recovery_workspace_root(&cache)?;
+    let destination = absolute_path(destination)?;
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| anyhow!("PipeFS recovery export destination has no file name"))?;
+    let parent = destination.parent().ok_or_else(|| {
+        anyhow!(
+            "PipeFS recovery export destination has no parent: {}",
+            destination.display()
+        )
+    })?;
+    let parent = parent.canonicalize().with_context(|| {
+        format!(
+            "canonicalizing PipeFS recovery export parent {}",
+            parent.display()
+        )
+    })?;
+    ensure!(
+        parent.is_dir(),
+        "PipeFS recovery export parent is not a directory: {}",
+        parent.display()
+    );
+    let destination = parent.join(file_name);
+    let session_root = session_cache_root(&default_cache_base(), cache_scope, session_id)?;
+    let canonical_session_root = session_root.canonicalize().with_context(|| {
+        format!(
+            "canonicalizing PipeFS session cache {}",
+            session_root.display()
+        )
+    })?;
+    ensure!(
+        !destination.starts_with(&canonical_session_root),
+        "refusing to export a PipeFS recovery archive inside its managed cache"
+    );
+    match fs::symlink_metadata(&destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => bail!(
+            "PipeFS recovery export destination already exists: {}",
+            destination.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "checking PipeFS recovery export destination {}",
+                    destination.display()
+                )
+            });
+        }
+    }
+    let snapshot = scan_workspace(&workspace_root)
+        .context("scanning the PipeFS recovery workspace for export")?;
+    let maximum_archive_bytes = revision_archive_size_upper_bound(&snapshot, None, true)?;
+    ensure_cache_capacity(
+        &parent,
+        maximum_archive_bytes,
+        "exporting the recovery workspace",
+    )?;
+    build_revision_from_snapshot_to_file_bounded(
+        &workspace_root,
+        snapshot,
+        None,
+        true,
+        &destination,
+        maximum_archive_bytes,
+    )
+    .context("building full PipeFS recovery export")?;
+    Ok(destination)
+}
+
+/// Permanently discard one recovery cache. The confirmation must exactly
+/// equal the cache identifier so a stale path, wildcard, or session ID cannot
+/// broaden the deletion target.
+pub fn discard_recovery_cache(
+    cache_scope: &PipeFsCacheScope,
+    session_id: &str,
+    cache_id: &str,
+    confirmation: &str,
+) -> Result<()> {
+    ensure!(
+        confirmation == cache_id,
+        "recovery cache confirmation must exactly match {cache_id:?}"
+    );
+    let cache = inspect_recovery_cache(cache_scope, session_id, cache_id)?;
+    let session_root = session_cache_root(&default_cache_base(), cache_scope, session_id)?;
+    remove_cache_directory(&session_root, &cache.path)
+}
+
+fn local_recovery_required_at(
+    base: &Path,
+    cache_scope: &PipeFsCacheScope,
+    session_id: &str,
+) -> bool {
     if validate_session_id(session_id).is_err() {
         return true;
     }
-    let session_digest = blake3::hash(session_id.as_bytes()).to_hex().to_string();
-    let session_root = base.join(&session_digest[..32]);
+    let Ok(session_root) = session_cache_root(base, cache_scope, session_id) else {
+        return true;
+    };
     match fs::read_dir(&session_root) {
-        Ok(entries) => entries
-            .filter_map(std::result::Result::ok)
-            .any(|entry| entry.path().join("recovery-required").is_file()),
+        Ok(entries) => entries.filter_map(std::result::Result::ok).any(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && fs::symlink_metadata(entry.path().join("recovery-required"))
+                    .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => true,
     }
+}
+
+fn session_cache_root(
+    base: &Path,
+    cache_scope: &PipeFsCacheScope,
+    session_id: &str,
+) -> Result<PathBuf> {
+    validate_session_id(session_id)?;
+    let session_digest = blake3::hash(session_id.as_bytes()).to_hex().to_string();
+    Ok(base
+        .join(cache_scope.directory_name())
+        .join(&session_digest[..32]))
+}
+
+fn prepare_authority_cache_root(base: &Path, cache_scope: &PipeFsCacheScope) -> Result<PathBuf> {
+    // The chosen cache base is itself part of the private-data boundary. In
+    // particular, the `/tmp` fallback must not inherit a planted symlink or
+    // remain world-readable merely because only its descendants were checked.
+    create_private_dir(base)?;
+    let authority = base.join(cache_scope.directory_name());
+    create_private_dir(&authority)?;
+    Ok(authority)
+}
+
+fn validate_recovery_cache_id(cache_id: &str) -> Result<()> {
+    ensure!(
+        !cache_id.is_empty()
+            && cache_id.len() <= 128
+            && cache_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "invalid PipeFS recovery cache identifier"
+    );
+    Ok(())
+}
+
+fn list_recovery_caches_at(
+    base: &Path,
+    cache_scope: &PipeFsCacheScope,
+    session_id: &str,
+) -> Result<Vec<PipeFsRecoveryCache>> {
+    let session_root = session_cache_root(base, cache_scope, session_id)?;
+    let entries = match fs::read_dir(&session_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "reading PipeFS recovery cache directory {}",
+                    session_root.display()
+                )
+            });
+        }
+    };
+    let session_metadata = fs::symlink_metadata(&session_root)?;
+    ensure!(
+        session_metadata.is_dir() && !session_metadata.file_type().is_symlink(),
+        "PipeFS session cache is not a real directory: {}",
+        session_root.display()
+    );
+
+    let mut caches = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let marker = path.join("recovery-required");
+        let marker_metadata = match fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !marker_metadata.is_file() || marker_metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if validate_recovery_cache_id(id).is_err() {
+            continue;
+        }
+
+        let controller = load_scoped_recovery_controller(&path, cache_scope);
+        let (workspace_root, phase, logical_size_bytes, last_error) = match controller {
+            Ok(state) => {
+                let logical_size = state
+                    .snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.logical_size_bytes);
+                let mut error = state.last_error;
+                let workspace_root = match state.materialized_root {
+                    Some(root) => match validate_recovery_workspace_root(&path, &root) {
+                        Ok(root) => Some(root),
+                        Err(root_error) => {
+                            error = Some(match error {
+                                Some(error) => format!("{error}; {root_error:#}"),
+                                None => format!("{root_error:#}"),
+                            });
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                (workspace_root, Some(state.phase), logical_size, error)
+            }
+            Err(error) => (None, None, 0, Some(format!("{error:#}"))),
+        };
+        let pending_archive = path.join("pending.tar.zst");
+        let pending_archive_bytes = fs::symlink_metadata(pending_archive)
+            .ok()
+            .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            .map_or(0, |metadata| metadata.len());
+        caches.push(PipeFsRecoveryCache {
+            id: id.to_string(),
+            path,
+            workspace_root,
+            phase,
+            logical_size_bytes,
+            pending_archive_bytes,
+            last_error,
+        });
+    }
+    caches.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(caches)
+}
+
+fn load_scoped_recovery_controller(
+    cache: &Path,
+    cache_scope: &PipeFsCacheScope,
+) -> Result<ControllerState> {
+    let controller_path = cache.join("controller.json");
+    let metadata =
+        fs::symlink_metadata(&controller_path).context("reading recovery controller metadata")?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "recovery controller is not a regular non-symlink file"
+    );
+    let state: ControllerState = serde_json::from_slice(
+        &fs::read(&controller_path).context("reading recovery controller state")?,
+    )
+    .context("parsing recovery controller state")?;
+    validate_controller_cache_scope(&state, cache_scope)?;
+    Ok(state)
+}
+
+fn validate_recovery_cache_scope(cache: &Path, cache_scope: &PipeFsCacheScope) -> Result<()> {
+    load_scoped_recovery_controller(cache, cache_scope).map(|_| ())
+}
+
+fn validate_recovery_workspace_root(cache: &Path, workspace_root: &Path) -> Result<PathBuf> {
+    ensure!(
+        workspace_root.starts_with(cache) && workspace_root != cache,
+        "recovery cache points outside its generation directory"
+    );
+    let canonical_cache = cache.canonicalize()?;
+    let canonical_root = workspace_root.canonicalize().with_context(|| {
+        format!(
+            "canonicalizing recovery workspace {}",
+            workspace_root.display()
+        )
+    })?;
+    ensure!(
+        canonical_root.starts_with(&canonical_cache) && canonical_root != canonical_cache,
+        "recovery workspace resolves outside its generation directory"
+    );
+    let metadata = fs::symlink_metadata(&canonical_root)?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "recovery workspace is not a real directory"
+    );
+    Ok(canonical_root)
+}
+
+fn recovery_workspace_root(cache: &PipeFsRecoveryCache) -> Result<PathBuf> {
+    let workspace_root = cache.workspace_root.as_ref().ok_or_else(|| {
+        anyhow!(
+            "PipeFS recovery cache {:?} has no safe materialized workspace{}",
+            cache.id,
+            cache
+                .last_error
+                .as_deref()
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        )
+    })?;
+    validate_recovery_workspace_root(&cache.path, workspace_root)
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
@@ -1493,6 +2433,84 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     {
         write_private_portable(path, bytes)
     }
+}
+
+fn install_private_archive(source: &Path, destination: &Path) -> Result<()> {
+    ensure!(
+        source.parent() == destination.parent(),
+        "PipeFS staged archive must remain in its private cache directory"
+    );
+    let source_metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("reading staged PipeFS archive {}", source.display()))?;
+    ensure!(
+        source_metadata.is_file() && !source_metadata.file_type().is_symlink(),
+        "PipeFS staged archive is not a regular file"
+    );
+    if let Ok(destination_metadata) = fs::symlink_metadata(destination) {
+        ensure!(
+            destination_metadata.is_file() && !destination_metadata.file_type().is_symlink(),
+            "refusing to replace a non-regular PipeFS pending archive"
+        );
+    }
+    fs::rename(source, destination).with_context(|| {
+        format!(
+            "atomically staging PipeFS archive {}",
+            destination.display()
+        )
+    })?;
+    if let Some(parent) = destination.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn verify_staged_archive(path: &Path, expected_size: u64, expected_hash: &str) -> Result<u64> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading staged PipeFS archive {}", path.display()))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "local recovery archive is not a regular file"
+    );
+    if expected_size != 0 {
+        ensure!(
+            metadata.len() == expected_size,
+            "local recovery archive has size {}, expected {expected_size}",
+            metadata.len()
+        );
+    }
+    #[cfg(unix)]
+    let mut file = fs::File::from(
+        rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    #[cfg(not(unix))]
+    let mut file = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or_else(|| anyhow!("local recovery archive size overflow"))?;
+        hasher.update(&buffer[..read]);
+    }
+    ensure!(
+        expected_size == 0 || size == expected_size,
+        "local recovery archive changed size while being verified"
+    );
+    ensure!(
+        hasher.finalize().to_hex().as_str() == expected_hash,
+        "local recovery archive failed BLAKE3 verification"
+    );
+    Ok(size)
 }
 
 #[cfg(unix)]
@@ -1630,15 +2648,28 @@ fn recovery_caches(session_root: &Path, current: Option<&Path>) -> Vec<PathBuf> 
     };
     entries
         .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
         .filter(|path| current != Some(path.as_path()))
-        .filter(|path| path.join("recovery-required").is_file())
+        .filter(|path| {
+            fs::symlink_metadata(path.join("recovery-required"))
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_cache_scope() -> PipeFsCacheScope {
+        PipeFsClient::new(crate::PipeFsClientConfig::new(
+            "http://127.0.0.1:1",
+            "test-key",
+        ))
+        .unwrap()
+        .cache_scope()
+    }
 
     fn remote_with_chain(kinds: &[RevisionKind], sizes: &[u64]) -> ControllerState {
         ControllerState {
@@ -1664,9 +2695,33 @@ mod tests {
                 maximum_revision_bytes: 1_000_000,
                 maximum_workspace_bytes: 1_000_000,
                 maximum_delta_chain: 20,
+                writes_available: true,
+                restore_available: true,
             }),
             ..ControllerState::default()
         }
+    }
+
+    #[test]
+    fn remote_enable_reconciliation_preserves_uncommitted_phase() {
+        assert_eq!(
+            phase_after_remote_enable(WorkspacePhase::Clean).unwrap(),
+            WorkspacePhase::Clean
+        );
+        assert_eq!(
+            phase_after_remote_enable(WorkspacePhase::Dirty).unwrap(),
+            WorkspacePhase::Dirty
+        );
+        assert_eq!(
+            phase_after_remote_enable(WorkspacePhase::Pending).unwrap(),
+            WorkspacePhase::Pending
+        );
+        assert_eq!(
+            phase_after_remote_enable(WorkspacePhase::Disabled).unwrap(),
+            WorkspacePhase::Clean
+        );
+        assert!(phase_after_remote_enable(WorkspacePhase::Restoring).is_err());
+        assert!(phase_after_remote_enable(WorkspacePhase::LeaseLost).is_err());
     }
 
     #[test]
@@ -1700,6 +2755,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_recognizes_a_pending_revision_that_already_became_remote_head() {
+        let pending = PendingRevision {
+            expected_base_revision_id: Some(Uuid::nil()),
+            revision_type: RevisionKind::Delta,
+            archive_blake3: "b".repeat(64),
+            archive_size_bytes: 123,
+            manifest_digest: "a".repeat(64),
+            logical_size_bytes: 42,
+            idempotency_key: "retry-key".to_string(),
+            snapshot: Snapshot::default(),
+        };
+        let remote = PipeFsRemoteState {
+            session_id: "recovered-session".to_string(),
+            enabled: true,
+            current_head: Some(Uuid::new_v4()),
+            sequence: 2,
+            manifest_digest: Some("a".repeat(64)),
+            logical_size_bytes: 42,
+            restore_chain: Vec::new(),
+        };
+
+        assert!(pending_matches_remote_head(&pending, &remote));
+        let mut wrong_size = remote.clone();
+        wrong_size.logical_size_bytes += 1;
+        assert!(!pending_matches_remote_head(&pending, &wrong_size));
+        let mut wrong_manifest = remote;
+        wrong_manifest.manifest_digest = Some("c".repeat(64));
+        assert!(!pending_matches_remote_head(&pending, &wrong_manifest));
+    }
+
     #[tokio::test]
     async fn server_requested_compaction_restages_current_tree_as_full() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1720,6 +2806,7 @@ mod tests {
             },
             PipeFsWorkspaceConfig {
                 session_id: "compaction-restage-test".to_string(),
+                cache_scope: test_cache_scope(),
                 original_workspace_root: workspace_root.clone(),
                 original_state_root: state_root,
                 cache_base: Some(temporary.path().join("cache")),
@@ -1745,6 +2832,8 @@ mod tests {
             maximum_revision_bytes: 1_000_000,
             maximum_workspace_bytes: 1_000_000,
             maximum_delta_chain: 20,
+            writes_available: true,
+            restore_available: true,
         });
         let old_key = revision_idempotency_key(
             1,
@@ -1756,6 +2845,7 @@ mod tests {
             expected_base_revision_id: state.remote.as_ref().and_then(|remote| remote.current_head),
             revision_type: RevisionKind::Delta,
             archive_blake3: "old-delta".to_string(),
+            archive_size_bytes: 1,
             manifest_digest: "old-manifest".to_string(),
             logical_size_bytes: 0,
             idempotency_key: old_key.clone(),
@@ -1772,6 +2862,54 @@ mod tests {
         assert!(workspace.inner.pending_archive.is_file());
     }
 
+    #[tokio::test]
+    async fn restored_drain_mode_workspace_rejects_mutation_before_local_bytes_change() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace_root = temporary.path().join("workspace");
+        let state_root = temporary.path().join("state");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&state_root).unwrap();
+        let workspace = PipeFsWorkspace::new(
+            PipeFsClient::new(crate::PipeFsClientConfig::new(
+                "http://127.0.0.1:1",
+                "test-key",
+            ))
+            .unwrap(),
+            PipeFsLease {
+                token: "token".to_string(),
+                generation: 1,
+            },
+            PipeFsWorkspaceConfig {
+                session_id: "read-only-drain-test".to_string(),
+                cache_scope: test_cache_scope(),
+                original_workspace_root: workspace_root.clone(),
+                original_state_root: state_root,
+                cache_base: Some(temporary.path().join("cache")),
+            },
+        )
+        .unwrap();
+        let mut state = workspace.inner.state.lock().await;
+        state.phase = WorkspacePhase::Clean;
+        state.materialized_root = Some(workspace_root);
+        state.capabilities = Some(CapabilitiesDisk {
+            maximum_revision_bytes: 1_000_000,
+            maximum_workspace_bytes: 1_000_000,
+            maximum_delta_chain: 20,
+            writes_available: false,
+            restore_available: true,
+        });
+        drop(state);
+
+        let error = workspace
+            .mutation_started(Some(vec!["blocked.txt".to_string()]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("read-only"));
+        let state = workspace.inner.state.lock().await;
+        assert_eq!(state.phase, WorkspacePhase::Clean);
+        assert!(state.dirty_paths.is_empty());
+    }
+
     #[test]
     fn cache_removal_is_scoped() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1784,21 +2922,317 @@ mod tests {
         assert!(remove_cache_directory(&session, temporary.path()).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cache_base_is_private_and_rejects_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().join("cache-base");
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+        let scope = test_cache_scope();
+
+        let authority = prepare_authority_cache_root(&base, &scope).unwrap();
+        assert!(authority.is_dir());
+        assert_eq!(
+            fs::metadata(&base).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let target = temporary.path().join("symlink-target");
+        fs::create_dir(&target).unwrap();
+        let linked_base = temporary.path().join("linked-cache-base");
+        symlink(&target, &linked_base).unwrap();
+        let error = prepare_authority_cache_root(&linked_base, &scope).unwrap_err();
+        assert!(error.to_string().contains("not a real directory"));
+        assert!(fs::read_dir(&target).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn owned_temporary_guard_cleans_panics_and_preserves_disarmed_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_recovery = temporary.path().join("source-recovery");
+        fs::create_dir(&source_recovery).unwrap();
+        fs::write(source_recovery.join("user-data"), b"preserve").unwrap();
+
+        let panic_path = std::sync::Mutex::new(None);
+        let result = std::panic::catch_unwind(|| {
+            let archive = OwnedCacheTemporary::archive(temporary.path(), "panic");
+            *panic_path.lock().unwrap() = Some(archive.path().to_path_buf());
+            fs::write(archive.path(), b"partial").unwrap();
+            panic!("simulated archive builder panic");
+        });
+        assert!(result.is_err());
+        assert!(!panic_path.lock().unwrap().as_ref().unwrap().exists());
+
+        let mut activated = OwnedCacheTemporary::directory(temporary.path(), "workspace");
+        fs::create_dir(activated.path()).unwrap();
+        let activated_path = activated.path().to_path_buf();
+        activated.disarm();
+        drop(activated);
+        assert!(activated_path.is_dir());
+        assert_eq!(
+            fs::read(source_recovery.join("user-data")).unwrap(),
+            b"preserve"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_temporary_guard_cleans_a_cancelled_recovery_task() {
+        let temporary = tempfile::tempdir().unwrap();
+        let recovery = OwnedCacheTemporary::directory(temporary.path(), "recovery");
+        fs::create_dir(recovery.path()).unwrap();
+        fs::write(recovery.path().join("partial"), b"partial").unwrap();
+        let recovery_path = recovery.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            let _recovery = recovery;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(!recovery_path.exists());
+    }
+
+    #[test]
+    fn cache_and_recovery_are_isolated_by_authenticated_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache_base = temporary.path().join("cache");
+        let workspace_root = temporary.path().join("workspace");
+        let state_root = temporary.path().join("state");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&state_root).unwrap();
+        let session_id = "shared-session-id";
+        let client_a = PipeFsClient::new(crate::PipeFsClientConfig::new(
+            "https://one.example.test/v1",
+            "account-a-key",
+        ))
+        .unwrap();
+        let client_b = PipeFsClient::new(crate::PipeFsClientConfig::new(
+            "https://one.example.test/v1",
+            "account-b-key",
+        ))
+        .unwrap();
+        let client_c = PipeFsClient::new(crate::PipeFsClientConfig::new(
+            "https://two.example.test/v1",
+            "account-a-key",
+        ))
+        .unwrap();
+        let scope_a = client_a.cache_scope();
+        let scope_b = client_b.cache_scope();
+        let scope_c = client_c.cache_scope();
+        let make_workspace = |client: PipeFsClient, cache_scope: PipeFsCacheScope| {
+            PipeFsWorkspace::new(
+                client,
+                PipeFsLease {
+                    token: "token".to_string(),
+                    generation: 7,
+                },
+                PipeFsWorkspaceConfig {
+                    session_id: session_id.to_string(),
+                    cache_scope,
+                    original_workspace_root: workspace_root.clone(),
+                    original_state_root: state_root.clone(),
+                    cache_base: Some(cache_base.clone()),
+                },
+            )
+            .unwrap()
+        };
+        let workspace_a = make_workspace(client_a, scope_a.clone());
+        let workspace_b = make_workspace(client_b, scope_b.clone());
+        let workspace_c = make_workspace(client_c, scope_c.clone());
+
+        assert_ne!(
+            workspace_a.inner.session_cache_root,
+            workspace_b.inner.session_cache_root
+        );
+        assert_ne!(
+            workspace_a.inner.session_cache_root,
+            workspace_c.inner.session_cache_root
+        );
+        assert_ne!(workspace_a.inner.cache_root, workspace_b.inner.cache_root);
+        assert_ne!(workspace_a.inner.cache_root, workspace_c.inner.cache_root);
+
+        let state = workspace_a.inner.state.blocking_lock();
+        workspace_a.persist_locked(&state).unwrap();
+        drop(state);
+        write_private(
+            &workspace_a.inner.recovery_marker,
+            b"uncommitted account A workspace\n",
+        )
+        .unwrap();
+        workspace_a.record_mode_hint(true).unwrap();
+
+        assert!(local_recovery_required_at(
+            &cache_base,
+            &scope_a,
+            session_id
+        ));
+        assert!(!local_recovery_required_at(
+            &cache_base,
+            &scope_b,
+            session_id
+        ));
+        assert!(!local_recovery_required_at(
+            &cache_base,
+            &scope_c,
+            session_id
+        ));
+        assert!(local_state_requires_remote_probe_at(
+            &cache_base,
+            &scope_a,
+            session_id
+        ));
+        assert!(!local_state_requires_remote_probe_at(
+            &cache_base,
+            &scope_b,
+            session_id
+        ));
+        assert_eq!(
+            list_recovery_caches_at(&cache_base, &scope_a, session_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            list_recovery_caches_at(&cache_base, &scope_b, session_id)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Pre-scope cache layouts stay untouched and invisible to automatic
+        // recovery. Their bytes remain available for explicit manual salvage.
+        let legacy_digest = blake3::hash(session_id.as_bytes()).to_hex().to_string();
+        let legacy_generation = cache_base.join(&legacy_digest[..32]).join("generation");
+        create_private_dir(&legacy_generation).unwrap();
+        write_private(
+            &legacy_generation.join("recovery-required"),
+            b"legacy unscoped cache; recover manually\n",
+        )
+        .unwrap();
+        assert!(!local_recovery_required_at(
+            &cache_base,
+            &scope_b,
+            session_id
+        ));
+        assert!(
+            list_recovery_caches_at(&cache_base, &scope_b, session_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn controller_scope_mismatch_fails_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace_root = temporary.path().join("workspace");
+        let state_root = temporary.path().join("state");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&state_root).unwrap();
+        let client = PipeFsClient::new(crate::PipeFsClientConfig::new(
+            "https://one.example.test/v1",
+            "account-a-key",
+        ))
+        .unwrap();
+        let scope_a = client.cache_scope();
+        let scope_b = PipeFsClient::new(crate::PipeFsClientConfig::new(
+            "https://one.example.test/v1",
+            "account-b-key",
+        ))
+        .unwrap()
+        .cache_scope();
+        let config = PipeFsWorkspaceConfig {
+            session_id: "scope-mismatch".to_string(),
+            cache_scope: scope_a.clone(),
+            original_workspace_root: workspace_root,
+            original_state_root: state_root,
+            cache_base: Some(temporary.path().join("cache")),
+        };
+        let workspace = PipeFsWorkspace::new(
+            client.clone(),
+            PipeFsLease {
+                token: "token".to_string(),
+                generation: 1,
+            },
+            config.clone(),
+        )
+        .unwrap();
+        let mismatched = ControllerState::for_cache_scope(&scope_b);
+        write_private(
+            &workspace.inner.state_file,
+            &serde_json::to_vec(&mismatched).unwrap(),
+        )
+        .unwrap();
+        drop(workspace);
+
+        let error = PipeFsWorkspace::new(
+            client,
+            PipeFsLease {
+                token: "token".to_string(),
+                generation: 1,
+            },
+            config,
+        )
+        .err()
+        .expect("mismatched controller must be rejected");
+        assert!(error.to_string().contains("mismatched authority"));
+
+        let wrong_scope_error = PipeFsWorkspace::new(
+            PipeFsClient::new(crate::PipeFsClientConfig::new(
+                "https://one.example.test/v1",
+                "account-a-key",
+            ))
+            .unwrap(),
+            PipeFsLease {
+                token: "token".to_string(),
+                generation: 2,
+            },
+            PipeFsWorkspaceConfig {
+                session_id: "client-config-scope-mismatch".to_string(),
+                cache_scope: scope_b,
+                original_workspace_root: temporary.path().join("workspace"),
+                original_state_root: temporary.path().join("state"),
+                cache_base: Some(temporary.path().join("cache")),
+            },
+        )
+        .err()
+        .expect("client/config scope mismatch must be rejected");
+        assert!(
+            wrong_scope_error
+                .to_string()
+                .contains("authenticated client")
+        );
+    }
+
     #[test]
     fn session_mode_hint_survives_generation_cleanup_and_dirty_cache_fails_closed() {
         let temporary = tempfile::tempdir().unwrap();
         let base = temporary.path().join("cache");
         let session_id = "mode-hint-test";
-        let digest = blake3::hash(session_id.as_bytes()).to_hex().to_string();
-        let session_root = base.join(&digest[..32]);
+        let cache_scope = test_cache_scope();
+        let session_root = session_cache_root(&base, &cache_scope, session_id).unwrap();
         create_private_dir(&session_root).unwrap();
 
-        assert!(!local_state_requires_remote_probe_at(&base, session_id));
-        assert!(!local_recovery_required_at(&base, session_id));
-        write_private(&session_root.join("remote-mode"), b"enabled\n").unwrap();
-        assert!(local_state_requires_remote_probe_at(&base, session_id));
-        write_private(&session_root.join("remote-mode"), b"disabled\n").unwrap();
-        assert!(!local_state_requires_remote_probe_at(&base, session_id));
+        assert!(!local_state_requires_remote_probe_at(
+            &base,
+            &cache_scope,
+            session_id
+        ));
+        assert!(!local_recovery_required_at(&base, &cache_scope, session_id));
+        write_mode_hint(&session_root.join("remote-mode"), &cache_scope, true).unwrap();
+        assert!(local_state_requires_remote_probe_at(
+            &base,
+            &cache_scope,
+            session_id
+        ));
+        write_mode_hint(&session_root.join("remote-mode"), &cache_scope, false).unwrap();
+        assert!(!local_state_requires_remote_probe_at(
+            &base,
+            &cache_scope,
+            session_id
+        ));
 
         let generation = session_root.join("generation");
         create_private_dir(&generation).unwrap();
@@ -1807,12 +3241,20 @@ mod tests {
             b"uncommitted workspace changes\n",
         )
         .unwrap();
-        assert!(local_state_requires_remote_probe_at(&base, session_id));
-        assert!(local_recovery_required_at(&base, session_id));
+        assert!(local_state_requires_remote_probe_at(
+            &base,
+            &cache_scope,
+            session_id
+        ));
+        assert!(local_recovery_required_at(&base, &cache_scope, session_id));
         fs::remove_dir_all(generation).unwrap();
 
         write_private(&session_root.join("remote-mode"), b"corrupt\n").unwrap();
-        assert!(local_state_requires_remote_probe_at(&base, session_id));
+        assert!(local_state_requires_remote_probe_at(
+            &base,
+            &cache_scope,
+            session_id
+        ));
     }
 
     #[cfg(unix)]
@@ -1855,6 +3297,7 @@ mod tests {
             },
             PipeFsWorkspaceConfig {
                 session_id: "background-marker-test".to_string(),
+                cache_scope: test_cache_scope(),
                 original_workspace_root: workspace_root,
                 original_state_root: state_root,
                 cache_base: Some(temporary.path().join("cache")),
@@ -1904,6 +3347,7 @@ mod tests {
             },
             PipeFsWorkspaceConfig {
                 session_id: "lease-refresh-test".to_string(),
+                cache_scope: test_cache_scope(),
                 original_workspace_root: workspace_root,
                 original_state_root: state_root,
                 cache_base: Some(temporary.path().join("cache")),
@@ -1917,6 +3361,7 @@ mod tests {
                 expected_base_revision_id: None,
                 revision_type: RevisionKind::Full,
                 archive_blake3: "a".repeat(64),
+                archive_size_bytes: 6,
                 manifest_digest: "b".repeat(64),
                 logical_size_bytes: 0,
                 idempotency_key: "old-generation".to_string(),
@@ -1963,6 +3408,7 @@ mod tests {
                 },
                 PipeFsWorkspaceConfig {
                     session_id: "clean-cache-test".to_string(),
+                    cache_scope: test_cache_scope(),
                     original_workspace_root: workspace_root.clone(),
                     original_state_root: state_root.clone(),
                     cache_base: Some(temporary.path().join("cache")),
@@ -2012,6 +3458,7 @@ mod tests {
         fs::create_dir_all(&state_root).unwrap();
         let config = PipeFsWorkspaceConfig {
             session_id: "same-generation-drift-test".to_string(),
+            cache_scope: test_cache_scope(),
             original_workspace_root: workspace_root,
             original_state_root: state_root,
             cache_base: Some(temporary.path().join("cache")),
@@ -2085,6 +3532,7 @@ mod tests {
                 },
                 PipeFsWorkspaceConfig {
                     session_id: "stale-drift-test".to_string(),
+                    cache_scope: test_cache_scope(),
                     original_workspace_root: workspace_root.clone(),
                     original_state_root: state_root.clone(),
                     cache_base: Some(temporary.path().join("cache")),
@@ -2128,6 +3576,35 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recovery_discovery_never_follows_generation_or_marker_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let session_root = temporary.path().join("session");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&session_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("recovery-required"), b"outside\n").unwrap();
+
+        symlink(&outside, session_root.join("linked-generation")).unwrap();
+
+        let linked_marker = session_root.join("linked-marker");
+        fs::create_dir_all(&linked_marker).unwrap();
+        symlink(
+            outside.join("recovery-required"),
+            linked_marker.join("recovery-required"),
+        )
+        .unwrap();
+
+        let genuine = session_root.join("genuine");
+        fs::create_dir_all(&genuine).unwrap();
+        fs::write(genuine.join("recovery-required"), b"recover\n").unwrap();
+
+        assert_eq!(recovery_caches(&session_root, None), vec![genuine]);
+    }
+
     #[tokio::test]
     async fn rejects_workspace_larger_than_server_capability_before_staging() {
         let temporary = tempfile::tempdir().unwrap();
@@ -2136,7 +3613,6 @@ mod tests {
         fs::create_dir_all(&workspace_root).unwrap();
         fs::create_dir_all(&state_root).unwrap();
         fs::write(workspace_root.join("large"), b"0123456789").unwrap();
-        let artifact = build_revision(&workspace_root, None, true).unwrap();
         let workspace = PipeFsWorkspace::new(
             PipeFsClient::new(crate::PipeFsClientConfig::new(
                 "http://127.0.0.1:1",
@@ -2149,7 +3625,8 @@ mod tests {
             },
             PipeFsWorkspaceConfig {
                 session_id: "workspace-limit-test".to_string(),
-                original_workspace_root: workspace_root,
+                cache_scope: test_cache_scope(),
+                original_workspace_root: workspace_root.clone(),
                 original_state_root: state_root,
                 cache_base: Some(temporary.path().join("cache")),
             },
@@ -2157,18 +3634,29 @@ mod tests {
         .unwrap();
         let mut state = workspace.inner.state.lock().await;
         state.phase = WorkspacePhase::Dirty;
+        state.materialized_root = Some(workspace_root);
+        state.snapshot = Some(Snapshot::default());
         state.capabilities = Some(CapabilitiesDisk {
             maximum_revision_bytes: 1_000_000,
             maximum_workspace_bytes: 5,
             maximum_delta_chain: 20,
+            writes_available: true,
+            restore_available: true,
         });
+        workspace.persist_locked(&state).unwrap();
+        drop(state);
 
-        let error = workspace
-            .stage_pending_locked(&mut state, artifact, 1)
-            .unwrap_err();
+        let error = workspace.checkpoint().await.unwrap_err();
 
         assert!(error.to_string().contains("exceeding the server limit"));
+        let state = workspace.inner.state.lock().await;
         assert!(state.pending.is_none());
         assert!(!workspace.inner.pending_archive.exists());
+        assert!(
+            fs::read_dir(&workspace.inner.cache_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tar.zst"))
+        );
     }
 }

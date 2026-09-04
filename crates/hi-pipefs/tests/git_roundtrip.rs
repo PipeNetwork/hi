@@ -60,16 +60,23 @@ fn native_git_clone_checkout_add_commit_survives_restore() {
         &repository,
         &["config", "user.email", "pipefs@example.invalid"],
     );
+
+    // Machine A's first durable checkpoint is a full archive. Subsequent Git
+    // work is intentionally represented as deltas so the test exercises the
+    // same bounded restore-chain shape used for cross-machine resume.
+    let full = build_revision(source.path(), None, true).unwrap();
     git(&repository, &["checkout", "-b", "feature"]);
     fs::write(repository.join("tracked.txt"), "feature\n").unwrap();
     git(&repository, &["add", "tracked.txt"]);
     git(&repository, &["commit", "-m", "feature change"]);
     assert!(git(&repository, &["status", "--porcelain"]).is_empty());
 
-    let revision = build_revision(source.path(), None, true).unwrap();
-    let restored = tempfile::tempdir().unwrap();
-    apply_archive(restored.path(), &revision.bytes, None).unwrap();
-    let restored_repository = restored.path().join("repository");
+    let feature_delta = build_revision(source.path(), Some(&full.snapshot), false).unwrap();
+    let machine_b = tempfile::tempdir().unwrap();
+    let full_snapshot = apply_archive(machine_b.path(), &full.bytes, None).unwrap();
+    let feature_snapshot =
+        apply_archive(machine_b.path(), &feature_delta.bytes, Some(&full_snapshot)).unwrap();
+    let restored_repository = machine_b.path().join("repository");
 
     assert_eq!(
         git(&restored_repository, &["branch", "--show-current"]).trim(),
@@ -94,4 +101,37 @@ fn native_git_clone_checkout_add_commit_survives_restore() {
         &["commit", "-m", "commit after restore"],
     );
     assert!(git(&restored_repository, &["status", "--porcelain"]).is_empty());
+
+    // Machine B checkpoints its new commit. Machine C must reconstruct the
+    // repository from the full-plus-deltas chain, including .git metadata.
+    let post_restore_delta =
+        build_revision(machine_b.path(), Some(&feature_snapshot), false).unwrap();
+    let machine_c = tempfile::tempdir().unwrap();
+    let machine_c_full = apply_archive(machine_c.path(), &full.bytes, None).unwrap();
+    let machine_c_feature = apply_archive(
+        machine_c.path(),
+        &feature_delta.bytes,
+        Some(&machine_c_full),
+    )
+    .unwrap();
+    apply_archive(
+        machine_c.path(),
+        &post_restore_delta.bytes,
+        Some(&machine_c_feature),
+    )
+    .unwrap();
+    let machine_c_repository = machine_c.path().join("repository");
+    assert_eq!(
+        git(&machine_c_repository, &["branch", "--show-current"]).trim(),
+        "feature"
+    );
+    assert_eq!(
+        git(&machine_c_repository, &["log", "-1", "--format=%s"]).trim(),
+        "commit after restore"
+    );
+    assert_eq!(
+        fs::read_to_string(machine_c_repository.join("after-restore.txt")).unwrap(),
+        "native git\n"
+    );
+    assert!(git(&machine_c_repository, &["status", "--porcelain"]).is_empty());
 }

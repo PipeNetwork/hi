@@ -288,7 +288,33 @@ impl crate::Agent {
     /// Workspace MCP admin (`reconnect` / `enable` / `disable`).
     pub async fn mcp_workspace_admin(&self, args: &str) -> Option<anyhow::Result<String>> {
         let backend = self.mcp.as_ref()?;
-        Some(backend.workspace_admin(args).await)
+        let durability = self.workspace_durability.clone();
+        if let Some(durability) = &durability
+            && let Err(error) = durability
+                .mutation_started(Some(vec!["<workspace MCP configuration>".to_string()]))
+                .await
+        {
+            return Some(Err(
+                error.context("PipeFS refused the workspace MCP configuration mutation")
+            ));
+        }
+
+        let result = backend.workspace_admin(args).await;
+        let checkpoint = if let Some(durability) = durability {
+            durability.checkpoint().await
+        } else {
+            Ok(())
+        };
+        Some(match (result, checkpoint) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error.context(
+                "workspace MCP configuration changed, but its PipeFS revision was not committed; run /pipefs retry",
+            )),
+            (Err(admin_error), Err(checkpoint_error)) => Err(anyhow::anyhow!(
+                "workspace MCP command failed ({admin_error:#}), and reconciling its possible filesystem changes also failed ({checkpoint_error:#}); run /pipefs retry"
+            )),
+        })
     }
 
     /// Installs already-validated managed RSI reference context for the next

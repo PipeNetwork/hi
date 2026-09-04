@@ -22,7 +22,7 @@ pub async fn run_loops_daemon(launcher: FleetLauncher) -> Result<()> {
         bail!("no project loops file — the daemon needs a persisted loops.json location");
     };
     let lock_path = crate::lock::lock_path(&loops_file);
-    let Some(_lock) = crate::lock::try_acquire(&lock_path) else {
+    let Some(lock) = crate::lock::try_acquire(&lock_path).map(Arc::new) else {
         let who = crate::lock::live_holder(&lock_path)
             .map(|p| p.to_string())
             .unwrap_or_else(|| "another process".into());
@@ -42,7 +42,12 @@ pub async fn run_loops_daemon(launcher: FleetLauncher) -> Result<()> {
     }
     let _ = std::io::stdout().flush();
 
-    let handle = crate::loops::start(Arc::new(launcher), Some(loops_file), None);
+    let mut handle = Some(crate::loops::start_with_fire_lock(
+        Arc::new(launcher),
+        Some(loops_file),
+        None,
+        Some(lock),
+    ));
 
     loop {
         tokio::select! {
@@ -51,10 +56,16 @@ pub async fn run_loops_daemon(launcher: FleetLauncher) -> Result<()> {
             _ = shutdown_signal() => {
                 println!("⟳ daemon stopping — loops pause until a firer (TUI or daemon) next runs");
                 let _ = std::io::stdout().flush();
+                if let Some(handle) = handle.take() {
+                    handle
+                        .shutdown()
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                }
                 return Ok(());
             }
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                for (line, loud) in handle.drain() {
+                for (line, loud) in handle.as_ref().expect("daemon loop manager is active").drain() {
                     // Loud lines to stderr (so `| grep` on stdout can filter to
                     // routine ticks, or vice versa); quiet re-arm notes to stdout.
                     if loud {

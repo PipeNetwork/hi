@@ -57,6 +57,11 @@ const CHUNK_PART_BYTES: usize = 450 * 1024;
 const LEASE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const LEASE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 const LEASE_MAX_ATTEMPTS: usize = 2;
+const LEASE_CONFIRMATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+// The server currently grants 120 seconds. Keep the locally displayed horizon
+// conservative so clock/scheduling jitter never advertises authority right up
+// to the server's actual expiry.
+const LEASE_CONFIRMED_FRESH_SECS: u64 = 90;
 
 /// Configuration for syncing a session to ipop.
 #[derive(Clone, Debug)]
@@ -915,6 +920,51 @@ impl RemoteSessionSink {
         self.lease_lost.load(Ordering::Acquire)
     }
 
+    /// Synchronously prove this writer still owns the server lease. PipeFS
+    /// calls this before admitting every native filesystem mutation, rather
+    /// than relying on a cached token or eventually-consistent heartbeat task.
+    pub(crate) async fn confirm_writer_lease(&self) -> Result<()> {
+        if self.lease_lost.load(Ordering::Acquire) {
+            anyhow::bail!("lease_lost: this session was taken over by another writer");
+        }
+        let token = self
+            .lease_token()
+            .ok_or_else(|| anyhow!("writer lease is unavailable"))?;
+        let url = format!(
+            "{}/hi/sessions/{}/heartbeat",
+            self.config.base_url, self.session_id
+        );
+        let telemetry = lock_recover(&self.telemetry).clone();
+        let response = self
+            .client
+            .post(&url)
+            .header("x-api-key", &self.config.api_key)
+            .header("x-hi-lease-token", token)
+            .json(&serde_json::json!({
+                "model": telemetry.model,
+                "context_used_tokens": telemetry.context_used_tokens,
+                "context_max_tokens": telemetry.context_max_tokens,
+            }))
+            .timeout(LEASE_CONFIRMATION_TIMEOUT)
+            .send()
+            .await;
+        note_endpoint_outcome(&self.store, response.as_ref().err());
+        let response = response.with_context(|| format!("confirming writer lease at {url}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::CONFLICT {
+                self.lease_lost.store(true, Ordering::Release);
+            }
+            anyhow::bail!("writer lease confirmation failed: HTTP {status} {body}");
+        }
+        let confirmed_until = (unix_now().max(0) as u64).saturating_add(LEASE_CONFIRMED_FRESH_SECS);
+        self.store
+            .renew_lease_expiry(&self.session_id, confirmed_until)
+            .context("recording confirmed writer lease freshness")?;
+        Ok(())
+    }
+
     pub fn lease_token(&self) -> Option<String> {
         self.store.lease_token(&self.session_id).ok().flatten()
     }
@@ -995,7 +1045,12 @@ impl RemoteSessionSink {
                         lease_lost.store(true, Ordering::Release);
                         break;
                     }
-                    Ok(response) if response.status().is_success() => consecutive_failures = 0,
+                    Ok(response) if response.status().is_success() => {
+                        consecutive_failures = 0;
+                        let confirmed_until =
+                            (unix_now().max(0) as u64).saturating_add(LEASE_CONFIRMED_FRESH_SECS);
+                        let _ = store.renew_lease_expiry(&session_id, confirmed_until);
+                    }
                     Ok(_) | Err(_) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         if consecutive_failures >= 5 {
@@ -1388,6 +1443,12 @@ impl SessionSink for SyncSession {
 
     fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
         self.local.record_checkpoints(refs)?;
+        self.reconcile_best_effort();
+        Ok(())
+    }
+
+    fn record_pipefs_mode(&mut self, enabled: bool) -> Result<()> {
+        self.local.record_pipefs_mode(enabled)?;
         self.reconcile_best_effort();
         Ok(())
     }
@@ -3176,7 +3237,11 @@ pub async fn run_resume_local(
         .pipefs
         .as_ref()
         .is_some_and(|pipefs| pipefs.enabled || pipefs.restoration_required);
-    let loaded = fetched.loaded;
+    let mut loaded = fetched.loaded;
+    // The random local filename is only a cache key. Persist the existing
+    // remote identity into that cache so every later `--resume <local-id>`
+    // continues the same transcript, writer lease, and PipeFS workspace.
+    loaded.remote_session_id = Some(session_id.clone());
 
     let n_messages = loaded.messages.len();
     let has_goal = loaded.goal.is_some();

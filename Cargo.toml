@@ -132,7 +132,7 @@ dunce = "1"
 rustc-hash = "2"
 gix = { version = "0.83", default-features = false, features = ["sha1", "status", "index", "parallel"] }
 similar = "2.7"
-tokio-util = { version = "0.7", features = ["rt", "compat"] }
+tokio-util = { version = "0.7", features = ["rt", "compat", "io"] }
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 jsonschema = { version = "0.48.2", default-features = false }

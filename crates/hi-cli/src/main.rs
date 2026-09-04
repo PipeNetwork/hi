@@ -162,6 +162,36 @@ fn sync_session_enabled(
             }))
 }
 
+fn canonical_session_identity(
+    explicit_sync_id: Option<&str>,
+    persisted_remote_id: Option<&str>,
+    local_path: &std::path::Path,
+) -> String {
+    explicit_sync_id
+        .or(persisted_remote_id)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| feedback::session_id_from_path(local_path))
+}
+
+fn pipefs_startup_authority_required(
+    existing_session: bool,
+    local_pipefs_hint: bool,
+    persisted_pipefs_authority: bool,
+    has_persisted_remote_identity: bool,
+    has_explicit_remote_identity: bool,
+) -> bool {
+    local_pipefs_hint
+        || persisted_pipefs_authority
+        || (existing_session && (has_persisted_remote_identity || has_explicit_remote_identity))
+}
+
+fn completed_session_switch(canonical_id: String, summary: String) -> hi_tui::SessionSwitchInfo {
+    hi_tui::SessionSwitchInfo {
+        id: canonical_id,
+        summary,
+    }
+}
+
 async fn run() -> Result<()> {
     // Startup phase tracing: `HI_STARTUP_TRACE=1 hi …` prints elapsed-at-
     // milestone lines to stderr, so slow-start regressions get measured
@@ -537,6 +567,17 @@ async fn run() -> Result<()> {
     let (session_path, resolved_loaded) =
         resolve_session(&cli).inspect_err(|error| report_init_failure(error, None))?;
     let existing_session = resolved_loaded.is_some();
+    let persisted_remote_session_id = resolved_loaded
+        .as_ref()
+        .and_then(|loaded| loaded.remote_session_id.clone());
+    let persisted_pipefs_enabled = resolved_loaded
+        .as_ref()
+        .and_then(|loaded| loaded.pipefs_enabled);
+    let canonical_session_id = canonical_session_identity(
+        cli.sync_session_id.as_deref(),
+        persisted_remote_session_id.as_deref(),
+        &session_path,
+    );
     // Internal subagents/evals and isolated best-of workers deliberately do
     // not inherit the user's PipeFS default: none owns a persistent session
     // whose workspace can be committed and resumed.
@@ -558,7 +599,7 @@ async fn run() -> Result<()> {
         resolved_loaded
     };
     startup_trace!("session resolved");
-    let mut feedback_session_id = feedback::session_id_from_path(&session_path);
+    let mut feedback_session_id = canonical_session_id.clone();
 
     let fallbacks = config::resolve_fallbacks(&cli, &file);
     let startup_route =
@@ -849,13 +890,18 @@ async fn run() -> Result<()> {
     );
     let (mut sync_handle, mut remote_ui) = if persist_local_session && sync_enabled {
         let sync_config = build_sync_config(&settings, &cli, &file);
-        let session_id = cli
-            .sync_session_id
-            .clone()
-            .unwrap_or_else(|| feedback::session_id_from_path(&session_path));
+        let session_id = canonical_session_id.clone();
         let remote = sync::RemoteSessionSink::new(sync_config.clone(), session_id.clone());
         startup_trace!("remote sync sink built");
-        let sync_session = sync::SyncSession::new(JsonlSession::new(session_path), remote);
+        let mut local_session = JsonlSession::new(session_path);
+        if cli.sync_session_id.is_some()
+            && persisted_remote_session_id.as_deref() != Some(session_id.as_str())
+        {
+            local_session
+                .record_remote_session_identity(&session_id)
+                .context("persisting the canonical remote session identity")?;
+        }
+        let sync_session = sync::SyncSession::new(local_session, remote);
         startup_trace!("sync session reconciled");
         let handle = sync_session.remote_handle();
         agent.set_session(Box::new(sync_session));
@@ -872,11 +918,7 @@ async fn run() -> Result<()> {
     let mut pipefs_startup_checked = false;
     let pipefs_host = if persist_local_session {
         let sync_config = build_sync_config(&settings, &cli, &file);
-        let session_id = cli
-            .sync_session_id
-            .clone()
-            .unwrap_or_else(|| feedback::session_id_from_path(&daemon_session_path));
-        let local_pipefs_hint = hi_pipefs::local_state_requires_remote_probe(&session_id);
+        let session_id = canonical_session_id.clone();
         let host = std::sync::Arc::new(pipefs::PipeFsHost::new(
             sync_config,
             session_id,
@@ -886,11 +928,24 @@ async fn run() -> Result<()> {
             state_root.clone(),
             pipefs::PipeFsMcpConfig::resolve(&settings, &file),
         )?);
-        if pipefs_requested_for_new_session || (existing_session && local_pipefs_hint) {
+        let local_pipefs_hint = host.local_state_requires_remote_probe();
+        let persisted_pipefs_authority = persisted_pipefs_enabled == Some(true);
+        // A canonical remote identity is itself an authority signal. Always
+        // ask IPOP before activating a launch directory for such a resumed
+        // session: another machine may have enabled PipeFS before its
+        // best-effort transcript hint reached this cache.
+        let must_resolve_remote_pipefs = pipefs_startup_authority_required(
+            existing_session,
+            local_pipefs_hint,
+            persisted_pipefs_authority,
+            persisted_remote_session_id.is_some(),
+            cli.sync_session_id.is_some(),
+        );
+        if pipefs_requested_for_new_session || must_resolve_remote_pipefs {
             host.activate_for_startup(
                 &mut agent,
                 pipefs_requested_for_new_session,
-                local_pipefs_hint,
+                must_resolve_remote_pipefs,
             )
             .await?;
             // Startup may have lazily upgraded a saved local session to the
@@ -926,6 +981,9 @@ async fn run() -> Result<()> {
         && let Some(host) = &pipefs_host
         && host.is_active().await
     {
+        host.clean_exit(&mut agent)
+            .await
+            .context("cleaning the PipeFS materialization after rejecting --keep-background")?;
         anyhow::bail!(
             "--keep-background cannot be used with PipeFS because the local materialization is removed on clean exit"
         );
@@ -1042,10 +1100,7 @@ async fn run() -> Result<()> {
     // Requires sync to be enabled.
     if cli.daemon {
         let sync_config = build_sync_config(&settings, &cli, &file);
-        let session_id = cli
-            .sync_session_id
-            .clone()
-            .unwrap_or_else(|| feedback::session_id_from_path(&daemon_session_path));
+        let session_id = canonical_session_id.clone();
         // Ensure sync handles exist (daemon requires sync).
         let (daemon_sync_handle, daemon_remote_ui) = if sync_handle.is_none() {
             let remote = sync::RemoteSessionSink::new(sync_config.clone(), session_id.clone());
@@ -1377,7 +1432,7 @@ async fn run() -> Result<()> {
             let _ = handle.flush().await;
         }
         if let Some(host) = &pipefs_host {
-            let result = host.clean_exit(&agent).await;
+            let result = host.clean_exit(&mut agent).await;
             if let Err(error) = result {
                 eprintln!(
                     "\x1b[31mPipeFS exit blocked: {error:#}; recovery cache was retained\x1b[0m"
@@ -1749,10 +1804,7 @@ async fn run() -> Result<()> {
         } else {
             None
         };
-        let tui_sync_session_id = cli
-            .sync_session_id
-            .clone()
-            .or_else(|| Some(feedback::session_id_from_path(&daemon_session_path)));
+        let tui_sync_session_id = Some(canonical_session_id.clone());
         // Build the machine-cache side of the unified `/sessions` list.
         let session_lister: hi_tui::SessionLister = Box::new(|| {
             session::local_sessions()
@@ -1784,9 +1836,6 @@ async fn run() -> Result<()> {
                     let switch_sync_config = switch_sync_config.clone();
                     Box::pin(async move {
                         sync::validate_session_id(&id)?;
-                        if let Some(pipefs) = &pipefs {
-                            pipefs.prepare_session_switch(&id).await?;
-                        }
                         let path = session::session_path(&id)?;
                         if !path.is_file() {
                             let config = switch_sync_config.as_ref().ok_or_else(|| {
@@ -1803,12 +1852,26 @@ async fn run() -> Result<()> {
                             session::cache_loaded_session(&path, &fetched.loaded)?;
                         }
                         let loaded = session::load_history(&path)?;
+                        let canonical_remote_identity = loaded.remote_session_id.is_some();
+                        let canonical_id = loaded
+                            .remote_session_id
+                            .clone()
+                            .unwrap_or_else(|| id.clone());
+                        if let Some(pipefs) = &pipefs {
+                            pipefs
+                                .prepare_session_switch(
+                                    &canonical_id,
+                                    canonical_remote_identity,
+                                )
+                                .await?;
+                        }
                         let summary = session::resume_summary(&loaded);
 
                         let previous_handle = handles.lock().unwrap().clone();
                         let previous_events = events.lock().unwrap().clone();
                         let next_sync = if let Some(config) = &switch_sync_config {
-                            let remote = sync::RemoteSessionSink::new(config.clone(), id.clone());
+                            let remote =
+                                sync::RemoteSessionSink::new(config.clone(), canonical_id.clone());
                             remote.seed_snapshot(&loaded)?;
                             // Stage the replacement completely, including the
                             // automatic takeover lease, before touching the
@@ -1823,7 +1886,7 @@ async fn run() -> Result<()> {
                             let next_handle = synced.remote_handle();
                             let next_events = std::sync::Arc::new(sync::RemoteUi::new(
                                 config.clone(),
-                                id.clone(),
+                                canonical_id.clone(),
                             )?);
                             Some((synced, next_handle, next_events))
                         } else {
@@ -1842,11 +1905,11 @@ async fn run() -> Result<()> {
                             events.lock().unwrap().take();
                         }
                         if let Some(pipefs) = &pipefs {
-                            pipefs.complete_session_switch(id.clone(), path.clone());
+                            pipefs.complete_session_switch(canonical_id.clone(), path.clone());
                         }
-                        *active_session_id.lock().unwrap() = id.clone();
+                        *active_session_id.lock().unwrap() = canonical_id.clone();
                         *runtime_publisher.lock().unwrap() =
-                            local_runtime::Publisher::for_session(id.clone()).ok();
+                            local_runtime::Publisher::for_session(canonical_id.clone()).ok();
 
                         if previous_handle.is_some() || previous_events.is_some() {
                             tokio::spawn(async move {
@@ -1859,7 +1922,7 @@ async fn run() -> Result<()> {
                             });
                         }
 
-                        Ok(hi_tui::SessionSwitchInfo { id, summary })
+                        Ok(completed_session_switch(canonical_id, summary))
                     })
                 });
                 switcher
@@ -1959,16 +2022,7 @@ async fn run() -> Result<()> {
             let command: hi_tui::PipeFsCommand =
                 std::sync::Arc::new(move |argument: String, agent: &mut hi_agent::Agent| {
                     let host = host.clone();
-                    let argument = argument.trim().to_ascii_lowercase();
-                    Box::pin(async move {
-                        match argument.as_str() {
-                            "" | "status" => Ok(host.status().await),
-                            "on" => host.enable(agent).await,
-                            "off" => host.disable(agent).await,
-                            "retry" => host.retry(agent).await,
-                            _ => anyhow::bail!("usage: /pipefs on|off|status|retry"),
-                        }
-                    })
+                    Box::pin(async move { host.command(&argument, agent).await })
                 });
             command
         });
@@ -2067,7 +2121,7 @@ async fn run() -> Result<()> {
                 agent.kill_background_processes();
                 agent.background_task_registry().kill_all().await;
                 if let Some(host) = &pipefs_host {
-                    host.clean_exit(&agent)
+                    host.clean_exit(&mut agent)
                         .await
                         .context("persisting PipeFS workspace during TUI shutdown")?;
                 }
@@ -2154,7 +2208,7 @@ async fn run() -> Result<()> {
     agent.kill_background_processes();
     agent.background_task_registry().kill_all().await;
     if let Some(host) = &pipefs_host {
-        host.clean_exit(&agent)
+        host.clean_exit(&mut agent)
             .await
             .context("persisting PipeFS workspace during REPL shutdown")?;
     }

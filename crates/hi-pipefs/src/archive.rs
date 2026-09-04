@@ -25,6 +25,13 @@ const MANIFEST_PATH: &str = "pipefs-manifest.json";
 const OBJECT_PREFIX: &str = "objects/";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+// These format-v1 metadata budgets are mirrored by IPOP's commit verifier.
+// Keep the producer no more permissive than the control plane so an archive
+// accepted locally cannot become an unretryable server-side rejection.
+const MAX_ARCHIVE_ENTRIES: usize = 100_000;
+const MAX_AGGREGATE_PATH_BYTES: usize = 16 * 1024 * 1024;
+const MAX_AGGREGATE_SYMLINK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PATH_DEPTH: usize = 128;
 const STABLE_SCAN_ATTEMPTS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -98,6 +105,20 @@ pub struct ArchiveArtifact {
     pub snapshot: Snapshot,
 }
 
+/// A revision encoded directly into a private staging file.
+///
+/// Production checkpoints use this representation so the compressed archive
+/// is not duplicated in memory while it is hashed, persisted, and retried.
+#[derive(Clone, Debug)]
+pub struct StagedArchiveArtifact {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub blake3: String,
+    pub manifest_digest: String,
+    pub manifest: ArchiveManifest,
+    pub snapshot: Snapshot,
+}
+
 /// Scan until two complete walks agree. Each regular file is also checked
 /// before and after its contents are read. This avoids committing a hybrid of
 /// two workspace states when a process is still writing.
@@ -111,6 +132,182 @@ pub fn build_revision(
     force_full: bool,
 ) -> Result<ArchiveArtifact> {
     let scanned = scan_stable(root)?;
+    let (manifest, manifest_bytes, manifest_digest) = prepare_revision(&scanned, base, force_full)?;
+    let bytes = encode_archive(root, &manifest, &manifest_bytes, &scanned)?;
+    verify_encoded_snapshot(root, &scanned)?;
+    let archive_hash = blake3::hash(&bytes).to_hex().to_string();
+    let mut snapshot = scanned;
+    snapshot.manifest_digest = Some(manifest_digest.clone());
+    Ok(ArchiveArtifact {
+        bytes,
+        blake3: archive_hash,
+        manifest_digest,
+        manifest,
+        snapshot,
+    })
+}
+
+/// Build a revision into `destination` without retaining the compressed
+/// bytes in memory. The destination must not already exist.
+pub fn build_revision_to_file(
+    root: &Path,
+    base: Option<&Snapshot>,
+    force_full: bool,
+    destination: &Path,
+) -> Result<StagedArchiveArtifact> {
+    let scanned = scan_stable(root)?;
+    build_revision_from_snapshot_to_file(root, scanned, base, force_full, destination)
+}
+
+/// Build a revision while refusing to write more than `maximum_archive_bytes`
+/// to local staging. The partially written destination is removed on failure.
+pub fn build_revision_to_file_bounded(
+    root: &Path,
+    base: Option<&Snapshot>,
+    force_full: bool,
+    destination: &Path,
+    maximum_archive_bytes: u64,
+) -> Result<StagedArchiveArtifact> {
+    let scanned = scan_stable(root)?;
+    build_revision_from_snapshot_to_file_bounded(
+        root,
+        scanned,
+        base,
+        force_full,
+        destination,
+        maximum_archive_bytes,
+    )
+}
+
+/// Encode a snapshot that was just produced by [`scan_workspace`]. The tree
+/// is scanned once more after encoding, and every archived regular file is
+/// descriptor-verified while read, so a caller can avoid a second two-pass
+/// stable scan without weakening the checkpoint consistency check.
+pub fn build_revision_from_snapshot_to_file(
+    root: &Path,
+    scanned: Snapshot,
+    base: Option<&Snapshot>,
+    force_full: bool,
+    destination: &Path,
+) -> Result<StagedArchiveArtifact> {
+    build_revision_from_snapshot_to_file_bounded(
+        root,
+        scanned,
+        base,
+        force_full,
+        destination,
+        u64::MAX,
+    )
+}
+
+/// Snapshot-preserving variant of [`build_revision_to_file_bounded`].
+pub fn build_revision_from_snapshot_to_file_bounded(
+    root: &Path,
+    scanned: Snapshot,
+    base: Option<&Snapshot>,
+    force_full: bool,
+    destination: &Path,
+    maximum_archive_bytes: u64,
+) -> Result<StagedArchiveArtifact> {
+    ensure!(
+        maximum_archive_bytes > 0,
+        "revision_limit: maximum archive size must be positive"
+    );
+    let (manifest, manifest_bytes, manifest_digest) = prepare_revision(&scanned, base, force_full)?;
+    let parent = destination.parent().ok_or_else(|| {
+        anyhow!(
+            "PipeFS archive destination has no parent: {}",
+            destination.display()
+        )
+    })?;
+    ensure!(
+        parent.is_dir(),
+        "PipeFS archive destination parent is not a directory: {}",
+        parent.display()
+    );
+    // Open outside the cleanup scope. If `create_new` loses a race, the path
+    // belongs to somebody else and must never be unlinked as our partial file.
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(destination)
+        .with_context(|| format!("creating private PipeFS archive {}", destination.display()))?;
+    let result = (|| -> Result<(String, u64)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        let hashing = HashingWriter::bounded(file, maximum_archive_bytes);
+        let hashing = encode_archive_into(root, &manifest, &manifest_bytes, &scanned, hashing)?;
+        let (file, digest, size) = hashing.finish();
+        file.sync_all()?;
+        verify_encoded_snapshot(root, &scanned)?;
+        Ok((digest, size))
+    })();
+    let (archive_hash, size_bytes) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_file(destination);
+            return Err(error);
+        }
+    };
+    let mut snapshot = scanned;
+    snapshot.manifest_digest = Some(manifest_digest.clone());
+    Ok(StagedArchiveArtifact {
+        path: destination.to_path_buf(),
+        size_bytes,
+        blake3: archive_hash,
+        manifest_digest,
+        manifest,
+        snapshot,
+    })
+}
+
+/// Conservative upper bound used to reserve cache capacity before encoding.
+/// The hard bounded writer remains authoritative if a codec implementation
+/// ever emits more framing overhead than this estimate.
+pub fn revision_archive_size_upper_bound(
+    snapshot: &Snapshot,
+    base: Option<&Snapshot>,
+    force_full: bool,
+) -> Result<u64> {
+    let (manifest, manifest_bytes, _) = prepare_revision(snapshot, base, force_full)?;
+    let mut tar_bytes = 1024_u64; // POSIX end-of-archive blocks.
+    tar_bytes = tar_bytes
+        .checked_add(512)
+        .and_then(|size| size.checked_add(tar_padded_size(manifest_bytes.len() as u64)))
+        .ok_or_else(|| anyhow!("workspace_limit: archive size overflow"))?;
+    for entry in &manifest.entries {
+        if entry.entry_type != ArchiveEntryKind::File {
+            continue;
+        }
+        tar_bytes = tar_bytes
+            .checked_add(512)
+            .and_then(|size| size.checked_add(tar_padded_size(entry.size)))
+            .ok_or_else(|| anyhow!("workspace_limit: archive size overflow"))?;
+    }
+    let tar_bytes = usize::try_from(tar_bytes)
+        .map_err(|_| anyhow!("workspace_limit: archive is too large for this platform"))?;
+    let compressed = zstd::zstd_safe::compress_bound(tar_bytes);
+    u64::try_from(compressed)
+        .map_err(|_| anyhow!("workspace_limit: compressed archive bound overflow"))
+}
+
+fn tar_padded_size(size: u64) -> u64 {
+    size.saturating_add(511) / 512 * 512
+}
+
+fn prepare_revision(
+    scanned: &Snapshot,
+    base: Option<&Snapshot>,
+    force_full: bool,
+) -> Result<(ArchiveManifest, Vec<u8>, String)> {
     let kind = if force_full || base.is_none() {
         RevisionKind::Full
     } else {
@@ -172,18 +369,22 @@ pub fn build_revision(
     };
     validate_manifest(&manifest)?;
     let manifest_bytes = serde_json::to_vec(&manifest).context("serializing PipeFS manifest")?;
+    ensure!(
+        manifest_bytes.len() as u64 <= MAX_MANIFEST_BYTES,
+        "workspace_limit: manifest exceeds {MAX_MANIFEST_BYTES} bytes"
+    );
     let manifest_digest = blake3::hash(&manifest_bytes).to_hex().to_string();
-    let bytes = encode_archive(root, &manifest, &manifest_bytes, &scanned)?;
-    let archive_hash = blake3::hash(&bytes).to_hex().to_string();
-    let mut snapshot = scanned;
-    snapshot.manifest_digest = Some(manifest_digest.clone());
-    Ok(ArchiveArtifact {
-        bytes,
-        blake3: archive_hash,
-        manifest_digest,
-        manifest,
-        snapshot,
-    })
+    Ok((manifest, manifest_bytes, manifest_digest))
+}
+
+fn verify_encoded_snapshot(root: &Path, expected: &Snapshot) -> Result<()> {
+    let actual = scan_once(root)?;
+    ensure!(
+        actual.entries == expected.entries
+            && actual.logical_size_bytes == expected.logical_size_bytes,
+        "workspace_changed_during_scan: workspace changed during archive encoding"
+    );
+    Ok(())
 }
 
 fn scan_stable(root: &Path) -> Result<Snapshot> {
@@ -222,10 +423,11 @@ fn transient_scan_error(error: &anyhow::Error) -> bool {
 fn scan_once(root: &Path) -> Result<Snapshot> {
     let mut entries = BTreeMap::new();
     let mut portable_names = HashMap::<String, String>::new();
+    let mut budget = MetadataBudget::default();
     #[cfg(unix)]
-    scan_workspace_unix(root, &mut entries, &mut portable_names)?;
+    scan_workspace_unix(root, &mut entries, &mut portable_names, &mut budget)?;
     #[cfg(not(unix))]
-    scan_directory(root, root, &mut entries, &mut portable_names)?;
+    scan_directory(root, root, &mut entries, &mut portable_names, &mut budget)?;
     let logical_size_bytes = entries
         .values()
         .filter(|entry| entry.entry_type == ArchiveEntryKind::File)
@@ -238,12 +440,52 @@ fn scan_once(root: &Path) -> Result<Snapshot> {
     })
 }
 
+#[derive(Default)]
+struct MetadataBudget {
+    entries: usize,
+    path_bytes: usize,
+    symlink_bytes: usize,
+}
+
+impl MetadataBudget {
+    fn account(&mut self, path: &str, symlink_target: Option<&str>) -> Result<()> {
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("workspace_limit: entry count overflow"))?;
+        self.path_bytes = self
+            .path_bytes
+            .checked_add(path.len())
+            .ok_or_else(|| anyhow!("workspace_limit: aggregate path size overflow"))?;
+        if let Some(target) = symlink_target {
+            self.symlink_bytes = self
+                .symlink_bytes
+                .checked_add(target.len())
+                .ok_or_else(|| anyhow!("workspace_limit: symlink metadata size overflow"))?;
+        }
+        ensure!(
+            self.entries <= MAX_ARCHIVE_ENTRIES,
+            "workspace_limit: workspace contains more than {MAX_ARCHIVE_ENTRIES} entries"
+        );
+        ensure!(
+            self.path_bytes <= MAX_AGGREGATE_PATH_BYTES,
+            "workspace_limit: aggregate path metadata exceeds {MAX_AGGREGATE_PATH_BYTES} bytes"
+        );
+        ensure!(
+            self.symlink_bytes <= MAX_AGGREGATE_SYMLINK_BYTES,
+            "workspace_limit: aggregate symlink metadata exceeds {MAX_AGGREGATE_SYMLINK_BYTES} bytes"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(not(unix))]
 fn scan_directory(
     root: &Path,
     directory: &Path,
     entries: &mut BTreeMap<String, SnapshotEntry>,
     portable_names: &mut HashMap<String, String>,
+    budget: &mut MetadataBudget,
 ) -> Result<()> {
     let mut children = fs::read_dir(directory)
         .with_context(|| format!("reading workspace directory {}", directory.display()))?
@@ -255,11 +497,12 @@ fn scan_directory(
             .strip_prefix(root)
             .expect("walked path stays beneath root");
         let portable = portable_path(relative)?;
-        register_portable_name(&portable, portable_names)?;
         let before = fs::symlink_metadata(&path)
             .with_context(|| format!("reading metadata for {}", path.display()))?;
         let file_type = before.file_type();
         if file_type.is_file() {
+            budget.account(&portable, None)?;
+            register_portable_name(&portable, portable_names)?;
             let (digest, size) = hash_file(&path)
                 .with_context(|| format!("reading workspace file {}", path.display()))?;
             let after = fs::symlink_metadata(&path)
@@ -274,11 +517,13 @@ fn scan_directory(
                 snapshot_entry(&after, ArchiveEntryKind::File, Some(digest), None),
             );
         } else if file_type.is_dir() {
+            budget.account(&portable, None)?;
+            register_portable_name(&portable, portable_names)?;
             entries.insert(
                 portable,
                 snapshot_entry(&before, ArchiveEntryKind::Directory, None, None),
             );
-            scan_directory(root, &path, entries, portable_names)?;
+            scan_directory(root, &path, entries, portable_names, budget)?;
         } else if file_type.is_symlink() {
             let target = fs::read_link(&path)
                 .with_context(|| format!("reading symlink {}", path.display()))?;
@@ -289,6 +534,8 @@ fn scan_directory(
                 )
             })?;
             validate_symlink_target(&portable, target)?;
+            budget.account(&portable, Some(target))?;
+            register_portable_name(&portable, portable_names)?;
             entries.insert(
                 portable,
                 snapshot_entry(
@@ -410,6 +657,7 @@ fn scan_workspace_unix(
     root: &Path,
     entries: &mut BTreeMap<String, SnapshotEntry>,
     portable_names: &mut HashMap<String, String>,
+    budget: &mut MetadataBudget,
 ) -> Result<()> {
     let directory = open_workspace_root(root)?;
     let before = UnixFileState::from_metadata(&directory.metadata()?);
@@ -418,7 +666,7 @@ fn scan_workspace_unix(
         "PipeFS workspace is not a real directory: {}",
         root.display()
     );
-    scan_directory_unix(&directory, Path::new(""), entries, portable_names)?;
+    scan_directory_unix(&directory, Path::new(""), entries, portable_names, budget)?;
     let after = UnixFileState::from_metadata(&directory.metadata()?);
     ensure!(
         before == after,
@@ -433,6 +681,7 @@ fn scan_directory_unix(
     relative_directory: &Path,
     entries: &mut BTreeMap<String, SnapshotEntry>,
     portable_names: &mut HashMap<String, String>,
+    budget: &mut MetadataBudget,
 ) -> Result<()> {
     let mut reader = Dir::read_from(directory)
         .map_err(std::io::Error::from)
@@ -453,10 +702,11 @@ fn scan_directory_unix(
     for name in names {
         let relative = relative_directory.join(&name);
         let portable = portable_path(&relative)?;
-        register_portable_name(&portable, portable_names)?;
         let before = scan_stat_child(directory, &name, &portable)?;
         match before.file_type() {
             UnixFileType::RegularFile => {
+                budget.account(&portable, None)?;
+                register_portable_name(&portable, portable_names)?;
                 let file = open_scanned_child(
                     directory,
                     &name,
@@ -486,6 +736,8 @@ fn scan_directory_unix(
                 );
             }
             UnixFileType::Directory => {
+                budget.account(&portable, None)?;
+                register_portable_name(&portable, portable_names)?;
                 let child = open_scanned_child(
                     directory,
                     &name,
@@ -497,7 +749,7 @@ fn scan_directory_unix(
                     portable.clone(),
                     snapshot_entry_unix(&before, ArchiveEntryKind::Directory, None, None),
                 );
-                scan_directory_unix(&child, &relative, entries, portable_names)?;
+                scan_directory_unix(&child, &relative, entries, portable_names, budget)?;
                 let descriptor_after = UnixFileState::from_metadata(&child.metadata()?);
                 let path_after = scan_stat_child(directory, &name, &portable)?;
                 ensure!(
@@ -520,6 +772,8 @@ fn scan_directory_unix(
                     "workspace_changed_during_scan: {portable} changed while being read"
                 );
                 validate_symlink_target(&portable, target)?;
+                budget.account(&portable, Some(target))?;
+                register_portable_name(&portable, portable_names)?;
                 entries.insert(
                     portable,
                     snapshot_entry_unix(
@@ -689,9 +943,19 @@ fn encode_archive(
     manifest_bytes: &[u8],
     snapshot: &Snapshot,
 ) -> Result<Vec<u8>> {
+    encode_archive_into(root, manifest, manifest_bytes, snapshot, Vec::new())
+}
+
+fn encode_archive_into<W: Write>(
+    root: &Path,
+    manifest: &ArchiveManifest,
+    manifest_bytes: &[u8],
+    snapshot: &Snapshot,
+    writer: W,
+) -> Result<W> {
     let workspace = ArchiveWorkspace::open(root)?;
     let mut encoder =
-        zstd::stream::Encoder::new(Vec::new(), 9).context("creating PipeFS zstd encoder")?;
+        zstd::stream::Encoder::new(writer, 9).context("creating PipeFS zstd encoder")?;
     encoder.include_checksum(true)?;
     encoder.include_contentsize(true)?;
     let mut builder = tar::Builder::new(encoder);
@@ -731,6 +995,52 @@ fn encode_archive(
         .into_inner()
         .context("recovering PipeFS zstd encoder")?;
     encoder.finish().context("finishing PipeFS zstd archive")
+}
+
+struct HashingWriter<W> {
+    inner: W,
+    hasher: blake3::Hasher,
+    size: u64,
+    maximum_size: u64,
+}
+
+impl<W> HashingWriter<W> {
+    fn bounded(inner: W, maximum_size: u64) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+            size: 0,
+            maximum_size,
+        }
+    }
+
+    fn finish(self) -> (W, String, u64) {
+        (
+            self.inner,
+            self.hasher.finalize().to_hex().to_string(),
+            self.size,
+        )
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let requested = self.size.saturating_add(buffer.len() as u64);
+        if requested > self.maximum_size {
+            return Err(std::io::Error::other(format!(
+                "revision_limit: compressed PipeFS archive exceeds {} bytes",
+                self.maximum_size
+            )));
+        }
+        let written = self.inner.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        self.size = self.size.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 struct ArchiveWorkspace {
@@ -1004,11 +1314,31 @@ pub fn apply_archive(
     bytes: &[u8],
     expected_base: Option<&Snapshot>,
 ) -> Result<Snapshot> {
+    apply_archive_reader(root, Cursor::new(bytes), expected_base)
+}
+
+/// Apply an archive from disk without first loading the compressed revision
+/// into memory.
+pub fn apply_archive_file(
+    root: &Path,
+    archive_path: &Path,
+    expected_base: Option<&Snapshot>,
+) -> Result<Snapshot> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("opening PipeFS archive {}", archive_path.display()))?;
+    apply_archive_reader(root, file, expected_base)
+}
+
+fn apply_archive_reader<R: Read>(
+    root: &Path,
+    reader: R,
+    expected_base: Option<&Snapshot>,
+) -> Result<Snapshot> {
     fs::create_dir_all(root)
         .with_context(|| format!("creating PipeFS restore root {}", root.display()))?;
     ensure_root_is_not_symlink(root)?;
-    let decoder = zstd::stream::read::Decoder::new(Cursor::new(bytes))
-        .context("corrupt_archive: invalid zstd stream")?;
+    let decoder =
+        zstd::stream::read::Decoder::new(reader).context("corrupt_archive: invalid zstd stream")?;
     let bounded = BoundedReader::new(decoder, MAX_DECOMPRESSED_BYTES);
     let mut archive = tar::Archive::new(bounded);
     let mut archive_entries = archive.entries().context("reading PipeFS tar entries")?;
@@ -1433,8 +1763,10 @@ fn validate_manifest(manifest: &ArchiveManifest) -> Result<()> {
     let mut names = HashMap::new();
     let mut payloads = HashMap::new();
     let mut file_bytes = 0_u64;
+    let mut metadata_budget = MetadataBudget::default();
     for entry in &manifest.entries {
         validate_archive_path(&entry.path)?;
+        metadata_budget.account(&entry.path, entry.symlink_target.as_deref())?;
         register_portable_name(&entry.path, &mut names)?;
         if let Some(previous) = previous {
             ensure!(
@@ -1555,8 +1887,12 @@ fn validate_archive_path(path: &str) -> Result<()> {
         "path_portability: invalid path length"
     );
     ensure!(
-        !path.starts_with('/') && !path.contains('\\') && !path.contains('\0'),
-        "path_portability: absolute, backslash, and NUL paths are forbidden: {path:?}"
+        !path.starts_with('/') && !path.contains('\0'),
+        "path_portability: absolute and NUL paths are forbidden: {path:?}"
+    );
+    ensure!(
+        path_depth(path) <= MAX_PATH_DEPTH,
+        "path_portability: path exceeds {MAX_PATH_DEPTH} components"
     );
     for component in path.split('/') {
         validate_component(component)?;
@@ -1574,26 +1910,8 @@ fn validate_component(component: &str) -> Result<()> {
         "path_portability: filename component exceeds 255 bytes"
     );
     ensure!(
-        !component.ends_with([' ', '.']),
-        "path_portability: filename cannot end in a space or dot: {component:?}"
-    );
-    ensure!(
-        !component.chars().any(|character| character.is_control()
-            || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')),
-        "path_portability: filename contains characters unsafe on a restoring platform: {component:?}"
-    );
-    let stem = component
-        .split('.')
-        .next()
-        .unwrap_or(component)
-        .to_ascii_lowercase();
-    let reserved = matches!(stem.as_str(), "con" | "prn" | "aux" | "nul" | "clock$")
-        || (stem.len() == 4
-            && (stem.starts_with("com") || stem.starts_with("lpt"))
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
-    ensure!(
-        !reserved,
-        "path_portability: reserved filename {component:?}"
+        !component.chars().any(char::is_control),
+        "path_portability: filename contains control characters: {component:?}"
     );
     Ok(())
 }
@@ -1614,7 +1932,7 @@ fn register_portable_name(path: &str, names: &mut HashMap<String, String>) -> Re
 
 fn validate_symlink_target(link_path: &str, target: &str) -> Result<()> {
     ensure!(
-        !target.is_empty() && !target.contains('\0') && !target.contains('\\'),
+        !target.is_empty() && !target.contains('\0'),
         "path_portability: invalid symlink target for {link_path:?}"
     );
     let target_path = Path::new(target);
@@ -1823,6 +2141,118 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_archive_is_deterministic_and_round_trips_without_buffering() {
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("nested/empty")).unwrap();
+        fs::write(
+            source.path().join("nested/data.bin"),
+            vec![0x5a; 512 * 1024],
+        )
+        .unwrap();
+        let buffered = build_revision(source.path(), None, true).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let archive_path = staging.path().join("revision.tar.zst");
+        let staged = build_revision_to_file(source.path(), None, true, &archive_path).unwrap();
+
+        assert_eq!(staged.size_bytes, buffered.bytes.len() as u64);
+        assert_eq!(staged.blake3, buffered.blake3);
+        assert_eq!(staged.manifest_digest, buffered.manifest_digest);
+        assert_eq!(fs::read(&archive_path).unwrap(), buffered.bytes);
+
+        let restored = tempfile::tempdir().unwrap();
+        let snapshot = apply_archive_file(restored.path(), &archive_path, None).unwrap();
+        assert_eq!(snapshot, staged.snapshot);
+        assert_eq!(
+            fs::read(restored.path().join("nested/data.bin")).unwrap(),
+            vec![0x5a; 512 * 1024]
+        );
+    }
+
+    #[test]
+    fn bounded_archive_never_leaves_output_beyond_the_revision_limit() {
+        let source = tempfile::tempdir().unwrap();
+        let payload = (0_u32..256 * 1024)
+            .map(|index| (index.wrapping_mul(131) % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(source.path().join("incompressible.bin"), payload).unwrap();
+        let snapshot = scan_workspace(source.path()).unwrap();
+        let upper_bound = revision_archive_size_upper_bound(&snapshot, None, true).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let successful_path = staging.path().join("complete.tar.zst");
+        let complete = build_revision_from_snapshot_to_file_bounded(
+            source.path(),
+            snapshot.clone(),
+            None,
+            true,
+            &successful_path,
+            upper_bound,
+        )
+        .unwrap();
+        assert!(complete.size_bytes <= upper_bound);
+
+        let limited_path = staging.path().join("limited.tar.zst");
+        let limit = complete.size_bytes.saturating_sub(1);
+        let error = build_revision_from_snapshot_to_file_bounded(
+            source.path(),
+            snapshot,
+            None,
+            true,
+            &limited_path,
+            limit,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("revision_limit"), "{error:#}");
+        assert!(!limited_path.exists());
+    }
+
+    #[test]
+    fn bounded_archive_never_deletes_a_preexisting_destination() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("value"), b"workspace").unwrap();
+        let snapshot = scan_workspace(source.path()).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let destination = staging.path().join("existing.tar.zst");
+        fs::write(&destination, b"belongs to another writer").unwrap();
+
+        let error = build_revision_from_snapshot_to_file_bounded(
+            source.path(),
+            snapshot,
+            None,
+            true,
+            &destination,
+            1024 * 1024,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("creating private PipeFS archive"));
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"belongs to another writer"
+        );
+    }
+
+    #[test]
+    fn metadata_budget_bounds_entry_path_and_symlink_growth() {
+        let mut entries = MetadataBudget {
+            entries: MAX_ARCHIVE_ENTRIES,
+            ..MetadataBudget::default()
+        };
+        assert!(entries.account("next", None).is_err());
+
+        let mut paths = MetadataBudget {
+            path_bytes: MAX_AGGREGATE_PATH_BYTES,
+            ..MetadataBudget::default()
+        };
+        assert!(paths.account("x", None).is_err());
+
+        let mut symlinks = MetadataBudget {
+            symlink_bytes: MAX_AGGREGATE_SYMLINK_BYTES,
+            ..MetadataBudget::default()
+        };
+        assert!(symlinks.account("link", Some("x")).is_err());
+    }
+
+    #[test]
     fn delta_round_trip_handles_append_truncate_rename_and_recursive_delete() {
         let source = tempfile::tempdir().unwrap();
         fs::create_dir(source.path().join("gone")).unwrap();
@@ -1996,11 +2426,13 @@ mod tests {
     #[test]
     fn rejects_nonportable_and_escaping_paths() {
         assert!(validate_archive_path("../secret").is_err());
-        assert!(validate_archive_path("a\\b").is_err());
-        assert!(validate_archive_path("CON.txt").is_err());
+        assert!(validate_archive_path("a\\b").is_ok());
+        assert!(validate_archive_path("CON.txt").is_ok());
+        assert!(validate_archive_path("trailing.").is_ok());
+        assert!(validate_archive_path("colon:name").is_ok());
         assert!(validate_symlink_target("link", "../outside").is_err());
-        assert!(validate_symlink_target("link", "safe/CON.txt").is_err());
-        assert!(validate_symlink_target("link", "safe/bad:name").is_err());
+        assert!(validate_symlink_target("link", "safe/CON.txt").is_ok());
+        assert!(validate_symlink_target("link", "safe/bad:name").is_ok());
         assert!(validate_symlink_target("link", "safe/control\u{0001}").is_err());
 
         let mut names = HashMap::new();

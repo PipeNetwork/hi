@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::FleetLauncher;
@@ -285,6 +286,9 @@ pub(crate) enum LoopCtl {
     List {
         reply: oneshot::Sender<Vec<LoopSpec>>,
     },
+    /// Stop admitting work, cancel every manager-owned child, and acknowledge
+    /// only after firing, trigger, and auto-fix tasks have reaped/cleaned up.
+    Shutdown { reply: oneshot::Sender<()> },
 }
 
 /// The UI's handle to the loop manager.
@@ -295,12 +299,39 @@ pub(crate) struct LoopsHandle {
     /// Live per-loop state for the `/watch` dashboard; the manager keeps it
     /// current on every state change.
     pub(crate) snapshot: Arc<Mutex<Vec<LoopWatchRow>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct ManagerContext {
+    activity: Option<PathBuf>,
+    event_sink: Option<Arc<dyn hi_events::EventSink>>,
+    _fire_lock: Option<Arc<crate::lock::FireLock>>,
 }
 
 impl LoopsHandle {
     /// Take any queued transcript lines (called from UI tick arms).
     pub(crate) fn drain(&self) -> Vec<LoopLine> {
         std::mem::take(&mut *self.pending.lock().unwrap())
+    }
+
+    /// Cooperatively stop the manager and wait for all child process trees and
+    /// auto-fix worktrees to settle. Consuming the handle prevents later
+    /// controls from racing the acknowledged shutdown.
+    pub(crate) async fn shutdown(self) -> Result<(), String> {
+        let Self { ctl, task, .. } = self;
+        let (reply, acknowledged) = oneshot::channel();
+        let requested = ctl.send(LoopCtl::Shutdown { reply }).is_ok();
+        let acknowledgement = if requested {
+            acknowledged.await.map_err(|_| {
+                "recurring-loop manager stopped before shutdown was acknowledged".to_string()
+            })
+        } else {
+            Err("recurring-loop manager stopped before shutdown was requested".to_string())
+        };
+        drop(ctl);
+        task.await
+            .map_err(|error| format!("recurring-loop manager failed during shutdown: {error}"))?;
+        acknowledgement
     }
 }
 
@@ -407,26 +438,48 @@ pub(crate) fn is_quiet(summary: &str) -> bool {
 
 /// Spawn the loop manager: loads persisted loops (dropping expired ones),
 /// re-arms the rest, and runs the timer wheel until the TUI exits.
+#[cfg(test)]
 pub(crate) fn start(
     launcher: Arc<FleetLauncher>,
     loops_file: Option<PathBuf>,
     event_sink: Option<Arc<dyn hi_events::EventSink>>,
 ) -> LoopsHandle {
+    start_with_fire_lock(launcher, loops_file, event_sink, None)
+}
+
+/// Start a TUI-owned manager while sharing ownership of its fire lock. If the
+/// TUI unwinds before it can request acknowledged shutdown, the manager keeps
+/// the lock until its channel-close cancellation has joined every child.
+pub(crate) fn start_with_fire_lock(
+    launcher: Arc<FleetLauncher>,
+    loops_file: Option<PathBuf>,
+    event_sink: Option<Arc<dyn hi_events::EventSink>>,
+    fire_lock: Option<Arc<crate::lock::FireLock>>,
+) -> LoopsHandle {
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let pending: Arc<Mutex<Vec<LoopLine>>> = Arc::new(Mutex::new(Vec::new()));
     let snapshot: Arc<Mutex<Vec<LoopWatchRow>>> = Arc::new(Mutex::new(Vec::new()));
-    let handle = LoopsHandle {
+    let context = ManagerContext {
+        activity: loops_file
+            .as_ref()
+            .map(|path| crate::activity::activity_path(path)),
+        event_sink,
+        _fire_lock: fire_lock,
+    };
+    let task = tokio::spawn(manager(
+        launcher,
+        loops_file,
+        context,
+        ctl_rx,
+        pending.clone(),
+        snapshot.clone(),
+    ));
+    LoopsHandle {
         ctl: ctl_tx,
         pending: pending.clone(),
         snapshot: snapshot.clone(),
-    };
-    let activity = loops_file
-        .as_ref()
-        .map(|p| crate::activity::activity_path(p));
-    tokio::spawn(manager(
-        launcher, loops_file, activity, event_sink, ctl_rx, pending, snapshot,
-    ));
-    handle
+        task,
+    }
 }
 
 /// Append one loud event to the project's activity feed (best-effort).
@@ -519,14 +572,13 @@ fn publish(
 async fn manager(
     launcher: Arc<FleetLauncher>,
     loops_file: Option<PathBuf>,
-    activity: Option<PathBuf>,
-    event_sink: Option<Arc<dyn hi_events::EventSink>>,
+    context: ManagerContext,
     mut ctl: mpsc::UnboundedReceiver<LoopCtl>,
     pending: Arc<Mutex<Vec<LoopLine>>>,
     snapshot: Arc<Mutex<Vec<LoopWatchRow>>>,
 ) {
-    let activity = activity.as_deref();
-    let event_sink = event_sink.as_deref();
+    let activity = context.activity.as_deref();
+    let event_sink = context.event_sink.as_deref();
     // Reach-you notifications for loud events (opt-in via env; no-op otherwise).
     let notify = crate::notify::NotifyConfig::from_env();
     // Every trigger gets a child token. The drop guard also cancels them when
@@ -536,6 +588,10 @@ async fn manager(
     let mut firing_cancellations: HashMap<u64, CancellationToken> = HashMap::new();
     let mut trigger_cancellations: HashMap<u64, CancellationToken> = HashMap::new();
     let mut fix_cancellations: HashMap<u64, CancellationToken> = HashMap::new();
+    // Every manager-owned task is joined during acknowledged shutdown. The
+    // cancellation tokens stop its native child/process group; the JoinSet
+    // proves cleanup and reaping finished before a workspace can be rebound.
+    let mut children = JoinSet::new();
     let mut runtime: HashMap<u64, LoopRuntime> = HashMap::new();
     let mut state = load(loops_file.as_deref());
     let now = now_ms();
@@ -638,7 +694,7 @@ async fn manager(
                 let done = done_tx.clone();
                 let cancel = manager_cancel.child_token();
                 firing_cancellations.insert(spec.id, cancel.clone());
-                tokio::spawn(async move {
+                children.spawn(async move {
                     let result = run_firing(&launcher, &spec_snapshot, cancel).await;
                     let _ = done.send((spec_snapshot.id, result));
                 });
@@ -671,7 +727,13 @@ async fn manager(
 
         tokio::select! {
             maybe = ctl.recv() => {
-                let Some(msg) = maybe else { return }; // UI gone — stop
+                let Some(msg) = maybe else {
+                    manager_cancel.cancel();
+                    while children.join_next().await.is_some() {}
+                    settle_firings_for_shutdown(&mut state, &mut runtime, &mut done_rx);
+                    save(loops_file.as_deref(), &state);
+                    return;
+                }; // UI gone — stop
                 match msg {
                     LoopCtl::Create { secs, prompt, reply } => {
                         let result = if state.loops.len() >= MAX_LOOPS {
@@ -843,8 +905,17 @@ async fn manager(
                     LoopCtl::List { reply } => {
                         let _ = reply.send(state.loops.clone());
                     }
+                    LoopCtl::Shutdown { reply } => {
+                        manager_cancel.cancel();
+                        while children.join_next().await.is_some() {}
+                        settle_firings_for_shutdown(&mut state, &mut runtime, &mut done_rx);
+                        save(loops_file.as_deref(), &state);
+                        let _ = reply.send(());
+                        return;
+                    }
                 }
             }
+            _ = children.join_next(), if !children.is_empty() => {}
             Some((id, result)) = done_rx.recv() => {
                 in_flight = in_flight.saturating_sub(1);
                 firing_cancellations.remove(&id);
@@ -960,7 +1031,7 @@ async fn manager(
                         .entry(id)
                         .or_insert_with(|| manager_cancel.child_token())
                         .clone();
-                    tokio::spawn(async move {
+                    children.spawn(async move {
                         let outcome = run_trigger(&cmd, id, &name, &summary, cancel).await;
                         let _ = trig.send((id, outcome));
                     });
@@ -984,7 +1055,7 @@ async fn manager(
                     let summary = summary.clone();
                     let cancel = manager_cancel.child_token();
                     fix_cancellations.insert(id, cancel.clone());
-                    tokio::spawn(async move {
+                    children.spawn(async move {
                         let (line, loud) = run_fix(&launcher, &spec, &summary, cancel).await;
                         let _ = fix.send((spec.id, line, loud));
                     });
@@ -1073,6 +1144,55 @@ async fn manager(
 struct FiringOutcome {
     summary: String,
     total_tokens: u64,
+}
+
+/// Settle firing results after shutdown cancellation without dispatching new
+/// trigger/autofix work. A child that completed before observing cancellation
+/// keeps its cadence and spend; cancelled, failed, or panicked children have
+/// their at-spawn reservation rolled back and are due again shortly.
+fn settle_firings_for_shutdown(
+    state: &mut LoopsFile,
+    runtime: &mut HashMap<u64, LoopRuntime>,
+    done: &mut mpsc::UnboundedReceiver<(u64, Result<FiringOutcome, String>)>,
+) {
+    while let Ok((id, result)) = done.try_recv() {
+        let Some(loop_runtime) = runtime.get_mut(&id).filter(|runtime| runtime.firing) else {
+            continue;
+        };
+        let Ok(outcome) = result else {
+            continue;
+        };
+        loop_runtime.firing = false;
+        loop_runtime.last_quiet = is_quiet(&outcome.summary);
+        loop_runtime.last_summary = Some(outcome.summary.clone());
+        loop_runtime.last_fired_ms = now_ms();
+        if let Some(spec) = state.loops.iter_mut().find(|spec| spec.id == id) {
+            spec.spent_tokens = spec.spent_tokens.max(outcome.total_tokens);
+            if spec
+                .token_budget
+                .is_some_and(|budget| spec.spent_tokens >= budget)
+                || outcome
+                    .summary
+                    .to_ascii_lowercase()
+                    .contains("parked for approval")
+            {
+                spec.paused = true;
+            }
+        }
+    }
+
+    let now = now_ms();
+    for spec in &mut state.loops {
+        if let Some(loop_runtime) = runtime.get_mut(&spec.id)
+            && loop_runtime.firing
+        {
+            spec.firings = spec.firings.saturating_sub(1);
+            if !spec.paused {
+                spec.next_ms = now.saturating_add(2_000);
+            }
+            loop_runtime.firing = false;
+        }
+    }
 }
 
 /// Whether a child-output line is decoration rather than reply text: a tool-call
@@ -1201,13 +1321,14 @@ async fn run_firing(
     process_group.kill_now();
     if !matches!(waited, ChildWait::Exited(_)) {
         let _ = child.start_kill();
-        let _ = tokio::time::timeout(CHILD_PIPE_DRAIN_GRACE, child.wait()).await;
+        let _ = child.wait().await;
     }
     let tail = match tokio::time::timeout(CHILD_PIPE_DRAIN_GRACE, &mut stdout_read).await {
         Ok(Ok(tail)) => tail,
         Ok(Err(_)) => Vec::new(),
         Err(_) => {
             stdout_read.abort();
+            let _ = stdout_read.await;
             Vec::new()
         }
     };
@@ -1426,7 +1547,7 @@ async fn run_trigger_with_timeout(
     process_group.kill_now();
     if !matches!(waited, ChildWait::Exited(_)) {
         let _ = child.start_kill();
-        let _ = tokio::time::timeout(TRIGGER_PIPE_DRAIN_GRACE, child.wait()).await;
+        let _ = child.wait().await;
     }
     let drained = tokio::time::timeout(TRIGGER_PIPE_DRAIN_GRACE, async {
         tokio::join!(&mut stdout_read, &mut stderr_read)
@@ -1437,6 +1558,8 @@ async fn run_trigger_with_timeout(
         Err(_) => {
             stdout_read.abort();
             stderr_read.abort();
+            let _ = stdout_read.await;
+            let _ = stderr_read.await;
             (Vec::new(), Vec::new())
         }
     };
@@ -1656,7 +1779,7 @@ async fn run_fix(
             process_group.kill_now();
             if !matches!(waited, ChildWait::Exited(_)) {
                 let _ = child.start_kill();
-                let _ = tokio::time::timeout(CHILD_PIPE_DRAIN_GRACE, child.wait()).await;
+                let _ = child.wait().await;
             }
             match waited {
                 ChildWait::Exited(Ok(status)) => status.success(),
@@ -1702,8 +1825,15 @@ async fn run_fix(
             let spec_for_pr = spec.clone();
             let summary_for_pr = summary.to_string();
             let changed_for_pr = changed.clone();
+            let cancellation_for_pr = cancellation.clone();
             tokio::task::spawn_blocking(move || {
-                open_fix_pr(&wt_for_pr, &spec_for_pr, &summary_for_pr, &changed_for_pr)
+                open_fix_pr(
+                    &wt_for_pr,
+                    &spec_for_pr,
+                    &summary_for_pr,
+                    &changed_for_pr,
+                    &cancellation_for_pr,
+                )
             })
             .await
             .unwrap_or_else(|error| (format!("verified, but PR worker failed: {error}"), true))
@@ -1748,8 +1878,12 @@ fn open_fix_pr(
     spec: &LoopSpec,
     summary: &str,
     changed: &[String],
+    cancellation: &CancellationToken,
 ) -> (String, bool) {
     use hi_tools::worktree;
+    if cancellation.is_cancelled() {
+        return ("cancelled".to_string(), false);
+    }
     let name = spec.name();
     let branch = format!("hi-autofix/loop{}-{}", spec.id, now_ms());
     let commit_msg = format!("hi auto-fix: {name}\n\n{}", truncate(summary, 500));
@@ -1759,10 +1893,22 @@ fn open_fix_pr(
             true,
         );
     }
+    if cancellation.is_cancelled() {
+        return (
+            format!("cancelled after committing fix to local branch {branch}"),
+            false,
+        );
+    }
     if let Err(e) = worktree::push_branch(worktree, &branch) {
         return (
             format!("fix committed to branch {branch} (couldn't push: {e}) — review it locally"),
             true,
+        );
+    }
+    if cancellation.is_cancelled() {
+        return (
+            format!("cancelled after pushing fix branch {branch}; no PR was opened"),
+            false,
         );
     }
     // Open the PR (best-effort; the pushed branch stands alone if `gh` is absent).
@@ -2715,6 +2861,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acknowledged_manager_shutdown_reaps_an_in_flight_firing_tree() {
+        let dir = test_dir("manager-shutdown");
+        let descendant_pid = dir.join("firing-descendant.pid");
+        let launcher = fix_launcher(
+            &dir,
+            descendant_stub(&dir, "firing-wait.sh", &descendant_pid),
+            None,
+        );
+        let handle = start(Arc::new(launcher), None, None);
+        let (reply, created) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 3600,
+                prompt: "wait until cancelled".to_string(),
+                reply,
+            })
+            .unwrap();
+        created.await.unwrap().unwrap();
+        for _ in 0..250 {
+            if descendant_pid.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&descendant_pid)
+            .expect("loop firing recorded its descendant pid")
+            .trim()
+            .parse()
+            .unwrap();
+
+        let stale_control = handle.ctl.clone();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("manager shutdown settled")
+            .expect("manager acknowledged shutdown");
+        assert_process_exits(pid).await;
+        let (reply, _) = oneshot::channel();
+        assert!(
+            stale_control.send(LoopCtl::List { reply }).is_err(),
+            "an acknowledged shutdown must close every copied control sender"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shutdown_settlement_keeps_success_and_rearms_cancelled_firings() {
+        let mut succeeded = spec();
+        succeeded.id = 1;
+        succeeded.firings = 1;
+        succeeded.next_ms = now_ms().saturating_add(60_000);
+        let mut cancelled = spec();
+        cancelled.id = 2;
+        cancelled.firings = 1;
+        cancelled.next_ms = now_ms().saturating_add(60_000);
+        let mut state = LoopsFile {
+            loops: vec![succeeded, cancelled],
+            next_id: 2,
+        };
+        let mut runtime: HashMap<u64, LoopRuntime> = HashMap::new();
+        runtime.entry(1).or_default().firing = true;
+        runtime.entry(2).or_default().firing = true;
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+        done_tx
+            .send((
+                1,
+                Ok(FiringOutcome {
+                    summary: "baseline established".to_string(),
+                    total_tokens: 42,
+                }),
+            ))
+            .unwrap();
+        done_tx.send((2, Err("cancelled".to_string()))).unwrap();
+
+        settle_firings_for_shutdown(&mut state, &mut runtime, &mut done_rx);
+
+        assert_eq!(state.loops[0].firings, 1);
+        assert_eq!(state.loops[0].spent_tokens, 42);
+        assert_eq!(state.loops[1].firings, 0);
+        assert!(state.loops[1].next_ms <= now_ms().saturating_add(3_000));
+        assert!(!runtime.values().any(|runtime| runtime.firing));
     }
 
     /// A firing that outlives its interval (or a `FireNow` mid-flight) must NOT
