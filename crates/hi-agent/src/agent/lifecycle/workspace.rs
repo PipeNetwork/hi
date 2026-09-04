@@ -7,6 +7,32 @@ use hi_ai::Provider;
 
 use crate::AgentConfig;
 
+/// Retain deterministic evidence across a later, unrelated turn failure only
+/// when a pass is still bound to the current workspace. Provider/session
+/// failures are not verifier infrastructure failures, and therefore default to
+/// `Unverified` rather than manufacturing `InfrastructureError`.
+fn verification_after_turn_failure(
+    evidence: &crate::domain::VerifyEvidence,
+    workspace_reconciled: bool,
+    current_revision: u64,
+    current_digest: &str,
+) -> (crate::VerificationStatus, Option<String>) {
+    if !workspace_reconciled {
+        return (crate::VerificationStatus::Unverified, None);
+    }
+    match evidence {
+        crate::domain::VerifyEvidence::Passed { revision, digest }
+            if *revision == current_revision && digest == current_digest =>
+        {
+            (crate::VerificationStatus::Passed, Some(digest.clone()))
+        }
+        crate::domain::VerifyEvidence::Failed => (crate::VerificationStatus::Failed, None),
+        crate::domain::VerifyEvidence::None | crate::domain::VerifyEvidence::Passed { .. } => {
+            (crate::VerificationStatus::Unverified, None)
+        }
+    }
+}
+
 impl crate::Agent {
     /// Install or clear the host-provided durability fence used by PipeFS.
     pub fn set_workspace_durability(
@@ -439,8 +465,21 @@ impl crate::Agent {
             .active_turn_ledger_revision
             .take()
             .unwrap_or_else(|| self.runtime.ledger().revision());
-        let _ = self.runtime.ledger().reconcile();
-        let changes = self.runtime.ledger().changes_since(baseline);
+        let workspace_reconciled = self.runtime.ledger().reconcile().is_ok();
+        let (current_revision, current_digest, changes) = {
+            let mut ledger = self.runtime.ledger();
+            (
+                ledger.revision(),
+                ledger.workspace_revision(),
+                ledger.changes_since(baseline),
+            )
+        };
+        let (verification, verified_workspace_revision) = verification_after_turn_failure(
+            &self.report.verify,
+            workspace_reconciled,
+            current_revision,
+            &current_digest,
+        );
         self.workspace.record_changes(changes, true);
         self.report.clear_verify();
         self.workspace.clear_active_baselines();
@@ -450,6 +489,8 @@ impl crate::Agent {
             route.provider,
             self.workspace.last_changed_files.clone(),
         );
+        outcome.verification = verification;
+        outcome.verified_workspace_revision = verified_workspace_revision;
         outcome.review_same_model = self.skeptic_shares_session_model();
         self.report.set_outcome(outcome.clone());
         outcome
@@ -509,5 +550,29 @@ impl crate::Agent {
             .goal_drive_evidence
             .restore(snapshot.goal_drive_evidence);
         Ok(agent)
+    }
+}
+
+#[cfg(test)]
+mod failure_attribution_tests {
+    use super::verification_after_turn_failure;
+    use crate::VerificationStatus;
+    use crate::domain::VerifyEvidence;
+
+    #[test]
+    fn only_a_current_revision_pass_survives_later_infrastructure_failure() {
+        let pass = VerifyEvidence::pass(7, "current".into());
+        assert_eq!(
+            verification_after_turn_failure(&pass, true, 7, "current"),
+            (VerificationStatus::Passed, Some("current".into()))
+        );
+        assert_eq!(
+            verification_after_turn_failure(&pass, true, 8, "changed"),
+            (VerificationStatus::Unverified, None)
+        );
+        assert_eq!(
+            verification_after_turn_failure(&pass, false, 7, "current"),
+            (VerificationStatus::Unverified, None)
+        );
     }
 }

@@ -488,6 +488,15 @@ fn stop_reason(outcome: &hi_agent::TurnOutcome) -> acp::StopReason {
 }
 
 fn stop_status(outcome: &hi_agent::TurnOutcome) -> Option<&'static str> {
+    if outcome.stop_reason == hi_agent::TurnStopReason::InfrastructureFailure {
+        return Some(
+            if outcome.verification == hi_agent::VerificationStatus::InfrastructureError {
+                "verification infrastructure failure"
+            } else {
+                "the turn failed internally"
+            },
+        );
+    }
     if outcome.verification == hi_agent::VerificationStatus::InfrastructureError {
         return Some("verification infrastructure failure");
     }
@@ -512,7 +521,9 @@ fn stop_status(outcome: &hi_agent::TurnOutcome) -> Option<&'static str> {
         hi_agent::TurnStopReason::ReviewObjected => Some("independent review objected"),
         hi_agent::TurnStopReason::ToolModeDenied => Some("required tool use was denied"),
         hi_agent::TurnStopReason::ToolLimit => Some("tool-call limit reached"),
-        hi_agent::TurnStopReason::InfrastructureFailure => Some("the turn failed internally"),
+        hi_agent::TurnStopReason::InfrastructureFailure => unreachable!(
+            "infrastructure failures return before verification-specific status handling"
+        ),
         _ => None,
     }
 }
@@ -867,6 +878,29 @@ mod tests {
         );
         assert_eq!(stop_reason(&outcome), acp::StopReason::EndTurn);
         assert_eq!(stop_status(&outcome), Some("verification failed"));
+    }
+
+    #[test]
+    fn provider_failure_is_not_reported_as_verifier_infrastructure_failure() {
+        let provider_failure = outcome(
+            hi_agent::TurnStatus::Failed,
+            hi_agent::VerificationStatus::Failed,
+            hi_agent::TurnStopReason::InfrastructureFailure,
+        );
+        assert_eq!(
+            stop_status(&provider_failure),
+            Some("the turn failed internally")
+        );
+
+        let verifier_failure = outcome(
+            hi_agent::TurnStatus::Failed,
+            hi_agent::VerificationStatus::InfrastructureError,
+            hi_agent::TurnStopReason::InfrastructureFailure,
+        );
+        assert_eq!(
+            stop_status(&verifier_failure),
+            Some("verification infrastructure failure")
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod curate;
 mod decision;
 mod delegate;
 mod explore;
+mod failure_attribution;
 mod finalize;
 mod fresh_window;
 mod goal;

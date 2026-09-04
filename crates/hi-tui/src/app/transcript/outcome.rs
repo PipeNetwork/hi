@@ -169,7 +169,13 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
             TurnStopReason::Completed | TurnStopReason::ReviewEscalated
         )
         && outcome.review != ReviewStatus::Objected;
-    let base = if outcome.verification == VerificationStatus::InfrastructureError {
+    let base = if outcome.stop_reason == TurnStopReason::InfrastructureFailure {
+        if outcome.verification == VerificationStatus::InfrastructureError {
+            "verification infrastructure failure".to_string()
+        } else {
+            "infrastructure failure".to_string()
+        }
+    } else if outcome.verification == VerificationStatus::InfrastructureError {
         "verification infrastructure failure".to_string()
     } else if outcome.verification == VerificationStatus::Failed {
         "verification failed".to_string()
@@ -213,5 +219,30 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
         ReviewStatus::Objected => format!("{base} · review objected"),
         ReviewStatus::Escalated => format!("{base} · review escalated"),
         _ => base,
+    }
+}
+
+#[cfg(test)]
+mod failure_attribution_tests {
+    use super::outcome_detail;
+    use hi_agent::{TurnOutcome, TurnStopReason, VerificationStatus};
+
+    #[test]
+    fn provider_failure_is_not_presented_as_verifier_infrastructure_failure() {
+        let mut outcome = TurnOutcome::infrastructure_failure(
+            "pipe/deepseek-v4-flash-0731",
+            Some("pipe".into()),
+            Vec::new(),
+        );
+        outcome.verification = VerificationStatus::Failed;
+
+        assert_eq!(outcome.stop_reason, TurnStopReason::InfrastructureFailure);
+        assert_eq!(outcome_detail(&outcome), "infrastructure failure");
+
+        outcome.verification = VerificationStatus::InfrastructureError;
+        assert_eq!(
+            outcome_detail(&outcome),
+            "verification infrastructure failure"
+        );
     }
 }

@@ -115,6 +115,11 @@ pub struct TurnOutcome {
 impl TurnOutcome {
     /// Construct the typed failure included in reports when `run_turn` returns
     /// an infrastructure/provider error instead of a normal turn outcome.
+    ///
+    /// This says nothing about deterministic verification. Callers that still
+    /// hold current-revision verification evidence may attach it separately;
+    /// an ordinary provider outage must never be reported as a verification
+    /// infrastructure failure.
     pub fn infrastructure_failure(
         model: impl Into<String>,
         provider: Option<String>,
@@ -122,7 +127,7 @@ impl TurnOutcome {
     ) -> Self {
         Self {
             status: TurnStatus::Failed,
-            verification: VerificationStatus::InfrastructureError,
+            verification: VerificationStatus::Unverified,
             review: ReviewStatus::Unavailable,
             stop_reason: TurnStopReason::InfrastructureFailure,
             changed_files,

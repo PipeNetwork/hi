@@ -1790,10 +1790,9 @@ async fn infrastructure_finalizer_reconciles_ui_effects_after_session_failure() 
     let outcome = agent.finalize_failed_turn();
 
     assert_eq!(outcome.status, TurnStatus::Failed);
-    assert_eq!(
-        outcome.verification,
-        VerificationStatus::InfrastructureError
-    );
+    // The late UI mutation invalidates the earlier pass, but a session write
+    // failure is not a verifier infrastructure failure.
+    assert_eq!(outcome.verification, VerificationStatus::Unverified);
     assert!(outcome.changed_files.contains(&"work.rs".to_string()));
     assert!(outcome.changed_files.contains(&"late.rs".to_string()));
     let _ = std::fs::remove_dir_all(root);
