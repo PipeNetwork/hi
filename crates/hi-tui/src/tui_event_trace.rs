@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use crate::event::UiEvent;
 
 pub const TUI_EVENT_TRACE_SCHEMA_VERSION: u32 = 1;
+const SMOKE_RUN_MARKER_ENV: &str = "HI_SMOKE_RUN_MARKER";
 
 #[derive(Clone)]
 pub struct TuiEventTrace {
@@ -27,6 +28,7 @@ pub struct TuiEventTrace {
 struct TraceState {
     writer: BufWriter<File>,
     sequence: u64,
+    run_id: Option<String>,
     failure: Option<String>,
 }
 
@@ -35,6 +37,8 @@ struct TraceRecord<'a> {
     schema_version: u32,
     sequence: u64,
     process_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<&'a str>,
     timestamp_ms: u64,
     event: &'a str,
     data: Value,
@@ -68,6 +72,10 @@ impl TuiEventTrace {
     /// continue from the largest valid prior record, preserving evidence when
     /// a smoke scenario quits and restarts against the same artifact path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_run_id(path, smoke_run_id_from_env())
+    }
+
+    fn open_with_run_id(path: impl AsRef<Path>, run_id: Option<String>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path
             .parent()
@@ -96,6 +104,7 @@ impl TuiEventTrace {
             inner: Arc::new(Mutex::new(TraceState {
                 writer,
                 sequence,
+                run_id,
                 failure: None,
             })),
         })
@@ -109,10 +118,12 @@ impl TuiEventTrace {
         if let Some(failure) = &state.failure {
             return Err(anyhow!(failure.clone()));
         }
+        let run_id = state.run_id.clone();
         let record = TraceRecord {
             schema_version: TUI_EVENT_TRACE_SCHEMA_VERSION,
             sequence: state.sequence,
             process_id: std::process::id(),
+            run_id: run_id.as_deref(),
             timestamp_ms: unix_timestamp_ms(),
             event,
             data,
@@ -162,6 +173,27 @@ impl TuiEventTrace {
             _ => self.emit("ui_event", ui_event_summary(event)),
         }
     }
+}
+
+fn smoke_run_id_from_env() -> Option<String> {
+    std::env::var(SMOKE_RUN_MARKER_ENV)
+        .ok()
+        .filter(|marker| valid_smoke_run_marker(marker))
+}
+
+fn valid_smoke_run_marker(marker: &str) -> bool {
+    if marker.len() > 128 {
+        return false;
+    }
+    let mut parts = marker.split('-');
+    let (Some(pid), Some(nanos), Some(sequence), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    pid.parse::<u32>().is_ok_and(|pid| pid > 0)
+        && u128::from_str_radix(nanos, 16).is_ok_and(|nanos| nanos > 0)
+        && u64::from_str_radix(sequence, 16).is_ok_and(|sequence| sequence > 0)
 }
 
 pub(crate) fn compose_remote_event_tap(
@@ -681,7 +713,7 @@ mod tests {
     fn trace_is_versioned_sequenced_and_flushed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/events.jsonl");
-        let trace = TuiEventTrace::open(&path).unwrap();
+        let trace = TuiEventTrace::open_with_run_id(&path, None).unwrap();
         trace.emit("ready", json!({"width": 80})).unwrap();
         trace
             .emit_ui_event(&UiEvent::Text {
@@ -701,6 +733,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["schema_version"], 1);
         assert_eq!(rows[0]["sequence"], 0);
+        assert!(rows[0].get("run_id").is_none());
         assert_eq!(rows[1]["sequence"], 1);
         assert_eq!(rows[1]["event"], "ui_event");
         assert_eq!(rows[1]["data"]["kind"], "text");
@@ -713,12 +746,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         {
-            let trace = TuiEventTrace::open(&path).unwrap();
+            let trace =
+                TuiEventTrace::open_with_run_id(&path, Some("123-18fdb42-1".into())).unwrap();
             trace.emit("ready", json!({})).unwrap();
             trace.emit("session_ended", json!({})).unwrap();
         }
         {
-            let trace = TuiEventTrace::open(&path).unwrap();
+            let trace =
+                TuiEventTrace::open_with_run_id(&path, Some("123-18fdb42-2".into())).unwrap();
             trace.emit("ready", json!({})).unwrap();
         }
         let rows = std::fs::read_to_string(path)
@@ -731,6 +766,25 @@ mod tests {
         assert_eq!(rows[1]["sequence"], 1);
         assert_eq!(rows[2]["sequence"], 2);
         assert!(rows.iter().all(|row| row["process_id"].is_u64()));
+        assert_eq!(rows[0]["run_id"], "123-18fdb42-1");
+        assert_eq!(rows[1]["run_id"], "123-18fdb42-1");
+        assert_eq!(rows[2]["run_id"], "123-18fdb42-2");
+    }
+
+    #[test]
+    fn smoke_run_marker_validation_accepts_only_harness_shape() {
+        assert!(valid_smoke_run_marker("123-18fdb42-7"));
+        for marker in [
+            "",
+            "0-18fdb42-7",
+            "123-0-7",
+            "123-18fdb42-0",
+            "123-not-hex-7",
+            "123-18fdb42",
+            "123-18fdb42-7-extra",
+        ] {
+            assert!(!valid_smoke_run_marker(marker), "accepted {marker:?}");
+        }
     }
 
     #[test]

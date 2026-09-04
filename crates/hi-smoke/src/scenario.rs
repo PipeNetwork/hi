@@ -1263,6 +1263,7 @@ frame_delay_ms = 1
             "HI_TRUST_STORE",
             "HI_ME_MD",
             "HI_TRACE_CAPTURE",
+            "HI_SMOKE_RUN_MARKER",
             "HI_DISABLE_FEEDBACK",
         ] {
             assert!(

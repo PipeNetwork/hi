@@ -1361,7 +1361,7 @@ impl CaseRuntime {
 
     fn check_hard_invariants(&mut self) -> Result<()> {
         let events = read_jsonl(&self.events_path)?;
-        validate_event_invariants(&events, &self.process_ids)?;
+        validate_event_invariants(&events, &self.process_markers)?;
         validate_live_provider_event_route(&events, self.live_route.as_ref())?;
         let session = read_jsonl(&self.session_path)?;
         // Parsing every non-empty line is itself a hard invariant.
@@ -1443,6 +1443,8 @@ impl CaseRuntime {
         }
         let events = read_jsonl(&self.events_path)
             .context("post-failure state invariant could not parse TUI event JSONL")?;
+        validate_event_run_ids(&events, &self.process_markers)
+            .context("post-failure state invariant rejected TUI process identities")?;
         validate_event_stream_safety(&events)
             .context("post-failure state invariant rejected TUI lifecycle evidence")?;
         read_jsonl(&self.session_path)
@@ -2270,7 +2272,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn validate_event_invariants(events: &[Value], process_ids: &[u32]) -> Result<()> {
+fn validate_event_invariants(events: &[Value], run_ids: &[String]) -> Result<()> {
     ensure!(
         events.iter().any(|event| event["event"] == "ready"),
         "trace did not contain a ready event"
@@ -2279,20 +2281,49 @@ fn validate_event_invariants(events: &[Value], process_ids: &[u32]) -> Result<()
         events.iter().any(|event| event["event"] == "session_ended"),
         "trace did not contain a normal session_ended event"
     );
-    for process_id in process_ids {
+    let observed_run_ids = validate_event_run_ids(events, run_ids)?;
+    ensure!(
+        observed_run_ids == run_ids,
+        "trace run order {observed_run_ids:?} did not match spawned run order {run_ids:?}"
+    );
+    for run_id in run_ids {
+        let ready_count = events
+            .iter()
+            .filter(|event| event["event"] == "ready" && event["run_id"] == run_id.as_str())
+            .count();
         ensure!(
-            events.iter().any(|event| {
-                event["event"] == "ready"
-                    && event["process_id"].as_u64() == Some((*process_id).into())
-            }),
-            "process {process_id} did not emit a ready event"
+            ready_count == 1,
+            "TUI run {run_id} emitted {ready_count} ready events instead of exactly one"
         );
+        let ended_count = events
+            .iter()
+            .filter(|event| event["event"] == "session_ended" && event["run_id"] == run_id.as_str())
+            .count();
         ensure!(
-            events.iter().any(|event| {
-                event["event"] == "session_ended"
-                    && event["process_id"].as_u64() == Some((*process_id).into())
-            }),
-            "process {process_id} did not emit a normal session_ended event"
+            ended_count == 1,
+            "TUI run {run_id} emitted {ended_count} normal session_ended events instead of exactly one"
+        );
+        let ready_index = events
+            .iter()
+            .position(|event| event["event"] == "ready" && event["run_id"] == run_id.as_str())
+            .expect("ready count was exactly one");
+        let ended_index = events
+            .iter()
+            .position(|event| {
+                event["event"] == "session_ended" && event["run_id"] == run_id.as_str()
+            })
+            .expect("session_ended count was exactly one");
+        ensure!(
+            ready_index < ended_index,
+            "TUI run {run_id} emitted session_ended before ready"
+        );
+        let final_index = events
+            .iter()
+            .rposition(|event| event["run_id"] == run_id.as_str())
+            .expect("validated run has trace records");
+        ensure!(
+            ended_index == final_index,
+            "TUI run {run_id} emitted a trace record after session_ended"
         );
     }
     let active_turn = validate_event_stream_safety(events)?;
@@ -2303,6 +2334,54 @@ fn validate_event_invariants(events: &[Value], process_ids: &[u32]) -> Result<()
     Ok(())
 }
 
+fn validate_event_run_ids(events: &[Value], expected_run_ids: &[String]) -> Result<Vec<String>> {
+    let expected = expected_run_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        expected.len() == expected_run_ids.len(),
+        "spawned TUI run ids were not unique: {expected_run_ids:?}"
+    );
+    let mut observed = Vec::<String>::new();
+    let mut process_ids = BTreeMap::<String, u32>::new();
+    for (index, event) in events.iter().enumerate() {
+        let run_id = event["run_id"]
+            .as_str()
+            .filter(|run_id| !run_id.is_empty())
+            .ok_or_else(|| anyhow!("trace record {index} has no non-empty run_id"))?;
+        ensure!(
+            expected.contains(run_id),
+            "trace record {index} has unknown run_id {run_id:?}"
+        );
+        let process_id = event["process_id"]
+            .as_u64()
+            .and_then(|process_id| u32::try_from(process_id).ok())
+            .filter(|process_id| *process_id > 0)
+            .ok_or_else(|| {
+                anyhow!("trace record {index} has no positive u32 process_id for run {run_id:?}")
+            })?;
+        if let Some(prior) = process_ids.insert(run_id.to_owned(), process_id) {
+            ensure!(
+                prior == process_id,
+                "trace run {run_id:?} changed process_id from {prior} to {process_id} at record {index}"
+            );
+        }
+        if observed.last().is_none_or(|prior| prior != run_id) {
+            ensure!(
+                !observed.iter().any(|prior| prior == run_id),
+                "trace run_id {run_id:?} reappeared noncontiguously at record {index}"
+            );
+            observed.push(run_id.to_owned());
+        }
+    }
+    ensure!(
+        expected_run_ids.starts_with(&observed),
+        "trace run order {observed:?} was not a contiguous prefix of spawned run order {expected_run_ids:?}"
+    );
+    Ok(observed)
+}
+
 /// Validate trace properties that remain meaningful when the harness had to
 /// terminate `hi` after an earlier failure. An active final turn is permitted
 /// here because forced termination can prevent normal settlement; overlapping
@@ -2311,7 +2390,7 @@ fn validate_event_invariants(events: &[Value], process_ids: &[u32]) -> Result<()
 fn validate_event_stream_safety(events: &[Value]) -> Result<Option<u64>> {
     let mut prior_sequence = None;
     let mut active_turn = None;
-    let mut prompt_queues = BTreeMap::<u64, PromptQueueTraceState>::new();
+    let mut prompt_queues = BTreeMap::<String, PromptQueueTraceState>::new();
     for (index, event) in events.iter().enumerate() {
         ensure!(
             event["schema_version"] == 1,
@@ -2393,7 +2472,7 @@ struct PromptQueueTraceState {
 fn validate_prompt_queue_event(
     index: usize,
     event: &Value,
-    queues: &mut BTreeMap<u64, PromptQueueTraceState>,
+    queues: &mut BTreeMap<String, PromptQueueTraceState>,
 ) -> Result<()> {
     let event_name = event["event"].as_str().unwrap_or("<unknown>");
     let is_transition = matches!(
@@ -2405,6 +2484,21 @@ fn validate_prompt_queue_event(
             !is_transition,
             "prompt queue invariant at record {index}: {event_name} has no queue_depth"
         );
+        if event_name == "session_ended" {
+            let run_id = event["run_id"]
+                .as_str()
+                .filter(|run_id| !run_id.is_empty())
+                .ok_or_else(|| {
+                    anyhow!("prompt queue invariant at record {index}: session_ended has no run_id")
+                })?;
+            if let Some(queue) = queues.get(run_id) {
+                ensure!(
+                    queue.depth == 0 && queue.pending.is_empty(),
+                    "prompt queue invariant at record {index}: run {run_id:?} ended with {} queued prompt(s)",
+                    queue.depth
+                );
+            }
+        }
         return Ok(());
     };
     let reported_depth = depth_value.as_u64().ok_or_else(|| {
@@ -2412,12 +2506,15 @@ fn validate_prompt_queue_event(
             "prompt queue invariant at record {index}: queue_depth must be a nonnegative integer, got {depth_value}"
         )
     })?;
-    let process_id = event["process_id"].as_u64().ok_or_else(|| {
-        anyhow!(
-            "prompt queue invariant at record {index}: queue_depth is present but process_id is not an unsigned integer"
-        )
-    })?;
-    let queue = queues.entry(process_id).or_default();
+    let run_id = event["run_id"]
+        .as_str()
+        .filter(|run_id| !run_id.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "prompt queue invariant at record {index}: queue_depth is present but run_id is missing"
+            )
+        })?;
+    let queue = queues.entry(run_id.to_owned()).or_default();
 
     match event_name {
         "prompt_queued" => {
@@ -2464,6 +2561,13 @@ fn validate_prompt_queue_event(
         "prompt queue invariant at record {index}: {event_name} reported depth {reported_depth}, but traced prompt multiset has depth {}",
         queue.depth
     );
+    if event_name == "session_ended" {
+        ensure!(
+            queue.depth == 0 && queue.pending.is_empty(),
+            "prompt queue invariant at record {index}: run {run_id:?} ended with {} queued prompt(s)",
+            queue.depth
+        );
+    }
     Ok(())
 }
 
@@ -3539,10 +3643,15 @@ mod tests {
     }
 
     fn lifecycle_event(sequence: u64, event: &str, data: Value) -> Value {
+        lifecycle_event_for_run(sequence, "test-run", event, data)
+    }
+
+    fn lifecycle_event_for_run(sequence: u64, run_id: &str, event: &str, data: Value) -> Value {
         json!({
             "schema_version": 1,
             "sequence": sequence,
-            "process_id": 7,
+            "process_id": 2,
+            "run_id": run_id,
             "event": event,
             "data": data,
         })
@@ -3556,6 +3665,185 @@ mod tests {
             &BTreeMap::from([("/event".into(), json!("x"))]),
             &BTreeMap::from([("/data/message".into(), "world".into())]),
         ));
+    }
+
+    #[test]
+    fn lifecycle_uses_unique_run_ids_when_pid_namespace_reuses_pid() {
+        let events = vec![
+            lifecycle_event_for_run(0, "run-a", "ready", json!({"queue_depth": 0})),
+            lifecycle_event_for_run(1, "run-a", "session_ended", json!({})),
+            lifecycle_event_for_run(2, "run-b", "ready", json!({"queue_depth": 0})),
+            lifecycle_event_for_run(3, "run-b", "session_ended", json!({})),
+        ];
+
+        validate_event_invariants(&events, &["run-a".into(), "run-b".into()]).unwrap();
+        assert!(events.iter().all(|event| event["process_id"] == 2));
+    }
+
+    #[test]
+    fn lifecycle_rejects_missing_unknown_and_noncontiguous_run_ids() {
+        let expected = ["run-a".into(), "run-b".into()];
+        let valid = vec![
+            lifecycle_event_for_run(0, "run-a", "ready", json!({})),
+            lifecycle_event_for_run(1, "run-a", "session_ended", json!({})),
+            lifecycle_event_for_run(2, "run-b", "ready", json!({})),
+            lifecycle_event_for_run(3, "run-b", "session_ended", json!({})),
+        ];
+
+        let mut missing = valid.clone();
+        missing[1].as_object_mut().unwrap().remove("run_id");
+        assert!(
+            validate_event_invariants(&missing, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("no non-empty run_id")
+        );
+
+        let mut unknown = valid.clone();
+        unknown[2]["run_id"] = json!("foreign-run");
+        assert!(
+            validate_event_invariants(&unknown, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown run_id")
+        );
+
+        let noncontiguous = vec![
+            valid[0].clone(),
+            valid[2].clone(),
+            valid[1].clone(),
+            valid[3].clone(),
+        ];
+        assert!(
+            validate_event_invariants(&noncontiguous, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("reappeared noncontiguously")
+        );
+
+        let missing_spawn = &valid[..2];
+        assert_eq!(
+            validate_event_run_ids(missing_spawn, &expected).unwrap(),
+            vec!["run-a".to_owned()]
+        );
+        assert!(
+            validate_event_invariants(missing_spawn, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("did not match spawned run order")
+        );
+
+        let duplicate_ready = vec![
+            lifecycle_event_for_run(0, "run-a", "ready", json!({})),
+            lifecycle_event_for_run(1, "run-a", "ready", json!({})),
+            lifecycle_event_for_run(2, "run-a", "session_ended", json!({})),
+            lifecycle_event_for_run(3, "run-b", "ready", json!({})),
+            lifecycle_event_for_run(4, "run-b", "session_ended", json!({})),
+        ];
+        assert!(
+            validate_event_invariants(&duplicate_ready, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("2 ready events")
+        );
+        assert!(
+            validate_event_invariants(&valid, &["run-a".into(), "run-a".into()])
+                .unwrap_err()
+                .to_string()
+                .contains("were not unique")
+        );
+
+        let missing_middle = vec![valid[0].clone(), valid[1].clone()];
+        let missing_middle_expected = ["run-a".into(), "run-b".into(), "run-c".into()];
+        let mut run_c = vec![
+            lifecycle_event_for_run(2, "run-c", "ready", json!({})),
+            lifecycle_event_for_run(3, "run-c", "session_ended", json!({})),
+        ];
+        let mut missing_middle = missing_middle;
+        missing_middle.append(&mut run_c);
+        assert!(
+            validate_event_run_ids(&missing_middle, &missing_middle_expected)
+                .unwrap_err()
+                .to_string()
+                .contains("not a contiguous prefix")
+        );
+
+        let ended_before_ready = vec![
+            lifecycle_event_for_run(0, "run-a", "session_ended", json!({})),
+            lifecycle_event_for_run(1, "run-a", "ready", json!({})),
+        ];
+        assert!(
+            validate_event_invariants(&ended_before_ready, &["run-a".into()])
+                .unwrap_err()
+                .to_string()
+                .contains("session_ended before ready")
+        );
+
+        let row_after_end = vec![
+            lifecycle_event_for_run(0, "run-a", "ready", json!({})),
+            lifecycle_event_for_run(1, "run-a", "session_ended", json!({})),
+            lifecycle_event_for_run(2, "run-a", "ui_event", json!({"kind": "text"})),
+        ];
+        assert!(
+            validate_event_invariants(&row_after_end, &["run-a".into()])
+                .unwrap_err()
+                .to_string()
+                .contains("after session_ended")
+        );
+
+        let mut invalid_process_id = valid.clone();
+        invalid_process_id[0]["process_id"] = json!(0);
+        assert!(
+            validate_event_invariants(&invalid_process_id, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("no positive u32 process_id")
+        );
+        let mut changed_process_id = valid.clone();
+        changed_process_id[1]["process_id"] = json!(3);
+        assert!(
+            validate_event_invariants(&changed_process_id, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("changed process_id from 2 to 3")
+        );
+    }
+
+    #[test]
+    fn prompt_queues_are_isolated_by_run_id_when_inner_pid_is_reused() {
+        let cross_run_consume = vec![
+            lifecycle_event_for_run(0, "run-a", "ready", json!({"queue_depth": 0})),
+            lifecycle_event_for_run(
+                1,
+                "run-a",
+                "prompt_queued",
+                json!({"prompt_fingerprint": "queued-before-restart", "queue_depth": 1}),
+            ),
+            lifecycle_event_for_run(
+                2,
+                "run-b",
+                "prompt_dequeued",
+                json!({"prompt_fingerprint": "queued-before-restart", "queue_depth": 0}),
+            ),
+        ];
+        let cross_run_error = validate_event_stream_safety(&cross_run_consume).unwrap_err();
+        assert!(
+            cross_run_error.to_string().contains("from an empty queue"),
+            "{cross_run_error:#}"
+        );
+
+        let pending_at_end = vec![
+            cross_run_consume[0].clone(),
+            cross_run_consume[1].clone(),
+            lifecycle_event_for_run(2, "run-a", "session_ended", json!({})),
+        ];
+        let pending_error = validate_event_stream_safety(&pending_at_end).unwrap_err();
+        assert!(
+            pending_error
+                .to_string()
+                .contains("ended with 1 queued prompt"),
+            "{pending_error:#}"
+        );
     }
 
     #[test]
@@ -3627,6 +3915,7 @@ mod tests {
             "schema_version": 1,
             "sequence": 0,
             "process_id": 7,
+            "run_id": "test-run",
             "event": "turn_started",
             "data": {"origin": "user", "queue_depth": 0},
         })];
@@ -3640,6 +3929,7 @@ mod tests {
                 "schema_version": 1,
                 "sequence": 0,
                 "process_id": 7,
+                "run_id": "test-run",
                 "event": "turn_started",
                 "data": {"origin": "user", "queue_depth": 0},
             }),
@@ -3647,6 +3937,7 @@ mod tests {
                 "schema_version": 1,
                 "sequence": 1,
                 "process_id": 7,
+                "run_id": "test-run",
                 "event": "turn_settled",
                 "data": {"outcome": {"status": "failed"}, "queue_depth": 0},
             }),
@@ -3654,6 +3945,7 @@ mod tests {
                 "schema_version": 1,
                 "sequence": 2,
                 "process_id": 7,
+                "run_id": "test-run",
                 "event": "turn_started",
                 "data": {"origin": "plan_drive", "queue_depth": 0},
             }),
