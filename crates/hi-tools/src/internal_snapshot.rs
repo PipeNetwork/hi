@@ -72,8 +72,10 @@ pub(crate) fn create(root: &Path, state_root: &Path) -> Result<String> {
     Ok(format!("{ID_PREFIX}{}:{digest}", store.workspace_id))
 }
 
+#[cfg(test)]
 pub(crate) fn restore(root: &Path, state_root: &Path, id: &str) -> Result<usize> {
-    let (plan, changed) = prepare_restore(root, state_root, id, None)?;
+    crate::transaction::recover_workspace_transactions(root, state_root)?;
+    let (plan, changed) = prepare_restore_after_recovery(root, state_root, id, None)?;
     if let Some(plan) = plan {
         plan.commit()?;
     }
@@ -150,23 +152,28 @@ pub(crate) fn materialize(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn restore_sealed(
     root: &Path,
     state_root: &Path,
     target: &str,
     expected_current: &str,
 ) -> Result<usize> {
-    let (plan, changed) = prepare_restore(root, state_root, target, Some(expected_current))?;
+    crate::transaction::recover_workspace_transactions(root, state_root)?;
+    let (plan, changed) =
+        prepare_restore_after_recovery(root, state_root, target, Some(expected_current))?;
     if let Some(plan) = plan {
         plan.commit()?;
     }
     Ok(changed)
 }
 
-/// Construct every restore postimage and the transaction journal plan before
-/// touching the workspace. Sealed restores compare the complete captured file
-/// universe twice: once before planning and again immediately before commit.
-fn prepare_restore(
+/// Construct every restore postimage and transaction plan without touching the
+/// workspace. The caller must recover pending transactions synchronously before
+/// dispatching this function to a detachable worker. Sealed restores compare
+/// the complete captured file universe twice: once before planning and again
+/// immediately before commit.
+pub(crate) fn prepare_restore_after_recovery(
     root: &Path,
     state_root: &Path,
     target_id: &str,
@@ -212,7 +219,7 @@ fn prepare_restore(
         };
         mutations.push(RestoreMutation { path, postimage });
     }
-    let plan = MutationPlan::new_restore_with_state(&root, state_root, mutations)?;
+    let plan = MutationPlan::new_restore_with_state_after_recovery(&root, state_root, mutations)?;
 
     if let Some(expected) = expected {
         let observed = decoded_entries(scan(&root, state_root, None)?.into_values().collect())?;
@@ -222,6 +229,25 @@ fn prepare_restore(
         );
     }
     Ok((Some(plan), changed))
+}
+
+/// Revalidate the complete captured workspace, including paths outside a
+/// restore frontier. Sealed undo calls this after last-moment transaction
+/// recovery so an unrelated recovered file cannot be silently accepted.
+pub(crate) fn ensure_current_matches(
+    root: &Path,
+    state_root: &Path,
+    expected_id: &str,
+) -> Result<()> {
+    let root = canonical_root(root)?;
+    let (_, expected_manifest, _) = load(&root, state_root, expected_id)?;
+    let expected = decoded_entries(expected_manifest.entries)?;
+    let observed = decoded_entries(scan(&root, state_root, None)?.into_values().collect())?;
+    ensure!(
+        observed == expected,
+        "undo conflict: workspace changed externally while preparing restore"
+    );
+    Ok(())
 }
 
 fn decoded_entries(entries: Vec<SnapshotEntry>) -> Result<BTreeMap<PathBuf, SnapshotEntry>> {
@@ -994,6 +1020,29 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.join("file")).unwrap(),
             "external"
+        );
+        let _ = fs::remove_dir_all(workspace.parent().unwrap());
+    }
+
+    #[test]
+    fn final_sealed_revalidation_covers_paths_outside_restore_frontier() {
+        let (workspace, state) = roots("sealed-final-revalidation");
+        fs::write(workspace.join("changed"), "before").unwrap();
+        fs::write(workspace.join("stable"), "same").unwrap();
+        let before = create(&workspace, &state).unwrap();
+        fs::write(workspace.join("changed"), "after").unwrap();
+        let after = create(&workspace, &state).unwrap();
+        crate::transaction::recover_workspace_transactions(&workspace, &state).unwrap();
+        let (plan, _) =
+            prepare_restore_after_recovery(&workspace, &state, &before, Some(&after)).unwrap();
+
+        fs::write(workspace.join("stable"), "external").unwrap();
+
+        assert!(ensure_current_matches(&workspace, &state, &after).is_err());
+        drop(plan);
+        assert_eq!(
+            fs::read_to_string(workspace.join("changed")).unwrap(),
+            "after"
         );
         let _ = fs::remove_dir_all(workspace.parent().unwrap());
     }

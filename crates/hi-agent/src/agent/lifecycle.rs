@@ -309,11 +309,25 @@ impl crate::Agent {
     /// checkpoint. Returns `None` if there's nothing to undo, else the number of
     /// files restored or removed.
     pub async fn undo(&mut self) -> Result<Option<usize>> {
+        self.undo_with_ledger_reconcile(true).await
+    }
+
+    /// Cancellation already performs one bounded ledger reconciliation after
+    /// rollback. Deferring this scan keeps an otherwise successful restore from
+    /// starting an unbounded cleanup wait before that cancellation backstop.
+    pub(crate) async fn undo_without_ledger_reconcile(&mut self) -> Result<Option<usize>> {
+        self.undo_with_ledger_reconcile(false).await
+    }
+
+    async fn undo_with_ledger_reconcile(
+        &mut self,
+        reconcile_ledger: bool,
+    ) -> Result<Option<usize>> {
         if self.workspace.checkpoints.is_empty() {
             return Ok(None);
         }
         self.begin_durable_workspace_mutation(None).await?;
-        let operation = self.undo_inner().await;
+        let operation = self.undo_inner(reconcile_ledger).await;
         let durability = self.checkpoint_durable_workspace().await;
         match (operation, durability) {
             (Ok(value), Ok(())) => Ok(value),
@@ -327,7 +341,7 @@ impl crate::Agent {
         }
     }
 
-    async fn undo_inner(&mut self) -> Result<Option<usize>> {
+    async fn undo_inner(&mut self, reconcile_ledger: bool) -> Result<Option<usize>> {
         let Some(reference) = self.workspace.checkpoints.last().cloned() else {
             return Ok(None);
         };
@@ -402,7 +416,11 @@ impl crate::Agent {
             .await;
             self.invalidate_snapshot();
             self.runtime.clear_read_cache();
-            let reconcile = self.runtime.reconcile_ledger_async().await;
+            let reconcile = if reconcile_ledger {
+                self.runtime.reconcile_ledger_async().await.map(|_| ())
+            } else {
+                Ok(())
+            };
             return match (rollback, reconcile) {
                     (Ok(_), Ok(_)) => Err(persist_error.context(
                         "persisting the shortened undo stack failed; workspace rollback succeeded",
@@ -431,7 +449,9 @@ impl crate::Agent {
         self.runtime.clear_read_cache();
         // Bring the content ledger back to the restored state and do not report
         // the now-undone effects as the latest workspace changes.
-        self.runtime.reconcile_ledger_async().await?;
+        if reconcile_ledger {
+            self.runtime.reconcile_ledger_async().await?;
+        }
         self.runtime.clear_repo_map_cache();
         self.workspace.last_changed_files.clear();
         self.workspace.last_file_changes.clear();

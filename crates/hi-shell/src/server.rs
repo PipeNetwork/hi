@@ -256,16 +256,22 @@ impl acp::Agent for HiShell {
             .run_turn_cancellable(&input, &mut ui, cancellation)
             .await;
         session.active_turn.lock().await.take();
-        if result.is_err() {
+        let cancellation_already_finalized = result.is_err()
+            && agent
+                .last_turn_outcome()
+                .is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Cancelled);
+        if result.is_err() && !cancellation_already_finalized {
             // `run_turn_cancellable` only performs the turn-scoped background
-            // kill before returning an error; reconcile and finalize the
-            // failed turn here before persisting the session snapshot.
+            // kill for ordinary errors before returning; reconcile and
+            // finalize those here before persisting the session snapshot. A
+            // configured hard timeout already ran Agent-owned Cancel cleanup
+            // and intentionally returns its deadline as an Err.
             if agent
                 .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
                 .await
                 .is_err()
             {
-                let _ = agent.finalize_failed_turn();
+                let _ = agent.finalize_failed_turn_snapshot_only();
             }
         }
         self.store_snapshot(

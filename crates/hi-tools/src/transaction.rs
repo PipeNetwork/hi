@@ -301,10 +301,33 @@ impl MutationPlan {
         state_root: impl AsRef<Path>,
         mutations: Vec<RestoreMutation>,
     ) -> Result<Self> {
+        Self::new_restore_with_state_inner(root, state_root, mutations, true)
+    }
+
+    /// Build a restore plan after the caller has synchronously recovered this
+    /// workspace's transaction journal. This variant is used by checkpoint
+    /// preparation running on a detachable blocking worker: repeating recovery
+    /// there could mutate the live tree after its async owner was cancelled.
+    pub(crate) fn new_restore_with_state_after_recovery(
+        root: impl AsRef<Path>,
+        state_root: impl AsRef<Path>,
+        mutations: Vec<RestoreMutation>,
+    ) -> Result<Self> {
+        Self::new_restore_with_state_inner(root, state_root, mutations, false)
+    }
+
+    fn new_restore_with_state_inner(
+        root: impl AsRef<Path>,
+        state_root: impl AsRef<Path>,
+        mutations: Vec<RestoreMutation>,
+        recover: bool,
+    ) -> Result<Self> {
         ensure!(!mutations.is_empty(), "restore has no file operations");
         let root = canonical_root(root.as_ref())?;
         let journal_dir = transaction_journal_dir(&root, state_root.as_ref());
-        recover_pending(&journal_dir)?;
+        if recover {
+            recover_pending(&journal_dir)?;
+        }
         let mut seen = HashSet::new();
         let mut changes = Vec::with_capacity(mutations.len());
         for mutation in mutations {

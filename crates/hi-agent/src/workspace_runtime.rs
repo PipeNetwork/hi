@@ -1,12 +1,156 @@
 //! Per-agent ownership boundary for all workspace-scoped state.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result, ensure};
 
 use crate::LspMode;
 use crate::change_ledger::ChangeLedger;
+
+const RECONCILE_RUNNING: u8 = 0;
+const RECONCILE_COMMITTING: u8 = 1;
+const RECONCILE_CANCELLED: u8 = 2;
+const RECONCILE_DONE: u8 = 3;
+
+/// Arbitrates the only check/commit boundary in an async ledger reconcile.
+/// Cancellation owns RUNNING work immediately; once the worker owns COMMITTING,
+/// cancellation waits for its constant-size state swap to reach DONE.
+struct ReconcileOwnership {
+    state: AtomicU8,
+    done_lock: Mutex<()>,
+    done: Condvar,
+}
+
+impl ReconcileOwnership {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(RECONCILE_RUNNING),
+            done_lock: Mutex::new(()),
+            done: Condvar::new(),
+        }
+    }
+
+    fn begin_commit(&self) -> bool {
+        self.state
+            .compare_exchange(
+                RECONCILE_RUNNING,
+                RECONCILE_COMMITTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn finish(&self) {
+        let _done = self
+            .done_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.state.store(RECONCILE_DONE, Ordering::Release);
+        self.done.notify_all();
+    }
+
+    fn cancel_or_wait_for_commit(&self, cancellation: &tokio_util::sync::CancellationToken) {
+        loop {
+            match self.state.load(Ordering::Acquire) {
+                RECONCILE_RUNNING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            RECONCILE_RUNNING,
+                            RECONCILE_CANCELLED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        cancellation.cancel();
+                        return;
+                    }
+                }
+                RECONCILE_COMMITTING => {
+                    let mut done = self
+                        .done_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while self.state.load(Ordering::Acquire) == RECONCILE_COMMITTING {
+                        done = self
+                            .done
+                            .wait(done)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    return;
+                }
+                RECONCILE_CANCELLED | RECONCILE_DONE => return,
+                _ => unreachable!("invalid ledger reconcile ownership state"),
+            }
+        }
+    }
+}
+
+/// Cancels the worker whenever its owning async future is dropped.
+struct ReconcileFutureGuard {
+    cancellation: tokio_util::sync::CancellationToken,
+    ownership: Arc<ReconcileOwnership>,
+    armed: bool,
+}
+
+impl ReconcileFutureGuard {
+    fn new(
+        cancellation: tokio_util::sync::CancellationToken,
+        ownership: Arc<ReconcileOwnership>,
+    ) -> Self {
+        Self {
+            cancellation,
+            ownership,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReconcileFutureGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ownership.cancel_or_wait_for_commit(&self.cancellation);
+        }
+    }
+}
+
+/// Guarantees that a panicking/early-returning worker cannot strand a waiter
+/// in COMMITTING. Declare this before the ledger guard so unwinding unlocks the
+/// ledger before publishing DONE.
+struct ReconcileWorkerGuard {
+    ownership: Arc<ReconcileOwnership>,
+    finished: bool,
+}
+
+impl ReconcileWorkerGuard {
+    fn new(ownership: Arc<ReconcileOwnership>) -> Self {
+        Self {
+            ownership,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.finished {
+            self.ownership.finish();
+            self.finished = true;
+        }
+    }
+}
+
+impl Drop for ReconcileWorkerGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
 
 /// Runtime state that must never leak between agents or workspace roots.
 pub struct WorkspaceRuntime {
@@ -252,6 +396,34 @@ impl WorkspaceRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Try to inspect the ledger without ever parking the current async runtime
+    /// thread. Abnormal-turn cleanup uses this after a bounded reconciliation:
+    /// an OS-stalled filesystem worker must not defeat the turn's hard deadline.
+    pub(crate) fn try_ledger(&self) -> Option<std::sync::MutexGuard<'_, ChangeLedger>> {
+        match self.ledger.try_lock() {
+            Ok(ledger) => Some(ledger),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Wait briefly for a cooperatively-cancelled ledger worker to leave its
+    /// critical section. The wait itself never takes the blocking mutex, so a
+    /// stalled filesystem syscall cannot pin abnormal-turn cleanup.
+    pub(crate) async fn wait_for_ledger_available(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(ledger) = self.try_ledger() {
+                drop(ledger);
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     pub fn ledger_arc(&self) -> Arc<Mutex<ChangeLedger>> {
         self.ledger.clone()
     }
@@ -266,15 +438,23 @@ impl WorkspaceRuntime {
     /// before reconciling the current workspace so a still-running startup scan
     /// cannot hide stage mutations from its before/after comparison.
     pub(crate) async fn ensure_ledger_scan_complete_async(&self) -> Result<()> {
-        let ledger = self.ledger.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut ledger = ledger
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            ledger.ensure_scan_complete_blocking()
-        })
-        .await
-        .context("workspace ledger scan task panicked")?
+        // The startup scan already owns its background thread. Poll its result
+        // without joining while holding the ledger mutex: dropping this future
+        // must immediately stop waiting, leaving the useful startup scan free to
+        // finish for a later turn rather than detaching a mutex-owning waiter.
+        loop {
+            let complete = match self.ledger.try_lock() {
+                Ok(mut ledger) => ledger.finish_background_scan_if_ready()?,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    poisoned.into_inner().finish_background_scan_if_ready()?
+                }
+                Err(std::sync::TryLockError::WouldBlock) => false,
+            };
+            if complete {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     /// Reconcile an exact set of known dirty paths without walking the entire
@@ -290,18 +470,47 @@ impl WorkspaceRuntime {
         &self,
         paths: Option<Vec<String>>,
     ) -> Result<Vec<hi_tools::FileChange>> {
+        // `spawn_blocking` tasks cannot be force-aborted once running. Couple
+        // the worker to this future with an operation token and explicit commit
+        // ownership: dropping a cancelled/expired turn either prevents publish
+        // or waits for the already-owned O(1) publish to finish.
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let ownership = Arc::new(ReconcileOwnership::new());
+        let drop_guard = ReconcileFutureGuard::new(cancellation.clone(), ownership.clone());
+        let worker_cancellation = cancellation.clone();
+        let worker_ownership = ownership.clone();
         let ledger = self.ledger.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut ledger = ledger
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match paths {
-                Some(paths) => ledger.reconcile_dirty_paths(&paths),
-                None => ledger.reconcile(),
+        let joined = tokio::task::spawn_blocking(move || {
+            // This guard is declared before the mutex guard so unwind releases
+            // the ledger before waking a cancellation waiter.
+            let mut worker_done = ReconcileWorkerGuard::new(worker_ownership.clone());
+            let mut ledger = lock_ledger_cancellable(&ledger, &worker_cancellation)?;
+            let prepared =
+                ledger.prepare_reconcile_cancellable(paths.as_deref(), &worker_cancellation)?;
+            if let Err(error) = ledger.await_reconcile_commit_ownership(&worker_cancellation) {
+                drop(ledger);
+                drop(prepared);
+                return Err(error);
             }
+            if !worker_ownership.begin_commit() {
+                drop(ledger);
+                drop(prepared);
+                anyhow::bail!("workspace ledger reconcile cancelled before commit")
+            }
+            #[cfg(test)]
+            ledger.await_owned_reconcile_commit_test_gate()?;
+            let (changes, retired) = ledger.commit_prepared_reconcile(prepared);
+            drop(ledger);
+            // Cancellation waiting on COMMITTING may continue as soon as the
+            // shared ledger is coherent and unlocked. Large retired maps and
+            // history are destroyed afterward on this blocking worker.
+            worker_done.finish();
+            retired.discard();
+            Ok(changes)
         })
-        .await
-        .context("workspace ledger reconcile task panicked")?
+        .await;
+        drop_guard.disarm();
+        joined.context("workspace ledger reconcile task panicked")?
     }
 
     pub fn invalidate_context(&self) {
@@ -332,17 +541,18 @@ fn new_ledger(
     state_root: &Path,
     scan: Option<crate::change_ledger::BackgroundScan>,
 ) -> Result<ChangeLedger> {
+    // An explicitly supplied production-style scan is honored in tests too.
+    // Ordinary test runtimes still use a synchronous baseline below, while
+    // focused cancellation tests can exercise the real startup path.
+    if let Some(scan) = scan {
+        return ChangeLedger::from_background_scan(root, Some(state_root), scan);
+    }
     #[cfg(not(test))]
     {
-        if let Some(scan) = scan {
-            ChangeLedger::from_background_scan(root, Some(state_root), scan)
-        } else {
-            ChangeLedger::new_with_state_background(root, Some(state_root))
-        }
+        ChangeLedger::new_with_state_background(root, Some(state_root))
     }
     #[cfg(test)]
     {
-        let _ = scan; // tests always scan synchronously
         ChangeLedger::new_with_state(root, Some(state_root))
     }
 }
@@ -372,6 +582,26 @@ fn discover_hooks(root: &Path, allow_project_hooks: bool) -> Option<Arc<hi_hooks
     (!hooks.is_empty()).then(|| Arc::new(hooks))
 }
 
+fn lock_ledger_cancellable<'a>(
+    ledger: &'a Arc<Mutex<ChangeLedger>>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<std::sync::MutexGuard<'a, ChangeLedger>> {
+    loop {
+        match ledger.try_lock() {
+            Ok(ledger) => return Ok(ledger),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                return Ok(poisoned.into_inner());
+            }
+            Err(std::sync::TryLockError::WouldBlock) if cancellation.is_cancelled() => {
+                anyhow::bail!("workspace ledger reconcile cancelled while waiting for the ledger")
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 fn absolute_state_root(root: &Path, state_root: &Path) -> PathBuf {
     if state_root.is_absolute() {
         state_root.to_path_buf()
@@ -382,6 +612,7 @@ fn absolute_state_root(root: &Path, state_root: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -397,6 +628,28 @@ mod tests {
         let state = base.join("state");
         std::fs::create_dir_all(&root).unwrap();
         (root, state)
+    }
+
+    async fn wait_for_gate_count(
+        gate: &crate::change_ledger::ScanTestGate,
+        expected: usize,
+        exited: bool,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let actual = if exited {
+                    gate.exited()
+                } else {
+                    gate.entered()
+                };
+                if actual >= expected {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("ledger scan test gate was not reached");
     }
 
     #[test]
@@ -437,5 +690,175 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(first_root.parent().unwrap());
         let _ = std::fs::remove_dir_all(second_root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn dropping_full_reconcile_cancels_worker_and_releases_ledger() {
+        let (root, state) = roots("cancel-full-reconcile");
+        let runtime = Arc::new(WorkspaceRuntime::new(&root, &state, LspMode::Off).unwrap());
+        std::fs::write(root.join("changed.txt"), "after baseline\n").unwrap();
+        let gate = crate::change_ledger::install_scan_test_gate(&root);
+
+        let worker_runtime = Arc::clone(&runtime);
+        let reconcile = tokio::spawn(async move { worker_runtime.reconcile_ledger_async().await });
+        wait_for_gate_count(&gate, 1, false).await;
+        reconcile.abort();
+        assert!(reconcile.await.unwrap_err().is_cancelled());
+        wait_for_gate_count(&gate, 1, true).await;
+        assert!(
+            runtime
+                .wait_for_ledger_available(std::time::Duration::from_millis(250))
+                .await,
+            "cancelled reconcile retained the ledger mutex"
+        );
+
+        gate.release();
+        let changes = runtime.reconcile_ledger_async().await.unwrap();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["changed.txt"]
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_staging_preserves_the_change_for_retry() {
+        let (root, state) = roots("cancel-reconcile-before-commit");
+        let runtime = Arc::new(WorkspaceRuntime::new(&root, &state, LspMode::Off).unwrap());
+        std::fs::write(root.join("changed.txt"), "after baseline\n").unwrap();
+        let gate = crate::change_ledger::install_reconcile_commit_test_gate(&root);
+
+        let worker_runtime = Arc::clone(&runtime);
+        let reconcile = tokio::spawn(async move { worker_runtime.reconcile_ledger_async().await });
+        wait_for_gate_count(&gate, 1, false).await;
+        reconcile.abort();
+        assert!(reconcile.await.unwrap_err().is_cancelled());
+        wait_for_gate_count(&gate, 1, true).await;
+        assert!(
+            runtime
+                .wait_for_ledger_available(std::time::Duration::from_millis(250))
+                .await,
+            "cancelled pre-commit reconcile retained the ledger mutex"
+        );
+
+        gate.release();
+        let changes = runtime.reconcile_ledger_async().await.unwrap();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["changed.txt"],
+            "a cancelled worker must not consume the change before retry"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_waits_for_a_commit_that_already_owns_publication() {
+        let (root, state) = roots("cancel-owned-reconcile-commit");
+        let runtime = Arc::new(WorkspaceRuntime::new(&root, &state, LspMode::Off).unwrap());
+        let baseline = runtime.ledger().revision();
+        std::fs::write(root.join("changed.txt"), "after baseline\n").unwrap();
+        let gate = crate::change_ledger::install_owned_reconcile_commit_test_gate(&root);
+
+        let worker_runtime = Arc::clone(&runtime);
+        let reconcile = tokio::spawn(async move { worker_runtime.reconcile_ledger_async().await });
+        wait_for_gate_count(&gate, 1, false).await;
+        reconcile.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !reconcile.is_finished(),
+            "dropping the future returned while an owned commit was paused"
+        );
+
+        gate.release();
+        let cancellation = tokio::time::timeout(std::time::Duration::from_secs(2), reconcile)
+            .await
+            .expect("owned commit did not release its cancellation waiter")
+            .expect_err("aborted reconcile task unexpectedly returned normally");
+        assert!(cancellation.is_cancelled());
+        wait_for_gate_count(&gate, 1, true).await;
+        assert!(runtime.try_ledger().is_some());
+        assert_eq!(
+            runtime
+                .ledger()
+                .changes_since(baseline)
+                .into_iter()
+                .map(|change| change.path)
+                .collect::<Vec<_>>(),
+            vec!["changed.txt"],
+            "the owned commit must publish before cancellation settles"
+        );
+        assert!(
+            runtime.reconcile_ledger_async().await.unwrap().is_empty(),
+            "an owned commit must not leave its change for duplicate reconciliation"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn dropping_exact_path_reconcile_cancels_hash_and_releases_ledger() {
+        let (root, state) = roots("cancel-path-reconcile");
+        std::fs::write(root.join("tracked.txt"), "baseline\n").unwrap();
+        let runtime = Arc::new(WorkspaceRuntime::new(&root, &state, LspMode::Off).unwrap());
+        std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        let gate = crate::change_ledger::install_scan_test_gate(&root);
+
+        let worker_runtime = Arc::clone(&runtime);
+        let reconcile = tokio::spawn(async move {
+            worker_runtime
+                .reconcile_dirty_paths_async(vec!["tracked.txt".into()])
+                .await
+        });
+        wait_for_gate_count(&gate, 1, false).await;
+        reconcile.abort();
+        assert!(reconcile.await.unwrap_err().is_cancelled());
+        wait_for_gate_count(&gate, 1, true).await;
+        assert!(
+            runtime
+                .wait_for_ledger_available(std::time::Duration::from_millis(250))
+                .await,
+            "cancelled exact-path reconcile retained the ledger mutex"
+        );
+
+        gate.release();
+        let changes = runtime
+            .reconcile_dirty_paths_async(vec!["tracked.txt".into()])
+            .await
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "tracked.txt");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelled_startup_scan_wait_never_owns_the_ledger_mutex() {
+        let (root, state) = roots("cancel-startup-scan");
+        std::fs::write(root.join("tracked.txt"), "baseline\n").unwrap();
+        let gate = crate::change_ledger::install_scan_test_gate(&root);
+        let scan = crate::BackgroundScan::start(&root, &[], &BTreeSet::new()).unwrap();
+        wait_for_gate_count(&gate, 1, false).await;
+        let runtime = Arc::new(
+            WorkspaceRuntime::new_with_scan(&root, &state, LspMode::Off, Some(scan)).unwrap(),
+        );
+
+        let waiter_runtime = Arc::clone(&runtime);
+        let waiter =
+            tokio::spawn(async move { waiter_runtime.ensure_ledger_scan_complete_async().await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(
+            runtime.try_ledger().is_some(),
+            "waiting for the startup scan held the ledger mutex"
+        );
+
+        drop(runtime);
+        wait_for_gate_count(&gate, 1, true).await;
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }

@@ -2174,7 +2174,11 @@ pub async fn run_daemon_loop(
                 let (kind, guidance) = hi_agent::classify_error(err);
                 eprintln!("\x1b[31m{kind}: {err:#} — {guidance}\x1b[0m");
             }
-            if result.is_err() {
+            if result.is_err()
+                && !agent
+                    .last_turn_outcome()
+                    .is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Cancelled)
+            {
                 let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
             }
 
@@ -3250,7 +3254,11 @@ pub async fn run_resume_local(
             let (kind, guidance) = hi_agent::classify_error(err);
             eprintln!("\x1b[31m{kind}: {err:#} — {guidance}\x1b[0m");
         }
-        if result.is_err() {
+        if result.is_err()
+            && !agent
+                .last_turn_outcome()
+                .is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Cancelled)
+        {
             let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
         }
         agent.kill_background_processes();

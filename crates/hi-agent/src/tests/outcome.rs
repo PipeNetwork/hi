@@ -385,8 +385,8 @@ fn agent_construction_reports_runtime_and_verification_configuration_errors() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[test]
-fn cancelled_turn_reconciles_surviving_workspace_changes() {
+#[tokio::test]
+async fn cancelled_turn_reconciles_surviving_workspace_changes() {
     let root = std::env::temp_dir().join(format!("hi-agent-cancel-outcome-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
@@ -398,7 +398,13 @@ fn cancelled_turn_reconciles_surviving_workspace_changes() {
     agent.workspace.active_turn_message_start = Some(agent.messages().len());
     std::fs::write(root.join("survived.txt"), "kept\n").unwrap();
 
-    let outcome = agent.finalize_cancelled_turn().unwrap();
+    let outcome = agent
+        .cleanup_turn(crate::TurnCleanupKind::Cancel {
+            session: crate::SessionRollback::AlreadyApplied,
+        })
+        .await
+        .unwrap()
+        .outcome;
 
     assert_eq!(outcome.status, TurnStatus::Cancelled);
     assert_eq!(outcome.verification, VerificationStatus::Unverified);
@@ -408,6 +414,109 @@ fn cancelled_turn_reconciles_surviving_workspace_changes() {
     assert!(change.before_digest.is_none());
     assert!(change.after_digest.is_some());
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[allow(deprecated)]
+fn legacy_sync_finalizers_keep_their_full_reconcile_contract() {
+    let cancelled_workspace = IsolatedWorkspace::new("legacy-cancelled-finalizer-reconcile");
+    let mut cancelled = agent(Vec::new(), cancelled_workspace.config());
+    cancelled.workspace.active_turn_ledger_revision = Some(cancelled.runtime.ledger().revision());
+    std::fs::write(
+        cancelled.workspace_root().join("cancelled-survivor.txt"),
+        "kept\n",
+    )
+    .unwrap();
+
+    let cancelled_outcome = cancelled.finalize_cancelled_turn().unwrap();
+    assert_eq!(cancelled_outcome.status, TurnStatus::Cancelled);
+    assert_eq!(
+        cancelled_outcome.changed_files,
+        vec!["cancelled-survivor.txt"]
+    );
+
+    let failed_workspace = IsolatedWorkspace::new("legacy-failed-finalizer-reconcile");
+    let mut failed = agent(Vec::new(), failed_workspace.config());
+    failed.workspace.active_turn_ledger_revision = Some(failed.runtime.ledger().revision());
+    std::fs::write(
+        failed.workspace_root().join("failed-survivor.txt"),
+        "kept\n",
+    )
+    .unwrap();
+
+    let failed_outcome = failed.finalize_failed_turn();
+    assert_eq!(failed_outcome.status, TurnStatus::Failed);
+    assert_eq!(failed_outcome.changed_files, vec!["failed-survivor.txt"]);
+
+    let implicit_workspace = IsolatedWorkspace::new("legacy-failed-implicit-baseline");
+    let mut implicit = agent(Vec::new(), implicit_workspace.config());
+    assert!(implicit.workspace.active_turn_ledger_revision.is_none());
+    std::fs::write(
+        implicit.workspace_root().join("implicit-survivor.txt"),
+        "kept\n",
+    )
+    .unwrap();
+
+    let implicit_outcome = implicit.finalize_failed_turn();
+    assert_eq!(implicit_outcome.status, TurnStatus::Failed);
+    assert_eq!(
+        implicit_outcome.changed_files,
+        vec!["implicit-survivor.txt"]
+    );
+}
+
+#[tokio::test]
+async fn cancelled_turn_bounds_its_final_ledger_reconcile() {
+    let workspace = IsolatedWorkspace::new("cancel-bounded-final-reconcile");
+    let mut agent = agent(Vec::new(), workspace.config());
+    agent.workspace.active_turn_ledger_revision = Some(agent.runtime.ledger().revision());
+    agent.workspace.active_turn_message_start = Some(agent.messages().len());
+    let gate = crate::change_ledger::install_scan_test_gate(agent.workspace_root());
+
+    let cleanup = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        agent.cleanup_turn(crate::TurnCleanupKind::Cancel {
+            session: crate::SessionRollback::AlreadyApplied,
+        }),
+    )
+    .await
+    .expect("a stalled final reconcile must not block cancellation")
+    .unwrap();
+
+    assert_eq!(cleanup.outcome.status, TurnStatus::Cancelled);
+    assert_eq!(
+        gate.exited(),
+        gate.entered(),
+        "every cleanup scan that started must observe cancellation"
+    );
+    assert!(agent.runtime.try_ledger().is_some());
+}
+
+#[test]
+fn busy_ledger_finalizer_does_not_reuse_previous_turn_changes() {
+    let workspace = IsolatedWorkspace::new("busy-ledger-stale-turn-files");
+    let mut agent = agent(Vec::new(), workspace.config());
+    let baseline = agent.runtime.ledger().revision();
+    agent.workspace.active_turn_ledger_revision = Some(baseline);
+    agent.workspace.last_changed_files = vec!["previous-turn.txt".into()];
+    agent.workspace.last_file_changes = vec![hi_tools::FileChange {
+        path: "previous-turn.txt".into(),
+        kind: hi_tools::FileChangeKind::Modify,
+        before_digest: Some("before".into()),
+        after_digest: Some("after".into()),
+        before_len: Some(6),
+        after_len: Some(5),
+        before_mode: Some(0o644),
+        after_mode: Some(0o644),
+    }];
+    let ledger = agent.runtime.ledger_arc();
+    let _held = ledger.lock().unwrap();
+
+    let outcome = agent.finalize_failed_turn_snapshot_only();
+
+    assert!(outcome.changed_files.is_empty());
+    assert!(agent.last_changed_files().is_empty());
+    assert!(agent.last_file_changes().is_empty());
 }
 
 #[tokio::test]
@@ -1787,7 +1896,11 @@ async fn infrastructure_finalizer_reconciles_ui_effects_after_session_failure() 
         .await
         .unwrap_err();
     assert!(error.to_string().contains("session persistence failed"));
-    let outcome = agent.finalize_failed_turn();
+    let outcome = agent
+        .cleanup_turn(crate::TurnCleanupKind::Fail)
+        .await
+        .unwrap()
+        .outcome;
 
     assert_eq!(outcome.status, TurnStatus::Failed);
     // The late UI mutation invalidates the earlier pass, but a session write
@@ -1955,6 +2068,32 @@ async fn hard_turn_timeout_runs_cancellation_cleanup_before_returning() {
         history_len,
         "the cancelled prompt must be rolled back"
     );
+}
+
+#[tokio::test]
+async fn hard_turn_timeout_cancels_an_inflight_ledger_reconcile() {
+    let workspace = IsolatedWorkspace::new("hard-timeout-ledger-reconcile");
+    let mut cfg = workspace.config();
+    cfg.routing.tool_mode = ToolMode::ChatOnly;
+    cfg.loop_limits.turn_timeout = Some(std::time::Duration::from_millis(20));
+    let mut agent = Agent::new(std::sync::Arc::new(PendingProvider), cfg).unwrap();
+    let gate = crate::change_ledger::install_scan_test_gate(agent.workspace_root());
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        agent.run_turn("wait in ledger setup", &mut NullUi),
+    )
+    .await
+    .expect("a ledger worker must not defeat the hard turn deadline")
+    .unwrap_err();
+
+    assert!(error.to_string().contains("turn deadline exceeded"));
+    assert_eq!(
+        gate.exited(),
+        gate.entered(),
+        "every deadline scan that started must observe cancellation"
+    );
+    assert!(agent.runtime.try_ledger().is_some());
 }
 
 #[tokio::test]

@@ -306,7 +306,15 @@ const LEGACY_PLAN_MODE_START: &str = "You are in PLAN MODE.";
 const LEGACY_PLAN_REQUEST_MARKER: &str = "\n\nUser request:\n";
 const LEGACY_TURN_CONTROL_SUFFIXES: &[&str] = &[
     "\n\nRead-only review guard: use only the currently advertised read-only inspection tools;",
+    "\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection",
+    "\n\nRead-only review guard: shell execution (`bash`) and mutation tools are unavailable for this review. Use only the advertised read-only inspection tools;",
     "\n\nImplementation guard: inspect the workspace before choosing files or stack.",
+];
+const LEGACY_TURN_CONTROL_ENDINGS: &[&str] = &[
+    "If only a directory listing is available, keep inspecting before making file-specific findings.",
+    "If only a directory listing is available, keep inspecting or explicitly say the evidence is insufficient instead of making file-specific findings.",
+    "Do not install packages globally or with host package managers. Use project manifests, project-local installs, or a virtual environment when dependencies are necessary.",
+    "Do not run a foreground TUI directly; validate with unit tests, cargo build/check/test, or a bounded smoke command such as `timeout 5s cargo run`.",
 ];
 const HISTORICAL_CONTROL_TURN: &str =
     "[Historical turn; injected context/control removed and no user text remained.]";
@@ -316,9 +324,7 @@ fn has_turn_scoped_user_text(text: &str) -> bool {
         || text.contains(LEGACY_CONTEXT_BLOCK_START)
         || text.contains(TURN_CONTROL_START)
         || text.trim_start().starts_with(LEGACY_PLAN_MODE_START)
-        || LEGACY_TURN_CONTROL_SUFFIXES
-            .iter()
-            .any(|suffix| text.contains(suffix))
+        || legacy_turn_control_suffix_start(text).is_some()
 }
 
 fn has_plan_mode_control(text: &str) -> bool {
@@ -351,13 +357,70 @@ fn strip_delimited_blocks(text: &str, start: &str, end: &str) -> String {
     output
 }
 
-fn strip_legacy_turn_control_suffix(text: &str) -> &str {
-    let end = LEGACY_TURN_CONTROL_SUFFIXES
+pub(crate) fn last_legacy_turn_control_prefix(text: &str) -> Option<usize> {
+    LEGACY_TURN_CONTROL_SUFFIXES
         .iter()
-        .filter_map(|suffix| text.find(suffix))
-        .min()
-        .unwrap_or(text.len());
-    &text[..end]
+        .filter_map(|suffix| text.rfind(suffix))
+        .max()
+}
+
+/// Start of a complete, historically generated undelimited control suffix.
+///
+/// Prefixes alone are not provenance: a user can quote an old prompt in a bug
+/// report. Historical generators always appended one of these complete blocks
+/// at the end of the message, so require both the recognized start and fixed
+/// terminal sentence before erasing anything. Prefer the last start marker so
+/// a quoted copy in the durable prompt cannot hide the actual appended block.
+pub(crate) fn legacy_turn_control_suffix_start(text: &str) -> Option<usize> {
+    let end_trimmed = text.trim_end();
+    if !LEGACY_TURN_CONTROL_ENDINGS
+        .iter()
+        .any(|ending| end_trimmed.ends_with(ending))
+    {
+        return None;
+    }
+    let start = last_legacy_turn_control_prefix(end_trimmed)?;
+    // Content-only legacy sessions do not carry provenance metadata. Preserve
+    // the concrete user-report shape where someone deliberately quotes or
+    // asks to reproduce an old guard; otherwise a byte-exact bug report would
+    // be erased on the next idempotent cleanup pass.
+    let quote_cue = end_trimmed[..start]
+        .trim_end()
+        .lines()
+        .next_back()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    // A generic phrase elsewhere in the request (for example, "Document this
+    // API") is not evidence that the generated suffix is quoted. Require the
+    // clause immediately introducing the suffix to express both quote intent
+    // and a control-text subject.
+    let quotes_text = [
+        "document",
+        "quote",
+        "paste",
+        "verbatim",
+        "reproduce",
+        "preserve",
+    ]
+    .iter()
+    .any(|marker| quote_cue.contains(marker));
+    let names_control_text = [
+        "guard",
+        "prompt",
+        "turn control",
+        "turn-control",
+        "control suffix",
+        "historical",
+        "verbatim",
+    ]
+    .iter()
+    .any(|marker| quote_cue.contains(marker));
+    let quotes_historical_control = quotes_text && names_control_text;
+    (!quotes_historical_control).then_some(start)
+}
+
+fn strip_legacy_turn_control_suffix(text: &str) -> &str {
+    &text[..legacy_turn_control_suffix_start(text).unwrap_or(text.len())]
 }
 
 fn strip_legacy_plan_mode_control(text: &str) -> Option<String> {
@@ -369,7 +432,12 @@ fn strip_legacy_plan_mode_control(text: &str) -> Option<String> {
         return Some(String::new());
     };
     let request = &trimmed[marker + LEGACY_PLAN_REQUEST_MARKER.len()..];
-    let request = strip_legacy_turn_control_suffix(request).trim_matches('\n');
+    // The outer legacy plan preamble and request marker establish that this
+    // whole wrapper was generated by hi. This path may therefore recover old
+    // abbreviated fixtures as well as complete historical suffixes, while the
+    // standalone path above remains strict enough to preserve quoted prose.
+    let request_end = last_legacy_turn_control_prefix(request).unwrap_or(request.len());
+    let request = request[..request_end].trim_matches('\n');
     Some(if request.is_empty() {
         String::new()
     } else {
@@ -390,10 +458,18 @@ pub(crate) fn strip_turn_scoped_user_text(text: &str) -> String {
     let mut cleaned = strip_delimited_blocks(text, CONTEXT_BLOCK_START, CONTEXT_BLOCK_END);
     cleaned = strip_delimited_blocks(&cleaned, LEGACY_CONTEXT_BLOCK_START, CONTEXT_BLOCK_END);
     cleaned = strip_delimited_blocks(&cleaned, TURN_CONTROL_START, TURN_CONTROL_END);
-    if !has_delimited_control {
+    let cleaned_has_legacy_plan_wrapper = {
+        let trimmed = cleaned.trim_start_matches('\n');
+        trimmed.starts_with(LEGACY_PLAN_MODE_START) && trimmed.contains(LEGACY_PLAN_REQUEST_MARKER)
+    };
+    if !has_delimited_control || cleaned_has_legacy_plan_wrapper {
         cleaned = strip_legacy_plan_mode_control(&cleaned).unwrap_or(cleaned);
-        cleaned = strip_legacy_turn_control_suffix(&cleaned).to_string();
     }
+    // A transcript can contain a newly delimited control block and an older
+    // undelimited suffix after migrations across releases. Remove recognized
+    // legacy suffixes independently so cleanup is complete in one pass. The
+    // quote safeguard above preserves explicit byte-for-byte bug reports.
+    cleaned = strip_legacy_turn_control_suffix(&cleaned).to_string();
     let cleaned = cleaned.trim_matches('\n');
     let cleaned = if was_plan_control {
         cleaned
@@ -1323,6 +1399,59 @@ Read-only review guard: use only the currently advertised read-only inspection t
     }
 
     #[test]
+    fn every_legacy_review_guard_is_removed_from_plan_wrappers() {
+        let guards = [
+            "Read-only review guard: use only the currently advertised read-only inspection tools; never invent tool names.",
+            "Read-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer.",
+            "Read-only review guard: shell execution (`bash`) and mutation tools are unavailable for this review. Use only the advertised read-only inspection tools; do not write.",
+        ];
+
+        for guard in guards {
+            let legacy = format!(
+                "You are in PLAN MODE. Do not modify files.\n\nProduce a plan.\n\nUser request:\ncreate profiles\n\n{guard}"
+            );
+            assert_eq!(
+                strip_turn_scoped_user_text(&legacy),
+                "create profiles",
+                "failed to remove {guard}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_historical_review_guard_is_ephemeral() {
+        let mut transcript = Transcript::new(vec![user(
+            "review code\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. Treat this as a bounded review. If only a directory listing is available, keep inspecting or explicitly say the evidence is insufficient instead of making file-specific findings.",
+        )]);
+
+        transcript.strip_previous_turn_blocks();
+
+        assert_eq!(transcript.as_slice()[0].text(), "review code");
+    }
+
+    #[test]
+    fn mixed_delimited_and_legacy_controls_are_removed_in_one_pass() {
+        let mixed = format!(
+            "{TURN_CONTROL_START}\nPlan mode is OFF for this turn.\n{TURN_CONTROL_END}\n\nreview code\n\nRead-only review guard: shell execution (`bash`) and mutation tools are unavailable for this review. Use only the advertised read-only inspection tools; do not write. If only a directory listing is available, keep inspecting before making file-specific findings."
+        );
+
+        let cleaned = strip_turn_scoped_user_text(&mixed);
+        assert_eq!(cleaned, "review code");
+        assert_eq!(strip_turn_scoped_user_text(&cleaned), cleaned);
+    }
+
+    #[test]
+    fn mixed_delimited_control_and_legacy_plan_wrapper_are_removed_in_one_pass() {
+        let mixed = format!(
+            "{TURN_CONTROL_START}\nPlan mode is OFF for this turn.\n{TURN_CONTROL_END}\n\nYou are in PLAN MODE. Do not modify files.\n\nProduce a plan.\n\nUser request:\nbuild profiles\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer."
+        );
+
+        let cleaned = strip_turn_scoped_user_text(&mixed);
+        assert_eq!(cleaned, "build profiles");
+        assert_eq!(strip_turn_scoped_user_text(&cleaned), cleaned);
+    }
+
+    #[test]
     fn legacy_empty_plan_control_becomes_non_directive_history() {
         let mut transcript = Transcript::new(vec![user(
             "You are in PLAN MODE. Do not modify files.\n\nProduce a plan and wait.",
@@ -1361,6 +1490,43 @@ Read-only review guard: use only the currently advertised read-only inspection t
         );
 
         assert_eq!(strip_turn_scoped_user_text(&controlled), quoted);
+
+        let quoted_guard =
+            "Document this exact old bug text:\n\nRead-only review guard: do not write anything.";
+        let controlled = format!(
+            "{TURN_CONTROL_START}\nPlan mode is OFF for this turn.\n{TURN_CONTROL_END}\n\n{quoted_guard}"
+        );
+        assert_eq!(strip_turn_scoped_user_text(&controlled), quoted_guard);
+
+        let quoted_long_guard = "Document this historical prefix exactly:\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. This following sentence is still user-authored.";
+        let controlled = format!(
+            "{TURN_CONTROL_START}\nPlan mode is OFF for this turn.\n{TURN_CONTROL_END}\n\n{quoted_long_guard}"
+        );
+        assert_eq!(strip_turn_scoped_user_text(&controlled), quoted_long_guard);
+
+        let complete_quote = "Document this historical guard exactly:\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. If only a directory listing is available, keep inspecting or explicitly say the evidence is insufficient instead of making file-specific findings.";
+        let controlled = format!(
+            "{TURN_CONTROL_START}\nPlan mode is OFF for this turn.\n{TURN_CONTROL_END}\n\n{complete_quote}"
+        );
+        assert_eq!(strip_turn_scoped_user_text(&controlled), complete_quote);
+    }
+
+    #[test]
+    fn legacy_guard_quote_detection_requires_a_local_control_subject() {
+        let generated_guard = "Read-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. If only a directory listing is available, keep inspecting or explicitly say the evidence is insufficient instead of making file-specific findings.";
+        let exact_quote = format!("Document this historical guard exactly:\n\n{generated_guard}");
+        assert_eq!(
+            strip_turn_scoped_user_text(&exact_quote),
+            exact_quote,
+            "an explicitly introduced historical-guard quote is user-authored"
+        );
+
+        let generated_suffix = format!("Document this API\n\n{generated_guard}");
+        assert_eq!(
+            strip_turn_scoped_user_text(&generated_suffix),
+            "Document this API",
+            "generic documentation intent must not preserve a generated guard"
+        );
     }
 
     #[test]

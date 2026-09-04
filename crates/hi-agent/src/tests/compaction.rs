@@ -74,7 +74,7 @@ async fn compact_does_not_summarize_stale_turn_controls() {
         config(),
     );
     let poisoned = format!(
-        "{}\nold context\n{}\n\nYou are in PLAN MODE. Do not modify files or run mutating commands.\nProduce a clear plan and wait.\n\nUser request:\nbuild profiles\n\nRead-only review guard: use only the currently advertised read-only inspection tools; never invent tool names.",
+        "{}\nold context\n{}\n\nYou are in PLAN MODE. Do not modify files or run mutating commands.\nProduce a clear plan and wait.\n\nUser request:\nbuild profiles\n\nRead-only review guard: shell execution (`bash`) and mutation tools are unavailable for this review. Use only the advertised read-only inspection tools; do not write.",
         crate::transcript::CONTEXT_BLOCK_START,
         crate::transcript::CONTEXT_BLOCK_END,
     );
@@ -84,8 +84,6 @@ async fn compact_does_not_summarize_stale_turn_controls() {
         .push(Message::assistant(vec![Content::Text(
             "I'm in plan mode; the plan is ready.".into(),
         )]));
-    agent.set_plan_mode(false);
-
     agent
         .compact_with(CompactionKind::Summarize, &mut NullUi)
         .await

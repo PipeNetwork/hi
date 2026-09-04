@@ -124,6 +124,35 @@ impl BudgetLedger {
         &self.usage
     }
 
+    fn merge_consumption_floor(&mut self, floor: &BudgetUsage) -> Result<BudgetUsage> {
+        ensure!(
+            self.reservations.is_empty() && self.usage.reserved.values().all(|amount| *amount == 0),
+            "budget consumption floor cannot merge while reservations are active"
+        );
+        ensure!(
+            floor.reserved.values().all(|amount| *amount == 0),
+            "budget consumption floor contains unsettled reservations"
+        );
+        // Validate the complete floor before mutating any dimension so a bad
+        // snapshot cannot partially advance the live ledger.
+        for (&kind, &amount) in &floor.consumed {
+            let limit = self
+                .limits
+                .get(&kind)
+                .copied()
+                .ok_or_else(|| anyhow!("budget floor references unknown {kind:?} budget"))?;
+            ensure!(
+                amount <= limit,
+                "budget floor {kind:?} usage {amount} exceeds limit {limit}"
+            );
+        }
+        for (&kind, &amount) in &floor.consumed {
+            let consumed = self.usage.consumed.entry(kind).or_default();
+            *consumed = (*consumed).max(amount);
+        }
+        Ok(self.usage.clone())
+    }
+
     fn take(&mut self, requested: BudgetReservation) -> Result<BudgetReservation> {
         let held = self
             .reservations
@@ -178,6 +207,33 @@ impl SharedBudgetLedger {
             .map_err(|_| anyhow!("budget ledger lock poisoned"))?
             .usage()
             .clone())
+    }
+
+    /// Raise durable consumption to at least `floor` without ever erasing
+    /// usage already incurred by this ledger. This is safe for both a fresh
+    /// process and an in-process retry using the same ledger, and is
+    /// idempotent when the floor was already merged.
+    ///
+    /// Neither side may contain live reservations: those represent in-flight
+    /// work and must settle before a retry boundary.
+    pub fn merge_consumption_floor(&self, floor: &BudgetUsage) -> Result<BudgetUsage> {
+        self.0
+            .lock()
+            .map_err(|_| anyhow!("budget ledger lock poisoned"))?
+            .merge_consumption_floor(floor)
+    }
+
+    /// Remaining unreserved capacity for one budget dimension.
+    ///
+    /// Keep this query on the shared ledger rather than deriving it from a
+    /// [`BudgetUsage`] snapshot: reservations made by concurrent stages must
+    /// count against transition admission immediately.
+    pub fn remaining(&self, kind: BudgetKind) -> Result<u64> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("budget ledger lock poisoned"))?
+            .remaining(kind))
     }
 }
 
@@ -254,6 +310,61 @@ mod tests {
                 .consumed
                 .get(&BudgetKind::ModelCalls),
             Some(&10)
+        );
+    }
+
+    #[test]
+    fn shared_remaining_includes_consumed_and_reserved_capacity() {
+        let ledger = SharedBudgetLedger::new(&limits());
+        ledger.consume(BudgetKind::ToolCalls, 3).unwrap();
+        let held = ledger.reserve(BudgetKind::ToolCalls, 4).unwrap();
+        assert_eq!(ledger.remaining(BudgetKind::ToolCalls).unwrap(), 3);
+        ledger.release(held).unwrap();
+        assert_eq!(ledger.remaining(BudgetKind::ToolCalls).unwrap(), 7);
+    }
+
+    #[test]
+    fn consumption_floor_is_monotonic_idempotent_and_atomic() {
+        let ledger = SharedBudgetLedger::new(&limits());
+        ledger.consume(BudgetKind::ToolCalls, 3).unwrap();
+        let merged = ledger
+            .merge_consumption_floor(&BudgetUsage {
+                consumed: BTreeMap::from([(BudgetKind::ToolCalls, 2), (BudgetKind::ModelCalls, 4)]),
+                reserved: BTreeMap::new(),
+            })
+            .unwrap();
+        assert_eq!(merged.consumed.get(&BudgetKind::ToolCalls), Some(&3));
+        assert_eq!(merged.consumed.get(&BudgetKind::ModelCalls), Some(&4));
+        assert_eq!(
+            ledger.merge_consumption_floor(&merged).unwrap(),
+            merged,
+            "merging the same durable floor twice must be a no-op"
+        );
+
+        let error = ledger
+            .merge_consumption_floor(&BudgetUsage {
+                consumed: BTreeMap::from([
+                    (BudgetKind::ToolCalls, 5),
+                    (BudgetKind::ModelCalls, 11),
+                ]),
+                reserved: BTreeMap::new(),
+            })
+            .expect_err("an over-limit dimension must reject the complete floor");
+        assert!(error.to_string().contains("exceeds limit"));
+        assert_eq!(
+            ledger.usage().unwrap().consumed.get(&BudgetKind::ToolCalls),
+            Some(&3),
+            "validation must finish before any dimension is raised"
+        );
+
+        assert!(
+            ledger
+                .merge_consumption_floor(&BudgetUsage {
+                    consumed: BTreeMap::new(),
+                    reserved: BTreeMap::from([(BudgetKind::ToolCalls, 1)]),
+                })
+                .is_err(),
+            "durable floors must never import in-flight reservations"
         );
     }
 }

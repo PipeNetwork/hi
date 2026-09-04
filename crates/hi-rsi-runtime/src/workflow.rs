@@ -48,7 +48,13 @@ pub enum TransitionCondition {
     Always,
     StagePassed,
     StageFailed,
+    /// Admit and charge one repair iteration while capacity remains.
+    ///
+    /// This unit variant is retained for wire compatibility with protocol-v1
+    /// workflow manifests, where `budget_remaining` specifically denotes the
+    /// repair-iteration budget.
     BudgetRemaining,
+    /// Matches a successful [`StageKind::HumanApprovalGate`] only.
     HumanApproved,
 }
 
@@ -168,6 +174,18 @@ impl WorkflowGraph {
                 priorities.insert((edge.from.clone(), edge.priority)),
                 "workflow has duplicate transition priority"
             );
+            if edge.condition == TransitionCondition::HumanApproved {
+                ensure!(
+                    self.stages[&edge.from].kind == StageKind::HumanApprovalGate,
+                    "human-approved transition must originate at a human approval gate"
+                );
+            }
+            if edge.condition == TransitionCondition::BudgetRemaining {
+                ensure!(
+                    self.stages[&edge.from].kind != StageKind::ParallelFanOut,
+                    "budget-remaining transitions cannot originate at parallel fan-out stages"
+                );
+            }
         }
         self.validate_reachability()?;
         self.validate_cycles()?;
@@ -414,5 +432,32 @@ mod tests {
             .unwrap()
             .model_role = Some("unauthorized".into());
         assert!(graph.validate(&roles, &tools).is_err());
+    }
+
+    #[test]
+    fn human_approved_transition_requires_a_human_gate() {
+        let (roles, tools) = authorities();
+        let mut graph = WorkflowGraph::default_coding();
+        graph.edges[0].condition = TransitionCondition::HumanApproved;
+        let error = graph.validate(&roles, &tools).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must originate at a human approval gate"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn budget_remaining_transition_rejects_parallel_fan_out() {
+        let (roles, tools) = authorities();
+        let mut graph = WorkflowGraph::default_coding();
+        graph.stages.get_mut(&StageId::from("intake")).unwrap().kind = StageKind::ParallelFanOut;
+        graph.edges[0].condition = TransitionCondition::BudgetRemaining;
+
+        let error = graph
+            .validate(&roles, &tools)
+            .expect_err("fan-out budget transitions have ambiguous multi-charge semantics");
+        assert!(error.to_string().contains("parallel fan-out"));
     }
 }

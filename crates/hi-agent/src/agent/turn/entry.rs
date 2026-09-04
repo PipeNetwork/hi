@@ -131,6 +131,12 @@ impl crate::Agent {
         cancellation: crate::TurnCancellation,
     ) -> Result<TurnOutcome> {
         let requested_drive_kind = crate::DriveKind::from_prompt(input);
+        // A frontend may use the terminal report to decide whether an Err
+        // already passed through Agent-owned cancellation cleanup (notably the
+        // hard-timeout path, which preserves its deadline error). Clear the
+        // previous turn before setup too, so an early setup failure cannot be
+        // mistaken for the preceding turn's cancellation.
+        self.report.last_turn_outcome = None;
         // Pin the currently active decision-engine generation for the whole
         // turn. A reload requested during streaming becomes pending and is
         // promoted only after this lease is dropped.
@@ -152,12 +158,6 @@ impl crate::Agent {
                 return Err(error);
             }
         };
-        // A frontend may use the terminal report to decide whether an Err
-        // already passed through Agent-owned cancellation cleanup (notably the
-        // hard-timeout path, which preserves its deadline error). Clear the
-        // previous turn before any await/preflight so a late Ctrl-C cannot make
-        // a new early error look like an already-finalized cancellation.
-        self.report.last_turn_outcome = None;
         if cancellation.is_cancelled() {
             let restore_plan_pause = requested_drive_kind == crate::DriveKind::Plan
                 || self.pending_plan_interruption_resume

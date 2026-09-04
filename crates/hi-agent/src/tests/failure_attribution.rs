@@ -47,7 +47,11 @@ async fn provider_outage_after_failed_verification_is_not_verifier_infrastructur
     assert!(error.to_string().contains("503 Service Unavailable"));
     assert_eq!(requests.lock().unwrap().len(), 4);
 
-    let outcome = agent.finalize_failed_turn();
+    let outcome = agent
+        .cleanup_turn(crate::TurnCleanupKind::Fail)
+        .await
+        .unwrap()
+        .outcome;
     assert_eq!(outcome.status, TurnStatus::Failed);
     assert_eq!(outcome.stop_reason, TurnStopReason::InfrastructureFailure);
     assert_eq!(outcome.verification, VerificationStatus::Failed);

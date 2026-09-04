@@ -1240,7 +1240,7 @@ async fn run() -> Result<()> {
                         .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
                         .await
                         .map(|r| r.outcome)
-                        .unwrap_or_else(|_| agent.finalize_failed_turn()),
+                        .unwrap_or_else(|_| agent.finalize_failed_turn_snapshot_only()),
                 ),
                 Ok(_) => None,
             };

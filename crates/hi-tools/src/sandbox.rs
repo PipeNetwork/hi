@@ -400,11 +400,15 @@ impl SandboxProfile {
             .into_iter()
             .map(|argument| argument.as_ref().to_os_string())
             .collect::<Vec<_>>();
-        let (program, mut wrapped) = self.wrap_program(program, &args);
+        let (program, wrapped) = self.wrap_program(program, &args);
         #[cfg(target_os = "linux")]
-        if self.pipe_wrap.is_some() {
-            insert_pipe_wrap_chdir(&mut wrapped, args.len(), cwd);
-        }
+        let wrapped = {
+            let mut wrapped = wrapped;
+            if self.pipe_wrap.is_some() {
+                insert_pipe_wrap_chdir(&mut wrapped, args.len(), cwd);
+            }
+            wrapped
+        };
         let _ = cwd;
         (program, wrapped)
     }
@@ -544,7 +548,7 @@ fn pipe_wrap_arguments(
     )
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn insert_pipe_wrap_chdir(args: &mut Vec<OsString>, program_args: usize, cwd: &Path) {
     let separator = args
         .len()

@@ -176,7 +176,11 @@ impl ObservedProvider {
         };
         let call = budget.reserve(BudgetKind::ModelCalls, 1)?;
         match budget.reserve(BudgetKind::OutputTokens, u64::from(maximum_output)) {
-            Ok(output) => Ok(Some(ModelReservation { call, output })),
+            Ok(output) => Ok(Some(ModelReservation {
+                budget: budget.clone(),
+                call: Some(call),
+                output: Some(output),
+            })),
             Err(error) => {
                 budget.release(call)?;
                 Err(error)
@@ -186,8 +190,49 @@ impl ObservedProvider {
 }
 
 struct ModelReservation {
-    call: BudgetReservation,
-    output: BudgetReservation,
+    budget: SharedBudgetLedger,
+    call: Option<BudgetReservation>,
+    output: Option<BudgetReservation>,
+}
+
+impl ModelReservation {
+    /// Commit the call immediately before entering the provider. If the
+    /// provider future is later cancelled, that accepted attempt remains
+    /// spent while the still-unknown output reservation is released by Drop.
+    fn start(&mut self) -> Result<()> {
+        if let Some(call) = self.call {
+            self.budget.commit(call, 1)?;
+            self.call = None;
+        }
+        Ok(())
+    }
+
+    fn complete(&mut self, input_tokens: u64, output_tokens: u64) -> Result<()> {
+        if let Some(output) = self.output {
+            self.budget.commit(output, output_tokens)?;
+            self.output = None;
+        }
+        self.budget.consume(BudgetKind::InputTokens, input_tokens)
+    }
+
+    fn fail(&mut self) -> Result<()> {
+        if let Some(output) = self.output {
+            self.budget.release(output)?;
+            self.output = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ModelReservation {
+    fn drop(&mut self) {
+        if let Some(call) = self.call.take() {
+            let _ = self.budget.release(call);
+        }
+        if let Some(output) = self.output.take() {
+            let _ = self.budget.release(output);
+        }
+    }
 }
 
 #[async_trait]
@@ -197,7 +242,7 @@ impl Provider for ObservedProvider {
         request: ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
-        let reservation = self.reserve_model(request.max_tokens)?;
+        let mut reservation = self.reserve_model(request.max_tokens)?;
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
         let correlation = format!("model-{attempt}");
         let request_payload = if self.full_capture {
@@ -296,12 +341,16 @@ impl Provider for ObservedProvider {
             }
             sink(event);
         };
+        if let Some(reservation) = reservation.as_mut() {
+            reservation.start()?;
+        }
         match self.inner.stream(request, &mut observed_sink).await {
             Ok(completion) => {
-                if let (Some(budget), Some(reservation)) = (&self.budget, reservation) {
-                    budget.commit(reservation.call, 1)?;
-                    budget.commit(reservation.output, completion.usage.output_tokens)?;
-                    budget.consume(BudgetKind::InputTokens, completion.usage.input_tokens)?;
+                if let Some(reservation) = reservation.as_mut() {
+                    reservation.complete(
+                        completion.usage.input_tokens,
+                        completion.usage.output_tokens,
+                    )?;
                 }
                 let completion_payload = if self.full_capture {
                     serde_json::to_value(&completion)?
@@ -326,9 +375,8 @@ impl Provider for ObservedProvider {
                 Ok(completion)
             }
             Err(error) => {
-                if let (Some(budget), Some(reservation)) = (&self.budget, reservation) {
-                    budget.commit(reservation.call, 1)?;
-                    budget.release(reservation.output)?;
+                if let Some(reservation) = reservation.as_mut() {
+                    reservation.fail()?;
                 }
                 let error_payload = if self.full_capture {
                     serde_json::json!({"error": format!("{error:#}")})
@@ -598,5 +646,166 @@ impl ToolObserver {
         ) {
             let _ = self.sink.observe(event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hi_ai::{Message, RequestProfile};
+    use hi_rsi_runtime::RuntimeBudgets;
+
+    struct AcceptingSink;
+
+    impl ObservationSink for AcceptingSink {
+        fn observe(&self, _: Observation) -> Result<ObservationReceipt> {
+            Ok(ObservationReceipt {
+                event_hash: "a".repeat(64),
+                sequence: 1,
+            })
+        }
+    }
+
+    struct RejectingSink;
+
+    impl ObservationSink for RejectingSink {
+        fn observe(&self, _: Observation) -> Result<ObservationReceipt> {
+            Err(anyhow!("trace rejected before provider admission"))
+        }
+    }
+
+    struct HangingProvider {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for HangingProvider {
+        async fn stream(
+            &self,
+            _: ChatRequest,
+            _: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<Completion> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    struct TrackingProvider {
+        entered: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Provider for TrackingProvider {
+        async fn stream(
+            &self,
+            _: ChatRequest,
+            _: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<Completion> {
+            self.entered.store(true, Ordering::SeqCst);
+            Ok(Completion::default())
+        }
+    }
+
+    fn budgets() -> RuntimeBudgets {
+        RuntimeBudgets {
+            wall_time_seconds: 60,
+            cpu_time_seconds: 60,
+            memory_bytes: 1,
+            disk_bytes: 1,
+            input_tokens: 100,
+            output_tokens: 100,
+            tool_calls: 1,
+            cost_microusd: 1,
+            model_calls: 1,
+            repair_iterations: 1,
+            trace_bytes: 1,
+        }
+    }
+
+    fn request() -> ChatRequest {
+        ChatRequest {
+            model: "test-model".into(),
+            request_id: Some("request-1".into()),
+            retry_attempt: 0,
+            user_turn: true,
+            canonical_objective: Some("test cancellation accounting".into()),
+            messages: Arc::new(vec![Message::user("hello")]),
+            tools: Vec::new().into(),
+            max_tokens: 40,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: RequestProfile::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_provider_releases_output_reservation_but_keeps_started_call() {
+        let ledger = SharedBudgetLedger::new(&budgets());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = ObservedProvider::new(
+            Arc::new(HangingProvider {
+                started: started.clone(),
+            }),
+            Arc::new(AcceptingSink),
+            Some(ledger.clone()),
+            false,
+        );
+        let mut event_sink = |_: StreamEvent| {};
+        {
+            let stream = provider.stream(request(), &mut event_sink);
+            tokio::pin!(stream);
+            tokio::select! {
+                _ = started.notified() => {}
+                result = &mut stream => panic!("provider unexpectedly settled: {result:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    panic!("inner provider never started")
+                }
+            }
+        }
+
+        let usage = ledger.usage().unwrap();
+        assert_eq!(usage.consumed.get(&BudgetKind::ModelCalls), Some(&1));
+        assert_eq!(
+            usage
+                .consumed
+                .get(&BudgetKind::OutputTokens)
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert!(usage.reserved.values().all(|amount| *amount == 0));
+        assert_eq!(ledger.remaining(BudgetKind::ModelCalls).unwrap(), 0);
+        assert_eq!(ledger.remaining(BudgetKind::OutputTokens).unwrap(), 100);
+    }
+
+    #[tokio::test]
+    async fn rejected_request_observation_releases_all_model_reservations() {
+        let ledger = SharedBudgetLedger::new(&budgets());
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = ObservedProvider::new(
+            Arc::new(TrackingProvider {
+                entered: entered.clone(),
+            }),
+            Arc::new(RejectingSink),
+            Some(ledger.clone()),
+            false,
+        );
+        let mut event_sink = |_: StreamEvent| {};
+
+        let error = provider
+            .stream(request(), &mut event_sink)
+            .await
+            .expect_err("mandatory observation is scripted to fail");
+
+        assert!(error.to_string().contains("trace rejected"));
+        assert!(!entered.load(Ordering::SeqCst));
+        let usage = ledger.usage().unwrap();
+        assert!(usage.consumed.values().all(|amount| *amount == 0));
+        assert!(usage.reserved.values().all(|amount| *amount == 0));
+        assert_eq!(ledger.remaining(BudgetKind::ModelCalls).unwrap(), 1);
+        assert_eq!(ledger.remaining(BudgetKind::OutputTokens).unwrap(), 100);
     }
 }

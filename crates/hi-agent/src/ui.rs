@@ -1350,10 +1350,6 @@ const CONTEXT_BLOCK_STARTS: &[&str] = &[
 const TURN_CONTROL_END: &str = "[/hi:turn-control]";
 const TURN_CONTROL_START: &str = "[hi:turn-control — current turn only]";
 const LEGACY_PLAN_REQUEST_MARKER: &str = "\n\nUser request:\n";
-const LEGACY_TURN_CONTROL_SUFFIXES: &[&str] = &[
-    "\n\nRead-only review guard: use only the currently advertised read-only inspection tools;",
-    "\n\nImplementation guard: inspect the workspace before choosing files or stack.",
-];
 
 /// Strip leading volatile/one-turn controls from a persisted user message.
 /// Listings, memory, and titles should show the human prompt, not mode guards
@@ -1383,7 +1379,9 @@ pub fn strip_context_block(text: &str) -> &str {
         delimited = true;
         text = &text[..suffix];
     }
-    if !delimited && text.starts_with("You are in PLAN MODE.") {
+    let legacy_plan_wrapper =
+        text.starts_with("You are in PLAN MODE.") && text.contains(LEGACY_PLAN_REQUEST_MARKER);
+    if (!delimited || legacy_plan_wrapper) && text.starts_with("You are in PLAN MODE.") {
         text = text
             .find(LEGACY_PLAN_REQUEST_MARKER)
             .map(|marker| &text[marker + LEGACY_PLAN_REQUEST_MARKER.len()..])
@@ -1393,14 +1391,10 @@ pub fn strip_context_block(text: &str) -> &str {
         .strip_prefix("User request:\n")
         .unwrap_or(text)
         .trim_start();
-    let end = if delimited {
-        text.len()
+    let end = if legacy_plan_wrapper {
+        crate::transcript::last_legacy_turn_control_prefix(text).unwrap_or(text.len())
     } else {
-        LEGACY_TURN_CONTROL_SUFFIXES
-            .iter()
-            .filter_map(|suffix| text.find(suffix))
-            .min()
-            .unwrap_or(text.len())
+        crate::transcript::legacy_turn_control_suffix_start(text).unwrap_or(text.len())
     };
     text[..end].trim_end()
 }
@@ -2015,6 +2009,22 @@ Plan mode is OFF for this turn.\n[/hi:turn-control]\n\n\
 build all of that\n\n[hi:turn-control — current turn only]\n\
 Implementation guard: edit files.\n[/hi:turn-control]";
         assert_eq!(super::user_prompt_title(executing, 72), "build all of that");
+        let historical = "review code\n\nRead-only review guard: shell execution (`bash`) and mutation tools are unavailable for this review. Use only the advertised read-only inspection tools; inspect carefully. If only a directory listing is available, keep inspecting before making file-specific findings.";
+        assert_eq!(super::user_prompt_title(historical, 72), "review code");
+        let mixed = "[hi:turn-control — current turn only]\nPlan mode is OFF for this turn.\n[/hi:turn-control]\n\nreview code\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. If only a directory listing is available, keep inspecting or explicitly say the evidence is insufficient instead of making file-specific findings.";
+        assert_eq!(super::user_prompt_title(mixed, 72), "review code");
+        let mixed_plan = "[hi:turn-control — current turn only]\nPlan mode is OFF for this turn.\n[/hi:turn-control]\n\nYou are in PLAN MODE. Do not modify files.\n\nProduce a plan.\n\nUser request:\nbuild profiles\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer.";
+        assert_eq!(super::user_prompt_title(mixed_plan, 72), "build profiles");
+        let quoted = "Document this historical prefix exactly:\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. This following sentence is still user-authored.";
+        assert_eq!(
+            super::user_prompt_title(quoted, 300),
+            super::collapse_ws(quoted)
+        );
+        let exact_quote = "Document this historical guard exactly:\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. If only a directory listing is available, keep inspecting or explicitly say the evidence is insufficient instead of making file-specific findings.";
+        assert_eq!(
+            super::user_prompt_title(exact_quote, 400),
+            super::collapse_ws(exact_quote)
+        );
         assert_eq!(super::user_prompt_title("plain prompt", 72), "plain prompt");
     }
 }

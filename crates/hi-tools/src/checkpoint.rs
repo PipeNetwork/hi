@@ -25,12 +25,24 @@ use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::process::Output;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 const SEALED_REFERENCE_PREFIX: &str = "sealed:v1:";
 static ISOLATED_ID: AtomicU64 = AtomicU64::new(0);
+static ISOLATED_NAME_SALT: OnceLock<String> = OnceLock::new();
+
+// Checkpoint Git commands are local and normally finish in milliseconds, but
+// large repositories can legitimately need time to hash hundreds of MiB. Keep
+// a generous finite ceiling while making cancellation immediate and ensuring a
+// wedged hook/filter can never pin a turn forever.
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const GIT_PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const GIT_REAP_GRACE: Duration = Duration::from_secs(2);
 
 const MAX_CHECKPOINT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CHECKPOINT_ENTRIES: usize = 200_000;
@@ -45,128 +57,838 @@ pub enum CreateResult {
     Failed(String),
 }
 
+/// Minimal raw-output Git runner for checkpoint plumbing.
+///
+/// `ProcessRunner` intentionally turns subprocess output into bounded UTF-8
+/// summaries. Checkpoint operations need the exact bytes produced by Git
+/// (`-z` path lists and blobs included), so this runner keeps `Output` binary
+/// while retaining the same non-interactive lifecycle. On Unix, each Git
+/// command gets its own process group so cancellation tears down descendants;
+/// on other platforms, cancellation is limited to the direct Git child.
+#[derive(Clone, Debug)]
+struct GitRunner {
+    program: OsString,
+    timeout: Duration,
+}
+
+impl Default for GitRunner {
+    fn default() -> Self {
+        Self {
+            program: OsString::from("git"),
+            timeout: GIT_COMMAND_TIMEOUT,
+        }
+    }
+}
+
+impl GitRunner {
+    #[cfg(test)]
+    fn new(program: impl Into<OsString>, timeout: Duration) -> Self {
+        Self {
+            program: program.into(),
+            timeout,
+        }
+    }
+
+    async fn output(
+        &self,
+        dir: &Path,
+        args: &[OsString],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Output> {
+        self.output_with_completion(dir, args, extra_env, None)
+            .await
+    }
+
+    async fn output_with_completion(
+        &self,
+        dir: &Path,
+        args: &[OsString],
+        extra_env: &[(&str, &str)],
+        completion: Option<BlockingWorkSignal>,
+    ) -> Result<Output> {
+        let mut command = Command::new(&self.program);
+        command
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .envs(extra_env.iter().copied())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "never")
+            .env("PAGER", "cat")
+            .env("GIT_PAGER", "cat")
+            .env("GIT_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true");
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let child = command.spawn().context("spawning git")?;
+        let mut child = ReapingGitChild::new(child, completion);
+        let mut group = GitProcessGroupGuard::for_child(child.child());
+        let stdout = child
+            .child_mut()
+            .stdout
+            .take()
+            .context("capturing git stdout")?;
+        let stderr = child
+            .child_mut()
+            .stderr
+            .take()
+            .context("capturing git stderr")?;
+
+        let execution = async {
+            let drains = async {
+                tokio::try_join!(read_raw_pipe(stdout), read_raw_pipe(stderr))
+                    .context("reading git output")
+            };
+            tokio::pin!(drains);
+            let wait = child.child_mut().wait();
+            tokio::pin!(wait);
+
+            tokio::select! {
+                status = &mut wait => {
+                    let status = status.context("waiting for git")?;
+                    // A Git hook/filter may have left a descendant holding the
+                    // inherited pipes. The direct child is settled, so remove
+                    // any such strays and give buffered bytes a bounded drain.
+                    group.terminate();
+                    let (stdout, stderr) = tokio::time::timeout(
+                        GIT_PIPE_DRAIN_GRACE,
+                        &mut drains,
+                    )
+                    .await
+                    .context("timed out draining git output")??;
+                    Ok(Output { status, stdout, stderr })
+                }
+                captured = &mut drains => {
+                    let (stdout, stderr) = captured?;
+                    let status = wait.await.context("waiting for git")?;
+                    group.terminate();
+                    Ok(Output { status, stdout, stderr })
+                }
+            }
+        };
+
+        match tokio::time::timeout(self.timeout, execution).await {
+            Ok(Ok(output)) => {
+                child.mark_reaped();
+                Ok(output)
+            }
+            Ok(Err(error)) => {
+                if terminate_and_reap_git(child.child_mut(), &mut group).await {
+                    child.mark_reaped();
+                }
+                Err(error)
+            }
+            Err(_) => {
+                if terminate_and_reap_git(child.child_mut(), &mut group).await {
+                    child.mark_reaped();
+                }
+                bail!(
+                    "git command timed out after {:.3}s",
+                    self.timeout.as_secs_f64()
+                )
+            }
+        }
+    }
+}
+
+/// Owns a spawned Git process until it has actually been waited. Dropping a
+/// Tokio Child with kill-on-drop requests termination but does not wait for
+/// process exit. A cancelled checkpoint future can therefore otherwise release
+/// its temporary-index or worktree guards while Git still has those resources
+/// open. The optional signal is released only after a successful reap.
+struct ReapingGitChild {
+    child: Option<tokio::process::Child>,
+    completion: Option<BlockingWorkSignal>,
+}
+
+impl ReapingGitChild {
+    fn new(child: tokio::process::Child, completion: Option<BlockingWorkSignal>) -> Self {
+        Self {
+            child: Some(child),
+            completion,
+        }
+    }
+
+    fn child(&self) -> &tokio::process::Child {
+        self.child.as_ref().expect("Git child must be present")
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child.as_mut().expect("Git child must be present")
+    }
+
+    fn mark_reaped(&mut self) {
+        self.child.take();
+        // Dropping the signal wakes every dependent cleanup waiter. Do this
+        // only after the OS child has been waited successfully.
+        self.completion.take();
+    }
+}
+
+impl Drop for ReapingGitChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            crate::process::kill_group(pid as i32);
+        }
+        let _ = child.start_kill();
+
+        // ManuallyDrop is deliberate: if the OS cannot start a reaper thread,
+        // retaining the signal leaves dependent cleanup safely disarmed rather
+        // than deleting resources beneath a child whose exit is unproven.
+        let completion = self.completion.take().map(std::mem::ManuallyDrop::new);
+        let spawned = std::thread::Builder::new()
+            .name("hi-git-reaper".into())
+            .spawn(move || {
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => {
+                            #[cfg(unix)]
+                            if let Some(pid) = child.id() {
+                                crate::process::kill_group(pid as i32);
+                            }
+                            let _ = child.start_kill();
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => {
+                            eprintln!("warning: could not reap cancelled Git child: {error}");
+                            return;
+                        }
+                    }
+                }
+                if let Some(completion) = completion {
+                    drop(std::mem::ManuallyDrop::into_inner(completion));
+                }
+            });
+        if let Err(error) = spawned {
+            eprintln!("warning: could not start cancelled Git child reaper: {error}");
+        }
+    }
+}
+
+async fn read_raw_pipe<R>(mut pipe: R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+struct GitProcessGroupGuard {
+    pgid: Option<i32>,
+}
+
+#[cfg(unix)]
+impl GitProcessGroupGuard {
+    fn for_child(child: &tokio::process::Child) -> Self {
+        Self {
+            pgid: child.id().map(|pid| pid as i32),
+        }
+    }
+
+    fn terminate(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            crate::process::kill_group(pgid);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GitProcessGroupGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(not(unix))]
+struct GitProcessGroupGuard;
+
+#[cfg(not(unix))]
+impl GitProcessGroupGuard {
+    fn for_child(_child: &tokio::process::Child) -> Self {
+        Self
+    }
+
+    fn terminate(&mut self) {}
+}
+
+async fn terminate_and_reap_git(
+    child: &mut tokio::process::Child,
+    group: &mut GitProcessGroupGuard,
+) -> bool {
+    group.terminate();
+    let _ = child.start_kill();
+    matches!(
+        tokio::time::timeout(GIT_REAP_GRACE, child.wait()).await,
+        Ok(Ok(_))
+    )
+}
+
+/// Owns short-lived checkpoint plumbing files across async Git calls. Git
+/// writes an adjacent `<index>.lock`; cancellation can kill Git before it
+/// unlinks that lock, so the index guard owns both paths.
+struct TemporaryFileGuard {
+    paths: Vec<PathBuf>,
+    blocking_work: Option<BlockingWorkCompletion>,
+}
+
+impl TemporaryFileGuard {
+    fn file(path: PathBuf) -> Self {
+        Self {
+            paths: vec![path],
+            blocking_work: None,
+        }
+    }
+
+    fn git_index(path: PathBuf) -> Self {
+        let lock = path_with_suffix(&path, ".lock");
+        Self {
+            paths: vec![path, lock],
+            blocking_work: None,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.paths[0]
+    }
+
+    fn wait_for(&mut self, completion: BlockingWorkCompletion) {
+        self.blocking_work = Some(completion);
+    }
+}
+
+impl Drop for TemporaryFileGuard {
+    fn drop(&mut self) {
+        let paths = std::mem::take(&mut self.paths);
+        let Some(completion) = self.blocking_work.take() else {
+            remove_temporary_files(paths);
+            return;
+        };
+        if completion.is_finished() {
+            remove_temporary_files(paths);
+            return;
+        }
+
+        // A cancelled Git future hands its child to a detached reaper. Keep
+        // the index, adjacent lock, and pathspec alive until that reaper proves
+        // the child has exited.
+        if let Err(error) = std::thread::Builder::new()
+            .name("hi-checkpoint-temp-cleanup".into())
+            .spawn(move || {
+                completion.wait_blocking();
+                remove_temporary_files(paths);
+            })
+        {
+            eprintln!("warning: could not start checkpoint temporary-file cleanup: {error}");
+        }
+    }
+}
+
+fn remove_temporary_files(paths: Vec<PathBuf>) {
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "warning: could not remove checkpoint temporary file {}: {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn isolated_name_salt() -> &'static str {
+    ISOLATED_NAME_SALT.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let address = (&now as *const u128) as usize as u128;
+        format!(
+            "{:032x}",
+            now ^ address ^ (std::process::id() as u128) << 64
+        )
+    })
+}
+
+fn cleanup_record_path(sandbox: &Path) -> Result<PathBuf> {
+    let parent = sandbox
+        .parent()
+        .context("isolated sandbox has no allocation parent")?;
+    let name = sandbox
+        .file_name()
+        .context("isolated sandbox has no file name")?;
+    let mut record_name = name.to_os_string();
+    record_name.push(".cleanup.json");
+    Ok(parent.join(record_name))
+}
+
+/// Completion handshake for blocking work that may outlive its awaiting
+/// future. `spawn_blocking` tasks cannot be force-cancelled once running, so an
+/// isolated directory must not be removed until its materializer has stopped
+/// writing to it.
+#[derive(Debug, Default)]
+struct BlockingWorkState {
+    finished: bool,
+    waiters: usize,
+}
+
+#[derive(Clone, Debug)]
+struct BlockingWorkCompletion(Arc<(Mutex<BlockingWorkState>, Condvar)>);
+
+struct BlockingWorkSignal(BlockingWorkCompletion);
+
+impl BlockingWorkCompletion {
+    fn pair() -> (Self, BlockingWorkSignal) {
+        let completion = Self(Arc::new((
+            Mutex::new(BlockingWorkState::default()),
+            Condvar::new(),
+        )));
+        let signal = BlockingWorkSignal(completion.clone());
+        (completion, signal)
+    }
+
+    async fn wait(&self) -> Result<()> {
+        let completion = self.clone();
+        tokio::task::spawn_blocking(move || completion.wait_blocking())
+            .await
+            .context("blocking work completion waiter failed")?;
+        Ok(())
+    }
+
+    fn wait_blocking(&self) {
+        let (state, wake) = &*self.0;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.waiters = state.waiters.saturating_add(1);
+        wake.notify_all();
+        while !state.finished {
+            state = wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .finished
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .waiters
+    }
+}
+
+impl Drop for BlockingWorkSignal {
+    fn drop(&mut self) {
+        let (state, wake) = &*self.0.0;
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .finished = true;
+        wake.notify_all();
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IsolatedCleanup {
+    path: PathBuf,
+    git_repo: Option<PathBuf>,
+    registered_worktree: bool,
+    git: GitRunner,
+    blocking_work: Option<BlockingWorkCompletion>,
+    record_path: Option<PathBuf>,
+}
+
+/// Durable breadcrumb retained when detached cleanup cannot finish. These files
+/// are intentionally not auto-consumed: the shared temporary directory is an
+/// untrusted boundary, and safely authenticating a dead process's repository
+/// ownership would require a broader recovery protocol.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IsolatedCleanupRecord {
+    version: u32,
+    owner_pid: u32,
+    path: IsolatedRecordPath,
+    git_repo: Option<IsolatedRecordPath>,
+    registered_worktree: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "encoding", content = "value", rename_all = "snake_case")]
+enum IsolatedRecordPath {
+    UnixBytes(String),
+    WindowsWide(Vec<u16>),
+    Utf8(String),
+}
+
+impl IsolatedRecordPath {
+    fn encode(path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let value = path
+                .as_os_str()
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            Ok(Self::UnixBytes(value))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+
+            Ok(Self::WindowsWide(path.as_os_str().encode_wide().collect()))
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            Ok(Self::Utf8(
+                path.to_str()
+                    .context("isolated cleanup path is not Unicode")?
+                    .to_string(),
+            ))
+        }
+    }
+
+    #[cfg(test)]
+    fn decode(&self) -> Result<PathBuf> {
+        match self {
+            Self::UnixBytes(value) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStringExt;
+
+                    ensure!(
+                        value.len().is_multiple_of(2)
+                            && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                        "invalid encoded Unix cleanup path"
+                    );
+                    let bytes = (0..value.len())
+                        .step_by(2)
+                        .map(|index| u8::from_str_radix(&value[index..index + 2], 16))
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    Ok(PathBuf::from(OsString::from_vec(bytes)))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = value;
+                    bail!("Unix cleanup path cannot be decoded on this platform")
+                }
+            }
+            Self::WindowsWide(value) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::ffi::OsStringExt;
+
+                    Ok(PathBuf::from(OsString::from_wide(value)))
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = value;
+                    bail!("Windows cleanup path cannot be decoded on this platform")
+                }
+            }
+            Self::Utf8(value) => Ok(PathBuf::from(value)),
+        }
+    }
+}
+
 struct IsolatedGuard {
     path: PathBuf,
     git_repo: Option<PathBuf>,
     registered_worktree: bool,
+    git: GitRunner,
+    blocking_work: Option<BlockingWorkCompletion>,
+    record_path: Option<PathBuf>,
     cleaned: bool,
 }
 
 impl IsolatedGuard {
+    #[cfg(test)]
     fn directory(path: PathBuf) -> Self {
         Self {
             path,
             git_repo: None,
             registered_worktree: false,
+            git: GitRunner::default(),
+            blocking_work: None,
+            record_path: None,
             cleaned: false,
         }
     }
 
-    fn worktree(path: PathBuf, git_repo: PathBuf) -> Self {
-        Self {
+    fn directory_after(path: PathBuf, completion: BlockingWorkCompletion) -> Result<Self> {
+        let mut guard = Self {
+            path,
+            git_repo: None,
+            registered_worktree: false,
+            git: GitRunner::default(),
+            blocking_work: Some(completion),
+            record_path: None,
+            // Keep Drop disarmed until the breadcrumb is durable. A
+            // constructor error means no materialization has started and
+            // therefore owns nothing that needs asynchronous cleanup.
+            cleaned: true,
+        };
+        guard.persist_cleanup_record()?;
+        guard.cleaned = false;
+        Ok(guard)
+    }
+
+    fn worktree(path: PathBuf, git_repo: PathBuf, git: GitRunner) -> Result<Self> {
+        let mut guard = Self {
             path,
             git_repo: Some(git_repo),
             registered_worktree: true,
-            cleaned: false,
+            git,
+            blocking_work: None,
+            record_path: None,
+            // In particular, do not run `git worktree prune` if breadcrumb
+            // persistence itself fails before `git worktree add` is attempted.
+            cleaned: true,
+        };
+        guard.persist_cleanup_record()?;
+        guard.cleaned = false;
+        Ok(guard)
+    }
+
+    fn persist_cleanup_record(&mut self) -> Result<()> {
+        let record_path = cleanup_record_path(&self.path)?;
+        let record = IsolatedCleanupRecord {
+            version: 1,
+            owner_pid: std::process::id(),
+            path: IsolatedRecordPath::encode(&self.path)?,
+            git_repo: self
+                .git_repo
+                .as_deref()
+                .map(IsolatedRecordPath::encode)
+                .transpose()?,
+            registered_worktree: self.registered_worktree,
+        };
+        let bytes = serde_json::to_vec(&record).context("serializing isolated cleanup record")?;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&record_path)
+            .with_context(|| format!("creating {}", record_path.display()))?;
+        let persist = file
+            .write_all(&bytes)
+            .with_context(|| format!("writing {}", record_path.display()))
+            .and_then(|()| {
+                file.sync_all()
+                    .with_context(|| format!("syncing {}", record_path.display()))
+            });
+        if let Err(error) = persist {
+            drop(file);
+            let _ = std::fs::remove_file(&record_path);
+            return Err(error).context("persisting isolated cleanup record");
         }
+        drop(file);
+        self.record_path = Some(record_path);
+        Ok(())
+    }
+
+    fn cleanup_plan(&self) -> IsolatedCleanup {
+        IsolatedCleanup {
+            path: self.path.clone(),
+            git_repo: self.git_repo.clone(),
+            registered_worktree: self.registered_worktree,
+            git: self.git.clone(),
+            blocking_work: self.blocking_work.clone(),
+            record_path: self.record_path.clone(),
+        }
+    }
+
+    fn wait_for(&mut self, completion: BlockingWorkCompletion) {
+        self.blocking_work = Some(completion);
     }
 
     async fn cleanup(&mut self) -> Result<()> {
         if self.cleaned {
             return Ok(());
         }
-        if self.registered_worktree {
-            let repo = self
-                .git_repo
-                .as_ref()
-                .context("isolated worktree has no source repository")?;
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["worktree", "remove", "--force"])
-                .arg(&self.path)
-                .output()
-                .await
-                .context("removing isolated verification worktree")?;
-            if !output.status.success() {
-                // Removing the directory and pruning the now-missing worktree
-                // is an idempotent fallback, including after cancellation or a
-                // verification command that damaged its own `.git` file.
-                let _ = std::fs::remove_dir_all(&self.path);
-                let prune = Command::new("git")
-                    .arg("-C")
-                    .arg(repo)
-                    .args(["worktree", "prune", "--expire", "now"])
-                    .output()
-                    .await
-                    .context("pruning isolated verification worktree")?;
-                if !prune.status.success() {
-                    bail!(
-                        "could not remove isolated verification worktree: {}; prune also failed: {}",
-                        String::from_utf8_lossy(&output.stderr).trim(),
-                        String::from_utf8_lossy(&prune.stderr).trim()
-                    );
-                }
-            }
-        } else if self.path.exists() {
-            std::fs::remove_dir_all(&self.path).with_context(|| {
-                format!(
-                    "removing isolated verification copy {}",
-                    self.path.display()
-                )
-            })?;
-        }
+        let cleanup = self.cleanup_plan();
+        cleanup_isolated_physical(&cleanup).await?;
         // `self.path` is the only directory this guard owns. The parent is a
         // shared allocation root: another verifier may have created it but not
         // yet materialized its child. Removing that empty parent here creates
         // a TOCTOU race where the other verifier reports an infrastructure
         // failure instead of the stage's real result.
+        //
+        // Physical ownership has ended at this point. Disarm before removing
+        // the durable breadcrumb so an unlink failure cannot make Drop run a
+        // second destructive Git removal/prune sequence.
         self.cleaned = true;
-        Ok(())
-    }
-
-    fn cleanup_sync(&mut self) {
-        if self.cleaned {
-            return;
-        }
-        // Intentionally blocking (`std::process`): called from `Drop`, where we
-        // cannot `.await`, and only ever off the async turn path.
-        if self.registered_worktree
-            && let Some(repo) = &self.git_repo
-        {
-            let removed = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["worktree", "remove", "--force"])
-                .arg(&self.path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-            if !removed {
-                let _ = std::fs::remove_dir_all(&self.path);
-                let _ = std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(repo)
-                    .args(["worktree", "prune", "--expire", "now"])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
-        } else {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-        // Do not remove the shared parent; see the async cleanup path above.
-        self.cleaned = true;
+        remove_isolated_cleanup_record(&cleanup)
     }
 }
 
 impl Drop for IsolatedGuard {
     fn drop(&mut self) {
-        self.cleanup_sync();
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
+        let cleanup = self.cleanup_plan();
+        // Cancellation drops this guard on the async turn path. Cleanup must
+        // outlive that cancelled future without making Drop itself wait on Git
+        // or a recursive filesystem traversal, so give recovery its own small
+        // runtime on a detached OS thread.
+        if let Err(error) = spawn_isolated_cleanup(cleanup) {
+            eprintln!(
+                "warning: could not start isolated verification cleanup thread for {}: {error}",
+                self.path.display()
+            );
+        }
     }
+}
+
+fn spawn_isolated_cleanup(cleanup: IsolatedCleanup) -> std::io::Result<()> {
+    let path = cleanup.path.clone();
+    std::thread::Builder::new()
+        .name("hi-isolated-cleanup".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match runtime {
+                Ok(runtime) => {
+                    if let Err(error) = runtime.block_on(cleanup_isolated(cleanup)) {
+                        eprintln!(
+                            "warning: isolated verification cleanup failed for {}: {error:#}",
+                            path.display()
+                        );
+                    }
+                }
+                Err(error) => eprintln!(
+                    "warning: could not start isolated verification cleanup runtime for {}: {error}",
+                    path.display()
+                ),
+            }
+        })
+        .map(|_| ())
+}
+
+async fn cleanup_isolated(cleanup: IsolatedCleanup) -> Result<()> {
+    cleanup_isolated_physical(&cleanup).await?;
+    remove_isolated_cleanup_record(&cleanup)
+}
+
+async fn cleanup_isolated_physical(cleanup: &IsolatedCleanup) -> Result<()> {
+    if let Some(completion) = &cleanup.blocking_work {
+        completion.wait().await?;
+    }
+    if cleanup.registered_worktree {
+        let repo = cleanup
+            .git_repo
+            .as_ref()
+            .context("isolated worktree has no source repository")?;
+        let remove_args = vec![
+            OsString::from("worktree"),
+            OsString::from("remove"),
+            OsString::from("--force"),
+            cleanup.path.clone().into_os_string(),
+        ];
+        let removed = cleanup
+            .git
+            .output(repo, &remove_args, &[])
+            .await
+            .context("removing isolated verification worktree");
+        if !matches!(&removed, Ok(output) if output.status.success()) {
+            // Removing the directory and pruning the now-missing worktree is
+            // an idempotent fallback, including cancellation during `add` or a
+            // verification command that damaged its own `.git` file.
+            let directory_removal = remove_dir_all_async(cleanup.path.clone()).await;
+            let prune_args = [
+                OsString::from("worktree"),
+                OsString::from("prune"),
+                OsString::from("--expire"),
+                OsString::from("now"),
+            ];
+            let prune = cleanup
+                .git
+                .output(repo, &prune_args, &[])
+                .await
+                .context("pruning isolated verification worktree")?;
+            if !prune.status.success() {
+                let remove_error = match removed {
+                    Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                    Err(error) => format!("{error:#}"),
+                };
+                bail!(
+                    "could not remove isolated verification worktree: {remove_error}; prune also failed: {}",
+                    String::from_utf8_lossy(&prune.stderr).trim()
+                );
+            }
+            directory_removal
+                .context("Git worktree removal failed and its directory fallback also failed")?;
+        }
+    } else if cleanup.path.exists() {
+        remove_dir_all_async(cleanup.path.clone()).await?;
+    }
+    if std::fs::symlink_metadata(&cleanup.path).is_ok() {
+        remove_dir_all_async(cleanup.path.clone())
+            .await
+            .context("isolated cleanup reported success but its sandbox survived")?;
+    }
+    Ok(())
+}
+
+fn remove_isolated_cleanup_record(cleanup: &IsolatedCleanup) -> Result<()> {
+    if let Some(record_path) = &cleanup.record_path {
+        match std::fs::remove_file(record_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("removing isolated cleanup record {}", record_path.display())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn remove_dir_all_async(path: PathBuf) -> Result<()> {
+    let display = path.display().to_string();
+    tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    })
+    .await
+    .context("isolated cleanup worker failed")?
+    .with_context(|| format!("removing isolated verification copy {display}"))
 }
 
 /// Run an operation in a fresh copy of an immutable checkpoint and remove the
@@ -184,6 +906,27 @@ where
     F: FnOnce(PathBuf) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
+    with_isolated_checkpoint_with_runner(
+        dir,
+        reference,
+        state_root,
+        GitRunner::default(),
+        operation,
+    )
+    .await
+}
+
+async fn with_isolated_checkpoint_with_runner<T, F, Fut>(
+    dir: &Path,
+    reference: &str,
+    state_root: &Path,
+    git_runner: GitRunner,
+    operation: F,
+) -> Result<T>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
     let (target, _) = parse_reference(reference)?;
     // The state root is control-plane data and is intentionally protected by
     // the default command sandbox. A verification worktree needs to create
@@ -192,30 +935,50 @@ where
     let parent = std::env::temp_dir().join("hi-verification-sandboxes");
     std::fs::create_dir_all(&parent)
         .with_context(|| format!("creating verification sandbox root {}", parent.display()))?;
+    ensure!(
+        std::fs::symlink_metadata(&parent)?.file_type().is_dir(),
+        "verification sandbox root is not a real directory: {}",
+        parent.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing verification sandbox root {}", parent.display()))?;
+    }
     let sandbox = parent.join(format!(
-        "verify-{}-{}",
+        "verify-{}-{}-{}",
         std::process::id(),
+        isolated_name_salt(),
         ISOLATED_ID.fetch_add(1, Ordering::Relaxed)
     ));
     if sandbox.exists() {
-        std::fs::remove_dir_all(&sandbox)
+        remove_dir_all_async(sandbox.clone())
+            .await
             .with_context(|| format!("removing stale sandbox {}", sandbox.display()))?;
     }
 
     let (mut guard, operation_root) = if crate::internal_snapshot::is_internal_id(target) {
-        let guard = IsolatedGuard::directory(sandbox.clone());
+        let (materialization, materialization_signal) = BlockingWorkCompletion::pair();
+        let guard = IsolatedGuard::directory_after(sandbox.clone(), materialization)?;
         let source = dir.to_path_buf();
         let state = state_root.to_path_buf();
         let target = target.to_string();
         let destination = sandbox.clone();
         tokio::task::spawn_blocking(move || {
+            // Kept alive for the complete blocking call. On success, failure,
+            // panic, or cancellation before the task starts, dropping this
+            // signal releases any detached cleanup waiter.
+            let _materialization_signal = materialization_signal;
             crate::internal_snapshot::materialize(&source, &state, &target, &destination)
         })
         .await
         .context("isolated snapshot materialization task failed")??;
         (guard, sandbox)
     } else {
-        let repo = toplevel(dir).await.context("not in a git work tree")?;
+        let repo = toplevel_with_runner(dir, &git_runner)
+            .await
+            .context("not in a git work tree")?;
         let source = dir
             .canonicalize()
             .with_context(|| format!("canonicalizing workspace root {}", dir.display()))?;
@@ -229,30 +992,37 @@ where
                 repo.display()
             )
         })?;
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["worktree", "add", "--detach", "--force"])
-            .arg(&sandbox)
-            .arg(target)
-            .output()
+        // Arm recovery before `worktree add`: cancellation may arrive after
+        // Git registers the worktree but before the command returns.
+        let mut guard = IsolatedGuard::worktree(sandbox.clone(), repo.clone(), git_runner.clone())?;
+        let (git_completion, git_signal) = BlockingWorkCompletion::pair();
+        guard.wait_for(git_completion);
+        let add_args = vec![
+            OsString::from("worktree"),
+            OsString::from("add"),
+            OsString::from("--detach"),
+            OsString::from("--force"),
+            sandbox.clone().into_os_string(),
+            OsString::from(target),
+        ];
+        let output = git_runner
+            .output_with_completion(&repo, &add_args, &[], Some(git_signal))
             .await
             .context("creating isolated verification worktree")?;
         if !output.status.success() {
-            let _ = std::fs::remove_dir_all(&sandbox);
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(["worktree", "prune", "--expire", "now"])
-                .output()
-                .await;
-            bail!(
+            let error = anyhow::anyhow!(
                 "creating isolated verification worktree failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
+            return match guard.cleanup().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!(
+                    "isolated worktree recovery also failed: {cleanup:#}"
+                ))),
+            };
         }
         let operation_root = sandbox.join(relative_root);
-        (IsolatedGuard::worktree(sandbox, repo), operation_root)
+        (guard, operation_root)
     };
 
     let operation_result = operation(operation_root).await;
@@ -306,32 +1076,29 @@ fn ensure_reference_boundary(payload: &str, offset: usize) -> Result<()> {
 }
 
 async fn git(dir: &Path, args: &[&str]) -> Result<Output> {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
+    let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+    GitRunner::default()
+        .output(dir, &args, &[])
         .await
         .context("running git")
 }
 
-async fn git_indexed(dir: &Path, index: &str, args: &[String]) -> Result<Output> {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_INDEX_FILE", index)
-        .output()
+async fn git_indexed_with_completion(
+    dir: &Path,
+    index: &str,
+    args: &[String],
+    completion: BlockingWorkSignal,
+) -> Result<Output> {
+    let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+    GitRunner::default()
+        .output_with_completion(dir, &args, &[("GIT_INDEX_FILE", index)], Some(completion))
         .await
         .context("running git")
 }
 
 async fn git_owned(dir: &Path, args: Vec<OsString>) -> Result<Output> {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
+    GitRunner::default()
+        .output(dir, &args, &[])
         .await
         .context("running git")
 }
@@ -374,13 +1141,17 @@ async fn git_scope(dir: &Path) -> Result<GitScope> {
     })
 }
 
-async fn toplevel(dir: &Path) -> Option<std::path::PathBuf> {
-    let out = git(dir, &["rev-parse", "--show-toplevel"]).await.ok()?;
+async fn toplevel_with_runner(dir: &Path, runner: &GitRunner) -> Option<PathBuf> {
+    let args = [
+        OsString::from("rev-parse"),
+        OsString::from("--show-toplevel"),
+    ];
+    let out = runner.output(dir, &args, &[]).await.ok()?;
     if !out.status.success() {
         return None;
     }
     let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!p.is_empty()).then(|| std::path::PathBuf::from(p))
+    (!p.is_empty()).then(|| PathBuf::from(p))
 }
 
 /// Snapshot the working tree of the repo containing `dir` into a dangling commit,
@@ -474,13 +1245,28 @@ async fn create_git_detailed(dir: &Path, state_root: &Path) -> CreateResult {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!("hi-checkpoint-{}-{n}", std::process::id()));
-    let Some(index) = tmp.to_str() else {
+    let mut temp_index = TemporaryFileGuard::git_index(tmp);
+    let Some(index) = temp_index.path().to_str().map(str::to_owned) else {
         return CreateResult::Failed("temporary checkpoint index path is not valid UTF-8".into());
     };
 
     // Seed the throwaway index from HEAD so `add -A` is a fast incremental
     // (harmlessly fails in a repo with no commits yet).
-    let _ = git_indexed(&scope.root, index, &["read-tree".into(), "HEAD".into()]).await;
+    let (completion, signal) = BlockingWorkCompletion::pair();
+    temp_index.wait_for(completion.clone());
+    let _ = git_indexed_with_completion(
+        &scope.root,
+        &index,
+        &["read-tree".into(), "HEAD".into()],
+        signal,
+    )
+    .await;
+    if !completion.is_finished() {
+        return CreateResult::Failed(
+            "git read-tree did not terminate cleanly; checkpoint index retained for recovery"
+                .into(),
+        );
+    }
     // Limit the throwaway index update to the explicit workspace root. The
     // index is seeded from HEAD, so paths elsewhere in a containing monorepo
     // remain at HEAD even when they have unrelated dirty user changes. This
@@ -506,15 +1292,15 @@ async fn create_git_detailed(dir: &Path, state_root: &Path) -> CreateResult {
         add_args.push(format!(":(exclude){relative_state}"));
         add_args.push(format!(":(exclude){relative_state}/**"));
     }
-    let add = match git_indexed(&scope.root, index, &add_args).await {
+    let (completion, signal) = BlockingWorkCompletion::pair();
+    temp_index.wait_for(completion);
+    let add = match git_indexed_with_completion(&scope.root, &index, &add_args, signal).await {
         Ok(output) => output,
         Err(err) => {
-            let _ = std::fs::remove_file(&tmp);
             return CreateResult::Failed(format!("git add failed: {err:#}"));
         }
     };
     if !add.status.success() {
-        let _ = std::fs::remove_file(&tmp);
         return CreateResult::Failed(format!(
             "git add failed: {}",
             String::from_utf8_lossy(&add.stderr).trim()
@@ -529,47 +1315,57 @@ async fn create_git_detailed(dir: &Path, state_root: &Path) -> CreateResult {
             pathspecs.extend_from_slice(os_str_bytes(path.as_os_str()));
             pathspecs.push(0);
         }
-        let spec_file =
-            std::env::temp_dir().join(format!("hi-checkpoint-pathspec-{}-{n}", std::process::id()));
-        if let Err(error) = std::fs::write(&spec_file, pathspecs) {
-            let _ = std::fs::remove_file(&tmp);
+        let mut spec_file = TemporaryFileGuard::file(
+            std::env::temp_dir().join(format!("hi-checkpoint-pathspec-{}-{n}", std::process::id())),
+        );
+        if let Err(error) = std::fs::write(spec_file.path(), pathspecs) {
             return CreateResult::Failed(format!("writing checkpoint pathspec file: {error}"));
         }
-        let force_add = git_indexed(
+        let (completion, signal) = BlockingWorkCompletion::pair();
+        temp_index.wait_for(completion.clone());
+        spec_file.wait_for(completion);
+        let force_add = git_indexed_with_completion(
             &scope.root,
-            index,
+            &index,
             &[
                 "add".into(),
                 "-f".into(),
                 "--pathspec-file-nul".into(),
-                format!("--pathspec-from-file={}", spec_file.display()),
+                format!("--pathspec-from-file={}", spec_file.path().display()),
             ],
+            signal,
         )
         .await;
-        let _ = std::fs::remove_file(&spec_file);
+        drop(spec_file);
         let force_add = match force_add {
             Ok(output) => output,
             Err(err) => {
-                let _ = std::fs::remove_file(&tmp);
                 return CreateResult::Failed(format!("git add of ignored inputs failed: {err:#}"));
             }
         };
         if !force_add.status.success() {
-            let _ = std::fs::remove_file(&tmp);
             return CreateResult::Failed(format!(
                 "git add of ignored inputs failed: {}",
                 String::from_utf8_lossy(&force_add.stderr).trim()
             ));
         }
     }
-    let tree_out = match git_indexed(&scope.root, index, &["write-tree".into()]).await {
+    let (completion, signal) = BlockingWorkCompletion::pair();
+    temp_index.wait_for(completion);
+    let tree_out = match git_indexed_with_completion(
+        &scope.root,
+        &index,
+        &["write-tree".into()],
+        signal,
+    )
+    .await
+    {
         Ok(output) => output,
         Err(err) => {
-            let _ = std::fs::remove_file(&tmp);
             return CreateResult::Failed(format!("git write-tree failed: {err:#}"));
         }
     };
-    let _ = std::fs::remove_file(&tmp);
+    drop(temp_index);
     if !tree_out.status.success() {
         return CreateResult::Failed(format!(
             "git write-tree failed: {}",
@@ -941,14 +1737,7 @@ pub async fn restore(dir: &Path, target: &str) -> Result<usize> {
 
 pub async fn restore_with_state(dir: &Path, target: &str, state_root: &Path) -> Result<usize> {
     if crate::internal_snapshot::is_internal_id(target) {
-        let root = dir.to_path_buf();
-        let state = state_root.to_path_buf();
-        let target = target.to_string();
-        return tokio::task::spawn_blocking(move || {
-            crate::internal_snapshot::restore(&root, &state, &target)
-        })
-        .await
-        .context("internal restore task failed")?;
+        return restore_internal_with_state(dir, target, None, state_root, || {}, || {}).await;
     }
     let scope = git_scope(dir).await.context("not in a Git work tree")?;
     // Snapshot the current state and diff against the target, then prepare all
@@ -961,9 +1750,95 @@ pub async fn restore_with_state(dir: &Path, target: &str, state_root: &Path) -> 
     };
     let (plan, changed) = prepare_git_restore(&scope, target, &current, state_root).await?;
     if let Some(plan) = plan {
-        plan.commit()?;
+        run_uncancellable_filesystem_boundary(move || plan.commit())?;
     }
     Ok(changed)
+}
+
+/// Prepare an internal restore off the async runtime, but retain ownership of
+/// the live-tree commit in an explicit uncancellable filesystem boundary. A
+/// cancelled `spawn_blocking` join detaches its worker, so committing inside a
+/// normally-awaited blocking task would let `/undo` keep changing the
+/// workspace after its async future had returned cancellation. Preparation is
+/// read-only and remains cancellable. Once finalization starts, a multithreaded
+/// Tokio runtime replaces the blocked scheduler worker and the caller cannot
+/// observe cancellation until recovery, revalidation, and commit are settled.
+async fn restore_internal_with_state<F, G>(
+    dir: &Path,
+    target: &str,
+    expected_current: Option<&str>,
+    state_root: &Path,
+    after_prepare: F,
+    before_commit: G,
+) -> Result<usize>
+where
+    F: FnOnce() + Send + 'static,
+    G: FnOnce() + Send + 'static,
+{
+    // Journal recovery may repair an interrupted transaction, so perform it
+    // before creating the detachable preparation worker. It uses the same
+    // uncancellable boundary as commit: recovery may mutate the live tree and
+    // must settle before this API can report cancellation.
+    run_uncancellable_filesystem_boundary(|| {
+        crate::transaction::recover_workspace_transactions(dir, state_root)
+    })?;
+    let root = dir.to_path_buf();
+    let state = state_root.to_path_buf();
+    let target = target.to_string();
+    let expected = expected_current.map(str::to_string);
+    let expected_for_commit = expected.clone();
+    let (plan, changed) = tokio::task::spawn_blocking(move || {
+        let prepared = crate::internal_snapshot::prepare_restore_after_recovery(
+            &root,
+            &state,
+            &target,
+            expected.as_deref(),
+        );
+        after_prepare();
+        prepared
+    })
+    .await
+    .context("internal restore preparation task failed")??;
+    // Give cancellation one final scheduling point while all completed work is
+    // still read-only. From the next statement through commit there is no
+    // detachable mutation worker and no cancellation boundary.
+    tokio::task::yield_now().await;
+    run_uncancellable_filesystem_boundary(move || -> Result<()> {
+        // Another process may have left a journal while the detachable scan
+        // was in flight. Recover again inside the owned commit boundary;
+        // MutationPlan's preimage seal rejects overlap changed by recovery.
+        crate::transaction::recover_workspace_transactions(dir, state_root)?;
+        if let Some(expected) = expected_for_commit {
+            crate::internal_snapshot::ensure_current_matches(dir, state_root, &expected)?;
+        }
+        before_commit();
+        if let Some(plan) = plan {
+            plan.commit()?;
+        }
+        Ok(())
+    })?;
+    Ok(changed)
+}
+
+/// Execute a synchronous filesystem transaction without starving unrelated
+/// async work or allowing task cancellation to detach live-tree mutations.
+///
+/// `block_in_place` temporarily hands the scheduler worker's async duties to a
+/// replacement thread. A current-thread runtime has no replacement-worker
+/// facility, so it intentionally falls back to the same inline, uncancellable
+/// semantics; callers still never observe completion while writes are active.
+fn run_uncancellable_filesystem_boundary<T>(operation: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            tokio::task::block_in_place(operation)
+        }
+        _ => operation(),
+    }
 }
 
 async fn prepare_git_restore(
@@ -1130,15 +2005,15 @@ pub async fn restore_sealed_with_state(
     if crate::internal_snapshot::is_internal_id(target)
         && crate::internal_snapshot::is_internal_id(expected_current)
     {
-        let root = dir.to_path_buf();
-        let state = state_root.to_path_buf();
-        let target = target.to_string();
-        let expected = expected_current.to_string();
-        return tokio::task::spawn_blocking(move || {
-            crate::internal_snapshot::restore_sealed(&root, &state, &target, &expected)
-        })
-        .await
-        .context("sealed internal restore task failed")?;
+        return restore_internal_with_state(
+            dir,
+            target,
+            Some(expected_current),
+            state_root,
+            || {},
+            || {},
+        )
+        .await;
     }
     // Git callers seal against an immutable tree, prepare all postimages, then
     // sample the tree once more before the transaction's own per-node digest
@@ -1168,7 +2043,7 @@ pub async fn restore_sealed_with_state(
                 "undo conflict: workspace changed externally while preparing restore"
             );
             if let Some(plan) = plan {
-                plan.commit()?;
+                run_uncancellable_filesystem_boundary(move || plan.commit())?;
             }
             Ok(changed)
         }
@@ -1218,6 +2093,717 @@ pub fn default_state_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes process existence and does not mutate
+        // memory or deliver a signal.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: i32) -> bool {
+        for _ in 0..200 {
+            if !process_is_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_path(path: &Path, should_exist: bool) -> bool {
+        for _ in 0..200 {
+            if path.exists() == should_exist {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_git_runner_preserves_binary_output_and_disables_interaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_git = temp.path().join("fake-git");
+        write_executable(
+            &fake_git,
+            "#!/bin/sh\n\
+             printf 'caf\\303\\251\\000\\377'\n\
+             printf '%s|%s|%s|%s' \"$GIT_TERMINAL_PROMPT\" \"$GCM_INTERACTIVE\" \"$PAGER\" \"$GIT_PAGER\" >&2\n",
+        );
+        let runner = GitRunner::new(&fake_git, Duration::from_secs(2));
+
+        let output = runner.output(temp.path(), &[], &[]).await.unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"caf\xc3\xa9\0\xff");
+        assert_eq!(output.stderr, b"0|never|cat|cat");
+    }
+
+    #[tokio::test]
+    async fn cancelling_checkpoint_temp_scope_removes_index_lock_and_pathspec() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = temp.path().join("hi-checkpoint-index");
+        let index_lock = path_with_suffix(&index, ".lock");
+        let pathspec = temp.path().join("hi-checkpoint-pathspec");
+        let task_index = index.clone();
+        let task_index_lock = index_lock.clone();
+        let task_pathspec = pathspec.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _index_cleanup = TemporaryFileGuard::git_index(task_index.clone());
+            let _pathspec_cleanup = TemporaryFileGuard::file(task_pathspec.clone());
+            std::fs::write(task_index, b"index").unwrap();
+            std::fs::write(task_index_lock, b"lock left by killed git").unwrap();
+            std::fs::write(task_pathspec, b"pathspec").unwrap();
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        started_rx.await.unwrap();
+        assert!(index.exists());
+        assert!(index_lock.exists());
+        assert!(pathspec.exists());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(!index.exists(), "temporary checkpoint index survived");
+        assert!(!index_lock.exists(), "temporary Git index lock survived");
+        assert!(!pathspec.exists(), "temporary pathspec file survived");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn temporary_file_cleanup_waits_for_child_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("owned-by-git");
+        std::fs::write(&path, b"temporary index").unwrap();
+        let (completion, signal) = BlockingWorkCompletion::pair();
+        let mut guard = TemporaryFileGuard::file(path.clone());
+        guard.wait_for(completion.clone());
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while completion.waiter_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("temporary-file cleanup did not wait for its owner");
+        assert!(
+            path.exists(),
+            "temporary file was removed before its owner completed"
+        );
+
+        drop(signal);
+        assert!(
+            wait_for_path(&path, false).await,
+            "temporary file survived after its owner completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_internal_restore_drops_prepared_plan_without_committing() {
+        for sealed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let workspace = temp.path().join("workspace");
+            let state = temp.path().join("state");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(&state).unwrap();
+            let file = workspace.join("file");
+            std::fs::write(&file, "before").unwrap();
+            let before = crate::internal_snapshot::create(&workspace, &state).unwrap();
+            std::fs::write(&file, "after").unwrap();
+            let expected =
+                sealed.then(|| crate::internal_snapshot::create(&workspace, &state).unwrap());
+
+            let task_workspace = workspace.clone();
+            let task_state = state.clone();
+            let task_before = before.clone();
+            let task_expected = expected.clone();
+            let (prepared_tx, prepared_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let worker_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let task_worker_done = worker_done.clone();
+            let task = tokio::spawn(async move {
+                restore_internal_with_state(
+                    &task_workspace,
+                    &task_before,
+                    task_expected.as_deref(),
+                    &task_state,
+                    move || {
+                        let _ = prepared_tx.send(());
+                        release_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("test did not release prepared restore worker");
+                        task_worker_done.store(true, Ordering::Release);
+                    },
+                    || {},
+                )
+                .await
+            });
+
+            tokio::time::timeout(Duration::from_secs(5), prepared_rx)
+                .await
+                .expect("restore preparation did not reach the test barrier")
+                .expect("restore preparation task exited before the test barrier");
+            task.abort();
+            let cancellation = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("restore cancellation waited for its detached worker")
+                .expect_err("restore unexpectedly completed before cancellation");
+            assert!(cancellation.is_cancelled());
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "after",
+                "{sealed:?} restore committed before its cancelled API returned"
+            );
+
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !worker_done.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("detached restore preparation worker did not finish");
+            tokio::task::yield_now().await;
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "after",
+                "{sealed:?} restore committed after its cancelled API returned"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn internal_restore_commit_boundary_is_owned_and_does_not_starve_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let file = workspace.join("file");
+        std::fs::write(&file, "before").unwrap();
+        let before = crate::internal_snapshot::create(&workspace, &state).unwrap();
+        std::fs::write(&file, "after").unwrap();
+        let after = crate::internal_snapshot::create(&workspace, &state).unwrap();
+
+        let task_workspace = workspace.clone();
+        let task_state = state.clone();
+        let task_before = before.clone();
+        let task_after = after.clone();
+        let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let mut task = tokio::spawn(async move {
+            restore_internal_with_state(
+                &task_workspace,
+                &task_before,
+                Some(&task_after),
+                &task_state,
+                || {},
+                move || {
+                    let _ = commit_tx.send(());
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("test did not release owned restore commit");
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), commit_rx)
+            .await
+            .expect("restore did not enter its commit boundary")
+            .expect("restore exited before its commit boundary");
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(1)),
+        )
+        .await
+        .expect("the synchronous commit boundary starved the single-worker runtime");
+
+        task.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut task)
+                .await
+                .is_err(),
+            "task cancellation returned while an owned commit could still mutate the workspace"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "after");
+
+        release_tx.send(()).unwrap();
+        let joined = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("owned restore commit did not settle after release");
+        match joined {
+            Ok(result) => assert_eq!(result.unwrap(), 1),
+            Err(error) => assert!(error.is_cancelled()),
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "before");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "before",
+            "restore kept mutating after its task settled"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_cleanup_record_round_trips_non_utf8_paths_losslessly() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/hi-sandbox-\xff".to_vec()));
+        let repo = PathBuf::from(OsString::from_vec(b"/tmp/hi-repo-\xfe".to_vec()));
+        let record = IsolatedCleanupRecord {
+            version: 1,
+            owner_pid: 123,
+            path: IsolatedRecordPath::encode(&path).unwrap(),
+            git_repo: Some(IsolatedRecordPath::encode(&repo).unwrap()),
+            registered_worktree: true,
+        };
+
+        let encoded = serde_json::to_vec(&record).unwrap();
+        let decoded: IsolatedCleanupRecord = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded.path.decode().unwrap(), path);
+        assert_eq!(
+            decoded.git_repo.unwrap().decode().unwrap(),
+            repo,
+            "non-UTF-8 repository path changed in durable cleanup record"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_guard_record_failure_does_not_run_git_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let sandbox = temp.path().join("verify-guard");
+        let fake_git = temp.path().join("fake-git");
+        let invoked = path_with_suffix(&fake_git, ".called");
+        std::fs::create_dir(&repo).unwrap();
+        write_executable(
+            &fake_git,
+            "#!/bin/sh\nprintf called > \"$0.called\"\nexit 0\n",
+        );
+        // Force breadcrumb persistence to fail before `git worktree add` can
+        // begin. Constructor unwinding must leave Drop disarmed.
+        std::fs::write(cleanup_record_path(&sandbox).unwrap(), b"occupied").unwrap();
+
+        let error = IsolatedGuard::worktree(
+            sandbox,
+            repo,
+            GitRunner::new(fake_git, Duration::from_secs(1)),
+        )
+        .err()
+        .expect("an occupied cleanup-record path must reject construction");
+        assert!(error.to_string().contains("creating"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !invoked.exists(),
+            "constructor failure unexpectedly ran Git cleanup/prune"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_record_unlink_failure_disarms_worktree_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let sandbox = temp.path().join("verify-unlink-failure");
+        let record = temp.path().join("retained-cleanup-record");
+        let fake_git = temp.path().join("fake-git");
+        let calls = repo.join("calls");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&sandbox).unwrap();
+        // remove_file on a directory fails portably, deterministically
+        // exercising a breadcrumb-unlink error after physical cleanup.
+        std::fs::create_dir(&record).unwrap();
+        write_executable(
+            &fake_git,
+            "#!/bin/sh\n\
+             repo=$2\n\
+             shift 2\n\
+             printf '%s:%s\\n' \"$1\" \"$2\" >> \"$repo/calls\"\n\
+             if [ \"$1:$2\" = 'worktree:remove' ]; then\n\
+               rm -rf \"$4\"\n\
+               exit 0\n\
+             fi\n\
+             exit 2\n",
+        );
+        let mut guard = IsolatedGuard {
+            path: sandbox.clone(),
+            git_repo: Some(repo),
+            registered_worktree: true,
+            git: GitRunner::new(fake_git, Duration::from_secs(1)),
+            blocking_work: None,
+            record_path: Some(record.clone()),
+            cleaned: false,
+        };
+
+        let error = guard
+            .cleanup()
+            .await
+            .expect_err("cleanup-record unlink unexpectedly succeeded");
+
+        assert!(
+            error
+                .to_string()
+                .contains("removing isolated cleanup record"),
+            "unexpected cleanup error: {error:#}"
+        );
+        assert!(
+            !sandbox.exists(),
+            "physical worktree cleanup did not finish"
+        );
+        assert!(
+            record.exists(),
+            "failed cleanup breadcrumb was not retained"
+        );
+        assert!(guard.cleaned, "physically cleaned guard remained armed");
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            std::fs::read_to_string(calls).unwrap(),
+            "worktree:remove\n",
+            "Drop repeated destructive Git cleanup after breadcrumb unlink failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_git_timeout_kills_and_reaps_its_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_git = temp.path().join("fake-git");
+        let parent_pid = temp.path().join("parent.pid");
+        let child_pid = temp.path().join("child.pid");
+        write_executable(
+            &fake_git,
+            "#!/bin/sh\n\
+             shift 2\n\
+             printf '%s' \"$$\" > \"$1\"\n\
+             sleep 60 &\n\
+             printf '%s' \"$!\" > \"$2\"\n\
+             wait\n",
+        );
+        let runner = GitRunner::new(&fake_git, Duration::from_secs(1));
+        let args = [
+            parent_pid.clone().into_os_string(),
+            child_pid.clone().into_os_string(),
+        ];
+        let started = std::time::Instant::now();
+
+        let error = runner.output(temp.path(), &args, &[]).await.unwrap_err();
+
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout path exceeded its bounded reap grace"
+        );
+        let parent = std::fs::read_to_string(&parent_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let child = std::fs::read_to_string(&child_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert!(
+            wait_for_process_exit(parent).await,
+            "Git parent survived timeout"
+        );
+        assert!(
+            wait_for_process_exit(child).await,
+            "Git descendant survived timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_git_runner_reaps_before_releasing_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_git = temp.path().join("fake-git");
+        let parent_pid = temp.path().join("parent.pid");
+        let child_pid = temp.path().join("child.pid");
+        write_executable(
+            &fake_git,
+            "#!/bin/sh\n\
+             shift 2\n\
+             printf '%s' \"$$\" > \"$1\"\n\
+             sleep 60 &\n\
+             printf '%s' \"$!\" > \"$2\"\n\
+             wait\n",
+        );
+        let runner = GitRunner::new(&fake_git, Duration::from_secs(30));
+        let args = [
+            parent_pid.clone().into_os_string(),
+            child_pid.clone().into_os_string(),
+        ];
+        let (completion, signal) = BlockingWorkCompletion::pair();
+        let git_dir = temp.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            runner
+                .output_with_completion(&git_dir, &args, &[], Some(signal))
+                .await
+        });
+        assert!(
+            wait_for_path(&child_pid, true).await,
+            "fake Git never started"
+        );
+        let parent = std::fs::read_to_string(&parent_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let child = std::fs::read_to_string(&child_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), completion.wait())
+            .await
+            .expect("cancelled Git child was never reaped")
+            .expect("Git reaper completion waiter failed");
+        assert!(
+            !process_is_alive(parent),
+            "completion was released before the direct Git child was reaped"
+        );
+        assert!(
+            wait_for_process_exit(child).await,
+            "Git descendant survived cancellation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_worktree_add_kills_git_tree_and_schedules_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let fake_git = temp.path().join("fake-git");
+        let registered = repo.join("registered");
+        let parent_pid = repo.join("add-parent.pid");
+        let child_pid = repo.join("add-child.pid");
+        let sandbox_record = repo.join("sandbox.path");
+        write_executable(
+            &fake_git,
+            "#!/bin/sh\n\
+             repo=$2\n\
+             shift 2\n\
+             if [ \"$1:$2\" = 'rev-parse:--show-toplevel' ]; then\n\
+               printf '%s\\n' \"$repo\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1:$2\" = 'worktree:add' ]; then\n\
+               sandbox=$5\n\
+               : > \"$repo/registered\"\n\
+               printf '%s' \"$sandbox\" > \"$repo/sandbox.path\"\n\
+               mkdir -p \"$sandbox\"\n\
+               printf '%s' \"$$\" > \"$repo/add-parent.pid\"\n\
+               sleep 60 &\n\
+               printf '%s' \"$!\" > \"$repo/add-child.pid\"\n\
+               wait\n\
+             fi\n\
+             if [ \"$1:$2\" = 'worktree:remove' ]; then\n\
+               rm -f \"$repo/registered\"\n\
+               rm -rf \"$4\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1:$2\" = 'worktree:prune' ]; then\n\
+               rm -f \"$repo/registered\"\n\
+               exit 0\n\
+             fi\n\
+             exit 2\n",
+        );
+        let runner = GitRunner::new(&fake_git, Duration::from_secs(30));
+        let repo_for_task = repo.clone();
+        let state_for_task = state.clone();
+        let task = tokio::spawn(async move {
+            with_isolated_checkpoint_with_runner(
+                &repo_for_task,
+                "checkpoint-id",
+                &state_for_task,
+                runner,
+                |_| async { Ok(()) },
+            )
+            .await
+        });
+        assert!(
+            wait_for_path(&registered, true).await,
+            "fake Git never registered the worktree"
+        );
+        assert!(wait_for_path(&child_pid, true).await);
+        let parent = std::fs::read_to_string(&parent_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let child = std::fs::read_to_string(&child_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let sandbox = PathBuf::from(std::fs::read_to_string(&sandbox_record).unwrap());
+        let cancelled_at = std::time::Instant::now();
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(1),
+            "dropping the isolated guard blocked on cleanup"
+        );
+        assert!(
+            wait_for_path(&registered, false).await,
+            "recovery did not unregister the interrupted add"
+        );
+        assert!(
+            wait_for_process_exit(parent).await,
+            "worktree-add Git process survived cancellation"
+        );
+        assert!(
+            wait_for_process_exit(child).await,
+            "worktree-add descendant survived cancellation"
+        );
+        assert!(!sandbox.exists(), "interrupted worktree directory survived");
+    }
+
+    #[tokio::test]
+    async fn cancelling_isolated_operation_unregisters_worktree_off_drop_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        sh(
+            &repo,
+            "git init -q && git config user.email t@t && git config user.name t",
+        );
+        std::fs::write(repo.join("value.txt"), "checkpoint\n").unwrap();
+        let checkpoint = create(&repo).await.expect("checkpoint");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let repo_for_task = repo.clone();
+        let state_for_task = state.clone();
+        let task = tokio::spawn(async move {
+            with_isolated_checkpoint(
+                &repo_for_task,
+                &checkpoint,
+                &state_for_task,
+                move |isolated| async move {
+                    let _ = started_tx.send(isolated);
+                    std::future::pending::<Result<()>>().await
+                },
+            )
+            .await
+        });
+        let sandbox = tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("isolated operation did not start")
+            .expect("isolated operation dropped its start signal");
+        let listed_sandbox = sandbox.canonicalize().unwrap();
+        let listed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&listed.stdout).contains(&listed_sandbox.to_string_lossy()[..]),
+            "isolated worktree was not registered before cancellation: {}",
+            String::from_utf8_lossy(&listed.stdout)
+        );
+        let cancelled_at = std::time::Instant::now();
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(1),
+            "guard Drop synchronously waited for worktree cleanup"
+        );
+        let mut unregistered = false;
+        for _ in 0..200 {
+            let listed = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "list", "--porcelain"])
+                .output()
+                .unwrap();
+            if !String::from_utf8_lossy(&listed.stdout)
+                .contains(&listed_sandbox.to_string_lossy()[..])
+                && !sandbox.exists()
+            {
+                unregistered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            unregistered,
+            "cancelled operation left its isolated worktree registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_cleanup_waits_for_detached_materialization_before_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("internal-sandbox");
+        std::fs::create_dir(&sandbox).unwrap();
+        let (completion, signal) = BlockingWorkCompletion::pair();
+        let cleanup = IsolatedCleanup {
+            path: sandbox.clone(),
+            git_repo: None,
+            registered_worktree: false,
+            git: GitRunner::default(),
+            blocking_work: Some(completion.clone()),
+            record_path: None,
+        };
+        let cleanup = tokio::spawn(cleanup_isolated(cleanup));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while completion.waiter_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("isolated cleanup never waited for the materializer");
+        assert!(
+            sandbox.exists(),
+            "cleanup removed the directory while materialization was active"
+        );
+        std::fs::write(
+            sandbox.join("late-object"),
+            b"materialized after cancellation",
+        )
+        .unwrap();
+
+        // In production this signal is owned by the spawn_blocking closure and
+        // drops only after materialize() returns or unwinds.
+        drop(signal);
+        tokio::time::timeout(Duration::from_secs(2), cleanup)
+            .await
+            .expect("isolated cleanup did not finish after materialization")
+            .expect("isolated cleanup task panicked")
+            .expect("isolated cleanup failed");
+        assert!(
+            !sandbox.exists(),
+            "completed materialization sandbox survived cleanup"
+        );
+    }
 
     #[test]
     fn sealed_reference_round_trips_internal_and_git_ids() {

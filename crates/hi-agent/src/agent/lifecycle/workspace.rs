@@ -367,6 +367,7 @@ impl crate::Agent {
                         }
                     }
                 }
+                self.reconcile_abnormal_turn_bounded().await;
                 let outcome = self.finalize_cancelled_turn_inner()?;
                 Ok(crate::TurnCleanupResult {
                     outcome,
@@ -375,7 +376,8 @@ impl crate::Agent {
             }
             crate::TurnCleanupKind::Fail => {
                 let killed = self.take_and_kill_turn_backgrounds();
-                let outcome = self.finalize_failed_turn_inner();
+                let workspace_reconciled = self.reconcile_abnormal_turn_bounded().await;
+                let outcome = self.finalize_failed_turn_inner(workspace_reconciled);
                 Ok(crate::TurnCleanupResult {
                     outcome,
                     killed_backgrounds: killed,
@@ -384,17 +386,82 @@ impl crate::Agent {
         }
     }
 
-    /// Finalize a cancelled turn. Prefer [`Self::cleanup_turn`] so background kill
-    /// and session rollback stay consistent across frontends.
+    /// Legacy synchronous cancelled-turn finalizer.
+    ///
+    /// Use [`Self::cleanup_turn`] so background kill and bounded ledger
+    /// reconciliation stay consistent across frontends. Call
+    /// [`Self::finalize_cancelled_turn_snapshot_only`] only when a deliberately
+    /// incomplete, nonblocking fallback is required.
+    #[deprecated(
+        since = "0.3.1",
+        note = "use async Agent::cleanup_turn; use finalize_cancelled_turn_snapshot_only only for an incomplete nonblocking fallback"
+    )]
     pub fn finalize_cancelled_turn(&mut self) -> Result<crate::TurnOutcome> {
+        let _ = self.take_and_kill_turn_backgrounds();
+        // Preserve the historical public API's ordering and full, blocking
+        // reconciliation for downstream callers while steering new async
+        // frontends to `cleanup_turn`. Truncate before the fallible scan just
+        // as the pre-deprecation implementation did.
+        if let Some(start) = self.workspace.active_turn_message_start.take() {
+            self.truncate_messages(start);
+        }
+        let explicit_baseline = self.workspace.active_turn_ledger_revision;
+        let changes = {
+            let mut ledger = self.runtime.ledger();
+            ledger.reconcile()?;
+            let baseline = explicit_baseline.unwrap_or_else(|| ledger.revision());
+            ledger.changes_since(baseline)
+        };
+        self.workspace.active_turn_ledger_revision = None;
+        self.finalize_cancelled_turn_with_changes(changes)
+    }
+
+    /// Finalize a cancelled turn using only changes already present in the
+    /// ledger. This never starts or waits for a workspace scan, so unobserved
+    /// shell/editor effects may be absent from `TurnOutcome::changed_files`.
+    pub fn finalize_cancelled_turn_snapshot_only(&mut self) -> Result<crate::TurnOutcome> {
         let _ = self.take_and_kill_turn_backgrounds();
         self.finalize_cancelled_turn_inner()
     }
 
-    /// Finalize a failed turn. Prefer [`Self::cleanup_turn`]([`TurnCleanupKind::Fail`]).
+    /// Legacy synchronous failed-turn finalizer.
+    ///
+    /// Use [`Self::cleanup_turn`] with [`TurnCleanupKind::Fail`], which performs
+    /// a bounded scan for otherwise-unobserved shell/editor effects. Call
+    /// [`Self::finalize_failed_turn_snapshot_only`] only when a deliberately
+    /// incomplete, nonblocking fallback is required.
+    #[deprecated(
+        since = "0.3.1",
+        note = "use async Agent::cleanup_turn; use finalize_failed_turn_snapshot_only only for an incomplete nonblocking fallback"
+    )]
     pub fn finalize_failed_turn(&mut self) -> crate::TurnOutcome {
         let _ = self.take_and_kill_turn_backgrounds();
-        self.finalize_failed_turn_inner()
+        // Compatibility wrapper: the legacy method attempted a synchronous
+        // full scan and ignored its error. It also selected the fallback
+        // baseline before that scan, so callers without an explicit active
+        // turn still observed the resulting delta. Keep both behaviors for
+        // external callers; in-tree async paths use bounded cleanup instead.
+        let explicit_baseline = self.workspace.active_turn_ledger_revision.take();
+        let (changes, current_workspace, workspace_reconciled) = {
+            let mut ledger = self.runtime.ledger();
+            let baseline = explicit_baseline.unwrap_or_else(|| ledger.revision());
+            let workspace_reconciled = ledger.reconcile().is_ok();
+            (
+                ledger.changes_since(baseline),
+                Some((ledger.revision(), ledger.workspace_revision())),
+                workspace_reconciled,
+            )
+        };
+        self.finalize_failed_turn_with_changes(changes, workspace_reconciled, current_workspace)
+    }
+
+    /// Finalize a failed turn using only changes already present in the ledger.
+    /// This never starts or waits for a workspace scan or a busy ledger mutex,
+    /// so unobserved shell/editor effects may be absent from
+    /// `TurnOutcome::changed_files`.
+    pub fn finalize_failed_turn_snapshot_only(&mut self) -> crate::TurnOutcome {
+        let _ = self.take_and_kill_turn_backgrounds();
+        self.finalize_failed_turn_inner(false)
     }
 
     /// Restore the checkpoint created by the active turn, if one is still on
@@ -412,7 +479,7 @@ impl crate::Agent {
             return Ok(0);
         }
 
-        let restored_files = self.undo().await?.unwrap_or(0);
+        let restored_files = self.undo_without_ledger_reconcile().await?.unwrap_or(0);
         if self.workspace.checkpoints == checkpoint_refs_before {
             return Ok(restored_files);
         }
@@ -432,13 +499,14 @@ impl crate::Agent {
         if let Some(start) = self.workspace.active_turn_message_start.take() {
             self.truncate_messages(start);
         }
-        self.runtime.ledger().reconcile()?;
-        let baseline = self
-            .workspace
-            .active_turn_ledger_revision
-            .take()
-            .unwrap_or_else(|| self.runtime.ledger().revision());
-        let changes = self.runtime.ledger().changes_since(baseline);
+        let changes = self.take_abnormal_turn_ledger_changes();
+        self.finalize_cancelled_turn_with_changes(changes)
+    }
+
+    fn finalize_cancelled_turn_with_changes(
+        &mut self,
+        changes: Vec<hi_tools::FileChange>,
+    ) -> Result<crate::TurnOutcome> {
         self.workspace.record_changes(changes, true);
         self.report.clear_verify();
         self.workspace.clear_active_baselines();
@@ -459,27 +527,27 @@ impl crate::Agent {
         Ok(outcome)
     }
 
-    fn finalize_failed_turn_inner(&mut self) -> crate::TurnOutcome {
-        let baseline = self
-            .workspace
-            .active_turn_ledger_revision
-            .take()
-            .unwrap_or_else(|| self.runtime.ledger().revision());
-        let workspace_reconciled = self.runtime.ledger().reconcile().is_ok();
-        let (current_revision, current_digest, changes) = {
-            let mut ledger = self.runtime.ledger();
-            (
-                ledger.revision(),
-                ledger.workspace_revision(),
-                ledger.changes_since(baseline),
-            )
-        };
-        let (verification, verified_workspace_revision) = verification_after_turn_failure(
-            &self.report.verify,
-            workspace_reconciled,
-            current_revision,
-            &current_digest,
-        );
+    fn finalize_failed_turn_inner(&mut self, workspace_reconciled: bool) -> crate::TurnOutcome {
+        let (changes, current_workspace) = self.take_abnormal_turn_ledger_snapshot();
+        self.finalize_failed_turn_with_changes(changes, workspace_reconciled, current_workspace)
+    }
+
+    fn finalize_failed_turn_with_changes(
+        &mut self,
+        changes: Vec<hi_tools::FileChange>,
+        workspace_reconciled: bool,
+        current_workspace: Option<(u64, String)>,
+    ) -> crate::TurnOutcome {
+        let (verification, verified_workspace_revision) = current_workspace
+            .map(|(current_revision, current_digest)| {
+                verification_after_turn_failure(
+                    &self.report.verify,
+                    workspace_reconciled,
+                    current_revision,
+                    &current_digest,
+                )
+            })
+            .unwrap_or((crate::VerificationStatus::Unverified, None));
         self.workspace.record_changes(changes, true);
         self.report.clear_verify();
         self.workspace.clear_active_baselines();
@@ -494,6 +562,64 @@ impl crate::Agent {
         outcome.review_same_model = self.skeptic_shares_session_model();
         self.report.set_outcome(outcome.clone());
         outcome
+    }
+
+    /// Reconcile surviving shell/editor changes without allowing abnormal-turn
+    /// cleanup to inherit an unbounded filesystem walk. Dropping the timed
+    /// future signals the blocking worker; the short follow-up wait lets it
+    /// release the ledger mutex but never takes that mutex on this async task.
+    async fn reconcile_abnormal_turn_bounded(&self) -> bool {
+        const RECONCILE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+        const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+        if self.workspace.active_turn_ledger_revision.is_none() {
+            // Setup can be cancelled while its initial reconciliation owns the
+            // ledger, before a turn baseline exists. Dropping that reconcile
+            // future signals its blocking worker, but does not join it. Give
+            // the worker the same bounded release window used below so the
+            // completed cancellation does not leave the next turn racing a
+            // still-unwinding setup scan.
+            let _ = self.runtime.wait_for_ledger_available(RELEASE_GRACE).await;
+            return false;
+        }
+        match tokio::time::timeout(RECONCILE_GRACE, self.runtime.reconcile_ledger_async()).await {
+            Ok(Ok(_)) => return true,
+            Ok(Err(error)) => {
+                eprintln!("hi-agent: abnormal-turn ledger reconciliation failed: {error:#}");
+            }
+            Err(_) => {
+                eprintln!(
+                    "hi-agent: abnormal-turn ledger reconciliation exceeded its {}ms cleanup budget; changed-files reporting may be incomplete",
+                    RECONCILE_GRACE.as_millis()
+                );
+            }
+        }
+        let _ = self.runtime.wait_for_ledger_available(RELEASE_GRACE).await;
+        false
+    }
+
+    fn take_abnormal_turn_ledger_changes(&mut self) -> Vec<hi_tools::FileChange> {
+        self.take_abnormal_turn_ledger_snapshot().0
+    }
+
+    fn take_abnormal_turn_ledger_snapshot(
+        &mut self,
+    ) -> (Vec<hi_tools::FileChange>, Option<(u64, String)>) {
+        let baseline = self.workspace.active_turn_ledger_revision.take();
+        let Some(mut ledger) = self.runtime.try_ledger() else {
+            eprintln!(
+                "hi-agent: ledger remained busy after abnormal-turn cleanup; changed-files reporting may be incomplete"
+            );
+            // `last_file_changes` belongs to the last settled turn until the
+            // new prompt reaches its durable boundary. Reusing it here can
+            // falsely attribute that prior turn's files to an early-cancelled
+            // or failed turn, so an unavailable ledger must fail empty.
+            return (Vec::new(), None);
+        };
+        let baseline = baseline.unwrap_or_else(|| ledger.revision());
+        (
+            ledger.changes_since(baseline),
+            Some((ledger.revision(), ledger.workspace_revision())),
+        )
     }
 
     /// Take the turn background baseline and kill anything started after it.

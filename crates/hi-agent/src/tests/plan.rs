@@ -955,7 +955,7 @@ fn resumed_legacy_plan_session_is_clean_before_first_turn() {
         "{}\nold task index\n{}\n\n\
 You are in PLAN MODE. Do not modify files or run mutating commands.\n\
 Produce a clear plan and wait.\n\nUser request:\ncreate the profiles page\n\n\
-Read-only review guard: use only the currently advertised read-only inspection tools; never invent tool names. Do not write.",
+Read-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer.",
         crate::transcript::CONTEXT_BLOCK_START,
         crate::transcript::CONTEXT_BLOCK_END,
     );

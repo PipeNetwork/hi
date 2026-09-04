@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use hi_tools::{FileChange, FileChangeKind, ToolEffects};
 
@@ -34,7 +35,7 @@ impl PartialEq for FileState {
 
 impl Eq for FileState {}
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LedgerWindow {
     baseline: u64,
     changes: BTreeMap<String, FileChange>,
@@ -84,11 +85,77 @@ pub struct ChangeLedger {
     active_turn_window: Option<LedgerWindow>,
     verification_window: Option<LedgerWindow>,
     /// Background initial workspace scan, launched at construction so it runs
-    /// concurrently with agent/system-prompt setup. `reconcile` and any other
-    /// method that reads `observed` call [`Self::ensure_scan_complete`] first,
-    /// which joins the thread and seeds `observed`. Once consumed this is
-    /// `None` and the ledger behaves exactly as before.
+    /// concurrently with agent/system-prompt setup. Async callers poll it
+    /// without holding the ledger mutex; synchronous snapshot helpers consume
+    /// it only once it is ready. Once consumed this is `None` and the ledger
+    /// behaves exactly as before.
     pending_scan: Option<BackgroundScan>,
+}
+
+/// Fully staged replacement for one reconciliation. Building this may be
+/// expensive, but publishing it only swaps owned collections and scalars.
+pub(crate) struct PreparedReconcile {
+    observed: BTreeMap<String, FileState>,
+    changes: Vec<FileChange>,
+    event: Option<PreparedReconcileEvent>,
+}
+
+struct PreparedReconcileEvent {
+    revision: u64,
+    events: VecDeque<(u64, Vec<FileChange>)>,
+    compacted_through: u64,
+    dropped_events: u64,
+    origin_changes: BTreeMap<String, FileChange>,
+    lifetime_touched_paths: BTreeSet<String>,
+    lifetime_had_mutation: bool,
+    active_turn_window: Option<LedgerWindow>,
+    verification_window: Option<LedgerWindow>,
+    /// Cloned history evicted while staging must not be dropped under the
+    /// ledger mutex after commit ownership has been acquired.
+    discarded_events: Vec<Vec<FileChange>>,
+}
+
+/// State replaced by an O(1) reconciliation commit. The worker releases the
+/// ledger mutex and commit ownership before calling [`Self::discard`].
+pub(crate) struct RetiredReconcile {
+    observed: BTreeMap<String, FileState>,
+    event: Option<RetiredReconcileEvent>,
+}
+
+struct RetiredReconcileEvent {
+    events: VecDeque<(u64, Vec<FileChange>)>,
+    origin_changes: BTreeMap<String, FileChange>,
+    lifetime_touched_paths: BTreeSet<String>,
+    active_turn_window: Option<LedgerWindow>,
+    verification_window: Option<LedgerWindow>,
+    discarded_events: Vec<Vec<FileChange>>,
+}
+
+impl RetiredReconcile {
+    /// Make the intentionally deferred destruction explicit and keep every
+    /// retired field visibly used for dead-code linting.
+    pub(crate) fn discard(self) {
+        let Self { observed, event } = self;
+        drop(observed);
+        if let Some(event) = event {
+            let RetiredReconcileEvent {
+                events,
+                origin_changes,
+                lifetime_touched_paths,
+                active_turn_window,
+                verification_window,
+                discarded_events,
+            } = event;
+            drop((
+                events,
+                origin_changes,
+                lifetime_touched_paths,
+                active_turn_window,
+                verification_window,
+                discarded_events,
+            ));
+        }
+    }
 }
 
 /// A handle to a workspace scan running in a background thread. Launch it as
@@ -101,13 +168,14 @@ pub struct ChangeLedger {
 type ScanResult = Arc<Mutex<Option<Result<BTreeMap<String, FileState>>>>>;
 
 pub struct BackgroundScan {
-    join: std::thread::JoinHandle<()>,
+    join: Option<std::thread::JoinHandle<()>>,
     result: ScanResult,
+    cancellation: CancellationToken,
 }
 
 impl BackgroundScan {
     /// Start scanning `root` (excluding `excluded_roots`) in a background
-    /// thread. The result is available when [`Self::join`] is called.
+    /// thread. The owning ledger consumes the result once the thread finishes.
     pub fn start(
         root: &Path,
         excluded_roots: &[PathBuf],
@@ -118,22 +186,43 @@ impl BackgroundScan {
         let scan_explicit = explicit_paths.clone();
         let result = Arc::new(Mutex::new(None));
         let result_handle = result.clone();
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
         let join = std::thread::Builder::new()
             .name("hi-ledger-scan".into())
             .spawn(move || {
-                let scanned = scan_workspace(&scan_root, &scan_excluded, &scan_explicit, None);
+                let scanned = scan_workspace(
+                    &scan_root,
+                    &scan_excluded,
+                    &scan_explicit,
+                    None,
+                    Some(&worker_cancellation),
+                );
                 // Swallow a poisoned mutex rather than panicking the scan
                 // thread: if the lock is poisoned the result is already lost,
                 // and a panic here would be silently dropped by JoinHandle
                 // (the only signal we'd get is a None result on join). Leaving
-                // the cell as `None` lets `ensure_scan_complete` treat the scan
-                // as failed and fall back to an empty snapshot.
+                // the cell as `None` lets the ledger surface the missing scan
+                // result once the thread is observed as finished.
                 if let Ok(mut slot) = result_handle.lock() {
                     *slot = Some(scanned);
                 }
             })
             .context("spawning ledger scan thread")?;
-        Ok(Self { join, result })
+        Ok(Self {
+            join: Some(join),
+            result,
+            cancellation,
+        })
+    }
+}
+
+impl Drop for BackgroundScan {
+    fn drop(&mut self) {
+        // Dropping a std JoinHandle detaches its thread. Signal the scan first
+        // so a runtime/session dropped during startup does not leave an
+        // unowned workspace walk running indefinitely.
+        self.cancellation.cancel();
     }
 }
 
@@ -153,7 +242,7 @@ impl ChangeLedger {
             .into_iter()
             .collect::<Vec<_>>();
         let explicit_paths = BTreeSet::new();
-        let observed = scan_workspace(&root, &excluded_roots, &explicit_paths, None)?;
+        let observed = scan_workspace(&root, &excluded_roots, &explicit_paths, None, None)?;
         Ok(Self {
             root,
             excluded_roots,
@@ -176,9 +265,9 @@ impl ChangeLedger {
     /// a background thread so it runs concurrently with the rest of agent
     /// startup (system-prompt build, project-context loading, provider
     /// construction). The scan typically completes before the first turn's
-    /// `reconcile` needs the result; if not, `ensure_scan_complete` blocks
-    /// until it does. Tests use the synchronous [`Self::new_with_state`] so the
-    /// initial snapshot is deterministic.
+    /// reconciliation needs the result; if not, the async runtime polls it
+    /// without blocking a worker or the ledger mutex. Tests use the synchronous
+    /// [`Self::new_with_state`] so the initial snapshot is deterministic.
     pub fn new_with_state_background(
         root: impl AsRef<Path>,
         state_root: Option<&Path>,
@@ -260,33 +349,43 @@ impl ChangeLedger {
     /// `refresh_paths` (which overwrites those entries regardless of the initial
     /// scan).
     fn ensure_scan_complete(&mut self) -> Result<()> {
-        self.ensure_scan_complete_inner(false)
+        let _ = self.finish_background_scan_if_ready()?;
+        Ok(())
     }
 
-    pub(crate) fn ensure_scan_complete_blocking(&mut self) -> Result<()> {
-        self.ensure_scan_complete_inner(true)
-    }
-
-    fn ensure_scan_complete_inner(&mut self, wait: bool) -> Result<()> {
+    /// Consume a completed startup scan without ever waiting for its thread.
+    /// Returns `false` while a scan is still running and `true` once there is no
+    /// pending scan. The async runtime polls this method without holding the
+    /// ledger mutex across an await, which keeps turn cancellation responsive.
+    pub(crate) fn finish_background_scan_if_ready(&mut self) -> Result<bool> {
         let Some(scan) = &self.pending_scan else {
-            return Ok(());
+            return Ok(true);
         };
         let ready = scan
             .result
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some();
-        if !wait && !ready {
-            return Ok(());
+        let finished = scan.join.as_ref().is_some_and(|join| join.is_finished());
+        if !ready && !finished {
+            return Ok(false);
         }
-        let scan = self
+        self.consume_finished_background_scan()?;
+        Ok(true)
+    }
+
+    fn consume_finished_background_scan(&mut self) -> Result<()> {
+        let mut scan = self
             .pending_scan
             .take()
-            .expect("pending_scan checked above");
-        // Result is already written; join returns immediately.
-        scan.join
-            .join()
-            .map_err(|_| anyhow::anyhow!("ledger scan thread panicked"))?;
+            .expect("finished background scan checked above");
+        // The result is written before normal thread exit. `is_finished` also
+        // lets us join and surface a panic instead of polling forever when a
+        // scanner exits without writing the result cell.
+        if let Some(join) = scan.join.take() {
+            join.join()
+                .map_err(|_| anyhow::anyhow!("ledger scan thread panicked"))?;
+        }
         let result = scan
             .result
             .lock()
@@ -348,9 +447,11 @@ impl ChangeLedger {
 
     /// The last-reconciled workspace listing as `(relative path, byte length)`,
     /// in path order. Already excludes hard-pruned trees (`target/`,
-    /// `node_modules/`, VCS metadata) — a cheap, current snapshot for callers
-    /// that need "what exists and how big is it" without walking the disk
-    /// (e.g. the goal completion auditor).
+    /// `node_modules/`, VCS metadata). This accessor never waits for the
+    /// background startup scan: until an async reconciliation has consumed that
+    /// scan, the listing contains only state already observed explicitly.
+    /// Turn settlement and the goal auditor reconcile first, so their snapshots
+    /// are complete without making this synchronous accessor a blocking path.
     pub fn observed_files(&mut self) -> Vec<(String, u64)> {
         self.ensure_scan_complete().ok();
         self.observed
@@ -359,7 +460,9 @@ impl ChangeLedger {
             .collect()
     }
 
-    /// Stable digest of the last reconciled workspace state.
+    /// Stable digest of the last-reconciled state currently available. Like
+    /// [`Self::observed_files`], this never waits for a pending startup scan;
+    /// correctness-sensitive callers await reconciliation before reading it.
     pub fn workspace_revision(&mut self) -> String {
         self.ensure_scan_complete().ok();
         let mut hash = Sha256::new();
@@ -401,38 +504,55 @@ impl ChangeLedger {
     /// Detect foreground/background shell, delegate, user, or other external
     /// edits by comparing content digests rather than timestamps.
     pub fn reconcile(&mut self) -> Result<Vec<FileChange>> {
-        self.reconcile_paths(None)
+        let prepared = self.prepare_reconcile_paths(None, None)?;
+        let (changes, retired) = self.commit_prepared_reconcile(prepared);
+        retired.discard();
+        Ok(changes)
     }
 
     /// Reconcile only known dirty paths when the caller has exact mutation
     /// attribution. Unknown shell/editor activity passes `None` and retains the
     /// full-scan correctness fallback.
     pub fn reconcile_dirty_paths(&mut self, paths: &[String]) -> Result<Vec<FileChange>> {
-        self.reconcile_paths(Some(paths))
+        let prepared = self.prepare_reconcile_paths(Some(paths), None)?;
+        let (changes, retired) = self.commit_prepared_reconcile(prepared);
+        retired.discard();
+        Ok(changes)
     }
 
-    fn reconcile_paths(&mut self, paths: Option<&[String]>) -> Result<Vec<FileChange>> {
+    pub(crate) fn prepare_reconcile_cancellable(
+        &mut self,
+        paths: Option<&[String]>,
+        cancellation: &CancellationToken,
+    ) -> Result<PreparedReconcile> {
+        self.prepare_reconcile_paths(paths, Some(cancellation))
+    }
+
+    fn prepare_reconcile_paths(
+        &mut self,
+        paths: Option<&[String]>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<PreparedReconcile> {
+        ensure_scan_active(cancellation)?;
         // If the background initial scan is still running, try to consume its
         // result without blocking. If it's not ready yet, skip the re-scan for
         // this call — the initial scan IS the current state, so there's nothing
         // to diff against anyway. The next `reconcile` (after the scan finishes)
         // will do a proper diff. This keeps startup from blocking on the scan.
-        if let Some(scan) = &self.pending_scan {
-            let ready = scan
-                .result
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_some();
-            if !ready {
-                return Ok(Vec::new());
-            }
+        if !self.finish_background_scan_if_ready()? {
+            return Ok(PreparedReconcile {
+                observed: self.observed.clone(),
+                changes: Vec::new(),
+                event: None,
+            });
         }
-        self.ensure_scan_complete()?;
         let current = if let Some(paths) = paths {
             let mut current = self.observed.clone();
             for relative in paths.iter().map(|path| normalize(path)) {
+                ensure_scan_active(cancellation)?;
                 let absolute = self.root.join(&relative);
-                match read_state(&absolute, self.observed.get(&relative))? {
+                match read_state_cancellable(&absolute, self.observed.get(&relative), cancellation)?
+                {
                     Some(state) => {
                         current.insert(relative, state);
                     }
@@ -448,14 +568,138 @@ impl ChangeLedger {
                 &self.excluded_roots,
                 &self.explicit_paths,
                 Some(&self.observed),
+                cancellation,
             )?
         };
-        let changes = diff_states(&self.observed, &current);
-        self.observed = current;
-        if !changes.is_empty() {
-            self.push_event(changes.clone());
+        ensure_scan_active(cancellation)?;
+        let changes = diff_states(&self.observed, &current, cancellation)?;
+        // Clone and update every potentially large aggregate before commit
+        // ownership is acquired. Cancellation that wins while this staging is
+        // running prevents publication; cancellation that loses waits only for
+        // the constant-size swaps in `commit_prepared_reconcile`.
+        ensure_scan_active(cancellation)?;
+        let event = (!changes.is_empty()).then(|| self.prepare_reconcile_event(&changes));
+        Ok(PreparedReconcile {
+            observed: current,
+            changes,
+            event,
+        })
+    }
+
+    fn prepare_reconcile_event(&self, changes: &[FileChange]) -> PreparedReconcileEvent {
+        let revision = self.revision.saturating_add(1);
+        let mut events = self.events.clone();
+        let mut compacted_through = self.compacted_through;
+        let mut dropped_events = self.dropped_events;
+        let mut origin_changes = self.origin_changes.clone();
+        let mut lifetime_touched_paths = self.lifetime_touched_paths.clone();
+        let mut active_turn_window = self.active_turn_window.clone();
+        let mut verification_window = self.verification_window.clone();
+        for change in changes {
+            lifetime_touched_paths.insert(change.path.clone());
+            merge_change(&mut origin_changes, change.clone());
         }
-        Ok(changes)
+        if let Some(window) = active_turn_window.as_mut() {
+            window.record(revision, changes);
+        }
+        if let Some(window) = verification_window.as_mut() {
+            window.record(revision, changes);
+        }
+        events.push_back((revision, changes.to_vec()));
+        let mut discarded_events = Vec::new();
+        while events.len() > MAX_REVISION_EVENTS {
+            if let Some((event_revision, event_changes)) = events.pop_front() {
+                compacted_through = event_revision;
+                dropped_events = dropped_events.saturating_add(1);
+                discarded_events.push(event_changes);
+            }
+        }
+        PreparedReconcileEvent {
+            revision,
+            events,
+            compacted_through,
+            dropped_events,
+            origin_changes,
+            lifetime_touched_paths,
+            lifetime_had_mutation: true,
+            active_turn_window,
+            verification_window,
+            discarded_events,
+        }
+    }
+
+    /// Last cancellable boundary before the caller arbitrates RUNNING versus
+    /// COMMITTING ownership.
+    pub(crate) fn await_reconcile_commit_ownership(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        #[cfg(test)]
+        wait_for_reconcile_commit_test_gate(&self.root, Some(cancellation))?;
+        ensure_scan_active(Some(cancellation))
+    }
+
+    /// Test-only pause after COMMITTING ownership is acquired. Production has
+    /// no work between ownership arbitration and the O(1) state swap.
+    #[cfg(test)]
+    pub(crate) fn await_owned_reconcile_commit_test_gate(&self) -> Result<()> {
+        wait_for_test_gate(&self.root, None, &OWNED_RECONCILE_COMMIT_TEST_GATES)
+    }
+
+    /// Publish a fully staged reconciliation using only collection/scalar
+    /// swaps. Destruction of the replaced state is returned to the caller.
+    pub(crate) fn commit_prepared_reconcile(
+        &mut self,
+        prepared: PreparedReconcile,
+    ) -> (Vec<FileChange>, RetiredReconcile) {
+        let PreparedReconcile {
+            observed,
+            changes,
+            event,
+        } = prepared;
+        let retired_observed = std::mem::replace(&mut self.observed, observed);
+        let retired_event = event.map(|event| {
+            let PreparedReconcileEvent {
+                revision,
+                events,
+                compacted_through,
+                dropped_events,
+                origin_changes,
+                lifetime_touched_paths,
+                lifetime_had_mutation,
+                active_turn_window,
+                verification_window,
+                discarded_events,
+            } = event;
+            self.revision = revision;
+            self.compacted_through = compacted_through;
+            self.dropped_events = dropped_events;
+            self.lifetime_had_mutation = lifetime_had_mutation;
+            RetiredReconcileEvent {
+                events: std::mem::replace(&mut self.events, events),
+                origin_changes: std::mem::replace(&mut self.origin_changes, origin_changes),
+                lifetime_touched_paths: std::mem::replace(
+                    &mut self.lifetime_touched_paths,
+                    lifetime_touched_paths,
+                ),
+                active_turn_window: std::mem::replace(
+                    &mut self.active_turn_window,
+                    active_turn_window,
+                ),
+                verification_window: std::mem::replace(
+                    &mut self.verification_window,
+                    verification_window,
+                ),
+                discarded_events,
+            }
+        });
+        (
+            changes,
+            RetiredReconcile {
+                observed: retired_observed,
+                event: retired_event,
+            },
+        )
     }
 
     pub fn changes_since(&self, revision: u64) -> Vec<FileChange> {
@@ -614,23 +858,26 @@ fn merge_change(merged: &mut BTreeMap<String, FileChange>, latest: FileChange) {
 fn diff_states(
     before: &BTreeMap<String, FileState>,
     after: &BTreeMap<String, FileState>,
-) -> Vec<FileChange> {
-    let paths: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
-    paths
-        .into_iter()
-        .filter_map(|path| {
-            let old = before.get(path);
-            let new = after.get(path);
-            if old == new {
-                return None;
-            }
-            Some(FileChange {
+    cancellation: Option<&CancellationToken>,
+) -> Result<Vec<FileChange>> {
+    let mut paths = BTreeSet::new();
+    for path in before.keys().chain(after.keys()) {
+        ensure_scan_active(cancellation)?;
+        paths.insert(path);
+    }
+    let mut changes = Vec::new();
+    for path in paths {
+        ensure_scan_active(cancellation)?;
+        let old = before.get(path);
+        let new = after.get(path);
+        if old != new {
+            changes.push(FileChange {
                 path: path.clone(),
                 kind: match (old, new) {
                     (None, Some(_)) => FileChangeKind::Create,
                     (Some(_), None) => FileChangeKind::Delete,
                     (Some(_), Some(_)) => FileChangeKind::Modify,
-                    (None, None) => return None,
+                    (None, None) => continue,
                 },
                 before_digest: old.map(|state| state.digest.clone()),
                 after_digest: new.map(|state| state.digest.clone()),
@@ -638,9 +885,10 @@ fn diff_states(
                 after_len: new.map(|state| state.len),
                 before_mode: old.map(|state| state.mode),
                 after_mode: new.map(|state| state.mode),
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    Ok(changes)
 }
 
 fn scan_workspace(
@@ -648,7 +896,11 @@ fn scan_workspace(
     excluded_roots: &[PathBuf],
     explicit_paths: &BTreeSet<String>,
     previous: Option<&BTreeMap<String, FileState>>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<BTreeMap<String, FileState>> {
+    ensure_scan_active(cancellation)?;
+    #[cfg(test)]
+    wait_for_scan_test_gate(root, cancellation)?;
     let mut states = BTreeMap::new();
     let filter_root = root.to_path_buf();
     let filter_excluded = excluded_roots.to_vec();
@@ -665,6 +917,7 @@ fn scan_workspace(
         .filter_entry(move |entry| !hard_pruned(&filter_root, &filter_excluded, entry.path()))
         .build()
     {
+        ensure_scan_active(cancellation)?;
         let entry = match result {
             Ok(entry) => entry,
             // A concurrent test/editor can remove a directory between the
@@ -710,7 +963,7 @@ fn scan_workspace(
             continue;
         }
         let prior = previous.and_then(|map| map.get(&relative));
-        if let Some(state) = read_state(path, prior)? {
+        if let Some(state) = read_state_cancellable(path, prior, cancellation)? {
             states.insert(relative, state);
         }
     }
@@ -718,12 +971,13 @@ fn scan_workspace(
     // pruned build/dependency tree so a later full reconciliation cannot turn
     // the just-recorded create into a synthetic deletion.
     for relative in explicit_paths {
+        ensure_scan_active(cancellation)?;
         if vcs_relative_path(relative) {
             continue;
         }
         let path = root.join(relative);
         let prior = previous.and_then(|map| map.get(relative));
-        if let Some(state) = read_state(&path, prior)? {
+        if let Some(state) = read_state_cancellable(&path, prior, cancellation)? {
             states.insert(relative.clone(), state);
         } else {
             states.remove(relative);
@@ -733,6 +987,17 @@ fn scan_workspace(
 }
 
 fn read_state(path: &Path, previous: Option<&FileState>) -> Result<Option<FileState>> {
+    read_state_cancellable(path, previous, None)
+}
+
+fn read_state_cancellable(
+    path: &Path,
+    previous: Option<&FileState>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Option<FileState>> {
+    ensure_scan_active(cancellation)?;
+    #[cfg(test)]
+    wait_for_scan_test_gate(path, cancellation)?;
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -774,7 +1039,7 @@ fn read_state(path: &Path, previous: Option<&FileState>) -> Result<Option<FileSt
             mtime_ns,
         }));
     }
-    let (digest, hashed_len) = hash_file_streaming(path)?;
+    let (digest, hashed_len) = hash_file_streaming(path, cancellation)?;
     Ok(Some(FileState {
         digest,
         len: hashed_len,
@@ -783,7 +1048,10 @@ fn read_state(path: &Path, previous: Option<&FileState>) -> Result<Option<FileSt
     }))
 }
 
-fn hash_file_streaming(path: &Path) -> Result<(String, u64)> {
+fn hash_file_streaming(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(String, u64)> {
     use std::io::Read;
     let mut file =
         std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
@@ -791,6 +1059,7 @@ fn hash_file_streaming(path: &Path) -> Result<(String, u64)> {
     let mut buf = [0u8; 64 * 1024];
     let mut hashed_len = 0u64;
     loop {
+        ensure_scan_active(cancellation)?;
         let n = file
             .read(&mut buf)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -801,6 +1070,130 @@ fn hash_file_streaming(path: &Path) -> Result<(String, u64)> {
         hashed_len += n as u64;
     }
     Ok((format!("sha256:{:x}", hasher.finalize()), hashed_len))
+}
+
+fn ensure_scan_active(cancellation: Option<&CancellationToken>) -> Result<()> {
+    ensure!(
+        cancellation.is_none_or(|token| !token.is_cancelled()),
+        "workspace ledger scan cancelled"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) struct ScanTestGate {
+    root: PathBuf,
+    entered: std::sync::atomic::AtomicUsize,
+    exited: std::sync::atomic::AtomicUsize,
+    released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl ScanTestGate {
+    pub(crate) fn entered(&self) -> usize {
+        self.entered.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn exited(&self) -> usize {
+        self.exited.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+static SCAN_TEST_GATES: std::sync::LazyLock<Mutex<Vec<std::sync::Weak<ScanTestGate>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[cfg(test)]
+static RECONCILE_COMMIT_TEST_GATES: std::sync::LazyLock<Mutex<Vec<std::sync::Weak<ScanTestGate>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[cfg(test)]
+static OWNED_RECONCILE_COMMIT_TEST_GATES: std::sync::LazyLock<
+    Mutex<Vec<std::sync::Weak<ScanTestGate>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[cfg(test)]
+pub(crate) fn install_scan_test_gate(root: &Path) -> Arc<ScanTestGate> {
+    install_test_gate(root, &SCAN_TEST_GATES)
+}
+
+#[cfg(test)]
+pub(crate) fn install_reconcile_commit_test_gate(root: &Path) -> Arc<ScanTestGate> {
+    install_test_gate(root, &RECONCILE_COMMIT_TEST_GATES)
+}
+
+#[cfg(test)]
+pub(crate) fn install_owned_reconcile_commit_test_gate(root: &Path) -> Arc<ScanTestGate> {
+    install_test_gate(root, &OWNED_RECONCILE_COMMIT_TEST_GATES)
+}
+
+#[cfg(test)]
+fn install_test_gate(
+    root: &Path,
+    gates: &Mutex<Vec<std::sync::Weak<ScanTestGate>>>,
+) -> Arc<ScanTestGate> {
+    let gate = Arc::new(ScanTestGate {
+        root: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+        entered: std::sync::atomic::AtomicUsize::new(0),
+        exited: std::sync::atomic::AtomicUsize::new(0),
+        released: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut gates = gates
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    gates.retain(|gate| gate.strong_count() > 0);
+    gates.push(Arc::downgrade(&gate));
+    gate
+}
+
+#[cfg(test)]
+fn wait_for_reconcile_commit_test_gate(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<()> {
+    wait_for_test_gate(path, cancellation, &RECONCILE_COMMIT_TEST_GATES)
+}
+
+#[cfg(test)]
+fn wait_for_scan_test_gate(path: &Path, cancellation: Option<&CancellationToken>) -> Result<()> {
+    wait_for_test_gate(path, cancellation, &SCAN_TEST_GATES)
+}
+
+#[cfg(test)]
+fn wait_for_test_gate(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+    gates: &Mutex<Vec<std::sync::Weak<ScanTestGate>>>,
+) -> Result<()> {
+    let comparable_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let gate = {
+        let mut gates = gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gates.retain(|gate| gate.strong_count() > 0);
+        gates
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .find(|gate| comparable_path.starts_with(&gate.root))
+    };
+    let Some(gate) = gate else {
+        return Ok(());
+    };
+    gate.entered
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    while !gate.released.load(std::sync::atomic::Ordering::Acquire)
+        && cancellation.is_none_or(|token| !token.is_cancelled())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    gate.exited
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    ensure_scan_active(cancellation)
 }
 
 fn mtime_as_ns(metadata: &std::fs::Metadata) -> u64 {

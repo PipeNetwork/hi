@@ -3,7 +3,8 @@
 //! Model output is untrusted evidence: each role answers a strict JSON
 //! contract, plans and patches are extracted and validated, patch bytes are
 //! sealed into a content-addressed artifact store, and model-call/token
-//! budgets are consumed against the shared ledger before and after every
+//! call admission is owned by the workflow executor, while provider-reported
+//! token budgets are consumed against the shared ledger after every
 //! invocation. Per docs/adr/001-rsi-runtime-boundary.md only the managed
 //! (noninteractive, descriptor-bound) path may compose this with
 //! `hi_agent_runtime::WorkflowExecutor` — never the interactive loop.
@@ -184,7 +185,6 @@ impl StageModel for ProviderStageModel {
         attempt: u32,
         state: &RunState,
     ) -> Result<StageOutcome> {
-        self.ledger.consume(BudgetKind::ModelCalls, 1)?;
         let request = ChatRequest {
             model: self.model.clone(),
             request_id: Some(format!("rsi-{}-{}-{attempt}", state.run_id, stage.0)),

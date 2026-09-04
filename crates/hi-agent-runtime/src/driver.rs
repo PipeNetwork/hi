@@ -235,11 +235,7 @@ impl<M: StageModel, A: Attestor, G: GateAuthority> TrustedStageDriver for StageD
                 self.checkpoint_dir.display()
             )
         })?;
-        let name = format!(
-            "{:012}-{}.json",
-            checkpoint.created_at_sequence,
-            &hash[..16]
-        );
+        let name = checkpoint_filename(checkpoint, &hash);
         let temp = self.checkpoint_dir.join(format!(".{name}.tmp"));
         let path = self.checkpoint_dir.join(&name);
         std::fs::write(&temp, &bytes)
@@ -254,13 +250,35 @@ impl<M: StageModel, A: Attestor, G: GateAuthority> TrustedStageDriver for StageD
     }
 }
 
+fn checkpoint_filename(checkpoint: &Checkpoint, canonical_hash: &str) -> String {
+    format!(
+        "{:012}-{}.json",
+        checkpoint.created_at_sequence,
+        &canonical_hash[..16]
+    )
+}
+
 /// Load and validate one sealed checkpoint for [`crate::WorkflowExecutor::resume`].
 pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     let bytes =
         std::fs::read(path).with_context(|| format!("reading checkpoint {}", path.display()))?;
     let checkpoint: Checkpoint = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing checkpoint {}", path.display()))?;
-    checkpoint.canonical_hash()?;
+    let hash = checkpoint.canonical_hash()?;
+    let expected_name = checkpoint_filename(&checkpoint, &hash);
+    let actual_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "checkpoint path has no valid UTF-8 filename: {}",
+                path.display()
+            )
+        })?;
+    ensure!(
+        actual_name == expected_name,
+        "checkpoint filename seal mismatch: expected {expected_name}, found {actual_name}"
+    );
     Ok(checkpoint)
 }
 
@@ -296,7 +314,7 @@ mod tests {
     use super::*;
     use crate::{TerminalOutcome, WorkflowExecutor};
     use hi_rsi_runtime::{
-        ArtifactRef, BudgetUsage, EngineeringPlan, RepositoryState, RuntimeBudgets,
+        ArtifactRef, BudgetKind, BudgetUsage, EngineeringPlan, RepositoryState, RuntimeBudgets,
         SharedBudgetLedger, WorkflowGraph,
     };
     use std::collections::{BTreeMap, BTreeSet};
@@ -414,7 +432,7 @@ mod tests {
             output_tokens: 1,
             tool_calls: 100,
             cost_microusd: 1,
-            model_calls: 1,
+            model_calls: 10,
             repair_iterations: 1,
             trace_bytes: 1,
         }
@@ -566,5 +584,72 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resumed, TerminalOutcome::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_filename_seal_rejects_tampered_accounting_and_sequence() {
+        let base = tempfile::tempdir().unwrap();
+        let checkpoint_dir = base.path().join("checkpoints");
+        let harness = driver(&checkpoint_dir, StubModel::default());
+        let mut checkpoint_state = state(base.path());
+        checkpoint_state.attempts.insert(StageId::from("plan"), 2);
+        checkpoint_state
+            .budget
+            .consumed
+            .insert(BudgetKind::ToolCalls, 3);
+        let checkpoint = Checkpoint {
+            schema_version: 1,
+            run_id: checkpoint_state.run_id.clone(),
+            candidate_id: checkpoint_state.candidate_id.clone(),
+            workspace_tree_hash: checkpoint_state.repository.source_tree_hash.clone(),
+            state: checkpoint_state,
+            workflow_position: BTreeSet::from([StageId::from("implement")]),
+            context_manifests: vec![],
+            response_artifacts: vec![],
+            created_at_sequence: 7,
+        };
+        harness.checkpoint(&checkpoint, "test").await.unwrap();
+        let path = std::fs::read_dir(&checkpoint_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .expect("sealed checkpoint file");
+
+        let mut tampered_budget = checkpoint.clone();
+        tampered_budget
+            .state
+            .budget
+            .consumed
+            .insert(BudgetKind::ToolCalls, 0);
+        std::fs::write(&path, serde_json::to_vec_pretty(&tampered_budget).unwrap()).unwrap();
+        let error = latest_checkpoint(&checkpoint_dir)
+            .expect_err("latest checkpoint selection must reject a tampered budget");
+        assert!(error.to_string().contains("filename seal mismatch"));
+
+        let mut tampered_attempts = checkpoint.clone();
+        tampered_attempts
+            .state
+            .attempts
+            .insert(StageId::from("plan"), 1);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&tampered_attempts).unwrap(),
+        )
+        .unwrap();
+        let error = load_checkpoint(&path).expect_err("tampered attempts must invalidate the seal");
+        assert!(error.to_string().contains("filename seal mismatch"));
+
+        let mut tampered_sequence = checkpoint.clone();
+        tampered_sequence.created_at_sequence = 8;
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&tampered_sequence).unwrap(),
+        )
+        .unwrap();
+        let error = load_checkpoint(&path).expect_err("tampered sequence must invalidate the seal");
+        assert!(error.to_string().contains("filename seal mismatch"));
+
+        std::fs::write(&path, serde_json::to_vec_pretty(&checkpoint).unwrap()).unwrap();
+        assert_eq!(load_checkpoint(&path).unwrap(), checkpoint);
     }
 }
