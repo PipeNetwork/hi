@@ -234,9 +234,9 @@ impl Drop for ModelReservation {
         }
     }
 }
-
 #[async_trait]
 impl Provider for ObservedProvider {
+    crate::provider::forward_provider_capabilities!(self, inner);
     async fn stream(
         &self,
         request: ChatRequest,

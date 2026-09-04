@@ -3,7 +3,6 @@
 //! **Trust-boundary policy** (path safety, pack/context budgets, base URL rules)
 //! lives in [`crate::rsi_policy`]. This module must not loosen those checks.
 //! Interactive managed RSI bootstrap is [`crate::rsi_bootstrap`].
-//!
 //! See `docs/adr/001-rsi-runtime-boundary.md`.
 
 use std::{
@@ -474,6 +473,7 @@ impl RsiRemoteProvider {
 
 #[async_trait]
 impl Provider for RsiRemoteProvider {
+    crate::provider::forward_provider_capabilities!(self, inner);
     async fn stream(
         &self,
         request: ChatRequest,

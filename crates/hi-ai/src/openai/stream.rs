@@ -1186,8 +1186,11 @@ fn no_index_tool_call_index(
         .as_ref()
         .and_then(|function| function.arguments.as_deref())
         .unwrap_or("");
-    let current_arguments_complete =
-        !last.arguments.trim().is_empty() && serde_json::from_str::<Value>(&last.arguments).is_ok();
+    let current_arguments_complete = serde_json::from_str::<Value>(&last.arguments).is_ok()
+        || last
+            .cumulative_arguments
+            .as_deref()
+            .is_some_and(|candidate| serde_json::from_str::<Value>(candidate).is_ok());
     if current_arguments_complete
         && (!delta_name.is_empty()
             || delta_arguments.trim_start().starts_with('{')
@@ -1261,6 +1264,7 @@ struct ToolCallBuilder {
     id: String,
     name: String,
     arguments: String,
+    cumulative_arguments: Option<String>,
 }
 
 impl ToolCallBuilder {
@@ -1269,7 +1273,31 @@ impl ToolCallBuilder {
     }
 
     fn merge_arguments(&mut self, fragment: &str) -> usize {
-        merge_stream_fragment(&mut self.arguments, fragment)
+        let previous_candidate = self.cumulative_arguments.as_ref().map_or(0, String::len);
+        // Argument deltas are literal bytes. Even an entire repeated object
+        // prefix can be a valid nested object: `{"x":` + `{"x":` + `1}}`.
+        // Retain the literal stream as authoritative, and keep a separately
+        // budgeted candidate for gateways that resend cumulative snapshots.
+        // Only finalization may choose that candidate, if literal JSON is invalid.
+        if let Some(candidate) = &mut self.cumulative_arguments {
+            if fragment.starts_with(candidate.as_str()) {
+                candidate.push_str(&fragment[candidate.len()..]);
+            } else {
+                candidate.push_str(fragment);
+            }
+        } else if !self.arguments.is_empty()
+            && fragment.trim_start().starts_with('{')
+            && fragment.starts_with(self.arguments.as_str())
+        {
+            self.cumulative_arguments = Some(fragment.to_string());
+        }
+        self.arguments.push_str(fragment);
+        fragment.len().saturating_add(
+            self.cumulative_arguments
+                .as_ref()
+                .map_or(0, String::len)
+                .saturating_sub(previous_candidate),
+        )
     }
 
     fn finish(self, index: usize) -> Content {
@@ -1283,14 +1311,20 @@ impl ToolCallBuilder {
         } else {
             self.id
         };
+        let arguments = if self.arguments.is_empty() {
+            "{}".into()
+        } else if let Some(candidate) = self.cumulative_arguments
+            && serde_json::from_str::<Value>(&self.arguments).is_err()
+            && serde_json::from_str::<Value>(&candidate).is_ok()
+        {
+            candidate
+        } else {
+            self.arguments
+        };
         Content::ToolCall {
             id,
             name: self.name,
-            arguments: if self.arguments.is_empty() {
-                "{}".into()
-            } else {
-                self.arguments
-            },
+            arguments,
         }
     }
 }
@@ -1976,6 +2010,89 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn tool_arguments_preserve_repeated_bytes_at_every_chunk_boundary() {
+        // Exercise both wire formats with repeated source text, nested braces,
+        // and character-sized chunks. Prefix/suffix deduplication corrupts even
+        // valid JSON when a quote or closing brace arrives in its own frame.
+        let arguments = serde_json::json!({
+            "path": "foofoo.rs",
+            "content": "{{ nested }}\n\nlet x = x; x;",
+            "options": {"nested": {"value": "aa"}},
+            "x": {"x": 1}
+        })
+        .to_string();
+        for legacy in [false, true] {
+            for chunk_size in 1..=arguments.len() {
+                let mut events = arguments
+                    .as_bytes()
+                    .chunks(chunk_size)
+                    .enumerate()
+                    .map(|(index, bytes)| {
+                        let mut function = serde_json::json!({
+                            "arguments": std::str::from_utf8(bytes).unwrap()
+                        });
+                        if index == 0 {
+                            function["name"] = serde_json::json!("write");
+                        }
+                        let delta = if legacy {
+                            serde_json::json!({"function_call": function})
+                        } else {
+                            serde_json::json!({"tool_calls": [{
+                                "index": 0,
+                                "function": function
+                            }]})
+                        };
+                        Ok(serde_json::json!({"choices": [{"delta": delta}]}).to_string())
+                    })
+                    .collect::<Vec<Result<String>>>();
+                events.push(Ok("[DONE]".into()));
+                let mut streamed_arguments = String::new();
+                let mut sink = |event: StreamEvent| {
+                    if let StreamEvent::ToolCallDelta {
+                        arguments_delta, ..
+                    } = event
+                    {
+                        streamed_arguments.push_str(&arguments_delta);
+                    }
+                };
+                let completion = collect_completion(stream::iter(events), &mut sink)
+                    .await
+                    .unwrap();
+                let calls = completion.tool_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(
+                    calls[0].arguments, arguments,
+                    "legacy={legacy}, chunk_size={chunk_size}"
+                );
+                assert_eq!(streamed_arguments, arguments);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_nested_object_prefixes_are_literal_argument_deltas() {
+        for fragments in [
+            vec![r#"{"x":"#, r#"{"x":"#, "1}}"],
+            vec![r#"{"x":"#, r#"{"x":1}"#, "}"],
+        ] {
+            let events = fragments.into_iter().enumerate().map(|(index, fragment)| {
+                let mut function = serde_json::json!({"arguments": fragment});
+                if index == 0 {
+                    function["name"] = serde_json::json!("write");
+                }
+                Ok(serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "function": function
+                }]}}]})
+                .to_string())
+            });
+            let completion = collect_completion(stream::iter(events), &mut |_| {})
+                .await
+                .unwrap();
+            assert_eq!(completion.tool_calls()[0].arguments, r#"{"x":{"x":1}}"#);
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn mixed_dsml_and_openai_tool_calls_do_not_leak_protocol_text() {
         let stream = never_ending(vec![
@@ -2028,6 +2145,20 @@ mod tests {
         ]);
         let mut sink = |_: StreamEvent| {};
         let completion = collect_completion(stream, &mut sink).await.unwrap();
+        let calls = completion.tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments, r#"{"path":"a"}"#);
+        assert_eq!(calls[1].arguments, r#"{"path":"b"}"#);
+    }
+
+    #[tokio::test]
+    async fn omitted_index_starts_new_call_after_cumulative_arguments() {
+        let events = stream::iter(vec![
+            Ok(r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#.to_string()),
+            Ok(r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"path\":\"a\"}"}}]}}]}"#.to_string()),
+            Ok(r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"read","arguments":"{\"path\":\"b\"}"}}]}}]}"#.to_string()),
+        ]);
+        let completion = collect_completion(events, &mut |_| {}).await.unwrap();
         let calls = completion.tool_calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].arguments, r#"{"path":"a"}"#);

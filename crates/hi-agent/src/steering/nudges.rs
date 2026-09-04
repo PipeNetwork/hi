@@ -6,7 +6,6 @@ use super::constants::{
     GAP_DEEPEN_NUDGE, IMPLEMENTATION_MISSING_VALIDATION_NUDGE, NO_EVIDENCE_GAP_NUDGE,
     NO_EVIDENCE_REVIEW_NUDGE, NO_EVIDENCE_SECURITY_NUDGE, NO_EVIDENCE_STATUS_NUDGE,
     REVIEW_DEEPEN_NUDGE, SECURITY_DEEPEN_NUDGE, STATUS_DEEPEN_NUDGE,
-    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE,
 };
 use super::intent::contains_any;
 use super::types::{EvidenceTracker, ImplementationTracker, ReviewIntent};
@@ -20,7 +19,9 @@ pub(crate) fn implementation_missing_validation_nudge(tracker: &ImplementationTr
 }
 
 pub(crate) fn implementation_text_tool_nudge(reason: &str) -> String {
-    format!("{reason}\n\n{TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE}")
+    format!(
+        "{reason}\n\nThe next request will describe the plain-text call format from its sealed tool envelope."
+    )
 }
 
 pub(crate) fn answer_says_insufficient_evidence(content: &str) -> bool {

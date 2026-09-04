@@ -5,7 +5,7 @@ use crate::steering::{
     BACKGROUND_WAIT_FINAL_NUDGE, BACKGROUND_WAIT_STATUS_NUDGE, EvidenceTracker,
     IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker, MutationRecovery,
     REREAD_NUDGE, WAIT_POLL_STATIC_NUDGE, bash_call_waits, implementation_text_tool_nudge,
-    tool_validation_retry_nudge,
+    tool_validation_retry_nudge, unavailable_tool_retry_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::ui::Ui;
@@ -15,7 +15,7 @@ use super::super::progress::{
     AWAITING_BACKGROUND_REASON, NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker,
     REPEATED_VALIDATION_DIAGNOSIS_NUDGE, WAITING_ROUND_BUDGET, no_progress_signature_for_calls,
 };
-use super::super::tools::ToolBatchOutcome;
+use super::super::tools::{ToolBatchOutcome, ToolProtocolFailureKind};
 use super::RoundControl;
 
 const COMPLETED_PLAN_TOOL_CLOSEOUT: &str =
@@ -88,9 +88,56 @@ impl crate::Agent {
             let validation_summary = protocol_validation_errors
                 .iter()
                 .take(3)
-                .map(|(tool, error)| format!("{tool}: {error}"))
+                .map(|failure| format!("{}: {}", failure.tool, failure.message))
                 .collect::<Vec<_>>()
                 .join("; ");
+            if protocol_validation_errors
+                .iter()
+                .any(|failure| failure.kind == ToolProtocolFailureKind::EnvelopeIntegrity)
+            {
+                progress_tracker.record(
+                    ProgressKind::None,
+                    "sealed tool envelope failed integrity validation",
+                    None,
+                );
+                *force_tools_next = false;
+                *text_tool_fallback_next = false;
+                ui.status(&format!(
+                    "sealed tool envelope failed integrity validation; stopping tool recovery ({validation_summary})"
+                ));
+                return RoundControl::BreakInner(false);
+            }
+            let unavailable_tools = protocol_validation_errors
+                .iter()
+                .filter(|failure| failure.kind == ToolProtocolFailureKind::UnavailableTool)
+                .map(|failure| failure.tool.as_str())
+                .collect::<Vec<_>>();
+            if !unavailable_tools.is_empty() {
+                if *repeat_nudges < self.config.loop_limits.max_repeat_nudges {
+                    *repeat_nudges += 1;
+                    *force_tools_next = !batch.admitted_tool_names.is_empty();
+                    *text_tool_fallback_next = false;
+                    progress_tracker.force_no_progress_final_answer_next = false;
+                    progress_tracker.prev_added_no_evidence = false;
+                    progress_tracker.prev_call_sig = None;
+                    ui.nudge(&format!(
+                        "the model called a tool outside this request's sealed envelope; retrying with the admitted tool list ({repeat_nudges}/{})",
+                        self.config.loop_limits.max_repeat_nudges,
+                    ));
+                    self.messages.push_nudge(
+                        NudgeKind::Continue,
+                        unavailable_tool_retry_nudge(
+                            &unavailable_tools,
+                            &batch.admitted_tool_names,
+                        ),
+                    );
+                    return RoundControl::Continue;
+                }
+                ui.status(&format!(
+                    "the model kept calling tools outside the sealed envelope ({validation_summary})"
+                ));
+                return RoundControl::BreakInner(false);
+            }
             if *repeat_nudges < self.config.loop_limits.max_repeat_nudges {
                 if !*deepseek_strict_fallback_used
                     && self.config.routing.deepseek_compat != hi_ai::DeepSeekCompat::Off
@@ -110,7 +157,7 @@ impl crate::Agent {
                 let guidance = protocol_validation_errors
                     .iter()
                     .take(3)
-                    .map(|(tool, error)| tool_validation_retry_nudge(tool, error))
+                    .map(|failure| tool_validation_retry_nudge(&failure.tool, &failure.message))
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 ui.nudge(&format!(
@@ -132,7 +179,7 @@ impl crate::Agent {
                 let guidance = protocol_validation_errors
                     .iter()
                     .take(3)
-                    .map(|(tool, error)| tool_validation_retry_nudge(tool, error))
+                    .map(|failure| tool_validation_retry_nudge(&failure.tool, &failure.message))
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 ui.nudge(

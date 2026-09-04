@@ -434,6 +434,58 @@ fn verifier_mutation_is_unstable_and_rolls_back() {
 }
 
 #[test]
+fn independently_verify_candidate_cached_revalidates_corrupt_and_mismatched_records() {
+    let (root, worktree) = candidate_fixture("verify-cache-invalid");
+    std::fs::write(worktree.join("value.txt"), "after\n").unwrap();
+    let cache = root.join(".hi-test-verify-cache");
+    let marker = worktree.join(".hi/allow-verification");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, "allowed").unwrap();
+    let verify = "test -f .hi/allow-verification";
+    independently_verify_candidate_cached(&worktree, "HEAD", verify, &cache, None).unwrap();
+    let entry = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .unwrap();
+    let valid: Value = serde_json::from_slice(&std::fs::read(&entry).unwrap()).unwrap();
+    std::fs::remove_file(&marker).unwrap();
+
+    let mut invalid_records = vec![b"{truncated".to_vec()];
+    for field in ["schema_version", "key", "base", "verify", "fingerprint"] {
+        let mut record = valid.clone();
+        record[field] = Value::Null;
+        invalid_records.push(serde_json::to_vec(&record).unwrap());
+    }
+    for record in invalid_records {
+        std::fs::write(&entry, record).unwrap();
+        let error = independently_verify_candidate_cached(&worktree, "HEAD", verify, &cache, None)
+            .expect_err("an invalid cache entry must rerun the now-failing verifier");
+        assert!(format!("{error:#}").contains("configured verifier"));
+        assert!(!entry.with_extension("lock").exists());
+    }
+
+    // A rerun can repair the invalid cache, and a valid cache hit still works.
+    std::fs::write(&marker, "allowed").unwrap();
+    independently_verify_candidate_cached(&worktree, "HEAD", verify, &cache, None).unwrap();
+    std::fs::remove_file(&marker).unwrap();
+    independently_verify_candidate_cached(&worktree, "HEAD", verify, &cache, None).unwrap();
+
+    let cancel = hi_agent::TurnCancellation::new();
+    cancel.cancel();
+    let error =
+        independently_verify_candidate_cached(&worktree, "HEAD", verify, &cache, Some(cancel))
+            .expect_err("cancellation must take precedence over a valid cached pass");
+    assert!(is_verifier_cancelled(&error));
+
+    hi_tools::worktree::cleanup(&root, &[worktree]);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn independently_verify_candidate_cached_cancel_skips_cache() {
     let original_sandbox = std::env::var_os("HI_SANDBOX");
     unsafe { std::env::set_var("HI_SANDBOX", "off") };

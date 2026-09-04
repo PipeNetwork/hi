@@ -63,6 +63,8 @@ pub(super) async fn capture_child_maybe_timeout(
     let callback: &Mutex<&mut (dyn FnMut(&str) + Send)> = &Mutex::new(on_line);
     let stdout_buf = Mutex::new(BoundedBuffer::default());
     let stderr_buf = Mutex::new(BoundedBuffer::default());
+    let mut stdout_pending = Vec::new();
+    let mut stderr_pending = Vec::new();
 
     let (status, exit_code) = {
         // Race the reap against the pipe drains. A grandchild that inherited
@@ -74,8 +76,8 @@ pub(super) async fn capture_child_maybe_timeout(
         let combined = async {
             let drains = async {
                 tokio::join!(
-                    read_stream(&mut stdout, callback, &stdout_buf),
-                    read_stream(&mut stderr, callback, &stderr_buf),
+                    read_stream(&mut stdout, callback, &stdout_buf, &mut stdout_pending),
+                    read_stream(&mut stderr, callback, &stderr_buf, &mut stderr_pending),
                 );
             };
             let mut drains = std::pin::pin!(drains);
@@ -91,6 +93,15 @@ pub(super) async fn capture_child_maybe_timeout(
         let completed = match timeout {
             Some(timeout) => tokio::time::timeout(timeout, combined).await.ok(),
             None => Some(combined.await),
+        };
+        flush_stream_line(&mut stdout_pending, callback, &stdout_buf);
+        flush_stream_line(&mut stderr_pending, callback, &stderr_buf);
+        // The deadline may have interrupted pipe draining after `wait()`
+        // already reaped the child. Preserve that exit status rather than
+        // reporting a timeout caused only by an inherited pipe.
+        let completed = match completed {
+            None => child.try_wait().context("checking command exit")?.map(Ok),
+            completed => completed,
         };
         match completed {
             Some(Ok(exit)) if exit.success() => (ToolStatus::Succeeded, exit.code()),
@@ -207,6 +218,8 @@ pub(super) async fn capture_child_adoptable(
     let callback: &Mutex<&mut (dyn FnMut(&str) + Send)> = &Mutex::new(on_line);
     let stdout_buf = Mutex::new(BoundedBuffer::default());
     let stderr_buf = Mutex::new(BoundedBuffer::default());
+    let mut stdout_pending = Vec::new();
+    let mut stderr_pending = Vec::new();
 
     let timed_out = {
         // Same wait-vs-drain race as `capture_child`: an inherited-pipe
@@ -215,8 +228,8 @@ pub(super) async fn capture_child_adoptable(
         let combined = async {
             let drains = async {
                 tokio::join!(
-                    read_stream(&mut stdout, callback, &stdout_buf),
-                    read_stream(&mut stderr, callback, &stderr_buf),
+                    read_stream(&mut stdout, callback, &stdout_buf, &mut stdout_pending),
+                    read_stream(&mut stderr, callback, &stderr_buf, &mut stderr_pending),
                 );
             };
             let mut drains = std::pin::pin!(drains);
@@ -229,8 +242,15 @@ pub(super) async fn capture_child_adoptable(
                 _ = &mut drains => wait.await,
             }
         };
-        match tokio::time::timeout(foreground_budget, combined).await {
-            Ok(Ok(exit)) if exit.success() => {
+        let completed = tokio::time::timeout(foreground_budget, combined).await.ok();
+        flush_stream_line(&mut stdout_pending, callback, &stdout_buf);
+        flush_stream_line(&mut stderr_pending, callback, &stderr_buf);
+        let completed = match completed {
+            None => child.try_wait().context("checking command exit")?.map(Ok),
+            completed => completed,
+        };
+        match completed {
+            Some(Ok(exit)) if exit.success() => {
                 drop(group_guard);
                 return Ok(AdoptableOutcome::Completed(build_execution(
                     stdout_buf.into_inner().unwrap_or_default(),
@@ -240,7 +260,7 @@ pub(super) async fn capture_child_adoptable(
                     started,
                 )));
             }
-            Ok(Ok(exit)) => {
+            Some(Ok(exit)) => {
                 drop(group_guard);
                 return Ok(AdoptableOutcome::Completed(build_execution(
                     stdout_buf.into_inner().unwrap_or_default(),
@@ -250,8 +270,8 @@ pub(super) async fn capture_child_adoptable(
                     started,
                 )));
             }
-            Ok(Err(err)) => return Err(err).context("waiting for command"),
-            Err(_) => true,
+            Some(Err(err)) => return Err(err).context("waiting for command"),
+            None => true,
         }
     };
 
@@ -348,6 +368,7 @@ async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     pipe: &mut Option<R>,
     on_line: &Mutex<&mut (dyn FnMut(&str) + Send)>,
     buffer: &Mutex<BoundedBuffer>,
+    line: &mut Vec<u8>,
 ) {
     let Some(pipe) = pipe.as_mut() else { return };
     use tokio::io::AsyncReadExt;
@@ -357,19 +378,9 @@ async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     // long line in chunks prevents a single malicious/noisy record from
     // defeating the total capture cap through an intermediate allocation.
     let mut chunk = [0_u8; 8 * 1024];
-    let mut line = Vec::with_capacity(MAX_STREAM_LINE_BYTES);
-    let emit = |bytes: &[u8]| {
-        if bytes.is_empty() {
-            return;
-        }
-        let text = hi_secrets::redact_secrets(&String::from_utf8_lossy(bytes)).into_owned();
-        if let Ok(mut callback) = on_line.lock() {
-            (*callback)(&text);
-        }
-        if let Ok(mut buffer) = buffer.lock() {
-            buffer.push(&text);
-        }
-    };
+    // Keep pending bytes outside the read future: a deadline can cancel it
+    // between reads, and the caller still needs the final unterminated line
+    // for timeout diagnostics or foreground-to-background adoption.
 
     loop {
         let read = match pipe.read(&mut chunk).await {
@@ -387,16 +398,41 @@ async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
 
             while line.len() > MAX_STREAM_LINE_BYTES {
                 let prefix: Vec<u8> = line.drain(..MAX_STREAM_LINE_BYTES).collect();
-                emit(&prefix);
+                emit_stream_chunk(&prefix, on_line, buffer);
             }
             if newline.is_some() {
-                let complete = std::mem::take(&mut line);
-                emit(&complete);
+                flush_stream_line(line, on_line, buffer);
             }
             start = end;
         }
     }
-    emit(&line);
+    flush_stream_line(line, on_line, buffer);
+}
+
+fn flush_stream_line(
+    line: &mut Vec<u8>,
+    on_line: &Mutex<&mut (dyn FnMut(&str) + Send)>,
+    buffer: &Mutex<BoundedBuffer>,
+) {
+    emit_stream_chunk(line, on_line, buffer);
+    line.clear();
+}
+
+fn emit_stream_chunk(
+    bytes: &[u8],
+    on_line: &Mutex<&mut (dyn FnMut(&str) + Send)>,
+    buffer: &Mutex<BoundedBuffer>,
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    let text = hi_secrets::redact_secrets(&String::from_utf8_lossy(bytes)).into_owned();
+    if let Ok(mut callback) = on_line.lock() {
+        (*callback)(&text);
+    }
+    if let Ok(mut buffer) = buffer.lock() {
+        buffer.push(&text);
+    }
 }
 
 fn char_boundary_at_or_before(text: &str, mut offset: usize) -> usize {

@@ -7,10 +7,7 @@ use hi_ai::{ChatRequest, Completion, ProviderErrorKind, Role, StreamEvent, provi
 use hi_workflow::extract_partial_program_source;
 
 use crate::snapshot::changed_files_between;
-use crate::steering::{
-    EvidenceTracker, ImplementationIntent, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE,
-    tool_protocol_retry_nudge,
-};
+use crate::steering::{EvidenceTracker, ImplementationIntent, tool_protocol_retry_nudge};
 use crate::transcript::NudgeKind;
 use crate::verify::WorkspaceRepairVerifier;
 use crate::{MAX_TOOL_PROTOCOL_RETRIES, Ui};
@@ -217,7 +214,8 @@ impl crate::Agent {
                 }
             }
         };
-        let protocol_retry_nudge = tool_protocol_retry_nudge(&request.tools);
+        let protocol_retry_nudge =
+            tool_protocol_retry_nudge(&request.tools, request.profile.tool_mode);
         let provider_result = self.provider.stream(request, &mut sink).await;
         // A retry, fatal provider error, or a completed non-program response
         // invalidates shadow work. Keeping it alive across a changed request
@@ -517,18 +515,6 @@ impl crate::Agent {
                 ui.status(
                     "structured tool calls kept failing; falling back to plain-text tool-call parsing",
                 );
-                if self
-                    .messages
-                    .as_slice()
-                    .last()
-                    .is_some_and(|message| message.role == Role::User)
-                {
-                    self.messages
-                        .push_user_or_fold(TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE);
-                } else {
-                    self.messages
-                        .push_nudge(NudgeKind::Continue, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE);
-                }
                 Ok(ProviderStreamResult::Continue)
             }
             Err(err)

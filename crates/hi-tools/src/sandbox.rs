@@ -405,7 +405,8 @@ impl SandboxProfile {
 
     /// Wrap a direct executable while preserving `cwd` across Linux
     /// pipe-wrap's private-root setup. macOS and unwrapped commands inherit
-    /// the working directory configured on the spawned process.
+    /// the working directory configured on the spawned process. Explicit
+    /// relative executable paths are resolved against this directory, too.
     pub fn wrap_program_in<I, S>(
         &self,
         program: &OsStr,
@@ -420,7 +421,17 @@ impl SandboxProfile {
             .into_iter()
             .map(|argument| argument.as_ref().to_os_string())
             .collect::<Vec<_>>();
-        let (program, wrapped) = self.wrap_program(program, &args);
+        let program_path = Path::new(program);
+        let program = if program_path.is_relative()
+            && program_path
+                .parent()
+                .is_some_and(|parent| !parent.as_os_str().is_empty())
+        {
+            cwd.join(program_path).into_os_string()
+        } else {
+            program.to_os_string()
+        };
+        let (program, wrapped) = self.wrap_program(&program, &args);
         #[cfg(target_os = "linux")]
         let wrapped = {
             let mut wrapped = wrapped;
@@ -1345,6 +1356,27 @@ mod tests {
 
         assert_eq!(program, OsStr::new("sh"));
         assert_eq!(args, [OsStr::new("-c"), OsStr::new("pwd")]);
+    }
+
+    #[test]
+    fn cwd_aware_wrap_resolves_explicit_relative_executables_in_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        for policy in [SandboxPolicy::Off, SandboxPolicy::Workspace] {
+            let profile = SandboxProfile::new(policy, &[workspace.path()]);
+            for relative in ["./runner", "bin/runner"] {
+                let expected = workspace.path().join(relative).into_os_string();
+                let (program, args) = profile.wrap_program_in(
+                    OsStr::new(relative),
+                    [OsStr::new("--version")],
+                    workspace.path(),
+                );
+                assert!(
+                    program == expected || args.contains(&expected),
+                    "{policy:?} must resolve {relative} against the child's workspace: {program:?} {args:?}"
+                );
+                assert_eq!(args.last().unwrap(), OsStr::new("--version"));
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

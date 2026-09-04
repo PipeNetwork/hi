@@ -12,6 +12,25 @@ use hi_routing::{
 
 use crate::config::{ProviderName, Settings};
 
+// `Provider` defaults are deliberately conservative, so transparent wrappers
+// must forward both the exact declaration and every possible route member.
+macro_rules! forward_provider_capabilities {
+    ($self:ident, $inner:ident) => {
+        fn capabilities(&$self) -> hi_ai::ProviderCapabilities {
+            $self.$inner.capabilities()
+        }
+
+        fn capability_candidates(
+            &$self,
+            route: &str,
+            model: &str,
+        ) -> Vec<hi_ai::ProviderCapabilityCandidate> {
+            $self.$inner.capability_candidates(route, model)
+        }
+    };
+}
+pub(crate) use forward_provider_capabilities;
+
 pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
     // Same string as config files and `--provider` use, so a label can't drift
     // from the name a user is expected to type.
@@ -375,3 +394,7 @@ mod tests {
         assert!(capabilities.modalities.image_input);
     }
 }
+
+#[cfg(test)]
+#[path = "provider_wrapper_tests.rs"]
+mod wrapper_tests;

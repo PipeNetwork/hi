@@ -11,6 +11,9 @@ use crate::types::{
 
 const MAX_STREAM_TOOL_NAME_BYTES: usize = 256;
 const MAX_STREAM_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
+/// Allow gateway-specific trailing usage without waiting indefinitely after a
+/// terminal response when the server leaves its SSE connection open.
+const POST_FINISH_USAGE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 struct StreamAcc {
     text: String,
@@ -69,8 +72,20 @@ pub(crate) async fn collect_completion(
     let mut progressed = false;
     let mut stream_complete = false;
     let mut usage_seen = false;
+    let mut post_finish_deadline = None;
 
-    while let Some(event) = stream.next().await {
+    loop {
+        let next = if stream_complete {
+            let deadline = *post_finish_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + POST_FINISH_USAGE_GRACE);
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            }
+        } else {
+            stream.next().await
+        };
+        let Some(event) = next else { break };
         let event = match event {
             Ok(event) => event,
             Err(err) => {
@@ -179,10 +194,26 @@ pub(crate) async fn collect_completion(
                     }
                 }
             }
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
                 stream_complete = true;
                 if let Some(response) = data.get("response") {
                     ingest_completed(response, &mut acc, &mut completion, &mut usage_seen)?;
+                    if event_type == "response.incomplete"
+                        && let Some(reason) = response
+                            .pointer("/incomplete_details/reason")
+                            .and_then(Value::as_str)
+                    {
+                        // The agent's existing truncation recovery recognizes
+                        // max_tokens, so preserve the provider's terminal cause
+                        // instead of treating partial output as a normal answer.
+                        completion.stop_reason = Some(
+                            match reason {
+                                "max_output_tokens" => "max_tokens",
+                                reason => reason,
+                            }
+                            .to_string(),
+                        );
+                    }
                 } else if let Some(usage) = data.get("usage") {
                     apply_usage(&mut completion, usage);
                     usage_seen = true;
@@ -534,11 +565,113 @@ pub(crate) fn backfill_missing_usage(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use anyhow::Result;
-    use futures_util::stream;
+    use futures_util::{StreamExt, stream};
 
     use super::collect_completion;
-    use crate::types::StreamEvent;
+    use crate::types::{Content, StreamEvent};
+
+    fn event(data: serde_json::Value) -> Result<eventsource_stream::Event> {
+        Ok(eventsource_stream::Event {
+            data: data.to_string(),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_response_without_usage_does_not_wait_for_socket_close() {
+        let events = stream::iter(vec![
+            event(serde_json::json!({"type": "response.output_text.delta", "delta": "done"})),
+            event(serde_json::json!({
+                "type": "response.completed",
+                "response": {"status": "completed"}
+            })),
+        ])
+        .chain(stream::pending());
+        let started = tokio::time::Instant::now();
+        let completion = tokio::time::timeout(
+            Duration::from_secs(3),
+            collect_completion(events, &mut |_| {}),
+        )
+        .await
+        .expect("terminal response must not wait indefinitely for missing usage")
+        .unwrap();
+        assert_eq!(started.elapsed(), super::POST_FINISH_USAGE_GRACE);
+        assert_eq!(completion.stop_reason.as_deref(), Some("completed"));
+        assert!(matches!(&completion.content[0], Content::Text(text) if text == "done"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_usage_grace_is_not_extended_by_heartbeats() {
+        let terminal = stream::iter(vec![event(serde_json::json!({
+            "type": "response.completed", "response": {"status": "completed"}
+        }))]);
+        let heartbeats = stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Some((event(serde_json::json!({"type": "ping"})), ()))
+        });
+        let events = Box::pin(terminal.chain(heartbeats));
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            collect_completion(events, &mut |_| {}),
+        )
+        .await
+        .expect("heartbeats must not keep a terminal response alive")
+        .unwrap();
+        assert_eq!(started.elapsed(), super::POST_FINISH_USAGE_GRACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trailing_usage_after_terminal_response_is_preserved() {
+        let events = stream::iter(vec![
+            event(serde_json::json!({
+                "type": "response.completed", "response": {"status": "completed"}
+            })),
+            event(serde_json::json!({"usage": {"input_tokens": 12, "output_tokens": 8}})),
+        ])
+        .chain(stream::pending());
+        let completion = tokio::time::timeout(
+            Duration::from_secs(3),
+            collect_completion(events, &mut |_| {}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(completion.usage.input_tokens, 12);
+        assert_eq!(completion.usage.output_tokens, 8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_response_preserves_output_usage_and_token_limit_reason() {
+        let events = stream::iter(vec![event(serde_json::json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 20, "output_tokens": 10},
+                "output": [{"type": "message", "content": [{
+                    "type": "output_text", "text": "partial answer"
+                }]}]
+            }
+        }))])
+        .chain(stream::pending());
+        let completion = tokio::time::timeout(
+            Duration::from_secs(3),
+            collect_completion(events, &mut |_| {}),
+        )
+        .await
+        .expect("incomplete is a terminal response too")
+        .unwrap();
+        assert_eq!(completion.stop_reason.as_deref(), Some("max_tokens"));
+        assert_eq!(completion.usage.input_tokens, 20);
+        assert_eq!(completion.usage.output_tokens, 10);
+        assert!(matches!(
+            &completion.content[0], Content::Text(text) if text == "partial answer"
+        ));
+    }
 
     #[tokio::test]
     async fn responses_stream_accepts_more_than_128_parallel_tool_calls() {

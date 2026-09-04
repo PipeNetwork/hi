@@ -191,13 +191,14 @@ fn create_verify_lock(path: &Path, owner: &str) -> std::io::Result<File> {
 
 #[cfg(test)]
 fn acquire_verify_flight(key: &str, cache_path: &Path) -> Result<Option<VerifyFlight>> {
-    acquire_verify_flight_while(key, cache_path, &|| false)
+    acquire_verify_flight_while(key, cache_path, &|| false, &|| false)
 }
 
 fn acquire_verify_flight_while(
     key: &str,
     cache_path: &Path,
     stop: &dyn Fn() -> bool,
+    cache_valid: &dyn Fn() -> bool,
 ) -> Result<Option<VerifyFlight>> {
     let flights = VERIFY_SINGLE_FLIGHT.get_or_init(|| Mutex::new(BTreeSet::new()));
     let lock_path = cache_path.with_extension("lock");
@@ -210,7 +211,7 @@ fn acquire_verify_flight_while(
         if stop() {
             return Err(VerifierCancelled.into());
         }
-        if cache_path.is_file() {
+        if cache_valid() {
             return Ok(None);
         }
         let owns_local = flights
@@ -600,6 +601,9 @@ pub(crate) fn independently_verify_candidate_cached(
     cancellation: Option<hi_agent::TurnCancellation>,
 ) -> Result<CandidateDiff> {
     ensure!(!verify.trim().is_empty(), "candidate verifier is empty");
+    if cancel_requested(cancellation.as_ref()) {
+        return Err(VerifierCancelled.into());
+    }
     let before = staged_candidate_diff(worktree, base)?;
     ensure!(!before.paths.is_empty(), "candidate diff is empty");
     let fingerprint = verification_fingerprint();
@@ -614,20 +618,28 @@ pub(crate) fn independently_verify_candidate_cached(
     key.update(&before.patch);
     let key_hex = format!("{:x}", key.finalize());
     let cache_path = cache_root.join(format!("{key_hex}.json"));
-    if let Ok(raw) = std::fs::read(&cache_path)
-        && let Ok(record) = serde_json::from_slice::<Value>(&raw)
-        && record.get("schema_version").and_then(Value::as_u64) == Some(2)
-        && record.get("key").and_then(Value::as_str) == Some(key_hex.as_str())
-        && record.get("base").and_then(Value::as_str) == Some(base)
-        && record.get("verify").and_then(Value::as_str) == Some(verify)
-        && record.get("fingerprint").and_then(Value::as_str) == Some(fingerprint.as_str())
-    {
-        return Ok(before);
-    }
-    let _flight = acquire_verify_flight_while(&key_hex, &cache_path, &|| {
-        cancel_requested(cancellation.as_ref())
-    })?;
-    if cache_path.is_file() {
+    let cache_valid = || {
+        let Ok(raw) = std::fs::read(&cache_path) else {
+            return false;
+        };
+        let Ok(record) = serde_json::from_slice::<Value>(&raw) else {
+            return false;
+        };
+        record.get("schema_version").and_then(Value::as_u64) == Some(2)
+            && record.get("key").and_then(Value::as_str) == Some(key_hex.as_str())
+            && record.get("base").and_then(Value::as_str) == Some(base)
+            && record.get("verify").and_then(Value::as_str) == Some(verify)
+            && record.get("fingerprint").and_then(Value::as_str) == Some(fingerprint.as_str())
+    };
+    // Waiters must validate the same record as the initial lookup. Mere file
+    // existence can be a corrupt or unrelated entry, never a passing gate.
+    let flight = acquire_verify_flight_while(
+        &key_hex,
+        &cache_path,
+        &|| cancel_requested(cancellation.as_ref()),
+        &cache_valid,
+    )?;
+    if flight.is_none() {
         return Ok(before);
     }
     if cancel_requested(cancellation.as_ref()) {

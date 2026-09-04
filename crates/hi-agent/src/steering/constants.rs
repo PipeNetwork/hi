@@ -189,9 +189,13 @@ pub(crate) const POST_TOOL_EMPTY_RESPONSE_NUDGE: &str = "The previous model resp
 results was empty. Continue from the returned tool output now. If more workspace inspection is \
 needed, use the available tools; otherwise answer or implement the next concrete step. Do not \
 repeat the same read-only calls unless their prior output lacks the needed details.";
-pub(crate) fn tool_protocol_retry_nudge(tools: &[hi_ai::ToolSpec]) -> String {
+pub(crate) fn tool_protocol_retry_nudge(
+    tools: &[hi_ai::ToolSpec],
+    tool_mode: hi_ai::ToolMode,
+) -> String {
     let mut names = tools
         .iter()
+        .filter(|_| !matches!(tool_mode, hi_ai::ToolMode::ChatOnly))
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
     names.sort_unstable();
@@ -224,32 +228,148 @@ pub(crate) fn tool_validation_retry_nudge(tool: &str, error: &str) -> String {
         "The `{tool}` tool call was rejected by client-side schema validation: {error}. Emit a new `{tool}` call with a complete JSON object that satisfies the declared schema. Do not repeat the invalid arguments; include every required property and use the correct JSON types."
     )
 }
-pub(crate) const TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE: &str = "Structured tool calling did not produce \
-an executable tool call in the previous attempts. For this next response only, do not use provider/function tool calling. \
-Emit exactly one plain-text tool call in this XML-ish format and no markdown fences:\n\
-<tool_call>write<arg_key>path</arg_key><arg_value>src/main.rs</arg_value><arg_key>content</arg_key><arg_value>file contents here</arg_value></tool_call>\n\
-For shell commands use:\n\
-<tool_call>bash<arg_key>command</arg_key><arg_value>cargo test</arg_value></tool_call>\n\
-Keep the edit compact; a minimal working vertical slice is better than a huge invalid tool call.";
+
+pub(crate) fn unavailable_tool_retry_nudge(
+    rejected_tools: &[&str],
+    admitted_tools: &[String],
+) -> String {
+    let rejected = rejected_tools
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let availability = admitted_tool_names(admitted_tools.iter().map(String::as_str));
+    format!(
+        "The previous call used {rejected}, which is not admitted by this request's sealed tool \
+envelope. Changing its arguments or spelling it in XML/plain text cannot grant access. {availability} \
+Use one of those admitted tools with its exact JSON schema. If none can perform the task, answer \
+plainly with the limitation instead of emitting another unavailable tool."
+    )
+}
+
+pub(crate) fn tool_protocol_text_fallback_nudge(
+    tools: &[hi_ai::ToolSpec],
+    tool_mode: hi_ai::ToolMode,
+) -> String {
+    if matches!(tool_mode, hi_ai::ToolMode::ChatOnly) || tools.is_empty() {
+        return "The sealed envelope for this request admits no executable tools. Do not emit a \
+structured, JSON, or XML/plain-text tool call; answer in plain text instead."
+            .to_string();
+    }
+    let availability = admitted_tool_names(tools.iter().map(|tool| tool.name.as_str()));
+    let example = xmlish_admitted_tool_example(tools).unwrap_or_else(|| {
+        "Use `<tool_call>ADMITTED_TOOL_NAME` followed by complete `<arg_key>` / `<arg_value>` pairs from that tool's schema and `</tool_call>`.".to_string()
+    });
+    format!(
+        "Structured tool calling did not produce an executable tool call in the previous attempts. \
+For this response only, emit exactly one plain-text call using a tool from the current sealed \
+envelope and no markdown fences. {availability} Here is the XML-ish shape using one of those \
+admitted schemas; replace only the example values with the real arguments you need:\n{example}\n\
+Do not name any tool outside the admitted list. If none fits, answer in plain text."
+    )
+}
+
+fn xmlish_admitted_tool_example(tools: &[hi_ai::ToolSpec]) -> Option<String> {
+    const PREFERRED: &[&str] = &[
+        "apply_patch",
+        "edit",
+        "write",
+        "bash",
+        "read",
+        "grep",
+        "list",
+    ];
+    let tool = PREFERRED
+        .iter()
+        .find_map(|name| tools.iter().find(|tool| tool.name == *name))
+        .or_else(|| tools.first())?;
+    let required = tool
+        .parameters
+        .get("required")
+        .and_then(|value| value.as_array())
+        .or_else(|| {
+            tool.parameters
+                .get("oneOf")?
+                .as_array()?
+                .first()?
+                .get("required")?
+                .as_array()
+        })?;
+    let fields = required
+        .iter()
+        .filter_map(|value| value.as_str())
+        .filter(|key| {
+            tool.parameters["properties"][*key]["type"]
+                .as_str()
+                .is_some_and(|kind| kind == "string")
+        })
+        .collect::<Vec<_>>();
+    if fields.len() != required.len() || fields.is_empty() {
+        return None;
+    }
+    let args = fields
+        .iter()
+        .map(|key| {
+            let value = match *key {
+                "path" => "path/to/file",
+                "command" => "command to run",
+                "pattern" => "search pattern",
+                "patch" => "patch text",
+                "old_string" => "existing text",
+                "new_string" | "content" => "replacement text",
+                _ => "value",
+            };
+            format!("<arg_key>{key}</arg_key><arg_value>{value}</arg_value>")
+        })
+        .collect::<String>();
+    Some(format!("<tool_call>{}{args}</tool_call>", tool.name))
+}
+
+fn admitted_tool_names<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let mut names = names.into_iter().collect::<Vec<_>>();
+    if names.is_empty() {
+        return "No tools are admitted in this request.".to_string();
+    }
+    names.sort_unstable();
+    names.dedup();
+    format!(
+        "The only admitted tool names are: {}.",
+        names
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
 
 #[cfg(test)]
 mod protocol_retry_tests {
     use super::{
-        TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, tool_protocol_retry_nudge, tool_validation_retry_nudge,
+        tool_protocol_retry_nudge, tool_protocol_text_fallback_nudge, tool_validation_retry_nudge,
+        unavailable_tool_retry_nudge,
     };
-    use hi_ai::ToolSpec;
+    use hi_ai::{ToolMode, ToolSpec};
 
     fn tool(name: &str) -> ToolSpec {
+        let field = match name {
+            "read" => "path",
+            "grep" => "pattern",
+            _ => "value",
+        };
         ToolSpec {
             name: name.to_string(),
             description: String::new(),
-            parameters: serde_json::json!({"type": "object"}),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {(field): {"type": "string"}},
+                "required": [field]
+            }),
         }
     }
 
     #[test]
     fn protocol_retry_guidance_only_names_tools_in_the_request() {
-        let nudge = tool_protocol_retry_nudge(&[tool("read"), tool("grep")]);
+        let nudge = tool_protocol_retry_nudge(&[tool("read"), tool("grep")], ToolMode::ReadOnly);
 
         assert!(nudge.contains("`grep`, `read`"));
         assert!(!nudge.contains("`bash`"));
@@ -259,7 +379,7 @@ mod protocol_retry_tests {
 
     #[test]
     fn protocol_retry_guidance_for_tool_free_requests_requires_text() {
-        let nudge = tool_protocol_retry_nudge(&[]);
+        let nudge = tool_protocol_retry_nudge(&[tool("read")], ToolMode::ChatOnly);
 
         assert!(nudge.contains("No tools are available"));
         assert!(nudge.contains("plain text"));
@@ -278,8 +398,33 @@ mod protocol_retry_tests {
     }
 
     #[test]
-    fn text_fallback_does_not_invent_a_provider_rejection() {
-        assert!(TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE.contains("did not produce an executable"));
-        assert!(!TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE.contains("rejected repeatedly by the provider"));
+    fn unavailable_tool_guidance_does_not_prescribe_the_rejected_tool() {
+        let nudge = unavailable_tool_retry_nudge(&["bash"], &["read".to_string()]);
+
+        assert!(nudge.contains("`bash`"));
+        assert!(nudge.contains("not admitted"));
+        assert!(nudge.contains("only admitted tool names are: `read`"));
+        assert!(!nudge.contains("new `bash` call"));
+        assert!(nudge.contains("cannot grant access"));
+    }
+
+    #[test]
+    fn text_fallback_is_derived_from_read_only_admitted_tools() {
+        let nudge =
+            tool_protocol_text_fallback_nudge(&[tool("read"), tool("grep")], ToolMode::ReadOnly);
+
+        assert!(nudge.contains("`grep`, `read`"));
+        assert!(!nudge.contains("`bash`"));
+        assert!(!nudge.contains("`write`"));
+        assert!(nudge.contains("<tool_call>read<arg_key>"));
+    }
+
+    #[test]
+    fn text_fallback_for_chat_only_never_suggests_a_call() {
+        let nudge = tool_protocol_text_fallback_nudge(&[tool("read")], ToolMode::ChatOnly);
+
+        assert!(nudge.contains("admits no executable tools"));
+        assert!(nudge.contains("answer in plain text"));
+        assert!(!nudge.contains("<tool_call>"));
     }
 }

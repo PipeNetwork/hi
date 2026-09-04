@@ -1,5 +1,4 @@
 //! Interactive Outcome routing: cargo mutation turns go to `POST /v1/tasks`.
-//!
 //! Interactive `hi` stays a **client**. Fail open to the inner provider (local
 //! chat, or RSI `/v1/rsi/runs` when `--rsi` is on) when the task plane is
 //! missing. `--rsi-managed` never enters this path.
@@ -701,6 +700,7 @@ fn text_completion(text: &str) -> Completion {
 
 #[async_trait]
 impl Provider for OutcomeRouteProvider {
+    crate::provider::forward_provider_capabilities!(self, inner);
     async fn stream(
         &self,
         request: ChatRequest,

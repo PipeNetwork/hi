@@ -214,6 +214,28 @@ fn is_nudge_text(text: &str) -> bool {
     text.starts_with("[hi:nudge:")
 }
 
+const USER_FOLD_SEPARATOR: &str = "\n\n---\n\n";
+
+/// Append without rebuilding the message from its text projection: image and
+/// other typed blocks remain in their original order.
+fn fold_user_text(message: &mut Message, text: &str) {
+    if let Some(Content::Text(tail)) = message.content.last_mut() {
+        tail.push_str(USER_FOLD_SEPARATOR);
+        tail.push_str(text);
+    } else {
+        message.content.push(Content::Text(text.to_string()));
+    }
+}
+
+fn contains_only_synthetic_nudges(message: &Message) -> bool {
+    message.role == Role::User
+        && !message.content.is_empty()
+        && message.content.iter().all(|content| {
+            matches!(content, Content::Text(text)
+                if text.split(USER_FOLD_SEPARATOR).all(is_nudge_text))
+        })
+}
+
 /// The background handle a `bash_output` call polls (`{"id":"sh_1"}` → `bg_1`).
 pub(crate) fn background_poll_handle(arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
@@ -573,16 +595,7 @@ impl Transcript {
         if let Some(last) = msgs.last_mut()
             && last.role == Role::User
         {
-            // Fold: append the real request to the prior user message.
-            let mut folded = String::new();
-            for c in &last.content {
-                if let Content::Text(t) = c {
-                    folded.push_str(t);
-                    folded.push_str("\n\n---\n\n");
-                }
-            }
-            folded.push_str(&text);
-            last.content = vec![Content::Text(folded)];
+            fold_user_text(last, &text);
         } else {
             msgs.push(Message::user(text));
         }
@@ -1017,9 +1030,9 @@ impl Transcript {
     }
 
     /// Append a synthetic nudge while preserving provider-safe alternation. If
-    /// the previous message is the same nudge kind, replace it; if it is another
-    /// user message, fold this nudge into that message instead of creating
-    /// consecutive user turns.
+    /// the previous message contains only the same synthetic nudge kind,
+    /// replace it; otherwise fold without discarding user text or attachments.
+    /// Interjections are genuine user input and are always retained.
     pub(crate) fn push_nudge_or_fold(&mut self, kind: NudgeKind, text: impl Into<String>) {
         let marker = marker_for(kind);
         let body = text.into();
@@ -1028,24 +1041,15 @@ impl Transcript {
         if let Some(last) = msgs.last_mut()
             && last.role == Role::User
         {
-            if last
-                .content
-                .iter()
-                .any(|c| matches!(c, Content::Text(t) if t.starts_with(marker)))
+            if !matches!(kind, NudgeKind::Interjection | NudgeKind::Btw)
+                && matches!(last.content.as_slice(), [Content::Text(t)]
+                    if t.starts_with(marker) && !t.contains(USER_FOLD_SEPARATOR))
             {
                 last.content = vec![Content::Text(tagged)];
                 return;
             }
 
-            let mut folded = String::new();
-            for c in &last.content {
-                if let Content::Text(t) = c {
-                    folded.push_str(t);
-                    folded.push_str("\n\n---\n\n");
-                }
-            }
-            folded.push_str(&tagged);
-            last.content = vec![Content::Text(folded)];
+            fold_user_text(last, &tagged);
             return;
         }
         msgs.push(Message::user(tagged));
@@ -1074,7 +1078,7 @@ impl Transcript {
         }
         let prior_nudge = idx.checked_sub(1).filter(|&i| {
             let m = &msgs[i];
-            m.role == Role::User
+            contains_only_synthetic_nudges(m)
                 && m.content
                     .iter()
                     .any(|c| matches!(c, Content::Text(t) if t.starts_with(marker)))
@@ -1082,13 +1086,19 @@ impl Transcript {
         if let Some(i) = prior_nudge {
             msgs.truncate(i);
         }
-        msgs.push(Message::user(tagged));
+        if let Some(last) = msgs.last_mut()
+            && last.role == Role::User
+        {
+            fold_user_text(last, &tagged);
+        } else {
+            msgs.push(Message::user(tagged));
+        }
     }
 
     // ---- rollback / reset ----------------------------------------------
 
-    /// Strip trailing synthetic nudge messages (any `Role::User` message whose
-    /// text starts with a known nudge marker). Called at turn end so a failed
+    /// Strip trailing messages containing only synthetic nudges. Folded real
+    /// user text and attachments are retained. Called at turn end so a failed
     /// or interrupted turn doesn't leave a synthetic
     /// user message as the last entry — which would absorb the next real prompt
     /// via [`push_user_or_fold`] and make the model "pick up where it stopped"
@@ -1103,11 +1113,7 @@ impl Transcript {
         // followed by `continue` or `break` (turn ends), so at most one trailing
         // nudge is expected — but loop defensively in case an edge case leaves two.
         while let Some(last) = msgs.last()
-            && last.role == Role::User
-            && last
-                .content
-                .iter()
-                .any(|c| matches!(c, Content::Text(t) if is_nudge_text(t)))
+            && contains_only_synthetic_nudges(last)
         {
             msgs.pop();
         }
@@ -1136,8 +1142,7 @@ impl Transcript {
             .last()
             .map(|m| m.role == Role::Assistant)
             .unwrap_or(false);
-        let finalize_before_recap = msgs[msgs.len() - 2]
-            .role == Role::User
+        let finalize_before_recap = contains_only_synthetic_nudges(&msgs[msgs.len() - 2])
             && msgs[msgs.len() - 2]
                 .content
                 .iter()
@@ -2090,10 +2095,14 @@ Read-only review guard: use only the currently advertised read-only inspection t
     }
 
     #[test]
-    fn replace_last_nudge_appends_when_no_prior() {
+    fn replace_last_nudge_folds_into_user_input_when_no_prior() {
         let mut t = Transcript::new(vec![user("fix it")]);
         t.replace_last_nudge(NudgeKind::Verify { round: 1 }, "first failure");
-        assert_eq!(t.as_slice().len(), 2);
+        assert_eq!(t.as_slice().len(), 1);
+        let text = t.last().unwrap().text();
+        assert!(text.contains("fix it"));
+        assert!(text.contains("first failure"));
+        t.validate_for_provider().unwrap();
     }
 
     #[test]
@@ -2422,6 +2431,129 @@ Read-only review guard: use only the currently advertised read-only inspection t
         let text = t.as_slice().last().unwrap().text();
         assert!(text.contains("second"));
         assert!(!text.contains("first"));
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn folded_user_text_and_retry_nudges_preserve_images() {
+        for nudge in [false, true] {
+            let mut input = user("Use this screenshot to fix the page.");
+            input.content.push(Content::Image {
+                media_type: "image/png".into(),
+                data: "screenshot-bytes".into(),
+            });
+            let mut t = Transcript::new(vec![input]);
+            if nudge {
+                t.push_nudge_or_fold(NudgeKind::Continue, "Retry with a valid tool call.");
+            } else {
+                t.push_user_or_fold("Keep the existing colors.");
+            }
+
+            assert_eq!(t.len(), 1);
+            let last = t.last().unwrap();
+            assert!(matches!(&last.content[1], Content::Image { data, .. }
+                if data == "screenshot-bytes"));
+            assert!(last.text().contains("Use this screenshot"));
+            t.strip_trailing_nudges();
+            assert_eq!(t.len(), 1, "cleanup must preserve the attached user input");
+            t.validate_for_provider().unwrap();
+        }
+    }
+
+    #[test]
+    fn multiple_queued_interjections_are_all_retained() {
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
+        t.push_nudge_or_fold(NudgeKind::Interjection, "Keep the public API stable.");
+        t.push_nudge_or_fold(NudgeKind::Interjection, "Also add a regression test.");
+
+        assert_eq!(t.len(), 3);
+        let text = t.last().unwrap().text();
+        assert!(text.contains("Keep the public API stable."));
+        assert!(text.contains("Also add a regression test."));
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn replacing_a_nudge_preserves_folded_user_steering() {
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
+        t.push_nudge_or_fold(NudgeKind::Continue, "Retry the response.");
+        t.push_nudge_or_fold(NudgeKind::Interjection, "Do not modify the public API.");
+        t.push_nudge_or_fold(NudgeKind::Continue, "Use a different approach.");
+
+        let text = t.last().unwrap().text();
+        assert!(text.contains("Do not modify the public API."));
+        assert!(text.contains("Use a different approach."));
+        t.strip_trailing_nudges();
+        assert_eq!(t.len(), 3, "cleanup must preserve folded user steering");
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn replacing_verify_cycle_preserves_folded_user_steering() {
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
+        t.push_nudge_or_fold(NudgeKind::Verify { round: 1 }, "Verification failed.");
+        t.push_nudge_or_fold(NudgeKind::Interjection, "Keep the public API stable.");
+        t.push_assistant(vec![Content::Text("I updated the implementation.".into())]);
+        t.replace_last_nudge(NudgeKind::Verify { round: 2 }, "Verification still fails.");
+
+        assert_eq!(
+            t.len(),
+            5,
+            "the user steering and its response must survive"
+        );
+        assert!(
+            t.as_slice()[2]
+                .text()
+                .contains("Keep the public API stable.")
+        );
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn strip_finalize_pair_preserves_folded_user_steering() {
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
+        t.push_nudge_or_fold(NudgeKind::Finalize, "Summarize the result.");
+        t.push_nudge_or_fold(
+            NudgeKind::Interjection,
+            "Mention the remaining test failure.",
+        );
+        t.push_assistant(vec![Content::Text("One test still fails.".into())]);
+        t.strip_finalize_pair();
+
+        assert_eq!(t.len(), 4, "the user steering and its answer must survive");
+        assert!(
+            t.as_slice()[2]
+                .text()
+                .contains("Mention the remaining test failure.")
+        );
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn strip_trailing_nudges_preserves_folded_real_user_request() {
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
+        t.push_nudge_or_fold(NudgeKind::Continue, "Retry the response.");
+        t.push_user_or_fold("New request: explain the failing test first.");
+        t.strip_trailing_nudges();
+
+        assert_eq!(t.len(), 3);
+        assert!(
+            t.last()
+                .unwrap()
+                .text()
+                .contains("explain the failing test")
+        );
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn strip_trailing_nudges_removes_folded_synthetic_nudges() {
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
+        t.push_nudge_or_fold(NudgeKind::Verify { round: 1 }, "Verification failed.");
+        t.push_nudge_or_fold(NudgeKind::Continue, "Use a different approach.");
+        t.strip_trailing_nudges();
+
+        assert_eq!(t.len(), 2);
         t.validate_for_provider().unwrap();
     }
 

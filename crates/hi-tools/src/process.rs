@@ -280,7 +280,9 @@ impl ProcessRunner {
         S: AsRef<OsStr>,
     {
         let started = Instant::now();
-        let (wrapped_program, wrapped_args) = self.sandbox.wrap_program(program.as_ref(), args);
+        let (wrapped_program, wrapped_args) =
+            self.sandbox
+                .wrap_program_in(program.as_ref(), args, &self.root);
         let mut command = Command::new(wrapped_program);
         command.args(wrapped_args);
         self.configure(&mut command);
@@ -312,7 +314,9 @@ impl ProcessRunner {
         V: AsRef<OsStr>,
     {
         let started = Instant::now();
-        let (wrapped_program, wrapped_args) = self.sandbox.wrap_program(program.as_ref(), args);
+        let (wrapped_program, wrapped_args) =
+            self.sandbox
+                .wrap_program_in(program.as_ref(), args, &self.root);
         let mut command = Command::new(wrapped_program);
         command.args(wrapped_args);
         self.configure(&mut command);
@@ -343,7 +347,9 @@ impl ProcessRunner {
         V: AsRef<OsStr>,
     {
         let started = Instant::now();
-        let (wrapped_program, wrapped_args) = self.sandbox.wrap_program(program.as_ref(), args);
+        let (wrapped_program, wrapped_args) =
+            self.sandbox
+                .wrap_program_in(program.as_ref(), args, &self.root);
         let mut command = Command::new(wrapped_program);
         command.args(wrapped_args);
         self.configure(&mut command);
@@ -372,7 +378,9 @@ impl ProcessRunner {
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
     {
-        let (wrapped_program, wrapped_args) = self.sandbox.wrap_program(program.as_ref(), args);
+        let (wrapped_program, wrapped_args) =
+            self.sandbox
+                .wrap_program_in(program.as_ref(), args, &self.root);
         let mut command = Command::new(wrapped_program);
         command.args(wrapped_args);
         self.configure(&mut command);
@@ -438,7 +446,9 @@ impl ProcessRunner {
     /// platform enforces it), the command runs confined via the sandbox wrapper
     /// (e.g. `sandbox-exec` on macOS); otherwise it's a plain `sh -c`.
     pub(crate) fn spawn_shell(&self, command: &str) -> Result<tokio::process::Child> {
-        let (program, args) = self.sandbox.wrap(command);
+        let (program, args) =
+            self.sandbox
+                .wrap_program_in(OsStr::new("sh"), ["-c", command], &self.root);
         let mut cmd = Command::new(program);
         cmd.args(args);
         self.configure(&mut cmd);
@@ -491,6 +501,29 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, ToolStatus::TimedOut);
         assert_eq!(run.outcome.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn timeout_retains_unterminated_output_from_both_streams() {
+        let root = tempfile::tempdir().unwrap();
+        let runner =
+            ProcessRunner::new_with_policy(root.path(), crate::sandbox::SandboxPolicy::Off)
+                .unwrap();
+        let mut streamed = String::new();
+        let run = runner
+            .run_shell_streaming(
+                "printf pending-stdout; printf pending-stderr >&2; exec sleep 600",
+                Duration::from_millis(400),
+                &mut |text| streamed.push_str(text),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(run.status, ToolStatus::TimedOut);
+        assert_eq!(run.outcome.stdout_summary, "pending-stdout");
+        assert_eq!(run.outcome.stderr_summary, "pending-stderr");
+        assert!(streamed.contains("pending-stdout"));
+        assert!(streamed.contains("pending-stderr"));
     }
 
     #[tokio::test]
@@ -865,7 +898,7 @@ mod tests {
         let mut sink = |_: &str| {};
         let outcome = runner
             .run_shell_adoptable(
-                "echo seedline; sleep 600",
+                "printf seedline; printf diagnostic >&2; sleep 600",
                 Duration::from_millis(400),
                 &mut sink,
             )
@@ -883,6 +916,11 @@ mod tests {
                 // was defused, so nothing killed it for us).
                 kill_process_group(&running.child);
                 let _ = running.child.kill().await;
+                assert!(
+                    running.partial_output.contains("diagnostic"),
+                    "unterminated stderr survives adoption: {:?}",
+                    running.partial_output
+                );
             }
             AdoptableOutcome::Completed(_) => panic!("a 600s sleep must outlast a 400ms budget"),
         }
@@ -894,10 +932,13 @@ mod tests {
         // detached sleep inherits stdout, so pipe-EOF never arrives on its
         // own. The reap must not wait for EOF — this used to report a
         // full-budget timeout and discard the real exit status.
-        let runner = ProcessRunner::from_current_dir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let runner =
+            ProcessRunner::new_with_policy(root.path(), crate::sandbox::SandboxPolicy::Off)
+                .unwrap();
         let started = Instant::now();
         let exec = runner
-            .run_shell("echo done; sleep 30 &", Duration::from_secs(10))
+            .run_shell("printf done; sleep 30 &", Duration::from_millis(400))
             .await
             .expect("ok");
         assert_eq!(exec.status, ToolStatus::Succeeded);
@@ -908,9 +949,45 @@ mod tests {
             exec.outcome.stdout_summary
         );
         assert!(
-            started.elapsed() < Duration::from_secs(8),
+            started.elapsed() < Duration::from_secs(3),
             "must not burn the budget waiting for the descendant: {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn adoptable_does_not_adopt_exited_children_with_inherited_pipes() {
+        let root = tempfile::tempdir().unwrap();
+        let runner =
+            ProcessRunner::new_with_policy(root.path(), crate::sandbox::SandboxPolicy::Off)
+                .unwrap();
+        for exit_code in [0, 7] {
+            let command = format!("printf done; sleep 30 & exit {exit_code}");
+            let outcome = runner
+                .run_shell_adoptable(&command, Duration::from_millis(400), &mut |_| {})
+                .await
+                .unwrap();
+            match outcome {
+                AdoptableOutcome::Completed(execution) => {
+                    assert_eq!(execution.outcome.exit_code, Some(exit_code));
+                    assert_eq!(
+                        execution.status,
+                        if exit_code == 0 {
+                            ToolStatus::Succeeded
+                        } else {
+                            ToolStatus::Failed
+                        }
+                    );
+                    assert_eq!(execution.outcome.stdout_summary, "done");
+                }
+                AdoptableOutcome::StillRunning(mut running) => {
+                    if let Some(pgid) = running.pgid {
+                        kill_group(pgid);
+                    }
+                    let _ = running.child.kill().await;
+                    panic!("an exited child must not be adopted as still running");
+                }
+            }
+        }
     }
 }

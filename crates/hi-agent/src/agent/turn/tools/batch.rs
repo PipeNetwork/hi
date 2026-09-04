@@ -9,8 +9,8 @@ mod outcome;
 mod policy;
 
 use feedback::{PendingCheck, append_fast_feedback};
-pub(in crate::agent::turn) use outcome::ToolBatchOutcome;
-use outcome::{append_tool_images, emit_capability_request};
+pub(in crate::agent::turn) use outcome::{ToolBatchOutcome, ToolProtocolFailureKind};
+use outcome::{append_tool_images, emit_capability_request, validate_sealed_tool_call};
 use policy::{
     dry_run_message, parked_or_denied_delegate, parked_or_denied_shell,
     terminal_background_requires_reconciliation, wait_flavored_call, workspace_execution_report,
@@ -629,41 +629,35 @@ impl crate::Agent {
                 .map(|(_, (_, _, arguments))| arguments.as_str()),
             tool_envelope.payload.limits.max_tool_argument_bytes as usize,
         )
-        .err();
+        .err()
+        .map(|error| error.to_string());
         for (i, (id, name, arguments)) in calls.iter().enumerate().take(permitted_prefix) {
             if completed[i] {
                 continue;
             }
-            let error = if let Some(error) = envelope_error.clone() {
-                error
-            } else if !tool_envelope.admits(name) {
-                format!(
-                    "tool `{name}` is outside the model request's sealed envelope {}",
-                    tool_envelope.digest
-                )
-            } else if let Some(error) = batch_validation_error.clone() {
-                error.to_string()
-            } else {
-                match hi_ai::validate_client_tool_call_with_limit(
-                    id,
-                    name,
-                    arguments,
-                    tool_specs,
-                    tool_envelope.payload.limits.max_tool_argument_bytes as usize,
-                ) {
-                    Ok(()) => continue,
-                    Err(error) => error.to_string(),
-                }
+            let failure = match validate_sealed_tool_call(
+                envelope_error.as_deref(),
+                batch_validation_error.as_deref(),
+                id,
+                name,
+                arguments,
+                tool_specs,
+                tool_envelope,
+            ) {
+                Ok(()) => continue,
+                Err(failure) => failure,
             };
+            let error = failure.message.clone();
             ui.tool_call_id(id, name, arguments);
             let content = serde_json::json!({
                 "error": {
                     "kind": "tool_protocol_error",
+                    "reason": failure.kind.code(),
                     "message": error.to_string(),
                 }
             })
             .to_string();
-            protocol_validation_errors.push((name.clone(), error.to_string()));
+            protocol_validation_errors.push(failure);
             let output = synthetic_tool_outcome(content.clone(), hi_tools::ToolStatus::Denied);
             emit_tool_output(&mut *ui, id, name, &output);
             let progress_label = ToolProgressLabel::new(
@@ -2409,6 +2403,11 @@ impl crate::Agent {
             interrupted_calls,
             interrupted_coordination_calls,
             protocol_validation_errors,
+            admitted_tool_names: tool_specs
+                .iter()
+                .filter(|tool| tool_envelope.admits(&tool.name))
+                .map(|tool| tool.name.clone())
+                .collect(),
             unknown_background_handles: self.runtime.background().unknown_handles(),
             program_fallback_exhausted: false,
         })
@@ -2693,6 +2692,11 @@ impl crate::Agent {
             interrupted_calls: usize::from(outer_status == hi_tools::ToolStatus::Cancelled),
             interrupted_coordination_calls: 0,
             protocol_validation_errors: Vec::new(),
+            admitted_tool_names: tool_specs
+                .iter()
+                .filter(|tool| tool_envelope.admits(&tool.name))
+                .map(|tool| tool.name.clone())
+                .collect(),
             unknown_background_handles: self.runtime.background().unknown_handles(),
             program_fallback_exhausted,
         })

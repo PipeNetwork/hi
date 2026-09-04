@@ -21,7 +21,7 @@ use crate::steering::{
     REREAD_NUDGE, SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_COMPLETED_FILE_REREAD_RESULT,
     SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT, bash_call_waits,
     bash_no_progress_signature, implementation_text_tool_nudge, inspected_paths_for_prompt,
-    should_nudge_read_after_repeated_search,
+    should_nudge_read_after_repeated_search, tool_protocol_text_fallback_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::{MAX_TOOL_PROTOCOL_RETRIES, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE, Ui};
@@ -334,6 +334,12 @@ impl crate::Agent {
         let request_tools = request_shape.tools.clone();
         let tool_mode = request_shape.tool_mode;
         let requested_request_max_tokens = request_shape.max_output_tokens;
+        if request_text_tool_fallback {
+            self.messages.push_nudge_or_fold(
+                NudgeKind::Continue,
+                tool_protocol_text_fallback_nudge(&request_tools, tool_mode),
+            );
+        }
         let request_tool_schema_tokens = super::model_request::note_advertised_tools(
             &request_tools,
             &mut advertised_tool_names,
@@ -767,11 +773,9 @@ impl crate::Agent {
                     .collect()
             };
 
-        // Fallback for local models (Ollama, llama.cpp, etc.) that emit
-        // tool calls as text — raw JSON like {"name":"bash","arguments":…}
-        // — instead of using the structured `tool_calls` API field. When
-        // the API returned no structured calls, scan the assistant text
-        // for tool-call JSON and promote any matches to real ToolCall
+        // Fallback for local models that emit calls as raw JSON text instead
+        // of the structured field: scan when no native call arrived, then
+        // promote any matches to real ToolCall
         // blocks so they actually execute. The raw JSON is stripped from
         // the recorded text so history stays clean.
         let calls = if calls.is_empty()

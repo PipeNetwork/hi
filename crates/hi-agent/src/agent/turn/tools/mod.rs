@@ -4,4 +4,4 @@
 
 mod batch;
 
-pub(in crate::agent::turn) use batch::ToolBatchOutcome;
+pub(in crate::agent::turn) use batch::{ToolBatchOutcome, ToolProtocolFailureKind};
