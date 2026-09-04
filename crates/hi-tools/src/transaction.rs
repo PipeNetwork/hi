@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,7 +12,19 @@ use sha2::{Digest, Sha256};
 
 use crate::{FileChange, FileChangeKind};
 
+mod paths;
+use paths::canonical_root;
+pub(crate) use paths::{resolve_workspace_target, workspace_display_path};
+
 static TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+#[path = "transaction/path_tests.rs"]
+mod path_tests;
+
+#[cfg(all(test, unix))]
+#[path = "transaction/restore_path_tests.rs"]
+mod restore_path_tests;
 
 /// Per-process random suffix for staged temp-file names. Stage files are
 /// created with `create_new(true)`, which already fails on a pre-existing
@@ -331,7 +343,7 @@ impl MutationPlan {
         let mut seen = HashSet::new();
         let mut changes = Vec::with_capacity(mutations.len());
         for mutation in mutations {
-            let target = resolve_workspace_target(&root, &mutation.path)?;
+            let target = paths::resolve_restore_target(&root, &mutation.path)?;
             ensure!(target != root, "refusing to replace the workspace root");
             ensure!(
                 seen.insert(target.clone()),
@@ -747,102 +759,6 @@ struct Journal {
     phase: JournalPhase,
     active_index: Option<usize>,
     entries: Vec<JournalEntry>,
-}
-
-fn canonical_root(root: &Path) -> Result<PathBuf> {
-    let metadata =
-        fs::metadata(root).with_context(|| format!("reading workspace root {}", root.display()))?;
-    ensure!(
-        metadata.is_dir(),
-        "workspace root is not a directory: {}",
-        root.display()
-    );
-    root.canonicalize()
-        .with_context(|| format!("canonicalizing workspace root {}", root.display()))
-}
-
-pub(crate) fn resolve_workspace_target(root: &Path, requested: &Path) -> Result<PathBuf> {
-    // Callers pass the workspace root in whatever form they hold (the agent
-    // runtime pre-canonicalizes; direct tool entry points like `execute_in`
-    // may not). Canonicalize here so the containment check and the returned
-    // target never depend on caller hygiene.
-    let root = &canonical_root(root)?;
-    let joined = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        root.join(requested)
-    };
-    let lexical = lexical_normalize(&joined);
-    let resolved = canonicalize_nearest(&lexical)?;
-    ensure!(
-        resolved.starts_with(root),
-        "path '{}' is outside workspace {}",
-        requested.display(),
-        root.display()
-    );
-    // Return the path that was actually validated. The lexical form can name
-    // the workspace through a symlink alias (macOS `/var` → `/private/var`,
-    // so any `$TMPDIR` path) — every later containment check compares against
-    // the canonical root and would reject it ("parent escaped workspace"),
-    // failing all mutations in such workspaces. It would also let the write
-    // land on a different file than the one the escape check resolved.
-    Ok(resolved)
-}
-
-/// The workspace-relative display form of a resolved mutation target. Effects
-/// and ledger records must use this — never the caller's verbatim path string
-/// — so a model-supplied alias (`./x`, an absolute path, or a path resolved
-/// through any fallback) can never make the recorded change disagree with the
-/// file that actually changed.
-pub(crate) fn workspace_display_path(root: &Path, target: &Path) -> String {
-    let stripped = canonical_root(root)
-        .ok()
-        .and_then(|canonical| target.strip_prefix(&canonical).ok().map(Path::to_path_buf));
-    match stripped {
-        Some(relative) if !relative.as_os_str().is_empty() => {
-            relative.to_string_lossy().replace('\\', "/")
-        }
-        _ => target.to_string_lossy().into_owned(),
-    }
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::RootDir => out.push(Path::new("/")),
-            Component::Normal(name) => out.push(name),
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-        }
-    }
-    out
-}
-
-fn canonicalize_nearest(path: &Path) -> Result<PathBuf> {
-    let mut ancestor = path;
-    let mut tail = Vec::new();
-    loop {
-        match ancestor.canonicalize() {
-            Ok(mut canonical) => {
-                for part in tail.iter().rev() {
-                    canonical.push(part);
-                }
-                return Ok(canonical);
-            }
-            Err(_) => {
-                if let Some(name) = ancestor.file_name() {
-                    tail.push(name.to_os_string());
-                }
-                ancestor = ancestor
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("cannot resolve path {}", path.display()))?;
-            }
-        }
-    }
 }
 
 fn read_node(path: &Path) -> Result<Option<RestoreNode>> {

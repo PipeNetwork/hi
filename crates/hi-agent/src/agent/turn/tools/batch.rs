@@ -8,6 +8,7 @@ mod feedback;
 mod observations;
 mod outcome;
 mod policy;
+mod program_output;
 
 use feedback::{PendingCheck, append_fast_feedback};
 pub(in crate::agent::turn) use outcome::{ToolBatchOutcome, ToolProtocolFailureKind};
@@ -2563,27 +2564,7 @@ impl crate::Agent {
                 *program_fallback_next = true;
             }
         }
-        let aggregate = match &outcome {
-            ProgramOutcome::Succeeded { result, calls } => serde_json::json!({
-                "status": "succeeded",
-                "result": result,
-                "calls": calls,
-            }),
-            ProgramOutcome::Failed { error, calls } => serde_json::json!({
-                "status": "failed",
-                "error": error,
-                "calls": calls,
-            }),
-            ProgramOutcome::Cancelled { calls } => serde_json::json!({
-                "status": "cancelled",
-                "error": "program cancelled",
-                "calls": calls,
-            }),
-        };
-        let raw = serde_json::to_string(&aggregate).unwrap_or_else(|_| {
-            "{\"status\":\"failed\",\"error\":\"program result was not serializable\"}".into()
-        });
-        let (content, _) = hi_tools::bound_tool_content(raw);
+        let (content, truncation) = program_output::program_output(&outcome);
         if calls.len() != 1 {
             // The provider cannot receive an assistant tool-use without a
             // matching result. Keep only the rejected program envelope in
@@ -2630,7 +2611,8 @@ impl crate::Agent {
             self.checkpoint_durable_workspace_with_execution(execution)
                 .await?;
         }
-        let output = synthetic_tool_outcome(content.clone(), outer_status);
+        let mut output = synthetic_tool_outcome(content.clone(), outer_status);
+        output.truncation = truncation;
         ui.tool_call_id(id, "run_program", arguments);
         emit_tool_output(&mut *ui, id, "run_program", &output);
         let label = ToolProgressLabel::new(

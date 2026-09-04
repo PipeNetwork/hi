@@ -162,3 +162,24 @@ fn stale_idle_approve_does_not_start_execution() {
     assert!(app.plan.is_empty());
     assert!(app.plan_approval.is_none());
 }
+
+#[test]
+fn idle_overlay_key_cannot_approve_a_hidden_plan() {
+    let (_root, mut agent, mut app) = fixture();
+    agent.set_plan_mode(true);
+    app.refresh_goal(&agent);
+    app.open_plan_approval();
+    app.tutorial = Some(crate::tutorial::TutorialOverlay::fresh());
+    let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+    assert_eq!(
+        handle_idle_plan_approval_key(&mut app, &mut agent, &key),
+        None
+    );
+    assert!(agent.plan_mode());
+    assert!(app.plan_approval_capturing());
+    app.tutorial = None;
+    assert_eq!(
+        handle_idle_plan_approval_key(&mut app, &mut agent, &key).as_deref(),
+        Some(hi_agent::PLAN_DRIVE_PROMPT)
+    );
+}

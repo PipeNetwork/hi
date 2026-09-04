@@ -190,7 +190,7 @@ pub(super) fn run_chord_pipeline(app: &mut App, key: &KeyEvent) -> Option<ChordP
         crate::memory_browser::handle_key(app, key);
         return Some(ChordPipeline::Continue);
     }
-    if app.plan_approval_capturing() {
+    if app.plan_approval_visible() {
         return Some(match crate::plan_approval::handle_key(app, key) {
             crate::plan_approval::PlanApprovalOutcome::Continue => ChordPipeline::Continue,
             crate::plan_approval::PlanApprovalOutcome::Park => ChordPipeline::PlanPark,

@@ -9,6 +9,7 @@ use ratatui::prelude::*;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use super::plan_input::handle_working_plan_approval_key;
 use super::{ChordPipeline, reconcile_queue_with_interjections, run_chord_pipeline};
 use crate::event::{ConfirmationControl, UiEvent};
 use crate::{App, TurnState, dim, watchdog_stuck_timeout};
@@ -298,7 +299,9 @@ where
                         app.ask_user_draft.push_str(&text);
                     }
                     Some(Event::Paste(text)) if pending_confirmation.is_none() => {
-                        app.input.insert_str(&text)
+                        if !app.paste_plan_comment(&text) {
+                            app.input.insert_str(&text)
+                        }
                     }
                     Some(Event::Paste(_)) => {}
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
@@ -443,6 +446,9 @@ where
                             }
                             continue;
                         }
+                        if handle_working_plan_approval_key(app, &key) {
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Char('c') if ctrl => {
                                 signal_turn_cancel(app, &mut cancelled);
@@ -522,32 +528,8 @@ where
                                     app.cycle_session_face();
                                     continue;
                                 }
-                                Some(ChordPipeline::PlanApprove) => {
-                                    if app.plan_approval_capturing() && app.plan_has_leftover() {
-                                        app.apply_plan_approve_local();
-                                        let prompt = if app.goal.as_ref().is_some_and(hi_agent::Goal::has_drive_work) {
-                                            hi_agent::GOAL_CONTINUE_PROMPT
-                                        } else {
-                                            hi_agent::PLAN_DRIVE_PROMPT
-                                        };
-                                        let _ = app.enqueue_prompt_front(
-                                            prompt.to_string(),
-                                        );
-                                    }
-                                    continue;
-                                }
-                                Some(ChordPipeline::PlanPark) => {
-                                    app.park_plan_approval_local();
-                                    continue;
-                                }
-                                Some(ChordPipeline::PlanRequestChanges) => {
-                                    app.apply_plan_request_changes_local();
-                                    continue;
-                                }
-                                Some(ChordPipeline::PlanQuit) => {
-                                    app.apply_plan_quit_local();
-                                    continue;
-                                }
+                                Some(ChordPipeline::PlanApprove | ChordPipeline::PlanPark
+                                    | ChordPipeline::PlanRequestChanges | ChordPipeline::PlanQuit) => continue,
                                 None => {}
                             }
                             if let Some(submitted) = app.edit_key(&key) {

@@ -1,5 +1,7 @@
 //! `App` methods: render.
 
+mod overlays;
+
 use hi_agent::{Agent, PlanStatus};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -627,51 +629,7 @@ impl crate::App {
         let _profile = crate::profiling::FrameTimer::begin("session", area);
         let ui_layout = UiLayout::from_width(area.width);
         let metrics = ui_layout.metrics();
-        if let Some(tutorial) = &self.tutorial {
-            crate::tutorial::render(frame, area, tutorial);
-            return;
-        }
-        if let Some(overlay) = &self.workflow_overlay {
-            crate::workflow_tui::render_overlay(frame, area, overlay);
-            return;
-        }
-        if self.inspect_subagent.is_some() {
-            crate::subagent_overlay::render_inspect(frame, area, self);
-            return;
-        }
-        if let Some(overlay) = &self.tasks_overlay {
-            crate::subagent_overlay::render_tasks(frame, area, overlay);
-            return;
-        }
-        if self.block_viewer.is_some() {
-            crate::block_viewer::render(frame, area, self);
-            return;
-        }
-        if let Some(picker) = &self.jump_picker {
-            crate::session_pickers::render_jump(frame, area, picker);
-            return;
-        }
-        if let Some(picker) = &self.rewind_picker {
-            crate::session_pickers::render_rewind(frame, area, picker);
-            return;
-        }
-        if let Some(browser) = &self.memory_browser {
-            crate::memory_browser::render(frame, area, browser);
-            return;
-        }
-        if let Some(overlay) = &self.diff_lab {
-            overlay.render(frame, area);
-            return;
-        }
-        if let Some(overlay) = &self.race {
-            overlay.render(frame, area);
-            return;
-        }
-        // Full-screen diff review overlay (Ctrl-G): takes over the whole screen
-        // with a scrollable, syntax-colored diff and hunk navigation. Rendered
-        // before the normal layout and returned early so it's truly modal.
-        if self.mode.is_review() {
-            self.render_review(frame, area);
+        if self.confirmation.is_none() && self.render_fullscreen_overlay(frame, area) {
             return;
         }
         // Grok-build chrome floats on the canvas: 2-column side inset, a blank
@@ -1419,7 +1377,68 @@ impl crate::App {
         }
 
         // --- Bottom region: a fetch/plan spinner, the model picker, or the input bar. ---
-        if let Some(model) = &self.local_download_confirmation {
+        if let Some(request) = &self.confirmation {
+            let details = request.details();
+            let all = confirmation_lines(request, &details);
+            let options = crate::confirm_overlay::option_lines(self, request);
+            let visible = composer_area
+                .height
+                .saturating_sub(6 + options.len() as u16) as usize;
+            let max_scroll = all.len().saturating_sub(visible.max(1));
+            let scroll = self.confirmation_scroll.min(max_scroll);
+            let is_ask = matches!(request, hi_agent::ConfirmationRequest::AskUser { .. });
+            let mut body = vec![Line::styled(
+                if is_ask {
+                    "The agent needs a decision before it can continue."
+                } else if matches!(request, hi_agent::ConfirmationRequest::External { .. }) {
+                    "This action reaches the network or an external system. Review it before approving."
+                } else {
+                    "This action can change your workspace. Review it before approving."
+                },
+                Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+            )];
+            if is_ask {
+                // Options replace the numbered dump from confirmation_lines.
+                if let hi_agent::ConfirmationRequest::AskUser { question, .. } = request {
+                    body.push(Line::styled(
+                        question.clone(),
+                        Style::default()
+                            .fg(th.text_primary)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    body.push(Line::raw(""));
+                }
+                body.extend(options);
+                body.push(Line::raw(""));
+                body.push(Line::from(vec![
+                    Span::styled("answer: ", dim()),
+                    Span::raw(self.ask_user_draft.clone()),
+                ]));
+            } else {
+                body.extend(all.iter().skip(scroll).take(visible.max(1)).cloned());
+                body.push(Line::raw(""));
+                body.extend(options);
+                if self.confirm_focus == crate::confirm_overlay::ConfirmFocus::Followup {
+                    body.push(Line::raw(""));
+                    body.push(Line::from(vec![
+                        Span::styled("follow-up: ", dim()),
+                        Span::raw(self.ask_user_draft.clone()),
+                    ]));
+                }
+            }
+            let hint = crate::confirm_overlay::hint(
+                request,
+                self.confirm_focus,
+                self.confirmation_waiting,
+            );
+            let block = th
+                .panel_block(request.title(), UiTone::Warning)
+                .title_bottom(Line::styled(hint, dim()));
+            frame.render_widget(
+                Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+                input_area,
+            );
+        } else if let Some(model) = &self.local_download_confirmation {
             let block = th
                 .panel_block(" download local MLX model? ", UiTone::Warning)
                 .title_bottom(
@@ -1528,69 +1547,8 @@ impl crate::App {
                 ),
             ];
             frame.render_widget(Paragraph::new(body).block(block), composer_area);
-        } else if self.plan_approval_capturing() {
+        } else if self.plan_approval_visible() {
             crate::plan_approval::render(frame, composer_area, self);
-        } else if let Some(request) = &self.confirmation {
-            let details = request.details();
-            let all = confirmation_lines(request, &details);
-            let options = crate::confirm_overlay::option_lines(self, request);
-            let visible = composer_area
-                .height
-                .saturating_sub(6 + options.len() as u16) as usize;
-            let max_scroll = all.len().saturating_sub(visible.max(1));
-            let scroll = self.confirmation_scroll.min(max_scroll);
-            let is_ask = matches!(request, hi_agent::ConfirmationRequest::AskUser { .. });
-            let mut body = vec![Line::styled(
-                if is_ask {
-                    "The agent needs a decision before it can continue."
-                } else if matches!(request, hi_agent::ConfirmationRequest::External { .. }) {
-                    "This action reaches the network or an external system. Review it before approving."
-                } else {
-                    "This action can change your workspace. Review it before approving."
-                },
-                Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
-            )];
-            if is_ask {
-                // Options replace the numbered dump from confirmation_lines.
-                if let hi_agent::ConfirmationRequest::AskUser { question, .. } = request {
-                    body.push(Line::styled(
-                        question.clone(),
-                        Style::default()
-                            .fg(th.text_primary)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    body.push(Line::raw(""));
-                }
-                body.extend(options);
-                body.push(Line::raw(""));
-                body.push(Line::from(vec![
-                    Span::styled("answer: ", dim()),
-                    Span::raw(self.ask_user_draft.clone()),
-                ]));
-            } else {
-                body.extend(all.iter().skip(scroll).take(visible.max(1)).cloned());
-                body.push(Line::raw(""));
-                body.extend(options);
-                if self.confirm_focus == crate::confirm_overlay::ConfirmFocus::Followup {
-                    body.push(Line::raw(""));
-                    body.push(Line::from(vec![
-                        Span::styled("follow-up: ", dim()),
-                        Span::raw(self.ask_user_draft.clone()),
-                    ]));
-                }
-            }
-            let hint = crate::confirm_overlay::hint(
-                request,
-                self.confirm_focus,
-                self.confirmation_waiting,
-            );
-            let block = th
-                .panel_block(request.title(), UiTone::Warning)
-                .title_bottom(Line::styled(hint, dim()));
-            frame.render_widget(
-                Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
-                input_area,
-            );
         } else if let Some(started) = self.fetching.or(self.planning) {
             let frame_ch = SPINNER[self.spinner % SPINNER.len()];
             let elapsed = fmt_elapsed(started.elapsed().as_secs());

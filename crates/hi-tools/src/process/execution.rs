@@ -11,6 +11,9 @@ use crate::{ProcessOutcome, ToolStatus, TruncationState};
 use super::ProcessExecution;
 use super::foreground::{ForegroundProcessRegistration, ForegroundProcessRegistry};
 
+#[cfg(all(test, unix))]
+mod policy_tests;
+
 /// Maximum bytes retained from each process stream before the middle is
 /// discarded. The reader continues draining after the cap so a noisy child can
 /// never deadlock on a full pipe.
@@ -250,22 +253,21 @@ pub(super) async fn capture_child_adoptable(
             completed => completed,
         };
         match completed {
-            Some(Ok(exit)) if exit.success() => {
-                drop(group_guard);
-                return Ok(AdoptableOutcome::Completed(build_execution(
-                    stdout_buf.into_inner().unwrap_or_default(),
-                    stderr_buf.into_inner().unwrap_or_default(),
-                    ToolStatus::Succeeded,
-                    exit.code(),
-                    started,
-                )));
-            }
             Some(Ok(exit)) => {
+                // Match the regular foreground path: --keep-background lets
+                // an exited launcher leave its detached service running.
+                if detached_descendants_preserved() {
+                    group_guard.defuse();
+                }
                 drop(group_guard);
                 return Ok(AdoptableOutcome::Completed(build_execution(
                     stdout_buf.into_inner().unwrap_or_default(),
                     stderr_buf.into_inner().unwrap_or_default(),
-                    ToolStatus::Failed,
+                    if exit.success() {
+                        ToolStatus::Succeeded
+                    } else {
+                        ToolStatus::Failed
+                    },
                     exit.code(),
                     started,
                 )));

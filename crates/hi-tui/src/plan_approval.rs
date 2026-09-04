@@ -284,6 +284,32 @@ impl App {
         self.plan_approval.as_ref().is_some_and(|p| !p.parked)
     }
 
+    /// Input must target the surface actually rendered. A completed draft can
+    /// open its card while a full-screen overlay or tool question is still up.
+    /// Keep the approval gate pending, but never accept a hidden plan decision.
+    pub(crate) fn plan_approval_visible(&self) -> bool {
+        self.plan_approval_capturing()
+            && self.confirmation.is_none()
+            && self.tutorial.is_none()
+            && self.workflow_overlay.is_none()
+            && self.inspect_subagent.is_none()
+            && self.tasks_overlay.is_none()
+            && self.block_viewer.is_none()
+            && self.jump_picker.is_none()
+            && self.rewind_picker.is_none()
+            && self.memory_browser.is_none()
+            && self.diff_lab.is_none()
+            && self.race.is_none()
+            && !self.mode.is_review()
+            && self.local_download_confirmation.is_none()
+            && self.local_directory_prompt.is_none()
+            && self.local_picker.is_none()
+            && !((self.local_startup_blocked || self.local_startup_error.is_some())
+                && self.provider_picker.is_none()
+                && self.provider_form.is_none()
+                && self.picker.is_none())
+    }
+
     /// Reopen a parked card. Returns `true` only for the transition, so repeated
     /// `/view-plan` dispatches cannot consume or emit the unpark twice.
     pub(crate) fn unpark_plan_approval(&mut self) -> bool {
@@ -313,6 +339,24 @@ impl App {
         self.session_face_dirty = true;
         self.status = "plan approval parked — /view-plan".into();
         self.trace_approval_decided("plan", "parked");
+    }
+
+    /// Bracketed paste belongs to the visible comment editor, just like typed
+    /// characters. Keep a parked card from consuming the main composer's paste.
+    pub(crate) fn paste_plan_comment(&mut self, text: &str) -> bool {
+        if !self.plan_approval_visible() {
+            return false;
+        }
+        let Some(card) = self
+            .plan_approval
+            .as_mut()
+            .filter(|card| !card.parked && card.focus == PlanApprovalFocus::Commenting)
+        else {
+            return false;
+        };
+        card.comment_draft
+            .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        true
     }
 
     pub(crate) fn park_plan_approval(&mut self, agent: &mut Agent) {

@@ -30,6 +30,7 @@ mod mutation_recovery;
 mod outcome;
 mod pipefs_command_gate;
 mod plan;
+mod program_results;
 mod protocol_import_lint;
 mod retry;
 mod scheduler;

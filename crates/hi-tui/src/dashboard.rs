@@ -46,6 +46,8 @@ use crate::render::dim;
 use crate::theme::UiTone;
 use crate::{App, FleetLauncher, SPINNER};
 
+mod merge_check;
+
 /// Lines of output kept per row for the peek/attach panels.
 const TAIL_CAP: usize = 200;
 /// Max table rows shown before the list scrolls with the selection.
@@ -409,7 +411,7 @@ pub(crate) enum RowDone {
     Turn { ok: bool, killed: bool },
     /// The off-thread merge check finished (diff vs base + verify verdict).
     MergeCheck {
-        changed: Vec<String>,
+        changed: Result<Vec<String>, String>,
         verified: bool,
     },
     /// The verified worktree diff was applied to the real workspace.
@@ -2331,18 +2333,7 @@ fn finish_turn(
     let base = row.base.clone();
     let verify = launcher.verify.clone();
     in_flight.push(Box::pin(async move {
-        let check_path = worktree_path.clone();
-        let changed =
-            tokio::task::spawn_blocking(move || worktree::changed_files(&check_path, &base))
-                .await
-                .unwrap_or_default();
-        let verified = match &verify {
-            Some(verify) if !changed.is_empty() => {
-                worktree::verify_passes_async(&worktree_path, verify, None).await
-            }
-            _ => true,
-        };
-        (idx, RowDone::MergeCheck { changed, verified })
+        (idx, merge_check::check(worktree_path, base, verify).await)
     }));
 }
 
@@ -2493,12 +2484,16 @@ fn coerce_structured_output(value: serde_json::Value) -> serde_json::Value {
 fn finish_merge_check(
     app: &mut App,
     idx: usize,
-    changed: Vec<String>,
+    changed: Result<Vec<String>, String>,
     verified: bool,
     launcher: &FleetLauncher,
     line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) {
+    let changed = match changed {
+        Ok(changed) => changed,
+        Err(error) => return merge_check::finish_failure(app, idx, error),
+    };
     if app
         .fleet
         .get(idx)
@@ -2939,21 +2934,10 @@ fn queue_force_merge(
     row.activity = "force merging…".to_string();
     row.attention = false;
     in_flight.push(Box::pin(async move {
-        let check_path = worktree_path.clone();
-        let check_base = base.clone();
-        let changed =
-            tokio::task::spawn_blocking(move || worktree::changed_files(&check_path, &check_base))
-                .await
-                .unwrap_or_default();
-        let result = if changed.is_empty() {
-            Ok(())
-        } else {
-            worktree::apply_changes_to_async(&worktree_path, &base, &destination, None)
-                .await
-                .map(|_| ())
-                .map_err(|error| format!("{error:#}"))
-        };
-        (idx, RowDone::ForceMerge { changed, result })
+        (
+            idx,
+            merge_check::force(worktree_path, base, destination).await,
+        )
     }));
     None
 }
@@ -3833,7 +3817,7 @@ mod tests {
         }
     }
 
-    fn row() -> FleetRow {
+    pub(super) fn row() -> FleetRow {
         FleetRow {
             id: 1,
             title: "test".into(),
@@ -4145,7 +4129,7 @@ mod tests {
         finish_merge_check(
             &mut app,
             0,
-            vec!["sensitive.txt".into()],
+            Ok(vec!["sensitive.txt".into()]),
             true,
             &launcher,
             &line_tx,

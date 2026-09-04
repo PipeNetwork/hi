@@ -27,6 +27,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::FleetLauncher;
 
+mod fix_inspection;
+
 /// Leave a child enough time to verify and persist after an explicitly
 /// configured soft turn deadline. Ordinary loop work has no wall-clock cap.
 const CHILD_SETTLEMENT_GRACE_SECS: u64 = 60;
@@ -1732,12 +1734,7 @@ async fn run_fix(
     if cancellation.is_cancelled() {
         return ("cancelled".into(), false);
     }
-    let wt = std::env::temp_dir().join(format!(
-        "hi-loopfix-{}-{}-{}",
-        std::process::id(),
-        spec.id,
-        base.chars().take(12).collect::<String>()
-    ));
+    let wt = fix_inspection::worktree_path(spec.id, &base);
     let setup_root = root.clone();
     let setup_wt = wt.clone();
     let setup_base = base.clone();
@@ -1798,13 +1795,10 @@ async fn run_fix(
 
     let has_verify = launcher.verify.is_some();
     // Ground-truth re-verify of the final worktree state before any merge.
-    let wt_for_check = wt.clone();
-    let base_for_check = base.clone();
-    let changed = tokio::task::spawn_blocking(move || {
-        worktree::changed_files(&wt_for_check, &base_for_check)
-    })
-    .await
-    .unwrap_or_default();
+    let changed = match fix_inspection::inspect(&wt, &base).await {
+        Ok(changed) => changed,
+        Err(result) => return result,
+    };
     let verified = if completed && !changed.is_empty() {
         match launcher.verify.as_deref() {
             Some(verify) => worktree::verify_passes_async(&wt, verify, Some(&cancellation)).await,

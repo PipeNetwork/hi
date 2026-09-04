@@ -7,6 +7,7 @@ mod drive;
 mod helpers;
 #[cfg(test)]
 mod plan_approval_tests;
+mod plan_input;
 mod queue;
 mod turn_execution;
 
@@ -16,6 +17,7 @@ pub(crate) use drive::drive;
 pub(crate) use helpers::search_transcript;
 use helpers::{ChordPipeline, expand_file_mentions, run_chord_pipeline, run_shell_escape_async};
 pub(crate) use helpers::{handle_normal_mode, review_next_hunk};
+use plan_input::handle_idle_plan_approval_key;
 use queue::reconcile_queue_with_interjections;
 use turn_execution::run_agent_turn;
 
@@ -26,7 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::{
     EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers,
+    KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
@@ -109,47 +111,6 @@ fn dequeue_ready_prompt(app: &mut App, agent: &Agent) -> Option<String> {
         }
     }
     None
-}
-
-/// Handle approval before composer completion or any other idle key handler.
-/// Draft text and queued prompts are left intact until the user decides.
-fn handle_idle_plan_approval_key(
-    app: &mut App,
-    agent: &mut Agent,
-    key: &KeyEvent,
-) -> Option<String> {
-    if !app.plan_approval_capturing() {
-        return None;
-    }
-    match crate::plan_approval::handle_key(app, key) {
-        crate::plan_approval::PlanApprovalOutcome::Approve => {
-            if !app.plan_has_leftover() || !agent.plan_incomplete() {
-                app.refresh_goal(agent);
-                return None;
-            }
-            if app.apply_plan_approve(agent) {
-                agent
-                    .explicit_goal_drive_decision()
-                    .prompt()
-                    .map(str::to_string)
-            } else {
-                None
-            }
-        }
-        crate::plan_approval::PlanApprovalOutcome::Park => {
-            app.park_plan_approval(agent);
-            None
-        }
-        crate::plan_approval::PlanApprovalOutcome::RequestChanges => {
-            app.apply_plan_request_changes(agent);
-            None
-        }
-        crate::plan_approval::PlanApprovalOutcome::Quit => {
-            app.apply_plan_quit(agent);
-            None
-        }
-        crate::plan_approval::PlanApprovalOutcome::Continue => None,
-    }
 }
 
 pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
@@ -656,7 +617,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 };
                 if let Event::Key(key) = &event
                     && key.kind == KeyEventKind::Press
-                    && app.plan_approval_capturing()
+                    && app.plan_approval_visible()
                 {
                     if let Some(prompt) = handle_idle_plan_approval_key(&mut app, agent, key) {
                         break 'input prompt;
@@ -700,7 +661,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     // or the main input line. Without this, a paste while the
                     // form is open silently went into the hidden main input.
                     Event::Paste(text) => {
-                        if let Some(form) = app.provider_form.as_mut() {
+                        if app.paste_plan_comment(&text) {
+                            continue 'input;
+                        } else if let Some(form) = app.provider_form.as_mut() {
                             form.insert_str(&text);
                         } else if let Some(path) = app.local_directory_prompt.as_mut() {
                             path.push_str(&text);
