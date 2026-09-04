@@ -201,7 +201,7 @@ pub use process::{
     AdoptableOutcome, ForegroundProcessRegistry, ProcessExecution, ProcessRunner, RunningChild,
     preserve_detached_descendants,
 };
-pub use read::read_output_invites_paging;
+pub use read::{read_output_invites_paging, read_regular_file_bytes_bounded};
 pub use repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
 /// True when a Pipe research API key is installed for this process.
 pub fn research_credentials_configured() -> bool {
@@ -437,13 +437,11 @@ impl ToolOutcome {
         }
     }
 
-    /// A `read` page. Pages stay under the dedicated read budget (not the
-    /// shared ~5k cap). [`bound_tool_content`] preserves numbered pages in that
-    /// budget; the paging footer is the truncation signal for incomplete files.
-    pub(crate) fn plain_read(content: String, source_bytes: u64) -> Self {
+    /// A read page with explicit clipping metadata from the bounded renderer.
+    pub(crate) fn plain_read(content: String, source_bytes: u64, truncated: bool) -> Self {
         let retained_bytes = content.len() as u64;
         let mut outcome = Self::plain(content);
-        if crate::read::read_output_invites_paging(&outcome.content) {
+        if truncated {
             outcome.truncation = TruncationState::Truncated {
                 original_bytes: source_bytes.max(retained_bytes.saturating_add(1)),
                 retained_bytes,

@@ -248,8 +248,7 @@ impl crate::Agent {
             ));
         };
         let mut recent = source[split..].to_vec();
-        let head = recent[0].text();
-        recent[0] = Message::user(fold_reference_summary_into_user(&summary, &head));
+        fold_reference_summary_into_user(&summary, &mut recent[0]);
         let mut messages = Vec::with_capacity(recent.len() + 1);
         messages.push(self.system_message());
         messages.extend(recent);
@@ -284,8 +283,7 @@ impl crate::Agent {
         let mut recent = working[split..].to_vec();
         let had_summary = summary.is_some();
         if let Some(summary) = summary {
-            let head = recent[0].text();
-            recent[0] = Message::user(fold_reference_summary_into_user(&summary, &head));
+            fold_reference_summary_into_user(&summary, &mut recent[0]);
         }
         let mut messages = Vec::with_capacity(1 + old.len() + recent.len());
         messages.push(self.system_message());

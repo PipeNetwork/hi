@@ -31,82 +31,7 @@ pub(crate) struct RequestAttempt {
     pub(crate) output_token_fallback: bool,
 }
 
-/// Given the attempt that just failed (at `current`) and its error, the index of
-/// the next attempt to try — the one whose degradation actually addresses this
-/// error — or `None` to stop and surface the error. Tool rejection is never
-/// downgraded to chat-only: a coding-agent turn that advertised tools cannot
-/// reliably complete after losing workspace access.
-pub(crate) fn next_degraded_attempt(
-    attempts: &[RequestAttempt],
-    current: usize,
-    kind: ProviderErrorKind,
-    text: &str,
-) -> Option<usize> {
-    let cur = attempts[current];
-    let after = current + 1;
-    if cur.strict_fallback {
-        return None;
-    }
-    if cur.output_token_parameter != OutputTokenParameter::Auto
-        && !cur.output_token_fallback
-        && is_unsupported_output_token_text(text)
-    {
-        return attempts[after..]
-            .iter()
-            .position(|a| {
-                a.output_token_fallback
-                    && a.include_usage == cur.include_usage
-                    && a.include_tools == cur.include_tools
-                    && a.include_frequency_penalty == cur.include_frequency_penalty
-                    && a.strict_tools == cur.strict_tools
-                    && a.deepseek_thinking == cur.deepseek_thinking
-            })
-            .map(|i| after + i);
-    }
-    if cur.strict_tools && is_deepseek_strict_schema_text(text) {
-        return attempts[after..]
-            .iter()
-            // Preserve earlier degradations. For example, if the provider
-            // already rejected `stream_options`, the strict-schema fallback
-            // must not re-add it and pay for another avoidable 400.
-            .position(|a| {
-                !a.strict_tools
-                    && a.include_tools
-                    && a.include_usage == cur.include_usage
-                    && a.include_frequency_penalty == cur.include_frequency_penalty
-            })
-            .map(|i| after + i);
-    }
-    // Usage streaming rejected → retry without it (keeping tools).
-    if cur.include_usage && mentions(text, &["stream_options", "include_usage"]) {
-        return attempts[after..]
-            .iter()
-            .position(|a| !a.include_usage)
-            .map(|i| after + i);
-    }
-    // frequency_penalty rejected (xAI: "does not support parameter frequencyPenalty")
-    // → retry without it. Keep tools and stream_options.
-    if cur.include_frequency_penalty && is_unsupported_frequency_penalty_text(text) {
-        return attempts[after..]
-            .iter()
-            .position(|a| !a.include_frequency_penalty)
-            .map(|i| after + i);
-    }
-    // Tool schema rejected → fail fast. Use `--tool-mode chat-only` for an
-    // explicit no-tools request.
-    if cur.include_tools
-        && matches!(
-            kind,
-            ProviderErrorKind::UnsupportedTools | ProviderErrorKind::UnsupportedRequestShape
-        )
-    {
-        return None;
-    }
-    // Provider/transport failures never justify mutating and replaying the
-    // payload against the same route. The outer route/fallback policy may move
-    // to another compatible backend when the typed error permits it.
-    None
-}
+pub(crate) use super::compatibility::next_degraded_attempt;
 
 /// Return the separate one-shot thinking-disabled attempt for a gateway that
 /// rejects or strips DeepSeek reasoning fields. This intentionally is not part
@@ -351,7 +276,7 @@ pub(crate) fn deepseek_compatibility_hint(text: &str) -> Option<&'static str> {
 }
 
 /// xAI returns camelCase (`frequencyPenalty`); OpenAI-style wording uses snake_case.
-fn is_unsupported_frequency_penalty_text(text: &str) -> bool {
+pub(super) fn is_unsupported_frequency_penalty_text(text: &str) -> bool {
     mentions(
         text,
         &["frequency_penalty", "frequencypenalty", "frequency penalty"],

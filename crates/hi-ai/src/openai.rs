@@ -7,8 +7,12 @@
 //! [`stream`]; this module holds the [`OpenAiProvider`] struct and its
 //! [`Provider`] impl, which wires the two together.
 
+mod compatibility;
+#[cfg(test)]
+mod compatibility_tests;
 mod deepseek;
 mod request;
+mod retry_usage;
 mod stream;
 mod thinking_tags;
 
@@ -49,6 +53,7 @@ pub struct OpenAiProvider {
     /// compatibility retry. This is intentionally process-local: a stale
     /// persisted capability must never suppress the bounded probe.
     output_token_cache: Arc<Mutex<HashMap<String, OutputTokenParameter>>>,
+    compatibility_cache: compatibility::CompatibilityCache,
     x402: Option<X402Session>,
     #[cfg(test)]
     capability_base_url: Option<String>,
@@ -76,6 +81,7 @@ impl OpenAiProvider {
             deepseek_strict_cache: Arc::new(Mutex::new(HashMap::new())),
             deepseek_thinking_cache: Arc::new(Mutex::new(HashMap::new())),
             output_token_cache: Arc::new(Mutex::new(HashMap::new())),
+            compatibility_cache: compatibility::CompatibilityCache::default(),
             x402: None,
             #[cfg(test)]
             capability_base_url: None,
@@ -108,6 +114,7 @@ impl OpenAiProvider {
             deepseek_strict_cache: Arc::new(Mutex::new(HashMap::new())),
             deepseek_thinking_cache: Arc::new(Mutex::new(HashMap::new())),
             output_token_cache: Arc::new(Mutex::new(HashMap::new())),
+            compatibility_cache: compatibility::CompatibilityCache::default(),
             x402: None,
             #[cfg(test)]
             capability_base_url: None,
@@ -170,6 +177,7 @@ impl Provider for OpenAiProvider {
         {
             request.profile.output_token_parameter = parameter;
         }
+        self.compatibility_cache.apply(&mut request);
         let detected_capabilities = deepseek::ProviderCapabilities::detect(
             capability_base_url,
             &request.model,
@@ -209,6 +217,7 @@ impl Provider for OpenAiProvider {
             );
         }
         let mut last_error: Option<ProviderError> = None;
+        let mut prior_usage = Usage::default();
         let mut idx = 0;
         let mut auth_refreshed = false;
         let correlation_id = canonical_request_id(request.request_id.as_deref());
@@ -250,6 +259,7 @@ impl Provider for OpenAiProvider {
             };
 
             if response.status().is_success() {
+                self.compatibility_cache.remember(&request, attempt);
                 persist_x402_credit_token(&self.auth, response.headers()).await;
                 sink(StreamEvent::WireAudit(Box::new(wire_audit(
                     &request,
@@ -280,22 +290,26 @@ impl Provider for OpenAiProvider {
                 )
                 .await
                 .map_err(|err| {
-                    stream::classify_stream_error(err).with_usage(Usage {
-                        input_tokens: estimated_input_tokens,
-                        output_tokens: 0,
-                        cache_read_tokens: 0,
-                        cache_creation_tokens: 0,
-                        input_includes_cache: true,
-                        context_occupancy: estimated_input_tokens,
-                        rate_limits,
-                        estimated: true,
-                    })
+                    retry_usage::error_with_previous(
+                        stream::classify_stream_error(err).with_usage(Usage {
+                            input_tokens: estimated_input_tokens,
+                            output_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                            input_includes_cache: true,
+                            context_occupancy: estimated_input_tokens,
+                            rate_limits,
+                            estimated: true,
+                        }),
+                        prior_usage,
+                    )
                 })?;
                 if auto_output_parameter && let Ok(mut cache) = self.output_token_cache.lock() {
                     cache.insert(output_cache_key.clone(), attempt.output_token_parameter);
                 }
                 stream::backfill_missing_usage(&mut completion, &request);
                 completion.usage.rate_limits = completion.usage.rate_limits.or(rate_limits);
+                completion.usage = retry_usage::include_previous(completion.usage, prior_usage);
 
                 let thinking_was_enabled = capabilities.deepseek
                     && request
@@ -345,6 +359,7 @@ impl Provider for OpenAiProvider {
                         request_id = %correlation_id,
                         "gateway omitted DeepSeek reasoning_content; retrying with thinking disabled"
                     );
+                    prior_usage = completion.usage;
                     idx = next;
                     continue;
                 }
@@ -462,11 +477,10 @@ impl Provider for OpenAiProvider {
                 None => break,
             }
         }
-        Err(last_error
-            .unwrap_or_else(|| {
-                ProviderError::new(ProviderErrorKind::Other, "request failed before streaming")
-            })
-            .into())
+        let error = last_error.unwrap_or_else(|| {
+            ProviderError::new(ProviderErrorKind::Other, "request failed before streaming")
+        });
+        Err(retry_usage::error_with_previous(error, prior_usage).into())
     }
 
     async fn list_models(&self) -> Result<Vec<crate::provider::ServedModel>> {
@@ -904,47 +918,6 @@ mod tests {
             1,
             "a static key has no second credential to try"
         );
-    }
-
-    #[tokio::test]
-    async fn fake_server_rejects_stream_options_then_succeeds() {
-        let Some(server) = FakeOpenAiServer::new(vec![
-            Response::json(400, r#"{"error":"stream_options unsupported"}"#),
-            Response::sse(sse_text("ok")),
-        ]) else {
-            return;
-        };
-        let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
-        let request = request(vec![], Default::default());
-        let mut statuses = Vec::new();
-        let mut sink = |event| {
-            if let StreamEvent::Status(status) = event {
-                statuses.push(status);
-            }
-        };
-        let completion = provider.stream(request, &mut sink).await.unwrap();
-        assert!(matches!(completion.content.first(), Some(Content::Text(t)) if t == "ok"));
-        assert!(
-            completion.usage.input_tokens > 0,
-            "fallback request gets estimated input usage: {:?}",
-            completion.usage
-        );
-        assert!(
-            completion.usage.output_tokens > 0,
-            "fallback request gets estimated output usage: {:?}",
-            completion.usage
-        );
-        assert!(
-            statuses.is_empty(),
-            "provider wire-shape retries must not appear as user status: {statuses:?}"
-        );
-        let bodies = server.bodies();
-        assert!(bodies[0].contains("stream_options"));
-        assert!(!bodies[1].contains("stream_options"));
-        let request_ids = server.request_ids();
-        let idempotency_keys = server.idempotency_keys();
-        assert_ne!(request_ids[0], request_ids[1]);
-        assert_ne!(idempotency_keys[0], idempotency_keys[1]);
     }
 
     #[tokio::test]

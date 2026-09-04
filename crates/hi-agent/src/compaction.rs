@@ -11,6 +11,10 @@ use std::collections::HashMap;
 
 use hi_ai::{Content, Message, Role};
 
+mod elision;
+pub(crate) use elision::repair_legacy_elided_thinking;
+use elision::{elide_old_image, elide_old_thinking_in};
+
 /// User turns kept verbatim by `Hybrid`/`ElideToolOutput` by default.
 pub const DEFAULT_KEEP_RECENT: usize = 3;
 
@@ -224,8 +228,8 @@ pub(crate) fn elide_tool_outputs(messages: &mut [Message], up_to: usize) -> usiz
                 Content::ToolCall { arguments, .. } => {
                     freed += elide_old_tool_arguments_in(arguments);
                 }
-                Content::Thinking { text, .. } => {
-                    freed += elide_old_thinking_in(text);
+                Content::Thinking { .. } => {
+                    freed += elide_old_thinking_in(block);
                 }
                 Content::Image { .. } => {
                     freed += elide_old_image(block);
@@ -251,8 +255,8 @@ pub(crate) fn elide_old_tool_arguments(messages: &mut [Message], up_to: usize) -
                 Content::ToolCall { arguments, .. } => {
                     freed += elide_old_tool_arguments_in(arguments);
                 }
-                Content::Thinking { text, .. } => {
-                    freed += elide_old_thinking_in(text);
+                Content::Thinking { .. } => {
+                    freed += elide_old_thinking_in(block);
                 }
                 Content::Image { .. } => {
                     freed += elide_old_image(block);
@@ -261,28 +265,6 @@ pub(crate) fn elide_old_tool_arguments(messages: &mut [Message], up_to: usize) -
             }
         }
     }
-    freed
-}
-
-const ELIDE_THINKING_MIN_CHARS: usize = 400;
-
-fn elide_old_thinking_in(text: &mut String) -> usize {
-    if text.chars().count() <= ELIDE_THINKING_MIN_CHARS || text.starts_with("[elided thinking") {
-        return 0;
-    }
-    let n = text.chars().count();
-    let freed = text.len();
-    *text = format!("[elided thinking — was {n} chars]");
-    freed
-}
-
-fn elide_old_image(block: &mut Content) -> usize {
-    let Content::Image { data, .. } = block else {
-        return 0;
-    };
-    let n = data.chars().count();
-    let freed = data.len();
-    *block = Content::Text(format!("[elided image — was {n} chars]"));
     freed
 }
 
@@ -352,8 +334,8 @@ pub(crate) fn elide_tool_outputs_except_recent(
                 Content::ToolCall { id, arguments, .. } if !recent_ids.contains(id) => {
                     freed += elide_old_tool_arguments_in(arguments);
                 }
-                Content::Thinking { text, .. } if !keep_thinking => {
-                    freed += elide_old_thinking_in(text);
+                Content::Thinking { .. } if !keep_thinking => {
+                    freed += elide_old_thinking_in(block);
                 }
                 _ => {}
             }
@@ -618,11 +600,10 @@ mod tests {
         let split = recent_split(&m, 1).unwrap();
         let freed = elide_tool_outputs(&mut m, split);
         assert!(freed > 0);
-        let Content::Thinking { text, signature } = &m[2].content[0] else {
+        let Content::Text(text) = &m[2].content[0] else {
             panic!("old thinking");
         };
         assert!(text.starts_with("[elided thinking"), "{text}");
-        assert_eq!(signature.as_deref(), Some("sig-old"));
         let Content::Thinking { text, .. } = &m[4].content[0] else {
             panic!("new thinking");
         };

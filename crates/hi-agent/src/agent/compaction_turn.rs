@@ -140,8 +140,7 @@ impl crate::Agent {
         }
         let recent_len = recent.len();
         compaction::elide_tool_outputs(&mut recent, recent_len);
-        let head = recent[0].text();
-        recent[0] = Message::user(fold_reference_summary_into_user(&summary, &head));
+        fold_reference_summary_into_user(&summary, &mut recent[0]);
         let mut next = Vec::with_capacity(recent.len() + 1);
         next.push(system);
         next.extend(recent);
@@ -543,12 +542,18 @@ pub(super) fn reference_summary_block(summary: &str) -> String {
     )
 }
 
-pub(super) fn fold_reference_summary_into_user(summary: &str, latest_user: &str) -> String {
-    format!(
-        "{}\n\n--- LATEST USER MESSAGE ---\n\n{}",
-        reference_summary_block(summary),
-        latest_user
-    )
+pub(super) fn fold_reference_summary_into_user(summary: &str, latest_user: &mut Message) {
+    let prefix = format!(
+        "{}\n\n--- LATEST USER MESSAGE ---\n\n",
+        reference_summary_block(summary)
+    );
+    // The retained request can contain screenshots and interleaved text.
+    // Prepend reference context without flattening away its typed attachments.
+    if let Some(Content::Text(text)) = latest_user.content.first_mut() {
+        text.insert_str(0, &prefix);
+    } else {
+        latest_user.content.insert(0, Content::Text(prefix));
+    }
 }
 
 fn local_overflow_summary(old: &[Message]) -> String {

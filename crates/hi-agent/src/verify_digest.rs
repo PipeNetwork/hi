@@ -13,12 +13,14 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+#[path = "verify_digest_source.rs"]
+mod source;
+use source::source_region;
+
 /// Distinct diagnostics to list in full (with source spans for the first few).
 const MAX_LISTED_ERRORS: usize = 8;
 /// Diagnostics that get their source region inlined.
 const MAX_SPANNED_ERRORS: usize = 3;
-/// Context lines either side of a diagnostic's line in the inlined region.
-const SPAN_CONTEXT_LINES: usize = 4;
 /// Failing tests that get their panic/stdout excerpt inlined.
 const MAX_TEST_EXCERPTS: usize = 3;
 /// Lines kept from a failing test's `---- name stdout ----` section.
@@ -255,42 +257,6 @@ fn parse_failing_tests(raw: &str) -> Vec<(String, Vec<String>)> {
     out
 }
 
-/// The ±context source region around `path:line:col`, resolved under `root`.
-/// Returns `None` when the path doesn't resolve to a readable workspace file.
-fn source_region(root: &Path, location: &str) -> Option<String> {
-    let mut parts = location.split(':');
-    let path = parts.next()?;
-    let line: usize = parts.next()?.parse().ok()?;
-    let relative = Path::new(path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        return None;
-    }
-    let file_path = root.join(relative);
-    const MAX_SOURCE_REGION_FILE_BYTES: u64 = 256 * 1024;
-    let metadata = std::fs::metadata(&file_path).ok()?;
-    if metadata.len() > MAX_SOURCE_REGION_FILE_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(file_path).ok()?;
-    let lines: Vec<&str> = text.lines().collect();
-    if line == 0 || line > lines.len() {
-        return None;
-    }
-    let start = line.saturating_sub(SPAN_CONTEXT_LINES + 1);
-    let end = (line + SPAN_CONTEXT_LINES).min(lines.len());
-    let mut region = format!("   source ({path}:{}-{end}):\n", start + 1);
-    for (offset, content) in lines[start..end].iter().enumerate() {
-        let number = start + offset + 1;
-        let marker = if number == line { ">" } else { " " };
-        region.push_str(&format!("   {marker}{number:>5} | {content}\n"));
-    }
-    Some(region)
-}
-
 /// Digest a failed stage's raw output. Returns `None` when nothing structured
 /// was recognized — the caller then keeps the raw output alone.
 /// Name-anchored panic excerpt: the `thread '<name>' panicked at …` block for
@@ -398,13 +364,20 @@ pub(crate) fn digest_failure(root: &Path, raw: &str) -> Option<FailureDigest> {
     if !failing_tests.is_empty() {
         let names: Vec<&str> = failing_tests
             .iter()
+            .take(MAX_LISTED_ERRORS)
             .map(|(name, _)| name.as_str())
             .collect();
         text.push_str(&format!(
             "{} failing test(s): {}\n",
-            names.len(),
+            failing_tests.len(),
             names.join(", ")
         ));
+        if failing_tests.len() > names.len() {
+            text.push_str(&format!(
+                "… and {} more failing test(s) in the full output below.\n",
+                failing_tests.len() - names.len()
+            ));
+        }
         for (name, excerpt) in failing_tests.iter().take(MAX_TEST_EXCERPTS) {
             signature.insert(failing_test_signature(name, excerpt));
             if !excerpt.is_empty() {

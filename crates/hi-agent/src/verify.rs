@@ -1198,7 +1198,12 @@ impl WorkspaceRepairVerifier {
                         workspace.state_root,
                         move |isolated| async move {
                             let runner = verification_runner(&isolated, sandbox_policy)?;
-                            hi_tools::run_check_in_with_runner(&runner, &command).await
+                            hi_tools::run_check_in_with_runner_maybe_timeout(
+                                &runner,
+                                &command,
+                                verification_timeout,
+                            )
+                            .await
                         },
                     )
                     .await;
@@ -1750,3 +1755,7 @@ mod tests_more;
 #[cfg(test)]
 #[path = "verify_test_support.rs"]
 mod verify_test_support;
+
+#[cfg(test)]
+#[path = "verify_timeout_tests.rs"]
+mod timeout_tests;

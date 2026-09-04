@@ -2,103 +2,132 @@
 
 use super::{DEFAULT_READ_LIMIT, read_output_budget};
 
-/// Render a file for the `read` tool: each line prefixed with its 1-based number
-/// and a tab (so the model can cite and edit precisely), optionally restricted
-/// to `[offset, offset+limit)`. When no limit is provided, return a bounded
-/// page. A footer notes when lines were omitted so the model knows to page a
-/// large file with `offset`/`limit` rather than assume it saw everything.
+#[cfg(test)]
+#[path = "formatting_tests.rs"]
+mod tests;
+
+pub(super) struct RenderedRead {
+    pub content: String,
+    pub truncated: bool,
+}
+
 #[cfg(test)]
 pub(super) fn format_read(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
     format_read_with_budget(content, offset, limit, None)
 }
 
-/// Render a read page without relying on a lossy post-render clip. A model
-/// often asks for the default 2,000-line page, while the shared tool-result
-/// budget is much smaller than that for ordinary source files. Rendering the
-/// whole page and clipping afterward can leave an inaccurate footer (or no
-/// usable next offset), which makes models repeatedly read the same file.
-/// Select the largest complete line range that fits and report the exact
-/// range that was returned.
-pub(super) fn format_read_for_output(
-    content: &str,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> String {
-    format_read_with_budget(content, offset, limit, Some(read_output_budget()))
-}
-
+#[cfg(test)]
 pub(super) fn format_read_with_budget(
     content: &str,
     offset: Option<usize>,
     limit: Option<usize>,
     budget: Option<usize>,
 ) -> String {
+    render_read_with_budget(content, offset, limit, budget).content
+}
+
+/// Keep an explicit clipping flag: a single minified line has no next line to
+/// page to, but its abbreviated contents must still be reported as truncated.
+pub(super) fn format_read_for_output(
+    content: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> RenderedRead {
+    render_read_with_budget(content, offset, limit, Some(read_output_budget()))
+}
+
+pub(super) fn render_read_with_budget(
+    content: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    budget: Option<usize>,
+) -> RenderedRead {
     if content.is_empty() {
-        return "(empty file)".to_string();
+        return small_message("(empty file)".to_owned(), budget);
     }
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     let start = offset.unwrap_or(1).max(1);
     if start > total {
-        return format!("(file has {total} line(s); offset {start} is past the end)");
+        return small_message(
+            format!("(file has {total} line(s); offset {start} is past the end)"),
+            budget,
+        );
     }
-    // Treat zero as the smallest useful page rather than producing the
-    // misleading range "lines 1-0" and an empty result.
     let limit = limit.unwrap_or(DEFAULT_READ_LIMIT).max(1);
     let end = start.saturating_add(limit).saturating_sub(1).min(total);
-    // Width from the file's total line count (not this page's end) so the gutter
-    // is consistent across pages — reading lines 1-240 vs 9900-10000 shouldn't
-    // shift the column.
     let width = total.to_string().len().max(4);
     let mut out = String::new();
+    let mut used_chars = 0usize;
     let mut rendered_end = start.saturating_sub(1);
     for (i, line) in lines[start - 1..end].iter().enumerate() {
         let n = start + i;
-        let rendered = format!("{n:>width$}\t{line}\n");
-        let footer = if start > 1 || n < total {
-            let mut footer = format!("… showing lines {start}-{n} of {total}");
-            if n < total {
-                footer.push_str(&format!(" — read more with offset {}", n + 1));
-            }
-            footer
-        } else {
-            String::new()
-        };
+        let prefix = format!("{n:>width$}\t");
+        let rendered_chars = prefix.chars().count() + line.chars().count() + 1;
+        let footer = page_footer(start, n, total);
         if let Some(budget) = budget
-            && !out.is_empty()
-            && out
-                .chars()
-                .count()
-                .saturating_add(rendered.chars().count())
+            && used_chars
+                .saturating_add(rendered_chars)
                 .saturating_add(footer.chars().count())
                 > budget
         {
+            if out.is_empty() {
+                return clipped_first_line(&prefix, line, &footer, budget);
+            }
             break;
         }
-        out.push_str(&rendered);
+        out.push_str(&prefix);
+        out.push_str(line);
+        out.push('\n');
+        used_chars += rendered_chars;
         rendered_end = n;
     }
-    // A single unusually long line can exceed the budget even when it is the
-    // first line. Keep a bounded prefix rather than falling back to the old
-    // ambiguous whole-page truncation.
-    if rendered_end < start {
-        let prefix = format!("{start:>width$}\t");
-        let suffix = " … [line truncated]";
-        let remaining = budget
-            .unwrap_or(usize::MAX)
-            .saturating_sub(prefix.chars().count() + suffix.chars().count());
-        out.push_str(&prefix);
-        out.extend(lines[start - 1].chars().take(remaining));
-        out.push_str(suffix);
-        rendered_end = start;
+    out.push_str(&page_footer(start, rendered_end, total));
+    RenderedRead {
+        content: out,
+        truncated: rendered_end < total,
     }
-    if start > 1 || rendered_end < total {
-        out.push_str(&format!(
-            "… showing lines {start}-{rendered_end} of {total}"
-        ));
-        if rendered_end < total {
-            out.push_str(&format!(" — read more with offset {}", rendered_end + 1));
-        }
+}
+
+fn page_footer(start: usize, end: usize, total: usize) -> String {
+    if start == 1 && end == total {
+        return String::new();
     }
-    out
+    let mut footer = format!("… showing lines {start}-{end} of {total}");
+    if end < total {
+        footer.push_str(&format!(" — read more with offset {}", end + 1));
+    }
+    footer
+}
+
+fn clipped_first_line(prefix: &str, line: &str, footer: &str, budget: usize) -> RenderedRead {
+    let note =
+        "\n… [line truncated]; use a bounded shell command to inspect the rest of this line.\n";
+    let overhead = prefix.chars().count() + note.chars().count() + footer.chars().count();
+    let content = if overhead <= budget {
+        let mut out = prefix.to_owned();
+        out.extend(line.chars().take(budget - overhead));
+        out.push_str(note);
+        out.push_str(footer);
+        out
+    } else {
+        // Tiny shares in a many-file read may not fit a line plus instructions.
+        // The typed flag still records clipping even if the marker itself clips.
+        format!("[line truncated]\n{footer}")
+            .chars()
+            .take(budget)
+            .collect()
+    };
+    RenderedRead {
+        content,
+        truncated: true,
+    }
+}
+
+fn small_message(message: String, budget: Option<usize>) -> RenderedRead {
+    let truncated = budget.is_some_and(|budget| message.chars().count() > budget);
+    RenderedRead {
+        content: message.chars().take(budget.unwrap_or(usize::MAX)).collect(),
+        truncated,
+    }
 }

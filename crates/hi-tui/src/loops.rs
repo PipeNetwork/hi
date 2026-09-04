@@ -3112,12 +3112,12 @@ mod tests {
             })
             .unwrap();
         let id = rx.await.unwrap().unwrap().id;
-        for _ in 0..100 {
-            if pid_file.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // Child startup can exceed two seconds under the parallel suite. Wait
+        // for a complete PID record before exercising cancellation.
+        wait_until(&handle, |_| {
+            std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.trim().parse::<i32>().is_ok())
+        })
+        .await;
         let pid: i32 = std::fs::read_to_string(&pid_file)
             .expect("firing recorded descendant pid")
             .trim()
@@ -3170,12 +3170,10 @@ mod tests {
             })
             .unwrap();
         rx.await.unwrap().unwrap();
-        for _ in 0..100 {
-            if pid_file.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_until(&handle, |_| {
+            std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.trim().parse::<i32>().is_ok())
+        })
+        .await;
         let pid: i32 = std::fs::read_to_string(&pid_file)
             .expect("firing recorded descendant pid")
             .trim()

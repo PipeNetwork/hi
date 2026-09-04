@@ -28,6 +28,8 @@ use std::sync::Arc;
 use crate::steering::ReviewRepairMode;
 use hi_ai::{Content, Message, Role};
 
+mod folding;
+
 pub(crate) const PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER: &str =
     "Provider-invisible assistant content was omitted from the transcript.";
 
@@ -519,6 +521,7 @@ impl Transcript {
         // legacy result back into provider context when the session resumes.
         for message in &mut messages {
             for block in &mut message.content {
+                crate::compaction::repair_legacy_elided_thinking(block);
                 if let Content::ToolResult { output, .. } = block {
                     let (bounded, _) = hi_tools::bound_tool_content(std::mem::take(output));
                     *output = bounded;
@@ -766,92 +769,6 @@ impl Transcript {
                     } else {
                         cleaned
                     };
-                }
-            }
-        }
-    }
-
-    /// Shrink every superseded `bash_output` result for `handle` to a one-line
-    /// digest, keeping only the newest poll verbatim. A turn (or session)
-    /// watching a long-running background process otherwise accumulates
-    /// hundreds of stale progress dumps that are re-sent — and re-billed —
-    /// with every subsequent model request, while only the latest poll carries
-    /// information the model still needs.
-    pub(crate) fn fold_superseded_background_polls(&mut self, handle: &str) {
-        let digest = format!("[{handle}: superseded poll — see the latest bash_output result]");
-        self.fold_superseded_tool_results(&digest, |name, arguments| {
-            name == "bash_output" && background_poll_handle(arguments).as_deref() == Some(handle)
-        });
-    }
-
-    /// Shrink every superseded `read` result with the same call shape
-    /// (path + offset + limit) to a one-line digest, keeping only the newest
-    /// verbatim. Edit-heavy sessions re-read the same file after each change
-    /// (one real session read `src/model.rs` 21×), and only the newest copy
-    /// reflects the file — the older ones are pure context bloat.
-    pub(crate) fn fold_superseded_file_reads(&mut self, key: &ReadCallKey) {
-        let target = if key.paths.len() == 1 {
-            key.paths[0].clone()
-        } else {
-            format!("{} files ({})", key.paths.len(), key.paths.join(", "))
-        };
-        let digest = format!(
-            "[superseded read of {} — see the latest read result]",
-            target
-        );
-        self.fold_superseded_tool_results(&digest, |name, arguments| {
-            name == "read" && read_call_key(arguments).as_ref() == Some(key)
-        });
-    }
-
-    /// Shared folding walk: find every ToolCall matching `matches`, then
-    /// rewrite the ToolResults of all but the last one to `digest`.
-    fn fold_superseded_tool_results(&mut self, digest: &str, matches: impl Fn(&str, &str) -> bool) {
-        let mut matching_call_ids: Vec<String> = Vec::new();
-        for message in self.messages.iter() {
-            for block in &message.content {
-                if let Content::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } = block
-                    && matches(name, arguments)
-                {
-                    matching_call_ids.push(id.clone());
-                }
-            }
-        }
-        if matching_call_ids.len() < 2 {
-            return;
-        }
-        let superseded: std::collections::HashSet<&str> = matching_call_ids
-            [..matching_call_ids.len() - 1]
-            .iter()
-            .map(String::as_str)
-            .collect();
-        // Skip the rewrite (and the copy-on-write clone) when every superseded
-        // result is already folded — the common case after the first fold.
-        let already_folded = self
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .all(|block| match block {
-                Content::ToolResult { call_id, output }
-                    if superseded.contains(call_id.as_str()) =>
-                {
-                    output == digest
-                }
-                _ => true,
-            });
-        if already_folded {
-            return;
-        }
-        for message in self.make_mut().iter_mut() {
-            for block in &mut message.content {
-                if let Content::ToolResult { call_id, output } = block
-                    && superseded.contains(call_id.as_str())
-                {
-                    *output = digest.to_string();
                 }
             }
         }
@@ -1720,7 +1637,7 @@ Read-only review guard: use only the currently advertised read-only inspection t
     }
 
     #[test]
-    fn superseded_background_polls_fold_to_a_one_line_digest() {
+    fn superseded_idle_background_polls_fold_to_a_short_status() {
         let mut t = Transcript::new(vec![user("watch the download")]);
         let poll = |call_id: &str, handle: &str| Content::ToolCall {
             id: call_id.into(),
@@ -1730,13 +1647,19 @@ Read-only review guard: use only the currently advertised read-only inspection t
         t.push_assistant_with_results(
             vec![poll("p1", "sh_1"), poll("q1", "sh_2")],
             vec![
-                ("p1".into(), "[sh_1: running]\n10 GiB / 100 GiB".into()),
+                (
+                    "p1".into(),
+                    "[sh_1 · download: still running — no new output]".into(),
+                ),
                 ("q1".into(), "[sh_2: running]\n1 GiB / 50 GiB".into()),
             ],
         );
         t.push_assistant_with_results(
             vec![poll("p2", "sh_1")],
-            vec![("p2".into(), "[sh_1: running]\n11 GiB / 100 GiB".into())],
+            vec![(
+                "p2".into(),
+                "[sh_1 · download: still running — no new output]".into(),
+            )],
         );
         t.push_assistant_with_results(
             vec![poll("p3", "sh_1")],
@@ -1757,7 +1680,7 @@ Read-only review guard: use only the currently advertised read-only inspection t
                 })
                 .unwrap()
         };
-        let digest = "[sh_1: superseded poll — see the latest bash_output result]";
+        let digest = "[no new output]";
         assert_eq!(output_of(&t, "p1"), digest);
         assert_eq!(output_of(&t, "p2"), digest);
         assert!(

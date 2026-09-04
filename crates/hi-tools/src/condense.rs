@@ -1,5 +1,9 @@
 use std::sync::LazyLock;
 
+#[cfg(test)]
+#[path = "condense_token_tests.rs"]
+mod token_tests;
+
 /// Per-result character budget so a single read or noisy command can't blow the
 /// context. Overridable via `HI_TOOL_RESULT_CHARS` — lower it for a tight local
 /// window, raise it when the model has room. Read once, at first use. The
@@ -75,9 +79,30 @@ pub fn condense_diagnostics(s: &str, max: usize) -> String {
     // keeping. If not, detection was a false positive — clip normally instead of
     // emitting a misleading "everything omitted" digest.
     let mut matched = false;
+    let mut rust_test_listing = false;
+    let mut rust_failure_details = false;
     for i in 0..n {
         let line = lines[i];
-        if starts_diagnostic_block(line) {
+        let trimmed = line.trim();
+        if starts_rust_test_listing(trimmed) {
+            rust_test_listing = true;
+            rust_failure_details = false;
+        } else if trimmed == "failures:" && rust_test_listing {
+            rust_test_listing = false;
+            rust_failure_details = true;
+        } else if trimmed.starts_with("test result:") {
+            rust_test_listing = false;
+            rust_failure_details = false;
+        }
+        if rust_failure_details {
+            // Captured stdout and multiline assertion values can carry the
+            // actual cause without containing any diagnostic keyword.
+            keep[i] = true;
+            matched = true;
+        } else if rust_test_listing && is_passing_rust_test(trimmed) {
+            // Names such as rejects_invalid_input or handles_expected_error
+            // describe passing regressions, not failed assertions.
+        } else if starts_diagnostic_block(line) {
             // Keep the whole multi-line block: rustc/gcc/clang print the location,
             // code frame, and notes under the `error:` line, ending at a blank
             // line. Bounded so a pathological block can't run away.
@@ -142,6 +167,20 @@ pub fn condense_diagnostics(s: &str, max: usize) -> String {
     }
     // Even the condensed view honours the char budget.
     truncate_to(out.trim_end(), max)
+}
+
+fn starts_rust_test_listing(line: &str) -> bool {
+    line.strip_prefix("running ")
+        .and_then(|count| {
+            count
+                .strip_suffix(" tests")
+                .or_else(|| count.strip_suffix(" test"))
+        })
+        .is_some_and(|count| count.parse::<usize>().is_ok())
+}
+
+fn is_passing_rust_test(line: &str) -> bool {
+    line.starts_with("test ") && line.ends_with(" ... ok")
 }
 
 /// Whether output looks like a test run or compiler diagnostics, and so is worth

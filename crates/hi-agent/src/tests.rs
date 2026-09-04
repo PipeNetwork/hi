@@ -9,6 +9,7 @@ mod candidate_publication;
 mod coding_memory;
 mod common;
 mod compaction;
+mod context_integrity;
 mod curate;
 mod decision;
 mod delegate;

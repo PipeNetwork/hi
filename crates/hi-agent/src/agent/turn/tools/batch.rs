@@ -5,6 +5,7 @@
 //! batch stats for the post-tool Steer phase.
 
 mod feedback;
+mod observations;
 mod outcome;
 mod policy;
 
@@ -512,6 +513,7 @@ impl crate::Agent {
         // order. UI streaming and snapshot invalidation still happen
         // during execution.
         let mut results: Vec<Option<(String, String)>> = vec![None; calls.len()];
+        let mut complete_reads = vec![false; calls.len()];
         let mut vision: Vec<hi_tools::ToolImage> = Vec::new();
         let mut completed = vec![false; calls.len()];
         let mut completion_order: Vec<usize> = Vec::with_capacity(calls.len());
@@ -2042,6 +2044,8 @@ impl crate::Agent {
                 });
             for (i, mut output) in outputs {
                 let name = &calls[i].1;
+                complete_reads[i] =
+                    name == "read" && observations::read_result_is_complete(&output);
                 let mut unsupported_completion_claims = Vec::new();
                 // In plan mode, `update_plan` describes work to execute after
                 // approval; it is not evidence that the work already ran. A
@@ -2365,29 +2369,7 @@ impl crate::Agent {
                 content,
             });
         }
-        // Collapse older polls of the handles polled this batch to one-line
-        // digests: only the newest poll carries information the model still
-        // needs, and a long watch otherwise re-sends every stale progress
-        // dump on every subsequent request.
-        let mut folded_handles: BTreeSet<String> = BTreeSet::new();
-        for (_, name, arguments) in calls {
-            if name == "bash_output"
-                && let Some(handle) = crate::transcript::background_poll_handle(arguments)
-                && folded_handles.insert(handle.clone())
-            {
-                self.messages.fold_superseded_background_polls(&handle);
-            }
-        }
-        // Same for re-reads of the same file region: after each edit models
-        // tend to re-read the whole file (one real session read the same
-        // source file 21×), and only the newest copy reflects reality.
-        for (_, name, arguments) in calls {
-            if name == "read"
-                && let Some(key) = crate::transcript::read_call_key(arguments)
-            {
-                self.messages.fold_superseded_file_reads(&key);
-            }
-        }
+        observations::fold_completed_observations(&mut self.messages, calls, &complete_reads);
         // A fully cancelled batch did not execute discovery or implementation
         // work, so it must not burn the mutation-recovery round budget.
         if interrupted_calls < calls.len() {
