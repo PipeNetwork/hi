@@ -106,3 +106,42 @@ async fn failed_switch_preserves_current_session_grants_and_pending_ui_choices()
     assert_eq!(card.comments[0].text, "previous session comment");
     assert!(app.transcript_text().contains("destination unavailable"));
 }
+
+#[tokio::test]
+async fn successful_switch_cannot_install_previous_sessions_delayed_host_input() {
+    let (_root, mut agent, mut app) = fixture();
+    app.sync_session_id = Some("previous-session".into());
+    app.session_switcher = Some(Box::new(|id, _| {
+        Box::pin(async move {
+            Ok(crate::SessionSwitchInfo {
+                id: id.into(),
+                summary: "new history".into(),
+            })
+        })
+    }));
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tx.send("modify files in the previous session".into())
+        .unwrap();
+    let poller = tokio::spawn(std::future::pending::<()>());
+    let abort = poller.abort_handle();
+    app.pending_host_enable = Some(tokio::spawn(async move { Ok(Some((rx, abort))) }));
+    while !app.pending_host_enable.as_ref().unwrap().is_finished() {
+        tokio::task::yield_now().await;
+    }
+
+    app.switch_session(&mut agent, "destination-session").await;
+    app.poll_pending_host_enable().await;
+
+    assert_eq!(app.sync_session_id.as_deref(), Some("destination-session"));
+    assert!(app.pending_host_enable.is_none());
+    assert!(!app.hosting_remote_input);
+    assert!(!app.drain_remote_input());
+    assert!(app.queue.is_empty());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), poller)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled()
+    );
+}

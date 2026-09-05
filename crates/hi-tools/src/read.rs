@@ -3,13 +3,17 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 
 use crate::edit::sh_quote;
-use crate::paths::{ReadCache, cache_key};
+use crate::paths::{FileVersion, ReadCache, cache_key};
 use crate::{ProcessRunner, ToolOutcome, ToolStatus};
 
 mod discovery;
 mod formatting;
 mod grep_fallback;
 mod resource;
+
+#[cfg(test)]
+#[path = "read/cache_tests.rs"]
+mod cache_tests;
 
 pub(crate) use resource::workspace_path_from_read_arguments;
 pub use resource::{ResourceReadRoutingError, route_resource_read};
@@ -187,11 +191,16 @@ pub(crate) async fn run_read_with_mcp(
 /// Read one file as UTF-8 text, using the per-turn cache and bailing clearly
 /// on binary files. Shared by the single- and multi-path read paths.
 pub(super) async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) -> Result<String> {
-    let cached = match cache.lock() {
-        Ok(mut cache) => cache.get(&cache_key(std::path::Path::new(path))).cloned(),
+    let key = cache_key(std::path::Path::new(path));
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("reading metadata for {path}"))?;
+    let version = FileVersion::from_metadata(&metadata);
+    let cached = match (cache.lock(), version.as_ref()) {
+        (Ok(mut cache), Some(version)) => cache.get_file(&key, version).cloned(),
         // Poisoned lock — treat as a cache miss and re-read the file, rather than
         // turning every subsequent `read` into a panic (as `.unwrap()` did).
-        Err(_) => None,
+        _ => None,
     };
     if let Some(cached) = cached {
         return Ok(cached);
@@ -209,8 +218,18 @@ pub(super) async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) ->
         );
     }
     let content = String::from_utf8_lossy(&bytes).into_owned();
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(cache_key(std::path::Path::new(path)), content.clone());
+    let after = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|metadata| FileVersion::from_metadata(&metadata));
+    if version.is_some()
+        && version == after
+        && let Ok(mut cache) = cache.lock()
+    {
+        // A background process/editor may mutate a file independently of the
+        // agent's explicit cache clears. Never label an in-flight read with a
+        // newer stamp than the contents it actually observed.
+        cache.insert_file(key, content.clone(), version);
     }
     Ok(content)
 }

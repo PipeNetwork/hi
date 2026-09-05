@@ -13,10 +13,10 @@ mod foreground;
 mod hermetic;
 
 use environment::{SECRET_ENV_VARS, sensitive_environment_name, workspace_cargo_home};
-pub(crate) use execution::kill_group;
 #[cfg(test)]
 use execution::kill_process_group;
 pub use execution::{AdoptableOutcome, RunningChild, preserve_detached_descendants};
+pub(crate) use execution::{PIPE_DRAIN_GRACE, detached_descendants_preserved, kill_group};
 use execution::{capture_child, capture_child_adoptable, capture_child_maybe_timeout};
 pub use foreground::ForegroundProcessRegistry;
 

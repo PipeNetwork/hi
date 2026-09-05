@@ -34,6 +34,7 @@ pub(super) async fn run_agent_turn(
     // before snapshotting mode or constructing the provider request.
     let drive_kind = hi_agent::DriveKind::from_prompt(run_line);
     app.push_session_face(agent);
+    app.begin_plan_draft(agent.plan_mode());
     if agent.prepare_plan_drive_for_turn(drive_kind)? {
         // The transition must be visible before the future starts. Otherwise
         // a resumed user/plan turn works while the title bar still says paused.

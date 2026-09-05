@@ -301,7 +301,7 @@ async fn retained_user_images_survive_hybrid_tail_and_overflow_compaction() {
             _ => {
                 assert!(
                     agent
-                        .retry_after_request_too_large_compact(&mut NullUi)
+                        .retry_after_request_too_large_compact(3, &mut NullUi)
                         .unwrap()
                 );
             }

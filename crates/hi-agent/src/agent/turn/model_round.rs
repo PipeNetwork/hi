@@ -346,17 +346,10 @@ impl crate::Agent {
             &mut advertised_tool_names,
             &mut tool_schema_tokens,
         );
-        // Destructive context recovery rebuilds the current turn from `input`.
-        // A forced-final instruction normally lives in a later synthetic user
-        // nudge, so rebuilding from the raw input alone silently loses the
-        // instruction even though the sticky ChatOnly flag survives. Carry the
-        // policy in the recovery seed as well; ordinary requests remain
-        // byte-for-byte unchanged.
-        let forced_final_recovery_input = request_no_progress_final_answer
-            .then(|| format!("{input}\n\n{NO_PROGRESS_FINAL_ANSWER_NUDGE}"));
-        let recovery_input = forced_final_recovery_input.as_deref().unwrap_or(input);
+        // Recovery retains the active user messages, including the sticky
+        // forced-final instruction in its synthetic nudge and user corrections.
         let context_preflight = match self.ensure_request_fits_context(
-            recovery_input,
+            input,
             turn_start,
             requested_request_max_tokens,
             request_tool_schema_tokens,
@@ -366,7 +359,9 @@ impl crate::Agent {
             Ok(context_preflight) => context_preflight,
             Err(err) => {
                 self.reconcile_error_turn_changes(turn_ledger_revision).await?;
-                self.truncate_messages(turn_start);
+                // A successful history replacement can still leave a prompt
+                // too large to send. Its boundary has moved to the new tail.
+                self.truncate_messages(turn_start.min(self.messages.len().saturating_sub(1)));
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
                 self.report.last_compat_fallbacks = compat_fallbacks.clone();
@@ -547,7 +542,7 @@ impl crate::Agent {
                 &mut turn_start,
                 turn_ledger_revision,
                 &turn_snapshot,
-                recovery_input,
+                input,
                 max_steps,
                 verifier,
                 repeat_nudges,

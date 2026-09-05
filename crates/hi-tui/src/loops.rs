@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use crate::FleetLauncher;
 
 mod fix_inspection;
+mod fix_pr;
 
 /// Leave a child enough time to verify and persist after an explicitly
 /// configured soft turn deadline. Ordinary loop work has no wall-clock cap.
@@ -1812,6 +1813,7 @@ async fn run_fix(
         return ("cancelled".into(), false);
     }
 
+    let mut retain_candidate = false;
     let result = match decide_fix(true, completed, changed.len(), has_verify, verified) {
         // PR mode: land the verified fix as a reviewable branch + PR.
         FixDecision::Merge if spec.fix_pr => {
@@ -1820,8 +1822,8 @@ async fn run_fix(
             let summary_for_pr = summary.to_string();
             let changed_for_pr = changed.clone();
             let cancellation_for_pr = cancellation.clone();
-            tokio::task::spawn_blocking(move || {
-                open_fix_pr(
+            let outcome = tokio::task::spawn_blocking(move || {
+                fix_pr::open(
                     &wt_for_pr,
                     &spec_for_pr,
                     &summary_for_pr,
@@ -1830,7 +1832,12 @@ async fn run_fix(
                 )
             })
             .await
-            .unwrap_or_else(|error| (format!("verified, but PR worker failed: {error}"), true))
+            .unwrap_or_else(|error| fix_pr::Outcome {
+                result: (format!("verified, but PR worker failed: {error}"), true),
+                committed: false,
+            });
+            retain_candidate = !outcome.committed;
+            outcome.result
         }
         // Merge mode: apply the verified diff into the working tree, then
         // re-verify the merged real tree (see merged_outcome — the base may have
@@ -1848,89 +1855,30 @@ async fn run_fix(
                     )
                     .await
                 }
-                Err(error) => (format!("verified but merge failed: {error}"), true),
+                Err(error) => {
+                    retain_candidate = true;
+                    (format!("verified but merge failed: {error}"), true)
+                }
             }
         }
         FixDecision::NoChanges => ("made no changes".into(), false),
-        FixDecision::Reject(why) => (
-            format!("{} file(s) changed but NOT merged — {why}", changed.len()),
-            true,
-        ),
+        FixDecision::Reject(why) => {
+            retain_candidate = true;
+            (
+                format!("{} file(s) changed but NOT merged — {why}", changed.len()),
+                true,
+            )
+        }
         FixDecision::NotGitRepo => ("skipped — not a git repository".into(), false),
     };
-    cleanup_loop_fix(&root, &wt).await;
-    result
-}
-
-/// Land a verified fix as a reviewable branch + PR instead of a working-tree
-/// merge. Commits the worktree's diff on a fresh branch, pushes it, and opens a
-/// PR with `gh`. Degrades gracefully: no remote → left on a local branch; no
-/// `gh` → a pushed branch to open a PR from. The branch persists after the
-/// worktree is cleaned up (it lives in the shared repo).
-fn open_fix_pr(
-    worktree: &std::path::Path,
-    spec: &LoopSpec,
-    summary: &str,
-    changed: &[String],
-    cancellation: &CancellationToken,
-) -> (String, bool) {
-    use hi_tools::worktree;
-    if cancellation.is_cancelled() {
-        return ("cancelled".to_string(), false);
-    }
-    let name = spec.name();
-    let branch = format!("hi-autofix/loop{}-{}", spec.id, now_ms());
-    let commit_msg = format!("hi auto-fix: {name}\n\n{}", truncate(summary, 500));
-    if let Err(e) = worktree::commit_to_branch(worktree, &branch, &commit_msg) {
-        return (
-            format!("verified, but couldn't prepare the PR branch: {e}"),
-            true,
-        );
-    }
-    if cancellation.is_cancelled() {
-        return (
-            format!("cancelled after committing fix to local branch {branch}"),
-            false,
-        );
-    }
-    if let Err(e) = worktree::push_branch(worktree, &branch) {
-        return (
-            format!("fix committed to branch {branch} (couldn't push: {e}) — review it locally"),
-            true,
-        );
-    }
-    if cancellation.is_cancelled() {
-        return (
-            format!("cancelled after pushing fix branch {branch}; no PR was opened"),
-            false,
-        );
-    }
-    // Open the PR (best-effort; the pushed branch stands alone if `gh` is absent).
-    let title = format!("hi auto-fix: {name}");
-    let body = format!(
-        "A recurring `hi` watch (\"{name}\") detected a problem and an agent produced a \
-         verify-passing fix.\n\n**Problem**\n\n{summary}\n\n**Changed files**\n\n{}\n",
-        changed
-            .iter()
-            .map(|f| format!("- `{f}`"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    );
-    match std::process::Command::new("gh")
-        .current_dir(worktree)
-        .args([
-            "pr", "create", "--head", &branch, "--title", &title, "--body", &body,
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            let url = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            (format!("opened PR: {url}"), true)
-        }
-        _ => (
-            format!("fix pushed to branch {branch} — open a PR to land it"),
-            true,
-        ),
+    if retain_candidate {
+        (
+            format!("{}; candidate retained at {}", result.0, wt.display()),
+            result.1,
+        )
+    } else {
+        cleanup_loop_fix(&root, &wt).await;
+        result
     }
 }
 
@@ -2027,7 +1975,7 @@ mod tests {
     use super::*;
 
     /// Init a throwaway git repo with one commit.
-    fn init_git_repo(dir: &std::path::Path) {
+    pub(super) fn init_git_repo(dir: &std::path::Path) {
         let git = |args: &[&str]| {
             std::process::Command::new("git")
                 .args(args)
@@ -2043,7 +1991,7 @@ mod tests {
         git(&["commit", "-qm", "init"]);
     }
 
-    fn spec() -> LoopSpec {
+    pub(super) fn spec() -> LoopSpec {
         LoopSpec {
             id: 1,
             prompt: "check whether the CI pipeline on main is green".into(),
@@ -3676,7 +3624,7 @@ mod tests {
 
     /// A stub "fixer" `hi` that writes `file` in its cwd (the worktree),
     /// simulating an agent that made a change. LLM-free.
-    fn fixer_stub(_dir: &std::path::Path, name: &str, file: &str) -> PathBuf {
+    pub(super) fn fixer_stub(_dir: &std::path::Path, name: &str, file: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let bin_dir =
             std::env::temp_dir().join(format!("hi-fixer-bin-{}-{}", std::process::id(), name));
@@ -3688,7 +3636,11 @@ mod tests {
         path
     }
 
-    fn fix_launcher(root: &std::path::Path, exe: PathBuf, verify: Option<&str>) -> FleetLauncher {
+    pub(super) fn fix_launcher(
+        root: &std::path::Path,
+        exe: PathBuf,
+        verify: Option<&str>,
+    ) -> FleetLauncher {
         FleetLauncher {
             exe,
             workspace_root: root.to_path_buf(),
@@ -3759,6 +3711,12 @@ mod tests {
             !dir.join("bad.txt").exists(),
             "the unverified change must NOT reach the real tree"
         );
+        let candidate = rejected
+            .0
+            .rsplit_once("; candidate retained at ")
+            .unwrap()
+            .1;
+        cleanup_loop_fix(&dir, std::path::Path::new(candidate)).await;
 
         let _ = std::fs::remove_dir_all(&dir);
     }

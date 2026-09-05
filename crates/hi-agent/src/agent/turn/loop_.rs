@@ -369,9 +369,8 @@ impl crate::Agent {
         // turn — not the per-round invalidation the old volatile system
         // message caused.
         self.messages.strip_previous_turn_blocks();
+        self.messages.validate_and_repair_for_provider()?;
         self.persisted = self.persisted.min(self.messages.len());
-        let turn_start = self.messages.len();
-        self.workspace.set_message_start(turn_start);
         let model_turn_input = match self.volatile_context_block() {
             Some(block) => format!(
                 "{}\n{block}\n{}\n\n{model_turn_input}",
@@ -403,6 +402,8 @@ impl crate::Agent {
         } else {
             self.messages.push_user_or_fold(&model_turn_input);
         }
+        let turn_start = self.messages.len().saturating_sub(1);
+        self.workspace.set_message_start(turn_start);
         self.persist_durable_boundary("prompt")?;
         self.report.verify = VerifyEvidence::none();
         self.workspace.last_changed_files.clear();

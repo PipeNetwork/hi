@@ -112,6 +112,79 @@ fn settled_turn_does_not_reopen_already_approved_or_parked_card() {
     assert!(!agent.plan_mode());
 }
 
+#[test]
+fn successful_revision_reopens_previously_parked_approval_without_losing_feedback() {
+    let (_root, mut agent, mut app) = fixture();
+    app.finish_plan_draft(true, Some(&completed()));
+    app.plan_approval
+        .as_mut()
+        .unwrap()
+        .comments
+        .push(PlanComment {
+            step: 0,
+            text: "Preserve the cancellation API.".into(),
+        });
+    app.park_plan_approval(&mut agent);
+
+    // An ordinary submitted revision (or /retry) starts a new plan-mode turn.
+    app.begin_plan_draft(agent.plan_mode());
+    agent.restore_plan(vec![PlanStep {
+        title: "Implement the revised scheduler".into(),
+        status: PlanStatus::Pending,
+    }]);
+    app.refresh_goal(&agent);
+    app.finish_plan_draft(true, Some(&completed()));
+    app.push_session_face(&mut agent);
+    app.maybe_queue_drive(&agent, Some(&completed()));
+
+    assert!(app.plan_approval_visible());
+    assert_eq!(app.plan[0].title, "Implement the revised scheduler");
+    assert_eq!(
+        app.plan_approval.as_ref().unwrap().comments[0].text,
+        "Preserve the cancellation API."
+    );
+    assert!(app.plan_mode && agent.plan_mode());
+    assert!(agent.plan_approval_parked());
+    assert!(app.queue.is_empty());
+}
+
+#[test]
+fn unsuccessful_or_nonplanning_revision_does_not_reopen_parked_review() {
+    for status in [
+        hi_agent::TurnStatus::Failed,
+        hi_agent::TurnStatus::Blocked,
+        hi_agent::TurnStatus::Cancelled,
+    ] {
+        let (_root, mut agent, mut app) = fixture();
+        app.finish_plan_draft(true, Some(&completed()));
+        app.park_plan_approval(&mut agent);
+        app.begin_plan_draft(true);
+        let mut outcome = completed();
+        outcome.status = status;
+        app.finish_plan_draft(true, Some(&outcome));
+        assert!(app.plan_approval.as_ref().unwrap().parked);
+    }
+    let (_root, mut agent, mut app) = fixture();
+    app.finish_plan_draft(true, Some(&completed()));
+    app.park_plan_approval(&mut agent);
+    app.begin_plan_draft(false);
+    app.finish_plan_draft(false, Some(&completed()));
+    assert!(app.plan_approval.as_ref().unwrap().parked);
+}
+
+#[test]
+fn explicitly_parking_during_revision_remains_respected_at_settlement() {
+    let (_root, mut agent, mut app) = fixture();
+    app.finish_plan_draft(true, Some(&completed()));
+    app.park_plan_approval(&mut agent);
+    app.begin_plan_draft(true);
+    assert!(app.unpark_plan_approval());
+    app.park_plan_approval(&mut agent);
+    app.finish_plan_draft(true, Some(&completed()));
+    assert!(app.plan_approval.as_ref().unwrap().parked);
+    assert!(agent.plan_approval_parked());
+}
+
 struct ApprovalRecorder(Arc<Mutex<Vec<bool>>>);
 
 impl hi_agent::SessionSink for ApprovalRecorder {

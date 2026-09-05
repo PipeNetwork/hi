@@ -93,6 +93,54 @@ fn dropped_context_retry_prompt(
     body
 }
 
+/// Keep the complete active request, including typed attachments, folded
+/// interjections, and completion-policy nudges. Rebuilding from `input` alone
+/// silently discards everything the user added after turn startup.
+fn dropped_context_retry_message(
+    messages: &[Message],
+    turn_start: usize,
+    input: &str,
+    recap: Option<&str>,
+    provider_rejected: bool,
+) -> Message {
+    let mut current = Vec::new();
+    for message in messages.get(turn_start..).unwrap_or_default() {
+        if message.role != Role::User {
+            continue;
+        }
+        if !current.is_empty() {
+            current.push(Content::Text("\n\n---\n\n".into()));
+        }
+        for content in &message.content {
+            let mut content = content.clone();
+            if let Content::Text(text) = &mut content
+                && text.starts_with(COMPACTION_REFERENCE_PREFIX)
+                && let Some((_, request)) = text.split_once(&format!(
+                    "{COMPACTION_SUMMARY_END}\n\n--- LATEST USER MESSAGE ---\n\n"
+                ))
+            {
+                // This is the locally generated first-stage summary. The
+                // original typed request follows it; only retire the summary.
+                *text = request.to_string();
+            }
+            current.push(content);
+        }
+    }
+    if current.is_empty() {
+        return Message::user(dropped_context_retry_prompt(
+            input,
+            recap,
+            provider_rejected,
+        ));
+    }
+    let mut recovered = Message::user(format!(
+        "{}\n\n--- CURRENT USER REQUEST ---\n\n",
+        dropped_context_retry_prompt("", recap, provider_rejected)
+    ));
+    recovered.content.extend(current);
+    recovered
+}
+
 fn dropped_context_retry_status(provider_rejected: bool, kept_recap: bool) -> String {
     let trigger = if provider_rejected {
         "provider rejected the request as too large"
@@ -123,12 +171,19 @@ impl crate::Agent {
     /// latest prompt + last recap.
     pub(crate) fn retry_after_request_too_large_compact(
         &mut self,
+        turn_start: usize,
         ui: &mut dyn Ui,
     ) -> Result<bool> {
-        let Some(split) = compaction::recent_split(self.messages.as_slice(), 1) else {
-            return Ok(false);
-        };
-        if split <= 1 {
+        // Later user messages can be corrections or internal nudges within
+        // this same turn. They must not become the retained turn boundary.
+        let split = turn_start;
+        if split <= 1
+            || self
+                .messages
+                .as_slice()
+                .get(split)
+                .is_none_or(|m| m.role != Role::User)
+        {
             return Ok(false);
         }
         let old = self.messages.as_slice()[1..split].to_vec();
@@ -138,8 +193,10 @@ impl crate::Agent {
         if recent.is_empty() {
             return Ok(false);
         }
-        let recent_len = recent.len();
-        compaction::elide_tool_outputs(&mut recent, recent_len);
+        compaction::elide_tool_outputs_except_recent(
+            &mut recent,
+            self.config.memory.in_turn_keep_tool_results,
+        );
         fold_reference_summary_into_user(&summary, &mut recent[0]);
         let mut next = Vec::with_capacity(recent.len() + 1);
         next.push(system);
@@ -158,7 +215,7 @@ impl crate::Agent {
     pub(crate) fn retry_after_request_too_large(
         &mut self,
         input: &str,
-        _turn_start: usize,
+        turn_start: usize,
         ui: &mut dyn Ui,
     ) -> Result<bool> {
         if self.messages.len() <= 1 {
@@ -182,10 +239,15 @@ impl crate::Agent {
         }
 
         let recap = last_assistant_recap(self.messages.as_slice());
-        self.replace_history_with_compaction(vec![self.system_message()])?;
+        let request = dropped_context_retry_message(
+            self.messages.as_slice(),
+            turn_start,
+            input,
+            recap.as_deref(),
+            true,
+        );
+        self.replace_history_with_compaction(vec![self.system_message(), request])?;
         self.runtime.invalidate_context_after_compaction();
-        self.messages
-            .push_user(dropped_context_retry_prompt(input, recap.as_deref(), true));
         self.report.context_used = 0;
         ui.status(&dropped_context_retry_status(true, recap.is_some()));
         Ok(true)
@@ -285,10 +347,15 @@ impl crate::Agent {
         let mut dropped_prior_context = false;
         if turn_start > 1 {
             let recap = last_assistant_recap(self.messages.as_slice());
-            self.replace_history_with_compaction(vec![self.system_message()])?;
+            let request = dropped_context_retry_message(
+                self.messages.as_slice(),
+                turn_start,
+                input,
+                recap.as_deref(),
+                false,
+            );
+            self.replace_history_with_compaction(vec![self.system_message(), request])?;
             self.runtime.invalidate_context_after_compaction();
-            self.messages
-                .push_user(dropped_context_retry_prompt(input, recap.as_deref(), false));
             self.report.context_used = 0;
             dropped_prior_context = true;
             ui.status(&dropped_context_retry_status(false, recap.is_some()));

@@ -16,21 +16,23 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
-use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
+
+mod execution;
+use execution::{drive, stop_and_reap};
 
 #[path = "background_names.rs"]
 mod names;
+
+#[cfg(test)]
+#[path = "background/lifecycle_tests.rs"]
+mod lifecycle_tests;
 use names::handle_id;
 pub use names::shell_title;
 
 /// Cap on retained per-process output. Beyond this we drop the oldest bytes (a
 /// ring buffer): a chatty server left unpolled can't grow memory without bound.
 const MAX_BG_BUFFER: usize = 256 * 1024;
-/// Bound one pseudo-line while draining a background pipe. A watcher can emit
-/// a newline-free megabyte record; `read_until` would allocate that whole
-/// record before the ring-buffer cap could run.
-const MAX_BG_LINE_BYTES: usize = 64 * 1024;
 /// Cap on retained processes. When exceeded, already-exited entries are pruned
 /// oldest-first so a long session that starts many servers can't leak handles.
 const MAX_BG_PROCS: usize = 64;
@@ -165,6 +167,9 @@ struct BgInner {
     /// unread omission the next poll must surface.
     read_position: u64,
     state: BgState,
+    /// Native child/drain cleanup is complete; publication may still await
+    /// the workspace callback. A later kill cannot cancel completed work.
+    native_exited: bool,
     reaped: bool,
     /// Effects are sealed on the first observation after the process becomes
     /// terminal, so later unrelated workspace edits cannot be attributed to it.
@@ -183,12 +188,17 @@ impl BgInner {
             dropped_bytes: 0,
             read_position: 0,
             state: BgState::Running,
+            native_exited: false,
             reaped: false,
             terminal_effects: None,
             empty_polls: 0,
         };
         trim_output_to_cap(&mut inner);
         inner
+    }
+
+    fn native_running(&self) -> bool {
+        self.state == BgState::Running && !self.native_exited
     }
 }
 
@@ -759,7 +769,7 @@ impl BackgroundRegistry {
             .collect::<Vec<_>>();
         let running = processes
             .iter()
-            .filter(|(_, process)| matches!(process.inner.lock().unwrap().state, BgState::Running))
+            .filter(|(_, process)| process.inner.lock().unwrap().native_running())
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         if !running.is_empty() {
@@ -881,7 +891,7 @@ impl BackgroundRegistry {
                 continue;
             }
             let mut inner = proc.inner.lock().unwrap();
-            if inner.state == BgState::Running {
+            if inner.native_running() {
                 inner.state = BgState::Killed;
                 if let Some(pgid) = proc.pgid {
                     crate::tools::kill_group(pgid);
@@ -980,7 +990,7 @@ impl BackgroundRegistry {
         for (id, process) in &targets {
             let running = {
                 let inner = process.inner.lock().unwrap();
-                matches!(inner.state, BgState::Running)
+                inner.native_running()
             };
             if running && kill_from(self, id).is_ok() {
                 signalled += 1;
@@ -1164,6 +1174,12 @@ fn kill_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
     {
         let mut inner = proc.inner.lock().unwrap();
         match inner.state {
+            BgState::Running if inner.native_exited => {
+                return Ok(format!(
+                    "[{id} · {}] already exited; waiting for settlement",
+                    proc.title
+                ));
+            }
             BgState::Exited(_) => {
                 return Ok(format!("[{id} · {}] already exited", proc.title));
             }
@@ -1190,7 +1206,7 @@ fn kill_all_from(registry: &BackgroundRegistry) {
     let reg = registry.processes.lock().unwrap();
     for proc in reg.values() {
         let mut inner = proc.inner.lock().unwrap();
-        if inner.state == BgState::Running {
+        if inner.native_running() {
             inner.state = BgState::Killed;
             if let Some(pgid) = proc.pgid {
                 crate::tools::kill_group(pgid);
@@ -1244,7 +1260,7 @@ fn kill_started_after_from(registry: &BackgroundRegistry, before: &[String]) -> 
             .filter(|(id, proc)| {
                 !before.contains(id.as_str())
                     && proc.origin == BgOrigin::AutoBackgrounded
-                    && matches!(proc.inner.lock().unwrap().state, BgState::Running)
+                    && proc.inner.lock().unwrap().native_running()
             })
             .map(|(id, _)| id.clone())
             .collect()
@@ -1309,7 +1325,7 @@ async fn wait_for_terminal_reap(
         notified.as_mut().enable();
         {
             let inner = process.inner.lock().unwrap();
-            if matches!(inner.state, BgState::Running) {
+            if inner.native_running() {
                 bail!("background process {id} is still running");
             }
             if inner.reaped {
@@ -1349,118 +1365,6 @@ fn id_num(id: &str) -> u64 {
     id.rsplit_once('_')
         .and_then(|(_, n)| n.parse().ok())
         .unwrap_or(0)
-}
-
-/// Drive one process to completion: pump both pipes into the shared buffer, then
-/// reap. A kill recorded mid-flight is preserved (not clobbered by the status).
-async fn drive(
-    proc: Arc<BgProc>,
-    mut child: tokio::process::Child,
-    stdout: Option<tokio::process::ChildStdout>,
-    stderr: Option<tokio::process::ChildStderr>,
-) {
-    tokio::join!(pump(stdout, &proc), pump(stderr, &proc));
-    let raw_state = match child.wait().await {
-        Ok(status) => BgState::Exited(status.code()),
-        Err(_) => BgState::Failed,
-    };
-    let cancelled = matches!(proc.inner.lock().unwrap().state, BgState::Killed);
-    let failpoint_error = (!cancelled)
-        .then(|| {
-            hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::JobAfterNaturalExit)
-                .err()
-        })
-        .flatten();
-    let terminal = if cancelled {
-        crate::BackgroundJobTerminal::Cancelled
-    } else if failpoint_error.is_some() {
-        crate::BackgroundJobTerminal::Failed
-    } else {
-        match raw_state {
-            BgState::Exited(Some(0)) => crate::BackgroundJobTerminal::Succeeded,
-            _ => crate::BackgroundJobTerminal::Failed,
-        }
-    };
-    let detail = failpoint_error.as_ref().map(ToString::to_string);
-    let lifecycle_error = match &proc.managed_job {
-        Some(job) => job.observe(terminal, detail).await.err(),
-        None => None,
-    };
-    let mut inner = proc.inner.lock().unwrap();
-    inner.state = if cancelled {
-        BgState::Killed
-    } else if lifecycle_error.is_some() || failpoint_error.is_some() {
-        BgState::Failed
-    } else {
-        raw_state
-    };
-    if let Some(error) = lifecycle_error {
-        inner
-            .output
-            .push_str(&format!("workspace job settlement failed: {error}\n"));
-        trim_output_to_cap(&mut inner);
-    }
-    inner.reaped = true;
-    drop(inner);
-    proc.reaped.notify_waiters();
-    proc.changed.notify_waiters();
-}
-
-async fn stop_and_reap(mut child: tokio::process::Child, pgid: Option<i32>) {
-    if let Some(pgid) = pgid {
-        crate::tools::kill_group(pgid);
-    }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-/// Append every line from one pipe into the shared buffer, enforcing the size
-/// cap by front-trimming on a char boundary (and shifting the read cursor).
-async fn pump<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, proc: &BgProc) {
-    let Some(pipe) = pipe else { return };
-    // Read fixed-size chunks and assemble bounded pseudo-lines. A noisy child
-    // must keep draining even when it never emits a newline.
-    let mut reader = pipe;
-    let mut chunk = [0_u8; 8 * 1024];
-    let mut line = Vec::with_capacity(MAX_BG_LINE_BYTES);
-    loop {
-        let read = match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => read,
-        };
-        let mut start = 0;
-        while start < read {
-            let newline = chunk[start..read]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map(|offset| start + offset + 1);
-            let end = newline.unwrap_or(read);
-            line.extend_from_slice(&chunk[start..end]);
-            while line.len() > MAX_BG_LINE_BYTES {
-                let prefix: Vec<u8> = line.drain(..MAX_BG_LINE_BYTES).collect();
-                append_output(proc, &prefix);
-            }
-            if newline.is_some() {
-                let complete = std::mem::take(&mut line);
-                append_output(proc, &complete);
-            }
-            start = end;
-        }
-    }
-    append_output(proc, &line);
-}
-
-fn append_output(proc: &BgProc, bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    let line = String::from_utf8_lossy(bytes);
-    let mut inner = proc.inner.lock().unwrap();
-    inner.output.push_str(line.trim_end_matches(['\r', '\n']));
-    inner.output.push('\n');
-    trim_output_to_cap(&mut inner);
-    drop(inner);
-    proc.changed.notify_waiters();
 }
 
 /// Enforce the retained-output cap while preserving an absolute byte origin.

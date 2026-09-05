@@ -338,16 +338,11 @@ impl crate::Agent {
             Err(err) if provider_error_kind(&err) == Some(ProviderErrorKind::RequestTooLarge) => {
                 let mut context_recovery_persistence_failed = false;
                 if !retry_state.request_too_large_compacted {
-                    match self.retry_after_request_too_large_compact(ui) {
+                    match self.retry_after_request_too_large_compact(*turn_start, ui) {
                         Ok(true) => {
                             retry_state.request_too_large_compacted = true;
                             retry_state.record_recovery_attempt();
-                            *turn_start = self
-                                .messages
-                                .as_slice()
-                                .iter()
-                                .rposition(|message| message.role == Role::User)
-                                .unwrap_or(1);
+                            *turn_start = 1;
                             return Ok(ProviderStreamResult::Continue);
                         }
                         Ok(false) => {

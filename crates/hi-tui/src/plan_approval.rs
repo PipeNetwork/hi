@@ -41,6 +41,7 @@ pub(crate) struct PlanApproval {
     pub preview_sel: usize,
     pub focus: PlanApprovalFocus,
     pub parked: bool,
+    review_after_draft: bool,
     pub comments: Vec<PlanComment>,
     pub comment_draft: String,
 }
@@ -52,6 +53,7 @@ impl PlanApproval {
             preview_sel: 0,
             focus: PlanApprovalFocus::Preview,
             parked: false,
+            review_after_draft: false,
             comments: Vec::new(),
             comment_draft: String::new(),
         }
@@ -318,6 +320,7 @@ impl App {
                 return false;
             }
             card.parked = false;
+            card.review_after_draft = false;
             card.focus = PlanApprovalFocus::Preview;
             self.completion = None;
             self.session_face_dirty = true;
@@ -336,6 +339,7 @@ impl App {
             return;
         }
         card.parked = true;
+        card.review_after_draft = false;
         self.session_face_dirty = true;
         self.status = "plan approval parked — /view-plan".into();
         self.trace_approval_decided("plan", "parked");
@@ -399,6 +403,15 @@ impl App {
         self.open_plan_approval();
     }
 
+    /// A new user revision supersedes an earlier decision to park review. Keep
+    /// the card and feedback until the draft succeeds; a fresh mid-turn park
+    /// remains an explicit choice and clears this pending review.
+    pub(crate) fn begin_plan_draft(&mut self, started_in_plan_mode: bool) {
+        if let Some(card) = self.plan_approval.as_mut() {
+            card.review_after_draft = started_in_plan_mode && card.parked;
+        }
+    }
+
     /// Drafting stays read-only until the user approves. The end of a
     /// successful draft presents that decision without requiring a mode key.
     /// An explicit mid-turn approval already left plan mode and must not open
@@ -408,13 +421,20 @@ impl App {
         started_in_plan_mode: bool,
         outcome: Option<&hi_agent::TurnOutcome>,
     ) {
+        let review_parked = self
+            .plan_approval
+            .as_mut()
+            .is_some_and(|card| std::mem::take(&mut card.review_after_draft) && card.parked);
         if started_in_plan_mode
             && self.plan_mode
             && self.plan_has_leftover()
-            && self.plan_approval.is_none()
             && outcome.is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Completed)
         {
-            self.open_plan_approval();
+            if self.plan_approval.is_none() {
+                self.open_plan_approval();
+            } else if review_parked {
+                self.unpark_plan_approval();
+            }
         }
     }
 

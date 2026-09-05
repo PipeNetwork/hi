@@ -28,6 +28,7 @@ mod mcp_workspace_admin;
 mod memory;
 mod mutation_recovery;
 mod outcome;
+mod overflow_recovery;
 mod pipefs_command_gate;
 mod plan;
 mod program_results;

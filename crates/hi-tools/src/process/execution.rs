@@ -35,7 +35,7 @@ const MAX_STREAM_LINE_BYTES: usize = 64 * 1024;
 /// the capture under the truncation cap and misreporting a truncated run as
 /// `Complete`. 5 s keeps the leaked-descendant guard while comfortably
 /// covering real buffered output.
-const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 pub(super) async fn capture_child(
     child: tokio::process::Child,
@@ -468,7 +468,7 @@ pub fn preserve_detached_descendants(preserve: bool) {
     PRESERVE_DETACHED_DESCENDANTS.store(preserve, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn detached_descendants_preserved() -> bool {
+pub(crate) fn detached_descendants_preserved() -> bool {
     PRESERVE_DETACHED_DESCENDANTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 

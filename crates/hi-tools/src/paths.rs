@@ -1,6 +1,20 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+mod file_version;
+pub(crate) use file_version::FileVersion;
+
+struct CachedRead {
+    content: String,
+    version: Option<FileVersion>,
+}
+
+impl CachedRead {
+    fn len(&self) -> usize {
+        self.content.len()
+    }
+}
+
 /// Canonicalize a not-yet-existing path by resolving its nearest existing
 /// ancestor and re-joining the not-yet-existing tail. Canonicalizing the
 /// deepest existing ancestor resolves symlinks in *every* existing component,
@@ -113,7 +127,7 @@ const RESOURCE_BODY_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// operations are O(1) amortized. The deque is bounded to
 /// [`READ_CACHE_MAX`] entries, matching the map.
 pub struct ReadCache {
-    map: HashMap<String, String>,
+    map: HashMap<String, CachedRead>,
     order: std::collections::VecDeque<String>,
     bytes: usize,
     resources: HashMap<hi_workspace::ResourceUri, String>,
@@ -231,7 +245,7 @@ impl ReadCache {
             // Promote to back (MRU) — remove from current position, push to end
             self.order.retain(|k| k != key);
             self.order.push_back(key.to_string());
-            Some(val)
+            Some(&val.content)
         } else {
             None
         }
@@ -239,6 +253,25 @@ impl ReadCache {
 
     /// Insert an entry, evicting the LRU (front) on overflow.
     pub fn insert(&mut self, key: String, value: String) {
+        self.insert_file(key, value, None);
+    }
+
+    /// Use a filesystem entry only while its observed identity is unchanged.
+    pub(crate) fn get_file(&mut self, key: &str, version: &FileVersion) -> Option<&String> {
+        if self.map.get(key)?.version.as_ref() != Some(version) {
+            self.remove(key);
+            return None;
+        }
+        self.get(key)
+    }
+
+    pub(crate) fn insert_file(
+        &mut self,
+        key: String,
+        content: String,
+        version: Option<FileVersion>,
+    ) {
+        let value = CachedRead { content, version };
         if value.len() > READ_CACHE_MAX_BYTES {
             self.remove(&key);
             return;
@@ -250,7 +283,7 @@ impl ReadCache {
             }
             self.bytes = self
                 .bytes
-                .saturating_add(self.map.get(&key).map_or(0, String::len));
+                .saturating_add(self.map.get(&key).map_or(0, CachedRead::len));
             self.order.retain(|k| k != &key);
             self.order.push_back(key);
             while self.bytes > READ_CACHE_MAX_BYTES {

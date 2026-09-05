@@ -100,6 +100,7 @@ fn running_effect_snapshot_is_not_sealed_when_process_exits_during_scan() {
         dropped_bytes: 0,
         read_position: 0,
         state: BgState::Exited(Some(0)),
+        native_exited: true,
         reaped: true,
         terminal_effects: None,
         empty_polls: 0,
