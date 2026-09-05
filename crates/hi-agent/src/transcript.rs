@@ -1728,7 +1728,7 @@ Read-only review guard: use only the currently advertised read-only inspection t
         };
         t.push_assistant_with_results(
             vec![read("r1", r#"{"paths":["a.rs","b.rs"]}"#)],
-            vec![("r1".into(), "old batch".into())],
+            vec![("r1".into(), "old batch\n".repeat(32))],
         );
         t.push_assistant_with_results(
             vec![read("r2", r#"{"paths":["b.rs","a.rs"]}"#)],
@@ -1767,7 +1767,7 @@ Read-only review guard: use only the currently advertised read-only inspection t
         };
         t.push_assistant_with_results(
             vec![read("r1", r#"{"path":"src/model.rs"}"#)],
-            vec![("r1".into(), "fn old() {}".into())],
+            vec![("r1".into(), "fn old() {}\n".repeat(32))],
         );
         t.push_assistant_with_results(
             vec![read(

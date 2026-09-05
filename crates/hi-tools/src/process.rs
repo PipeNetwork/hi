@@ -11,6 +11,7 @@ mod environment;
 mod execution;
 mod foreground;
 mod hermetic;
+mod program;
 
 use environment::{SECRET_ENV_VARS, sensitive_environment_name, workspace_cargo_home};
 #[cfg(test)]
@@ -245,52 +246,6 @@ impl ProcessRunner {
         let started = Instant::now();
         let child = self.spawn_shell(command)?;
         capture_child_adoptable(child, foreground_budget, on_line, started, &self.foreground).await
-    }
-
-    /// Run an executable directly, keeping filesystem-derived arguments out of
-    /// a shell parser. This is used for filename-sensitive syntax checks and
-    /// other internal commands.
-    pub async fn run_program<I, S>(
-        &self,
-        program: impl AsRef<OsStr>,
-        args: I,
-        timeout: Duration,
-    ) -> Result<ProcessExecution>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        self.run_program_maybe_timeout(program, args, Some(timeout))
-            .await
-    }
-
-    /// Run an executable directly with an optional outer deadline.
-    ///
-    /// `None` leaves productive work active until the program exits or the
-    /// returned future is cancelled. Cancellation still drops the process
-    /// group guard and removes the direct child and all of its descendants.
-    pub async fn run_program_maybe_timeout<I, S>(
-        &self,
-        program: impl AsRef<OsStr>,
-        args: I,
-        timeout: Option<Duration>,
-    ) -> Result<ProcessExecution>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let started = Instant::now();
-        let (wrapped_program, wrapped_args) =
-            self.sandbox
-                .wrap_program_in(program.as_ref(), args, &self.root);
-        let mut command = Command::new(wrapped_program);
-        command.args(wrapped_args);
-        self.configure(&mut command);
-        if self.sandbox.is_enforced() {
-            command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
-        }
-        let child = command.spawn().context("failed to spawn program")?;
-        capture_child_maybe_timeout(child, timeout, &mut |_| {}, started, &self.foreground).await
     }
 
     /// Run a trusted executable directly with explicit environment overrides.

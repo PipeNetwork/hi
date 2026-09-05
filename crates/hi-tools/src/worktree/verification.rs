@@ -254,30 +254,16 @@ fn run_git(
         .current_dir(worktree)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    // Content filters may leave background children behind. They must not
-    // keep an inherited capture pipe open after Git itself has exited.
-    if args.first() == Some(&"add") {
-        command
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-    }
+        .env("LC_ALL", "C");
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }
-    configure_private_process_group(&mut command);
-    let child = command.spawn().context("starting verification snapshot")?;
-    let pid = child.id();
-    let result = super::wait_for_apply(child, timeout, cancellation);
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
-    result
+    super::command::run(
+        &mut command,
+        None,
+        super::command::Budget::new(timeout),
+        cancellation,
+    )
 }
 
 #[derive(Clone, Copy)]

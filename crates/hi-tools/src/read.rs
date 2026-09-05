@@ -15,6 +15,10 @@ mod resource;
 #[path = "read/cache_tests.rs"]
 mod cache_tests;
 
+#[cfg(test)]
+#[path = "read/search_tests.rs"]
+mod search_tests;
+
 pub(crate) use resource::workspace_path_from_read_arguments;
 pub use resource::{ResourceReadRoutingError, route_resource_read};
 
@@ -272,18 +276,7 @@ async fn run_grep_with_runner_maybe_timeout(
             "--line-number".to_string(),
             "--color=never".to_string(),
             "--no-config".to_string(),
-            "--max-count=200".to_string(),
-            // Never search VCS metadata, even if the user's ripgrep
-            // config enables --hidden (which would otherwise descend
-            // into .git and leak repository internals to the model).
-            "--glob=!.git".to_string(),
-            "--glob=!.hg".to_string(),
-            "--glob=!.svn".to_string(),
-            "--glob=!.jj".to_string(),
-            // A project-local Cargo home is a downloaded dependency cache,
-            // not repository source. Searching it polluted context and made
-            // affected-package verification target registry crates.
-            "--glob=!**/.cargo-home/**".to_string(),
+            "--hidden".to_string(),
         ];
         if context > 0 {
             cmd_args.push(format!("--context={context}"));
@@ -292,13 +285,26 @@ async fn run_grep_with_runner_maybe_timeout(
             cmd_args.push("--glob".to_string());
             cmd_args.push(glob.clone());
         }
+        // Put exclusions after the user glob: rg gives later globs priority.
+        // Include useful dotfiles without bringing VCS/dependency internals
+        // back into a search when a caller supplies a broad pattern like `**`.
+        cmd_args.extend(
+            [
+                "--glob=!.git",
+                "--glob=!.hg",
+                "--glob=!.svn",
+                "--glob=!.jj",
+                "--glob=!**/.cargo-home/**",
+                "--glob=!**/.hi/state/cargo-home/**",
+            ]
+            .map(str::to_owned),
+        );
         cmd_args.push("--".to_string());
         cmd_args.push(pattern.clone());
         cmd_args.push(target.clone());
         // Route the fast path through the same bounded process runner as bash
-        // and verification. `rg --max-count` caps matches per file, not the
-        // total output, so `Command::output()` could still retain gigabytes
-        // before the final model-content truncation.
+        // and verification. Bound retained output, not matches per file:
+        // hundreds of short matches may still fit the configured model budget.
         let owned_runner = process_runner
             .is_none()
             .then(|| ProcessRunner::new(root))
@@ -307,7 +313,7 @@ async fn run_grep_with_runner_maybe_timeout(
             .or(owned_runner.as_ref())
             .expect("grep runner is either borrowed or constructed above");
         let output = runner
-            .run_program_maybe_timeout("rg", &cmd_args, timeout)
+            .run_program_plain_maybe_timeout("rg", &cmd_args, timeout)
             .await;
         match output {
             Ok(execution) if execution.status == ToolStatus::Succeeded => {

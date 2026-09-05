@@ -37,6 +37,21 @@ const MAX_STREAM_LINE_BYTES: usize = 64 * 1024;
 /// covering real buffered output.
 pub(crate) const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy)]
+pub(super) enum OutputMode {
+    Diagnostics,
+    Plain,
+}
+
+impl OutputMode {
+    fn summarize(self, text: &str) -> String {
+        match self {
+            Self::Diagnostics => crate::condense::condense(text),
+            Self::Plain => crate::condense::truncate(text),
+        }
+    }
+}
+
 pub(super) async fn capture_child(
     child: tokio::process::Child,
     timeout: Duration,
@@ -52,11 +67,30 @@ pub(super) async fn capture_child(
 /// This is used by long-lived internal workers, while ordinary shell tools
 /// continue to call [`capture_child`] with an explicit timeout.
 pub(super) async fn capture_child_maybe_timeout(
+    child: tokio::process::Child,
+    timeout: Option<Duration>,
+    on_line: &mut (dyn FnMut(&str) + Send),
+    started: Instant,
+    foreground: &ForegroundProcessRegistry,
+) -> Result<ProcessExecution> {
+    capture_child_with_output_mode(
+        child,
+        timeout,
+        on_line,
+        started,
+        foreground,
+        OutputMode::Diagnostics,
+    )
+    .await
+}
+
+pub(super) async fn capture_child_with_output_mode(
     mut child: tokio::process::Child,
     timeout: Option<Duration>,
     on_line: &mut (dyn FnMut(&str) + Send),
     started: Instant,
     foreground: &ForegroundProcessRegistry,
+    output_mode: OutputMode,
 ) -> Result<ProcessExecution> {
     let mut group_guard = ProcessGroupDropGuard::for_child(&child);
     let _foreground = foreground.register(&child);
@@ -137,6 +171,7 @@ pub(super) async fn capture_child_maybe_timeout(
         status,
         exit_code,
         started,
+        output_mode,
     ))
 }
 
@@ -167,6 +202,7 @@ fn build_execution(
     status: ToolStatus,
     exit_code: Option<i32>,
     started: Instant,
+    output_mode: OutputMode,
 ) -> ProcessExecution {
     let stdout_total_bytes = stdout.total_bytes;
     let stderr_total_bytes = stderr.total_bytes;
@@ -178,8 +214,8 @@ fn build_execution(
     // split-token leak.
     let stdout_text = hi_secrets::redact_secrets(&stdout.into_text()).into_owned();
     let stderr_text = hi_secrets::redact_secrets(&stderr.into_text()).into_owned();
-    let stdout_summary = crate::condense::condense(stdout_text.trim_end());
-    let stderr_summary = crate::condense::condense(stderr_text.trim_end());
+    let stdout_summary = output_mode.summarize(stdout_text.trim_end());
+    let stderr_summary = output_mode.summarize(stderr_text.trim_end());
     let original_bytes = stdout_total_bytes.saturating_add(stderr_total_bytes) as u64;
     let retained_bytes = stdout_summary.len().saturating_add(stderr_summary.len()) as u64;
     let truncation = if stdout_truncated || stderr_truncated || retained_bytes < original_bytes {
@@ -270,6 +306,7 @@ pub(super) async fn capture_child_adoptable(
                     },
                     exit.code(),
                     started,
+                    OutputMode::Diagnostics,
                 )));
             }
             Some(Err(err)) => return Err(err).context("waiting for command"),

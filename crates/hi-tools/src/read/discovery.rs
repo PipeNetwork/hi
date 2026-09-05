@@ -31,7 +31,8 @@ pub(crate) async fn run_list(root: &std::path::Path, arguments: &str) -> Result<
 pub(super) fn is_searchable_entry(entry: &ignore::DirEntry) -> bool {
     !(is_vcs_metadata_dir(entry)
         || entry.file_type().is_some_and(|kind| kind.is_dir())
-            && entry.file_name().to_str() == Some(".cargo-home"))
+            && (entry.file_name().to_str() == Some(".cargo-home")
+                || entry.path().ends_with(".hi/state/cargo-home")))
 }
 
 pub(super) fn run_list_sync(root: &std::path::Path, target: &str) -> Result<ToolOutcome> {

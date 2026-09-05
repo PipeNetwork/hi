@@ -6,6 +6,9 @@ use super::phase::TurnPhase;
 use crate::ui::Ui;
 use crate::verify::{Snapshot, VerifyOutcome, VerifyWorkspace, WorkspaceRepairVerifier};
 
+#[cfg(test)]
+mod tests;
+
 impl crate::Agent {
     /// Kill turn-scoped background processes, reconcile the ledger, and run the
     /// configured [`WorkspaceRepairVerifier`] stages ([`TurnPhase::WorkspaceRepair`]).
@@ -32,15 +35,14 @@ impl crate::Agent {
         let killed_backgrounds = self
             .runtime
             .background()
-            .kill_started_after(turn_background_baseline);
+            .kill_started_after_and_reap(turn_background_baseline)
+            .await?;
         if killed_backgrounds > 0 {
             ui.status(&format!(
                 "stopped {killed_backgrounds} auto-backgrounded process(es) before final verification"
             ));
-            // Process-group termination is signalled synchronously. Yield so
-            // the driver tasks can observe it before the final filesystem
-            // reconciliation and verifier snapshot.
-            tokio::task::yield_now().await;
+            // Native exit and the lifecycle callback have both completed;
+            // reconciliation and verification can now observe a stable tree.
             self.invalidate_snapshot();
             self.reconcile_workspace_changes().await?;
         }

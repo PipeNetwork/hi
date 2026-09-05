@@ -6,7 +6,6 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 
 use crate::ToolOutcome;
-use crate::condense::truncate;
 
 use super::discovery::is_searchable_entry;
 use super::{MAX_GREP_FILE_BYTES, display_path};
@@ -104,22 +103,34 @@ pub(super) fn run_grep_fallback_sync(
             ));
             continue;
         }
+        let mut printed_end = 0usize;
         for (idx, (_, line)) in lines.iter().enumerate() {
             if re.is_match(line) {
-                let line_no = lines[idx].0;
-                if context > 0 {
-                    let start = idx.saturating_sub(context);
-                    let end = (idx + context + 1).min(lines.len());
-                    for (ctx_i, (ctx_no, ctx_line)) in
-                        lines.iter().enumerate().take(end).skip(start)
-                    {
-                        let marker = if ctx_i == idx { ":" } else { "-" };
-                        out.push_str(&format!("{rel}{marker}{}: {}\n", ctx_no, ctx_line));
-                    }
+                let start = idx.saturating_sub(context);
+                let end = idx
+                    .saturating_add(context)
+                    .saturating_add(1)
+                    .min(lines.len());
+                if context > 0 && printed_end > 0 && start > printed_end {
                     out.push_str("--\n");
-                } else {
-                    out.push_str(&format!("{rel}:{line_no}: {line}\n"));
                 }
+                // Merge intersecting/adjacent windows. A dense set of matches
+                // must not spend the budget repeating the same context or
+                // label another match as a context-only line.
+                for (ctx_i, (line_no, line)) in lines
+                    .iter()
+                    .enumerate()
+                    .take(end)
+                    .skip(start.max(printed_end))
+                {
+                    let marker = if ctx_i == idx || re.is_match(line) {
+                        ":"
+                    } else {
+                        "-"
+                    };
+                    out.push_str(&format!("{rel}{marker}{line_no}: {line}\n"));
+                }
+                printed_end = end;
                 count += 1;
                 // Auto-size: stop when we've filled the output budget. The
                 // final `truncate` will clip to exactly `budget`, but we stop
@@ -139,5 +150,5 @@ pub(super) fn run_grep_fallback_sync(
     } else {
         out
     };
-    Ok(ToolOutcome::plain(truncate(&out)))
+    Ok(ToolOutcome::bounded_plain(out))
 }

@@ -7,7 +7,7 @@ mod background_task;
 mod cancellation_settlement;
 mod candidate_publication;
 mod coding_memory;
-mod common;
+pub(crate) mod common;
 mod compaction;
 mod context_integrity;
 mod curate;

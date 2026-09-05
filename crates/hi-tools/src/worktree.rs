@@ -6,17 +6,22 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 mod changes;
+mod command;
+mod index;
 mod verification;
-pub use changes::{changed_files, changed_files_async};
+pub use changes::{changed_files, changed_files_async, changed_files_async_with_cancel};
 #[cfg(test)]
 use verification::{verification_timed_out, verify_passes_with_timeout};
 pub use verification::{verify_passes, verify_passes_async};
 
+#[cfg(test)]
+#[path = "worktree/merge_process_tests.rs"]
+mod merge_process_tests;
 #[cfg(test)]
 #[path = "worktree/verification_tests.rs"]
 mod verification_tests;
@@ -390,6 +395,7 @@ fn apply_changes_impl_with_timeout_and_cancel(
     if cancellation.is_some_and(|token| token.is_cancelled()) {
         bail!("git apply cancelled before merge preparation");
     }
+    let budget = command::Budget::new(apply_timeout);
     // Strip Python bytecode caches the child's own test runs left behind, and
     // exclude them from the staging/diff below: a firing (or the child's test
     // run) regenerates `__pycache__/*.pyc`, and because `checkpoint::create`
@@ -397,13 +403,16 @@ fn apply_changes_impl_with_timeout_and_cancel(
     // — so it otherwise churns through the diff as noise (or a spurious
     // deleted-file merge / unappliable binary patch). Real source only merges.
     crate::prepare_verify_workdir(worktree);
-    // Stage everything (minus pycache) so the diff captures new/deleted files.
-    let add = Command::new("git")
-        .current_dir(worktree)
+    // Stage everything (minus pycache) in an owned index. Interrupted filters
+    // cannot leave the candidate's real index locked or partially staged.
+    let index = index::PrivateIndex::copy_from(worktree, budget, cancellation)
+        .context("preparing worktree merge index")?;
+    let mut add = Command::new("git");
+    add.current_dir(worktree)
         .args(["add", "-A", "--", "."])
-        .args(PYCACHE_EXCLUDES)
-        .output()
-        .context("git add in worktree")?;
+        .args(PYCACHE_EXCLUDES);
+    index.configure(&mut add);
+    let add = command::run(&mut add, None, budget, cancellation).context("git add in worktree")?;
     if !add.status.success() {
         bail!(
             "git add failed: {}",
@@ -411,14 +420,26 @@ fn apply_changes_impl_with_timeout_and_cancel(
         );
     }
 
-    let diff = Command::new("git")
-        .current_dir(worktree)
+    let mut diff = Command::new("git");
+    diff.current_dir(worktree)
         // --binary so legitimate binary assets (images, fixtures) survive the
         // pipe to `git apply` instead of arriving as "Binary files differ".
-        .args(["diff", "--cached", "--binary", base, "--"])
-        .args(PYCACHE_EXCLUDES)
-        .output()
-        .context("git diff in worktree")?;
+        .args([
+            "diff",
+            "--cached",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            base,
+            "--",
+        ])
+        .args(PYCACHE_EXCLUDES);
+    index.configure(&mut diff);
+    let diff =
+        command::run(&mut diff, None, budget, cancellation).context("git diff in worktree")?;
     if !diff.status.success() {
         bail!(
             "git diff failed: {}",
@@ -435,38 +456,15 @@ fn apply_changes_impl_with_timeout_and_cancel(
     // Apply the patch in the main repo via stdin. Capture stderr so a failed
     // apply says *which file/hunk* conflicted — in the TUI the inherited stderr
     // is invisible, which made fleet merge failures undiagnosable.
-    use std::io::Write;
     // Serialize the real-tree apply (MERGE_LOCK) and run it from the repo root so
     // repo-root-relative patch paths resolve regardless of the launch cwd. The
-    // guard is held until this function returns (through the write + wait below).
-    let _merge = acquire_merge_lock(cancellation)?;
+    // guard is held until the complete private process group has stopped.
+    let _merge = acquire_merge_lock(cancellation, budget)?;
     let mut apply = Command::new("git");
     apply.args(["apply", "--whitespace=nowarn"]);
     apply.current_dir(destination_root);
     configure_private_process_group(&mut apply);
-    let mut child = apply
-        .stdin(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("spawning git apply")?;
-    let write_result = child
-        .stdin
-        .take()
-        .context("git apply stdin")
-        .and_then(|mut stdin| {
-            stdin
-                .write_all(&diff.stdout)
-                .context("writing patch to git apply")
-        });
-    if let Err(error) = write_result {
-        terminate_sync_child_group(&mut child);
-        return Err(error);
-    }
-    // The normal merge path has no wall-clock ceiling: large patches and slow
-    // filesystems remain productive until `git apply` actually settles. The
-    // optional helper path retains a typed, process-group-cleaning deadline for
-    // callers/tests that explicitly opt into one.
-    let out = wait_for_apply(child, apply_timeout, cancellation)?;
+    let out = run_apply_command(&mut apply, &diff.stdout, budget.remaining()?, cancellation)?;
     if !out.status.success() {
         let why = String::from_utf8_lossy(&out.stderr);
         let why = why.trim();
@@ -482,18 +480,31 @@ fn apply_changes_impl_with_timeout_and_cancel(
     Ok(true)
 }
 
+fn run_apply_command(
+    apply: &mut Command,
+    patch: &[u8],
+    apply_timeout: Option<Duration>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<std::process::Output> {
+    command::run(
+        apply,
+        Some(patch),
+        command::Budget::new(apply_timeout),
+        cancellation,
+    )
+}
+
 fn acquire_merge_lock(
     cancellation: Option<&tokio_util::sync::CancellationToken>,
+    budget: command::Budget,
 ) -> Result<std::sync::MutexGuard<'static, ()>> {
     loop {
+        let poll = budget.check(cancellation)?;
         match MERGE_LOCK.try_lock() {
             Ok(guard) => return Ok(guard),
             Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => {
-                if cancellation.is_some_and(|token| token.is_cancelled()) {
-                    bail!("git apply cancelled while waiting for the merge lock");
-                }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(poll);
             }
         }
     }
@@ -514,71 +525,6 @@ fn terminate_sync_child_group(child: &mut std::process::Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
-}
-
-fn wait_for_apply(
-    child: std::process::Child,
-    timeout: Option<Duration>,
-    cancellation: Option<&tokio_util::sync::CancellationToken>,
-) -> Result<std::process::Output> {
-    if timeout.is_none() && cancellation.is_none() {
-        return child.wait_with_output().context("waiting for git apply");
-    }
-
-    let pid = child.id();
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let started = Instant::now();
-    loop {
-        let poll = timeout
-            .map(|deadline| deadline.saturating_sub(started.elapsed()))
-            .unwrap_or(Duration::from_millis(50))
-            .min(Duration::from_millis(50));
-        match rx.recv_timeout(poll) {
-            Ok(Ok(out)) => return Ok(out),
-            Ok(Err(error)) => return Err(error).context("waiting for git apply"),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("git apply waiter disconnected before returning a result")
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                if cancellation.is_some_and(|token| token.is_cancelled()) =>
-            {
-                kill_waited_apply_group(pid, &rx);
-                bail!("git apply cancelled while holding the merge lock");
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                if timeout.is_some_and(|deadline| started.elapsed() >= deadline) =>
-            {
-                kill_waited_apply_group(pid, &rx);
-                bail!(
-                    "git apply timed out after {}s while holding the merge lock",
-                    timeout.unwrap_or_default().as_secs_f64()
-                );
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-        }
-    }
-}
-
-fn kill_waited_apply_group(
-    pid: u32,
-    rx: &std::sync::mpsc::Receiver<std::io::Result<std::process::Output>>,
-) {
-    #[cfg(unix)]
-    {
-        // The waiter thread owns/reaps the direct child. Kill its
-        // private group here so helpers spawned by git cannot survive.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-    }
-    let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
 }
 
 /// Commit all of the worktree's changes (minus pycache) onto a fresh `branch`
@@ -684,19 +630,19 @@ mod tests {
     fn apply_wait_has_no_default_deadline_but_accepts_an_explicit_one() {
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 0.03; exit 0"]);
-        configure_private_process_group(&mut command);
-        let child = command
-            .spawn()
-            .expect("spawn default-unlimited apply stand-in");
-        let output = wait_for_apply(child, None, None).expect("unlimited apply wait completes");
+        let output = command::run(&mut command, None, command::Budget::new(None), None)
+            .expect("unlimited apply wait completes");
         assert!(output.status.success());
 
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 1"]);
-        configure_private_process_group(&mut command);
-        let child = command.spawn().expect("spawn timed apply stand-in");
-        let error = wait_for_apply(child, Some(Duration::from_millis(25)), None)
-            .expect_err("explicit apply deadline must fire");
+        let error = command::run(
+            &mut command,
+            None,
+            command::Budget::new(Some(Duration::from_millis(25))),
+            None,
+        )
+        .expect_err("explicit apply deadline must fire");
         assert!(error.to_string().contains("timed out"), "{error:#}");
     }
 
@@ -718,8 +664,6 @@ mod tests {
             "-c",
             &format!("sleep 0.2; touch {}", leaked.to_string_lossy()),
         ]);
-        configure_private_process_group(&mut command);
-        let child = command.spawn().expect("spawn cancellable apply stand-in");
         let cancellation = tokio_util::sync::CancellationToken::new();
         let trigger = cancellation.clone();
         std::thread::spawn(move || {
@@ -727,8 +671,13 @@ mod tests {
             trigger.cancel();
         });
 
-        let error = wait_for_apply(child, None, Some(&cancellation))
-            .expect_err("cancelled apply wait must stop");
+        let error = command::run(
+            &mut command,
+            None,
+            command::Budget::new(None),
+            Some(&cancellation),
+        )
+        .expect_err("cancelled apply wait must stop");
         assert!(error.to_string().contains("cancelled"), "{error:#}");
         std::thread::sleep(Duration::from_millis(250));
         assert!(!leaked.exists(), "cancelled apply left a live descendant");
@@ -1151,7 +1100,7 @@ mod tests {
         let held = MERGE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
-        let error = acquire_merge_lock(Some(&cancellation))
+        let error = acquire_merge_lock(Some(&cancellation), command::Budget::new(None))
             .expect_err("a cancelled waiter must not block behind the merge lock");
         assert!(error.to_string().contains("cancelled"), "{error:#}");
         drop(held);

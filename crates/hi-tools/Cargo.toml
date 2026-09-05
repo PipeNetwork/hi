@@ -32,6 +32,7 @@ toml.workspace = true
 tree-sitter.workspace = true
 tree-sitter-bash.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -48,5 +49,4 @@ codebase-graph = ["dep:hi-codebase-graph"]
 unsafe_code = "allow"
 
 [dev-dependencies]
-tempfile.workspace = true
 axum.workspace = true

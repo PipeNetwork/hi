@@ -46,7 +46,10 @@ use crate::render::dim;
 use crate::theme::UiTone;
 use crate::{App, FleetLauncher, SPINNER};
 
+mod cancellation;
 mod merge_check;
+mod post_merge;
+use post_merge::{finish as finish_post_verify, queue as queue_post_merge_verify};
 
 /// Lines of output kept per row for the peek/attach panels.
 const TAIL_CAP: usize = 200;
@@ -80,6 +83,8 @@ pub(crate) struct FleetRow {
     pub(crate) reply: InputLine,
     /// Kills the in-flight child turn when fired.
     pub(crate) kill: Option<oneshot::Sender<()>>,
+    /// Shared by the turn's merge/check lifecycle; Ctrl+K also stops verifiers.
+    pub(crate) operation_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Current turn start (for the elapsed column).
     pub(crate) started: Option<Instant>,
     pub(crate) turns: u32,
@@ -188,6 +193,7 @@ pub(crate) fn benchmark_row(id: usize) -> FleetRow {
         pending: VecDeque::new(),
         reply: InputLine::default(),
         kill: None,
+        operation_cancel: None,
         started: None,
         turns: 3,
         usage: (id as u64) * 1_000,
@@ -432,10 +438,10 @@ pub(crate) enum RowDone {
     /// A user-requested row cleanup completed off the render task.
     Cleanup,
     /// Post-merge: combined-tree verify verdict (None = no verify configured)
-    /// + the refreshed base the worktree was reset onto (None = refresh failed).
+    /// + the refreshed base the worktree was reset onto, or the recovery error.
     PostVerify {
         verify_ok: Option<bool>,
-        new_base: Option<String>,
+        new_base: Result<String, String>,
     },
 }
 
@@ -949,14 +955,9 @@ pub(crate) async fn run_dashboard(
                                     }));
                                 }
                             }
-                            // Ctrl+K: kill the selected row's in-flight turn.
+                            // Ctrl+K stops the child or its merge/check lifecycle.
                             KeyCode::Char('k') if ctrl => {
-                                if let Some(row) = app.fleet.get_mut(selected)
-                                    && row.state == RowState::Working
-                                    && let Some(kill) = row.kill.take()
-                                {
-                                    let _ = kill.send(());
-                                }
+                                cancellation::request(app, selected);
                             }
                             KeyCode::Char('u') if ctrl => {
                                 focused_input(app, selected, focus, &mut dispatch).map(InputLine::kill_to_start);
@@ -1136,6 +1137,7 @@ async fn dispatch_new(
         pending: VecDeque::new(),
         reply: InputLine::default(),
         kill: None,
+        operation_cancel: None,
         started: None,
         turns: 0,
         usage: 0,
@@ -1815,6 +1817,7 @@ async fn spawn_workflow_agent(
         pending: VecDeque::new(),
         reply: InputLine::default(),
         kill: None,
+        operation_cancel: None,
         started: None,
         turns: 0,
         usage: 0,
@@ -1910,6 +1913,7 @@ pub(crate) async fn adopt_session(
         pending: VecDeque::new(),
         reply: InputLine::default(),
         kill: None,
+        operation_cancel: None,
         started: None,
         turns: 0,
         usage: 0,
@@ -2055,10 +2059,14 @@ fn start_turn(
     line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) {
+    cancellation::reset(app, idx);
     let Some(row) = app.fleet.get_mut(idx) else {
         return;
     };
     row.state = RowState::Working;
+    // The next turn may introduce new work; an older successful merge must
+    // not authorize discarding it if this turn is cancelled before inspection.
+    row.merge = MergeState::None;
     row.started = Some(Instant::now());
     row.activity = "starting…".to_string();
     row.driving = prompt == hi_agent::GOAL_CONTINUE_PROMPT;
@@ -2175,12 +2183,6 @@ fn finish_turn(
         return;
     };
     row.kill = None;
-    if row.workflow_status == Some(WorkflowJobStatus::Cancelled) {
-        row.state = RowState::Failed;
-        row.started = None;
-        row.activity.clear();
-        return;
-    }
     row.turns += 1;
     // Ingest the child's report: session-cumulative tokens, goal progress, and
     // the drive-stall comparison (an unchanged goal across a drive turn counts
@@ -2259,6 +2261,12 @@ fn finish_turn(
             "⚠ goal progress report missing — automatic drive paused; reply to resume".to_string(),
         );
     }
+    // A cancelled child can still have persisted billed usage and progress.
+    // Ingest that report before parking, while fencing every follow-up below.
+    if cancellation::settle(app, idx) {
+        return;
+    }
+    let row = &mut app.fleet[idx];
     if killed {
         row.state = RowState::Failed;
         row.started = None;
@@ -2332,8 +2340,12 @@ fn finish_turn(
     let worktree_path = row.worktree.clone();
     let base = row.base.clone();
     let verify = launcher.verify.clone();
+    let cancellation = cancellation::token(app, idx);
     in_flight.push(Box::pin(async move {
-        (idx, merge_check::check(worktree_path, base, verify).await)
+        (
+            idx,
+            merge_check::check(worktree_path, base, verify, cancellation).await,
+        )
     }));
 }
 
@@ -2490,6 +2502,16 @@ fn finish_merge_check(
     line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) {
+    if let Some(row) = app.fleet.get_mut(idx)
+        && cancellation::requested(row)
+        && let Ok(changed) = &changed
+    {
+        row.changed = changed.clone();
+        row.merge = MergeState::VerifyFailed;
+    }
+    if cancellation::settle(app, idx) {
+        return;
+    }
     let changed = match changed {
         Ok(changed) => changed,
         Err(error) => return merge_check::finish_failure(app, idx, error),
@@ -2569,11 +2591,7 @@ fn finish_merge_check(
         let base = row.base.clone();
         let destination = app.workspace_root.clone();
         let changed_for_apply = row.changed.clone();
-        let workflow_cancel = row
-            .workflow_run_id
-            .as_deref()
-            .and_then(|run_id| app.workflow_runs.get(run_id))
-            .map(|run| run.cancel.clone());
+        let operation_cancel = row.operation_cancel.clone();
         row.state = RowState::Working;
         row.activity = "merging…".to_string();
         in_flight.push(Box::pin(async move {
@@ -2581,7 +2599,7 @@ fn finish_merge_check(
                 &worktree_path,
                 &base,
                 &destination,
-                workflow_cancel.as_ref(),
+                operation_cancel.as_ref(),
             )
             .await
             .map(|_| ())
@@ -2611,15 +2629,7 @@ fn finish_merge_apply(
     line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) {
-    if app
-        .fleet
-        .get(idx)
-        .is_some_and(|row| row.workflow_status == Some(WorkflowJobStatus::Cancelled))
-    {
-        if let Some(row) = app.fleet.get_mut(idx) {
-            row.state = RowState::Failed;
-            row.activity.clear();
-        }
+    if result.is_err() && cancellation::settle(app, idx) {
         return;
     }
     let Some(row) = app.fleet.get_mut(idx) else {
@@ -2653,138 +2663,10 @@ fn finish_merge_apply(
         &format!("merged {} file(s): {}", changed.len(), changed.join(", ")),
     );
     mark_others_stale(app, idx);
+    if cancellation::settle(app, idx) {
+        return;
+    }
     queue_post_merge_verify(app, idx, launcher, in_flight);
-}
-
-/// Verify the combined explicit workspace root and refresh the row's base.
-/// Both the potentially slow verification and checkpoint/reset operations stay
-/// off the render task; the explicit root avoids depending on process cwd.
-fn queue_post_merge_verify(
-    app: &mut App,
-    idx: usize,
-    launcher: &FleetLauncher,
-    in_flight: &mut FuturesUnordered<RowFut>,
-) {
-    let verify = launcher.verify.clone();
-    let workspace_root = app.workspace_root.clone();
-    let worktree_path = app.fleet.get(idx).map(|row| row.worktree.clone());
-    let Some(worktree_path) = worktree_path else {
-        return;
-    };
-    let Some(row) = app.fleet.get_mut(idx) else {
-        return;
-    };
-    if row.workflow_status == Some(WorkflowJobStatus::Cancelled) {
-        row.state = RowState::Failed;
-        row.activity.clear();
-        return;
-    }
-    let workflow_cancel = row
-        .workflow_run_id
-        .as_deref()
-        .and_then(|run_id| app.workflow_runs.get(run_id))
-        .map(|run| run.cancel.clone());
-    row.state = RowState::Working;
-    row.activity = "post-merge check…".to_string();
-    in_flight.push(Box::pin(async move {
-        if workflow_cancel
-            .as_ref()
-            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-        {
-            return (
-                idx,
-                RowDone::PostVerify {
-                    verify_ok: Some(false),
-                    new_base: None,
-                },
-            );
-        }
-        let verify_ok = match &verify {
-            Some(verify) => Some(
-                worktree::verify_passes_async(&workspace_root, verify, workflow_cancel.as_ref())
-                    .await,
-            ),
-            None => None,
-        };
-        let new_base = hi_tools::checkpoint::create(&workspace_root).await;
-        let new_base = match new_base {
-            Some(base) => {
-                let wt = worktree_path.clone();
-                let sha = base.clone();
-                let reset_ok =
-                    tokio::task::spawn_blocking(move || worktree::reset_to(&wt, &sha).is_ok())
-                        .await
-                        .unwrap_or(false);
-                reset_ok.then_some(base)
-            }
-            None => None,
-        };
-        (
-            idx,
-            RowDone::PostVerify {
-                verify_ok,
-                new_base,
-            },
-        )
-    }));
-}
-
-/// The post-merge check landed: record the combined-tree verify verdict, adopt
-/// the refreshed base, then continue the row (queued reply or goal drive).
-fn finish_post_verify(
-    app: &mut App,
-    idx: usize,
-    verify_ok: Option<bool>,
-    new_base: Option<String>,
-    launcher: &FleetLauncher,
-    line_tx: &mpsc::UnboundedSender<(usize, String)>,
-    in_flight: &mut FuturesUnordered<RowFut>,
-) {
-    if app
-        .fleet
-        .get(idx)
-        .is_some_and(|row| row.workflow_status == Some(WorkflowJobStatus::Cancelled))
-    {
-        if let Some(row) = app.fleet.get_mut(idx) {
-            row.state = RowState::Failed;
-            row.activity.clear();
-        }
-        return;
-    }
-    let Some(row) = app.fleet.get_mut(idx) else {
-        return;
-    };
-    row.state = RowState::Idle;
-    row.started = None;
-    row.activity.clear();
-    if let Some(base) = new_base {
-        // The fresh snapshot contains this row's merged diff, so the worktree
-        // is now clean against it.
-        row.base = base;
-        row.changed.clear();
-        row.stale = false;
-    }
-    if verify_ok == Some(false) {
-        row.push_line("⚠ combined-tree verify failed after merge — inspect your tree".to_string());
-        record_fleet(
-            launcher,
-            row.id,
-            &row.title,
-            "combined-tree verify failed after merge — inspect your tree",
-        );
-        row.attention = true;
-    }
-    let success = verify_ok != Some(false);
-    let summary = if success {
-        "verified changes merged into the workspace".to_string()
-    } else {
-        "combined-tree verification failed after merge".to_string()
-    };
-    let completion = finish_workflow_agent(row, success, summary);
-    if settle_workflow_reply(app, completion) {
-        return;
-    }
-    continue_row(app, idx, launcher, line_tx, in_flight);
 }
 
 /// After a turn fully settles: run the next queued reply, else keep a goal
@@ -2796,6 +2678,9 @@ fn continue_row(
     line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) {
+    if cancellation::settle(app, idx) {
+        return;
+    }
     let Some(row) = app.fleet.get_mut(idx) else {
         return;
     };
@@ -2924,19 +2809,21 @@ fn queue_force_merge(
     idx: usize,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) -> Option<String> {
+    cancellation::reset(app, idx);
     let Some(row) = app.fleet.get_mut(idx) else {
         return Some("selected fleet row no longer exists".to_string());
     };
     let worktree_path = row.worktree.clone();
     let base = row.base.clone();
     let destination = app.workspace_root.clone();
+    let cancellation = row.operation_cancel.clone();
     row.state = RowState::Working;
     row.activity = "force merging…".to_string();
     row.attention = false;
     in_flight.push(Box::pin(async move {
         (
             idx,
-            merge_check::force(worktree_path, base, destination).await,
+            merge_check::force(worktree_path, base, destination, cancellation).await,
         )
     }));
     None
@@ -2950,6 +2837,9 @@ fn finish_force_merge(
     launcher: &FleetLauncher,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) {
+    if (result.is_err() || changed.is_empty()) && cancellation::settle(app, idx) {
+        return;
+    }
     let Some(row) = app.fleet.get_mut(idx) else {
         return;
     };
@@ -2984,6 +2874,9 @@ fn finish_force_merge(
         ),
     );
     mark_others_stale(app, idx);
+    if cancellation::settle(app, idx) {
+        return;
+    }
     queue_post_merge_verify(app, idx, launcher, in_flight);
 }
 
@@ -2998,7 +2891,8 @@ fn queue_rebase(
     let Some(row) = app.fleet.get_mut(idx) else {
         return Some("selected fleet row no longer exists".to_string());
     };
-    let unmerged = !row.changed.is_empty() && !matches!(row.merge, MergeState::Merged(_));
+    let unmerged = (!row.changed.is_empty() || cancellation::requested(row))
+        && !matches!(row.merge, MergeState::Merged(_));
     if unmerged {
         return Some(format!(
             "#{}: unmerged changes — merge (m) or close (x) first",
@@ -3797,7 +3691,7 @@ pub(crate) fn truncate_title(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    fn test_fleet_launcher() -> FleetLauncher {
+    pub(super) fn test_fleet_launcher() -> FleetLauncher {
         FleetLauncher {
             exe: PathBuf::from("/bin/false"),
             workspace_root: PathBuf::from("/tmp"),
@@ -3832,6 +3726,7 @@ mod tests {
             pending: VecDeque::new(),
             reply: InputLine::default(),
             kill: None,
+            operation_cancel: None,
             started: None,
             turns: 0,
             usage: 0,

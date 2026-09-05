@@ -5,34 +5,51 @@ use anyhow::{Context, Result, ensure};
 
 use super::PYCACHE_EXCLUDES;
 
-/// Stage and list the worktree's source changes. An inspection failure is not
+/// List source changes using a private index. An inspection failure is not
 /// evidence of an empty diff: callers must retain the candidate and report it.
 pub fn changed_files(worktree: &Path, base: &str) -> Result<Vec<String>> {
+    inspect(worktree, base, None)
+}
+
+fn inspect(
+    worktree: &Path,
+    base: &str,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Vec<String>> {
     crate::prepare_verify_workdir(worktree);
-    let staged = Command::new("git")
+    let budget = super::command::Budget::new(None);
+    let index = super::index::PrivateIndex::copy_from(worktree, budget, cancellation)
+        .context("staging worktree changes failed")?;
+    let mut staged = Command::new("git");
+    staged
         .current_dir(worktree)
         .args(["add", "-A", "--", "."])
-        .args(PYCACHE_EXCLUDES)
-        .output()
+        .args(PYCACHE_EXCLUDES);
+    index.configure(&mut staged);
+    let staged = super::command::run(&mut staged, None, budget, cancellation)
         .context("staging worktree changes")?;
     ensure!(
         staged.status.success(),
         "staging worktree changes failed: {}",
         String::from_utf8_lossy(&staged.stderr).trim()
     );
-    let diff = Command::new("git")
-        .current_dir(worktree)
+    let mut diff = Command::new("git");
+    diff.current_dir(worktree)
         .args([
             "diff",
             "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
             "--no-renames",
             "--name-only",
             "-z",
             base,
             "--",
         ])
-        .args(PYCACHE_EXCLUDES)
-        .output()
+        .args(PYCACHE_EXCLUDES);
+    index.configure(&mut diff);
+    let diff = super::command::run(&mut diff, None, budget, cancellation)
         .context("inspecting worktree changes")?;
     ensure!(
         diff.status.success(),
@@ -52,11 +69,28 @@ pub fn changed_files(worktree: &Path, base: &str) -> Result<Vec<String>> {
 }
 
 pub async fn changed_files_async(worktree: &Path, base: &str) -> Result<Vec<String>> {
+    changed_files_async_with_cancel(worktree, base, None).await
+}
+
+/// Dropping the inspection future or cancelling its parent stops staging
+/// filters and diff helpers before the worker releases its candidate.
+pub async fn changed_files_async_with_cancel(
+    worktree: &Path,
+    base: &str,
+    parent_cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Vec<String>> {
+    let cancellation = parent_cancel
+        .map(tokio_util::sync::CancellationToken::child_token)
+        .unwrap_or_default();
+    let guard = cancellation.clone().drop_guard();
     let worktree = worktree.to_path_buf();
     let base = base.to_owned();
-    tokio::task::spawn_blocking(move || changed_files(&worktree, &base))
-        .await
-        .context("worktree change inspection worker failed")?
+    let result =
+        tokio::task::spawn_blocking(move || inspect(&worktree, &base, Some(&cancellation)))
+            .await
+            .context("worktree change inspection worker failed")?;
+    let _ = guard.disarm();
+    result
 }
 
 #[cfg(test)]

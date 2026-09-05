@@ -1,6 +1,9 @@
 //! Fold superseded observations while retaining distinct source and process evidence.
 
-use super::{Content, ReadCallKey, Transcript, background_poll_handle, read_call_key};
+use super::{Content, ReadCallKey, Role, Transcript, background_poll_handle, read_call_key};
+
+#[cfg(test)]
+mod tests;
 
 impl Transcript {
     /// Shorten old idle status lines. Background polls return incremental
@@ -44,61 +47,74 @@ impl Transcript {
         );
     }
 
-    /// Shared folding walk: find every ToolCall matching `matches`, then
-    /// rewrite the ToolResults of all but the last one to `digest`.
+    /// Pair each result with its assistant round before deciding whether it
+    /// was superseded. Providers may reuse call IDs in subsequent rounds.
     fn fold_superseded_tool_results(
         &mut self,
         digest: &str,
         matches: impl Fn(&str, &str) -> bool,
         may_fold: impl Fn(&str) -> bool,
     ) {
-        let mut matching_call_ids: Vec<String> = Vec::new();
-        for message in self.messages.iter() {
+        let mut matching_results = Vec::new();
+        for (message_index, message) in self.messages.iter().enumerate() {
+            if message.role != Role::Assistant {
+                continue;
+            }
+            let mut results_by_id =
+                std::collections::HashMap::<_, std::collections::VecDeque<_>>::new();
+            for (result_index, result_message) in self
+                .messages
+                .iter()
+                .enumerate()
+                .skip(message_index + 1)
+                .take_while(|(_, m)| m.role == Role::Tool)
+            {
+                for (block_index, block) in result_message.content.iter().enumerate() {
+                    if let Content::ToolResult { call_id, .. } = block {
+                        results_by_id
+                            .entry(call_id.as_str())
+                            .or_default()
+                            .push_back((result_index, block_index));
+                    }
+                }
+            }
+            // Consume in call order, including nonmatching calls. Legacy
+            // batches with duplicate IDs pair by occurrence, just as append
+            // and provider validation do; IDs alone are never global identity.
             for block in &message.content {
                 if let Content::ToolCall {
                     id,
                     name,
                     arguments,
                 } = block
+                    && let Some(position) = results_by_id
+                        .get_mut(id.as_str())
+                        .and_then(|positions| positions.pop_front())
                     && matches(name, arguments)
                 {
-                    matching_call_ids.push(id.clone());
+                    matching_results.push(position);
                 }
             }
         }
-        if matching_call_ids.len() < 2 {
+        if matching_results.len() < 2 {
             return;
         }
-        let superseded: std::collections::HashSet<&str> = matching_call_ids
-            [..matching_call_ids.len() - 1]
-            .iter()
-            .map(String::as_str)
-            .collect();
-        // Skip the rewrite (and the copy-on-write clone) when every superseded
-        // result is already folded — the common case after the first fold.
-        let already_folded = self
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .all(|block| match block {
-                Content::ToolResult { call_id, output }
-                    if superseded.contains(call_id.as_str()) && may_fold(output) =>
-                {
-                    output == digest
-                }
-                _ => true,
-            });
-        if already_folded {
+        matching_results.pop();
+        let replacements = matching_results.into_iter().filter(|&(message_index, block_index)| {
+            matches!(&self.messages[message_index].content[block_index], Content::ToolResult { output, .. }
+                if output.len() > digest.len() && may_fold(output))
+        }).collect::<Vec<_>>();
+        // No copy-on-write clone or revision bump for already-folded results
+        // or observations shorter than their replacement notice.
+        if replacements.is_empty() {
             return;
         }
-        for message in self.make_mut().iter_mut() {
-            for block in &mut message.content {
-                if let Content::ToolResult { call_id, output } = block
-                    && superseded.contains(call_id.as_str())
-                    && may_fold(output)
-                {
-                    *output = digest.to_string();
-                }
+        let messages = self.make_mut();
+        for (message_index, block_index) in replacements {
+            if let Content::ToolResult { output, .. } =
+                &mut messages[message_index].content[block_index]
+            {
+                *output = digest.to_string();
             }
         }
     }

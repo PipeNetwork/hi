@@ -1,12 +1,18 @@
 use super::*;
 
-pub(super) async fn check(worktree: PathBuf, base: String, verify: Option<String>) -> RowDone {
-    let changed = worktree::changed_files_async(&worktree, &base)
-        .await
-        .map_err(|error| format!("{error:#}"));
+pub(super) async fn check(
+    worktree: PathBuf,
+    base: String,
+    verify: Option<String>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> RowDone {
+    let changed =
+        worktree::changed_files_async_with_cancel(&worktree, &base, cancellation.as_ref())
+            .await
+            .map_err(|error| format!("{error:#}"));
     let verified = match (&changed, verify.as_deref()) {
         (Ok(changed), Some(verify)) if !changed.is_empty() => {
-            worktree::verify_passes_async(&worktree, verify, None).await
+            worktree::verify_passes_async(&worktree, verify, cancellation.as_ref()).await
         }
         (Ok(_), _) => true,
         (Err(_), _) => false,
@@ -14,20 +20,28 @@ pub(super) async fn check(worktree: PathBuf, base: String, verify: Option<String
     RowDone::MergeCheck { changed, verified }
 }
 
-pub(super) async fn force(worktree: PathBuf, base: String, destination: PathBuf) -> RowDone {
-    let changed = match worktree::changed_files_async(&worktree, &base).await {
-        Ok(changed) => changed,
-        Err(error) => {
-            return RowDone::ForceMerge {
-                changed: Vec::new(),
-                result: Err(format!("could not inspect changes: {error:#}")),
-            };
-        }
-    };
+pub(super) async fn force(
+    worktree: PathBuf,
+    base: String,
+    destination: PathBuf,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> RowDone {
+    let changed =
+        match worktree::changed_files_async_with_cancel(&worktree, &base, cancellation.as_ref())
+            .await
+        {
+            Ok(changed) => changed,
+            Err(error) => {
+                return RowDone::ForceMerge {
+                    changed: Vec::new(),
+                    result: Err(format!("could not inspect changes: {error:#}")),
+                };
+            }
+        };
     let result = if changed.is_empty() {
         Ok(())
     } else {
-        worktree::apply_changes_to_async(&worktree, &base, &destination, None)
+        worktree::apply_changes_to_async(&worktree, &base, &destination, cancellation.as_ref())
             .await
             .map(|_| ())
             .map_err(|error| format!("{error:#}"))
@@ -64,7 +78,7 @@ mod tests {
         let candidate = tempfile::tempdir().unwrap();
         let destination = tempfile::tempdir().unwrap();
         std::fs::write(candidate.path().join("source.rs"), "new work").unwrap();
-        let done = check(candidate.path().into(), "missing-base".into(), None).await;
+        let done = check(candidate.path().into(), "missing-base".into(), None, None).await;
         assert!(matches!(
             done,
             RowDone::MergeCheck {
@@ -76,6 +90,7 @@ mod tests {
             candidate.path().into(),
             "missing-base".into(),
             destination.path().into(),
+            None,
         )
         .await;
         assert!(matches!(done, RowDone::ForceMerge { result: Err(_), .. }));
