@@ -219,6 +219,46 @@ async fn cancelled_compaction_seals_its_read_only_job() {
 }
 
 #[tokio::test]
+async fn cooperative_compaction_cancel_awaits_its_terminal_job_seal() {
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let config = config();
+    let _state_guard = config.test_state_root.clone();
+    let mut agent = Agent::new(
+        std::sync::Arc::new(PendingCompactionProvider {
+            entered: entered.clone(),
+        }),
+        config,
+    )
+    .unwrap();
+    agent.messages_mut().push(Message::user("old task"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text("old answer".into())]));
+    let state_root = agent.state_root().to_path_buf();
+    let binding = agent.workspace_controller_binding();
+    let cancellation = crate::TurnCancellation::new();
+    let worker_cancellation = cancellation.clone();
+    let worker = tokio::spawn(async move {
+        let result = agent
+            .compact_with_cancellable(CompactionKind::Summarize, &mut NullUi, worker_cancellation)
+            .await;
+        (agent, result)
+    });
+    entered.notified().await;
+    cancellation.cancel();
+    let (_agent, result) = worker.await.unwrap();
+    result.unwrap();
+
+    let store = hi_control::ControlStore::open_for_state(&state_root).unwrap();
+    let jobs = store.jobs_for_binding(binding.binding_id.as_str()).unwrap();
+    let compaction = jobs
+        .iter()
+        .find(|job| job.kind == hi_control::ControlJobKind::Compaction)
+        .expect("cancelled compaction job projection");
+    assert_eq!(compaction.state, hi_control::ControlJobState::Cancelled);
+}
+
+#[tokio::test]
 async fn compact_does_not_summarize_stale_turn_controls() {
     let (mut agent, requests) = scripted_agent(
         vec![ProviderStep::Completion(completion(

@@ -162,11 +162,41 @@ fn stack_fact(root: &Path, changed: &[String]) -> Option<Decision> {
 
 /// Merge fact bullets into project memory.md without a model call.
 /// Dedupes by case-insensitive summary prefix; caps total body size.
+#[cfg(test)]
 pub(crate) fn merge_facts_into_memory(path: &Path, facts: &[Decision]) -> Result<usize, String> {
     if facts.is_empty() {
         return Ok(0);
     }
-    let body = memory::read_layer(path);
+    let preimage = memory::read_memory_preimage(path)?;
+    let body = memory::memory_body_from_preimage(preimage.as_deref());
+    let (added, rendered) = merge_facts_body(&body, facts);
+    memory::write_memory_replace_if_unchanged(path, &rendered, preimage.as_deref())?;
+    Ok(added)
+}
+
+pub(crate) fn merge_facts_into_workspace_memory(
+    root: &Path,
+    state_root: &Path,
+    path: &Path,
+    facts: &[Decision],
+) -> Result<usize, String> {
+    if facts.is_empty() {
+        return Ok(0);
+    }
+    let preimage = memory::read_memory_preimage(path)?;
+    let body = memory::memory_body_from_preimage(preimage.as_deref());
+    let (added, rendered) = merge_facts_body(&body, facts);
+    memory::write_memory_replace_if_unchanged_at(
+        root,
+        state_root,
+        path,
+        &rendered,
+        preimage.as_deref(),
+    )?;
+    Ok(added)
+}
+
+fn merge_facts_body(body: &str, facts: &[Decision]) -> (usize, String) {
     let mut bullets: Vec<(Option<u32>, String)> = body
         .lines()
         .filter_map(memory::parse_bullet_line)
@@ -207,8 +237,7 @@ pub(crate) fn merge_facts_into_memory(path: &Path, facts: &[Decision]) -> Result
 
     let mut next = memory::max_bullet_id(&rendered).saturating_add(1);
     let rendered = memory::ensure_bullet_ids(&rendered, &mut next);
-    memory::write_memory(path, &rendered)?;
-    Ok(added)
+    (added, rendered)
 }
 
 fn one_line(text: &str) -> String {

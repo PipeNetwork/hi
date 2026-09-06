@@ -86,7 +86,7 @@ pub(crate) const fn generic_completion_guards_enabled() -> bool {
 /// stays a tight phrase match instead of a broad heuristic.
 pub(crate) fn answer_declines_mutation(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
-    contains_any(
+    let explicit_no_change = contains_any(
         &lower,
         &[
             "no file changes are needed",
@@ -100,27 +100,34 @@ pub(crate) fn answer_declines_mutation(content: &str) -> bool {
             "no edits are required",
             "requires no file changes",
             "requires no code changes",
-            // Broader decline / out-of-scope language after a no-change challenge.
-            "out of scope",
-            "outside the scope",
             "no changes necessary",
             "no change is needed",
-            "already implemented",
-            "already done",
-            "nothing to change",
             "nothing needs to change",
-            "i won't modify",
-            "i will not modify",
-            "i won't edit",
-            "i will not edit",
-            "leaving the code unchanged",
-            "leave the code unchanged",
-            "without modifying files",
-            "without changing files",
             "no modifications are needed",
             "no modifications needed",
         ],
-    )
+    );
+    // A bare refusal is not evidence that an explicit fix is already
+    // satisfied. Require the no-change conclusion to carry a concrete reason;
+    // otherwise weak models can escape the mutation obligation with "I won't
+    // edit" or an unsupported "out of scope" response.
+    let evidence_backed = contains_any(
+        &lower,
+        &[
+            " because ",
+            " already ",
+            "already correct",
+            "already rejects",
+            "already handles",
+            "does not reproduce",
+            "doesn't reproduce",
+            "current implementation",
+            "existing implementation",
+            "reported bug",
+            "report was",
+        ],
+    );
+    explicit_no_change && evidence_backed
 }
 
 pub(crate) fn should_deepen_review(
@@ -742,5 +749,20 @@ mod tests {
         assert!(!generic_completion_guards_enabled());
         #[cfg(not(feature = "smoke-negative-control-disable-generic-completion-guards"))]
         assert!(generic_completion_guards_enabled());
+    }
+
+    #[test]
+    fn mutation_decline_requires_a_no_change_conclusion_and_reason() {
+        assert!(answer_declines_mutation(
+            "No file changes are needed because the current implementation already handles it."
+        ));
+        for unsupported in [
+            "I won't modify the files.",
+            "That is out of scope.",
+            "No file changes are needed.",
+            "The work is already done.",
+        ] {
+            assert!(!answer_declines_mutation(unsupported), "{unsupported:?}");
+        }
     }
 }

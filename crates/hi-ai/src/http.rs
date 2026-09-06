@@ -1,9 +1,7 @@
 //! Shared HTTP send-with-retry used by every adapter.
 //!
-//! Retries the *initial* request (before streaming begins) on transient
-//! failures — connection/timeout errors only — with capped exponential
-//! backoff. HTTP responses are returned to the provider adapter so its typed
-//! `code`/`retryable` contract decides whether another logical attempt is safe.
+//! Retries the *initial* request on transient connection/timeout failures with
+//! capped backoff. Provider adapters own HTTP response and logical retry policy.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -171,9 +169,8 @@ impl ModelEntry {
     }
 }
 
-/// GET an OpenAI/Anthropic-style `/models` list from an already-authenticated
-/// request and return the served models — what the *current endpoint* actually
-/// offers (with any live window/price/health it reports).
+/// GET an OpenAI/Anthropic-style `/models` list and return what the current
+/// authenticated endpoint offers.
 pub async fn fetch_models(builder: RequestBuilder) -> Result<Vec<ServedModel>> {
     let duration = operation_deadline(
         "HI_MODEL_DISCOVERY_DEADLINE_SECS",
@@ -192,7 +189,9 @@ async fn fetch_models_inner(
     builder: RequestBuilder,
     budget: OperationBudget,
 ) -> Result<Vec<ServedModel>> {
-    let resp = send_with_retry_deadline(builder, budget).await?;
+    let Ok(resp) = send_with_retry_deadline(builder, budget).await else {
+        bail!("model discovery transport failed");
+    };
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -224,11 +223,9 @@ fn cache_path() -> Option<std::path::PathBuf> {
     Some(base.join("hi").join("models-cache.json"))
 }
 
-/// A stable key for a provider endpoint so pipenetwork@v1 and ollama@localhost
-/// don't collide. Includes the base_url so two OpenAI-compatible endpoints with
-/// different URLs get separate entries.
+/// Stable, credential-free cache identity for one concrete provider endpoint.
 pub fn cache_key(provider: &str, base_url: &str) -> String {
-    format!("{provider}@{base_url}")
+    crate::endpoint_capability_route(provider, base_url)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1222,6 +1219,9 @@ pub fn stream_idle_window() -> Option<std::time::Duration> {
 pub(crate) fn xai_stream_idle_window() -> Option<std::time::Duration> {
     stream_idle_window()
 }
+
+#[cfg(test)]
+mod security_tests;
 
 #[cfg(test)]
 mod idle_guard_tests {

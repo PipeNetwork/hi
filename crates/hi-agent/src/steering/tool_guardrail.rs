@@ -1,6 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
+mod validation;
+
+use validation::bash_validation_scope;
+pub(crate) use validation::{tool_result_hash_guard_applies, validation_exit_status_is_reliable};
+
 /// How many consecutive idle `bash_output` polls (running, no new output) for
 /// the same handle are allowed before the result-hash guard treats further
 /// polls as no progress. Two free polls keep legitimate progress-watching
@@ -17,6 +22,15 @@ pub(crate) struct ToolLoopGuardrail {
     evicted_idempotent_result_hashes: u64,
     /// Consecutive idle `bash_output` polls per background handle id.
     idle_bg_poll_strikes: HashMap<String, u32>,
+    /// A validation observation is reusable only until the next landed
+    /// workspace mutation. Including this epoch in its key re-admits the same
+    /// validator after real source changes without letting presentation-only
+    /// argument churn manufacture progress.
+    workspace_mutation_epoch: u64,
+    /// The authoritative local ledger revision catches workspace changes that
+    /// arrive through candidate publication or background reconciliation and
+    /// therefore do not necessarily carry `mutation_applied` on this result.
+    workspace_revision: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,6 +55,10 @@ pub(crate) struct ToolResultProgress {
 }
 
 impl ToolLoopGuardrail {
+    pub(crate) fn observe_workspace_revision(&mut self, revision: u64) {
+        self.workspace_revision = Some(revision);
+    }
+
     #[cfg(test)]
     pub(crate) fn record_tool_result(
         &mut self,
@@ -58,6 +76,9 @@ impl ToolLoopGuardrail {
         output: &str,
         mutation_applied: bool,
     ) -> ToolResultProgress {
+        if mutation_applied {
+            self.workspace_mutation_epoch = self.workspace_mutation_epoch.saturating_add(1);
+        }
         // Wait-polls ("sleep 300 && du -sh …") are exempt from the
         // signature-based repeat guards, so their loop bound lives here: the
         // same poll returning byte-identical output means the awaited state
@@ -68,6 +89,9 @@ impl ToolLoopGuardrail {
             .flatten();
         let inspection = (name == "bash" && !mutation_applied)
             .then(|| super::implementation::bash_inspection_signature(arguments))
+            .flatten();
+        let validation = (name == "bash" && !mutation_applied)
+            .then(|| bash_validation_scope(arguments))
             .flatten();
         let running_bg = name == "bash_output" && bash_output_is_running(output);
         let idle_bg = name == "bash_output" && bash_output_is_idle(output);
@@ -85,8 +109,9 @@ impl ToolLoopGuardrail {
         if !(is_hashable_idempotent_tool(name)
             || wait_poll
             || bounded_probe.is_some()
-            || inspection.is_some())
-            || output.starts_with("Error:")
+            || inspection.is_some()
+            || validation.is_some())
+            || (output.starts_with("Error:") && validation.is_none())
         {
             return ToolResultProgress {
                 running_background_poll: running_bg && !output.starts_with("Error:"),
@@ -100,7 +125,15 @@ impl ToolLoopGuardrail {
         // arguments: two different polls that happen to print the same bytes —
         // health checks of two different servers both saying "ready: True" —
         // are distinct events, not a static state.
-        let key = if let Some(probe) = bounded_probe {
+        let key = if let Some(validation) = validation {
+            format!(
+                "bash-validation:{:?}:{}:{}:{}",
+                self.workspace_revision,
+                self.workspace_mutation_epoch,
+                stable_result_hash(&validation),
+                stable_result_hash(output)
+            )
+        } else if let Some(probe) = bounded_probe {
             format!("bash-probe:{probe}:{}", stable_result_hash(output))
         } else if wait_poll {
             format!(
@@ -283,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_poll_bash_is_hash_guarded_but_plain_bash_is_not() {
+    fn wait_poll_and_validation_bash_are_hash_guarded_but_plain_bash_is_not() {
         let mut guard = ToolLoopGuardrail::default();
         let wait_args = r#"{"command":"sleep 300 && du -sh models/"}"#;
 
@@ -304,7 +337,12 @@ mod tests {
             "identical output means the awaited state stopped changing"
         );
 
-        let plain = guard.record_tool_result("bash", r#"{"command":"cargo test"}"#, "ok");
+        let validation =
+            guard.record_tool_result("bash", r#"{"command":"cargo test"}"#, "1 passed");
+        assert!(validation.hashable_idempotent);
+        assert!(!validation.repeated_idempotent_result);
+
+        let plain = guard.record_tool_result("bash", r#"{"command":"echo hi"}"#, "hi");
         assert!(!plain.hashable_idempotent, "plain bash is not hash guarded");
     }
 
@@ -324,6 +362,196 @@ mod tests {
         let mut mutation_guard = ToolLoopGuardrail::default();
         let mutation = mutation_guard.record_tool_result_with_effects("bash", head, output, true);
         assert!(!mutation.hashable_idempotent);
+    }
+
+    #[test]
+    fn varied_clippy_presentation_queries_with_empty_results_are_deduplicated() {
+        let mut guard = ToolLoopGuardrail::default();
+        let first = r#"{"command":"cd /Users/david/alovewtf && cargo clippy 2>&1 | grep -B3 -A12 \"src/main.rs:1605\" | head -40"}"#;
+        let second = r#"{"command":"cd /Users/david/alovewtf && cargo clippy 2>&1 | grep -B3 -A12 \"src/main.rs:1606\" | head -40"}"#;
+
+        let initial = guard.record_tool_result_with_effects("bash", first, "[no output]", false);
+        let repeated = guard.record_tool_result_with_effects("bash", second, "[no output]", false);
+
+        assert!(initial.hashable_idempotent);
+        assert!(!initial.repeated_idempotent_result);
+        assert!(repeated.hashable_idempotent);
+        assert!(repeated.repeated_idempotent_result);
+    }
+
+    #[test]
+    fn validation_scope_keeps_workspace_context_and_deduplicates_failures() {
+        let mut guard = ToolLoopGuardrail::default();
+        let api = r#"{"command":"cd crates/api && cargo clippy | grep first"}"#;
+        let api_again = r#"{"command":"cd crates/api && cargo clippy | grep second"}"#;
+        let web = r#"{"command":"cd crates/web && cargo clippy | grep second"}"#;
+
+        let first = guard.record_tool_result_with_effects("bash", api, "Error: failed", false);
+        let repeated =
+            guard.record_tool_result_with_effects("bash", api_again, "Error: failed", false);
+        let distinct = guard.record_tool_result_with_effects("bash", web, "Error: failed", false);
+
+        assert!(first.hashable_idempotent);
+        assert!(repeated.repeated_idempotent_result);
+        assert!(!distinct.repeated_idempotent_result);
+    }
+
+    #[test]
+    fn filtered_validator_exit_status_is_not_false_green() {
+        assert!(validation_exit_status_is_reliable(
+            "bash",
+            r#"{"command":"cargo clippy --workspace"}"#,
+        ));
+        assert!(!validation_exit_status_is_reliable(
+            "bash",
+            r#"{"command":"cargo clippy 2>&1 | grep warning | head -40"}"#,
+        ));
+        assert!(!validation_exit_status_is_reliable(
+            "bash",
+            r#"{"command":"set -o pipefail; cargo clippy | tee clippy.log"}"#,
+        ));
+        assert!(validation_exit_status_is_reliable(
+            "bash",
+            r#"{"command":"cargo clippy && echo checked"}"#,
+        ));
+        assert!(!validation_exit_status_is_reliable(
+            "bash",
+            r#"{"command":"cargo clippy; echo checked"}"#,
+        ));
+        assert!(!validation_exit_status_is_reliable(
+            "bash",
+            r#"{"command":"cargo clippy || echo ignored"}"#,
+        ));
+        for command in [
+            "true # cargo clippy",
+            "printf '%s' 'cargo clippy'",
+            "true || cargo clippy",
+            "! cargo clippy",
+            "echo \"$(cargo clippy)\"",
+            "echo pipefail; cargo clippy | head",
+            "set +o pipefail; cargo clippy | head",
+        ] {
+            let arguments = serde_json::json!({ "command": command }).to_string();
+            assert!(
+                !validation_exit_status_is_reliable("bash", &arguments),
+                "must fail closed when the validator status is ambiguous: {command}"
+            );
+        }
+        for command in [
+            "cd crate && cargo clippy",
+            "FOO=x cargo clippy",
+            "env FOO=x cargo clippy",
+            "cargo clippy 2>&1",
+            "cargo clippy --message-format='short|json'",
+        ] {
+            let arguments = serde_json::json!({ "command": command }).to_string();
+            assert!(
+                validation_exit_status_is_reliable("bash", &arguments),
+                "direct validator status should remain usable: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn landed_mutation_re_admits_validation_observation() {
+        let mut guard = ToolLoopGuardrail::default();
+        let validation = r#"{"command":"cargo clippy --package api"}"#;
+
+        assert!(
+            !guard
+                .record_tool_result_with_effects("bash", validation, "clean", false)
+                .repeated_idempotent_result
+        );
+        assert!(
+            guard
+                .record_tool_result_with_effects("bash", validation, "clean", false)
+                .repeated_idempotent_result
+        );
+        guard.record_tool_result_with_effects(
+            "edit",
+            r#"{"path":"src/lib.rs"}"#,
+            "Edited src/lib.rs",
+            true,
+        );
+        assert!(
+            !guard
+                .record_tool_result_with_effects("bash", validation, "clean", false)
+                .repeated_idempotent_result,
+            "a landed mutation starts a new validation epoch"
+        );
+    }
+
+    #[test]
+    fn authoritative_workspace_revision_re_admits_validation_observation() {
+        let mut guard = ToolLoopGuardrail::default();
+        let validation = r#"{"command":"cargo clippy --package api"}"#;
+        guard.observe_workspace_revision(7);
+        assert!(
+            !guard
+                .record_tool_result_with_effects("bash", validation, "clean", false)
+                .repeated_idempotent_result
+        );
+        assert!(
+            guard
+                .record_tool_result_with_effects("bash", validation, "clean", false)
+                .repeated_idempotent_result
+        );
+        guard.observe_workspace_revision(8);
+        assert!(
+            !guard
+                .record_tool_result_with_effects("bash", validation, "clean", false)
+                .repeated_idempotent_result,
+            "candidate/background reconciliation must re-admit current validation"
+        );
+    }
+
+    #[test]
+    fn distinct_validation_scopes_do_not_share_results() {
+        let mut guard = ToolLoopGuardrail::default();
+        let api = r#"{"command":"cargo clippy --package api --target aarch64-apple-darwin"}"#;
+        let web = r#"{"command":"cargo clippy --package web --target wasm32-unknown-unknown"}"#;
+
+        let first = guard.record_tool_result_with_effects("bash", api, "clean", false);
+        let distinct = guard.record_tool_result_with_effects("bash", web, "clean", false);
+
+        assert!(!first.repeated_idempotent_result);
+        assert!(!distinct.repeated_idempotent_result);
+    }
+
+    #[test]
+    fn validation_scope_normalizes_spacing_aliases_and_presentation_flags() {
+        let mut guard = ToolLoopGuardrail::default();
+        let first = r#"{"command":"cargo clippy -q --color always --message-format short -p api --target wasm32-unknown-unknown | grep first"}"#;
+        let cosmetic_variant = r#"{"command":"true && cargo    clippy --target=wasm32-unknown-unknown --package=api --color=never | head -40"}"#;
+
+        assert!(
+            !guard
+                .record_tool_result_with_effects("bash", first, "clean", false)
+                .repeated_idempotent_result
+        );
+        assert!(
+            guard
+                .record_tool_result_with_effects("bash", cosmetic_variant, "clean", false)
+                .repeated_idempotent_result
+        );
+    }
+
+    #[test]
+    fn direct_script_validation_is_semantically_guarded() {
+        let mut guard = ToolLoopGuardrail::default();
+        let first = r#"{"command":"python3 check.py | grep first"}"#;
+        let variant = r#"{"command":"python3 check.py | grep second"}"#;
+
+        assert!(
+            !guard
+                .record_tool_result_with_effects("bash", first, "ok", false)
+                .repeated_idempotent_result
+        );
+        assert!(
+            guard
+                .record_tool_result_with_effects("bash", variant, "ok", false)
+                .repeated_idempotent_result
+        );
     }
 
     #[test]

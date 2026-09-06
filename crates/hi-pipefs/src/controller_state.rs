@@ -36,6 +36,11 @@ pub(super) struct RecoveryEntry {
     pub(super) operation: Option<MutationPermitRecord>,
     pub(super) execution: Option<ExecutionReport>,
     pub(super) batch: Option<CausalTranscriptBatch>,
+    /// True when the interrupted job still has a projection in this process's
+    /// registry. Journal-restored recoveries deliberately do not recreate a
+    /// runnable job; their durable projection is terminalized by the journal
+    /// decorator after this controller acknowledges the recovery fence.
+    pub(super) registry_job: bool,
 }
 
 pub(super) struct BackendFailure {
@@ -182,6 +187,7 @@ pub(super) fn require_recovery(
             operation,
             execution,
             batch,
+            registry_job: false,
         },
     );
     state.active = None;
@@ -238,6 +244,7 @@ pub(super) fn register_job_recovery(inner: &Inner, job_id: &JobId, outcome: &Job
             operation: None,
             execution: None,
             batch: None,
+            registry_job: true,
         });
     state.status.state = WorkspaceState::RecoveryRequired;
     state.status.recovery_id = Some(recovery_id);
@@ -249,10 +256,47 @@ pub(super) fn reconcile_job_recovery(
     inner: &Inner,
     recovery_id: &RecoveryId,
 ) -> Option<RecoveryOutcome> {
-    let job_id = {
+    let (job_id, registry_job, already_resolved) = {
         let state = lock(&inner.state);
-        state.recoveries.get(recovery_id)?.record.job_id.clone()?
+        let entry = state.recoveries.get(recovery_id)?;
+        (
+            entry.record.job_id.clone()?,
+            entry.registry_job,
+            entry.record.resolved,
+        )
     };
+    if already_resolved {
+        return Some(recovery_outcome(
+            recovery_id.clone(),
+            RecoveryStatus::Recovered,
+            &lock(&inner.state).binding,
+            Some("job recovery was already resolved".into()),
+        ));
+    }
+
+    // A fresh process intentionally has no runnable registry entry for a job
+    // reconstructed from the durable control journal. Resolving that fence
+    // must not manufacture a success or try to replay the work. The outer
+    // journal decorator consumes this Recovered receipt and atomically moves
+    // the persisted lifecycle from RecoveryRequired to Failed.
+    if !registry_job {
+        let mut state = lock(&inner.state);
+        if let Some(entry) = state.recoveries.get_mut(recovery_id) {
+            entry.record.resolved = true;
+        }
+        state.status.active_jobs.retain(|active| active != &job_id);
+        promote_next_recovery(inner, &mut state, recovery_id);
+        publish(inner, &mut state);
+        return Some(recovery_outcome(
+            recovery_id.clone(),
+            RecoveryStatus::Recovered,
+            &state.binding,
+            Some(format!(
+                "interrupted job {job_id} was acknowledged without replay; its durable lifecycle must be finalized as failed"
+            )),
+        ));
+    }
+
     let result = inner.jobs.reconcile_recovery(
         &inner.jobs.fence(),
         recovery_id,

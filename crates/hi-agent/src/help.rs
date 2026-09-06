@@ -157,7 +157,7 @@ fn keybindings() -> &'static str {
 fn settings_blurb() -> &'static str {
     "\nsettings (also available as bare aliases):\n  \
      /config [key …]   hub for model, provider, auth, reasoning, verify, lsp, ui…\n  \
-     /model /provider /login /logout /verify /lsp /delegate\n  \
+     /model /provider /auth /login /logout /verify /lsp /delegate\n  \
      /theme /density /mouse   (TUI; also /config ui …)\n\
      aliases: /m /st /cp /redo /revert /new /changes /usage /debug /cfg /set /h /?\n"
 }
@@ -240,7 +240,7 @@ mod tests {
         );
         assert!(help.contains("settings (also available as bare aliases)"));
         assert!(help.contains("/config [key"));
-        assert!(help.contains("/model /provider"));
+        assert!(help.contains("/model /provider /auth /login"));
         assert!(
             !help
                 .lines()

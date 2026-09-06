@@ -468,11 +468,16 @@ impl WorkspaceController for JournaledWorkspaceController {
 
     async fn seal_job(&self, job: JobId, terminal: JobTerminal) -> JobSealOutcome {
         let permit = lock(&self.permits).get(&job).cloned();
+        let local_process_audit_only = permit.as_ref().is_some_and(|permit| {
+            self.journal_health().policy == JournalFailurePolicy::LocalContinueForeground
+                && permit.spec.kind == hi_workspace::JobKind::Process
+                && permit.spec.effect_scope == hi_workspace::EffectScope::LiveWriter
+        });
         let must_fence = permit.as_ref().is_some_and(|permit| {
             !matches!(
                 permit.spec.effect_scope,
                 hi_workspace::EffectScope::ReadOnly
-            )
+            ) && !local_process_audit_only
         }) || self.journal_health().policy
             == JournalFailurePolicy::PipeFsFailClosed;
         if must_fence {
@@ -517,13 +522,7 @@ impl WorkspaceController for JournaledWorkspaceController {
                     &terminal,
                 ) {
                     self.note_journal_failure(&error);
-                    let writer = !matches!(
-                        permit.spec.effect_scope,
-                        hi_workspace::EffectScope::ReadOnly
-                    );
-                    if writer
-                        || self.journal_health().policy == JournalFailurePolicy::PipeFsFailClosed
-                    {
+                    if must_fence {
                         let binding = self.inner.binding();
                         let recovery_id = journal_job_recovery_id(&binding, &job);
                         let detail = format!(

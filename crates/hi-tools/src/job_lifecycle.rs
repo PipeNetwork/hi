@@ -43,6 +43,10 @@ pub enum BackgroundJobTerminal {
     Failed,
     FailedBeforeStart,
     Cancelled,
+    /// Registry ownership was durably relinquished while the native process
+    /// was intentionally left running. This is terminal for the harness, but
+    /// makes no claim about the process's eventual exit status or effects.
+    Orphaned,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,11 +67,21 @@ pub enum BackgroundCandidateTransition {
 
 #[async_trait]
 pub trait BackgroundJobLifecycle: Send + Sync {
+    /// Whether this workspace binding can ever admit the requested background
+    /// effect. This is a capability preflight only; [`Self::register`] remains
+    /// authoritative because capacity or binding state can change before the
+    /// actual handoff.
+    fn supports_effect(&self, _effect: BackgroundJobEffect) -> bool {
+        true
+    }
+
     async fn register(&self, registration: BackgroundJobRegistration) -> Result<(), String>;
 
-    /// Called only after the underlying process/task has stopped. A live
-    /// writer returns `DurabilityPending`; success remains unpublished until
-    /// a later workspace receipt settles the returned pending identity.
+    /// Called after the underlying process/task has stopped, or with
+    /// [`BackgroundJobTerminal::Orphaned`] immediately before intentionally
+    /// relinquishing a still-running process. A live writer otherwise returns
+    /// `DurabilityPending`; success remains unpublished until a later
+    /// workspace receipt settles the returned pending identity.
     async fn observe_terminal(
         &self,
         id: &BackgroundJobId,
@@ -127,6 +141,14 @@ impl BackgroundJobLifecycleSlot {
             .lifecycle
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lifecycle);
+    }
+
+    pub(crate) fn supports_effect(&self, effect: BackgroundJobEffect) -> bool {
+        self.lifecycle
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_none_or(|lifecycle| lifecycle.supports_effect(effect))
     }
 
     pub(crate) async fn register(

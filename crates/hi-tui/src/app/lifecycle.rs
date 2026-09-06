@@ -122,6 +122,7 @@ impl crate::App {
             current_tool: None,
             current_tool_started: None,
             queue: VecDeque::new(),
+            queue_paused: false,
             mid_turn_offered: VecDeque::new(),
             queue_selected: None,
             last_prompt: None,
@@ -236,6 +237,8 @@ impl crate::App {
             startup_notice: None,
             checkpoint_warning: None,
             quit_notice: None,
+            turn_stop_requested: false,
+            exit_requested: false,
             completion: None,
             path_completion_cache: Vec::new(),
             focused: true,
@@ -360,6 +363,7 @@ impl crate::App {
             self.turn_status_seen.clear();
         }
         if working {
+            self.turn_stop_requested = false;
             self.checkpoint_warning = None;
             self.top_notice = None;
             self.last_turn_event = None;
@@ -552,11 +556,18 @@ impl crate::App {
     pub(crate) fn clamp_queue_selection(&mut self) {
         if self.queue.is_empty() {
             self.queue_selected = None;
+            self.queue_paused = false;
             return;
         }
         if let Some(i) = self.queue_selected {
             self.queue_selected = Some(i.min(self.queue.len() - 1));
         }
+    }
+
+    pub(crate) fn resume_queue(&mut self) -> usize {
+        let queued = self.queue.len();
+        self.queue_paused = false;
+        queued
     }
 
     /// Push a next-turn prompt. Empty / whitespace-only strings are ignored.

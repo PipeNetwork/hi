@@ -78,6 +78,16 @@ impl crate::Agent {
         // WorkspaceRepair drops matching affected-check/test stages.
         let skip_checks = fast_feedback.skippable_check_packages(current_revision);
         let skip_tests = fast_feedback.skippable_test_packages(current_revision);
+        // Local services are intentionally fail-open: they remain tracked for
+        // cancellation/output, but do not suppress unrelated local checks.
+        // PipeFS keeps the stable-scan requirement for any managed writer.
+        let active_managed_live_writer = matches!(
+            &self.workspace_coordination.binding().authority,
+            hi_workspace::WorkspaceAuthority::PipeFs { .. }
+        ) && self
+            .runtime
+            .background()
+            .has_running_managed_live_writer_started_after(turn_background_baseline);
         let workspace = VerifyWorkspace::new(
             self.runtime.root(),
             self.runtime.state_root(),
@@ -88,6 +98,7 @@ impl crate::Agent {
         .with_changed_files(&ledger_touched_files)
         .with_mutation_seen(ledger_mutation_seen)
         .with_skippable_affected(&skip_checks, &skip_tests)
+        .with_active_managed_live_writer(active_managed_live_writer)
         .with_workspace_coordination(
             self.workspace_coordination.clone(),
             self.workspace_durability.clone(),

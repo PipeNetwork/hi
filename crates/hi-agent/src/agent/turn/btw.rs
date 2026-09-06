@@ -57,18 +57,6 @@ const BTW_TOOL_ALLOWLIST: &[&str] = &[
     "diff",
     "repo_map",
     "find_symbol",
-    "bash_output",
-    "diagnostics",
-    "definition",
-    "references",
-    "hover",
-    "web_search",
-    "web_fetch",
-    "research",
-    "research_read",
-    "memory_search",
-    "memory_get",
-    "search_tool",
 ];
 
 /// Detached `/btw` work item — everything needed to answer without `&mut Agent`.
@@ -1051,7 +1039,7 @@ fn snapshot_section(snapshot: &str, prefix: &str) -> Option<String> {
 fn btw_tool_specs(available: &[ToolSpec]) -> Arc<[ToolSpec]> {
     available
         .iter()
-        .filter(|t| BTW_TOOL_ALLOWLIST.contains(&t.name.as_str()))
+        .filter(|t| request_policy::side_tool_is_pure(&t.name))
         .cloned()
         .collect::<Vec<_>>()
         .into()
@@ -1135,8 +1123,8 @@ mod tests {
                 parameters: serde_json::json!({}),
             },
             ToolSpec {
-                name: "bash".into(),
-                description: "b".into(),
+                name: "bash_output".into(),
+                description: "poll".into(),
                 parameters: serde_json::json!({}),
             },
             ToolSpec {

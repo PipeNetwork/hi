@@ -396,17 +396,34 @@ impl ProcessRunner {
         command.process_group(0);
     }
 
-    /// Spawn a child for the background registry. The registry is responsible
-    /// for draining and reaping it. When a sandbox policy is active (and the
-    /// platform enforces it), the command runs confined via the sandbox wrapper
-    /// (e.g. `sandbox-exec` on macOS); otherwise it's a plain `sh -c`.
+    /// Spawn a shell child with the ordinary foreground drop policy.
     pub(crate) fn spawn_shell(&self, command: &str) -> Result<tokio::process::Child> {
+        self.spawn_shell_with_drop_policy(command, true)
+    }
+
+    /// Spawn a child whose lifetime is owned by the background registry.
+    ///
+    /// Tokio's child handle must not kill the process merely because its
+    /// driver task is dropped after a successful `--keep-background` release.
+    /// The registry retains the fail-safe process-group kill until that
+    /// explicit ownership transfer, and all ordinary stop paths still kill and
+    /// reap the child themselves.
+    pub(crate) fn spawn_background_shell(&self, command: &str) -> Result<tokio::process::Child> {
+        self.spawn_shell_with_drop_policy(command, false)
+    }
+
+    fn spawn_shell_with_drop_policy(
+        &self,
+        command: &str,
+        kill_on_drop: bool,
+    ) -> Result<tokio::process::Child> {
         let (program, args) =
             self.sandbox
                 .wrap_program_in(OsStr::new("sh"), ["-c", command], &self.root);
         let mut cmd = Command::new(program);
         cmd.args(args);
         self.configure(&mut cmd);
+        cmd.kill_on_drop(kill_on_drop);
         if self.sandbox.is_enforced() {
             // Mark the confined process tree so a nested hi (e.g. this repo's
             // own test suite under verify) skips the re-wrap macOS would

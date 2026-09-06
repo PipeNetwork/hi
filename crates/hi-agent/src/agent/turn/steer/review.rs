@@ -187,10 +187,20 @@ impl crate::Agent {
                             .push_assistant(std::mem::take(completion_content));
                         return Ok(RoundControl::Continue);
                     }
+                    if !implementation_tracker.mutation_seen
+                        && (gated_expected_mutation || gated_implementation_intent.is_some())
+                    {
+                        implementation_tracker.no_mutation_exhausted = true;
+                        progress_tracker.record(
+                            ProgressKind::None,
+                            "implementation repair exhausted without a mutation",
+                            None,
+                        );
+                    }
                     ui.nudge(status);
-                    // A bounded heuristic may challenge the answer, but it is
-                    // not a terminal correctness oracle. Accept the best text
-                    // below and let deterministic verification decide.
+                    // Preserve the best text for context, but keep the sticky
+                    // semantic failure above. With no landed mutation there is
+                    // no verification stage that can turn this into success.
                 }
                 None => {}
             }
@@ -285,7 +295,12 @@ impl crate::Agent {
                 }
                 self.messages
                     .push_assistant(vec![Content::Text(NO_CHANGE_FALLBACK.into())]);
-                progress_tracker.record_final_answer();
+                implementation_tracker.no_mutation_exhausted = true;
+                progress_tracker.record(
+                    ProgressKind::None,
+                    "implementation answer exhausted without a mutation",
+                    None,
+                );
                 ui.status("no file changes were made; ending the turn without another retry");
                 return Ok(RoundControl::BreakInner(false));
             }
@@ -403,7 +418,7 @@ impl crate::Agent {
                 "structured plan has remaining steps",
                 None,
             );
-        } else {
+        } else if !implementation_tracker.no_mutation_exhausted {
             progress_tracker.no_progress_streak = 0;
             progress_tracker.last_no_progress_reason.clear();
             progress_tracker.record_final_answer();

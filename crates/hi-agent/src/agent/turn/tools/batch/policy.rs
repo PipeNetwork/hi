@@ -5,6 +5,72 @@ use crate::{ConfirmationResult, PARKED_TOOL_RESULT};
 #[cfg(test)]
 use crate::agent::turn::helpers::synthetic_tool_outcome;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProgramPreflightDenial {
+    Budget,
+    DryRun,
+}
+
+impl ProgramPreflightDenial {
+    pub(super) const fn for_request(budget_exhausted: bool, dry_run: bool) -> Option<Self> {
+        if budget_exhausted {
+            Some(Self::Budget)
+        } else if dry_run {
+            Some(Self::DryRun)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn outcome(self) -> hi_workflow::ProgramOutcome {
+        hi_workflow::ProgramOutcome::Failed {
+            error: self.content(),
+            calls: Vec::new(),
+        }
+    }
+
+    pub(super) fn content(self) -> String {
+        match self {
+            Self::Budget => serde_json::json!({
+                "error": {
+                    "kind": "tool_budget_exhausted",
+                    "message": "tool call denied: per-turn tool budget exhausted"
+                }
+            })
+            .to_string(),
+            Self::DryRun => dry_run_message("run_program", "", true),
+        }
+    }
+}
+
+pub(super) fn remaining_program_call_budget(
+    envelope: &hi_tools::envelope::ToolEnvelope,
+    remaining_turn_calls: u32,
+) -> usize {
+    usize::from(envelope.payload.limits.max_calls_per_round)
+        .saturating_sub(1)
+        .min(remaining_turn_calls.saturating_sub(1) as usize)
+}
+
+pub(super) fn permitted_call_prefix(
+    batch_len: usize,
+    remaining_turn_calls: u32,
+    sealed_calls: u16,
+) -> usize {
+    batch_len
+        .min(remaining_turn_calls as usize)
+        .min(usize::from(sealed_calls))
+}
+
+pub(super) fn execution_mode_denial(
+    sealed: hi_ai::ToolMode,
+    current: hi_ai::ToolMode,
+    tool: &str,
+) -> Option<String> {
+    crate::heuristics::mode_blocks_tool(sealed, tool)
+        .or_else(|| crate::heuristics::mode_blocks_tool(current, tool))
+}
+
 pub(super) fn workspace_mutation_intent(
     calls: &[(String, String, String)],
     dirty_paths: Option<Vec<String>>,
@@ -29,6 +95,52 @@ pub(super) fn workspace_mutation_intent(
     }
 }
 
+/// Build an intent only from calls that survived budget, mode, and sealed
+/// protocol validation. Denied calls must never acquire a mutation permit or
+/// strengthen the replay class of work that can actually execute.
+pub(super) fn workspace_intent_for_admitted_calls(
+    calls: &[(String, String, String)],
+    pipefs_active: bool,
+    allow_process_feedback: bool,
+    proactive_verify: bool,
+) -> Option<hi_workspace::MutationIntent> {
+    if !calls
+        .iter()
+        .any(|(_, name, arguments)| workspace_operation_requires_settlement(name, arguments))
+    {
+        return None;
+    }
+    let opaque = calls.iter().any(|(_, name, _)| {
+        matches!(name.as_str(), "bash" | "bash_output" | "bash_kill")
+            || (pipefs_active && name == "use_tool")
+    });
+    let paths = (!opaque).then(|| {
+        calls
+            .iter()
+            .filter_map(|(_, name, arguments)| hi_tools::target_path(name, arguments))
+            .collect()
+    });
+    let mut intent = workspace_mutation_intent(calls, paths);
+    if allow_process_feedback
+        && calls.iter().any(|(_, name, arguments)| {
+            if !hi_tools::is_filesystem_mutating(name) {
+                return false;
+            }
+            hi_tools::target_path(name, arguments).is_none_or(|path| {
+                !hi_tools::infra::lsp_source_paths([path.as_str()]).is_empty()
+                    || proactive_verify && hi_tools::fast_check_for(&path).is_some()
+            })
+        })
+    {
+        // Automatic post-edit checks can execute repository-controlled build
+        // scripts and may access resources beyond the workspace.
+        intent.effect_scope = hi_workspace::EffectScope::LiveWriter;
+        intent.replay_class = hi_workspace::ReplayClass::NonReplayableExternal;
+    }
+    Some(intent)
+}
+
+#[cfg(test)]
 pub(super) fn workspace_program_intent(
     name: &str,
     arguments: &str,
@@ -41,6 +153,31 @@ pub(super) fn workspace_program_intent(
         dirty_paths: dirty_paths.map(|paths| paths.into_iter().map(Into::into).collect()),
         description: Some(format!("program tool: {name}")),
     }
+}
+
+/// Conservatively classify every nested tool admitted by the sealed program
+/// envelope. Unknown or argument-dependent tools retain the fail-closed
+/// live-writer/non-replayable policy; a read-only sealed catalog no longer
+/// masquerades as an arbitrary external writer.
+pub(super) fn workspace_program_intent_for_envelope(
+    envelope: &hi_tools::envelope::ToolEnvelope,
+) -> Option<hi_workspace::MutationIntent> {
+    let policies = envelope
+        .payload
+        .program_tools
+        .iter()
+        .map(|tool| concrete_policy(&tool.name, "{}"))
+        .collect::<Vec<_>>();
+    let replay_class = combined_replay_class(policies.iter().map(|policy| policy.replay_class));
+    let effect_scope = combined_effect_scope(policies.iter().map(|policy| policy.effect_scope));
+    (effect_scope != hi_workspace::EffectScope::ReadOnly
+        || replay_class != hi_workspace::ReplayClass::PureWorkspace)
+        .then_some(hi_workspace::MutationIntent {
+            effect_scope,
+            replay_class,
+            dirty_paths: None,
+            description: Some("sealed workflow program".into()),
+        })
 }
 
 pub(super) fn workspace_operation_requires_settlement(name: &str, arguments: &str) -> bool {
@@ -149,6 +286,21 @@ pub(super) fn workspace_execution_report(
     }
 }
 
+pub(super) fn merge_reconciled_changes(
+    execution: &mut hi_workspace::ExecutionReport,
+    changes: &[hi_tools::FileChange],
+) {
+    if changes.is_empty() {
+        return;
+    }
+    execution.workspace_may_have_changed = true;
+    execution
+        .changed_paths
+        .extend(changes.iter().map(|change| change.path.clone().into()));
+    execution.changed_paths.sort();
+    execution.changed_paths.dedup();
+}
+
 /// Preserve the restricted program host's real terminal result while keeping
 /// its dynamically selected nested calls behind one conservative operation.
 /// `effect_may_have_occurred` is set by the host as soon as it dispatches any
@@ -190,7 +342,8 @@ pub(super) fn workspace_program_execution_report(
     hi_workspace::ExecutionReport {
         disposition,
         workspace_may_have_changed: effect_may_have_occurred
-            && intent.effect_scope == hi_workspace::EffectScope::LiveWriter,
+            && (intent.effect_scope == hi_workspace::EffectScope::LiveWriter
+                || intent.is_reconciliation()),
         external_effect_may_have_occurred: effect_may_have_occurred
             && intent.replay_class != hi_workspace::ReplayClass::PureWorkspace,
         content_digest: None,
@@ -288,33 +441,8 @@ pub(super) fn dry_run_message(name: &str, path: &str, mutates: bool) -> String {
 }
 
 #[cfg(test)]
-mod dry_run_tests {
-    use super::*;
-
-    #[test]
-    fn mutating_call_reports_path_and_mutation() {
-        let msg = dry_run_message("edit", "src/main.rs", true);
-        assert_eq!(
-            msg,
-            "[dry-run] would run `edit` on src/main.rs (mutating; not executed)"
-        );
-    }
-
-    #[test]
-    fn read_only_call_reports_read_only() {
-        let msg = dry_run_message("read", "src/main.rs", false);
-        assert_eq!(
-            msg,
-            "[dry-run] would run `read` on src/main.rs (read-only; not executed)"
-        );
-    }
-
-    #[test]
-    fn call_without_path_omits_target() {
-        let msg = dry_run_message("bash", "", true);
-        assert_eq!(msg, "[dry-run] would run `bash` (mutating; not executed)");
-    }
-}
+#[path = "policy/dry_run_tests.rs"]
+mod dry_run_tests;
 
 #[cfg(test)]
 mod workspace_policy_tests {
@@ -369,6 +497,81 @@ mod workspace_policy_tests {
 
         let delegate = workspace_mutation_intent(&[call("delegate", "{}")], None);
         assert_eq!(delegate.effect_scope, hi_workspace::EffectScope::LiveWriter);
+    }
+
+    #[test]
+    fn automatic_post_edit_processes_strengthen_the_outer_intent() {
+        let intent = workspace_intent_for_admitted_calls(
+            &[call(
+                "edit",
+                r#"{"path":"src/lib.rs","old_string":"a","new_string":"b"}"#,
+            )],
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(intent.effect_scope, hi_workspace::EffectScope::LiveWriter);
+        assert_eq!(
+            intent.replay_class,
+            hi_workspace::ReplayClass::NonReplayableExternal
+        );
+
+        let markdown = workspace_intent_for_admitted_calls(
+            &[call(
+                "edit",
+                r#"{"path":"README.md","old_string":"a","new_string":"b"}"#,
+            )],
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            markdown.replay_class,
+            hi_workspace::ReplayClass::PureWorkspace
+        );
+
+        let compatibility = workspace_intent_for_admitted_calls(
+            &[call(
+                "edit",
+                r#"{"path":"src/lib.rs","old_string":"a","new_string":"b"}"#,
+            )],
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            compatibility.replay_class,
+            hi_workspace::ReplayClass::PureWorkspace
+        );
+    }
+
+    #[test]
+    fn post_feedback_changes_are_folded_into_settlement_evidence() {
+        let intent = hi_workspace::MutationIntent::workspace("edit with feedback");
+        let mut report = workspace_execution_report(&intent, &[], 0);
+        report.workspace_may_have_changed = false;
+        let changes = vec![hi_tools::FileChange {
+            path: "generated.txt".into(),
+            kind: hi_tools::FileChangeKind::Create,
+            before_digest: None,
+            after_digest: Some("digest".into()),
+            before_len: None,
+            after_len: Some(1),
+            before_mode: None,
+            after_mode: None,
+        }];
+
+        merge_reconciled_changes(&mut report, &changes);
+
+        assert!(report.workspace_may_have_changed);
+        assert_eq!(
+            report.changed_paths,
+            vec![std::path::PathBuf::from("generated.txt")]
+        );
     }
 
     #[test]
@@ -481,6 +684,21 @@ mod workspace_policy_tests {
         );
         assert!(report.workspace_may_have_changed);
         assert_eq!(report.detail.as_deref(), Some("program cancelled"));
+    }
+
+    #[test]
+    fn terminal_writer_reconciliation_reports_possible_workspace_bytes() {
+        let report = workspace_program_execution_report(
+            &hi_workspace::MutationIntent::reconciliation(),
+            &hi_workflow::ProgramOutcome::Succeeded {
+                result: serde_json::Value::Null,
+                calls: Vec::new(),
+            },
+            true,
+        );
+
+        assert!(report.workspace_may_have_changed);
+        assert!(!report.external_effect_may_have_occurred);
     }
 }
 

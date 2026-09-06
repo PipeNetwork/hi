@@ -26,9 +26,11 @@ pub mod provider_capabilities;
 mod request_envelope;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+mod text_tool_fallback;
 pub mod token;
 mod tool_validation;
 pub mod types;
+mod wire_audit;
 pub mod x402;
 pub mod x402_auth;
 pub mod xai;
@@ -63,12 +65,12 @@ pub use moa::{
 pub use openai::OpenAiProvider;
 pub use provider::{
     CODING_AGENT_MIN_OUTPUT_TOKENS, KeyCheck, OutputCapError, Provider, ProviderCapabilities,
-    ProviderError, ProviderErrorKind, ServedModel, effective_coding_agent_max_tokens,
-    is_billing_or_quota_text, is_http_auth_rejection, is_pipenetwork_coding_route,
-    provider_error_affects_health, provider_error_is_fallback_eligible,
-    provider_error_is_temporary_overload, provider_error_kind, provider_error_retryable,
-    provider_error_usage, provider_output_cap_error, provider_retry_after_seconds,
-    provider_route_error_is_retryable,
+    ProviderError, ProviderErrorKind, ProviderRequestContext, ServedModel,
+    effective_coding_agent_max_tokens, is_billing_or_quota_text, is_http_auth_rejection,
+    is_pipenetwork_coding_route, provider_error_affects_health,
+    provider_error_is_fallback_eligible, provider_error_is_temporary_overload, provider_error_kind,
+    provider_error_retryable, provider_error_usage, provider_output_cap_error,
+    provider_retry_after_seconds, provider_route_error_is_retryable,
 };
 pub use provider_capabilities::{
     CAPABILITY_RECORD_SCHEMA_VERSION, CAPABILITY_REGISTRY_VERSION, CancellationSupport,
@@ -78,9 +80,9 @@ pub use provider_capabilities::{
     DEFAULT_CAPABILITY_PROBE_TIMEOUT, EffectiveProviderCapabilities, MAX_CAPABILITY_PROBE_MEMBERS,
     MAX_CAPABILITY_PROBE_TIMEOUT, ProviderCapabilityCandidate, ProviderCapabilityRegistry,
     ProviderModalities, ProviderRequestLimits, ReasoningReplayCapabilities, StrictSchemaDialect,
-    ToolChoiceCapabilities, UsageReporting,
+    ToolChoiceCapabilities, UsageReporting, endpoint_capability_route,
 };
-pub use request_envelope::RequestToolEnvelope;
+pub use request_envelope::{RequestToolEnvelope, TEXT_TOOL_FALLBACK_PERMISSION};
 pub use token::{PersistableToken, StaticToken, TokenSource};
 pub use tool_validation::{
     MAX_TOOL_ARGUMENT_BYTES, validate_client_tool_batch_limits,
@@ -95,6 +97,7 @@ pub use types::{
     estimate_content_tokens, estimate_messages_tokens, estimate_request_input_tokens,
     estimate_text_tokens, estimate_tool_schema_tokens,
 };
+pub use wire_audit::WireToolSchemaAudit;
 pub use x402::{
     AutoX402Confirmer, X402_CREDIT_TOKEN_PREFIX, X402_DEFAULT_MAX_USD, X402_MIN_TOPUP_MINOR,
     X402_PAYMENT_REQUIRED_HEADER, X402_PAYMENT_RESPONSE_HEADER, X402_PAYMENT_SIGNATURE_HEADER,

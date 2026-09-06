@@ -50,6 +50,32 @@ impl WorkspaceJobLifecycleBridge {
             jobs: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
+
+    fn supports_effect_now(&self, effect: BackgroundJobEffect) -> bool {
+        if !self
+            .coordination
+            .admission_generation_is_current(self.admission_generation)
+        {
+            return false;
+        }
+        let controller = self.coordination.job_controller();
+        let capabilities = controller.capabilities();
+        let harness = self.coordination.harness_settings();
+        let background_candidates_available = harness.features.candidate_jobs_v2
+            && match controller.binding().authority {
+                hi_workspace::WorkspaceAuthority::Local => true,
+                hi_workspace::WorkspaceAuthority::PipeFs {
+                    writer_protocol, ..
+                } => writer_protocol >= 2,
+            };
+        match effect {
+            BackgroundJobEffect::ReadOnly => true,
+            BackgroundJobEffect::CandidateOnly => {
+                capabilities.candidate_apply && background_candidates_available
+            }
+            BackgroundJobEffect::LiveWriter => capabilities.background_writers,
+        }
+    }
 }
 
 impl WorkspaceCoordination {
@@ -67,6 +93,10 @@ impl WorkspaceCoordination {
 
 #[async_trait]
 impl BackgroundJobLifecycle for WorkspaceJobLifecycleBridge {
+    fn supports_effect(&self, effect: BackgroundJobEffect) -> bool {
+        self.supports_effect_now(effect)
+    }
+
     async fn register(&self, registration: BackgroundJobRegistration) -> Result<(), String> {
         // Always take admission before the bridge job map. Rebind holds the
         // exclusive side while draining lifecycle callbacks, which may need
@@ -86,23 +116,8 @@ impl BackgroundJobLifecycle for WorkspaceJobLifecycleBridge {
             ));
         }
         let controller = self.coordination.job_controller();
-        let capabilities = controller.capabilities();
         let harness = self.coordination.harness_settings();
-        let background_candidates_available = harness.features.candidate_jobs_v2
-            && match controller.binding().authority {
-                hi_workspace::WorkspaceAuthority::Local => true,
-                hi_workspace::WorkspaceAuthority::PipeFs {
-                    writer_protocol, ..
-                } => writer_protocol >= 2,
-            };
-        let effect_available = match registration.effect {
-            BackgroundJobEffect::ReadOnly => true,
-            BackgroundJobEffect::CandidateOnly => {
-                capabilities.candidate_apply && background_candidates_available
-            }
-            BackgroundJobEffect::LiveWriter => capabilities.background_writers,
-        };
-        if !effect_available {
+        if !self.supports_effect_now(registration.effect) {
             return Err("background job effect is unavailable for this workspace binding".into());
         }
         let active = jobs
@@ -185,6 +200,15 @@ impl BackgroundJobLifecycle for WorkspaceJobLifecycleBridge {
                 return Ok(BackgroundJobPublication::DurabilityPending);
             }
             BridgeState::Running => {}
+        }
+
+        // `--keep-background` transfers ownership out of the harness. Record
+        // that handoff directly: it is not a process success/failure and must
+        // not wait for a workspace receipt from a process that will outlive us.
+        if terminal == BackgroundJobTerminal::Orphaned {
+            seal(job, JobCompletion::Orphaned, detail).await?;
+            job.state = BridgeState::Published;
+            return Ok(BackgroundJobPublication::Published);
         }
 
         if job.effect == BackgroundJobEffect::LiveWriter
@@ -378,6 +402,7 @@ fn completion_state(completion: JobCompletion) -> JobState {
         JobCompletion::Cancelled => JobState::Cancelled,
         JobCompletion::DurabilityPending => JobState::DurabilityPending,
         JobCompletion::RecoveryRequired => JobState::RecoveryRequired,
+        JobCompletion::Orphaned => JobState::Orphaned,
         JobCompletion::Stale => JobState::Stale,
     }
 }
@@ -423,8 +448,13 @@ fn completion(terminal: BackgroundJobTerminal) -> JobCompletion {
             JobCompletion::Failed
         }
         BackgroundJobTerminal::Cancelled => JobCompletion::Cancelled,
+        BackgroundJobTerminal::Orphaned => JobCompletion::Orphaned,
     }
 }
+
+#[cfg(test)]
+#[path = "workspace_coordination_jobs_keep_background_tests.rs"]
+mod keep_background_tests;
 
 #[cfg(test)]
 mod tests {

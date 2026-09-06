@@ -1,5 +1,7 @@
 //! System-prompt composition for the agent loop.
 
+mod system;
+
 use hi_ai::Message;
 
 /// Ending instruction when no separate finalization step runs: the model itself
@@ -76,7 +78,7 @@ impl SystemPrompt {
     }
 
     pub(crate) fn build(self) -> Message {
-        let mut text = super::SYSTEM_PROMPT.to_string();
+        let mut text = system::SYSTEM_PROMPT.to_string();
         text.push_str(if self.finalize {
             DEFERRED_RECAP_INSTRUCTION
         } else {
@@ -145,12 +147,21 @@ mod tests {
         assert!(text.contains("coherent chunks"));
         assert!(text.contains("targeted syntax/build/test command"));
         assert!(
+            text.contains("Once required checks pass")
+                && text.contains("only for new edits, failures"),
+            "keeps verification proportionate and avoids repeating successful checks: {text}"
+        );
+        assert!(
             text.contains("repo_map") && text.contains("find_symbol"),
             "steers orientation tools: {text}"
         );
         assert!(
             text.contains("explore") && text.contains("delegate"),
             "steers subagent tools: {text}"
+        );
+        assert!(
+            text.contains("bounded task") && text.contains("independent work while it runs"),
+            "gives delegation a concrete scope and permits parallel progress: {text}"
         );
         assert!(
             text.contains("Prefer `edit`") || text.contains("prefer `edit`"),
@@ -175,6 +186,24 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_preserves_user_authority_without_relaxing_harness_policy() {
+        let text = SystemPrompt::new()
+            .with_project_context(Some("# AGENTS.md\nAsk before every edit."))
+            .build()
+            .text();
+        assert!(text.contains("mean implement and verify"));
+        assert!(text.contains("ask only when a missing decision materially affects"));
+        assert!(text.contains("User authorization persists across turns"));
+        assert!(text.contains("finish the authorized preparation"));
+        assert!(text.contains("Explicit user instructions and authorization take precedence"));
+        assert!(text.contains("Enforced safety, permission, trust, and tool policies still apply"));
+        assert!(
+            text.contains("Ask before every edit."),
+            "preserves the guide as context"
+        );
+    }
+
+    #[test]
     fn system_prompt_clips_a_huge_project_guide() {
         let bomb = "TOKENBOMB ".repeat(5_000);
         let sys = SystemPrompt::new()
@@ -187,8 +216,11 @@ mod tests {
             text.chars().count()
         );
         assert!(
-            text.chars().count() <= MAX_PROJECT_CONTEXT_CHARS + 4_000,
-            "clipped guide plus identity must stay bounded: {}",
+            text.chars().count()
+                <= SystemPrompt::new().build().text().chars().count()
+                    + MAX_PROJECT_CONTEXT_CHARS
+                    + 2,
+            "project guide must add at most its cap plus a paragraph break: {}",
             text.chars().count()
         );
         assert!(

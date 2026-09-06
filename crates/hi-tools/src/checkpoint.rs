@@ -2494,9 +2494,9 @@ mod tests {
             &fake_git,
             "#!/bin/sh\n\
              shift 2\n\
-             printf '%s' \"$$\" > \"$1\"\n\
+             printf '%s' \"$$\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"\n\
              sleep 60 &\n\
-             printf '%s' \"$!\" > \"$2\"\n\
+             printf '%s' \"$!\" > \"$2.tmp\" && mv \"$2.tmp\" \"$2\"\n\
              wait\n",
         );
         let runner = GitRunner::new(&fake_git, Duration::from_secs(1));
@@ -2615,9 +2615,9 @@ mod tests {
                : > \"$repo/registered\"\n\
                printf '%s' \"$sandbox\" > \"$repo/sandbox.path\"\n\
                mkdir -p \"$sandbox\"\n\
-               printf '%s' \"$$\" > \"$repo/add-parent.pid\"\n\
+               printf '%s' \"$$\" > \"$repo/add-parent.pid.tmp\" && mv \"$repo/add-parent.pid.tmp\" \"$repo/add-parent.pid\"\n\
                sleep 60 &\n\
-               printf '%s' \"$!\" > \"$repo/add-child.pid\"\n\
+               printf '%s' \"$!\" > \"$repo/add-child.pid.tmp\" && mv \"$repo/add-child.pid.tmp\" \"$repo/add-child.pid\"\n\
                wait\n\
              fi\n\
              if [ \"$1:$2\" = 'worktree:remove' ]; then\n\

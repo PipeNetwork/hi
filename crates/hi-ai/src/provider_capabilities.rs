@@ -11,6 +11,7 @@ pub use runtime::{
     DEFAULT_CAPABILITY_CACHE_TTL, DEFAULT_CAPABILITY_PROBE_MEMBERS,
     DEFAULT_CAPABILITY_PROBE_TIMEOUT, EffectiveProviderCapabilities, MAX_CAPABILITY_PROBE_MEMBERS,
     MAX_CAPABILITY_PROBE_TIMEOUT, ProviderCapabilityCandidate, ProviderCapabilityRegistry,
+    endpoint_capability_route,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +105,29 @@ pub struct ProviderCapabilities {
     pub reasoning_replay: ReasoningReplayCapabilities,
     pub cancellation: CancellationSupport,
     pub actual_model_revision: Option<String>,
+}
+
+/// Pre-shaping request facts that can select a provider wrapper's backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProviderRequestContext<'a> {
+    pub user_turn: bool,
+    pub canonical_objective: Option<&'a str>,
+}
+
+impl<'a> ProviderRequestContext<'a> {
+    pub const fn auxiliary() -> Self {
+        Self {
+            user_turn: false,
+            canonical_objective: None,
+        }
+    }
+
+    pub const fn user_turn(canonical_objective: &'a str) -> Self {
+        Self {
+            user_turn: true,
+            canonical_objective: Some(canonical_objective),
+        }
+    }
 }
 
 impl ProviderCapabilities {

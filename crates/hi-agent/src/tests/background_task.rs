@@ -345,7 +345,7 @@ async fn general_purpose_task_is_isolated_and_cannot_succeed_before_parent_apply
                 root.canonicalize().unwrap(),
                 state_root.canonicalize().unwrap()
             ],
-            "http://delegate.invalid/v1".into(),
+            "delegate".into(),
             "delegate-model".into(),
             Some(std::time::Duration::from_secs(120)),
         )
@@ -628,7 +628,24 @@ async fn killing_a_ready_candidate_cancels_its_workspace_job_without_applying() 
         ready[0].candidate_ref.as_deref(),
         Some(artifacts[0].artifact.uri.as_str())
     );
-    let cancelled = registry.kill(&task_id).await.unwrap();
+    let requested = registry.kill(&task_id).await.unwrap();
+    // `kill` has a deliberately bounded synchronous acknowledgement window.
+    // Under full-suite contention the durable cancellation may outlive that
+    // window and initially report Running while its settlement task continues.
+    // Wait on the registry notification rather than assuming the fast path.
+    let cancelled = if requested.state == hi_tools::BackgroundTaskState::Running {
+        registry
+            .wait_all(
+                std::slice::from_ref(&task_id),
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .into_iter()
+            .next()
+            .unwrap()
+    } else {
+        requested
+    };
     assert_eq!(cancelled.state, hi_tools::BackgroundTaskState::Cancelled);
     assert!(!root.join("must-not-apply.txt").exists());
     assert_eq!(directory_bytes(&root.join(".git")), git_before);

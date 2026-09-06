@@ -22,8 +22,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use flate2::{Compression, GzBuilder};
 use hi_ai::{
-    ChatRequest, Completion, Content, Provider, Role, ServedModel, StreamEvent, Usage,
-    estimate_text_tokens,
+    ChatRequest, Completion, Content, Provider, Role, StreamEvent, Usage, estimate_text_tokens,
 };
 use ignore::WalkBuilder;
 use reqwest::{Client, StatusCode};
@@ -36,6 +35,8 @@ use crate::rsi_policy::{
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(10);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+mod provider_contract;
 
 fn wait_timeout_from_value(value: Option<&str>) -> Option<Duration> {
     value
@@ -195,6 +196,7 @@ impl RsiRemoteProvider {
         &self,
         request: ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
+        channel: &str,
     ) -> Result<Completion> {
         let capabilities = self.capabilities().await?;
         ensure!(capabilities.ready, "RSI service is not ready");
@@ -223,7 +225,6 @@ impl RsiRemoteProvider {
         submission_material.update(objective.as_bytes());
         submission_material.update(&serde_json::to_vec(&context)?);
         let maximum_cost_microusd = self.settings.maximum_cost_microusd();
-        let channel = self.settings.channel();
         submission_material.update(&maximum_cost_microusd.to_le_bytes());
         submission_material.update(channel.as_bytes());
         let submission_key = idempotency_key("run", submission_material.finalize().as_bytes());
@@ -468,27 +469,6 @@ impl RsiRemoteProvider {
     ) -> Result<T> {
         let response = ensure_success(self.authorized(request).send().await?).await?;
         response.json().await.context("decoding RSI response")
-    }
-}
-
-#[async_trait]
-impl Provider for RsiRemoteProvider {
-    crate::provider::forward_provider_capabilities!(self, inner);
-    async fn stream(
-        &self,
-        request: ChatRequest,
-        sink: &mut (dyn FnMut(StreamEvent) + Send),
-    ) -> Result<Completion> {
-        // Auxiliary requests (compaction, memory, planning, or finalization) stay on their
-        // normal route. The primary user turn is remote even in chat-only tool mode.
-        if !self.enabled.load(Ordering::SeqCst) || !request.user_turn {
-            return self.inner.stream(request, sink).await;
-        }
-        self.remote_stream(request, sink).await
-    }
-
-    async fn list_models(&self) -> Result<Vec<ServedModel>> {
-        self.inner.list_models().await
     }
 }
 

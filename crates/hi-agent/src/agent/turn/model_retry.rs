@@ -1,10 +1,7 @@
 //! Provider stream handling: success path, retryable failures, fatal errors.
 
-use std::collections::BTreeMap;
-
 use anyhow::Result;
 use hi_ai::{ChatRequest, Completion, ProviderErrorKind, Role, StreamEvent, provider_error_kind};
-use hi_workflow::extract_partial_program_source;
 
 use crate::snapshot::changed_files_between;
 use crate::steering::{EvidenceTracker, ImplementationIntent, tool_protocol_retry_nudge};
@@ -130,14 +127,18 @@ impl crate::Agent {
             || implementation_intent.is_some();
         let mut buffered_assistant_text = String::new();
         let mut streamed_assistant_text = false;
-        let mut program_delta_arguments = BTreeMap::<usize, String>::new();
-        let mut program_delta_ids = BTreeMap::<usize, String>::new();
-        let mut program_delta_names = BTreeMap::<usize, String>::new();
-        let program_speculator = request
-            .tools
-            .iter()
-            .any(|tool| tool.name == "run_program")
-            .then(|| self.program_speculator(&tool_envelope));
+        // Explicit Required sessions are always hard contracts. Within Auto,
+        // enforce steering Required only for the bounded mutation-only repair
+        // envelope; other steering rounds historically allow a useful text
+        // answer and have their own semantic convergence gates.
+        let mutation_only_repair = !request.tools.is_empty()
+            && request.tools.iter().all(|tool| {
+                hi_tools::tool_metadata(&tool.name).is_some_and(|metadata| {
+                    metadata.capability == hi_tools::ToolCapability::Mutation
+                })
+            });
+        let enforce_required_response = request.profile.tool_mode == hi_ai::ToolMode::Required
+            && (self.effective_tool_mode() == hi_ai::ToolMode::Required || mutation_only_repair);
         let mut sink = |event: StreamEvent| match event {
             StreamEvent::Text(text) => {
                 if buffer_read_only_review_text {
@@ -169,54 +170,38 @@ impl crate::Agent {
                 ui.status(&text);
             }
             StreamEvent::Warning(text) => ui.top_status(&text),
-            StreamEvent::ToolCallDelta {
-                index,
-                id_delta,
-                name_delta,
-                arguments_delta,
-            } => {
-                if let Some(id_delta) = id_delta {
-                    program_delta_ids
-                        .entry(index)
-                        .or_default()
-                        .push_str(&id_delta);
-                }
-                if let Some(name_delta) = name_delta {
-                    program_delta_names
-                        .entry(index)
-                        .or_default()
-                        .push_str(&name_delta);
-                }
-                if !arguments_delta.is_empty() {
-                    program_delta_arguments
-                        .entry(index)
-                        .or_default()
-                        .push_str(&arguments_delta);
-                }
-
-                // The event is deliberately internal-only. Once a provider
-                // has identified this call as run_program, a complete source
-                // prefix is enough to launch safe literal reads in the
-                // shadow executor while the rest of the program streams.
-                if program_delta_names
-                    .get(&index)
-                    .is_some_and(|name| name == "run_program")
-                    && let Some(program_speculator) = program_speculator.as_ref()
-                    && let Some(arguments) = program_delta_arguments.get(&index)
-                    && let Some(source) = extract_partial_program_source(arguments)
-                {
-                    let program_id = program_delta_ids
-                        .get(&index)
-                        .filter(|id| !id.is_empty())
-                        .cloned()
-                        .unwrap_or_else(|| format!("stream-program-{index}"));
-                    program_speculator.launch(speculation_registry, &program_id, &source);
-                }
-            }
+            // A streamed tool name and argument prefix is provisional: a later
+            // delta can change the name or leave the outer JSON/schema invalid.
+            // Never cross the execution boundary from this callback. The final
+            // completion path validates the admitted `run_program` call first,
+            // then launches the same conservative shadow reads while the Rhai
+            // host starts.
+            StreamEvent::ToolCallDelta { .. } => {}
         };
         let protocol_retry_nudge =
             tool_protocol_retry_nudge(&request.tools, request.profile.tool_mode);
-        let provider_result = self.provider.stream(request, &mut sink).await;
+        let response_tools = request.tools.clone();
+        let response_tool_mode = request.profile.tool_mode;
+        let provider_result =
+            self.provider
+                .stream(request, &mut sink)
+                .await
+                .and_then(|completion| {
+                    if enforce_required_response
+                        && response_tool_mode == hi_ai::ToolMode::Required
+                        && !completion
+                            .content
+                            .iter()
+                            .any(|content| matches!(content, hi_ai::Content::ToolCall { .. }))
+                    {
+                        hi_ai::validate_client_tool_calls(
+                            &completion,
+                            &response_tools,
+                            response_tool_mode,
+                        )?;
+                    }
+                    Ok(completion)
+                });
         // A retry, fatal provider error, or a completed non-program response
         // invalidates shadow work. Keeping it alive across a changed request
         // identity could leak a network/read task into the next round and let
@@ -475,7 +460,13 @@ impl crate::Agent {
                     return Ok(ProviderStreamResult::Continue);
                 }
                 if implementation_intent.is_some() || made_tool_call {
-                    *force_tools_next = true;
+                    *force_tools_next = tool_envelope
+                        .payload
+                        .provider
+                        .capability_record
+                        .capabilities
+                        .tool_choice
+                        .required;
                 }
                 ui.nudge(&format!(
                     "⚠ the model emitted an invalid tool turn — retrying with tool-format guidance ({protocol_retries}/{MAX_TOOL_PROTOCOL_RETRIES})"
@@ -498,6 +489,7 @@ impl crate::Agent {
                     && hi_ai::provider_error_retryable(&err) != Some(false)
                     && !request_no_progress_final_answer
                     && implementation_intent.is_some()
+                    && self.effective_tool_mode() == hi_ai::ToolMode::Auto
                     && retry_state.protocol_text_fallbacks < 1 =>
             {
                 ui.assistant_end();
@@ -514,7 +506,8 @@ impl crate::Agent {
             }
             Err(err)
                 if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
-                    && hi_ai::provider_error_retryable(&err) != Some(false) =>
+                    && hi_ai::provider_error_retryable(&err) != Some(false)
+                    && self.effective_tool_mode() != hi_ai::ToolMode::Required =>
             {
                 ui.assistant_end();
                 self.add_error_usage(&err);

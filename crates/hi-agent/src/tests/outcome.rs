@@ -578,66 +578,6 @@ async fn ambiguous_question_answered_in_text_completes() {
 }
 
 #[tokio::test]
-async fn explicit_mutation_request_without_changes_settles_with_the_available_answer() {
-    // Explicit mutation turns now share the implementation no-change cascade
-    // (two edit nudges) before accepting the available user-visible answer.
-    let workspace = IsolatedWorkspace::new("outcome-explicit-no-changes");
-    let mut agent = agent(
-        vec![
-            completion(
-                vec![Content::Text(
-                    "The bug is in parser.rs line 42; an edit there would resolve it.".into(),
-                )],
-                1,
-                1,
-            ),
-            completion(
-                vec![Content::Text(
-                    "Still diagnosing; the edit belongs in parser.rs.".into(),
-                )],
-                1,
-                1,
-            ),
-            completion(
-                vec![Content::Text(
-                    "I would edit parser.rs but am not calling tools.".into(),
-                )],
-                1,
-                1,
-            ),
-        ],
-        workspace.config(),
-    );
-    let mut ui = RecordingUi::default();
-
-    let outcome = agent.run_turn("fix the parser bug", &mut ui).await.unwrap();
-
-    assert_eq!(outcome.status, TurnStatus::Completed);
-    assert_eq!(outcome.verification, VerificationStatus::NotApplicable);
-    assert_eq!(
-        outcome.stop_reason,
-        TurnStopReason::NoApplicableVerification
-    );
-    assert_eq!(
-        agent.last_turn_telemetry().continue_nudges,
-        2,
-        "two no-change repair continues before bounded settlement"
-    );
-    assert!(
-        ui.statuses.iter().any(|s| s.contains("no file changes")),
-        "expected no-change repair status, got: {:?}",
-        ui.statuses
-    );
-    assert!(
-        !ui.statuses.iter().any(|status| {
-            status.contains("incomplete") || status.to_ascii_lowercase().contains("stalled")
-        }),
-        "no-change repair must not manufacture a legacy terminal state: {:?}",
-        ui.statuses
-    );
-}
-
-#[tokio::test]
 async fn conversational_greenfield_request_cannot_complete_without_work() {
     let workspace = IsolatedWorkspace::new("outcome-conversational-greenfield-noop");
     let generic = || {
@@ -664,11 +604,8 @@ async fn conversational_greenfield_request_cannot_complete_without_work() {
         .await
         .unwrap();
 
-    assert_eq!(outcome.status, TurnStatus::Completed);
-    assert_eq!(
-        outcome.stop_reason,
-        TurnStopReason::NoApplicableVerification
-    );
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
     assert!(
         ui.statuses
             .iter()

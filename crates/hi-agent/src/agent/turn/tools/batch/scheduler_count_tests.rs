@@ -1,6 +1,6 @@
+use super::plan_updates::plan_step_requires_execution_evidence;
 use super::{
-    ProgramRunGuard, normalize_unsupported_plan_completion, plan_step_requires_execution_evidence,
-    saturating_add_scheduler_count,
+    ProgramRunGuard, normalize_unsupported_plan_completion, saturating_add_scheduler_count,
 };
 use hi_tools::{PlanStatus, PlanStep};
 

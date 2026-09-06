@@ -2906,12 +2906,12 @@ async fn implementation_re_read_exhaustion_settles_as_typed_no_progress() {
 }
 
 #[tokio::test]
-async fn re_read_after_prior_mutation_does_not_hard_stall_the_turn() {
+async fn re_read_after_prior_mutation_forces_bounded_closeout() {
     // This mirrors long harness work: earlier plan steps already changed files,
     // then a later step gets stuck re-reading inspected context. The no-new-
-    // evidence guard should nudge, but after its advisory budget it must allow
-    // execution so the harness can continue instead of ending the whole turn as
-    // stalled.
+    // evidence guard should nudge, permit one recovery sample, then preserve
+    // the completed edits and force a tool-free closeout. A prior mutation
+    // must not grant an unlimited exemption from convergence.
     let path = temp_file("reread-after-mutation");
     let p = path.to_string_lossy().to_string();
     let read = || {
@@ -2956,13 +2956,13 @@ async fn re_read_after_prior_mutation_does_not_hard_stall_the_turn() {
         "repeat nudges should still be bounded, got: {:?}",
         ui.statuses
     );
+    assert!(!ui.statuses.iter().any(|s| s.contains("kept re-running")));
     assert!(
-        !ui.statuses.iter().any(|s| s.contains("kept re-running"))
-            && ui.assistant.trim().is_empty(),
-        "prior mutations should not be converted into a hard repeat stall, got statuses {:?} assistant {}",
-        ui.statuses,
-        ui.assistant
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("forcing a final answer"))
     );
+    assert_eq!(ui.assistant, "Done.");
     let read_results = ui
         .tool_results
         .iter()

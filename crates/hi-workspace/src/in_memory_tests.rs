@@ -117,12 +117,18 @@ async fn abandoned_permit_synchronously_fences_new_mutations() {
         controller.recovery(&recovery_id).unwrap().kind,
         RecoveryKind::AbandonedMutation
     );
+    let denied = controller
+        .begin(MutationIntent::workspace("blocked"))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.reason, AdmissionDeniedReason::NotReady);
+    assert!(denied.detail.contains("state=RecoveryRequired"));
     assert!(
-        controller
-            .begin(MutationIntent::workspace("blocked"))
-            .await
-            .is_err()
+        denied
+            .detail
+            .contains(&format!("recovery_id={recovery_id}"))
     );
+    assert!(denied.detail.contains("dropped before settlement"));
 
     let outcome = controller.reconcile(recovery_id).await;
     assert_eq!(outcome.status, RecoveryStatus::Recovered);
@@ -208,8 +214,15 @@ async fn watch_subscription_publishes_state_transitions() {
 }
 
 #[tokio::test]
-async fn live_writer_job_blocks_mutations_and_requires_settlement_before_success() {
-    let controller = controller();
+async fn pipefs_live_writer_job_blocks_mutations_and_requires_settlement_before_success() {
+    let controller = InMemoryWorkspaceController::new_pipefs(
+        WorkspaceId::new("workspace"),
+        "session",
+        2,
+        true,
+        PathBuf::from("/work/one"),
+        PathBuf::from("/state/one"),
+    );
     let job = controller
         .register_job(JobSpec {
             kind: crate::JobKind::Process,
@@ -230,6 +243,12 @@ async fn live_writer_job_blocks_mutations_and_requires_settlement_before_success
         .await
         .unwrap_err();
     assert_eq!(denied.reason, AdmissionDeniedReason::ActiveWriter);
+    assert!(denied.detail.contains("state=Ready"), "{}", denied.detail);
+    assert!(
+        denied.detail.contains(job.job_id.as_str()),
+        "{}",
+        denied.detail
+    );
 
     let succeeded = JobTerminal {
         completion: JobCompletion::Succeeded,
@@ -298,6 +317,113 @@ async fn live_writer_job_blocks_mutations_and_requires_settlement_before_success
     }
     let duplicate = controller.seal_job(job.job_id, succeeded).await;
     assert_eq!(duplicate.status, JobSealStatus::AlreadySealed);
+}
+
+#[tokio::test]
+async fn local_live_processes_do_not_fence_foreground_mutations_or_each_other() {
+    let controller = controller();
+    let first = controller
+        .register_job(JobSpec {
+            kind: crate::JobKind::Process,
+            effect_scope: EffectScope::LiveWriter,
+            name: "api".into(),
+            limits: JobLimits::default(),
+            parent_operation: None,
+        })
+        .await
+        .unwrap();
+    let second = controller
+        .register_job(JobSpec {
+            kind: crate::JobKind::Process,
+            effect_scope: EffectScope::LiveWriter,
+            name: "ui".into(),
+            limits: JobLimits::default(),
+            parent_operation: None,
+        })
+        .await
+        .unwrap();
+
+    let permit = controller
+        .begin(MutationIntent::workspace("edit while local services run"))
+        .await
+        .expect("local background services must not fence unrelated local work");
+    assert_eq!(
+        controller
+            .settle(permit, ExecutionReport::succeeded(None))
+            .await
+            .status,
+        SettlementStatus::NoChange
+    );
+
+    for job in [first, second] {
+        assert_eq!(
+            controller
+                .seal_job(
+                    job.job_id,
+                    JobTerminal {
+                        completion: JobCompletion::Cancelled,
+                        detail: None,
+                        artifacts: Vec::new(),
+                    },
+                )
+                .await
+                .status,
+            JobSealStatus::Sealed
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_non_process_live_writer_still_fences_mutations_and_processes() {
+    let controller = controller();
+    let hook = controller
+        .register_job(JobSpec {
+            kind: crate::JobKind::Hook,
+            effect_scope: EffectScope::LiveWriter,
+            name: "workspace hook".into(),
+            limits: JobLimits::default(),
+            parent_operation: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        controller
+            .begin(MutationIntent::workspace("overlapping edit"))
+            .await
+            .unwrap_err()
+            .reason,
+        AdmissionDeniedReason::ActiveWriter
+    );
+    assert_eq!(
+        controller
+            .register_job(JobSpec {
+                kind: crate::JobKind::Process,
+                effect_scope: EffectScope::LiveWriter,
+                name: "development server".into(),
+                limits: JobLimits::default(),
+                parent_operation: None,
+            })
+            .await
+            .unwrap_err()
+            .reason,
+        AdmissionDeniedReason::ActiveWriter
+    );
+
+    assert_eq!(
+        controller
+            .seal_job(
+                hook.job_id,
+                JobTerminal {
+                    completion: JobCompletion::Cancelled,
+                    detail: None,
+                    artifacts: Vec::new(),
+                },
+            )
+            .await
+            .status,
+        JobSealStatus::Sealed
+    );
 }
 
 #[tokio::test]
@@ -524,7 +650,7 @@ async fn active_mutation_can_handoff_to_its_matching_child_jobs() {
         })
         .await
         .unwrap();
-    let denied = controller
+    let second_writer = controller
         .register_job(JobSpec {
             kind: crate::JobKind::Process,
             effect_scope: EffectScope::LiveWriter,
@@ -533,13 +659,13 @@ async fn active_mutation_can_handoff_to_its_matching_child_jobs() {
             parent_operation: Some(mutation.record().operation_id.clone()),
         })
         .await
-        .unwrap_err();
-    assert_eq!(denied.reason, AdmissionDeniedReason::ActiveWriter);
+        .expect("one local operation may launch multiple local services");
 
     controller
         .settle(mutation, ExecutionReport::succeeded(None))
         .await;
     child_jobs.push(own_job);
+    child_jobs.push(second_writer);
     for child in child_jobs {
         controller
             .seal_job(

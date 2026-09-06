@@ -4176,6 +4176,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "filetime",
+ "hi-control",
  "hi-workspace",
  "reqwest",
  "rustix",

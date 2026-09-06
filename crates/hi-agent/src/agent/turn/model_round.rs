@@ -1,6 +1,7 @@
 //! One Model→(text)Steer iteration of the inner turn loop.
 
 mod state;
+mod text_fallback;
 
 pub(super) use state::{ModelRoundControl, ModelRoundState};
 use state::{
@@ -12,8 +13,7 @@ use hi_ai::{ChatRequest, Content, RequestProfile, ToolMode};
 use hi_tools::PlanStatus;
 
 use crate::heuristics::{
-    RECOVERY_SAMPLING, StallMode, looks_like_unfinished_step, parse_text_tool_calls,
-    recovery_sampling, recovery_telemetry, textcall_id_offset,
+    RECOVERY_SAMPLING, StallMode, looks_like_unfinished_step, recovery_sampling, recovery_telemetry,
 };
 use crate::steering::{
     BOOKKEEPING_REPOST_NUDGE, IMPLEMENTATION_NO_CHANGES_NUDGE, MUTATION_SAFE_CONTEXT_WINDOW,
@@ -106,6 +106,7 @@ impl crate::Agent {
         let read_only_intent = state.read_only_intent;
         let implementation_intent = state.implementation_intent;
         let expected_mutation = state.expected_mutation;
+        let mutation_recovery_requires_focus = state.mutation_recovery_requires_focus;
         let requested_validation = state.requested_validation;
         let input = state.input;
         let _user_prompt_tokens = state.user_prompt_tokens;
@@ -264,7 +265,7 @@ impl crate::Agent {
             );
         }
 
-        let request_text_tool_fallback = text_tool_fallback_next;
+        let pending_text_tool_fallback = text_tool_fallback_next;
         text_tool_fallback_next = false;
         let request_text_answer = force_text_answer_next;
         force_text_answer_next = false;
@@ -277,24 +278,26 @@ impl crate::Agent {
         // empty/malformed stream; clearing the flag before that response made
         // the retry tool-capable again and allowed the generic post-tool nudge
         // to contradict the existing "stop using tools" instruction.
-
         // After a continue-nudge, force this round to call a tool rather
         // than narrate again or come back empty. Only when tools are
         // freely available (Auto): never override an intentional
         // ChatOnly/ReadOnly restriction, and Required already forces.
-        // Wrap-up is ChatOnly *policy* (`tool_choice: none`); the catalog
-        // stays the working-round set so the tool-prefix cache still hits.
-        // Plain-text tool repair is not a wrap-up: it remains Required so a
-        // parsed textual call is covered by the same executable envelope as a
-        // provider-native call. A ChatOnly envelope never admits either form.
+        // Wrap-up stays ChatOnly; plain-text repair stays Auto for a textual call.
         let wrapping_up =
             request_text_answer || request_no_progress_final_answer || request_cap_wrap_up;
+        // A pending recovery flag must never broaden a forced final-answer
+        // request. In particular, the step-cap wrap-up is the one tool-free
+        // round after execution stops; allowing text fallback to win here would
+        // re-advertise tools and promote a textual call past the cap.
+        let request_text_tool_fallback = pending_text_tool_fallback && !wrapping_up;
         let session_tool_mode = self.effective_tool_mode();
-        let tool_mode = if request_text_tool_fallback {
-            ToolMode::Required
-        } else if wrapping_up {
+        let mut tool_mode = if wrapping_up {
             ToolMode::ChatOnly
-        } else if force_tools_next && session_tool_mode == ToolMode::Auto {
+        } else if request_text_tool_fallback {
+            session_tool_mode
+        } else if (force_tools_next || mutation_recovery_requires_focus)
+            && session_tool_mode == ToolMode::Auto
+        {
             ToolMode::Required
         } else {
             session_tool_mode
@@ -324,7 +327,28 @@ impl crate::Agent {
             suppress_bookkeeping_tools_next = false;
             request_tools = super::model_request::apply_bookkeeping_suppress(request_tools, true);
         }
-        let effective_provider_capabilities = self.effective_provider_capabilities().await;
+        // `ToolMode::Required` alone means "call any advertised tool". During
+        // bounded mutation recovery that still lets a weak model pick another
+        // read indefinitely. Seal this one-shot request against mutation
+        // primitives only, so the advertised contract matches the nudge.
+        let mutation_repair_focus = !wrapping_up
+            && !implementation_tracker.mutation_seen
+            && (expected_mutation || implementation_intent.is_some())
+            && (mutation_recovery_requires_focus
+                || ((force_tools_next || request_text_tool_fallback)
+                    && (implementation_tracker.no_change_nudges >= 2
+                        || implementation_tracker.discovery_nudges >= 2)));
+        request_tools = super::model_request::apply_mutation_repair_focus(
+            request_tools,
+            mutation_repair_focus,
+        );
+        let effective_provider_capabilities = self.user_turn_capabilities(context_task).await;
+        self.require_tool_route(&request_tools, &effective_provider_capabilities)?;
+        tool_mode = super::model_request::provider_constraints::executable_round_mode(
+            tool_mode,
+            session_tool_mode,
+            &effective_provider_capabilities.capabilities,
+        );
         let request_shape = super::model_request::provider_constraints::constrain(
             request_tools,
             tool_mode,
@@ -437,10 +461,14 @@ impl crate::Agent {
         }
         self.refresh_session_resource();
         let advertised_tool_specs = request_tools.clone();
+        let mut envelope_limits =
+            request_shape.envelope_limits(request_max_tokens, sched_tool_calls);
+        envelope_limits.text_tool_fallback = request_text_tool_fallback;
         let tool_envelope = self.build_tool_envelope(
             &request_tools,
             tool_mode,
-            request_shape.envelope_limits(request_max_tokens, sched_tool_calls),
+            tool_availability_mode,
+            envelope_limits,
             effective_provider_capabilities,
         );
         // Prompt-cache health: measure whether this request extends the
@@ -774,70 +802,13 @@ impl crate::Agent {
                     .collect()
             };
 
-        // Fallback for local models that emit calls as raw JSON text instead
-        // of the structured field: scan when no native call arrived, then
-        // promote any matches to real ToolCall
-        // blocks so they actually execute. The raw JSON is stripped from
-        // the recorded text so history stays clean.
-        let calls = if calls.is_empty()
-            && !request_text_answer
-            && !request_no_progress_final_answer
-            && !request_cap_wrap_up
-        {
-            let full_text: String = completion
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    Content::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let parsed =
-                parse_text_tool_calls(&full_text, textcall_id_offset(&self.messages));
-            if parsed.iter().any(|c| matches!(c, Content::ToolCall { .. })) {
-                // Replace text blocks with the interleaved content
-                // (prose segments + ToolCall blocks in emission order),
-                // preserving any Thinking blocks from the original.
-                let mut new_content = Vec::new();
-                let mut parsed_iter = parsed.into_iter().peekable();
-                for c in completion.content.iter() {
-                    match c {
-                        Content::Text(_) => {
-                            // Drain the parsed content that corresponds to
-                            // this text block (all of it — the original had
-                            // one Text block with the full raw text).
-                            for p in parsed_iter.by_ref() {
-                                new_content.push(p);
-                            }
-                        }
-                        Content::Thinking { .. } => new_content.push(c.clone()),
-                        _ => {}
-                    }
-                }
-                // If the original had no Text block (shouldn't happen for
-                // the local-model path, but be safe), drain remaining.
-                for p in parsed_iter {
-                    new_content.push(p);
-                }
-                completion.content = new_content;
-                completion
-                    .tool_calls()
-                    .into_iter()
-                    .map(|c| {
-                        (
-                            c.id.to_string(),
-                            c.name.to_string(),
-                            c.arguments.to_string(),
-                        )
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        } else {
-            calls
-        };
+        // Only this sealed recovery round may reinterpret prose as a call.
+        let (calls, rejected_multiple_text_calls) = text_fallback::promote(
+            &mut completion,
+            &self.messages,
+            request_text_tool_fallback,
+            calls,
+        );
 
         // A plain-text tool fallback is useful only if the model actually
         // emits a parseable call. The old one-shot flag was cleared before the
@@ -846,17 +817,18 @@ impl crate::Agent {
         // Keep the same fallback active for one bounded correction.
         let text_fallback_narration = request_text_tool_fallback
             && calls.is_empty()
-            && looks_like_unfinished_step(
-                &completion
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Text(text) => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
+            && (rejected_multiple_text_calls
+                || looks_like_unfinished_step(
+                    &completion
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            Content::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ));
         if text_fallback_narration {
             const MAX_TEXT_TOOL_FALLBACK_MISSES: u32 = 1;
             if retry_state.text_tool_fallback_misses < MAX_TEXT_TOOL_FALLBACK_MISSES {
@@ -871,12 +843,18 @@ impl crate::Agent {
                 self.messages.push_nudge(
                     NudgeKind::Continue,
                     implementation_text_tool_nudge(
-                        "The previous fallback response contained no executable tool call. Do not narrate or promise the next action; emit the required call now.",
+                        if rejected_multiple_text_calls {
+                            "The previous fallback response emitted multiple calls, but this recovery channel admits exactly one. Emit one call now."
+                        } else {
+                            "The previous fallback response contained no executable tool call. Do not narrate or promise the next action; emit the required call now."
+                        },
                     ),
                 );
-                ui.nudge(
-                    "plain-text tool fallback returned narration instead of a call; retrying once",
-                );
+                ui.nudge(if rejected_multiple_text_calls {
+                    "plain-text tool fallback emitted multiple calls; retrying exactly one call once"
+                } else {
+                    "plain-text tool fallback returned narration instead of a call; retrying once"
+                });
                 return Ok(ModelRoundControl::Continue);
             }
         } else if request_text_tool_fallback && !calls.is_empty() {
@@ -1321,6 +1299,7 @@ If the task is already complete, stop and give your final recap."
                     prev_call_sig = None;
                     return Ok(ModelRoundControl::Continue);
                 }
+                implementation_tracker.no_mutation_exhausted = true;
                 progress_tracker.record(
                     ProgressKind::None,
                     "implementation_no_mutation",

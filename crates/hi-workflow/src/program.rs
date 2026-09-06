@@ -27,108 +27,242 @@ pub struct ProgramCall {
 }
 
 /// Conservatively extract directly resolvable `tool("name", #{...})` calls.
-/// This is used only for shadow execution. Any control flow, dynamic value,
-/// nested expression, or non-literal map causes the caller to skip the
-/// candidate rather than guess.
+/// This is used only for shadow execution. It recognizes a tiny executable
+/// prefix and never searches past control flow, dynamic values, nested
+/// expressions, or non-literal maps.
 pub fn extract_safe_literal_calls(source: &str) -> Vec<ProgramCall> {
+    if source.len() > MAX_PROGRAM_SOURCE_BYTES || rhai::Engine::new().compile(source).is_err() {
+        return Vec::new();
+    }
     let lower = source.to_ascii_lowercase();
-    if ["if ", "if(", "for ", "while ", "loop", "switch ", "fn "]
-        .iter()
-        .any(|token| lower.contains(token))
+    if lower
+        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .any(|token| matches!(token, "if" | "for" | "while" | "loop" | "switch" | "fn"))
+        || !matches!(next_direct_call(source, 0, "parallel"), Ok(None))
     {
         return Vec::new();
     }
     let mut calls = Vec::new();
     let mut cursor = 0;
-    while let Some(start) = next_tool_call(source, cursor) {
-        let before_ok = start == 0 || !source.as_bytes()[start - 1].is_ascii_alphanumeric();
-        let after = start + 4;
-        let after_ok = source[after..].trim_start().starts_with('(');
-        if !before_ok || !after_ok {
-            cursor = after;
-            continue;
+    loop {
+        if skip_program_trivia(source, &mut cursor).is_err() {
+            return Vec::new();
         }
-        let open = after + source[after..].find('(').unwrap_or(0) + 1;
+        while source.as_bytes().get(cursor) == Some(&b';') {
+            cursor += 1;
+            if skip_program_trivia(source, &mut cursor).is_err() {
+                return Vec::new();
+            }
+        }
+        if cursor == source.len() {
+            break;
+        }
+        if source[cursor..].starts_with("let")
+            && source
+                .as_bytes()
+                .get(cursor + 3)
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 3;
+            if skip_program_trivia(source, &mut cursor).is_err()
+                || !consume_program_identifier(source, &mut cursor)
+                || skip_program_trivia(source, &mut cursor).is_err()
+                || source.as_bytes().get(cursor) != Some(&b'=')
+            {
+                return Vec::new();
+            }
+            cursor += 1;
+            if skip_program_trivia(source, &mut cursor).is_err() {
+                return Vec::new();
+            }
+        }
+        if !source[cursor..].starts_with("tool") {
+            break;
+        }
+        let after = cursor + 4;
+        if source
+            .as_bytes()
+            .get(after)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            return Vec::new();
+        }
+        let Some(open_offset) = source[after..].find(|character: char| !character.is_whitespace())
+        else {
+            return Vec::new();
+        };
+        if source.as_bytes().get(after + open_offset) != Some(&b'(') {
+            return Vec::new();
+        }
+        let open = after + open_offset + 1;
         let Some((name, after_name)) = quoted_literal(source, open) else {
-            cursor = open;
-            continue;
+            return Vec::new();
         };
-        let Some(comma) = source[after_name..]
-            .find(',')
-            .map(|index| after_name + index)
+        let after_name = &source[after_name..];
+        let Some(comma_offset) = after_name.find(|character: char| !character.is_whitespace())
         else {
-            break;
+            return Vec::new();
         };
-        let Some(map_start) = source[comma + 1..]
-            .find("#{")
-            .map(|index| comma + 1 + index)
+        if after_name.as_bytes()[comma_offset] != b',' {
+            return Vec::new();
+        }
+        let comma = source.len() - after_name.len() + comma_offset;
+        let after_comma = &source[comma + 1..];
+        let Some(map_offset) = after_comma.find(|character: char| !character.is_whitespace())
         else {
-            cursor = comma + 1;
-            continue;
+            return Vec::new();
         };
+        if !after_comma[map_offset..].starts_with("#{") {
+            return Vec::new();
+        }
+        let map_start = comma + 1 + map_offset;
         let Some(map_end) = balanced_map_end(source, map_start) else {
-            break;
+            return Vec::new();
         };
         let Some(arguments) = literal_map_to_json(&source[map_start..=map_end]) else {
-            cursor = map_end + 1;
-            continue;
+            return Vec::new();
         };
+        let after_map = &source[map_end + 1..];
+        let Some(close_offset) = after_map.find(|character: char| !character.is_whitespace())
+        else {
+            return Vec::new();
+        };
+        if after_map.as_bytes()[close_offset] != b')' {
+            return Vec::new();
+        }
         calls.push(ProgramCall {
             occurrence: calls.len(),
             name,
             arguments,
         });
-        cursor = map_end + 1;
+        cursor = map_end + 1 + close_offset + 1;
     }
     calls
 }
 
-fn next_tool_call(source: &str, start: usize) -> Option<usize> {
+fn skip_program_trivia(source: &str, cursor: &mut usize) -> Result<(), ()> {
+    let bytes = source.as_bytes();
+    loop {
+        while bytes
+            .get(*cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            *cursor += 1;
+        }
+        if bytes.get(*cursor..cursor.saturating_add(2)) == Some(b"//") {
+            *cursor = source[*cursor..]
+                .find('\n')
+                .map(|offset| *cursor + offset + 1)
+                .unwrap_or(bytes.len());
+            continue;
+        }
+        if bytes.get(*cursor..cursor.saturating_add(2)) == Some(b"/*") {
+            *cursor = flat_block_comment_end(bytes, *cursor).ok_or(())?;
+            continue;
+        }
+        return Ok(());
+    }
+}
+
+fn consume_program_identifier(source: &str, cursor: &mut usize) -> bool {
+    let bytes = source.as_bytes();
+    if !bytes
+        .get(*cursor)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
+        return false;
+    }
+    *cursor += 1;
+    while bytes
+        .get(*cursor)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        *cursor += 1;
+    }
+    true
+}
+
+fn next_direct_call(source: &str, start: usize, name: &str) -> Result<Option<usize>, ()> {
     let bytes = source.as_bytes();
     let mut index = start;
-    let mut quoted = false;
+    let mut previous_code_byte = None;
     while index < bytes.len() {
-        if quoted {
-            match bytes[index] {
-                b'\\' => index = index.saturating_add(2),
-                b'"' => {
-                    quoted = false;
-                    index += 1;
+        match bytes[index] {
+            b'"' => {
+                index = quoted_end(bytes, index, b'"').ok_or(())?;
+                previous_code_byte = Some(b'"');
+                continue;
+            }
+            // Rhai backtick strings can interpolate expressions. The shadow
+            // scanner deliberately does not try to reproduce those lexical
+            // rules: no speculation is safer than executing string contents.
+            b'`' | b'\'' => return Err(()),
+            // `#{` is the literal map syntax accepted below. Other `#` forms
+            // include raw strings, whose contents must never become calls.
+            b'#' if bytes.get(index + 1) != Some(&b'{') => return Err(()),
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index = source[index..]
+                    .find('\n')
+                    .map(|offset| index + offset + 1)
+                    .unwrap_or(bytes.len());
+                continue;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index = flat_block_comment_end(bytes, index).ok_or(())?;
+                continue;
+            }
+            byte if byte.is_ascii_whitespace() => {
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if bytes.get(index..index.saturating_add(name.len())) == Some(name.as_bytes()) {
+            let after = index + name.len();
+            if source[after..].trim_start().starts_with('(') {
+                if direct_call_boundary(previous_code_byte) {
+                    return Ok(Some(index));
                 }
-                _ => index += 1,
+                return Err(());
             }
-            continue;
         }
-        if bytes[index] == b'"' {
-            quoted = true;
-            index += 1;
-            continue;
+        previous_code_byte = Some(bytes[index]);
+        index += 1;
+    }
+    Ok(None)
+}
+
+fn quoted_end(bytes: &[u8], start: usize, delimiter: u8) -> Option<usize> {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index = index.checked_add(2)?,
+            byte if byte == delimiter => return Some(index + 1),
+            _ => index += 1,
         }
-        if bytes.get(index..index.saturating_add(2)) == Some(b"//") {
-            index = source[index..]
-                .find('\n')
-                .map(|offset| index + offset + 1)
-                .unwrap_or(bytes.len());
-            continue;
-        }
+    }
+    None
+}
+
+/// Skip one non-nested C-style comment. Rhai accepts nested block comments,
+/// but partially emulating that grammar risks treating still-commented text
+/// as executable, so their presence rejects the whole shadow batch.
+fn flat_block_comment_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start + 2;
+    while index < bytes.len() {
         if bytes.get(index..index.saturating_add(2)) == Some(b"/*") {
-            index = source[index + 2..]
-                .find("*/")
-                .map(|offset| index + 2 + offset + 2)
-                .unwrap_or(bytes.len());
-            continue;
+            return None;
         }
-        if bytes.get(index..index.saturating_add(4)) == Some(b"tool") {
-            let before_ok = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
-            let after = index + 4;
-            let after_ok = source[after..].trim_start().starts_with('(');
-            if before_ok && after_ok {
-                return Some(index);
-            }
+        if bytes.get(index..index.saturating_add(2)) == Some(b"*/") {
+            return Some(index + 2);
         }
         index += 1;
     }
     None
+}
+
+fn direct_call_boundary(previous_code_byte: Option<u8>) -> bool {
+    matches!(previous_code_byte, None | Some(b'=' | b';'))
 }
 
 /// Recover the currently available value of the JSON `source` argument from
@@ -697,6 +831,79 @@ mod tests {
             r#"let text = "tool(\"read\", #{path: \"secret\"})"; // tool("read", #{path: "comment"})"#
         )
         .is_empty());
+        assert!(
+            extract_safe_literal_calls("if\nready { tool(\"read\", #{path: \"x\"}); }").is_empty()
+        );
+        assert!(
+            extract_safe_literal_calls("for\titem in items { tool(\"read\", #{path: \"x\"}); }")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn similarly_named_or_member_calls_are_not_shadowed() {
+        assert!(extract_safe_literal_calls(r#"_tool("read", #{path: "secret"})"#).is_empty());
+        assert!(extract_safe_literal_calls(r#"obj.tool("read", #{path: "secret"})"#).is_empty());
+        assert!(extract_safe_literal_calls(r#"obj . tool("read", #{path: "secret"})"#).is_empty());
+        assert!(
+            extract_safe_literal_calls(r#"namespace::tool("read", #{path: "secret"})"#).is_empty()
+        );
+        assert!(
+            extract_safe_literal_calls(r#"namespace :: tool("read", #{path: "secret"})"#)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ambiguous_strings_and_nested_comments_are_not_shadowed() {
+        for source in [
+            r#"let text = `tool("read", #{path: "secret"})`; text"#,
+            "let text = #\"tool(\"read\", #{path: \"secret\"})\"#; text",
+            r#"/* outer /* nested */ tool("read", #{path: "secret"}) */ 0"#,
+        ] {
+            assert!(rhai::Engine::new().compile(source).is_ok(), "{source}");
+            assert!(extract_safe_literal_calls(source).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn flat_comments_preserve_a_direct_literal_call() {
+        let calls = extract_safe_literal_calls(
+            r#"// preparation
+               let value = /* safe flat comment */ tool("read", #{path: "visible"});
+               value"#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["path"], "visible");
+    }
+
+    #[test]
+    fn parallel_before_literal_call_rejects_shadow_batch() {
+        let source = r#"
+            parallel([#{name: "read", args: #{path: "first.txt"}}]);
+            tool("read", #{path: "later.txt"});
+        "#;
+        assert!(extract_safe_literal_calls(source).is_empty());
+    }
+
+    #[test]
+    fn unresolved_call_rejects_later_literal_shadow_work() {
+        let source = r#"
+            let target = "first.txt";
+            tool("read", #{path: target});
+            tool("read", #{path: "later.txt"});
+        "#;
+        assert!(
+            extract_safe_literal_calls(source).is_empty(),
+            "a later literal call must not run ahead of an unresolved runtime call"
+        );
+    }
+
+    #[test]
+    fn an_earlier_runtime_construct_blocks_later_shadow_work() {
+        let source = r#"throw("stop"); tool("read", #{path: "must-not-run"});"#;
+        assert!(rhai::Engine::new().compile(source).is_ok());
+        assert!(extract_safe_literal_calls(source).is_empty());
     }
 
     #[test]

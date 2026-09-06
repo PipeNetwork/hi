@@ -8,6 +8,30 @@ use super::{
     BTW_MAX_PARALLEL_TOOLS, BTW_MAX_TOKENS, BTW_TOOL_ALLOWLIST, SealedRequestPolicy, btw_tool_specs,
 };
 
+/// `/btw` has no workspace-controller settlement path. Keep its executor to
+/// pure, non-mutating local/session inspection even if an allowlisted catalog
+/// entry later changes policy. Network and MCP reads are excluded because
+/// their observable external effect needs an operation receipt too.
+pub(super) fn side_tool_is_pure(name: &str) -> bool {
+    BTW_TOOL_ALLOWLIST.contains(&name)
+        && hi_tools::tool_metadata(name).is_some_and(|metadata| {
+            metadata.read_only
+                && !metadata.filesystem_mutating
+                && matches!(
+                    metadata.policy.effect_scope,
+                    hi_tools::catalog::EffectScope::ReadOnly
+                )
+                && matches!(
+                    metadata.policy.replay_class,
+                    hi_tools::catalog::ReplayClass::PureWorkspace
+                )
+                && !metadata.policy.resource_access.workspace_write
+                && !metadata.policy.resource_access.network
+                && !metadata.policy.resource_access.credentials
+                && !metadata.policy.resource_access.mcp
+        })
+}
+
 pub(super) async fn seal(
     agent: &mut crate::Agent,
 ) -> (String, SealedRequestPolicy, SealedRequestPolicy) {
@@ -41,7 +65,7 @@ pub(super) fn rejection(policy: &SealedRequestPolicy, call: &ToolCall<'_>) -> Op
     if let Some(reason) = crate::heuristics::mode_blocks_tool(policy.tool_mode, call.name) {
         return Some(reason);
     }
-    if !BTW_TOOL_ALLOWLIST.contains(&call.name) {
+    if !side_tool_is_pure(call.name) {
         return Some(format!(
             "tool `{}` is not available on /btw side questions (read-only inspection only)",
             call.name
@@ -60,4 +84,34 @@ pub(super) fn rejection(policy: &SealedRequestPolicy, call: &ToolCall<'_>) -> Op
     )
     .err()
     .map(|error| format!("tool call rejected by the sealed /btw policy: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowlist_cannot_admit_workspace_job_or_external_effects() {
+        for name in BTW_TOOL_ALLOWLIST {
+            assert!(side_tool_is_pure(name), "unsafe /btw tool policy: {name}");
+        }
+        for name in [
+            "bash_output",
+            "get_task_output",
+            "wait_tasks",
+            "diagnostics",
+            "definition",
+            "references",
+            "hover",
+            "web_search",
+            "web_fetch",
+            "research",
+            "research_read",
+            "search_tool",
+            "memory_search",
+            "memory_get",
+        ] {
+            assert!(!side_tool_is_pure(name), "{name} escaped /btw isolation");
+        }
+    }
 }

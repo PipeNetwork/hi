@@ -47,3 +47,40 @@ async fn protocol_one_nonreplayable_effect_is_cleanly_denied_before_admission() 
     assert!(controller.status().active_operation.is_none());
     assert!(controller.status().recovery_id.is_none());
 }
+
+#[tokio::test]
+async fn cancelling_begin_during_remote_intent_ack_never_strands_mutating_state() {
+    let (_temporary, controller, _session, server) = subject(false).await;
+    server.hold_intents.store(true, Ordering::SeqCst);
+    let intent = MutationIntent {
+        effect_scope: EffectScope::LiveWriter,
+        replay_class: ReplayClass::NonReplayableExternal,
+        dirty_paths: None,
+        description: Some("external publish".into()),
+    };
+
+    let mut admission = Box::pin(controller.begin(intent));
+    tokio::select! {
+        entered = server.intent_entered.acquire() => entered.unwrap().forget(),
+        result = &mut admission => panic!("admission completed before the intent gate: {result:?}"),
+    }
+    let active = controller.status();
+    assert_eq!(active.state, WorkspaceState::Mutating);
+    assert!(active.active_operation.is_some());
+
+    drop(admission);
+    let cancelled = controller.status();
+    assert_eq!(cancelled.state, WorkspaceState::RecoveryRequired);
+    assert!(cancelled.active_operation.is_none());
+    assert!(cancelled.recovery_id.is_some());
+    assert!(
+        cancelled
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("abandoned"))
+    );
+
+    // Let the request handler finish rather than leaving a gated server task
+    // behind; its response is deliberately no longer consumed by `begin`.
+    server.allow_intent.add_permits(1);
+}

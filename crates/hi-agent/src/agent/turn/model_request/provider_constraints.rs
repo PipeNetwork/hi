@@ -2,6 +2,45 @@ use std::sync::Arc;
 
 use hi_ai::{ProviderCapabilities, ToolMode, ToolSpec};
 
+pub(in crate::agent::turn) fn ensure_explicit_required_supported(
+    session_mode: ToolMode,
+    has_tools: bool,
+    capabilities: &ProviderCapabilities,
+) -> anyhow::Result<()> {
+    if session_mode != ToolMode::Required
+        || (has_tools
+            && capabilities.native_tool_calls
+            && capabilities.tool_choice.required
+            && capabilities.request_limits.max_tools != Some(0))
+    {
+        return Ok(());
+    }
+    Err(hi_ai::ProviderError::new(
+        hi_ai::ProviderErrorKind::UnsupportedTools,
+        "the selected provider route cannot honor the session's required-tool policy",
+    )
+    .with_api_contract(
+        Some("required_tool_choice_unsupported".into()),
+        Some(false),
+        None,
+    )
+    .into())
+}
+
+impl crate::Agent {
+    pub(in crate::agent::turn) fn require_tool_route(
+        &self,
+        tools: &[ToolSpec],
+        effective: &hi_ai::EffectiveProviderCapabilities,
+    ) -> anyhow::Result<()> {
+        ensure_explicit_required_supported(
+            self.config.routing.tool_mode,
+            !tools.is_empty(),
+            &effective.capabilities,
+        )
+    }
+}
+
 pub(in crate::agent::turn) struct ProviderRequestShape {
     pub tools: Arc<[ToolSpec]>,
     pub tool_mode: ToolMode,
@@ -9,6 +48,25 @@ pub(in crate::agent::turn) struct ProviderRequestShape {
     pub max_parallel_calls: usize,
     pub max_tool_argument_bytes: u32,
     pub max_input_tokens: Option<u32>,
+}
+
+/// Preserve an executable Auto envelope when a one-round steering preference
+/// asks for Required but the provider cannot enforce that choice. An explicit
+/// Required session policy still fails closed in [`constrain`].
+pub(in crate::agent::turn) fn executable_round_mode(
+    requested: ToolMode,
+    session: ToolMode,
+    capabilities: &ProviderCapabilities,
+) -> ToolMode {
+    if requested == ToolMode::Required
+        && session == ToolMode::Auto
+        && !capabilities.tool_choice.required
+        && capabilities.tool_choice.automatic
+    {
+        ToolMode::Auto
+    } else {
+        requested
+    }
 }
 
 impl ProviderRequestShape {
@@ -32,6 +90,7 @@ impl ProviderRequestShape {
             executed_tool_calls,
             max_parallel_calls: self.max_parallel_calls,
             max_tool_argument_bytes: self.max_tool_argument_bytes,
+            text_tool_fallback: false,
         }
     }
 }
@@ -140,5 +199,22 @@ mod tests {
         assert_eq!(shape.tools.len(), 1);
         assert_eq!(shape.tool_mode, ToolMode::ChatOnly);
         assert_eq!(shape.max_parallel_calls, 1);
+    }
+
+    #[test]
+    fn a_required_round_preference_preserves_auto_on_an_auto_only_provider() {
+        let mut capabilities = ProviderCapabilities::native_tools(false);
+        capabilities.tool_choice.automatic = true;
+        capabilities.tool_choice.required = false;
+        assert!(!capabilities.tool_choice.required);
+
+        assert_eq!(
+            executable_round_mode(ToolMode::Required, ToolMode::Auto, &capabilities),
+            ToolMode::Auto
+        );
+        assert_eq!(
+            executable_round_mode(ToolMode::Required, ToolMode::Required, &capabilities),
+            ToolMode::Required
+        );
     }
 }

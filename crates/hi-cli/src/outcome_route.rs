@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use hi_agent::VerificationMode;
 use hi_agent::{ReviewPolicy, RsiControl, TaskContract};
 use hi_ai::{
-    ChatRequest, Completion, Content, Provider, Role, ServedModel, StreamEvent, ToolCallChannel,
-    Usage, estimate_text_tokens,
+    ChatRequest, Completion, Content, Provider, Role, StreamEvent, ToolCallChannel, Usage,
+    estimate_text_tokens,
 };
 use hi_outcome::{
     OutcomeClient, OutcomeClientConfig, OutcomeError, OutcomeMode, OutcomeOffer, TaskCreateRequest,
@@ -29,6 +29,8 @@ use crate::rsi_policy::{
 use crate::rsi_remote::{apply_exact_patch, capture_snapshot};
 
 const DEFAULT_JSON_SCHEMA: &str = r#"{"type":"object"}"#;
+
+mod provider_contract;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RepoCache {
@@ -695,34 +697,6 @@ fn text_completion(text: &str) -> Completion {
         stop_reason: Some("stop".into()),
         tool_call_channel: ToolCallChannel::None,
         ..Completion::default()
-    }
-}
-
-#[async_trait]
-impl Provider for OutcomeRouteProvider {
-    crate::provider::forward_provider_capabilities!(self, inner);
-    async fn stream(
-        &self,
-        request: ChatRequest,
-        sink: &mut (dyn FnMut(StreamEvent) + Send),
-    ) -> Result<Completion> {
-        if !request.user_turn {
-            return self.inner.stream(request, sink).await;
-        }
-        match self.submit_turn(request.clone(), sink).await {
-            Ok(completion) => Ok(completion),
-            Err(error) if error.is_fail_open() => {
-                if error.message != "turn is not an Outcome code.change" {
-                    sink(StreamEvent::Warning(fail_open_warning(&error)));
-                }
-                self.inner.stream(request, sink).await
-            }
-            Err(error) => Err(anyhow!(error)),
-        }
-    }
-
-    async fn list_models(&self) -> Result<Vec<ServedModel>> {
-        self.inner.list_models().await
     }
 }
 

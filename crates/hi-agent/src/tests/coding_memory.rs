@@ -2,8 +2,8 @@
 
 use super::common::*;
 
-#[test]
-fn coding_facts_continue_after_the_previous_session_cap() {
+#[tokio::test]
+async fn coding_facts_continue_after_the_previous_session_cap() {
     let cfg = config();
     std::fs::write(
         cfg.paths.workspace_root.join("Cargo.toml"),
@@ -22,7 +22,7 @@ fn coding_facts_continue_after_the_previous_session_cap() {
     agent.report.verify = crate::domain::VerifyEvidence::pass(1, "digest".into());
     agent.workspace.last_changed_files = vec!["src/lib.rs".into()];
 
-    agent.record_coding_facts_turn_end(&mut NullUi);
+    agent.record_coding_facts_turn_end(&mut NullUi).await;
 
     assert!(
         agent.subagents.coding_facts_written > 8,

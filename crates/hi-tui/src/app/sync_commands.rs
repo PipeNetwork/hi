@@ -496,6 +496,7 @@ impl crate::App {
                 while let Some(prompt) = self.queue.pop_front() {
                     self.trace_prompt_removed(&prompt);
                 }
+                self.clamp_queue_selection();
                 self.mid_turn_offered.clear();
                 // Standing grants and unsaved approval/mode choices belong to
                 // the previous session. Never apply them to the newly loaded
@@ -2554,7 +2555,7 @@ impl crate::App {
                 return;
             }
         };
-        let label = switched.switched.label.clone();
+        let label = switched.switched.route.label.clone();
         let model = switched.switched.model.clone();
         let profile = runtime.profile_name.clone();
         agent.register_driver_local_server(
@@ -2562,8 +2563,9 @@ impl crate::App {
             runtime.model_id.clone(),
             runtime.process_id.clone(),
         );
-        agent.set_provider(
+        agent.set_provider_with_route(
             switched.switched.provider.into(),
+            switched.switched.route,
             model.clone(),
             None,
             switched.switched.max_tokens,

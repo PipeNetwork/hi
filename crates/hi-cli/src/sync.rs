@@ -35,6 +35,8 @@ use workspace_execution::RequiredWorkspaceStageFailure;
 /// The server uses this to discriminate records without parsing the payload.
 const RECORD_TYPE_MESSAGE: &str = "message";
 const RECORD_TYPE_USAGE: &str = "usage";
+const RECORD_TYPE_LOCAL_WORKSPACE_STAGE: &str = "workspace_execution_staged";
+const RECORD_TYPE_LOCAL_WORKSPACE_SETTLEMENT: &str = "workspace_execution_settled";
 const RECORD_TYPE_CHECKPOINTS: &str = "checkpoints";
 const RECORD_TYPE_HARNESS_SETTINGS: &str = crate::session_harness::RECORD_TYPE;
 const RECORD_TYPE_STATE_REPLACEMENT: &str = "state_replacement";
@@ -398,6 +400,17 @@ impl RemoteSessionSink {
                 .get("type")
                 .and_then(|kind| kind.as_str())
                 .unwrap_or(RECORD_TYPE_MESSAGE);
+            if matches!(
+                record_type,
+                RECORD_TYPE_LOCAL_WORKSPACE_STAGE | RECORD_TYPE_LOCAL_WORKSPACE_SETTLEMENT
+            ) {
+                // Local settlement evidence is already staged separately in
+                // the PipeFS outbox. Never mirror this hidden JSONL copy as a
+                // second causal/visible remote record.
+                consumed_any = true;
+                offset = offset.saturating_add(line.len() as u64);
+                continue;
+            }
             if record_type != "name" {
                 let base_id = format!(
                     "{:x}",
@@ -1321,13 +1334,23 @@ pub struct SyncSession {
 }
 
 impl SyncSession {
-    pub fn new(local: crate::session::JsonlSession, remote: RemoteSessionSink) -> Self {
+    pub fn new(local: crate::session::JsonlSession, remote: RemoteSessionSink) -> Result<Self> {
+        let recovered = if local.path().is_file() {
+            let loaded = crate::session::load_history(local.path())?;
+            local.materialize_workspace_execution_recovery(&loaded)?;
+            loaded.workspace_execution_recovered.then_some(loaded)
+        } else {
+            None
+        };
         let session = Self {
             local,
             remote: std::sync::Arc::new(remote),
         };
+        if let Some(loaded) = &recovered {
+            session.remote.seed_snapshot(loaded)?;
+        }
         session.reconcile_best_effort();
-        session
+        Ok(session)
     }
 
     /// Get a handle to the remote sink for flushing / ending the session.
@@ -1353,12 +1376,15 @@ impl SessionSink for SyncSession {
         self.local.id()
     }
 
+    fn requires_local_workspace_execution_stage(&self) -> bool {
+        true
+    }
+
     fn record(&mut self, messages: &[Message], usage: Usage) -> Result<()> {
         self.local.record(messages, usage)?;
         self.remote.observe_messages(messages);
         self.remote.observe_context_used(usage.context_occupancy);
-        self.reconcile_best_effort();
-        Ok(())
+        self.remote.reconcile_message_prefix(self.local.path())
     }
 
     fn stage_workspace_execution(
@@ -1366,6 +1392,22 @@ impl SessionSink for SyncSession {
         record: &hi_agent::WorkspaceTranscriptExecution,
     ) -> Result<()> {
         self.remote.stage_workspace_execution(record)
+    }
+
+    fn stage_local_workspace_execution(
+        &mut self,
+        record: &hi_agent::WorkspaceTranscriptExecution,
+        visible_on_resume: bool,
+    ) -> Result<()> {
+        self.local
+            .stage_local_workspace_execution(record, visible_on_resume)
+    }
+
+    fn settle_local_workspace_execution(
+        &mut self,
+        operation_id: &hi_workspace::OperationId,
+    ) -> Result<()> {
+        self.local.settle_local_workspace_execution(operation_id)
     }
 
     fn record_model_context(&mut self, model: &str, context_window: Option<u32>) {
@@ -3234,7 +3276,7 @@ pub async fn run_resume_local(
     // remote sink for subsequent portal records.
     agent.detach_session();
     crate::session::apply_loaded_session(agent, loaded)?;
-    let sync_session = SyncSession::new(local, remote);
+    let sync_session = SyncSession::new(local, remote)?;
     let sync_handle = sync_session.remote_handle();
     let pipefs_sync_handle: crate::pipefs::SharedSyncHandle =
         std::sync::Arc::new(std::sync::Mutex::new(Some(sync_handle.clone())));

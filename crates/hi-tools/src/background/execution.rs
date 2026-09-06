@@ -6,11 +6,25 @@ const MAX_BG_LINE_BYTES: usize = 64 * 1024;
 
 /// Reap the direct child concurrently with output capture. Descendants may
 /// inherit its pipes; they must not hide a completed command's exit status.
-pub(super) async fn drive(
+pub(super) fn drive(
+    proc: Arc<BgProc>,
+    child: tokio::process::Child,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    // Construct the guard before returning the future. Even if Tokio drops the
+    // task before its first poll, the captured guard retains cancellation
+    // safety for a child whose own kill_on_drop is intentionally disabled.
+    let ownership = DriverOwnershipGuard(Arc::clone(&proc));
+    drive_owned(proc, child, stdout, stderr, ownership)
+}
+
+async fn drive_owned(
     proc: Arc<BgProc>,
     mut child: tokio::process::Child,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
+    _ownership: DriverOwnershipGuard,
 ) {
     let mut stdout_pending = Vec::new();
     let mut stderr_pending = Vec::new();
@@ -35,10 +49,22 @@ pub(super) async fn drive(
     // bytes outside the cancelled pumps so settlement still publishes it.
     append_output(&proc, &stdout_pending);
     append_output(&proc, &stderr_pending);
+
+    // Under --keep-background, an explicitly requested shell is only the
+    // launcher: its process group can still contain the service the user asked
+    // Hi to preserve. Keep the durable job live until that whole group exits
+    // or the shutdown release transfers ownership. Publishing Succeeded here
+    // would let a live writer escape both settlement and the Orphaned record.
+    let preserve_requested_group =
+        proc.origin == BgOrigin::Requested && crate::process::detached_descendants_preserved();
+    if exit.is_ok() && preserve_requested_group && proc.pgid.is_some_and(process_group_is_alive) {
+        wait_for_owned_process_group(&proc).await;
+    }
+
     let cancelled = {
         let mut inner = proc.inner.lock().unwrap();
         let cancelled = matches!(inner.state, BgState::Killed);
-        if (cancelled || exit.is_err() || !crate::process::detached_descendants_preserved())
+        if (cancelled || exit.is_err() || !preserve_requested_group)
             && let Some(pgid) = proc.pgid
         {
             crate::process::kill_group(pgid);
@@ -49,10 +75,29 @@ pub(super) async fn drive(
         inner.native_exited = true;
         cancelled
     };
+    // Serialize the real terminal callback with `--keep-background` release.
+    // `native_exited` is written first so release sees an already-observed
+    // native exit even while this callback is waiting for the async gate. If
+    // release guardedly observes a live process first, that is the intentional
+    // handoff linearization point and its Orphaned publication wins.
+    let _terminal_publication = proc.terminal_publication.lock().await;
     let raw_state = match exit {
         Ok(status) => BgState::Exited(status.code()),
         Err(_) => BgState::Failed,
     };
+    if proc.ownership_released.load(Ordering::Acquire) {
+        // Release already durably published Orphaned. The retained driver may
+        // reap the native child later, but it must not publish a second,
+        // contradictory terminal transition for a job the harness no longer
+        // owns.
+        let mut inner = proc.inner.lock().unwrap();
+        inner.state = raw_state;
+        inner.reaped = true;
+        drop(inner);
+        proc.reaped.notify_waiters();
+        proc.changed.notify_waiters();
+        return;
+    }
     let failpoint_error = (!cancelled)
         .then(|| {
             hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::JobAfterNaturalExit)
@@ -92,6 +137,36 @@ pub(super) async fn drive(
     drop(inner);
     proc.reaped.notify_waiters();
     proc.changed.notify_waiters();
+}
+
+struct DriverOwnershipGuard(Arc<BgProc>);
+
+impl Drop for DriverOwnershipGuard {
+    fn drop(&mut self) {
+        self.0.kill_native_if_owned();
+    }
+}
+
+async fn wait_for_owned_process_group(proc: &BgProc) {
+    let Some(pgid) = proc.pgid else { return };
+    while !proc.ownership_released.load(Ordering::Acquire) && process_group_is_alive(pgid) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(unix)]
+fn process_group_is_alive(pgid: i32) -> bool {
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return true;
+    }
+    // A group we own should be signalable, but permission ambiguity must not
+    // publish a false terminal state for a potentially live writer.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_group_is_alive(_pgid: i32) -> bool {
+    false
 }
 
 pub(super) async fn stop_and_reap(mut child: tokio::process::Child, pgid: Option<i32>) {

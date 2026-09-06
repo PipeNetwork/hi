@@ -251,6 +251,17 @@ impl crate::Agent {
             read_only_turn_prompt(&context_task, intent)
         } else if let Some(intent) = implementation_intent {
             implementation_turn_prompt(&context_task, intent)
+        } else if task_contract.explicit_mutation {
+            // Ordinary imperative fixes share the implementation execution
+            // contract even when they are not greenfield/build-continuation
+            // prompts. Keep their semantic intent unchanged so specialized
+            // implementation lifecycle gates are not activated accidentally.
+            implementation_turn_prompt(
+                &context_task,
+                ImplementationIntent {
+                    tui: implementation_mentions_tui(&context_task),
+                },
+            )
         } else {
             context_task.clone()
         };
@@ -511,8 +522,12 @@ impl crate::Agent {
         let review_repair = ReviewRepairState::default();
         let independent_review_status = ReviewStatus::NotRequired;
         let independent_review_repairs = 0_u32;
+        let last_hygiene_repair_revision = None;
+        let last_completion_review_repair_revision = None;
+        let last_verify_failure_repair = None;
         let review_unavailable_reason: Option<String> = None;
         let verification_infrastructure_error = false;
+        let verification_deferred_active_writer = false;
         let verification_unstable = false;
         // A pass is bound to both the ledger event number and the full content
         // digest observed immediately after the verifier. Later workspace
@@ -575,6 +590,8 @@ impl crate::Agent {
                 .as_ref()
                 .is_some_and(|enabled| enabled.load(std::sync::atomic::Ordering::SeqCst))
             && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
+            && (!self.pipefs_workspace_active()
+                || self.workspace_controller_capabilities().candidate_apply)
             // Keep one model-ordered tool slot when the caller selected a
             // one-call hard cap; the deterministic validation probe must not
             // make a coding turn unable to edit anything.
@@ -586,7 +603,7 @@ impl crate::Agent {
         {
             let preflight = self
                 .run_implementation_preflight(ui, &mut implementation_tracker, &mut tool_timeline)
-                .await;
+                .await?;
             if preflight.executed > 0 {
                 flags.made_tool_call = true;
                 sched_tool_calls = sched_tool_calls.saturating_add(preflight.executed);
@@ -699,8 +716,12 @@ impl crate::Agent {
             effective_fallback_route,
             independent_review_status,
             independent_review_repairs,
+            last_hygiene_repair_revision,
+            last_completion_review_repair_revision,
+            last_verify_failure_repair,
             review_unavailable_reason,
             verification_infrastructure_error,
+            verification_deferred_active_writer,
             verification_unstable,
             last_verify_attributions,
             turn_snapshot,
@@ -800,7 +821,9 @@ impl crate::Agent {
                 match model_result? {
                     super::model_round::ModelRoundControl::Continue => continue,
                     super::model_round::ModelRoundControl::BreakInner(hit) => {
-                        if self.native_director_candidate_yield(&mut turn, hit) {
+                        if !turn.implementation_tracker.no_mutation_exhausted
+                            && self.native_director_candidate_yield(&mut turn, hit)
+                        {
                             continue;
                         }
                         break hit;
@@ -869,6 +892,9 @@ impl crate::Agent {
                             &mut turn.flags.suppress_bookkeeping_tools_next,
                             &mut turn.flags.text_tool_fallback_next,
                             &mut turn.flags.tool_validation_text_fallback_used,
+                            &mut turn.flags.unavailable_tool_retry_used,
+                            &mut turn.flags.stale_workspace_retry_used,
+                            &mut turn.flags.provider_exhausted,
                             &mut turn.deepseek_strict_fallback_active,
                             &mut turn.deepseek_strict_fallback_used,
                             ui,
@@ -882,7 +908,9 @@ impl crate::Agent {
                         match steer {
                             super::steer::RoundControl::Continue => {}
                             super::steer::RoundControl::BreakInner(hit) => {
-                                if self.native_director_candidate_yield(&mut turn, hit) {
+                                if !turn.implementation_tracker.no_mutation_exhausted
+                                    && self.native_director_candidate_yield(&mut turn, hit)
+                                {
                                     continue;
                                 }
                                 break hit;
@@ -958,7 +986,8 @@ impl crate::Agent {
                     hi_events::ActivityState::Waiting,
                     hi_events::ActivityVerb::Wait,
                 ),
-                crate::verify::VerifyOutcome::NotRun => (
+                crate::verify::VerifyOutcome::DeferredActiveWriter { .. }
+                | crate::verify::VerifyOutcome::NotRun => (
                     hi_events::ActivityState::Waiting,
                     hi_events::ActivityVerb::Wait,
                 ),
@@ -1002,9 +1031,15 @@ impl crate::Agent {
                         force_tools_next: &mut turn.flags.force_tools_next,
                         independent_review_status: &mut turn.independent_review_status,
                         independent_review_repairs: &mut turn.independent_review_repairs,
+                        last_hygiene_repair_revision: &mut turn.last_hygiene_repair_revision,
+                        last_completion_review_repair_revision: &mut turn
+                            .last_completion_review_repair_revision,
+                        last_verify_failure_repair: &mut turn.last_verify_failure_repair,
                         review_unavailable_reason: &mut turn.review_unavailable_reason,
                         verification_infrastructure_error: &mut turn
                             .verification_infrastructure_error,
+                        verification_deferred_active_writer: &mut turn
+                            .verification_deferred_active_writer,
                         verification_unstable: &mut turn.verification_unstable,
                         last_verify_attributions: &mut turn.last_verify_attributions,
                         validation_after_last_mutation: turn
@@ -1024,6 +1059,12 @@ impl crate::Agent {
                 // kills the process. Honor the deadline here too, so a turn
                 // that ran out of time still settles on its own terms.
                 super::verify_outcome::VerifyOutcomeControl::ReenterModel => {
+                    if turn.flags.provider_exhausted {
+                        ui.status(
+                            "provider protocol recovery budget exhausted; settling without another model request",
+                        );
+                        break 'turn;
+                    }
                     if turn.flags.ended_at_cap {
                         let limit = match turn.flags.cap_kind {
                             Some(crate::domain::TurnCapKind::Tool) => "tool-call limit",
@@ -1196,7 +1237,7 @@ impl crate::Agent {
         // Phase K: always-on (cheap, no model call) coding-fact extraction into
         // the decision log + project memory after a green file-changing turn.
         if self.report.verify.passed() && !self.workspace.last_changed_files.is_empty() {
-            self.record_coding_facts_turn_end(ui);
+            self.record_coding_facts_turn_end(ui).await;
         }
 
         // Surface the files this turn changed, so the user sees what was touched
@@ -1214,16 +1255,23 @@ impl crate::Agent {
         // real work is finished, and make a completed turn look unfinished.
         self.set_turn_phase(TurnPhase::Finalize);
         let finalize_started = std::time::Instant::now();
-        let needs_closeout = !super::finalize::turn_has_visible_assistant_text(
-            self.messages.as_slice(),
-            turn.turn_start,
-        );
+        let no_mutation_exhausted = turn.implementation_tracker.no_mutation_exhausted;
+        // Interim diagnosis/narration is not a successful closeout when an
+        // explicit mutation obligation exhausted without an edit. Force the
+        // deterministic terminal explanation even if earlier assistant prose
+        // is present in the transcript.
+        let needs_closeout = no_mutation_exhausted
+            || !super::finalize::turn_has_visible_assistant_text(
+                self.messages.as_slice(),
+                turn.turn_start,
+            );
         let bounded_plan_answer_recovery_exhausted =
             turn.progress_tracker.bounded_plan_answer_recovery_exhausted;
         let mut closeout_generated = false;
         let optional_finalize_requested = self.config.memory.finalize
             && turn.flags.made_tool_call
             && !turn.flags.ended_at_deadline
+            && !no_mutation_exhausted
             && needs_closeout;
         if optional_finalize_requested || bounded_plan_answer_recovery_exhausted {
             // Side questions may still be streaming — wait so their UI/usage land
@@ -1250,7 +1298,8 @@ impl crate::Agent {
         // typed no-progress failure, not a successful answer. This is keyed on
         // the semantic tracker and the absence of a model/user-visible answer;
         // lexical guesses about the requested task do not manufacture it.
-        let no_progress_exhausted = bounded_plan_answer_recovery_exhausted
+        let no_progress_exhausted = no_mutation_exhausted
+            || bounded_plan_answer_recovery_exhausted
             || (needs_closeout
                 && !closeout_generated
                 && turn.progress_tracker.no_progress_streak > 0);
@@ -1499,7 +1548,8 @@ impl crate::Agent {
             verification_executions,
             turn.implementation_tracker.validation_after_last_mutation,
         );
-        let no_applicable_check = verification_executions == 0
+        let no_applicable_check = !turn.verification_deferred_active_writer
+            && verification_executions == 0
             && !matches!(
                 self.config.gates.verification,
                 crate::VerificationMode::Disabled

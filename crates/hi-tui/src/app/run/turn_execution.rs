@@ -77,7 +77,9 @@ pub(super) async fn run_agent_turn(
     // Reset the per-turn tool-call counter for the observability panel.
     app.turn_tool_calls = 0;
     app.turn_rounds = 0;
-    // Grab the interrupt handle so Esc during a tool call can signal it.
+    // Keep the batch interrupt paired with whole-turn cancellation. Esc and
+    // Ctrl-C use the turn token so an awaited foreground process is killed and
+    // reaped; the flag promptly wakes any cooperative batch boundary too.
     app.interrupt = Some(agent.interrupt_handle());
     let turn_cancel = hi_agent::TurnCancellation::new();
     let (tx, rx) = mpsc::unbounded_channel();
@@ -152,7 +154,12 @@ pub(super) async fn run_agent_turn(
         // effects and retain the same typed infrastructure outcome used by
         // one-shot reports.
         let outcome = agent
-            .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
+            .cleanup_turn(
+                driven
+                    .failure
+                    .clone()
+                    .unwrap_or(hi_agent::TurnCleanupKind::Fail),
+            )
             .await
             .map(|r| r.outcome)
             .unwrap_or_else(|_| agent.finalize_failed_turn_snapshot_only());
@@ -211,13 +218,14 @@ pub(super) async fn run_agent_turn(
         // lost after stopping a stuck turn.
         app.mid_turn_offered.clear();
         let kept = app.queue.len();
+        app.queue_paused = kept > 0;
         let stop_label = if driven.cancelled {
             "^C interrupted"
         } else {
             "turn deadline reached"
         };
         let msg = if kept > 0 {
-            format!("{stop_label}; turn discarded ({kept} queued command(s) kept)")
+            format!("{stop_label}; turn discarded ({kept} queued command(s) kept and paused)")
         } else {
             format!("{stop_label}; turn discarded")
         };
@@ -306,6 +314,9 @@ pub(super) async fn run_agent_turn(
                 Style::default().fg(crate::theme::theme().warning),
             ));
         }
+    }
+    if stop_requested && !app.queue.is_empty() {
+        app.queue_paused = true;
     }
     if let Some(state) = restore_model_state.take() {
         agent.restore_model_state(state);
@@ -406,6 +417,11 @@ pub(super) async fn run_agent_turn(
         app.maybe_queue_drive(agent, driven.value.as_ref());
     }
     app.trace_turn_settled(agent, agent.last_turn_outcome())?;
+    if cancelled && !app.exit_requested {
+        // Start the escalation window after cleanup, not at the original key
+        // press, so a second Ctrl-C queued during slow settlement still exits.
+        app.quit_notice = Some(std::time::Instant::now() + std::time::Duration::from_millis(1800));
+    }
     app.set_working(false);
     // Flush any pending live events from the TUI's /sync on RemoteUi.
     // Spawn as a background task so a slow/unreachable ipop doesn't block

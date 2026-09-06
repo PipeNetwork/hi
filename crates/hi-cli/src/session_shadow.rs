@@ -151,6 +151,7 @@ fn state_from_loaded(loaded: &LoadedSession) -> hi_agent::SessionState {
 fn loaded_from_state(state: &hi_agent::SessionState) -> LoadedSession {
     LoadedSession {
         messages: state.messages.clone(),
+        workspace_execution_recovered: false,
         usage: state.usage,
         checkpoint_refs: state.checkpoint_refs.clone(),
         harness_settings: crate::session_harness::empty_layer(),
@@ -178,6 +179,7 @@ mod tests {
     fn empty_loaded(messages: Vec<Message>) -> LoadedSession {
         LoadedSession {
             messages,
+            workspace_execution_recovered: false,
             usage: hi_ai::Usage::default(),
             checkpoint_refs: Vec::new(),
             harness_settings: crate::session_harness::empty_layer(),

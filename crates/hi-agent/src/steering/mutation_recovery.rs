@@ -19,11 +19,10 @@ pub(crate) enum DiscoveryRecovery {
     Stop,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct MutationRecovery {
-    /// `None` is the product default: distinct productive discovery has no
-    /// count ceiling. A finite policy is retained for explicitly bounded
-    /// integrations and focused tests.
+    /// This bounds only the discovery phase before the first mutation. The
+    /// interactive turn itself remains unlimited once it is making progress.
     round_cap: Option<u32>,
     rounds_per_nudge: u32,
     max_nudges: u32,
@@ -33,7 +32,35 @@ pub(crate) struct MutationRecovery {
     force_edit_sent: bool,
 }
 
+impl Default for MutationRecovery {
+    fn default() -> Self {
+        Self {
+            round_cap: Some(10),
+            rounds_per_nudge: 2,
+            max_nudges: 2,
+            phase_nudges: 0,
+            plan_grace_used: false,
+            plan_nudge_sent: false,
+            force_edit_sent: false,
+        }
+    }
+}
+
 impl MutationRecovery {
+    /// Whether the next model request must be sealed to mutation-capable tools.
+    ///
+    /// The recovery state, rather than the nudges/counters mirrored elsewhere,
+    /// is authoritative here. In particular, a plan gets one final targeted
+    /// read before `plan_nudge_sent` is set. After that read, continuing to
+    /// advertise `read`/`grep` makes the model's next inspection legal even
+    /// though [`Self::after_discovery`] will immediately stop the turn for it.
+    pub(crate) fn requires_mutation_focus(&self) -> bool {
+        self.round_cap.is_some()
+            && (self.plan_nudge_sent
+                || self.force_edit_sent
+                || (self.max_nudges > 0 && self.phase_nudges >= self.max_nudges))
+    }
+
     pub(crate) fn transition_after_plan(
         &mut self,
         tracker: &ImplementationTracker,
@@ -188,18 +215,43 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_discovery_crosses_the_legacy_round_boundary_without_settling() {
+    fn production_discovery_is_bounded_before_the_first_mutation() {
         let mut recovery = MutationRecovery::default();
         let mut tracker = ImplementationTracker {
-            pre_mutation_rounds: 11,
+            pre_mutation_rounds: 10,
             pre_mutation_tool_calls: 33,
             ..Default::default()
         };
 
         assert_eq!(
             recovery.after_discovery(&mut tracker, false),
-            DiscoveryRecovery::None
+            DiscoveryRecovery::Nudge {
+                attempt: 1,
+                maximum: 2
+            }
         );
-        assert!(!recovery.transition_after_plan(&tracker, true, true));
+        assert_eq!(tracker.discovery_nudges, 1);
+    }
+
+    #[test]
+    fn plan_grace_requires_mutation_focus_after_its_one_allowed_read() {
+        let mut recovery = MutationRecovery::bounded_for_test();
+        let mut tracker = ImplementationTracker {
+            pre_mutation_rounds: 10,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            recovery.after_discovery(&mut tracker, true),
+            DiscoveryRecovery::ExistingPlan
+        );
+        assert!(!recovery.requires_mutation_focus());
+
+        tracker.pre_mutation_rounds += 1;
+        assert_eq!(
+            recovery.after_discovery(&mut tracker, true),
+            DiscoveryRecovery::PlanNudge
+        );
+        assert!(recovery.requires_mutation_focus());
     }
 }

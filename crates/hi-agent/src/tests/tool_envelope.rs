@@ -1,5 +1,6 @@
 use super::common::*;
 use super::*;
+use hi_workspace::WorkspaceController;
 
 struct EnvelopeProbe {
     responses: Mutex<Vec<Completion>>,
@@ -96,10 +97,16 @@ async fn unadvertised_known_tool_is_rejected_by_the_same_audited_envelope() {
         .tool_results
         .iter()
         .find(|(name, _)| name == "update_plan")
-        .map(|(_, result)| result)
+        .map(|(_, result)| serde_json::from_str::<serde_json::Value>(result).unwrap())
         .expect("outside-envelope call receives a typed result");
-    assert!(denial.contains("sealed envelope"), "{denial}");
-    assert!(denial.contains(r#""reason":"unavailable_tool""#));
+    assert_eq!(denial["error"]["kind"], "tool_protocol_error");
+    assert_eq!(denial["error"]["reason"], "unavailable_tool");
+    assert!(
+        denial["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("sealed envelope")
+    );
     assert!(
         ui.plans.is_empty(),
         "the omitted coordination tool must not run"
@@ -150,6 +157,142 @@ async fn unadvertised_known_tool_is_rejected_by_the_same_audited_envelope() {
 }
 
 #[tokio::test]
+async fn malformed_mutation_is_denied_before_workspace_admission() {
+    let workspace = IsolatedWorkspace::new("tool-envelope-before-admission");
+    std::fs::write(workspace.path("src.rs"), "pub fn inspected() {}\n").unwrap();
+    let mut cfg = workspace.config();
+    cfg.memory.tool_set = ToolSet::Dynamic;
+    cfg.loop_limits.max_steps = 1;
+    let root = cfg.paths.workspace_root.clone();
+    let state = cfg.paths.state_root.clone();
+    let advertised = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = EnvelopeProbe {
+        responses: Mutex::new(vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "unavailable-bash".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text("The unavailable call was denied.".into())],
+                1,
+                1,
+            ),
+        ]),
+        advertised: advertised.clone(),
+        attachments: std::sync::Arc::new(Mutex::new(Vec::new())),
+        capabilities: envelope_capabilities(),
+    };
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    let controller = std::sync::Arc::new(hi_workspace::InMemoryWorkspaceController::new_pipefs(
+        "envelope-workspace",
+        "envelope-session",
+        2,
+        true,
+        root,
+        state,
+    ));
+    agent
+        .install_workspace_controller(controller.clone())
+        .unwrap();
+    let existing = controller
+        .begin(hi_workspace::MutationIntent::workspace("existing writer"))
+        .await
+        .unwrap();
+    let active_operation = controller.status().active_operation;
+    let mut ui = RecUi::default();
+
+    let _ = agent
+        .run_turn("Implement the requested change in src.rs.", &mut ui)
+        .await;
+
+    assert!(
+        advertised.lock().unwrap()[0]
+            .iter()
+            .any(|name| name == "bash")
+    );
+    let denial = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "bash")
+        .find_map(|(_, result)| serde_json::from_str::<serde_json::Value>(result).ok())
+        .unwrap_or_else(|| panic!("sealed-envelope denial missing: {:?}", ui.tool_results));
+    assert_eq!(denial["error"]["reason"], "invalid_arguments");
+    assert_eq!(controller.status().active_operation, active_operation);
+    assert!(!workspace.path("must-not-exist").exists());
+    let settled = controller
+        .settle(existing, hi_workspace::ExecutionReport::succeeded(None))
+        .await;
+    assert!(settled.receipt.is_some());
+}
+
+#[tokio::test]
+async fn unadvertised_run_program_uses_typed_unavailable_recovery() {
+    let workspace = IsolatedWorkspace::new("unadvertised-program-envelope");
+    std::fs::write(workspace.path("source.txt"), "evidence\n").unwrap();
+    let advertised = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let attachments = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = EnvelopeProbe {
+        responses: Mutex::new(vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "unavailable-program".into(),
+                    name: "run_program".into(),
+                    arguments: serde_json::json!({"source": "42"}).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "The unavailable workflow program was not executed.".into(),
+                )],
+                1,
+                1,
+            ),
+        ]),
+        advertised: advertised.clone(),
+        attachments,
+        capabilities: envelope_capabilities(),
+    };
+    let mut cfg = workspace.config();
+    cfg.loop_limits.max_steps = 2;
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    let mut ui = RecUi::default();
+
+    let _ = agent
+        .run_turn("Inspect source.txt without changing it.", &mut ui)
+        .await;
+
+    assert!(
+        advertised
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|tools| !tools.iter().any(|name| name == "run_program"))
+    );
+    let result = ui
+        .tool_results
+        .iter()
+        .find(|(name, _)| name == "run_program")
+        .map(|(_, result)| serde_json::from_str::<serde_json::Value>(result).unwrap())
+        .expect("unavailable run_program receives a typed result");
+    assert_eq!(result["error"]["kind"], "tool_protocol_error");
+    assert_eq!(result["error"]["reason"], "unavailable_tool");
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("ordinary structured tools after run_program failure")),
+        "an unavailable program must not enter the execution-failure fallback: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
 async fn read_only_envelope_recovers_from_unavailable_bash_with_an_admitted_read() {
     let workspace = IsolatedWorkspace::new("read-only-envelope-recovery");
     std::fs::create_dir_all(workspace.path("src")).unwrap();
@@ -160,6 +303,8 @@ async fn read_only_envelope_recovers_from_unavailable_bash_with_an_admitted_read
     cfg.loop_limits.max_steps = 4;
     let advertised = std::sync::Arc::new(Mutex::new(Vec::new()));
     let attachments = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let mut auto_only_capabilities = envelope_capabilities();
+    auto_only_capabilities.tool_choice.required = false;
     let provider = EnvelopeProbe {
         responses: Mutex::new(vec![
             completion(
@@ -191,8 +336,8 @@ async fn read_only_envelope_recovers_from_unavailable_bash_with_an_admitted_read
             ),
         ]),
         advertised: advertised.clone(),
-        attachments,
-        capabilities: envelope_capabilities(),
+        attachments: attachments.clone(),
+        capabilities: auto_only_capabilities,
     };
     let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
     let mut ui = RecUi::default();
@@ -207,6 +352,11 @@ async fn read_only_envelope_recovers_from_unavailable_bash_with_an_admitted_read
     assert!(!advertised[0].iter().any(|name| name == "bash"));
     assert!(advertised[1].iter().any(|name| name == "read"));
     assert!(!advertised[1].iter().any(|name| name == "bash"));
+    assert_eq!(
+        attachments.lock().unwrap()[1].payload["tool_mode"],
+        serde_json::json!("auto"),
+        "unavailable-tool recovery must not turn an Auto-only route into ChatOnly"
+    );
     assert_eq!(
         ui.tool_results
             .iter()
@@ -243,67 +393,109 @@ async fn read_only_envelope_recovers_from_unavailable_bash_with_an_admitted_read
 }
 
 #[tokio::test]
-async fn chat_only_envelope_rejects_a_text_promoted_write() {
-    let workspace = IsolatedWorkspace::new("chat-only-text-tool-envelope");
-    let destination = workspace.path("should-not-exist.txt");
-    let textual_call = format!(
-        "<tool_call>write<arg_key>path</arg_key><arg_value>{}</arg_value><arg_key>content</arg_key><arg_value>blocked</arg_value></tool_call>",
-        destination.display()
+async fn plain_text_fallback_stays_executable_on_an_auto_only_provider() {
+    let workspace = IsolatedWorkspace::new("auto-only-text-tool-fallback");
+    let destination = workspace.path("result.txt");
+    let destination_text = destination.to_string_lossy();
+    let invalid_write = |id: &str, arguments: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: id.into(),
+                name: "write".into(),
+                arguments: arguments.into(),
+            }],
+            1,
+            1,
+        )
+    };
+    let xmlish_write = format!(
+        "<tool_call>write<arg_key>path</arg_key><arg_value>{destination_text}</arg_value><arg_key>content</arg_key><arg_value>ok\n</arg_value></tool_call>"
     );
     let advertised = std::sync::Arc::new(Mutex::new(Vec::new()));
     let attachments = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let mut capabilities = envelope_capabilities();
+    capabilities.tool_choice.required = false;
     let provider = EnvelopeProbe {
         responses: Mutex::new(vec![
-            completion(vec![Content::Text(textual_call)], 1, 1),
+            invalid_write("invalid-write-1", "{}"),
+            invalid_write(
+                "invalid-write-2",
+                &serde_json::json!({"path": destination_text}).to_string(),
+            ),
+            completion(vec![Content::Text(xmlish_write)], 1, 1),
             completion(
-                vec![Content::Text("No workspace changes were made.".into())],
+                vec![Content::Text(
+                    "Created `result.txt` with the requested content.".into(),
+                )],
+                1,
+                1,
+            ),
+            bash_completion("true # validate"),
+            completion(
+                vec![Content::Text("Created and validated `result.txt`.".into())],
                 1,
                 1,
             ),
         ]),
-        advertised: advertised.clone(),
-        attachments,
-        capabilities: hi_ai::ProviderCapabilities::default(),
+        advertised,
+        attachments: attachments.clone(),
+        capabilities,
     };
     let mut cfg = workspace.config();
-    cfg.loop_limits.max_steps = 2;
+    cfg.loop_limits.max_repeat_nudges = 1;
+    cfg.gates.allow_unverified = true;
+    cfg.memory.finalize = false;
     let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
     let mut ui = RecUi::default();
 
-    let _ = agent
+    let outcome = agent
         .run_turn(
-            &format!("Create {} containing blocked.", destination.display()),
+            &format!("Create {} containing ok.", destination.display()),
             &mut ui,
         )
         .await;
 
-    assert!(!destination.exists());
-    let denial = ui
-        .tool_results
-        .iter()
-        .find(|(name, _)| name == "write")
-        .map(|(_, result)| result)
-        .expect("text-promoted call receives a typed denial");
     assert!(
-        denial.contains("chat-only") || denial.contains("sealed envelope"),
-        "{denial}"
+        outcome.is_ok(),
+        "outcome={outcome:?}; statuses={:?}; tools={:?}; transcript={:?}",
+        ui.statuses,
+        ui.tool_results,
+        agent
+            .messages()
+            .iter()
+            .map(hi_ai::Message::text)
+            .collect::<Vec<_>>()
     );
-    assert!(denial.contains("envelope mode is chat_only"), "{denial}");
+    assert_eq!(outcome.unwrap().status, TurnStatus::Completed);
+    assert_eq!(std::fs::read_to_string(destination).unwrap(), "ok\n");
+    let attachments = attachments.lock().unwrap();
+    assert!(attachments.len() >= 3);
+    assert_eq!(
+        attachments[0].payload["tool_mode"],
+        serde_json::json!("auto")
+    );
+    assert_eq!(
+        attachments[1].payload["tool_mode"],
+        serde_json::json!("auto")
+    );
+    assert_eq!(
+        attachments[2].payload["tool_mode"],
+        serde_json::json!("auto")
+    );
     assert!(
-        advertised
-            .lock()
+        attachments[2].payload["tools"]
+            .as_array()
             .unwrap()
             .iter()
-            .all(|tools| !tools.is_empty()),
-        "schemas may remain attached for audit/cache even though ChatOnly admits none"
+            .any(|tool| tool["name"] == serde_json::json!("write"))
     );
+    assert!(attachments[2].requests_text_tool_fallback());
+    assert!(!attachments[0].requests_text_tool_fallback());
     assert!(
         !ui.statuses
             .iter()
-            .any(|status| status.contains("schema-corrected")
-                || status.contains("DeepSeek tool arguments")
-                || status.contains("plain-text tool call")),
-        "ChatOnly denial must exit tool-free instead of changing call formats: {:?}",
+            .any(|status| status.contains("DeepSeek tool arguments")),
+        "DeepSeek schema fallback must not activate for an unrelated Auto route: {:?}",
         ui.statuses
     );
     let transcript = agent
@@ -312,6 +504,184 @@ async fn chat_only_envelope_rejects_a_text_promoted_write() {
         .map(hi_ai::Message::text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(transcript.contains("No tools are admitted in this request"));
-    assert!(!transcript.contains("Emit a new `write` call"));
+    assert!(transcript.contains("current sealed envelope"));
+    assert!(transcript.contains("<tool_call>"));
+}
+
+#[tokio::test]
+async fn ordinary_narrative_tool_json_is_not_promoted() {
+    let workspace = IsolatedWorkspace::new("narrative-tool-json");
+    let destination = workspace.path("should-not-exist.txt");
+    let textual_call = format!(
+        r#"For example only: {{"name":"write","arguments":{{"path":"{}","content":"blocked"}}}}"#,
+        destination.display()
+    );
+    let advertised = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let attachments = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = EnvelopeProbe {
+        responses: Mutex::new(vec![completion(
+            vec![Content::Text(textual_call.clone())],
+            1,
+            1,
+        )]),
+        advertised: advertised.clone(),
+        attachments,
+        capabilities: envelope_capabilities(),
+    };
+    let mut cfg = workspace.config();
+    cfg.memory.tool_set = ToolSet::Full;
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    let mut ui = RecUi::default();
+
+    let _ = agent
+        .run_turn("What does this hypothetical JSON object mean?", &mut ui)
+        .await;
+
+    assert!(!destination.exists());
+    assert!(
+        advertised
+            .lock()
+            .unwrap()
+            .first()
+            .is_some_and(|tools| tools.iter().any(|name| name == "write")),
+        "write must be admitted so this proves call-channel gating"
+    );
+    assert!(ui.tool_results.iter().all(|(name, _)| name != "write"));
+    let transcript = agent
+        .messages()
+        .iter()
+        .map(hi_ai::Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        transcript.contains(&textual_call),
+        "ordinary narrative must remain intact: {transcript:?}"
+    );
+}
+
+struct ProvisionalProgramProvider {
+    responses: Mutex<Vec<Completion>>,
+    emitted_delta: std::sync::atomic::AtomicBool,
+    advertised_program: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    speculative_call_seen: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl hi_ai::Provider for ProvisionalProgramProvider {
+    async fn stream(
+        &self,
+        request: hi_ai::ChatRequest,
+        sink: &mut (dyn FnMut(hi_ai::StreamEvent) + Send),
+    ) -> anyhow::Result<Completion> {
+        use std::sync::atomic::Ordering;
+
+        let advertised = request.tools.iter().any(|tool| tool.name == "run_program");
+        self.advertised_program.store(advertised, Ordering::Relaxed);
+        if !self.emitted_delta.swap(true, Ordering::Relaxed) {
+            let arguments = serde_json::json!({
+                "source": r#"tool("read", #{uri: "mcp://probe/file:///sentinel"})"#
+            })
+            .to_string();
+            sink(hi_ai::StreamEvent::ToolCallDelta {
+                index: 0,
+                id_delta: Some("provisional-program".into()),
+                name_delta: Some("run_program".into()),
+                arguments_delta: arguments,
+            });
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                self.speculative_call_seen.notified(),
+            )
+            .await;
+            sink(hi_ai::StreamEvent::ToolCallDelta {
+                index: 0,
+                id_delta: None,
+                name_delta: Some("_not_admitted".into()),
+                arguments_delta: String::new(),
+            });
+        }
+        pop_canned_completion(&self.responses, "ProvisionalProgramProvider")
+    }
+
+    fn capabilities(&self) -> hi_ai::ProviderCapabilities {
+        hi_ai::ProviderCapabilities::native_tools(true)
+    }
+}
+
+struct CountingResourceMcp {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    called: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl hi_tools::McpBackend for CountingResourceMcp {
+    async fn search(&self, _: Option<&str>) -> anyhow::Result<Vec<hi_tools::McpToolInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn call(&self, _: &str, _: &str, _: &serde_json::Value) -> anyhow::Result<String> {
+        unreachable!("the speculative program only requests an MCP resource read")
+    }
+
+    async fn read_resource(&self, _: &str, _: &str) -> anyhow::Result<String> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.called.notify_waiters();
+        Ok("sentinel".into())
+    }
+}
+
+#[tokio::test]
+async fn provisional_streamed_program_never_crosses_execution_boundary() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let workspace = IsolatedWorkspace::new("provisional-program-speculation");
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let called = std::sync::Arc::new(tokio::sync::Notify::new());
+    let advertised_program = std::sync::Arc::new(AtomicBool::new(false));
+    let source = r#"tool("read", #{uri: "mcp://probe/file:///sentinel"})"#;
+    let provider = ProvisionalProgramProvider {
+        responses: Mutex::new(vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "provisional-program".into(),
+                    name: "run_program_not_admitted".into(),
+                    arguments: serde_json::json!({"source": source}).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(vec![Content::Text("No program was executed.".into())], 1, 1),
+        ]),
+        emitted_delta: AtomicBool::new(false),
+        advertised_program: advertised_program.clone(),
+        speculative_call_seen: called.clone(),
+    };
+    let mut cfg = workspace.config();
+    cfg.memory.tool_set = ToolSet::Full;
+    cfg.program.mode = ProgramMode::Auto;
+    cfg.program.speculative_ptc = true;
+    cfg.loop_limits.max_steps = 2;
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    agent.attach_mcp(std::sync::Arc::new(CountingResourceMcp {
+        calls: calls.clone(),
+        called,
+    }));
+
+    let _ = agent
+        .run_turn(
+            "Inspect the available sentinel and summarize it.",
+            &mut RecUi::default(),
+        )
+        .await;
+
+    assert!(
+        advertised_program.load(Ordering::Relaxed),
+        "the fixture must advertise run_program so the zero-call result is meaningful"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "a provisional delta must not launch work before the final outer call is validated"
+    );
 }

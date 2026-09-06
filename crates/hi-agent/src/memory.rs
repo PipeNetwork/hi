@@ -12,15 +12,22 @@
 //! scratch ("use pnpm", "no external API keys", "terse output"). Both are
 //! loaded as context; the distiller routes each fact to the right layer.
 //!
-//! Because two `hi` processes may quit at once in the same directory, writes
-//! are serialized with an exclusive lock file (`.hi/.memory.lock`, via
-//! `O_EXCL` creation — pure std, no extra dep) and the memory body is written
-//! via temp-file + atomic `rename`, so a torn write or a concurrent
-//! distillation can never corrupt or truncate the file.
+//! Concurrent writers publish through the shared no-follow transaction engine.
+//! Every write seals the exact preimage it was derived from and atomically
+//! installs both the new memory and its undo record, so a stale distillation,
+//! crash, or symlink swap cannot silently overwrite a newer revision.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
+
+mod persistence;
+#[cfg(test)]
+use persistence::undo_sidecar;
+pub(crate) use persistence::{
+    memory_body_from_preimage, memory_write_paths, read_memory_preimage,
+    write_memory_replace_if_unchanged, write_memory_replace_if_unchanged_at,
+};
+pub use persistence::{undo_memory, write_memory};
 
 /// Backstop cap on the distilled memory file. The prompt does the real shaping
 /// (≤ ~20 short bullets); this just stops a runaway response from bloating the
@@ -733,186 +740,6 @@ pub fn strip_header(raw: &str) -> String {
     }
 }
 
-/// Atomically and exclusively write the distilled memory.
-///
-/// Empty bodies are skipped (no file created) so a blank distill cannot wipe
-/// existing notes. Use [`write_memory_replace`] to clear a file (forget-all).
-///
-/// - **Exclusive**: takes `.memory.lock` via `O_EXCL` creation. If another
-///   process holds it, this distillation is skipped (best-effort at quit — the
-///   other writer's revision wins). The lock is an advisory mutex scoped to the
-///   write via a guard that deletes it on drop.
-/// - **Atomic**: writes to `<file>.tmp` then `rename`s over the target, so a
-///   crash mid-write leaves the previous file intact rather than a truncated one.
-/// - **Versioned**: prepends the [`MEMORY_HEADER`] schema marker.
-/// - **Undo**: copies the previous file to a sibling `*.undo.md` sidecar.
-///
-/// Returns `Ok(notes)` with the count of non-empty lines written, or `Err` with
-/// a human-readable status string for the UI.
-pub fn write_memory(path: &Path, body: &str) -> Result<usize, String> {
-    if body.trim().is_empty() {
-        return Ok(0);
-    }
-    write_memory_replace(path, body)
-}
-
-/// Write `body` even when empty (header-only file). Used by `memory_forget`.
-pub fn write_memory_replace(path: &Path, body: &str) -> Result<usize, String> {
-    let body = body.trim();
-    let notes = body.lines().filter(|l| !l.trim().is_empty()).count();
-
-    let Some(parent) = path.parent() else {
-        return Err(format!("no parent directory for {}", path.display()));
-    };
-    if let Err(e) = fs::create_dir_all(parent) {
-        return Err(format!("couldn't create {}: {e}", parent.display()));
-    }
-
-    let _lock = take_lock(parent)?;
-    snapshot_undo(path);
-
-    let mut tmp = path.to_path_buf();
-    let mut name = tmp
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from("memory.md"));
-    name.push(format!(".{}.tmp", std::process::id()));
-    tmp.set_file_name(name);
-
-    let content = format!("{MEMORY_HEADER}\n{body}\n");
-    if let Err(e) = write_tmp(&tmp, &content) {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("couldn't write {}: {e}", tmp.display()));
-    }
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("couldn't install {}: {e}", path.display()));
-    }
-    Ok(notes)
-}
-
-fn write_tmp(tmp: &Path, content: &str) -> std::io::Result<()> {
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(tmp)?;
-    f.write_all(content.as_bytes())?;
-    f.sync_all()?;
-    Ok(())
-}
-
-/// A dropped-on-release exclusive lock acquired via `O_EXCL` file creation.
-struct LockGuard(PathBuf);
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-/// A lock older than this is presumed abandoned (the holder crashed or was
-/// killed before its `Drop` ran). Memory writes are sub-second, so minutes of
-/// age means no live holder — without this, one SIGKILL would disable memory
-/// persistence for every future session until the file is deleted by hand.
-const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-fn take_lock(parent: &Path) -> Result<LockGuard, String> {
-    let lock = parent.join(".memory.lock");
-    for _ in 0..2 {
-        match OpenOptions::new().write(true).create_new(true).open(&lock) {
-            Ok(_) => return Ok(LockGuard(lock)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&lock)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|age| age > LOCK_STALE_AFTER);
-                if !stale {
-                    return Err("another session is updating memory".to_string());
-                }
-                // Break the stale lock and retry the exclusive create once (a
-                // concurrent session may break it first — losing that race
-                // lands in AlreadyExists again and errors out normally).
-                let _ = fs::remove_file(&lock);
-            }
-            Err(e) => return Err(format!("couldn't take memory lock: {e}")),
-        }
-    }
-    Err("another session is updating memory".to_string())
-}
-
-fn undo_sidecar(path: &Path) -> PathBuf {
-    // Keep a markdown extension so post-verify settlement treats the sidecar as
-    // prose (same as `.hi/memory.md`). `memory.md.undo` would look like a
-    // binary/unknown file and wipe a green verification pass.
-    let stem = path
-        .file_stem()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "memory".into());
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .filter(|e| !e.is_empty())
-        .unwrap_or("md");
-    path.with_file_name(format!("{stem}.undo.{ext}"))
-}
-
-fn snapshot_undo(path: &Path) {
-    let sidecar = undo_sidecar(path);
-    match fs::read(path) {
-        Ok(bytes) => {
-            let _ = fs::write(&sidecar, bytes);
-        }
-        Err(_) => {
-            // Previous file missing — undo should delete the new file.
-            let _ = fs::write(&sidecar, b"");
-        }
-    }
-}
-
-/// Restore the last markdown memory write for this workspace (`/undo-memory`).
-pub fn undo_memory(workspace: &Path) -> Result<String, String> {
-    let project = memory_file_at(workspace);
-    let global = global_memory_file();
-    let candidates = [undo_sidecar(&project), undo_sidecar(&global)];
-    let Some(sidecar) = candidates.iter().filter(|p| p.is_file()).max_by_key(|p| {
-        fs::metadata(p)
-            .and_then(|m| m.modified())
-            .ok()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    }) else {
-        return Err("nothing to undo — no recent memory write in this session".into());
-    };
-    let target = if sidecar == &undo_sidecar(&project) {
-        project
-    } else {
-        global
-    };
-    let previous = fs::read(sidecar).map_err(|e| format!("couldn't read undo snapshot: {e}"))?;
-    if previous.is_empty() {
-        let _ = fs::remove_file(&target);
-    } else {
-        let Some(parent) = target.parent() else {
-            return Err(format!("no parent directory for {}", target.display()));
-        };
-        let _lock = take_lock(parent)?;
-        let mut tmp = target.clone();
-        let mut name = tmp
-            .file_name()
-            .map(|n| n.to_os_string())
-            .unwrap_or_else(|| std::ffi::OsString::from("memory.md"));
-        name.push(format!(".{}.tmp", std::process::id()));
-        tmp.set_file_name(name);
-        fs::write(&tmp, &previous).map_err(|e| format!("couldn't write undo temp: {e}"))?;
-        fs::rename(&tmp, &target).map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            format!("couldn't restore {}: {e}", target.display())
-        })?;
-    }
-    let _ = fs::remove_file(sidecar);
-    Ok(format!("restored {}", target.display()))
-}
-
 /// Parse `- [#12] text` (or a legacy `- text` line).
 pub fn parse_bullet_line(line: &str) -> Option<(Option<u32>, String)> {
     let trimmed = line.trim();
@@ -1119,9 +946,11 @@ impl hi_tools::MemoryBackend for MarkdownMemory {
         let Some((path, layer, _)) = find_bullet(&self.workspace, id) else {
             anyhow::bail!("no memory bullet [#{id}]");
         };
-        let next = update_bullet_in_body(&read_layer(&path), id, text)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        write_memory_replace(&path, &next).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let preimage = read_memory_preimage(&path).map_err(anyhow::Error::msg)?;
+        let body = memory_body_from_preimage(preimage.as_deref());
+        let next = update_bullet_in_body(&body, id, text).map_err(|e| anyhow::anyhow!("{e}"))?;
+        write_memory_replace_if_unchanged(&path, &next, preimage.as_deref())
+            .map_err(anyhow::Error::msg)?;
         Ok(format!("remembered [#{id}] ({layer}){UNDO_HINT}"))
     }
 
@@ -1130,9 +959,11 @@ impl hi_tools::MemoryBackend for MarkdownMemory {
         let Some((path, layer, _)) = find_bullet(&self.workspace, id) else {
             anyhow::bail!("no memory bullet [#{id}]");
         };
-        let next =
-            forget_bullet_in_body(&read_layer(&path), id).map_err(|e| anyhow::anyhow!("{e}"))?;
-        write_memory_replace(&path, &next).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let preimage = read_memory_preimage(&path).map_err(anyhow::Error::msg)?;
+        let body = memory_body_from_preimage(preimage.as_deref());
+        let next = forget_bullet_in_body(&body, id).map_err(|e| anyhow::anyhow!("{e}"))?;
+        write_memory_replace_if_unchanged(&path, &next, preimage.as_deref())
+            .map_err(anyhow::Error::msg)?;
         Ok(format!("forgot [#{id}] ({layer}){UNDO_HINT}"))
     }
 }
@@ -1265,8 +1096,7 @@ mod tests {
         assert!(raw.starts_with(MEMORY_HEADER), "header written");
         assert_eq!(strip_header(&raw), "- alpha\n- beta");
         let _ = fs::remove_file(&path);
-        // Lock sibling cleaned up.
-        let _ = fs::remove_file(path.with_file_name(".memory.lock"));
+        let _ = fs::remove_file(undo_sidecar(&path));
     }
 
     /// An empty body writes nothing and creates no file.
@@ -1285,11 +1115,12 @@ mod tests {
         assert!(!path.exists(), "no file created for empty body");
     }
 
-    /// A second concurrent lock attempt is rejected while the first is held.
+    /// A writer derived from an older source revision cannot overwrite a
+    /// concurrent publication.
     #[test]
-    fn concurrent_lock_is_exclusive() {
+    fn stale_preimage_is_rejected_without_overwriting_the_winner() {
         let dir = std::env::temp_dir().join(format!(
-            "hi-mem-lock-{}-{}",
+            "hi-mem-stale-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1297,13 +1128,37 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
-        let lock_a = take_lock(&dir);
-        assert!(lock_a.is_ok(), "first taker succeeds");
-        let lock_b = take_lock(&dir);
-        assert!(lock_b.is_err(), "second taker rejected while first holds");
-        drop(lock_a); // releases — Now it's free again.
-        assert!(take_lock(&dir).is_ok(), "re-acquirable after release");
+        let path = dir.join("memory.md");
+        write_memory(&path, "- first").unwrap();
+        let stale = read_memory_preimage(&path).unwrap().unwrap();
+        write_memory(&path, "- winner").unwrap();
+
+        let error = write_memory_replace_if_unchanged(&path, "- stale", Some(&stale)).unwrap_err();
+
+        assert!(error.contains("source changed"), "{error}");
+        assert_eq!(read_layer(&path), "- winner");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_sidecar_symlink_is_rejected_transactionally() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let path = dir.path().join("memory.md");
+        fs::write(&path, format!("{MEMORY_HEADER}\n- original\n")).unwrap();
+        symlink(outside.path(), undo_sidecar(&path)).unwrap();
+
+        let error = write_memory(&path, "- replacement").unwrap_err();
+
+        assert!(
+            error.contains("not a regular file") || error.contains("outside workspace"),
+            "{error}"
+        );
+        assert_eq!(read_layer(&path), "- original");
+        assert!(fs::read(outside.path()).unwrap().is_empty());
     }
 
     // --- hierarchical routing ---

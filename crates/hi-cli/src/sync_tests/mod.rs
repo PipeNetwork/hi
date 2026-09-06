@@ -110,3 +110,4 @@ impl MockServer {
 mod records;
 mod remote_state;
 mod transport;
+mod workspace_recovery;

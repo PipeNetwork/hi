@@ -205,6 +205,22 @@ impl Provider for MoaProvider {
         )
     }
 
+    fn capability_candidates_for_request(
+        &self,
+        route: &str,
+        model: &str,
+        context: crate::ProviderRequestContext<'_>,
+    ) -> Vec<ProviderCapabilityCandidate> {
+        request_policy::candidates_for_request(
+            &self.config,
+            self.passthrough.as_ref(),
+            self.routes.as_ref(),
+            route,
+            model,
+            context,
+        )
+    }
+
     async fn stream(
         &self,
         request: ChatRequest,
@@ -376,6 +392,7 @@ fn flatten_message_for_reference(message: &Message, tool_result_budget_chars: us
                 truncate_chars(output, tool_result_budget_chars)
             )),
             Content::Image { .. } => parts.push("[image omitted]".to_string()),
+            Content::ProviderReplay { .. } => {}
         }
     }
     parts.join("\n\n")
@@ -432,7 +449,7 @@ fn completion_text(content: &[Content]) -> String {
             Content::ToolResult { call_id, output } => {
                 Some(format!("[reference tool result `{call_id}`]\n{output}"))
             }
-            Content::Image { .. } => None,
+            Content::Image { .. } | Content::ProviderReplay { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n\n")

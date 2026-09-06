@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use hi_ai::{Content, Provider};
+use hi_ai::Provider;
 
 use super::workspace_failure::verification_after_turn_failure;
 use crate::AgentConfig;
@@ -126,84 +126,6 @@ impl crate::Agent {
             return Err(error.into());
         }
         Ok(())
-    }
-
-    /// Stage the exact provider-facing result before a PipeFS settlement.
-    /// Local workspaces publish their transcript after the local checkpoint and
-    /// therefore need no pre-stage. Remote workspaces must place this record in
-    /// the durable outbox first so the controller cannot commit bytes against a
-    /// one-step-behind transcript batch.
-    pub(crate) fn stage_active_workspace_execution(
-        &mut self,
-        calls: &[(String, String, String)],
-        assistant_content: &[Content],
-        results: &[(String, String)],
-        execution: &hi_workspace::ExecutionReport,
-    ) -> Result<()> {
-        if !matches!(
-            self.workspace_controller_binding().authority,
-            hi_workspace::WorkspaceAuthority::PipeFs { .. }
-        ) {
-            return Ok(());
-        }
-        let operation_id = match self.workspace_coordination.active_parent_operation() {
-            Some(operation_id) => operation_id,
-            None if !self.config.harness.features.workspace_controller_v2 => return Ok(()),
-            None => anyhow::bail!("PipeFS execution has no admitted workspace operation"),
-        };
-        anyhow::ensure!(
-            calls.len() == results.len(),
-            "workspace execution transcript has {} calls but {} results",
-            calls.len(),
-            results.len()
-        );
-        let transcript_calls = calls
-            .iter()
-            .zip(results)
-            .map(|((call_id, name, _), (result_id, result))| {
-                anyhow::ensure!(
-                    call_id == result_id,
-                    "workspace execution result order does not match call order"
-                );
-                Ok(crate::WorkspaceTranscriptCall {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    result: result.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let record = crate::WorkspaceTranscriptExecution {
-            schema_version: crate::WorkspaceTranscriptExecution::SCHEMA_VERSION,
-            operation_id,
-            assistant_content: assistant_content.to_vec(),
-            calls: transcript_calls,
-            execution: execution.clone(),
-        };
-        self.session
-            .as_mut()
-            .context("PipeFS execution requires a durable session sink")?
-            .stage_workspace_execution(&record)
-            .context("staging PipeFS workspace execution transcript")
-    }
-
-    /// Settle an admitted operation using the executor's real typed result.
-    /// Storage success must never rewrite a failed/cancelled/indeterminate
-    /// execution into `Succeeded` in the operation journal.
-    pub(crate) async fn checkpoint_durable_workspace_with_execution(
-        &self,
-        mut execution: hi_workspace::ExecutionReport,
-    ) -> Result<()> {
-        if execution.workspace_may_have_changed && execution.content_digest.is_none() {
-            execution.content_digest = Some(self.runtime.ledger().workspace_revision());
-        }
-        let pending = self.runtime.background().pending_job_settlements().await;
-        self.workspace_coordination
-            .checkpoint(self.workspace_durability.clone(), execution)
-            .await?;
-        self.runtime
-            .background()
-            .settle_jobs_after_workspace(&pending)
-            .await
     }
 
     /// Recreate all workspace-scoped runtime state against a materialized root.
@@ -500,9 +422,73 @@ impl crate::Agent {
     /// Observed motivation: one-shot prompts like "set up a server on port
     /// 8080 and keep it running" had their finished deliverable reaped by
     /// `kill_background_processes` microseconds before the caller connected.
-    pub fn release_background_services(&self) {
-        self.runtime.background().kill_auto_backgrounded();
-        self.runtime.background().release_all();
+    pub async fn release_background_services(&mut self) -> Result<()> {
+        self.background_task_registry().kill_all().await;
+        self.runtime
+            .background()
+            .kill_started_after_and_reap(&[])
+            .await
+            .context("stopping auto-backgrounded processes before service handoff")?;
+        if !self
+            .runtime
+            .background()
+            .pending_job_settlements()
+            .await
+            .is_empty()
+        {
+            self.reconcile_workspace_changes()
+                .await
+                .context("reconciling completed background writers before service handoff")?;
+            self.checkpoint_durable_workspace()
+                .await
+                .context("settling completed background writers before service handoff")?;
+        }
+        let release = self
+            .runtime
+            .background()
+            .release_requested_running()
+            .await
+            .context("recording durable background-process handoff")?;
+        self.runtime
+            .background()
+            .ensure_quiescent_and_reaped()
+            .await
+            .context("checking for a process that exited during service handoff")?;
+        let raced = self.runtime.background().pending_job_settlements().await;
+        if !raced.is_empty() {
+            self.reconcile_workspace_changes()
+                .await
+                .context("reconciling a writer that exited during service handoff")?;
+            self.checkpoint_durable_workspace()
+                .await
+                .context("settling a writer that exited during service handoff")?;
+        }
+        if !release.settlement_pending.is_empty()
+            && !self
+                .runtime
+                .background()
+                .pending_job_settlements()
+                .await
+                .is_empty()
+        {
+            anyhow::bail!("background process handoff left an unsettled writer");
+        }
+        let workspace_status = self.workspace_controller_status();
+        if !matches!(
+            workspace_status.state,
+            hi_workspace::WorkspaceState::Ready | hi_workspace::WorkspaceState::LocalAuditDegraded
+        ) || workspace_status.active_operation.is_some()
+            || !workspace_status.active_jobs.is_empty()
+            || workspace_status.recovery_id.is_some()
+        {
+            anyhow::bail!(
+                "background process handoff did not settle every workspace effect: {}",
+                workspace_status.admission_block_detail("workspace remains fenced")
+            );
+        }
+        self.require_workspace_barrier(hi_workspace::BarrierKind::Exit)
+            .await
+            .context("waiting for the workspace exit barrier after service handoff")?;
         self.stop_local_skeptic_server();
         if let Some(server) = &self.driver_local_server {
             hi_tools::stop_local_server(&server.process_id);
@@ -510,9 +496,9 @@ impl crate::Agent {
         for server in &self.team_local_servers {
             hi_tools::stop_local_server(&server.process_id);
         }
-        // Background subagent tasks are cleaned up via BackgroundTaskRegistry's
-        // Drop impl when the agent is dropped. The async `kill_all` method can
-        // be called from async cleanup paths if needed.
+        // Background subagent tasks were cancelled before native-process
+        // handoff so they cannot spawn new work into the release race.
+        Ok(())
     }
 
     /// Legacy synchronous cancelled-turn finalizer.
@@ -637,25 +623,53 @@ impl crate::Agent {
         workspace_reconciled: bool,
         current_workspace: Option<(u64, String)>,
     ) -> crate::TurnOutcome {
-        let (verification, verified_workspace_revision) = current_workspace
-            .map(|(current_revision, current_digest)| {
-                verification_after_turn_failure(
-                    &self.report.verify,
-                    workspace_reconciled,
-                    current_revision,
-                    &current_digest,
-                )
-            })
-            .unwrap_or((crate::VerificationStatus::Unverified, None));
+        self.finalize_failed_turn_with_changes_and_reason(
+            changes,
+            workspace_reconciled,
+            current_workspace,
+            crate::TurnStopReason::InfrastructureFailure,
+        )
+    }
+
+    pub(super) fn finalize_failed_turn_with_changes_and_reason(
+        &mut self,
+        changes: Vec<hi_tools::FileChange>,
+        workspace_reconciled: bool,
+        current_workspace: Option<(u64, String)>,
+        stop_reason: crate::TurnStopReason,
+    ) -> crate::TurnOutcome {
+        let (verification, verified_workspace_revision) = if stop_reason.is_workspace_admission() {
+            (crate::VerificationStatus::Unverified, None)
+        } else {
+            current_workspace
+                .map(|(current_revision, current_digest)| {
+                    verification_after_turn_failure(
+                        &self.report.verify,
+                        workspace_reconciled,
+                        current_revision,
+                        &current_digest,
+                    )
+                })
+                .unwrap_or((crate::VerificationStatus::Unverified, None))
+        };
         self.workspace.record_changes(changes, true);
         self.report.clear_verify();
         self.workspace.clear_active_baselines();
         let route = self.report.last_effective_route.clone();
-        let mut outcome = crate::TurnOutcome::infrastructure_failure(
-            route.model,
-            route.provider,
-            self.workspace.last_changed_files.clone(),
-        );
+        let mut outcome = if stop_reason.is_workspace_admission() {
+            crate::TurnOutcome::workspace_admission_blocked(
+                route.model,
+                route.provider,
+                self.workspace.last_changed_files.clone(),
+                stop_reason,
+            )
+        } else {
+            crate::TurnOutcome::infrastructure_failure(
+                route.model,
+                route.provider,
+                self.workspace.last_changed_files.clone(),
+            )
+        };
         outcome.verification = verification;
         outcome.verified_workspace_revision = verified_workspace_revision;
         outcome.review_same_model = self.skeptic_shares_session_model();

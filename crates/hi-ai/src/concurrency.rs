@@ -220,6 +220,16 @@ impl Provider for ConcurrencyLimitedProvider {
         self.inner.capability_candidates(route, model)
     }
 
+    fn capability_candidates_for_request(
+        &self,
+        route: &str,
+        model: &str,
+        context: crate::ProviderRequestContext<'_>,
+    ) -> Vec<crate::ProviderCapabilityCandidate> {
+        self.inner
+            .capability_candidates_for_request(route, model, context)
+    }
+
     async fn stream(
         &self,
         request: ChatRequest,

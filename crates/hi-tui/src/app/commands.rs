@@ -1934,6 +1934,18 @@ impl crate::App {
                     &agent.background_task_ids(),
                 );
             }
+            Command::Queue(arg) if arg.trim() == "resume" => {
+                let queued = self.resume_queue();
+                self.push(Line::styled(
+                    if queued == 0 {
+                        "queue is empty".to_string()
+                    } else {
+                        format!("resuming {queued} queued command(s)")
+                    },
+                    dim(),
+                ));
+                self.follow();
+            }
             Command::ViewPlan => {
                 if self.plan_approval.is_some() {
                     if self.unpark_plan_approval() {

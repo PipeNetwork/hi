@@ -58,39 +58,54 @@ pub(crate) fn resolve_bash_timeout_from_values(
 }
 
 /// Whether a foreground bash command that outlasts its budget is handed to the
-/// background (kept running, returns a handle) instead of being killed. This is
-/// deliberately opt-in: an ordinary finite build/test must stay attached to the
-/// active turn until it completes or the user cancels it. Enable with
-/// `HI_BASH_AUTO_BACKGROUND=1` when automatic handoff is desired.
+/// background (kept running, returns a handle) instead of holding the active
+/// turn and its workspace permit indefinitely. This is on by default: process
+/// lifetime remains unlimited, while foreground attachment is bounded. Disable
+/// explicitly with `HI_BASH_AUTO_BACKGROUND=0`.
 fn auto_background_enabled() -> bool {
     let configured = std::env::var("HI_BASH_AUTO_BACKGROUND").ok();
     auto_background_enabled_from_value(configured.as_deref())
 }
 
 pub(super) fn auto_background_enabled_from_value(configured: Option<&str>) -> bool {
-    configured.is_some_and(|value| {
+    !configured.is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
+            "0" | "false" | "no" | "off"
         )
     })
 }
 
-/// The foreground window before an auto-backgrounded command is handed off.
-/// Defaults to 30s so a hung build hands control back quickly while the process
-/// keeps running in the background. Set `HI_BASH_FOREGROUND_BUDGET_SECS` to
-/// override (use the full timeout value to restore the old block-until-done
-/// behaviour).
-fn resolve_foreground_budget(timeout: Option<Duration>) -> Duration {
-    let budget = match std::env::var("HI_BASH_FOREGROUND_BUDGET_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+/// The foreground window before an unlimited command is handed off. Explicit
+/// shell timeouts remain hard process-lifetime deadlines and never enter this
+/// path. The optional argument is an internal test override, not tool policy.
+fn resolve_foreground_budget(injected: Option<Duration>) -> Duration {
+    let configured = std::env::var("HI_BASH_FOREGROUND_BUDGET_SECS").ok();
+    resolve_foreground_budget_from_values(injected, configured.as_deref())
+}
+
+pub(super) fn resolve_foreground_budget_from_values(
+    injected: Option<Duration>,
+    configured: Option<&str>,
+) -> Duration {
+    if let Some(injected) = injected {
+        return injected;
+    }
+    match configured
+        .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
     {
         Some(secs) => Duration::from_secs(secs),
         None => Duration::from_secs(30),
-    };
-    timeout.map_or(budget, |deadline| budget.min(deadline))
+    }
+}
+
+fn managed_handoff_enabled(
+    configured: bool,
+    hard_timeout: Option<Duration>,
+    effect_supported: bool,
+) -> bool {
+    configured && hard_timeout.is_none() && effect_supported
 }
 
 /// Preserve colored subprocess output for the UI while keeping the model and
@@ -162,9 +177,10 @@ pub(crate) async fn run_bash_streaming_with_timeout(
 #[derive(Deserialize)]
 pub(super) struct BashArgs {
     pub command: String,
-    /// Optional per-command wall-clock limit in seconds. Omitted or zero means
-    /// unlimited unless `HI_BASH_TIMEOUT_SECS` supplies a positive value.
-    /// Ignored when `run_in_background` is set.
+    /// Optional hard process-lifetime limit in seconds. Omitted or zero means
+    /// unlimited unless `HI_BASH_TIMEOUT_SECS` supplies a positive value. An
+    /// unlimited command may be handed off after the foreground attachment
+    /// budget. Ignored when `run_in_background` is set.
     #[serde(default)]
     pub timeout: Option<u64>,
     /// Run detached: return a handle immediately instead of waiting for exit.
@@ -195,7 +211,8 @@ pub(super) async fn run_bash_tool(
 }
 
 /// Policy-injected implementation used by focused tests so they can exercise
-/// both branches without mutating the process-global environment.
+/// the explicit opt-out and default-on branches without mutating the
+/// process-global environment.
 pub(super) async fn run_bash_tool_with_auto_background(
     root: &Path,
     state_root: &Path,
@@ -283,8 +300,16 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop."
     // work needed; the turn-level ledger still performs its normal boundary
     // reconciliation before settlement.
     if definitely_read_only_shell(&args.command) {
-        let execution = if auto_background {
-            let budget = resolve_foreground_budget(timeout);
+        let can_handoff = managed_handoff_enabled(
+            auto_background,
+            timeout,
+            resources
+                .background
+                .supports_managed_effect(crate::BackgroundJobEffect::ReadOnly),
+        );
+        let execution = if can_handoff {
+            let budget =
+                resolve_foreground_budget(resources.background.foreground_handoff_budget());
             match runner
                 .run_shell_adoptable(&args.command, budget, on_line)
                 .await
@@ -292,7 +317,7 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop."
                 Ok(crate::AdoptableOutcome::Completed(execution)) => Ok(execution),
                 Ok(crate::AdoptableOutcome::StillRunning(running)) => {
                     let foreground_registration = running.foreground_registration;
-                    let id = resources
+                    let adoption = resources
                         .background
                         .adopt_read_only(
                             &args.command,
@@ -302,8 +327,21 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop."
                             running.pgid,
                             running.partial_output,
                         )
-                        .await?;
+                        .await;
                     drop(foreground_registration);
+                    let id = match adoption {
+                        Ok(id) => id,
+                        Err(error) => {
+                            let mut outcome = ToolOutcome::failed(format!(
+                                "Foreground process was stopped after managed background handoff failed: {error:#}"
+                            ));
+                            outcome.effects.mutation_attempted = true;
+                            if let Ok(mut cache) = resources.read_cache.lock() {
+                                cache.clear();
+                            }
+                            return Ok(outcome);
+                        }
+                    };
                     let title = crate::background::shell_title(&args.command);
                     let mut outcome = background_tool_outcome(
                         format!(
@@ -350,12 +388,18 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
             return Ok(outcome);
         }
     };
-    // Auto-background-on-timeout: a command still running at its foreground
-    // budget is adopted by the background registry (kept alive, handle
-    // returned) instead of killed, so no work is lost. Falls back to the
-    // classic kill-on-timeout path when disabled.
-    if auto_background {
-        let budget = resolve_foreground_budget(timeout);
+    // Managed handoff applies only to unlimited commands on bindings that
+    // support background live writers. Explicit timeouts remain hard, while
+    // capability-gated bindings (notably PipeFS) keep valid work foreground.
+    let can_handoff = managed_handoff_enabled(
+        auto_background,
+        timeout,
+        resources
+            .background
+            .supports_managed_effect(crate::BackgroundJobEffect::LiveWriter),
+    );
+    if can_handoff {
+        let budget = resolve_foreground_budget(resources.background.foreground_handoff_budget());
         let outcome = runner
             .run_shell_adoptable(&args.command, budget, on_line)
             .await;
@@ -373,7 +417,7 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
             }
             Ok(crate::AdoptableOutcome::StillRunning(running)) => {
                 let foreground_registration = running.foreground_registration;
-                let id = resources
+                let adoption = resources
                     .background
                     .adopt(
                         &args.command,
@@ -382,10 +426,27 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
                         running.stderr,
                         running.pgid,
                         running.partial_output,
-                        (root.to_path_buf(), state_root.to_path_buf(), before),
+                        (root.to_path_buf(), state_root.to_path_buf(), before.clone()),
                     )
-                    .await?;
+                    .await;
                 drop(foreground_registration);
+                let id = match adoption {
+                    Ok(id) => id,
+                    Err(error) => {
+                        let mut outcome = ToolOutcome::failed(format!(
+                            "Foreground process was stopped after managed background handoff failed: {error:#}"
+                        ));
+                        match crate::effects::workspace_snapshot(root, state_root).await {
+                            Ok(after) => {
+                                outcome.effects = crate::effects::process_effects(&before, &after)
+                            }
+                            Err(snapshot_error) => {
+                                mark_effect_inspection_failed(&mut outcome, &snapshot_error, true)
+                            }
+                        }
+                        return Ok(outcome);
+                    }
+                };
                 let title = crate::background::shell_title(&args.command);
                 let mut outcome = background_tool_outcome(
                     format!(
@@ -896,107 +957,5 @@ fn workspace_file_fits_read(root: &Path, rel: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{definitely_read_only_shell, file_dump_read_arguments, process_tool_outcome};
-    use crate::{ProcessExecution, ProcessOutcome, ToolStatus, TruncationState};
-
-    #[test]
-    fn read_only_shell_allowlist_is_conservative() {
-        for command in ["rg TODO src", "head -20 README.md", "printf 'done\\n'"] {
-            assert!(definitely_read_only_shell(command), "{command:?}");
-        }
-        for command in [
-            "echo hi > marker.txt",
-            "sed -i s/old/new/ src/lib.rs",
-            "find . -exec rm {} \\;",
-            "sort -o sorted.txt input.txt",
-            // Even observational Git commands can refresh the index, invoke
-            // fsmonitor/textconv/external-diff helpers, or start a pager. Keep
-            // them on the live-writer reconciliation path unless a future
-            // broker can prove the complete invocation hermetic.
-            "git status --short",
-            "git -C nested/repo diff",
-            "git diff --output=patch.txt",
-            "git -C /tmp/repo diff",
-            "./scripts/check.sh",
-            "cargo test",
-        ] {
-            assert!(!definitely_read_only_shell(command), "{command:?}");
-        }
-    }
-
-    #[test]
-    fn file_dump_commands_map_to_read_arguments() {
-        fn parsed(command: &str) -> Option<serde_json::Value> {
-            file_dump_read_arguments(command).map(|json| serde_json::from_str(&json).unwrap())
-        }
-        assert_eq!(
-            parsed("cat SPEC.md"),
-            Some(serde_json::json!({"path":"SPEC.md"}))
-        );
-        assert_eq!(
-            parsed("sed -n '200,400p' SPEC.md"),
-            Some(serde_json::json!({"path":"SPEC.md","offset":200,"limit":201}))
-        );
-        assert_eq!(
-            parsed("head -n 50 crates/api/src/lib.rs"),
-            Some(serde_json::json!({"path":"crates/api/src/lib.rs","limit":50}))
-        );
-        assert!(parsed("cat file | wc -l").is_none());
-        assert!(parsed("sed -i s/a/b/ SPEC.md").is_none());
-        assert!(parsed("echo hello").is_none());
-        assert!(parsed("cat *.md").is_none());
-        assert_eq!(
-            parsed("printf -- '---\\n' && cat SPEC.md"),
-            Some(serde_json::json!({"path":"SPEC.md"}))
-        );
-        assert_eq!(
-            parsed("echo banner; cat SPEC.md"),
-            Some(serde_json::json!({"path":"SPEC.md"}))
-        );
-        assert!(parsed("cat SPEC.md && rm SPEC.md").is_none());
-        assert!(parsed("rm SPEC.md && cat SPEC.md").is_none());
-    }
-
-    #[test]
-    fn process_tool_outcome_separates_model_and_display_text() {
-        let execution = ProcessExecution {
-            status: ToolStatus::Succeeded,
-            outcome: ProcessOutcome {
-                exit_code: Some(0),
-                stdout_summary: "\u{1b}[31mred\u{1b}[0m".into(),
-                stderr_summary: String::new(),
-                duration_ms: 1,
-            },
-            truncation: TruncationState::Complete,
-        };
-
-        let outcome = process_tool_outcome(execution, None);
-        assert_eq!(outcome.content, "red");
-        assert_eq!(outcome.display.as_deref(), Some("\u{1b}[31mred\u{1b}[0m"));
-        assert_eq!(
-            outcome.process.unwrap().stdout_summary,
-            "red",
-            "serialized process metadata stays plain"
-        );
-    }
-
-    #[test]
-    fn pipeline_status_warning_prevents_false_exit_zero_inference() {
-        let execution = ProcessExecution {
-            status: ToolStatus::Succeeded,
-            outcome: ProcessOutcome {
-                exit_code: Some(0),
-                stdout_summary: "exit=0".into(),
-                stderr_summary: String::new(),
-                duration_ms: 1,
-            },
-            truncation: TruncationState::Complete,
-        };
-
-        let outcome =
-            process_tool_outcome(execution, Some("timeout 10 ./app | head -30; echo exit=$?"));
-        assert!(outcome.content.contains("final command's status"));
-        assert!(outcome.content.contains("Capture the program status"));
-    }
-}
+#[path = "process_tools_tests.rs"]
+mod tests;

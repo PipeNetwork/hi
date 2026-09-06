@@ -56,6 +56,12 @@ pub enum TurnStopReason {
     /// Goal skeptic escalated/skipped; turn may still Complete with a scar.
     ReviewEscalated,
     ToolModeDenied,
+    /// Workspace admission was denied by a transient or concurrently owned
+    /// controller state. The effect was not started.
+    WorkspaceNotReady,
+    /// Workspace admission was denied by a durable recovery fence. The effect
+    /// was not started and recovery evidence remains available for inspection.
+    WorkspaceRecoveryRequired,
     /// A productive/fault-recovery loop stopped because it produced no new
     /// evidence. Kept distinct from user-configured execution limits.
     #[serde(alias = "Stalled", alias = "stalled")]
@@ -74,6 +80,38 @@ pub enum TurnStopReason {
     TurnLimit,
     Cancelled,
     InfrastructureFailure,
+}
+
+impl TurnStopReason {
+    /// Classify an error that escaped before normal turn finalization.
+    ///
+    /// Workspace admission is an expected fail-closed boundary, not an
+    /// infrastructure outage. All other escaped errors retain the historical
+    /// infrastructure classification.
+    pub fn for_error(err: &anyhow::Error) -> Self {
+        let Some(denied) = err.downcast_ref::<hi_workspace::AdmissionDenied>() else {
+            return Self::InfrastructureFailure;
+        };
+        match denied.state {
+            hi_workspace::WorkspaceState::PendingRemote
+            | hi_workspace::WorkspaceState::LeaseUncertain
+            | hi_workspace::WorkspaceState::LeaseLost
+            | hi_workspace::WorkspaceState::Conflict
+            | hi_workspace::WorkspaceState::TranscriptPending
+            | hi_workspace::WorkspaceState::CleanupPending
+            | hi_workspace::WorkspaceState::RecoveryRequired
+            | hi_workspace::WorkspaceState::JournalCorrupt
+            | hi_workspace::WorkspaceState::Incompatible => Self::WorkspaceRecoveryRequired,
+            _ => Self::WorkspaceNotReady,
+        }
+    }
+
+    pub const fn is_workspace_admission(self) -> bool {
+        matches!(
+            self,
+            Self::WorkspaceNotReady | Self::WorkspaceRecoveryRequired
+        )
+    }
 }
 
 /// Provider/model route that was effective for the turn.
@@ -137,6 +175,33 @@ impl TurnOutcome {
                 model: model.into(),
             },
             // Unknown outside Agent; callers with config should overwrite.
+            review_same_model: false,
+            leftover: None,
+            plan_leftover: None,
+        }
+    }
+
+    /// Construct the typed blocked result for a fail-closed workspace
+    /// admission. No operation was admitted, so this is intentionally neither
+    /// a provider failure nor a successful turn.
+    pub fn workspace_admission_blocked(
+        model: impl Into<String>,
+        provider: Option<String>,
+        changed_files: Vec<String>,
+        stop_reason: TurnStopReason,
+    ) -> Self {
+        debug_assert!(stop_reason.is_workspace_admission());
+        Self {
+            status: TurnStatus::Blocked,
+            verification: VerificationStatus::Unverified,
+            review: ReviewStatus::NotRequired,
+            stop_reason,
+            changed_files,
+            verified_workspace_revision: None,
+            effective_route: EffectiveModelRoute {
+                provider,
+                model: model.into(),
+            },
             review_same_model: false,
             leftover: None,
             plan_leftover: None,
@@ -236,6 +301,31 @@ mod tests {
     }
 
     #[test]
+    fn workspace_stop_reasons_have_stable_wire_values_and_exit_one() {
+        for (reason, wire) in [
+            (
+                TurnStopReason::WorkspaceNotReady,
+                r#""workspace_not_ready""#,
+            ),
+            (
+                TurnStopReason::WorkspaceRecoveryRequired,
+                r#""workspace_recovery_required""#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&reason).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<TurnStopReason>(wire).unwrap(),
+                reason
+            );
+            assert_eq!(
+                outcome(TurnStatus::Blocked, VerificationStatus::Unverified, reason)
+                    .exit_code(false),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn failed_exit_codes_distinguish_contract_failure_from_infrastructure() {
         assert_eq!(
             outcome(
@@ -278,6 +368,20 @@ pub enum TurnCleanupKind {
     Cancel { session: SessionRollback },
     /// `run_turn` returned `Err` or escaped before the normal finalizer.
     Fail,
+    /// `run_turn` returned `Err`, but the frontend retained a narrow typed
+    /// non-infrastructure stop reason for terminal settlement.
+    FailWithStopReason(TurnStopReason),
+}
+
+impl TurnCleanupKind {
+    pub fn for_error(err: &anyhow::Error) -> Self {
+        let stop_reason = TurnStopReason::for_error(err);
+        if stop_reason == TurnStopReason::InfrastructureFailure {
+            Self::Fail
+        } else {
+            Self::FailWithStopReason(stop_reason)
+        }
+    }
 }
 
 /// Result of [`crate::Agent::cleanup_turn`].

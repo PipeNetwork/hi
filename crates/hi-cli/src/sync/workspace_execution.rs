@@ -28,6 +28,19 @@ pub(super) struct RequiredWorkspaceStageFailure {
 }
 
 impl RemoteSessionSink {
+    /// A local message is best-effort portal sync until PipeFS makes the
+    /// remote transcript authoritative. Once pinned, it is the causal prefix
+    /// for any following workspace operation and must fail closed.
+    pub(crate) fn reconcile_message_prefix(&self, path: &std::path::Path) -> Result<()> {
+        if self.pipefs_sync_required() {
+            self.reconcile_jsonl(path)
+                .context("staging the PipeFS transcript prefix from local JSONL")
+        } else {
+            let _ = self.reconcile_jsonl(path);
+            Ok(())
+        }
+    }
+
     /// Durably enqueue the exact execution record which must share the next
     /// PipeFS publication boundary. The deterministic id makes an identical
     /// retry idempotent; a different payload receives a different digest and

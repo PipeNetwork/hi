@@ -54,6 +54,7 @@ pub(crate) struct ExploreJob {
     pub(crate) slot: u32,
     pub(crate) task: String,
     pub(crate) provider: std::sync::Arc<dyn hi_ai::Provider>,
+    pub(crate) capability_registry: hi_ai::ProviderCapabilityRegistry,
     pub(crate) child_config: AgentConfig,
 }
 
@@ -82,6 +83,7 @@ impl crate::Agent {
             .subagents
             .try_begin_explore(MAX_EXPLORE_SUBAGENTS_PER_TURN)?;
         let child_model = self.effective_explore_child_model();
+        let child_route = self.explore_child_route();
         // Requirements in project context are part of the delegated assignment.
         // Preserve them intact and let the child's normal context fitting decide
         // how to compact the complete request if the model window requires it.
@@ -97,6 +99,8 @@ impl crate::Agent {
             },
             routing: crate::AgentRouting {
                 model: child_model,
+                provider_route: Some(child_route.label),
+                capability_route: Some(child_route.capability_identity),
                 requested_max_tokens: self.config.routing.requested_max_tokens,
                 max_tokens: self.config.routing.max_tokens,
                 max_tokens_explicit: self.config.routing.max_tokens_explicit,
@@ -148,8 +152,38 @@ impl crate::Agent {
             slot: n,
             task,
             provider: self.explore_child_provider(),
+            capability_registry: self.provider_capability_registry.clone(),
             child_config,
         })
+    }
+
+    /// Display and cache identities for the provider that an explore child
+    /// will actually use. Endpoint overrides create a generic OpenAI-compatible
+    /// provider, so they must not inherit the driver's capability-cache key.
+    pub(crate) fn explore_child_route(&self) -> crate::AgentProviderRoute {
+        let stale = self.team_route_is_dead(
+            self.config.subagents.explore_model.as_deref(),
+            self.config.subagents.explore_endpoint.as_deref(),
+        );
+        if !stale && let Some(endpoint) = self.config.subagents.explore_endpoint.as_deref() {
+            return crate::AgentProviderRoute::new(
+                "explore",
+                hi_ai::endpoint_capability_route("explore", endpoint),
+            );
+        }
+        let label = self
+            .config
+            .routing
+            .provider_route
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let capability_identity = self
+            .config
+            .routing
+            .capability_route
+            .clone()
+            .unwrap_or_else(|| label.clone());
+        crate::AgentProviderRoute::new(label, capability_identity)
     }
 
     /// The provider explore children run on. Shares the driver's connection
@@ -259,10 +293,11 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
         slot,
         task,
         provider,
+        capability_registry,
         child_config,
     } = job;
 
-    let child = match crate::Agent::new(provider, child_config) {
+    let mut child = match crate::Agent::new(provider, child_config) {
         Ok(child) => child,
         Err(error) => {
             return ExploreResult {
@@ -275,6 +310,7 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
             };
         }
     };
+    child.set_provider_capability_registry(capability_registry);
     let mut child = super::child_process_teardown::ReapingChild::new(child, None);
     // `Box::pin` breaks the async-recursion cycle (`run_turn` → `handle_explore`
     // → child `run_turn`) that would otherwise make the future infinitely sized.

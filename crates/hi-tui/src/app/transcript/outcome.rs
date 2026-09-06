@@ -73,6 +73,10 @@ impl crate::App {
     }
 
     pub(crate) fn note_turn_failed(&mut self, error: &str, kind: &str, guidance: &str) {
+        if matches!(kind, "workspace" | "recovery") {
+            self.note_workspace_admission_error(error, kind, guidance);
+            return;
+        }
         self.status = format!("failed · {kind}").to_string();
         self.last_turn_state = TurnState::Failed(error.to_string());
         self.last_error = Some(error.to_string());
@@ -88,6 +92,30 @@ impl crate::App {
             theme().accent_error,
             format!("✗ failed · {kind}: {error}{guidance_line}{limits}"),
             Style::default().fg(theme().accent_error),
+        ));
+        self.follow();
+    }
+
+    /// Preserve actionable controller evidence while abnormal-turn cleanup
+    /// derives the authoritative blocked outcome. This is deliberately not a
+    /// terminal failure row: `note_turn_outcome` publishes the turn's single
+    /// terminal presentation after cleanup.
+    pub(crate) fn note_workspace_admission_error(
+        &mut self,
+        error: &str,
+        kind: &str,
+        guidance: &str,
+    ) {
+        self.last_error = Some(error.to_string());
+        let guidance_line = if guidance.is_empty() {
+            String::new()
+        } else {
+            format!("\n  💡 {guidance}")
+        };
+        self.push(accent_line(
+            theme().warning,
+            format!("⚠ {kind}: {error}{guidance_line}"),
+            Style::default().fg(theme().warning),
         ));
         self.follow();
     }
@@ -197,6 +225,8 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
             TurnStopReason::ReviewObjected => "review objected",
             TurnStopReason::ReviewEscalated => "review escalated",
             TurnStopReason::ToolModeDenied => "required tool was denied",
+            TurnStopReason::WorkspaceNotReady => "workspace not ready",
+            TurnStopReason::WorkspaceRecoveryRequired => "workspace recovery required",
             TurnStopReason::NoProgress => "no progress",
             TurnStopReason::StepLimit => "step limit reached",
             TurnStopReason::ToolLimit => "tool-call limit reached",
@@ -225,7 +255,13 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
 #[cfg(test)]
 mod failure_attribution_tests {
     use super::outcome_detail;
+    use crate::event::UiEvent;
+    use crate::{TurnState, tests::test_app};
     use hi_agent::{TurnOutcome, TurnStopReason, VerificationStatus};
+
+    fn workspace_outcome(reason: TurnStopReason) -> TurnOutcome {
+        TurnOutcome::workspace_admission_blocked("model", Some("test".into()), Vec::new(), reason)
+    }
 
     #[test]
     fn provider_failure_is_not_presented_as_verifier_infrastructure_failure() {
@@ -244,5 +280,56 @@ mod failure_attribution_tests {
             outcome_detail(&outcome),
             "verification infrastructure failure"
         );
+    }
+
+    #[test]
+    fn workspace_admission_blocks_are_actionable_not_infrastructure_failures() {
+        for (reason, detail) in [
+            (TurnStopReason::WorkspaceNotReady, "workspace not ready"),
+            (
+                TurnStopReason::WorkspaceRecoveryRequired,
+                "workspace recovery required",
+            ),
+        ] {
+            let mut app = test_app("openai", "gpt-4o");
+            app.note_turn_outcome(&workspace_outcome(reason));
+            let label = format!("blocked · {detail}");
+            assert_eq!(app.last_turn_state, TurnState::Warning(label.clone()));
+            assert_eq!(app.status, format!("warning · {label}"));
+            let transcript = app.transcript_text();
+            assert!(transcript.contains(&format!("⚠ {label}")), "{transcript}");
+            assert!(!transcript.contains("infrastructure failure"));
+            assert!(!transcript.contains("✗ failed"));
+        }
+    }
+
+    #[test]
+    fn workspace_error_and_cleanup_publish_one_blocked_terminal_row() {
+        let mut app = test_app("openai", "gpt-4o");
+        app.set_working(true);
+        app.apply(UiEvent::TurnError {
+            error_kind: "recovery".to_string(),
+            message: "workspace admission denied; recovery_id=recovery-1".to_string(),
+            guidance: "run `hi workspace status`".to_string(),
+        });
+        let diagnostic = app.transcript_text();
+        assert!(diagnostic.contains("recovery_id=recovery-1"));
+        assert!(diagnostic.contains("hi workspace status"));
+        assert!(!diagnostic.contains("✗ failed"));
+        assert!(!diagnostic.contains("blocked ·"));
+
+        app.note_turn_outcome(&workspace_outcome(
+            TurnStopReason::WorkspaceRecoveryRequired,
+        ));
+        let transcript = app.transcript_text();
+        assert_eq!(
+            transcript
+                .matches("⚠ blocked · workspace recovery required")
+                .count(),
+            1,
+            "{transcript}"
+        );
+        assert!(!transcript.contains("✗ failed"));
+        assert!(!transcript.contains("infrastructure failure"));
     }
 }

@@ -301,6 +301,35 @@ impl WorkspaceStatus {
             detail: None,
         }
     }
+
+    /// Describe the exact controller fence behind a `NotReady` admission.
+    /// Keep this in the shared contract so local and remote controllers do not
+    /// collapse actionable recovery evidence into a generic "unsettled"
+    /// message at the model/tool boundary.
+    pub fn admission_block_detail(&self, summary: &str) -> String {
+        let mut evidence = vec![format!("state={:?}", self.state)];
+        if let Some(recovery_id) = &self.recovery_id {
+            evidence.push(format!("recovery_id={recovery_id}"));
+        }
+        if let Some(operation_id) = &self.active_operation {
+            evidence.push(format!("active_operation={operation_id}"));
+        }
+        if !self.active_jobs.is_empty() {
+            evidence.push(format!(
+                "active_jobs={}",
+                self.active_jobs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        let evidence = evidence.join(", ");
+        match self.detail.as_deref().filter(|detail| !detail.is_empty()) {
+            Some(detail) => format!("{summary} ({evidence}): {detail}"),
+            None => format!("{summary} ({evidence})"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,6 +622,7 @@ pub enum JobCompletion {
     Cancelled,
     DurabilityPending,
     RecoveryRequired,
+    Orphaned,
     Stale,
 }
 

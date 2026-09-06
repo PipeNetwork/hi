@@ -22,6 +22,8 @@ pub struct Backend {
     pub model: String,
     /// A short human label for status messages, e.g. "ollama/qwen2.5:7b".
     pub label: String,
+    /// Credential-free concrete route used to isolate capability observations.
+    pub capability_route: String,
 }
 
 /// Tries each [`Backend`] in turn. A backend "fails" if it returns an error or a
@@ -91,7 +93,25 @@ impl Provider for FallbackProvider {
             .flat_map(|backend| {
                 backend
                     .provider
-                    .capability_candidates(&backend.label, &backend.model)
+                    .capability_candidates(&backend.capability_route, &backend.model)
+            })
+            .collect()
+    }
+
+    fn capability_candidates_for_request(
+        &self,
+        _route: &str,
+        _model: &str,
+        context: crate::ProviderRequestContext<'_>,
+    ) -> Vec<ProviderCapabilityCandidate> {
+        self.chain
+            .iter()
+            .flat_map(|backend| {
+                backend.provider.capability_candidates_for_request(
+                    &backend.capability_route,
+                    &backend.model,
+                    context,
+                )
             })
             .collect()
     }
@@ -285,7 +305,39 @@ mod tests {
             provider: Box::new(Canned(Mutex::new(results))),
             model: "m".into(),
             label: label.into(),
+            capability_route: label.into(),
         }
+    }
+
+    #[test]
+    fn capability_candidates_use_private_route_identity_not_status_label() {
+        let provider = FallbackProvider::new(
+            ["opaque-a", "opaque-b"]
+                .into_iter()
+                .map(|digest| Backend {
+                    provider: Box::new(Canned(Mutex::new(Vec::new()))),
+                    model: "model-a".into(),
+                    // Same family/model remains useful in human status text;
+                    // concrete endpoints must still occupy distinct keys.
+                    label: "openai/model-a".into(),
+                    capability_route: format!("openai@endpoint:blake3:{digest}"),
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        let candidates = provider.capability_candidates("fallback", "requested");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].target,
+            crate::CapabilityRoute::new("openai@endpoint:blake3:opaque-a", "model-a")
+        );
+        assert_eq!(
+            candidates[1].target,
+            crate::CapabilityRoute::new("openai@endpoint:blake3:opaque-b", "model-a")
+        );
+        assert_eq!(provider.chain[0].label, "openai/model-a");
+        assert_eq!(provider.chain[1].label, "openai/model-a");
     }
 
     fn req() -> ChatRequest {

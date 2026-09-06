@@ -286,14 +286,14 @@ pub(crate) fn compact_preflight_tool_output(name: &str, output: &str) -> String 
 pub(crate) fn implementation_preflight_command() -> &'static str {
     r#"set +e
 printf '[git_status]\n'
-if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  git status --short 2>&1 | head -80
+if git --no-pager --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git --no-pager --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false status --short 2>&1 | head -80
 else
   printf 'not a git repository\n'
 fi
 printf '\n[git_diff_stat]\n'
-if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  git diff --stat 2>&1 | head -80
+if git --no-pager --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git --no-pager --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false diff --no-ext-diff --no-textconv --stat 2>&1 | head -80
 else
   printf 'not a git repository\n'
 fi

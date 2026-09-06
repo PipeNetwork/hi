@@ -12,8 +12,8 @@ use crate::{
     JobSealOutcome, JobSealStatus, JobSpec, JobState, JobTerminal, MutationIntent, MutationPermit,
     MutationPermitRecord, OperationId, PermitAbandonment, PermitIssuer, RecoveryId, RecoveryKind,
     RecoveryOutcome, RecoveryRecord, RecoveryStatus, SettlementOutcome, SettlementReceipt,
-    SettlementStatus, WORKSPACE_CONTRACT_SCHEMA_VERSION, WorkspaceBinding, WorkspaceCapabilities,
-    WorkspaceController, WorkspaceId, WorkspaceState, WorkspaceStatus,
+    SettlementStatus, WORKSPACE_CONTRACT_SCHEMA_VERSION, WorkspaceAuthority, WorkspaceBinding,
+    WorkspaceCapabilities, WorkspaceController, WorkspaceId, WorkspaceState, WorkspaceStatus,
 };
 
 #[path = "in_memory_limits.rs"]
@@ -256,11 +256,10 @@ impl WorkspaceController for InMemoryWorkspaceController {
     async fn begin(&self, intent: MutationIntent) -> Result<MutationPermit, AdmissionDenied> {
         let mut state = lock(&self.inner.state);
         if !state.status.state.admits_mutation() {
-            return Err(denied(
-                &state,
-                AdmissionDeniedReason::NotReady,
-                "workspace has an unsettled operation",
-            ));
+            let detail = state
+                .status
+                .admission_block_detail("workspace is not ready for mutation admission");
+            return Err(denied(&state, AdmissionDeniedReason::NotReady, detail));
         }
         if state.active_operation.is_some() {
             return Err(denied(
@@ -275,6 +274,7 @@ impl WorkspaceController for InMemoryWorkspaceController {
             .filter(|job| {
                 !job.state.is_terminal()
                     && matches!(job.permit.spec.effect_scope, crate::EffectScope::LiveWriter)
+                    && !is_local_live_process(&state.binding, &job.permit.spec)
             })
             .map(|job| job.state)
             .collect::<Vec<_>>();
@@ -285,11 +285,10 @@ impl WorkspaceController for InMemoryWorkspaceController {
         if !(live_writer_states.is_empty()
             || intent.is_reconciliation() && writers_ready_to_reconcile)
         {
-            return Err(denied(
-                &state,
-                AdmissionDeniedReason::ActiveWriter,
-                "a live writer job is active",
-            ));
+            let detail = state
+                .status
+                .admission_block_detail("a live writer job blocks mutation admission");
+            return Err(denied(&state, AdmissionDeniedReason::ActiveWriter, detail));
         }
 
         let record = MutationPermitRecord {
@@ -430,24 +429,24 @@ impl WorkspaceController for InMemoryWorkspaceController {
             spec.parent_operation.as_ref() == Some(&operation.operation_id)
         });
         if !state.status.state.admits_mutation() && !belongs_to_active {
-            return Err(denied(
-                &state,
-                AdmissionDeniedReason::NotReady,
-                "workspace has an unsettled operation",
-            ));
+            let detail = state
+                .status
+                .admission_block_detail("workspace is not ready for job admission");
+            return Err(denied(&state, AdmissionDeniedReason::NotReady, detail));
         }
         if matches!(spec.effect_scope, crate::EffectScope::LiveWriter)
             && ((state.active_operation.is_some() && !belongs_to_active)
                 || state.jobs.values().any(|job| {
                     !job.state.is_terminal()
                         && matches!(job.permit.spec.effect_scope, crate::EffectScope::LiveWriter)
+                        && !(is_local_live_process(&state.binding, &spec)
+                            && is_local_live_process(&state.binding, &job.permit.spec))
                 }))
         {
-            return Err(denied(
-                &state,
-                AdmissionDeniedReason::ActiveWriter,
-                "another live writer is active",
-            ));
+            let detail = state
+                .status
+                .admission_block_detail("another live writer blocks job admission");
+            return Err(denied(&state, AdmissionDeniedReason::ActiveWriter, detail));
         }
         let active_jobs = state
             .jobs
@@ -676,8 +675,15 @@ fn completion_state(completion: JobCompletion) -> JobState {
         JobCompletion::Cancelled => JobState::Cancelled,
         JobCompletion::DurabilityPending => JobState::DurabilityPending,
         JobCompletion::RecoveryRequired => JobState::RecoveryRequired,
+        JobCompletion::Orphaned => JobState::Orphaned,
         JobCompletion::Stale => JobState::Stale,
     }
+}
+
+fn is_local_live_process(binding: &WorkspaceBinding, spec: &JobSpec) -> bool {
+    matches!(&binding.authority, WorkspaceAuthority::Local)
+        && spec.kind == crate::JobKind::Process
+        && spec.effect_scope == crate::EffectScope::LiveWriter
 }
 
 /// Keep the always-present local controller on the same publication fence as

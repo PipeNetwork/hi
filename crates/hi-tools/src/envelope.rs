@@ -18,7 +18,7 @@ use crate::catalog::{
     ArtifactPolicy, EffectScope, OutputPolicy, ReplayClass, ResourceAccess, tool_metadata,
 };
 
-pub const TOOL_ENVELOPE_SCHEMA_VERSION: u16 = 3;
+pub const TOOL_ENVELOPE_SCHEMA_VERSION: u16 = 4;
 pub const TOOL_ENVELOPE_MAX_INLINE_OUTPUT_BYTES: u64 = 50_000;
 const DIGEST_PREFIX: &str = "blake3:";
 
@@ -105,6 +105,10 @@ pub struct ToolEnvelopeContext {
     /// during a ChatOnly wrap-up for cache stability, but the envelope must
     /// still record that none are executable.
     pub tool_mode: ToolMode,
+    /// Host execution authority for this request. This is distinct from
+    /// provider `tool_choice`: an Auto-capable provider may receive a
+    /// read-only catalog for a review turn.
+    pub execution_mode: ToolMode,
     /// Runtime versions for dynamically discovered tools, keyed by advertised
     /// name. Built-ins default to this crate's version; unknown tools stay
     /// explicitly `unknown` unless the selector provides a version here.
@@ -134,7 +138,10 @@ pub struct EnvelopeTool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolEnvelopePayload {
     pub schema_version: u16,
-    /// Exact ordered provider-facing tool list.
+    /// Exact ordered tool list attached to the request and retained as the
+    /// local execution-validation authority. A provider adapter may apply a
+    /// bounded wire transform; that exact model-visible shape is audited
+    /// separately for each attempt.
     pub tools: Vec<EnvelopeTool>,
     /// Exact ordered host-tool list callable only from an admitted
     /// `run_program`. These tools are not provider-facing and therefore do
@@ -147,6 +154,7 @@ pub struct ToolEnvelopePayload {
     pub permissions: BTreeSet<String>,
     pub limits: ToolEnvelopeLimits,
     pub tool_mode: ToolMode,
+    pub execution_mode: ToolMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +226,7 @@ pub async fn seal_chat_only_request(
                 max_tool_argument_bytes,
             },
             tool_mode: ToolMode::ChatOnly,
+            execution_mode: ToolMode::ChatOnly,
             tool_versions: BTreeMap::new(),
         },
     );
@@ -258,23 +267,27 @@ impl ToolEnvelope {
             permissions: context.permissions,
             limits: context.limits,
             tool_mode: context.tool_mode,
+            execution_mode: context.execution_mode,
         };
         let digest = digest_serializable(&payload);
         Self { digest, payload }
     }
 
     pub fn digest_is_valid(&self) -> bool {
-        self.payload.provider.capability_identity_is_valid()
+        self.payload.schema_version == TOOL_ENVELOPE_SCHEMA_VERSION
+            && self.payload.provider.capability_identity_is_valid()
             && self.digest == digest_serializable(&self.payload)
     }
 
     pub fn admits(&self, tool_name: &str) -> bool {
         !matches!(self.payload.tool_mode, ToolMode::ChatOnly)
+            && !matches!(self.payload.execution_mode, ToolMode::ChatOnly)
             && self.payload.tools.iter().any(|tool| tool.name == tool_name)
     }
 
     pub fn admits_program(&self, tool_name: &str) -> bool {
         !matches!(self.payload.tool_mode, ToolMode::ChatOnly)
+            && !matches!(self.payload.execution_mode, ToolMode::ChatOnly)
             && self
                 .payload
                 .program_tools
@@ -294,8 +307,9 @@ impl ToolEnvelope {
             .collect()
     }
 
-    /// Prove the executor received the same ordered provider-facing schemas
-    /// sealed by this envelope, not a broader catalog reconstructed later.
+    /// Prove the executor received the same ordered request schemas sealed by
+    /// this envelope, not a broader catalog reconstructed later. Provider wire
+    /// transforms do not broaden this local execution authority.
     pub fn matches_specs(&self, specs: &[ToolSpec]) -> bool {
         matches_tools(&self.payload.tools, specs)
     }
@@ -395,8 +409,9 @@ impl EnvelopePolicy {
     }
 }
 
-/// Stable digest for just the provider-facing schemas. This is useful for
-/// prompt-cache telemetry before the full workspace/provider context is known.
+/// Stable digest for just the request-advertised schemas. This is useful for
+/// prompt-cache telemetry before the full workspace/provider context is known;
+/// provider-normalized wire schemas have their own per-attempt digest.
 pub fn canonical_tool_schema_digest(specs: &[ToolSpec]) -> String {
     let value = Value::Array(
         specs
@@ -496,6 +511,7 @@ mod tests {
                 max_tool_argument_bytes: hi_ai::MAX_TOOL_ARGUMENT_BYTES as u32,
             },
             tool_mode: ToolMode::Auto,
+            execution_mode: ToolMode::Auto,
             tool_versions: BTreeMap::new(),
         }
     }
@@ -568,6 +584,25 @@ mod tests {
             ToolEnvelope::build(&first, context()).digest,
             ToolEnvelope::build(&second, context()).digest
         );
+    }
+
+    #[test]
+    fn digest_rejects_self_consistent_unsupported_schema_version() {
+        let mut envelope =
+            ToolEnvelope::build(&[spec("read", json!({"type": "object"}))], context());
+        envelope.payload.schema_version = TOOL_ENVELOPE_SCHEMA_VERSION.saturating_add(1);
+        envelope.digest = digest_serializable(&envelope.payload);
+
+        assert!(!envelope.digest_is_valid());
+    }
+
+    #[test]
+    fn chat_only_execution_authority_admits_no_direct_tools() {
+        let mut request = context();
+        request.execution_mode = ToolMode::ChatOnly;
+        let envelope = ToolEnvelope::build(&[spec("read", json!({"type": "object"}))], request);
+
+        assert!(!envelope.admits("read"));
     }
 
     #[test]

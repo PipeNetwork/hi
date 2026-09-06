@@ -13,7 +13,7 @@ use crate::landing::LoadedAgentSession;
 use crate::project_context::{
     load_candidate_project_context_from, load_standing_rules, load_trust_aware_project_context_from,
 };
-use crate::provider::{LiveModelMetadata, provider_label};
+use crate::provider::{LiveModelMetadata, agent_provider_route};
 
 pub(crate) struct BuiltAgent {
     pub agent: Agent,
@@ -44,6 +44,8 @@ pub(crate) fn build_agent(
 ) -> Result<BuiltAgent> {
     hi_tools::configure_browser(settings.browser_enabled, settings.browser_allow_private);
     let measured = session_measured(cli.eval_input.is_some(), cli.report.is_some());
+    let provider_route = agent_provider_route(settings);
+    let capability_route = provider_route.capability_identity.clone();
     let agent_config = AgentConfig {
         execution: if cli.subagent || cli.eval_input.is_some() {
             hi_agent::ExecutionMode::Ephemeral
@@ -56,7 +58,8 @@ pub(crate) fn build_agent(
         },
         routing: hi_agent::AgentRouting {
             model: settings.model.clone(),
-            provider_route: Some(provider_label(settings.provider).to_string()),
+            provider_route: Some(provider_route.label),
+            capability_route: Some(provider_route.capability_identity),
             requested_max_tokens: settings.max_tokens,
             max_tokens,
             max_tokens_explicit: settings.max_tokens_explicit,
@@ -217,7 +220,7 @@ pub(crate) fn build_agent(
     if let Some(capabilities) = &live_metadata.provider_capabilities {
         let registry = hi_ai::ProviderCapabilityRegistry::default();
         registry.seed_observation(
-            hi_ai::CapabilityRoute::new(provider_label(settings.provider), settings.model.clone()),
+            hi_ai::CapabilityRoute::new(capability_route, settings.model.clone()),
             declared_provider_capabilities,
             hi_ai::CapabilityProbeObservation {
                 capabilities: capabilities.clone(),

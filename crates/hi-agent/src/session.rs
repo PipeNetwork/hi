@@ -42,6 +42,13 @@ pub trait SessionSink: Send {
         None
     }
 
+    /// Whether local workspace settlement must wait for this sink to stage
+    /// the exact execution record. Durable built-in sinks opt in; ephemeral
+    /// and compatibility/test sinks retain the legacy post-turn-only path.
+    fn requires_local_workspace_execution_stage(&self) -> bool {
+        false
+    }
+
     /// The model this session currently runs and its context window, for
     /// remote viewers. Called when the sink is attached and again on
     /// `/provider` switches, so a heartbeat never advertises a stale model.
@@ -54,12 +61,32 @@ pub trait SessionSink: Send {
     /// Stage the exact result of an admitted workspace operation for a causal
     /// durability commit.
     ///
-    /// Local-only sessions never call this hook. A PipeFS host must override
-    /// it and durably enqueue the record before returning; the default fails
-    /// closed so a remote workspace can never silently settle against an
-    /// empty or one-step-behind transcript batch.
+    /// A PipeFS host must override this and durably enqueue the record before
+    /// returning. The default fails closed so a local-only sink cannot
+    /// accidentally satisfy a remote causal transcript boundary.
     fn stage_workspace_execution(&mut self, _record: &WorkspaceTranscriptExecution) -> Result<()> {
         anyhow::bail!("this session sink cannot stage a workspace execution transcript")
+    }
+
+    /// Local counterpart to [`Self::stage_workspace_execution`]. The default
+    /// delegates for durable custom sinks that already implement the original
+    /// staging hook; JSONL overrides this without becoming a valid PipeFS sink.
+    fn stage_local_workspace_execution(
+        &mut self,
+        record: &WorkspaceTranscriptExecution,
+        _visible_on_resume: bool,
+    ) -> Result<()> {
+        self.stage_workspace_execution(record)
+    }
+
+    /// Persist that the local controller returned a terminal receipt for the
+    /// staged operation. Durable local sinks must override this. The default
+    /// fails closed; sinks that do not opt into local staging never call it.
+    fn settle_local_workspace_execution(
+        &mut self,
+        _operation_id: &hi_workspace::OperationId,
+    ) -> Result<()> {
+        anyhow::bail!("this session sink cannot acknowledge local workspace settlement")
     }
 
     /// Persist a compaction boundary: the compacted messages replace all prior

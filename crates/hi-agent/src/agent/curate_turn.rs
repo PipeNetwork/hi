@@ -147,13 +147,44 @@ impl crate::Agent {
         if skill.scope == "global" {
             ui.status("(automatic skill requested global scope; kept project-local)");
         }
-        match skills::write_skill(
-            &roots,
-            "project",
-            &skill.name,
-            &skill.description,
-            &skill.body,
-        ) {
+        let declared_paths = vec![roots.project.clone()];
+        let input = serde_json::json!({
+            "name": &skill.name,
+            "scope": "project",
+            "content_digest": hi_tools::envelope::canonical_value_digest(
+                &serde_json::Value::String(skill.body.clone()),
+            ),
+        });
+        let workspace_root = self.workspace_root().to_path_buf();
+        let write = self
+            .run_internal_file_mutation(
+                "auto_curate_skill",
+                "automatic skill curation",
+                &declared_paths,
+                input,
+                || {
+                    let written = skills::write_skill(
+                        &roots,
+                        "project",
+                        &skill.name,
+                        &skill.description,
+                        &skill.body,
+                    )?;
+                    let result = written.as_ref().map_or_else(
+                        || format!("skill {:?} already exists; no bytes changed", skill.name),
+                        |path| {
+                            let relative = path.strip_prefix(&workspace_root).unwrap_or(path);
+                            format!(
+                                "curated project skill at workspace://{}",
+                                relative.display()
+                            )
+                        },
+                    );
+                    Ok((written, result))
+                },
+            )
+            .await;
+        match write {
             Ok(Some(path)) => {
                 self.subagents.auto_skills_written =
                     self.subagents.auto_skills_written.saturating_add(1);
@@ -182,7 +213,7 @@ fn flatten_tool_history_for_chat_only(messages: &mut Vec<Message>) {
                 Content::ToolResult { output, .. } => {
                     flattened.push(Content::Text(format!("[tool result]\n{output}")));
                 }
-                Content::Thinking { .. } => {}
+                Content::Thinking { .. } | Content::ProviderReplay { .. } => {}
                 Content::Image { .. } => {
                     flattened.push(Content::Text("[image omitted]".to_string()));
                 }

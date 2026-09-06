@@ -1,8 +1,10 @@
 //! Per-session agent configuration and the layered-verification stage type.
 
-use hi_ai::{CompatMode, DeepSeekCompat, ReasoningEffort, ToolMode};
 use hi_engine_api::EngineMode;
 use serde::{Deserialize, Serialize};
+
+mod routing;
+pub use routing::{AgentProviderRoute, AgentRouting};
 
 use crate::compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 use crate::{
@@ -517,59 +519,6 @@ impl Default for AgentPaths {
             state_root: std::env::current_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                 .join(".hi"),
-        }
-    }
-}
-
-/// Model identity, sampling, and provider routing.
-#[derive(Clone, Debug)]
-pub struct AgentRouting {
-    pub model: String,
-    /// Human-readable effective provider route, when known by the frontend.
-    pub provider_route: Option<String>,
-    /// The user/config requested output-token cap before live model metadata is
-    /// applied. Kept separately so `/model` switches can recompute the active
-    /// cap without inheriting the previous route's live limit.
-    pub requested_max_tokens: u32,
-    pub max_tokens: u32,
-    /// True when the user deliberately set the cap (CLI or non-default profile).
-    /// Explicit caps are honored, only clamped downward to a model's advertised
-    /// limit.
-    pub max_tokens_explicit: bool,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub output_token_parameter: hi_ai::OutputTokenParameter,
-    pub thinking_budget: Option<u32>,
-    /// Abstract reasoning level (`reasoning_effort`) applied to every main-turn
-    /// request on OpenAI-compatible endpoints that support it; `None` leaves the
-    /// endpoint default. See [`hi_ai::ReasoningEffort`]. Housekeeping calls
-    /// (compaction/memory/recap) deliberately leave this off. Set via
-    /// `--reasoning-effort`, a profile, or `/config reasoning <level>`.
-    pub reasoning_effort: Option<ReasoningEffort>,
-    pub tool_mode: ToolMode,
-    pub compat: CompatMode,
-    pub deepseek_compat: DeepSeekCompat,
-    /// Model context window, when known — used to show how full it is.
-    pub context_window: Option<u32>,
-}
-
-impl Default for AgentRouting {
-    fn default() -> Self {
-        Self {
-            model: String::new(),
-            provider_route: None,
-            requested_max_tokens: 8192,
-            max_tokens: 8192,
-            max_tokens_explicit: false,
-            temperature: None,
-            top_p: None,
-            output_token_parameter: hi_ai::OutputTokenParameter::Auto,
-            thinking_budget: None,
-            reasoning_effort: None,
-            tool_mode: ToolMode::default(),
-            compat: CompatMode::default(),
-            deepseek_compat: DeepSeekCompat::default(),
-            context_window: None,
         }
     }
 }

@@ -37,8 +37,8 @@ fn print_help() {
         "\
 hi tickets — claim Pipe project tickets and run them locally
 
-Pair a project key (`hi /login pipenetwork`, pick the project in the
-dashboard), cd into the repo, then:
+Start interactive `hi`, run `/login pipenetwork`, and pick the project in the
+dashboard; then cd into the repo and run:
 
   hi tickets
 
@@ -332,7 +332,7 @@ impl TicketCredentials {
             })
             .ok_or_else(|| {
                 anyhow!(
-                    "no Pipe project key — run `hi /login pipenetwork` or set PIPENETWORK_API_KEY"
+                    "no Pipe project key — start interactive `hi` and run `/login pipenetwork`, or set PIPENETWORK_API_KEY"
                 )
             })?;
         Ok(Self { origin, api_key })

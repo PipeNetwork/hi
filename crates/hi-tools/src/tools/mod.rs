@@ -3,6 +3,8 @@
 //! File mutations live in [`mutations`]. Advertised specs live in [`crate::catalog`].
 
 mod commit;
+#[cfg(test)]
+mod diff_security_tests;
 mod external;
 mod mutations;
 mod process_tools;
@@ -334,18 +336,34 @@ pub async fn working_tree_diff_plain_in(root: &Path) -> String {
 }
 
 async fn working_tree_diff_impl(root: &Path, color: bool) -> String {
-    let tracked = match run_git_read(root, color, &["--no-pager", "diff", "HEAD"]).await {
+    let tracked = match run_git_read(
+        root,
+        color,
+        &[
+            "--no-pager",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+        ],
+    )
+    .await
+    {
         Ok(out) if out.status == crate::ToolStatus::Succeeded => out.outcome.stdout_summary,
         Ok(out) => {
             let stderr = out.outcome.stderr_summary;
             // Fresh repo with no commits yet: diff against the empty tree instead.
             if stderr.contains("unknown revision") || stderr.contains("ambiguous argument") {
-                run_git_read(root, color, &["--no-pager", "diff"])
-                    .await
-                    .ok()
-                    .filter(|out| out.status == crate::ToolStatus::Succeeded)
-                    .map(|out| out.outcome.stdout_summary)
-                    .unwrap_or_default()
+                run_git_read(
+                    root,
+                    color,
+                    &["--no-pager", "diff", "--no-ext-diff", "--no-textconv"],
+                )
+                .await
+                .ok()
+                .filter(|out| out.status == crate::ToolStatus::Succeeded)
+                .map(|out| out.outcome.stdout_summary)
+                .unwrap_or_default()
             } else if git_diff_failed_not_repo(&stderr) {
                 return "not a git repository; no git diff available".to_string();
             } else {
@@ -553,7 +571,17 @@ async fn run_git_operation_maybe_timeout(
 }
 
 async fn run_git_read(root: &Path, color: bool, args: &[&str]) -> Result<crate::ProcessExecution> {
-    let mut command = Vec::with_capacity(args.len() + 2);
+    let mut command = Vec::with_capacity(args.len() + 7);
+    command.extend(
+        [
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+        ]
+        .map(str::to_string),
+    );
     if color {
         command.extend(["-c".to_string(), "color.ui=always".to_string()]);
     }
@@ -1464,8 +1492,8 @@ mod tests {
     use super::mutations::is_retryable_edit_miss;
     use super::process_tools::{
         BashArgs, auto_background_enabled_from_value, foreground_interactive_command_reason,
-        foreground_interactive_command_reason_at, run_bash_streaming_with_timeout,
-        run_bash_tool_with_auto_background,
+        foreground_interactive_command_reason_at, resolve_foreground_budget_from_values,
+        run_bash_streaming_with_timeout, run_bash_tool_with_auto_background,
     };
     use super::{
         MAX_WRITE_OVERWRITE_BYTES, RuntimeResources, TOOL_SPECS, check_timeout_from_value,
@@ -1961,19 +1989,41 @@ mod tests {
     }
 
     #[test]
-    fn bash_auto_background_is_an_explicit_opt_in() {
-        assert!(!auto_background_enabled_from_value(None));
-        assert!(!auto_background_enabled_from_value(Some("")));
+    fn bash_auto_background_is_safe_by_default_with_explicit_opt_out() {
+        assert!(auto_background_enabled_from_value(None));
+        assert!(auto_background_enabled_from_value(Some("")));
         assert!(!auto_background_enabled_from_value(Some("0")));
         assert!(!auto_background_enabled_from_value(Some("false")));
-        assert!(!auto_background_enabled_from_value(Some("unexpected")));
+        assert!(!auto_background_enabled_from_value(Some("NO")));
+        assert!(!auto_background_enabled_from_value(Some("off")));
+        assert!(auto_background_enabled_from_value(Some("unexpected")));
         assert!(auto_background_enabled_from_value(Some("1")));
         assert!(auto_background_enabled_from_value(Some(" true ")));
         assert!(auto_background_enabled_from_value(Some("YES")));
         assert!(auto_background_enabled_from_value(Some("on")));
     }
 
-    /// Explicit auto-background-on-timeout: a foreground command still running
+    #[test]
+    fn bash_foreground_attachment_is_bounded_when_process_lifetime_is_unlimited() {
+        assert_eq!(
+            resolve_foreground_budget_from_values(None, None),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            resolve_foreground_budget_from_values(None, Some("7")),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            resolve_foreground_budget_from_values(Some(Duration::from_secs(3)), Some("7")),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            resolve_foreground_budget_from_values(None, Some("invalid")),
+            Duration::from_secs(30)
+        );
+    }
+
+    /// Default managed handoff: an unlimited foreground command still running
     /// at its budget is moved to the background (handle returned) instead of
     /// killed. Injecting policy keeps this deterministic and avoids mutating the
     /// process-global environment while other tests execute.
@@ -2000,14 +2050,15 @@ mod tests {
     // child, making the handoff timing flaky under CI load. A dedicated worker
     // thread lets the timer fire independently of the process I/O.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn explicitly_enabled_bash_auto_backgrounds_instead_of_killing() {
+    async fn default_bash_policy_auto_backgrounds_instead_of_stalling() {
         let (root, state) = isolated_ws("bg");
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root).unwrap());
         let background = crate::BackgroundRegistry::default();
+        background.set_foreground_handoff_budget(Some(Duration::from_secs(1)));
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
         let runner = crate::ProcessRunner::new(&root).unwrap();
-        // timeout:1 → foreground budget is 1s; a 600s sleep outlasts it.
+        // Inject a 1s foreground budget; process lifetime remains unlimited.
         let outcome = run_bash_tool_with_auto_background(
             &root,
             &state,
@@ -2025,11 +2076,11 @@ mod tests {
             },
             BashArgs {
                 command: "sleep 600".into(),
-                timeout: Some(1),
+                timeout: None,
                 run_in_background: false,
             },
             &mut |_| {},
-            true,
+            auto_background_enabled_from_value(None),
         )
         .await
         .unwrap();

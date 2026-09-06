@@ -4,20 +4,33 @@
 //! dep-aware scheduler, record results, attach fast-feedback, then return
 //! batch stats for the post-tool Steer phase.
 
+mod admission;
 mod feedback;
 mod observations;
 mod outcome;
+mod plan_updates;
 mod policy;
+mod program_guard;
 mod program_output;
+mod program_settlement;
+mod program_speculation;
+mod terminal;
 
+use admission::{
+    ToolBatchAdmission, emit_stale_workspace_denials, stale_workspace_protocol_failure,
+};
 use feedback::{PendingCheck, append_fast_feedback};
 pub(in crate::agent::turn) use outcome::{ToolBatchOutcome, ToolProtocolFailureKind};
-use outcome::{append_tool_images, emit_capability_request, validate_sealed_tool_call};
+use outcome::{
+    append_tool_images, emit_capability_request, sealed_workspace_staleness,
+    tool_protocol_failure_content, validate_sealed_tool_call, validate_sealed_tool_envelope,
+};
+use plan_updates::{normalize_plan_mode_update, normalize_unsupported_plan_completion};
 use policy::{
-    dry_run_message, parked_or_denied_delegate, parked_or_denied_shell,
-    terminal_background_requires_reconciliation, wait_flavored_call, workspace_execution_report,
-    workspace_mutation_intent, workspace_operation_requires_settlement,
-    workspace_program_execution_report, workspace_program_intent,
+    ProgramPreflightDenial, dry_run_message, execution_mode_denial, parked_or_denied_delegate,
+    parked_or_denied_shell, permitted_call_prefix, remaining_program_call_budget,
+    terminal_background_requires_reconciliation, wait_flavored_call,
+    workspace_operation_requires_settlement, workspace_program_execution_report,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,11 +43,11 @@ use hi_tools::protocol::{
 };
 
 use super::super::speculation::{SpeculationKey, SpeculationRegistry};
-use crate::heuristics::{emit_tool_output, mode_blocks_tool, respects_deps, tool_deps};
+use crate::heuristics::{emit_tool_output, respects_deps, tool_deps};
 use crate::steering::{
-    BashCommandKind, EvidenceTracker, ImplementationTracker, bash_call_waits, bash_command,
-    classify_bash_command, inspection_signature, read_only_blocked_tool_result,
-    read_only_blocks_tool,
+    BashCommandKind, EvidenceTracker, ImplementationTracker, bash_command, classify_bash_command,
+    inspection_signature, read_only_blocked_tool_result, read_only_blocks_tool,
+    tool_result_hash_guard_applies,
 };
 use crate::verify::Snapshot;
 use crate::{
@@ -45,31 +58,10 @@ use hi_ai::Content;
 use hi_workflow::{
     ProgramCall, ProgramHostRequest, ProgramOutcome, ProgramRunParams, extract_safe_literal_calls,
 };
+use program_guard::ProgramRunGuard;
+pub(crate) use program_speculation::ProgramSpeculator;
+use terminal::DeferredToolTerminals;
 use tokio_util::sync::CancellationToken;
-
-/// Owns every task launched for one workflow program. Dropping an async
-/// `JoinHandle` detaches it, and a running `spawn_blocking` task cannot be
-/// aborted. Cancel the cooperative Rhai token before aborting the watcher so a
-/// dropped turn cannot leave an unlimited program consuming a worker forever.
-struct ProgramRunGuard {
-    cancel: CancellationToken,
-    _watcher: tokio_util::task::AbortOnDropHandle<()>,
-}
-
-impl ProgramRunGuard {
-    fn new(cancel: CancellationToken, watcher: tokio::task::JoinHandle<()>) -> Self {
-        Self {
-            cancel,
-            _watcher: tokio_util::task::AbortOnDropHandle::new(watcher),
-        }
-    }
-}
-
-impl Drop for ProgramRunGuard {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
-}
 
 #[derive(Clone)]
 struct ProgramToolRunner {
@@ -84,72 +76,6 @@ struct ProgramToolRunner {
     memory: Option<std::sync::Arc<dyn hi_tools::MemoryBackend>>,
 }
 
-#[derive(Clone)]
-pub(crate) struct ProgramSpeculator {
-    runner: ProgramToolRunner,
-    allowed_tools: std::sync::Arc<BTreeSet<String>>,
-    turn_id: String,
-    enabled: bool,
-    external_allowed: bool,
-    max_calls: usize,
-    context_generation: u64,
-    ledger_revision: u64,
-    external_freshness_epoch: u64,
-}
-
-impl ProgramSpeculator {
-    pub(crate) fn launch(
-        &self,
-        speculation_registry: &SpeculationRegistry,
-        program_id: &str,
-        source: &str,
-    ) {
-        if !self.enabled {
-            return;
-        }
-        for call in extract_safe_literal_calls(source)
-            .into_iter()
-            .take(self.max_calls)
-        {
-            if !self.allowed_tools.contains(&call.name) {
-                continue;
-            }
-            let external = matches!(
-                hi_tools::speculation_class(&call.name),
-                hi_tools::SpeculationClass::IdempotentExternal
-            );
-            if external && !self.external_allowed {
-                continue;
-            }
-            if !matches!(
-                hi_tools::speculation_class(&call.name),
-                hi_tools::SpeculationClass::PureLocal
-                    | hi_tools::SpeculationClass::IdempotentExternal
-            ) {
-                continue;
-            }
-            let args = serde_json::to_string(&call.arguments).unwrap_or_default();
-            let key = SpeculationKey::new(
-                &self.turn_id,
-                program_id,
-                call.occurrence,
-                &call.name,
-                &args,
-                self.context_generation,
-                self.ledger_revision,
-                if external {
-                    self.external_freshness_epoch
-                } else {
-                    0
-                },
-            );
-            let registry = speculation_registry.clone();
-            let runner = self.runner.clone();
-            registry.launch(key, external, async move { runner.execute(&call).await.0 });
-        }
-    }
-}
-
 impl ProgramToolRunner {
     async fn execute(
         &self,
@@ -159,10 +85,11 @@ impl ProgramToolRunner {
         hi_tools::ToolOutcome,
     ) {
         let args = serde_json::to_string(&call.arguments).unwrap_or_default();
-        let allowed = matches!(
+        let allowed = (matches!(
             hi_tools::speculation_class(&call.name),
             hi_tools::SpeculationClass::PureLocal | hi_tools::SpeculationClass::IdempotentExternal
-        ) && hi_tools::is_read_only(&call.name)
+        ) || call.name == "bash_output")
+            && hi_tools::is_read_only(&call.name)
             && call.name != "run_program"
             && hi_tools::is_known_tool(&call.name);
         if !allowed {
@@ -234,146 +161,6 @@ fn saturating_add_scheduler_count(total: &mut u32, additional: usize) {
     *total = total.saturating_add(additional);
 }
 
-/// Constrain a model-authored checklist while the session is in plan mode.
-///
-/// A previously completed step may stay completed when the user re-enters
-/// planning to revise the remaining work. Every other step is executable work
-/// and therefore remains pending until a non-plan turn supplies real evidence.
-fn normalize_plan_mode_update(
-    current: &[hi_tools::PlanStep],
-    proposed: &mut [hi_tools::PlanStep],
-) -> usize {
-    let mut corrected = 0;
-    for (index, step) in proposed.iter_mut().enumerate() {
-        let status = if current.get(index).is_some_and(|existing| {
-            existing.title == step.title && existing.status == PlanStatus::Done
-        }) {
-            PlanStatus::Done
-        } else {
-            PlanStatus::Pending
-        };
-        if step.status != status {
-            step.status = status;
-            corrected += 1;
-        }
-    }
-    corrected
-}
-
-/// Whether a checklist title describes work that normally needs concrete
-/// workspace or validation evidence before it can truthfully become `Done`.
-/// Read-only milestones may still be completed from inspection evidence.
-fn plan_step_requires_execution_evidence(title: &str) -> bool {
-    crate::agent::plan_goal::plan_step_requires_execution_evidence(title)
-}
-
-/// Extract a model-supplied reason that this particular implementation step
-/// did not require a workspace change. A generic top-level recap cannot
-/// self-certify an entire checklist.
-fn plan_step_has_no_change_justification(arguments: &str, index: usize) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
-        return false;
-    };
-    value
-        .get("steps")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|steps| steps.get(index))
-        .and_then(|step| step.get("completion_evidence"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .is_some_and(concrete_no_change_justification)
-}
-
-fn concrete_no_change_justification(reason: &str) -> bool {
-    let normalized = reason
-        .to_ascii_lowercase()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '/' | '_' | '-') {
-                character
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>();
-    let words = normalized.split_whitespace().collect::<Vec<_>>();
-    if reason.chars().count() < 12 || words.len() < 3 {
-        return false;
-    }
-    !matches!(
-        words.join(" ").as_str(),
-        "done"
-            | "already done"
-            | "already complete"
-            | "already completed"
-            | "no change needed"
-            | "no changes needed"
-            | "no change required"
-            | "no changes required"
-            | "not needed"
-            | "not required"
-    )
-}
-
-/// Reject unsupported completion claims on implementation-shaped checklist
-/// steps. Successful mutation, successful validation, or an explicit per-step
-/// no-change justification is required.
-fn normalize_unsupported_plan_completion(
-    current: &[hi_tools::PlanStep],
-    proposed: &mut [hi_tools::PlanStep],
-    arguments: &str,
-    execution_evidence: bool,
-) -> Vec<usize> {
-    // Turn-global mutation/validation proves at most the step that was active
-    // when the work began. Letting one unrelated write or an old passing test
-    // authorize every `done` entry allowed a weak model to clear an entire
-    // durable checklist at once. Additional implementation steps need their
-    // own concrete `completion_evidence`.
-    let evidenced_index = execution_evidence
-        .then(|| {
-            current
-                .iter()
-                .position(|step| step.status == PlanStatus::Active)
-                .or_else(|| {
-                    current
-                        .iter()
-                        .position(|step| step.status == PlanStatus::Pending)
-                })
-                .or_else(|| {
-                    proposed.iter().position(|step| {
-                        step.status == PlanStatus::Done
-                            && plan_step_requires_execution_evidence(&step.title)
-                    })
-                })
-        })
-        .flatten();
-
-    let mut corrected = Vec::new();
-    for (index, step) in proposed.iter_mut().enumerate() {
-        if step.status != PlanStatus::Done || !plan_step_requires_execution_evidence(&step.title) {
-            continue;
-        }
-        let already_done = current.get(index).is_some_and(|existing| {
-            existing.title == step.title && existing.status == PlanStatus::Done
-        });
-        if already_done
-            || evidenced_index == Some(index)
-            || plan_step_has_no_change_justification(arguments, index)
-        {
-            continue;
-        }
-
-        step.status = current
-            .get(index)
-            .filter(|existing| existing.title == step.title)
-            .map(|existing| existing.status)
-            .filter(|status| *status != PlanStatus::Done)
-            .unwrap_or(PlanStatus::Pending);
-        corrected.push(index);
-    }
-    corrected
-}
-
 impl crate::Agent {
     /// Execute `calls` for the current round and append assistant+results.
     #[allow(clippy::too_many_arguments)]
@@ -404,9 +191,85 @@ impl crate::Agent {
         fast_feedback: &mut super::super::fast_feedback::FastFeedbackState,
         ui: &mut dyn Ui,
     ) -> Result<ToolBatchOutcome> {
-        // The negotiated provider limit is part of the sealed request. Even if
-        // the session is configured for wider fan-out, execution may never
-        // exceed what the request advertised and audited.
+        // Keep one error funnel around the whole batch. Once admission
+        // succeeds, no fallible bookkeeping branch may strand the permit in
+        // `Mutating` without an owner: it settles a definite pre-effect
+        // failure and leaves post-dispatch proof to failed-turn cleanup.
+        let active_operation_before = self.workspace_coordination.active_parent_operation();
+        let mut effects_may_have_begun = false;
+        let result = self
+            .execute_tool_batch_inner(
+                calls,
+                completion_content,
+                tool_specs,
+                tool_envelope,
+                read_only_intent,
+                max_parallel_tools,
+                task_contract,
+                implementation_tracker,
+                evidence,
+                progress_tracker,
+                tool_timeline,
+                sched_tool_calls,
+                sched_max_concurrent,
+                sched_serial_runs,
+                speculation_registry,
+                program_fallback_next,
+                program_fallback_used,
+                plan_updated_goal,
+                proposed_goal,
+                turn_snapshot,
+                turn_checkpoint_allowed,
+                turn_checkpoint_created,
+                fast_feedback,
+                &mut effects_may_have_begun,
+                ui,
+            )
+            .await;
+        match result {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(self
+                .finalize_failed_tool_batch_admission(
+                    error,
+                    active_operation_before.as_ref(),
+                    effects_may_have_begun,
+                )
+                .await),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_tool_batch_inner(
+        &mut self,
+        calls: &[(String, String, String)],
+        completion_content: &mut Vec<Content>,
+        tool_specs: &[hi_ai::ToolSpec],
+        tool_envelope: &hi_tools::envelope::ToolEnvelope,
+        read_only_intent: Option<crate::steering::ReviewIntent>,
+        max_parallel_tools: usize,
+        task_contract: &TaskContract,
+        implementation_tracker: &mut ImplementationTracker,
+        evidence: &mut EvidenceTracker,
+        progress_tracker: &mut ProgressTracker,
+        tool_timeline: &mut ToolTimeline,
+        sched_tool_calls: &mut u32,
+        sched_max_concurrent: &mut u32,
+        sched_serial_runs: &mut u32,
+        speculation_registry: &SpeculationRegistry,
+        program_fallback_next: &mut bool,
+        program_fallback_used: &mut bool,
+        plan_updated_goal: &mut bool,
+        proposed_goal: &mut Option<crate::Goal>,
+        turn_snapshot: &mut Option<Snapshot>,
+        turn_checkpoint_allowed: &mut Option<bool>,
+        turn_checkpoint_created: &mut bool,
+        fast_feedback: &mut super::super::fast_feedback::FastFeedbackState,
+        effects_may_have_begun: &mut bool,
+        ui: &mut dyn Ui,
+    ) -> Result<ToolBatchOutcome> {
+        // Fail before any branch can use or mask a corrupt request boundary.
+        validate_sealed_tool_envelope(tool_specs, tool_envelope)?;
+        // Never exceed the parallelism sealed for this request.
         let max_parallel_tools = max_parallel_tools
             .min(usize::from(tool_envelope.payload.limits.max_parallel_calls))
             .max(1);
@@ -431,6 +294,9 @@ impl crate::Agent {
         // announcing any individual tool so ordinary calls cannot look as if
         // they ran and no orphan tool results can enter the transcript.
         if calls.iter().any(|(_, name, _)| name == "run_program") {
+            // Admission occurs inside the program path. If it retains a
+            // permit and then errors, nested effects may already exist.
+            *effects_may_have_begun = true;
             return self
                 .execute_program_batch(
                     calls,
@@ -456,12 +322,9 @@ impl crate::Agent {
         for (id, name, _) in calls {
             emit_capability_request(&mut *ui, id, name);
         }
-        let hash_guard_applies = calls.iter().all(|(_, name, args)| {
-            matches!(
-                name.as_str(),
-                "read" | "list" | "grep" | "glob" | "bash_output"
-            ) || (name == "bash" && bash_call_waits(args))
-        });
+        let hash_guard_applies = calls
+            .iter()
+            .any(|(_, name, args)| tool_result_hash_guard_applies(name, args));
         let mut hashable_idempotent_results = 0usize;
         let mut repeated_idempotent_results = 0usize;
         let mut running_background_poll_results = 0usize;
@@ -473,28 +336,6 @@ impl crate::Agent {
         let mut interrupted_calls = 0usize;
         let mut interrupted_coordination_calls = 0usize;
         let mut protocol_validation_errors = Vec::new();
-        let batch_requires_settlement = !self.config.gates.dry_run
-            && calls.iter().any(|(_, name, arguments)| {
-                workspace_operation_requires_settlement(name, arguments)
-            });
-        let mut workspace_intent = if batch_requires_settlement {
-            let opaque = calls.iter().any(|(_, name, _)| {
-                matches!(name.as_str(), "bash" | "bash_output" | "bash_kill")
-                    || (self.pipefs_workspace_active() && name == "use_tool")
-            });
-            let paths = (!opaque).then(|| {
-                calls
-                    .iter()
-                    .filter_map(|(_, name, arguments)| hi_tools::target_path(name, arguments))
-                    .collect::<Vec<_>>()
-            });
-            let intent = workspace_mutation_intent(calls, paths);
-            self.begin_classified_workspace_operation(intent.clone())
-                .await?;
-            Some(intent)
-        } else {
-            None
-        };
         // Infer within-batch dependencies (a read of a file a mutating
         // call earlier in the batch targeted must observe that mutation;
         // mutating calls serialize). The scheduler below runs ready
@@ -522,12 +363,36 @@ impl crate::Agent {
         // Reserve the remaining hard tool budget for the model-ordered
         // prefix before any ready batch is dispatched. Calls beyond
         // this prefix receive typed denials and are never executed.
-        let permitted_prefix = calls.len().min(
+        let permitted_prefix = permitted_call_prefix(
+            calls.len(),
             self.config
                 .loop_limits
-                .remaining_tool_calls(*sched_tool_calls) as usize,
+                .remaining_tool_calls(*sched_tool_calls),
+            tool_envelope.payload.limits.max_calls_per_round,
         );
         let budget_denied = calls.len().saturating_sub(permitted_prefix);
+        // A digest-valid envelope can still be stale if the workspace was
+        // rebound or another operation settled while the provider request was
+        // in flight. Reject every otherwise executable call as one typed batch
+        // before constructing a mutation intent or crossing an executor
+        // boundary. Steer will request a newly sealed model response.
+        if let Some(message) =
+            sealed_workspace_staleness(tool_envelope, &self.workspace_controller_binding())
+        {
+            emit_stale_workspace_denials(
+                calls,
+                permitted_prefix,
+                &message,
+                &mut results,
+                &mut completed,
+                &mut completion_order,
+                &mut protocol_validation_errors,
+                progress_tracker,
+                &mut tool_progress_labels,
+                tool_timeline,
+                ui,
+            );
+        }
         for (i, (id, name, arguments)) in calls.iter().enumerate().skip(permitted_prefix) {
             ui.tool_call_id(id, name, arguments);
             let content = serde_json::json!({
@@ -560,7 +425,7 @@ impl crate::Agent {
                 entry.completion_index = completion_order.len() as u32;
             }
         }
-        // Pre-pass: resolve calls blocked by read-only intent up front.
+        // Pre-pass: resolve admitted calls blocked by read-only intent up front.
         // They produce instant synthetic error results and mutate
         // nothing, so completing them out of dep order is safe.
         // (`explore`/`delegate`/`record_decision` used to run here too,
@@ -569,6 +434,13 @@ impl crate::Agent {
         // tree — so they now dispatch inside the dep-aware scheduler
         // loop below.)
         for (i, (id, name, arguments)) in calls.iter().enumerate().take(permitted_prefix) {
+            // An unadvertised name belongs to the sealed-envelope protocol
+            // path below, never a runtime-mode policy. Checking admission here
+            // prevents read-only policy from masking an unavailable tool and
+            // feeding it into generic repeat/schema recovery.
+            if completed[i] || !tool_envelope.admits(name) {
+                continue;
+            }
             // Block calls forbidden by the review intent (read-only
             // prompt) OR the session tool_mode. The tool_mode check is
             // essential for the text-promoted tool-call path above: a
@@ -579,10 +451,12 @@ impl crate::Agent {
             let blocked = if read_only_blocks_tool(read_only_intent, name) {
                 Some(read_only_blocked_tool_result(name))
             } else {
-                // Use the session tool_mode, not the per-request mode: text-tool
-                // fallback sets request mode to ChatOnly so the provider won't emit
-                // structured calls, but promoted prose calls must still execute.
-                mode_blocks_tool(self.effective_tool_mode(), name)
+                // A mutable session mode may further narrow sealed authority.
+                execution_mode_denial(
+                    tool_envelope.payload.execution_mode,
+                    self.effective_tool_mode(),
+                    name,
+                )
             };
             if let Some(content) = blocked {
                 ui.tool_call_id(id, name, arguments);
@@ -614,16 +488,8 @@ impl crate::Agent {
             }
         }
         // Calls that survived policy/budget denial are about to cross the
-        // local execution boundary. Validate the declared Draft
-        // 2020-12 schema here: malformed model output receives a typed tool
-        // result and can never reach a workspace-mutating executor.
-        let envelope_error = if !tool_envelope.digest_is_valid() {
-            Some("tool envelope digest does not match its payload".to_string())
-        } else if !tool_envelope.matches_specs(tool_specs) {
-            Some("execution schemas do not match the sealed tool envelope".to_string())
-        } else {
-            None
-        };
+        // local execution boundary. Validate the sealed name and declared
+        // Draft 2020-12 schema before constructing a workspace intent.
         let batch_validation_error = hi_ai::validate_client_tool_batch_limits_with(
             calls
                 .iter()
@@ -639,7 +505,6 @@ impl crate::Agent {
                 continue;
             }
             let failure = match validate_sealed_tool_call(
-                envelope_error.as_deref(),
                 batch_validation_error.as_deref(),
                 id,
                 name,
@@ -650,16 +515,8 @@ impl crate::Agent {
                 Ok(()) => continue,
                 Err(failure) => failure,
             };
-            let error = failure.message.clone();
             ui.tool_call_id(id, name, arguments);
-            let content = serde_json::json!({
-                "error": {
-                    "kind": "tool_protocol_error",
-                    "reason": failure.kind.code(),
-                    "message": error.to_string(),
-                }
-            })
-            .to_string();
+            let content = tool_protocol_failure_content(&failure);
             protocol_validation_errors.push(failure);
             let output = synthetic_tool_outcome(content.clone(), hi_tools::ToolStatus::Denied);
             emit_tool_output(&mut *ui, id, name, &output);
@@ -684,6 +541,39 @@ impl crate::Agent {
                 entry.completion_index = completion_order.len() as u32;
             }
         }
+        let executable_calls = calls
+            .iter()
+            .enumerate()
+            .take(permitted_prefix)
+            .filter(|(index, _)| !completed[*index])
+            .map(|(_, call)| call.clone())
+            .collect::<Vec<_>>();
+        let allow_process_feedback = !self.pipefs_workspace_active()
+            || self.workspace_controller_capabilities().causal_commit;
+        let mut workspace_intent = match self
+            .admit_sealed_tool_batch(&executable_calls, tool_envelope, allow_process_feedback)
+            .await?
+        {
+            ToolBatchAdmission::NotRequired => None,
+            ToolBatchAdmission::Admitted(intent) => Some(intent),
+            ToolBatchAdmission::Stale(message) => {
+                emit_stale_workspace_denials(
+                    calls,
+                    permitted_prefix,
+                    &message,
+                    &mut results,
+                    &mut completed,
+                    &mut completion_order,
+                    &mut protocol_validation_errors,
+                    progress_tracker,
+                    &mut tool_progress_labels,
+                    tool_timeline,
+                    ui,
+                );
+                None
+            }
+        };
+        let mut terminals = DeferredToolTerminals::for_admitted_calls(&executable_calls);
         let mut done = completion_order.len();
         // Dry run: every call that survived policy/budget/protocol denial is a
         // planned action. Print what it *would* do and synthesize a result
@@ -700,7 +590,7 @@ impl crate::Agent {
                 ui.tool_call_id(id, name, arguments);
                 let mut output = synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
                 output.effects.mutation_attempted = mutates;
-                emit_tool_output(&mut *ui, id, name, &output);
+                terminals.emit(&mut *ui, id, name, &output);
                 let progress_label = ToolProgressLabel::new(
                     ProgressKind::None,
                     "dry-run: planned action not executed",
@@ -778,7 +668,7 @@ impl crate::Agent {
                             synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Cancelled);
                         output.effects.mutation_attempted =
                             implementation_tool_call_mutates(name, arguments);
-                        emit_tool_output(&mut *ui, id, name, &output);
+                        terminals.emit(&mut *ui, id, name, &output);
                         let progress_label = ToolProgressLabel::new(
                             ProgressKind::None,
                             progress_detail,
@@ -842,7 +732,7 @@ impl crate::Agent {
                         synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Cancelled);
                     output.effects.mutation_attempted =
                         implementation_tool_call_mutates(name, arguments);
-                    emit_tool_output(&mut *ui, id, name, &output);
+                    terminals.emit(&mut *ui, id, name, &output);
                     results[i] = Some((id.clone(), msg));
                     completed[i] = true;
                     completion_order.push(i);
@@ -889,7 +779,7 @@ impl crate::Agent {
                         let mut output =
                             synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Cancelled);
                         output.effects.mutation_attempted = true;
-                        emit_tool_output(&mut *ui, id, name, &output);
+                        terminals.emit(&mut *ui, id, name, &output);
                         let progress_label = ToolProgressLabel::new(
                             ProgressKind::Weak,
                             "shell mutation parked for approval",
@@ -929,7 +819,7 @@ impl crate::Agent {
                         let (msg, status) = parked_or_denied_shell(&decision);
                         let mut output = synthetic_tool_outcome(msg.clone(), status);
                         output.effects.mutation_attempted = true;
-                        emit_tool_output(&mut *ui, id, name, &output);
+                        terminals.emit(&mut *ui, id, name, &output);
                         let progress_label = ToolProgressLabel::new(
                             ProgressKind::Weak,
                             if decision == ConfirmationResult::Parked {
@@ -965,7 +855,7 @@ impl crate::Agent {
                 // can still rewrite files. Capture both the change
                 // baseline and undo checkpoint before every shell run;
                 // the mutation classifier is only a confirmation hint.
-                self.ensure_turn_snapshot(turn_snapshot).await?;
+                terminals.guard(ui, self.ensure_turn_snapshot(turn_snapshot).await)?;
                 if !self
                     .ensure_turn_checkpoint(turn_checkpoint_allowed, turn_checkpoint_created, ui)
                     .await
@@ -975,7 +865,7 @@ impl crate::Agent {
                     let mut output =
                         synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
                     output.effects.mutation_attempted = true;
-                    emit_tool_output(&mut *ui, id, name, &output);
+                    terminals.emit(&mut *ui, id, name, &output);
                     let progress_label = ToolProgressLabel::new(
                         ProgressKind::Weak,
                         "shell mutation denied without checkpoint",
@@ -1003,9 +893,13 @@ impl crate::Agent {
                     continue;
                 }
                 ui.tool_started_id(id, name, arguments);
+                terminals.started(id, name);
                 ui.tool_call_id(id, name, arguments);
                 let path = hi_tools::target_path(name, arguments).unwrap_or_default();
                 let started = std::time::Instant::now();
+                if workspace_operation_requires_settlement(name, arguments) {
+                    *effects_may_have_begun = true;
+                }
                 let ui_ref: &mut dyn Ui = &mut *ui;
                 let lsp = self.runtime.lsp();
                 let output = execute_streaming_in_runtime_with_runner(
@@ -1022,9 +916,12 @@ impl crate::Agent {
                 )
                 .await;
                 let duration_ms = started.elapsed().as_millis() as u64;
-                self.record_tool_effects(&output.effects)?;
+                terminals.guard(ui, self.record_tool_effects(&output.effects))?;
                 if let Some(background) = &output.background {
-                    self.observe_durable_background_process(background).await?;
+                    terminals.guard(
+                        ui,
+                        self.observe_durable_background_process(background).await,
+                    )?;
                 }
                 // Typed mutations already report exact paths. A foreground
                 // bash command reports its opaque effects from the before/after
@@ -1038,7 +935,7 @@ impl crate::Agent {
                         .iter()
                         .map(|change| change.path.clone())
                         .collect();
-                    self.runtime.reconcile_dirty_paths_async(paths).await?;
+                    terminals.guard(ui, self.runtime.reconcile_dirty_paths_async(paths).await)?;
                 }
                 for change in &output.effects.file_changes {
                     batch_mutated_paths.insert(change.path.clone());
@@ -1052,7 +949,7 @@ impl crate::Agent {
                 let signature = inspection_signature(name, arguments);
                 let signature_was_seen = signature_seen(evidence, &signature);
                 let tracker_before = implementation_tracker.clone();
-                let validation_succeeded = tool_satisfies_validation(&output);
+                let validation_succeeded = tool_satisfies_validation(name, arguments, &output);
                 evidence.record_success(name, arguments, &semantic_output);
                 implementation_tracker.record_tool_result(
                     name,
@@ -1061,6 +958,9 @@ impl crate::Agent {
                     validation_succeeded,
                     output.effects.mutation_applied,
                 );
+                progress_tracker
+                    .tool_guardrail
+                    .observe_workspace_revision(self.runtime.ledger().revision());
                 let progress = progress_tracker
                     .tool_guardrail
                     .record_tool_result_with_effects(
@@ -1107,7 +1007,7 @@ impl crate::Agent {
                     &progress_label,
                     arguments,
                 ));
-                emit_tool_output(&mut *ui, id, name, &output);
+                terminals.emit(&mut *ui, id, name, &output);
                 append_tool_images(&output, &mut vision);
                 results[i] = Some((id.clone(), output.content));
                 self.invalidate_snapshot();
@@ -1160,7 +1060,7 @@ impl crate::Agent {
                                investigate directly."
                         .to_string();
                     let output = explore_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
-                    emit_tool_output(&mut *ui, id, "explore", &output);
+                    terminals.emit(&mut *ui, id, "explore", &output);
                     let signature = inspection_signature("explore", arguments);
                     let progress_label = ToolProgressLabel::new(
                         ProgressKind::Weak,
@@ -1229,7 +1129,8 @@ impl crate::Agent {
                     let signature = inspection_signature("explore", arguments);
                     let signature_was_seen = signature_seen(evidence, &signature);
                     let tracker_before = implementation_tracker.clone();
-                    let validation_succeeded = tool_satisfies_validation(&output);
+                    let validation_succeeded =
+                        tool_satisfies_validation("explore", arguments, &output);
                     evidence.record_success("explore", arguments, &semantic_output);
                     implementation_tracker.record_tool_result(
                         "explore",
@@ -1238,6 +1139,9 @@ impl crate::Agent {
                         validation_succeeded,
                         output.effects.mutation_applied,
                     );
+                    progress_tracker
+                        .tool_guardrail
+                        .observe_workspace_revision(self.runtime.ledger().revision());
                     let progress = progress_tracker
                         .tool_guardrail
                         .record_tool_result_with_effects(
@@ -1274,7 +1178,7 @@ impl crate::Agent {
                         &output,
                         &progress_label,
                     ));
-                    emit_tool_output(&mut *ui, id, "explore", &output);
+                    terminals.emit(&mut *ui, id, "explore", &output);
                     append_tool_images(&output, &mut vision);
                     results[i] = Some((id.clone(), output.content));
                     completed[i] = true;
@@ -1342,7 +1246,7 @@ impl crate::Agent {
                         let mut output =
                             synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
                         output.effects.mutation_attempted = true;
-                        emit_tool_output(&mut *ui, id, "delegate", &output);
+                        terminals.emit(&mut *ui, id, "delegate", &output);
                         let signature = inspection_signature("delegate", arguments);
                         let progress_label =
                             ToolProgressLabel::new(ProgressKind::Weak, label, signature);
@@ -1366,7 +1270,7 @@ impl crate::Agent {
                     }
                     // Capture turn snapshot + checkpoint before any delegate
                     // mutates the tree (same as the serial path).
-                    self.ensure_turn_snapshot(turn_snapshot).await?;
+                    terminals.guard(ui, self.ensure_turn_snapshot(turn_snapshot).await)?;
                     if !self
                         .ensure_turn_checkpoint(
                             turn_checkpoint_allowed,
@@ -1384,7 +1288,7 @@ impl crate::Agent {
                                 .to_string();
                             let output =
                                 synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
-                            emit_tool_output(&mut *ui, id, "delegate", &output);
+                            terminals.emit(&mut *ui, id, "delegate", &output);
                             let signature = inspection_signature("delegate", arguments);
                             let progress_label = ToolProgressLabel::new(
                                 ProgressKind::Weak,
@@ -1428,6 +1332,7 @@ impl crate::Agent {
                     // transactionally serialized, but fast children no longer
                     // wait for the slowest child before reconciliation/UI output.
                     let max_concurrent = parallel_delegate_limit().min(prepared_delegates.len());
+                    *effects_may_have_begun = true;
                     let mut delegate_results =
                         futures_util::stream::iter(prepared_delegates.into_iter().map(
                             |(i, job, ledger_rev)| async move {
@@ -1453,7 +1358,8 @@ impl crate::Agent {
                         let signature = inspection_signature("delegate", arguments);
                         let signature_was_seen = signature_seen(evidence, &signature);
                         let tracker_before = implementation_tracker.clone();
-                        let validation_succeeded = tool_satisfies_validation(&output);
+                        let validation_succeeded =
+                            tool_satisfies_validation("delegate", arguments, &output);
                         evidence.record_success("delegate", arguments, &semantic_output);
                         implementation_tracker.record_tool_result(
                             "delegate",
@@ -1462,6 +1368,9 @@ impl crate::Agent {
                             validation_succeeded,
                             output.effects.mutation_applied,
                         );
+                        progress_tracker
+                            .tool_guardrail
+                            .observe_workspace_revision(self.runtime.ledger().revision());
                         let progress = progress_tracker
                             .tool_guardrail
                             .record_tool_result_with_effects(
@@ -1506,7 +1415,7 @@ impl crate::Agent {
                             &output,
                             &progress_label,
                         ));
-                        emit_tool_output(&mut *ui, id, "delegate", &output);
+                        terminals.emit(&mut *ui, id, "delegate", &output);
                         append_tool_images(&output, &mut vision);
                         results[i] = Some((id.clone(), output.content));
                         completed[i] = true;
@@ -1578,7 +1487,7 @@ impl crate::Agent {
                             let (msg, status) = parked_or_denied_delegate(&decision);
                             let mut output = synthetic_tool_outcome(msg.clone(), status);
                             output.effects.mutation_attempted = true;
-                            emit_tool_output(&mut *ui, id, name, &output);
+                            terminals.emit(&mut *ui, id, name, &output);
                             let progress_label = ToolProgressLabel::new(
                                 ProgressKind::Weak,
                                 "delegate skipped by confirmation",
@@ -1613,7 +1522,7 @@ impl crate::Agent {
                     // parent's verify + changed-files see "no changes", and
                     // leaving no pre-delegate checkpoint for `/undo` to
                     // isolate this turn.
-                    self.ensure_turn_snapshot(turn_snapshot).await?;
+                    terminals.guard(ui, self.ensure_turn_snapshot(turn_snapshot).await)?;
                     if !self
                         .ensure_turn_checkpoint(
                             turn_checkpoint_allowed,
@@ -1626,7 +1535,7 @@ impl crate::Agent {
                         let msg = "Delegate skipped because strict mode requires an available checkpoint.".to_string();
                         let output =
                             synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
-                        emit_tool_output(&mut *ui, id, name, &output);
+                        terminals.emit(&mut *ui, id, name, &output);
                         let progress_label = ToolProgressLabel::new(
                             ProgressKind::Weak,
                             "delegate skipped without checkpoint",
@@ -1656,6 +1565,9 @@ impl crate::Agent {
                 }
                 ui.tool_call_id(id, name, arguments);
                 let started = std::time::Instant::now();
+                if name == "delegate" {
+                    *effects_may_have_begun = true;
+                }
                 let output = match name.as_str() {
                     "explore" => self.handle_explore(arguments, &mut *ui).await,
                     "delegate" => self.handle_delegate(arguments, &mut *ui).await,
@@ -1683,7 +1595,7 @@ impl crate::Agent {
                 let signature = inspection_signature(name, arguments);
                 let signature_was_seen = signature_seen(evidence, &signature);
                 let tracker_before = implementation_tracker.clone();
-                let validation_succeeded = tool_satisfies_validation(&output);
+                let validation_succeeded = tool_satisfies_validation(name, &calls[i].2, &output);
                 evidence.record_success(name, arguments, &semantic_output);
                 implementation_tracker.record_tool_result(
                     name,
@@ -1692,6 +1604,9 @@ impl crate::Agent {
                     validation_succeeded,
                     output.effects.mutation_applied,
                 );
+                progress_tracker
+                    .tool_guardrail
+                    .observe_workspace_revision(self.runtime.ledger().revision());
                 let progress = progress_tracker
                     .tool_guardrail
                     .record_tool_result_with_effects(
@@ -1736,7 +1651,7 @@ impl crate::Agent {
                     &output,
                     &progress_label,
                 ));
-                emit_tool_output(&mut *ui, id, name, &output);
+                terminals.emit(&mut *ui, id, name, &output);
                 append_tool_images(&output, &mut vision);
                 results[i] = Some((id.clone(), output.content));
                 completed[i] = true;
@@ -1785,6 +1700,7 @@ impl crate::Agent {
             // never drift apart in a concurrent batch.
             for &i in &ready {
                 ui.tool_started_id(&calls[i].0, &calls[i].1, &calls[i].2);
+                terminals.started(&calls[i].0, &calls[i].1);
             }
             // A frontend can raise Esc from `tool_started_id` itself. For a
             // concurrent batch, all calls have only been announced and none
@@ -1902,7 +1818,7 @@ impl crate::Agent {
                 !preparation_failures.contains_key(&i)
                     && implementation_tool_call_mutates(&calls[i].1, &calls[i].2)
             }) {
-                self.ensure_turn_snapshot(turn_snapshot).await?;
+                terminals.guard(ui, self.ensure_turn_snapshot(turn_snapshot).await)?;
                 if !self
                     .ensure_turn_checkpoint(turn_checkpoint_allowed, turn_checkpoint_created, ui)
                     .await
@@ -1934,6 +1850,12 @@ impl crate::Agent {
                     )
                 })
                 .collect::<Vec<_>>();
+            if executions.iter().any(|(index, _, failure)| {
+                failure.is_none()
+                    && workspace_operation_requires_settlement(&calls[*index].1, &calls[*index].2)
+            }) {
+                *effects_may_have_begun = true;
+            }
             let outputs: Vec<_> =
                 futures_util::stream::iter(executions.into_iter().map(|(i, prepared, failure)| {
                     let root = &root;
@@ -2005,7 +1927,7 @@ impl crate::Agent {
                 };
                 let mut output = synthetic_tool_outcome(skipped_msg.clone(), status);
                 output.effects.mutation_attempted = true;
-                emit_tool_output(&mut *ui, &calls[i].0, name, &output);
+                terminals.emit(&mut *ui, &calls[i].0, name, &output);
                 results[i] = Some((calls[i].0.clone(), skipped_msg));
                 self.invalidate_snapshot();
                 let progress_label = ToolProgressLabel::new(
@@ -2037,11 +1959,14 @@ impl crate::Agent {
                 || outputs.iter().any(|(index, output)| {
                     output.status == hi_tools::ToolStatus::Succeeded
                         && (output.effects.mutation_applied
-                            || (tool_satisfies_validation(output)
-                                && crate::steering::implementation_tool_call_validates(
-                                    &calls[*index].1,
-                                    &calls[*index].2,
-                                )))
+                            || (tool_satisfies_validation(
+                                &calls[*index].1,
+                                &calls[*index].2,
+                                output,
+                            ) && crate::steering::implementation_tool_call_validates(
+                                &calls[*index].1,
+                                &calls[*index].2,
+                            )))
                 });
             for (i, mut output) in outputs {
                 let name = &calls[i].1;
@@ -2104,10 +2029,13 @@ impl crate::Agent {
                 // with its own result in completion order.
                 ui.tool_call_id(&calls[i].0, name, &calls[i].2);
                 let path = hi_tools::target_path(name, &calls[i].2).unwrap_or_default();
-                self.record_tool_effects(&output.effects)?;
+                terminals.guard(ui, self.record_tool_effects(&output.effects))?;
                 // Poll/kill outcomes are authoritative durability notifications.
                 if let Some(background) = &output.background {
-                    self.observe_durable_background_process(background).await?;
+                    terminals.guard(
+                        ui,
+                        self.observe_durable_background_process(background).await,
+                    )?;
                 }
                 for change in &output.effects.file_changes {
                     batch_mutated_paths.insert(change.path.clone());
@@ -2121,7 +2049,7 @@ impl crate::Agent {
                 let signature = inspection_signature(name, &calls[i].2);
                 let signature_was_seen = signature_seen(evidence, &signature);
                 let tracker_before = implementation_tracker.clone();
-                let validation_succeeded = tool_satisfies_validation(&output);
+                let validation_succeeded = tool_satisfies_validation(name, &calls[i].2, &output);
                 let plan_changed = calls[i].1 == "update_plan"
                     && output
                         .plan
@@ -2136,6 +2064,9 @@ impl crate::Agent {
                     validation_succeeded,
                     output.effects.mutation_applied,
                 );
+                progress_tracker
+                    .tool_guardrail
+                    .observe_workspace_revision(self.runtime.ledger().revision());
                 let progress = progress_tracker
                     .tool_guardrail
                     .record_tool_result_with_effects(
@@ -2182,7 +2113,7 @@ impl crate::Agent {
                     &progress_label,
                     &calls[i].2,
                 ));
-                emit_tool_output(&mut *ui, &calls[i].0, name, &output);
+                terminals.emit(&mut *ui, &calls[i].0, name, &output);
                 append_tool_images(&output, &mut vision);
                 results[i] = Some((calls[i].0.clone(), output.content));
                 // Track the latest plan state so the continue logic can
@@ -2194,11 +2125,11 @@ impl crate::Agent {
                 {
                     if let Some(session) = self.session.as_mut() {
                         if plan_has_pending_steps(plan) {
-                            session.record_plan(plan)?;
+                            terminals.guard(ui, session.record_plan(plan))?;
                         } else {
                             // Keep the completed checklist visible for this live
                             // turn, but do not resurrect it after a restart.
-                            session.clear_plan()?;
+                            terminals.guard(ui, session.clear_plan())?;
                         }
                     }
                     // Publish live state only after its durable write succeeds.
@@ -2240,7 +2171,8 @@ impl crate::Agent {
                     // fast check for the edited file so a syntax/lint
                     // error surfaces during the turn. The check is
                     // awaited after the batch; failures are non-fatal.
-                    if self.config.gates.proactive_verify
+                    if allow_process_feedback
+                        && self.config.gates.proactive_verify
                         && let Some(path) = hi_tools::target_path(&calls[i].1, &calls[i].2)
                         && let Some(cmd) = hi_tools::fast_check_for(&path)
                     {
@@ -2298,17 +2230,33 @@ impl crate::Agent {
             if terminal_background_requires_reconciliation(batch_entries, &pending) {
                 speculation_registry.invalidate_all();
                 let intent = hi_workspace::MutationIntent::reconciliation();
-                self.workspace_coordination
+                if let Err(error) = self
+                    .workspace_coordination
                     .begin_intent(self.workspace_durability.clone(), intent.clone())
-                    .await?;
+                    .await
+                {
+                    terminals.fail(
+                        ui,
+                        format!(
+                            "writer lifecycle completed, but workspace reconciliation could not start: {error:#}"
+                        ),
+                    );
+                    return Err(error);
+                }
+                // Reconciliation covers effects from a writer which already
+                // ran outside this foreground call.
+                *effects_may_have_begun = true;
                 workspace_intent = Some(intent);
             }
         }
+        let reconcile_after_feedback =
+            !pending_checks.is_empty() || !batch_mutated_paths.is_empty();
         append_fast_feedback(
             self,
             calls,
             pending_checks,
             batch_mutated_paths,
+            allow_process_feedback,
             task_contract,
             fast_feedback,
             implementation_tracker,
@@ -2316,44 +2264,29 @@ impl crate::Agent {
             ui,
         )
         .await;
-        // Stage the exact result before remote settlement, then publish it to
-        // the live/provider transcript only after the workspace controller has
-        // returned a receipt. This prevents both a one-step-behind causal batch
-        // and a locally visible false-success result after an ambiguous commit.
+        let feedback_changes = if reconcile_after_feedback && allow_process_feedback {
+            terminals.guard(ui, self.runtime.reconcile_ledger_async().await)?
+        } else {
+            Vec::new()
+        };
         let retained = tool_timeline.as_slice();
         let batch_entries = retained
             .len()
             .checked_sub(calls.len())
             .and_then(|start| retained.get(start..))
             .unwrap_or(&[]);
-        if let Some(intent) = workspace_intent.as_ref() {
-            let execution = workspace_execution_report(intent, batch_entries, calls.len());
-            if let Err(stage_error) = self.stage_active_workspace_execution(
-                calls,
-                completion_content,
-                &results,
-                &execution,
-            ) {
-                let mut indeterminate = execution;
-                indeterminate.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
-                indeterminate.detail = Some(format!(
-                    "workspace effects ran, but their transcript could not be staged: {stage_error:#}"
-                ));
-                return match self
-                    .checkpoint_durable_workspace_with_execution(indeterminate)
-                    .await
-                {
-                    Err(settlement_error) => Err(settlement_error).context(format!(
-                        "workspace transcript staging failed before settlement: {stage_error:#}"
-                    )),
-                    Ok(()) => Err(stage_error).context(
-                        "workspace transcript staging failed; execution remains indeterminate",
-                    ),
-                };
-            }
-            self.checkpoint_durable_workspace_with_execution(execution)
-                .await?;
-        }
+        terminal::publish_after_settlement(
+            self,
+            &mut terminals,
+            ui,
+            workspace_intent.as_ref(),
+            calls,
+            completion_content,
+            &results,
+            batch_entries,
+            &feedback_changes,
+        )
+        .await?;
         self.messages
             .push_assistant_with_results(std::mem::take(completion_content), results);
         if !vision.is_empty() {
@@ -2396,6 +2329,13 @@ impl crate::Agent {
                 .filter(|tool| tool_envelope.admits(&tool.name))
                 .map(|tool| tool.name.clone())
                 .collect(),
+            required_tool_choice_supported: tool_envelope
+                .payload
+                .provider
+                .capability_record
+                .capabilities
+                .tool_choice
+                .required,
             unknown_background_handles: self.runtime.background().unknown_handles(),
             program_fallback_exhausted: false,
         })
@@ -2433,35 +2373,50 @@ impl crate::Agent {
             .find(|(_, (_, name, _))| name == "run_program")
             .expect("program batch is entered with at least one program call");
         let mut outer_status = hi_tools::ToolStatus::Succeeded;
-        let envelope_error = if !tool_envelope.digest_is_valid() {
-            Some("tool envelope digest does not match its payload".to_string())
-        } else if !tool_envelope.matches_specs(tool_specs) {
-            Some("execution schemas do not match the sealed tool envelope".to_string())
-        } else if !tool_envelope.admits("run_program") {
-            Some(format!(
-                "run_program is outside the model request's sealed envelope {}",
-                tool_envelope.digest
-            ))
-        } else {
-            hi_ai::validate_client_tool_call(id, "run_program", arguments, tool_specs)
-                .err()
-                .map(|error| error.to_string())
-        };
-        let (outcome, program_effect_may_have_occurred, workspace_intent) = if calls.len() != 1 {
-            outer_status = hi_tools::ToolStatus::Failed;
+        let mut program_protocol_failure =
+            sealed_workspace_staleness(tool_envelope, &self.workspace_controller_binding())
+                .map(|message| {
+                    outcome::ToolProtocolFailure::stale_workspace("run_program", message)
+                })
+                .or_else(|| {
+                    validate_sealed_tool_call(
+                        None,
+                        id,
+                        "run_program",
+                        arguments,
+                        tool_specs,
+                        tool_envelope,
+                    )
+                    .err()
+                });
+        let hard_budget_exhausted = self
+            .config
+            .loop_limits
+            .remaining_tool_calls(*sched_tool_calls)
+            == 0
+            || tool_envelope.payload.limits.max_calls_per_round == 0;
+        let dry_run = self.config.gates.dry_run;
+        let preflight_denial = ProgramPreflightDenial::for_request(hard_budget_exhausted, dry_run);
+        let (outcome, program_effect_may_have_occurred, workspace_intent) = if let Some(failure) =
+            program_protocol_failure.as_ref()
+        {
+            outer_status = hi_tools::ToolStatus::Denied;
             (
                 ProgramOutcome::Failed {
-                    error: "run_program must be the only tool call in a completion; retry with ordinary structured tools".into(),
+                    error: failure.message.clone(),
                     calls: Vec::new(),
                 },
                 false,
                 None,
             )
-        } else if let Some(error) = envelope_error {
+        } else if let Some(denial) = preflight_denial {
             outer_status = hi_tools::ToolStatus::Denied;
+            (denial.outcome(), false, None)
+        } else if calls.len() != 1 {
+            outer_status = hi_tools::ToolStatus::Failed;
             (
                 ProgramOutcome::Failed {
-                    error,
+                    error: "run_program must be the only tool call in a completion; retry with ordinary structured tools".into(),
                     calls: Vec::new(),
                 },
                 false,
@@ -2487,32 +2442,28 @@ impl crate::Agent {
                         .map(str::to_owned)
                 }) {
                 Some(source) => {
-                    // The nested tool set is selected dynamically. Admit one
-                    // conservative outer operation before the program can
-                    // dispatch any effect, then settle it once with the exact
-                    // provider-facing aggregate result.
-                    let intent = workspace_program_intent("run_program", arguments, None);
-                    match self
-                        .begin_classified_workspace_operation(intent.clone())
-                        .await
-                    {
-                        Ok(()) => {
-                            if self.config.program.speculation_enabled() {
-                                self.launch_program_speculation(
-                                    speculation_registry,
-                                    id,
-                                    &source,
-                                    tool_envelope,
-                                );
-                            }
-                            let remaining_calls = self.max_tool_calls_cap().map(|_| {
-                                self.config
-                                    .loop_limits
-                                    .remaining_tool_calls(*sched_tool_calls)
-                                    .saturating_sub(1) as usize
-                            });
-                            let (outcome, effect_may_have_occurred) = self
-                                .run_program_host(
+                    let admission = self.admit_sealed_program(tool_envelope).await;
+                    match admission {
+                        Ok(intent) => {
+                            let speculative_external_effect =
+                                if self.config.program.speculation_enabled() {
+                                    self.launch_program_speculation(
+                                        speculation_registry,
+                                        id,
+                                        &source,
+                                        tool_envelope,
+                                    )
+                                } else {
+                                    false
+                                };
+                            let turn_calls = self
+                                .config
+                                .loop_limits
+                                .remaining_tool_calls(*sched_tool_calls);
+                            let remaining_calls =
+                                Some(remaining_program_call_budget(tool_envelope, turn_calls));
+                            let (outcome, mut effect_may_have_occurred, terminal_backgrounds) =
+                                self.run_program_host(
                                     source,
                                     id,
                                     speculation_registry,
@@ -2522,17 +2473,46 @@ impl crate::Agent {
                                 )
                                 .await;
                             speculation_registry.cancel_all();
+                            if !terminal_backgrounds.is_empty() {
+                                speculation_registry.invalidate_all();
+                            }
+                            let (intent, reconciled_writer) = self
+                                .admit_terminal_program_reconciliation(
+                                    intent,
+                                    &terminal_backgrounds,
+                                )
+                                .await?;
+                            effect_may_have_occurred |=
+                                reconciled_writer || speculative_external_effect;
                             let _ = speculation_registry.telemetry();
-                            (outcome, effect_may_have_occurred, Some(intent))
+                            (outcome, effect_may_have_occurred, intent)
                         }
-                        Err(error) => (
-                            ProgramOutcome::Failed {
-                                error: format!("workspace operation blocked: {error:#}"),
-                                calls: Vec::new(),
-                            },
-                            false,
-                            None,
-                        ),
+                        Err(error) => {
+                            if let Some(failure) =
+                                stale_workspace_protocol_failure(&error, "run_program")
+                            {
+                                outer_status = hi_tools::ToolStatus::Denied;
+                                let message = failure.message.clone();
+                                program_protocol_failure = Some(failure);
+                                (
+                                    ProgramOutcome::Failed {
+                                        error: message,
+                                        calls: Vec::new(),
+                                    },
+                                    false,
+                                    None,
+                                )
+                            } else {
+                                (
+                                    ProgramOutcome::Failed {
+                                        error: format!("workspace operation blocked: {error:#}"),
+                                        calls: Vec::new(),
+                                    },
+                                    false,
+                                    None,
+                                )
+                            }
+                        }
                     }
                 }
                 None => {
@@ -2557,14 +2537,29 @@ impl crate::Agent {
             // Give the model one ordinary-tool recovery request. This flag is
             // consumed while shaping that next request, so a repeated model
             // failure cannot create an unbounded fallback loop.
-            if *program_fallback_used {
-                program_fallback_exhausted = true;
-            } else {
-                *program_fallback_used = true;
-                *program_fallback_next = true;
+            if program_protocol_failure.is_none() && preflight_denial.is_none() {
+                if *program_fallback_used {
+                    program_fallback_exhausted = true;
+                } else {
+                    *program_fallback_used = true;
+                    *program_fallback_next = true;
+                }
             }
         }
-        let (content, truncation) = program_output::program_output(&outcome);
+        let (content, truncation) = program_protocol_failure.as_ref().map_or_else(
+            || {
+                preflight_denial.map_or_else(
+                    || program_output::program_output(&outcome),
+                    |denial| (denial.content(), hi_tools::TruncationState::Complete),
+                )
+            },
+            |failure| {
+                (
+                    tool_protocol_failure_content(failure),
+                    hi_tools::TruncationState::Complete,
+                )
+            },
+        );
         if calls.len() != 1 {
             // The provider cannot receive an assistant tool-use without a
             // matching result. Keep only the rejected program envelope in
@@ -2586,7 +2581,7 @@ impl crate::Agent {
                 program_effect_may_have_occurred,
             );
             let results = vec![(id.clone(), content.clone())];
-            if let Err(stage_error) = self.stage_active_workspace_execution(
+            if let Err(stage_error) = self.stage_visible_workspace_execution(
                 calls,
                 completion_content,
                 &results,
@@ -2612,6 +2607,8 @@ impl crate::Agent {
                 .await?;
         }
         let mut output = synthetic_tool_outcome(content.clone(), outer_status);
+        output.effects.mutation_attempted =
+            preflight_denial == Some(ProgramPreflightDenial::DryRun);
         output.truncation = truncation;
         ui.tool_call_id(id, "run_program", arguments);
         emit_tool_output(&mut *ui, id, "run_program", &output);
@@ -2639,10 +2636,12 @@ impl crate::Agent {
         };
         // A program is one provider-facing envelope, but each nested operation
         // consumes the same turn budget as an ordinary structured tool call.
-        saturating_add_scheduler_count(sched_tool_calls, 1);
-        saturating_add_scheduler_count(sched_tool_calls, nested_calls);
-        *sched_serial_runs = sched_serial_runs.saturating_add(1);
-        *sched_max_concurrent = (*sched_max_concurrent).max(1);
+        if preflight_denial != Some(ProgramPreflightDenial::Budget) {
+            saturating_add_scheduler_count(sched_tool_calls, 1);
+            saturating_add_scheduler_count(sched_tool_calls, nested_calls);
+            *sched_serial_runs = sched_serial_runs.saturating_add(1);
+            *sched_max_concurrent = (*sched_max_concurrent).max(1);
+        }
         self.messages.push_assistant_with_results(
             std::mem::take(completion_content),
             vec![(id.clone(), content)],
@@ -2660,49 +2659,62 @@ impl crate::Agent {
             plan_changed_this_batch: false,
             interrupted_calls: usize::from(outer_status == hi_tools::ToolStatus::Cancelled),
             interrupted_coordination_calls: 0,
-            protocol_validation_errors: Vec::new(),
+            protocol_validation_errors: program_protocol_failure.into_iter().collect(),
             admitted_tool_names: tool_specs
                 .iter()
                 .filter(|tool| tool_envelope.admits(&tool.name))
                 .map(|tool| tool.name.clone())
                 .collect(),
+            required_tool_choice_supported: tool_envelope
+                .payload
+                .provider
+                .capability_record
+                .capabilities
+                .tool_choice
+                .required,
             unknown_background_handles: self.runtime.background().unknown_handles(),
             program_fallback_exhausted,
         })
     }
 
-    /// Launch only the conservative, explicitly classified prefix of a
-    /// streamed program. This method is shared by the provider-delta path and
-    /// the final completion path; the registry makes repeated prefixes cheap
-    /// and prevents duplicate shadow calls.
+    /// Launch a conservative prefix after validating the outer program call.
     pub(crate) fn launch_program_speculation(
         &self,
         speculation_registry: &SpeculationRegistry,
         program_id: &str,
         source: &str,
         tool_envelope: &hi_tools::envelope::ToolEnvelope,
-    ) {
+    ) -> bool {
         self.program_speculator(tool_envelope)
-            .launch(speculation_registry, program_id, source);
+            .launch(speculation_registry, program_id, source)
     }
 
     pub(crate) fn program_speculator(
         &self,
         tool_envelope: &hi_tools::envelope::ToolEnvelope,
     ) -> ProgramSpeculator {
+        let program_specs: std::sync::Arc<[hi_ai::ToolSpec]> = tool_envelope.program_specs().into();
+        // `run_program` itself consumes one call from the sealed per-round
+        // budget. Shadow work may cover only the remaining nested calls; it
+        // must never get ahead of a denial the real program host would apply.
+        let sealed_nested_calls =
+            usize::from(tool_envelope.payload.limits.max_calls_per_round).saturating_sub(1);
         ProgramSpeculator {
             runner: self.program_tool_runner(),
-            allowed_tools: std::sync::Arc::new(
-                tool_envelope
-                    .payload
-                    .program_tools
-                    .iter()
-                    .map(|tool| tool.name.clone())
-                    .collect(),
-            ),
+            tool_envelope: std::sync::Arc::new(tool_envelope.clone()),
+            program_specs,
             turn_id: format!("turn-{}", self.turn_count),
             enabled: self.config.program.speculation_enabled()
-                && self.provider.capabilities().streamed_tool_call_deltas,
+                && tool_envelope
+                    .payload
+                    .provider
+                    .capability_record
+                    .capabilities
+                    .streamed_tool_call_deltas
+                && tool_envelope.digest_is_valid()
+                && sealed_workspace_staleness(tool_envelope, &self.workspace_controller_binding())
+                    .is_none()
+                && tool_envelope.admits("run_program"),
             // A speculative external request must not get ahead of an
             // approval prompt that the ordinary real path would show. In Ask
             // mode the egress policy currently requires approval for fetch/
@@ -2713,7 +2725,11 @@ impl crate::Agent {
                 self.config.gates.confirm_edits,
                 "web_fetch",
             ),
-            max_calls: self.config.program.max_speculative_calls,
+            max_calls: self
+                .config
+                .program
+                .max_speculative_calls
+                .min(sealed_nested_calls),
             context_generation: self.runtime.context_generation(),
             ledger_revision: self.runtime.ledger().revision(),
             external_freshness_epoch: external_freshness_epoch(
@@ -2730,7 +2746,7 @@ impl crate::Agent {
         max_calls: Option<usize>,
         tool_envelope: &hi_tools::envelope::ToolEnvelope,
         ui: &mut dyn Ui,
-    ) -> (ProgramOutcome, bool) {
+    ) -> (ProgramOutcome, bool, BTreeSet<String>) {
         let tool_specs = tool_envelope.program_specs();
         let cancel = CancellationToken::new();
         let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2759,6 +2775,7 @@ impl crate::Agent {
         let _run_guard = ProgramRunGuard::new(cancel.clone(), watcher);
         let program = async {
             let mut mutated_workspace = false;
+            let mut terminal_backgrounds = BTreeSet::new();
             loop {
                 tokio::select! {
                     joined = &mut task => {
@@ -2766,7 +2783,7 @@ impl crate::Agent {
                             Ok(outcome) => outcome,
                             Err(error) => ProgramOutcome::Failed { error: format!("program worker failed: {error}"), calls: Vec::new() },
                         };
-                        break (outcome, mutated_workspace);
+                        break (outcome, mutated_workspace, terminal_backgrounds);
                     }
                     request = host_rx.recv() => {
                         let Some(request) = request else {
@@ -2781,7 +2798,7 @@ impl crate::Agent {
                                     calls: Vec::new(),
                                 },
                             };
-                            break (outcome, mutated_workspace);
+                            break (outcome, mutated_workspace, terminal_backgrounds);
                         };
                         match request {
                             ProgramHostRequest::ExecuteTool { call, reply } => {
@@ -2802,9 +2819,9 @@ impl crate::Agent {
                                     )
                                     .await
                                 };
-                                let (result, output) = self
-                                    .observe_program_effect(&call, mutates, resolved)
-                                    .await;
+                                let ((result, output), terminal) =
+                                    self.observe_program_effect(&call, resolved).await;
+                                terminal_backgrounds.extend(terminal);
                                 ui.tool_call_id(&format!("program:{}", call.occurrence), &call.name, &serde_json::to_string(&call.arguments).unwrap_or_default());
                                 emit_tool_output(ui, &format!("program:{}", call.occurrence), &call.name, &output);
                                 let _ = reply.send(result);
@@ -2833,24 +2850,20 @@ impl crate::Agent {
                                 let outputs = if serialize_for_durability {
                                     let mut outputs = Vec::with_capacity(authorized_calls.len());
                                     for (call, denied) in authorized_calls {
-                                        let (mutates, resolved) = if let Some(denied) = denied {
-                                            (false, denied)
+                                        let resolved = if let Some(denied) = denied {
+                                            denied
                                         } else {
                                             let mutates = agent.program_call_requires_settlement(&call);
                                             mutated_workspace |= mutates;
-                                            let resolved = agent
+                                            agent
                                                 .resolve_program_call(
                                                     &call,
                                                     program_call_id,
                                                     speculation_registry,
                                                     &cancel,
                                                 )
-                                                .await;
-                                            (mutates, resolved)
+                                                .await
                                         };
-                                        let resolved = agent
-                                            .observe_program_effect(&call, mutates, resolved)
-                                            .await;
                                         outputs.push((call, resolved));
                                     }
                                     outputs
@@ -2883,7 +2896,10 @@ impl crate::Agent {
                                 outputs.sort_by_key(|(call, _)| call.occurrence);
                                 let mut results = Vec::with_capacity(outputs.len());
                                 let mut parallel_error = None;
-                                for (call, (result, output)) in outputs {
+                                for (call, resolved) in outputs {
+                                    let ((result, output), terminal) =
+                                        agent.observe_program_effect(&call, resolved).await;
+                                    terminal_backgrounds.extend(terminal);
                                     let nested_id = format!("program:{}", call.occurrence);
                                     let args = serde_json::to_string(&call.arguments).unwrap_or_default();
                                     ui.tool_call_id(&nested_id, &call.name, &args);
@@ -3005,13 +3021,26 @@ impl crate::Agent {
                 ),
             ));
         }
-        if let Err(error) = hi_ai::validate_client_tool_call(
+        if let Some(message) =
+            sealed_workspace_staleness(tool_envelope, &self.workspace_controller_binding())
+        {
+            return Some(program_denied_result(call, message));
+        }
+        if let Err(error) = hi_ai::validate_client_tool_call_with_limit(
             &format!("program_{}", call.occurrence),
             &call.name,
             &arguments,
             tool_specs,
+            tool_envelope.payload.limits.max_tool_argument_bytes as usize,
         ) {
             return Some(program_denied_result(call, error.to_string()));
+        }
+        if let Some(reason) = execution_mode_denial(
+            tool_envelope.payload.execution_mode,
+            self.effective_tool_mode(),
+            &call.name,
+        ) {
+            return Some(program_denied_result(call, reason));
         }
         if !egress_confirm_required(
             self.permission_mode,
@@ -3050,34 +3079,6 @@ impl crate::Agent {
         }
         let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
         workspace_operation_requires_settlement(&call.name, &arguments)
-    }
-
-    async fn observe_program_effect(
-        &self,
-        call: &ProgramCall,
-        mutates: bool,
-        resolved: (
-            std::result::Result<hi_workflow::ProgramToolResult, String>,
-            hi_tools::ToolOutcome,
-        ),
-    ) -> (
-        std::result::Result<hi_workflow::ProgramToolResult, String>,
-        hi_tools::ToolOutcome,
-    ) {
-        if !mutates {
-            return resolved;
-        }
-        if let Some(background) = &resolved.1.background
-            && let Err(error) = self.observe_durable_background_process(background).await
-        {
-            return program_failed_result(
-                call,
-                format!(
-                    "background process state could not be durably recorded: {error:#}; run /pipefs retry"
-                ),
-            );
-        }
-        resolved
     }
 
     async fn execute_program_tool(
@@ -3145,3 +3146,5 @@ fn external_freshness_epoch(ttl_seconds: u64) -> u64 {
 
 #[cfg(test)]
 mod scheduler_count_tests;
+#[cfg(test)]
+mod speculation_tests;

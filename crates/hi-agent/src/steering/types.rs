@@ -35,6 +35,11 @@ pub(crate) struct ImplementationIntent {
 pub(crate) struct ImplementationTracker {
     pub(crate) mutation_seen: bool,
     pub(crate) substantive_edit_seen: bool,
+    /// Sticky terminal evidence that a turn which owed a workspace mutation
+    /// exhausted its bounded recovery without landing one. Earlier diagnosis
+    /// prose is useful context, but must not turn an unimplemented fix into a
+    /// successful outcome.
+    pub(crate) no_mutation_exhausted: bool,
     /// A mutating call was accepted as a plan under `--dry-run`. This satisfies
     /// the dry-run contract without pretending the workspace actually changed.
     pub(crate) dry_run_mutation_planned: bool,

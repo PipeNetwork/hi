@@ -15,6 +15,17 @@ fn binding() -> WorkspaceBinding {
     )
 }
 
+fn pipefs_binding() -> WorkspaceBinding {
+    WorkspaceBinding::new_pipefs(
+        "controller".into(),
+        "workspace".into(),
+        "session".into(),
+        2,
+        "/work".into(),
+        "/state".into(),
+    )
+}
+
 fn spec(kind: JobKind, effect_scope: EffectScope, name: &str) -> JobSpec {
     JobSpec {
         kind,
@@ -236,7 +247,7 @@ fn candidate_success_requires_merge_and_settlement_and_seals_once() {
 }
 
 #[test]
-fn restart_requires_recovery_for_writers_and_orphans_readers() {
+fn local_restart_requires_recovery_for_candidates_and_orphans_processes_and_readers() {
     let original_binding = binding();
     let registry = WorkspaceJobRegistry::new(original_binding.clone());
     let fence = registry.fence();
@@ -317,7 +328,7 @@ fn restart_requires_recovery_for_writers_and_orphans_readers() {
             .status(&restored_fence, &writer.job_id)
             .unwrap()
             .state,
-        JobState::RecoveryRequired
+        JobState::Orphaned
     );
     assert_eq!(
         restored
@@ -336,7 +347,8 @@ fn restart_requires_recovery_for_writers_and_orphans_readers() {
             .any(|job| job.permit.job_id == stale_candidate.job_id && job.state == JobState::Stale)
     );
     assert!(report.recovery_required.contains(&candidate.job_id));
-    assert!(report.recovery_required.contains(&writer.job_id));
+    assert!(!report.recovery_required.contains(&writer.job_id));
+    assert!(report.orphaned.contains(&writer.job_id));
     assert!(report.orphaned.contains(&reader.job_id));
     assert!(report.stale.contains(&stale_candidate.job_id));
     assert_eq!(
@@ -350,6 +362,66 @@ fn restart_requires_recovery_for_writers_and_orphans_readers() {
             .status,
         BarrierStatus::RecoveryRequired
     );
+}
+
+#[test]
+fn only_local_process_writers_may_overlap_and_pipefs_restore_stays_fail_closed() {
+    let local = WorkspaceJobRegistry::new(binding());
+    let local_fence = local.fence();
+    local
+        .register(
+            &local_fence,
+            spec(JobKind::Process, EffectScope::LiveWriter, "api"),
+        )
+        .unwrap();
+    local
+        .register(
+            &local_fence,
+            spec(JobKind::Process, EffectScope::LiveWriter, "ui"),
+        )
+        .unwrap();
+    assert_eq!(
+        local
+            .register(
+                &local_fence,
+                spec(JobKind::Hook, EffectScope::LiveWriter, "hook"),
+            )
+            .unwrap_err(),
+        JobRegistryError::ActiveLiveWriter
+    );
+
+    let pipefs_binding = pipefs_binding();
+    let pipefs = WorkspaceJobRegistry::new(pipefs_binding.clone());
+    let pipefs_fence = pipefs.fence();
+    let writer = pipefs
+        .register(
+            &pipefs_fence,
+            spec(JobKind::Process, EffectScope::LiveWriter, "remote writer"),
+        )
+        .unwrap();
+    assert_eq!(
+        pipefs
+            .register(
+                &pipefs_fence,
+                spec(JobKind::Process, EffectScope::LiveWriter, "second writer"),
+            )
+            .unwrap_err(),
+        JobRegistryError::ActiveLiveWriter
+    );
+    let (restored, report) = WorkspaceJobRegistry::restore(
+        pipefs_binding,
+        JobRegistryLimits::default(),
+        pipefs.snapshot().jobs,
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .status(&restored.fence(), &writer.job_id)
+            .unwrap()
+            .state,
+        JobState::RecoveryRequired
+    );
+    assert_eq!(report.recovery_required, vec![writer.job_id]);
 }
 
 #[test]

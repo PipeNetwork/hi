@@ -9,10 +9,13 @@ use tokio::sync::watch;
 use crate::job_output::{DEFAULT_OUTPUT_BYTES, JobOutputChunk, JobOutputStream, truncate_output};
 use crate::{
     ArtifactRef, BarrierKind, BarrierReceipt, BarrierStatus, BindingId, ControllerId, EffectScope,
-    JobCompletion, JobId, JobKind, JobPermit, JobSealOutcome, JobSealStatus, JobSpec, JobState,
-    JobTerminal, RecoveryId, WORKSPACE_CONTRACT_SCHEMA_VERSION, WorkspaceBinding,
+    JobCompletion, JobId, JobPermit, JobSealOutcome, JobSealStatus, JobSpec, JobState, JobTerminal,
+    RecoveryId, WORKSPACE_CONTRACT_SCHEMA_VERSION, WorkspaceBinding,
 };
 
+#[path = "job_registry_admission.rs"]
+mod admission;
+use admission::{is_candidate, is_local_live_process, is_preparation, is_write_job};
 #[path = "job_registry_recovery.rs"]
 mod recovery;
 
@@ -240,6 +243,9 @@ impl WorkspaceJobRegistry {
                             report.orphaned.push(job_id.clone());
                             JobState::Orphaned
                         }
+                    } else if is_local_live_process(&binding, &job.permit.spec) {
+                        report.orphaned.push(job_id.clone());
+                        JobState::Orphaned
                     } else if is_write_job(&job.permit.spec) {
                         report.recovery_required.push(job_id.clone());
                         JobState::RecoveryRequired
@@ -289,7 +295,7 @@ impl WorkspaceJobRegistry {
         if matches!(spec.effect_scope, EffectScope::LiveWriter)
             && state.jobs.values().any(|job| {
                 !job.state.is_terminal()
-                    && matches!(job.permit.spec.effect_scope, EffectScope::LiveWriter)
+                    && admission::live_writers_conflict(&state.binding, &spec, &job.permit.spec)
             })
         {
             return Err(JobRegistryError::ActiveLiveWriter);
@@ -732,20 +738,9 @@ fn completion_state(completion: JobCompletion) -> JobState {
         JobCompletion::Cancelled => JobState::Cancelled,
         JobCompletion::DurabilityPending => JobState::DurabilityPending,
         JobCompletion::RecoveryRequired => JobState::RecoveryRequired,
+        JobCompletion::Orphaned => JobState::Orphaned,
         JobCompletion::Stale => JobState::Stale,
     }
-}
-
-fn is_candidate(spec: &JobSpec) -> bool {
-    spec.kind == JobKind::WriteCandidate || matches!(spec.effect_scope, EffectScope::CandidateOnly)
-}
-
-fn is_write_job(spec: &JobSpec) -> bool {
-    is_candidate(spec) || matches!(spec.effect_scope, EffectScope::LiveWriter)
-}
-
-fn is_preparation(spec: &JobSpec) -> bool {
-    is_candidate(spec)
 }
 
 fn active_count(jobs: &BTreeMap<JobId, WorkspaceJobSnapshot>) -> usize {

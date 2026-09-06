@@ -16,7 +16,7 @@ same admission and settlement lifecycle; only the durability authority differs.
 | Authority | Local controller journal plus complete workspace version | Remote head, manifest, lease generation, and transcript cursor |
 | Foreground mutation | Reconcile local bytes, journal the result, then return | Reconcile bytes and publish through the negotiated compatibility or causal protocol |
 | Write agent | Detached candidate; the parent applies verified bytes | Detached candidate; the child never receives the lease and the parent alone publishes |
-| Background live writer | Supported and tracked as a process group | Disabled until pause/checkpoint/resume fencing exists |
+| Background live writer | Local process jobs are tracked but do not serialize unrelated foreground work or other local process jobs | Disabled until pause/checkpoint/resume fencing exists |
 | Ambiguous settlement | Preserve local recovery evidence; foreground work can continue only in the explicit audit-degraded case | Preserve the archive/marker and fail closed until remote proof |
 | Hooks and repository MCP | Available only after folder trust | Disabled for the whole PipeFS binding |
 | Repository guides | Authority-bearing only after folder trust; otherwise data-only | Start data-only; a machine-local trust grant may promote only the prompt context |
@@ -49,6 +49,14 @@ not claim an Exit-barrier receipt. PipeFS continues to reject that option.
 Local sessions keep foreground work available when the audit journal fails,
 but visibly enter `LocalAuditDegraded` and stop admitting resumable writers.
 PipeFS fails closed on journal, lease, head, or transcript ambiguity.
+
+A local `Process + LiveWriter` job is an observability and shutdown record, not
+a workspace authority fence. If Hi restarts while one is recorded active, the
+old lifecycle becomes terminal `Orphaned` and any legacy synthetic
+`crashed_writer_job` marker for that same process is resolved without claiming
+success, cancellation, rollback, process death, or a workspace-byte decision.
+Detached candidates, hooks, unsettled foreground operations, and every PipeFS
+writer retain their recovery fences.
 
 ## Jobs and compatibility commands
 

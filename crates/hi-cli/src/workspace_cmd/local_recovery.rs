@@ -22,7 +22,6 @@ use super::{RecoveryCommand, WorkspaceCommand};
 
 const SCANNER_VERSION: u16 = 1;
 const MAX_ENTRIES: u64 = 200_000;
-const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const RESOLUTION: &str = "Stop every external writer, inspect the current workspace bytes (including VCS metadata), then run `hi workspace recover discard RECOVERY_ID --confirm DIGEST --accept-current-bytes`. This preserves the complete current workspace unchanged and marks only the interrupted lifecycle Failed; it does not infer process reaping, success, cancellation, or rollback.";
 const SETTLED_RESOLUTION: &str = "Stop every external writer, inspect the current workspace bytes (including VCS metadata), then run `hi workspace recover discard RECOVERY_ID --confirm DIGEST --accept-current-bytes`. This preserves both the complete current workspace and the already-terminal lifecycle status while resolving only the stale recovery fence.";
 
@@ -608,13 +607,12 @@ fn scan_workspace(workspace_root: &Path, state_root: &Path) -> Result<Scan> {
         } else if metadata.is_file() {
             hash_field(&mut hasher, b"file");
             hash_field(&mut hasher, &metadata.len().to_le_bytes());
-            byte_count = byte_count
-                .checked_add(metadata.len())
-                .context("workspace byte count overflow")?;
-            ensure!(
-                byte_count <= MAX_BYTES,
-                "workspace scan exceeds {MAX_BYTES} bytes"
-            );
+            // The recovery proof must remain available for large but otherwise
+            // valid workspaces. The content hash is streamed through a bounded
+            // buffer, so an aggregate byte ceiling does not protect memory; it
+            // only makes content-confirmed recovery permanently impossible once
+            // a workspace crosses that ceiling.
+            add_workspace_bytes(&mut byte_count, metadata.len())?;
             let mut file = open_regular(path)?;
             ensure!(
                 file.metadata()?.is_file(),
@@ -648,6 +646,13 @@ fn scan_workspace(workspace_root: &Path, state_root: &Path) -> Result<Scan> {
         byte_count,
         exclusions: exclusions(workspace_root, state_root),
     })
+}
+
+fn add_workspace_bytes(byte_count: &mut u64, file_len: u64) -> Result<()> {
+    *byte_count = byte_count
+        .checked_add(file_len)
+        .context("workspace byte count overflow")?;
+    Ok(())
 }
 
 #[cfg(unix)]

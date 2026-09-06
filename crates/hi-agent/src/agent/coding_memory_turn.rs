@@ -1,14 +1,16 @@
 //! Auto-record durable coding facts after a green verified turn.
 
 use crate::Ui;
-use crate::coding_memory::{CodingFactInput, extract_coding_facts, merge_facts_into_memory};
+use crate::coding_memory::{
+    CodingFactInput, extract_coding_facts, merge_facts_into_workspace_memory,
+};
 use crate::memory::memory_file_at;
 
 impl crate::Agent {
     /// After a turn that passed verification and changed files, extract durable
     /// coding facts (verify command, package ownership, stack, test gate) into
     /// the session decision log and project memory. Best-effort, no model call.
-    pub(crate) fn record_coding_facts_turn_end(&mut self, ui: &mut dyn Ui) {
+    pub(crate) async fn record_coding_facts_turn_end(&mut self, ui: &mut dyn Ui) {
         if !self.report.verify.passed() || self.workspace.last_changed_files.is_empty() {
             return;
         }
@@ -47,7 +49,34 @@ impl crate::Agent {
 
         // Project memory merge is best-effort and independent of the decision log.
         let mem_path = memory_file_at(self.runtime.root());
-        match merge_facts_into_memory(&mem_path, &facts) {
+        let declared_paths = crate::memory::memory_write_paths(&mem_path);
+        let fact_count = facts.len();
+        let workspace_root = self.runtime.root().to_path_buf();
+        let state_root = self.runtime.state_root().to_path_buf();
+        let write = self
+            .run_internal_file_mutation(
+                "record_coding_memory",
+                "record verifier-backed coding memory",
+                &declared_paths,
+                serde_json::json!({ "fact_count": fact_count }),
+                || {
+                    let added = merge_facts_into_workspace_memory(
+                        &workspace_root,
+                        &state_root,
+                        &mem_path,
+                        &facts,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    Ok((
+                        added,
+                        format!(
+                            "recorded {added} new coding-memory bullets from {fact_count} facts"
+                        ),
+                    ))
+                },
+            )
+            .await;
+        match write {
             Ok(0) => {
                 ui.status(&format!(
                     "coding memory · {} decision(s) (memory already current)",

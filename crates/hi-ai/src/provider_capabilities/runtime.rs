@@ -40,6 +40,48 @@ impl CapabilityRoute {
     }
 }
 
+/// Build a stable capability-cache route for one concrete endpoint without
+/// retaining credentials, query parameters, or other endpoint text in audit
+/// records. The provider-family prefix stays human- and policy-readable while
+/// the full digest keeps distinct gateways from sharing observations.
+pub fn endpoint_capability_route(route: &str, endpoint: &str) -> String {
+    let route = normalized_identity(route.to_owned());
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return route;
+    }
+    let identity = sanitized_endpoint_identity(endpoint);
+    format!(
+        "{route}@endpoint:blake3:{}",
+        blake3::hash(identity.as_bytes()).to_hex()
+    )
+}
+
+fn sanitized_endpoint_identity(endpoint: &str) -> String {
+    if let Ok(mut url) = reqwest::Url::parse(endpoint) {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        return url.into();
+    }
+    // Preserve a stable identity for deliberately non-URL routes while still
+    // removing the credential-shaped portions of malformed endpoint strings.
+    let without_fragment = endpoint.split_once('#').map_or(endpoint, |(head, _)| head);
+    let endpoint = without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(head, _)| head);
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{authority}{suffix}")
+}
+
 /// One possible backend for an effective route. Multi-backend routes resolve
 /// each member independently and advertise only their intersection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +220,9 @@ struct RegistryInner {
     probe: Option<Arc<dyn CapabilityProbe>>,
     registered: Mutex<HashMap<CapabilityRoute, ProviderCapabilities>>,
     cache: Mutex<HashMap<CapabilityRoute, CachedProbe>>,
+    /// Per-route single-flight fences. A cache miss must not let concurrent
+    /// model requests fan out into duplicate provider probes.
+    probe_flights: Mutex<HashMap<CapabilityRoute, Arc<tokio::sync::Mutex<()>>>>,
     audit: Mutex<VecDeque<CapabilityProbeAuditRecord>>,
 }
 
@@ -233,6 +278,7 @@ impl ProviderCapabilityRegistry {
                 probe,
                 registered: Mutex::new(HashMap::new()),
                 cache: Mutex::new(HashMap::new()),
+                probe_flights: Mutex::new(HashMap::new()),
                 audit: Mutex::new(VecDeque::new()),
             }),
         }
@@ -243,6 +289,17 @@ impl ProviderCapabilityRegistry {
     pub fn register(&self, target: CapabilityRoute, capabilities: ProviderCapabilities) {
         lock(&self.inner.registered).insert(target.clone(), capabilities);
         lock(&self.inner.cache).remove(&target);
+    }
+
+    /// Start an independent cache generation for a newly selected provider
+    /// route while preserving probe configuration and prior audit evidence.
+    ///
+    /// A new registry, rather than clearing the shared maps in place, keeps
+    /// already-running read jobs on the route generation they started with.
+    pub fn rotated(&self) -> Self {
+        let rotated = Self::new(self.inner.config, self.inner.probe.clone());
+        *lock(&rotated.inner.audit) = lock(&self.inner.audit).clone();
+        rotated
     }
 
     /// Seed a freshly completed external discovery into the same versioned TTL
@@ -351,6 +408,14 @@ impl ProviderCapabilityRegistry {
         now_ms: u64,
         probe_allowed: bool,
     ) -> ResolvedMember {
+        let flight = {
+            let mut flights = lock(&self.inner.probe_flights);
+            flights
+                .entry(candidate.target.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _flight_guard = flight.lock().await;
         let declared = lock(&self.inner.registered)
             .get(&candidate.target)
             .cloned()

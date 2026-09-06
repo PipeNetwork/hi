@@ -12,6 +12,7 @@ mod rsi;
 mod workspace;
 mod workspace_failure;
 mod workspace_shutdown;
+mod workspace_transcript;
 
 use std::sync::Arc;
 
@@ -682,11 +683,10 @@ impl crate::Agent {
             // Never advertise a runner that cannot prove the portable root.
             specs.retain(|spec| spec.name != "delegate");
         }
-        // `run_program` is negotiated at the provider boundary rather than
-        // inserted into the global catalog. This keeps ordinary providers and
-        // text-only routes byte-for-byte on the existing tool set.
+        // Put `run_program` in the candidate catalog before request-specific
+        // routing. Provider constraints and the sealed envelope decide whether
+        // the selected route may execute it.
         if self.config.program.mode_enabled()
-            && self.provider.capabilities().native_tool_calls
             && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
             && !specs.is_empty()
             && !specs.iter().any(|spec| spec.name == "run_program")
@@ -1253,31 +1253,6 @@ impl crate::Agent {
             max_output_tokens,
         );
         self.publish_model_context();
-    }
-
-    /// Update the provider (endpoint + wire format + key) and model for subsequent
-    /// turns. Used by `/provider` to use profiles mid-session. The caller
-    /// builds the new `Arc<dyn Provider>` (e.g. Anthropic vs OpenAI adapter) and
-    /// supplies a model id; pricing/context metadata is refreshed from the
-    /// registry or the provider's live `/models` response.
-    ///
-    /// Safe to call only between turns (the REPL/TUI serialize turns, so a
-    /// command handler runs when no stream is in flight). The conversation
-    /// history is kept — the new provider sees the same messages, just routed to
-    /// a different endpoint.
-    pub fn set_provider(
-        &mut self,
-        provider: Arc<dyn Provider>,
-        model: String,
-        context_window: Option<u32>,
-        requested_max_tokens: u32,
-        max_tokens_explicit: bool,
-        max_output_tokens: Option<u32>,
-    ) {
-        self.provider = provider;
-        self.config.routing.requested_max_tokens = requested_max_tokens;
-        self.config.routing.max_tokens_explicit = max_tokens_explicit;
-        self.set_model(model, context_window, max_output_tokens);
     }
 
     /// Reset the live and persisted context to just the current system prompt.
@@ -2028,7 +2003,16 @@ impl crate::Agent {
     /// continuing after a lost checkpoint would make the advertised recovery
     /// guarantee false.
     pub(crate) fn persist_durable_boundary(&mut self, boundary: &str) -> Result<()> {
-        if self.config.execution.is_durable() {
+        // Exact workspace transcript staging is only recoverable when its
+        // conversational prefix is already in the same durable sink. The
+        // interactive CLI otherwise runs in Ephemeral mode, so a stage fsync
+        // could outrun the user prompt (or a preceding read-only/tool batch)
+        // and restart would have no exact place to publish the result.
+        let requires_workspace_transcript_anchor = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.requires_local_workspace_execution_stage());
+        if self.config.execution.is_durable() || requires_workspace_transcript_anchor {
             self.persist().with_context(|| {
                 format!("durable execution checkpoint failed at {boundary} boundary")
             })?;

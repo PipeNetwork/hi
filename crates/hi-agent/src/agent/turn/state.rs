@@ -99,11 +99,29 @@ pub(super) struct TurnState {
     // --- verify / settle ---
     pub independent_review_status: ReviewStatus,
     pub independent_review_repairs: u32,
+    /// Exact content revision of cumulative reviewable turn paths that most
+    /// recently received a diff-hygiene repair opportunity.
+    pub last_hygiene_repair_revision: Option<String>,
+    /// Exact content revision of cumulative reviewable turn paths that most
+    /// recently received a completion-review repair opportunity. This is
+    /// separate from hygiene because the two reviewers can reach different
+    /// verdicts against the same bytes.
+    pub last_completion_review_repair_revision: Option<String>,
+    /// Exact content revision of cumulative reviewable turn paths plus the
+    /// verifier-stage identity that most recently received a deterministic
+    /// repair opportunity. Including the stage lets a newly exposed later
+    /// stage run once at the same revision while still stopping an identical
+    /// failing check from looping.
+    pub last_verify_failure_repair: Option<(String, String)>,
     /// Why the independent review produced no verdict (provider error, empty
     /// bounded diff, post-pass invalidation). Persisted with the outcome so a
     /// post-mortem can recover what the transient status line said.
     pub review_unavailable_reason: Option<String>,
     pub verification_infrastructure_error: bool,
+    /// A configured verifier was intentionally not executed because a
+    /// managed live writer still held the workspace fence. Kept distinct from
+    /// infrastructure failure and from there being no applicable check.
+    pub verification_deferred_active_writer: bool,
     pub verification_unstable: bool,
     pub last_verify_attributions: Vec<hi_tools::Attribution>,
     pub turn_snapshot: Option<Snapshot>,
@@ -114,6 +132,7 @@ pub(super) struct TurnState {
 impl TurnState {
     /// Project model-round mutables from this owned bag.
     pub(super) fn as_model_round_state(&mut self) -> super::model_round::ModelRoundState<'_> {
+        let mutation_recovery_requires_focus = self.mutation_recovery.requires_mutation_focus();
         super::model_round::ModelRoundState {
             steps: &mut self.steps,
             empty_retries: &mut self.empty_retries,
@@ -164,6 +183,7 @@ impl TurnState {
             read_only_intent: self.read_only_intent,
             implementation_intent: self.implementation_intent,
             expected_mutation: self.expected_mutation,
+            mutation_recovery_requires_focus,
             requested_validation: self.requested_validation,
             input: &self.turn_input,
             user_prompt_tokens: self.user_prompt_tokens,

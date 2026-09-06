@@ -1,7 +1,7 @@
 use super::{
     automatic_workflow_plan_path, canonical_session_identity, completed_session_switch,
-    pipefs_startup_authority_required, sync_session_enabled, top_level_error_code,
-    validate_tui_event_trace_request,
+    pipefs_startup_authority_required, settle_before_post_session_work, sync_session_enabled,
+    top_level_error_code, validate_tui_event_trace_request,
 };
 use crate::config::{Cli, ProviderName, Settings};
 use crate::landing::write_landing;
@@ -19,6 +19,46 @@ use async_trait::async_trait;
 use clap::Parser;
 use hi_ai::{ChatRequest, CompatMode, Completion, Provider, ServedModel, StreamEvent, ToolMode};
 use std::path::PathBuf;
+
+#[tokio::test]
+async fn interactive_shutdown_settles_before_optional_post_session_work() {
+    let phase = std::sync::atomic::AtomicUsize::new(0);
+    settle_before_post_session_work(
+        async {
+            assert_eq!(phase.load(std::sync::atomic::Ordering::SeqCst), 0);
+            phase.store(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+        async {
+            assert_eq!(
+                phase.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "optional feedback/flush work ran before workspace settlement"
+            );
+            phase.store(2, std::sync::atomic::Ordering::SeqCst);
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(phase.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn failed_interactive_settlement_skips_optional_post_session_work() {
+    let post_session_polled = std::sync::atomic::AtomicBool::new(false);
+    let error =
+        settle_before_post_session_work(async { anyhow::bail!("settlement failed") }, async {
+            post_session_polled.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("settlement failed"));
+    assert!(
+        !post_session_polled.load(std::sync::atomic::Ordering::SeqCst),
+        "post-session work must not run after failed authoritative settlement"
+    );
+}
 
 #[test]
 fn canonical_remote_session_identity_survives_a_random_local_cache_name() {
@@ -315,6 +355,17 @@ fn one_shot_exit_codes_follow_v2_outcomes() {
             true,
         ),
         1
+    );
+
+    let mut workspace_blocked = outcome(
+        hi_agent::TurnStatus::Blocked,
+        hi_agent::VerificationStatus::Unverified,
+    );
+    workspace_blocked.stop_reason = hi_agent::TurnStopReason::WorkspaceRecoveryRequired;
+    assert_eq!(
+        one_shot_exit_code(&workspace_blocked, false, false),
+        1,
+        "workspace recovery is a blocked turn, not infrastructure failure"
     );
 
     let mut explicit_cap = outcome(

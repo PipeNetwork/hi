@@ -65,7 +65,7 @@ impl Provider for XaiProvider {
 
         loop {
             let token = self.auth.token().await;
-            let response = crate::http::send_with_retry(
+            let response = match crate::http::send_with_retry(
                 self.http
                     .post(&url)
                     .bearer_auth(&token)
@@ -75,13 +75,24 @@ impl Provider for XaiProvider {
                     .json(&body),
             )
             .await
-            .map_err(|error| {
-                ProviderError::new(
-                    ProviderErrorKind::Outage,
-                    format!("request to xAI Responses endpoint failed: {error}"),
-                )
-                .with_api_contract(None, Some(true), None)
-            })?;
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    sink(StreamEvent::WireAudit(Box::new(request::wire_audit(
+                        &request,
+                        &self.base_url,
+                        &body,
+                        false,
+                        None,
+                    ))));
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::Outage,
+                        format!("request to xAI Responses endpoint failed: {error}"),
+                    )
+                    .with_api_contract(None, Some(true), None)
+                    .into());
+                }
+            };
 
             if response.status().is_success() {
                 sink(StreamEvent::WireAudit(Box::new(request::wire_audit(
@@ -383,6 +394,41 @@ mod tests {
         assert!(body.get("frequency_penalty").is_none());
         assert!(body.get("messages").is_none());
         assert!(body.get("input").is_some());
+    }
+
+    #[tokio::test]
+    async fn transport_failure_keeps_the_attempted_wire_schema_identity() {
+        let mut req = request(vec![bash_tool()], Default::default());
+        req.tool_envelope = Some(std::sync::Arc::new(crate::RequestToolEnvelope {
+            digest: "blake3:sealed-xai".into(),
+            payload: serde_json::json!({"schema_version": 4}),
+        }));
+        let expected_body = super::request::build_body(&req);
+        let provider = XaiProvider::new("http://[invalid".into(), "test".into());
+        let mut audits = Vec::new();
+
+        provider
+            .stream(req, &mut |event| {
+                if let StreamEvent::WireAudit(audit) = event {
+                    audits.push(audit);
+                }
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(audits.len(), 1);
+        assert!(!audits[0].accepted);
+        assert_eq!(audits[0].response_status, None);
+        assert_eq!(
+            audits[0].tool_envelope_digest.as_deref(),
+            Some("blake3:sealed-xai")
+        );
+        assert_eq!(
+            audits[0].tool_schema.as_ref().unwrap().wire_digest,
+            Some(crate::wire_audit::canonical_value_digest(
+                &expected_body["tools"]
+            ))
+        );
     }
 
     #[tokio::test]

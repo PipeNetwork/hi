@@ -326,20 +326,27 @@ impl acp::Agent for HiShell {
             && agent
                 .last_turn_outcome()
                 .is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Cancelled);
-        if result.is_err() && !cancellation_already_finalized {
+        let failed_outcome = if let Err(error) = &result
+            && !cancellation_already_finalized
+        {
             // `run_turn_cancellable` only performs the turn-scoped background
             // kill for ordinary errors before returning; reconcile and
             // finalize those here before persisting the session snapshot. A
             // configured hard timeout already ran Agent-owned Cancel cleanup
             // and intentionally returns its deadline as an Err.
-            if agent
-                .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
+            match agent
+                .cleanup_turn(hi_agent::TurnCleanupKind::for_error(error))
                 .await
-                .is_err()
             {
-                let _ = agent.finalize_failed_turn_snapshot_only();
+                Ok(cleanup) => Some(cleanup.outcome),
+                Err(_) => {
+                    let _ = agent.finalize_failed_turn_snapshot_only();
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
         self.store_snapshot(
             args.session_id.clone(),
             StoredSession {
@@ -360,6 +367,15 @@ impl acp::Agent for HiShell {
                 Ok(acp::PromptResponse::new(stop_reason(&outcome)))
             }
             Err(error) => {
+                if let Some(outcome) = failed_outcome
+                    && outcome.stop_reason.is_workspace_admission()
+                {
+                    if let Some(status) = stop_status(&outcome) {
+                        ui.status(status);
+                    }
+                    ui.flush().await?;
+                    return Ok(acp::PromptResponse::new(stop_reason(&outcome)));
+                }
                 let delivery = ui.flush().await;
                 eprintln!("hi-shell: agent turn failed: {error:#}");
                 delivery?;
@@ -547,6 +563,11 @@ fn stop_reason(outcome: &hi_agent::TurnOutcome) -> acp::StopReason {
         (hi_agent::TurnStatus::Completed, hi_agent::TurnStopReason::ToolLimit) => {
             acp::StopReason::MaxTurnRequests
         }
+        (
+            hi_agent::TurnStatus::Blocked,
+            hi_agent::TurnStopReason::WorkspaceNotReady
+            | hi_agent::TurnStopReason::WorkspaceRecoveryRequired,
+        ) => acp::StopReason::Refusal,
         _ => acp::StopReason::EndTurn,
     }
 }
@@ -584,6 +605,8 @@ fn stop_status(outcome: &hi_agent::TurnOutcome) -> Option<&'static str> {
         hi_agent::TurnStopReason::VerificationUnstable => Some("verification was unstable"),
         hi_agent::TurnStopReason::ReviewObjected => Some("independent review objected"),
         hi_agent::TurnStopReason::ToolModeDenied => Some("required tool use was denied"),
+        hi_agent::TurnStopReason::WorkspaceNotReady => Some("workspace not ready"),
+        hi_agent::TurnStopReason::WorkspaceRecoveryRequired => Some("workspace recovery required"),
         hi_agent::TurnStopReason::ToolLimit => Some("tool-call limit reached"),
         hi_agent::TurnStopReason::InfrastructureFailure => unreachable!(
             "infrastructure failures return before verification-specific status handling"
@@ -943,6 +966,28 @@ mod tests {
             )),
             acp::StopReason::EndTurn
         );
+    }
+
+    #[test]
+    fn workspace_admission_blocks_are_refusals_with_actionable_status() {
+        for (reason, expected_status) in [
+            (
+                hi_agent::TurnStopReason::WorkspaceNotReady,
+                "workspace not ready",
+            ),
+            (
+                hi_agent::TurnStopReason::WorkspaceRecoveryRequired,
+                "workspace recovery required",
+            ),
+        ] {
+            let outcome = outcome(
+                hi_agent::TurnStatus::Blocked,
+                hi_agent::VerificationStatus::Unverified,
+                reason,
+            );
+            assert_eq!(stop_reason(&outcome), acp::StopReason::Refusal);
+            assert_eq!(stop_status(&outcome), Some(expected_status));
+        }
     }
 
     #[test]

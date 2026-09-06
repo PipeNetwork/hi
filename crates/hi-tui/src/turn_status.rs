@@ -93,7 +93,20 @@ fn working_line(app: &App, width: u16) -> Line<'static> {
     let running = th.accent_running;
     let frame_ch = SPINNER[app.spinner % SPINNER.len()];
     let mut left = Vec::new();
-    if let Some((started_at, _)) = blocking_subagent(app) {
+    if cancellation_requested(app) {
+        left.push(Span::styled(
+            format!("{frame_ch} "),
+            Style::default().fg(running).add_modifier(Modifier::BOLD),
+        ));
+        left.push(Span::styled(
+            if app.exit_requested {
+                "Stopping safely, then exiting…"
+            } else {
+                "Stopping safely…"
+            },
+            Style::default().fg(running).add_modifier(Modifier::BOLD),
+        ));
+    } else if let Some((started_at, _)) = blocking_subagent(app) {
         left.push(Span::styled(
             format!("{frame_ch} "),
             Style::default().fg(running).add_modifier(Modifier::BOLD),
@@ -162,13 +175,58 @@ fn working_line(app: &App, width: u16) -> Line<'static> {
     if !right.is_empty() {
         right.push(Span::raw(" "));
     }
-    right.push(Span::styled(
-        "[stop]",
+    let control = Span::styled(
+        control_label(app),
         Style::default()
             .fg(th.accent_error)
             .add_modifier(Modifier::BOLD),
-    ));
+    );
+    right.push(control.clone());
+    if spans_width(&right) > width as usize {
+        right = clip_spans(vec![control], width as usize);
+    }
     pad_ends(left, right, width)
+}
+
+fn cancellation_requested(app: &App) -> bool {
+    app.turn_stop_requested
+}
+
+fn control_label(app: &App) -> &'static str {
+    if app.exit_requested {
+        "[exiting]"
+    } else if cancellation_requested(app) {
+        "[quit]"
+    } else {
+        "[stop]"
+    }
+}
+
+pub(crate) fn control_contains(app: &App, column: u16, row: u16) -> bool {
+    if !app.working {
+        return false;
+    }
+    control_hit(app.turn_status_rect, control_label(app), column, row)
+}
+
+pub(crate) fn exit_escalation_contains(app: &App, mouse: &crossterm::event::MouseEvent) -> bool {
+    app.turn_stop_requested
+        && app.quit_notice.is_some()
+        && matches!(
+            mouse.kind,
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        )
+        && control_hit(app.turn_status_rect, "[quit]", mouse.column, mouse.row)
+}
+
+fn control_hit(area: ratatui::layout::Rect, label: &str, column: u16, row: u16) -> bool {
+    if area.width == 0 || row < area.y || row >= area.y.saturating_add(area.height) {
+        return false;
+    }
+    let width = (display_width(label).min(u16::MAX as usize) as u16).min(area.width);
+    let right = area.x.saturating_add(area.width);
+    let left = right.saturating_sub(width).max(area.x);
+    column >= left && column < right
 }
 
 fn settled_line(app: &App) -> Option<Line<'static>> {
@@ -198,11 +256,9 @@ fn settled_line(app: &App) -> Option<Line<'static>> {
 }
 
 fn pad_ends(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16) -> Line<'static> {
-    let lw: usize = left.iter().map(|s| display_width(s.content.as_ref())).sum();
-    let rw: usize = right
-        .iter()
-        .map(|s| display_width(s.content.as_ref()))
-        .sum();
+    let rw = spans_width(&right);
+    let left = clip_spans(left, (width as usize).saturating_sub(rw));
+    let lw = spans_width(&left);
     let pad = (width as usize).saturating_sub(lw).saturating_sub(rw);
     let mut spans = left;
     if pad > 0 {
@@ -210,6 +266,44 @@ fn pad_ends(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16) -> 
     }
     spans.extend(right);
     Line::from(spans)
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
+}
+
+fn clip_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'static>> {
+    let mut clipped = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let remaining = max_width.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        let width = display_width(span.content.as_ref());
+        if width <= remaining {
+            used += width;
+            clipped.push(span);
+            continue;
+        }
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + width > max_width {
+                break;
+            }
+            used += width;
+            text.push(ch);
+        }
+        if !text.is_empty() {
+            clipped.push(Span::styled(text, span.style));
+        }
+        break;
+    }
+    clipped
 }
 
 fn blocking_subagent(app: &App) -> Option<(std::time::Instant, String)> {
@@ -227,4 +321,71 @@ fn live_background_subagents(app: &App) -> usize {
         .values()
         .filter(|info| info.background && info.live())
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn acknowledges_stop_and_offers_exit_escalation() {
+        let mut app = crate::tests::test_app("openai", "gpt-4o");
+        app.working = true;
+        app.turn_stop_requested = true;
+
+        let line = super::build(&app, 80).expect("working strip");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("Stopping safely…"), "{text}");
+        assert!(text.contains("[quit]"), "{text}");
+
+        app.exit_requested = true;
+        let line = super::build(&app, 80).expect("working strip");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("then exiting"), "{text}");
+        assert!(text.contains("[exiting]"), "{text}");
+    }
+
+    #[test]
+    fn narrow_status_reserves_the_visible_stop_hit_target() {
+        let mut app = crate::tests::test_app("openai", "gpt-4o");
+        app.set_working(true);
+        let line = super::build(&app, 8).expect("working strip");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(line.width(), 8, "{text}");
+        assert!(text.ends_with("[stop]"), "{text}");
+
+        app.turn_status_rect = ratatui::layout::Rect::new(3, 5, 8, 1);
+        assert!(!super::control_contains(&app, 4, 5));
+        assert!(super::control_contains(&app, 5, 5));
+        assert!(super::control_contains(&app, 10, 5));
+
+        let line = super::build(&app, 4).expect("tiny working strip");
+        assert_eq!(line.width(), 4);
+        app.turn_status_rect = ratatui::layout::Rect::new(3, 5, 4, 1);
+        assert!(!super::control_contains(&app, 2, 5));
+        assert!(super::control_contains(&app, 3, 5));
+        assert!(super::control_contains(&app, 6, 5));
+        assert!(!super::control_contains(&app, 7, 5));
+
+        app.turn_stop_requested = true;
+        app.quit_notice = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        app.working = false;
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 6,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(super::exit_escalation_contains(&app, &click));
+    }
 }

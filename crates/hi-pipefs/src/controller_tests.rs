@@ -18,6 +18,8 @@ use crate::{
     PipeFsWorkspaceConfig,
 };
 
+#[path = "controller_compatibility_tests.rs"]
+mod compatibility;
 #[path = "controller_job_limit_tests.rs"]
 mod job_limits;
 #[path = "controller_job_recovery_tests.rs"]
@@ -120,6 +122,9 @@ impl PipeFsSessionBridge for FakeSession {
 struct FakeServer {
     base_url: String,
     causal_calls: Arc<AtomicUsize>,
+    hold_intents: Arc<AtomicBool>,
+    intent_entered: Arc<tokio::sync::Semaphore>,
+    allow_intent: Arc<tokio::sync::Semaphore>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -135,12 +140,21 @@ impl FakeServer {
         let address = listener.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let task_calls = calls.clone();
+        let hold_intents = Arc::new(AtomicBool::new(false));
+        let task_hold_intents = hold_intents.clone();
+        let intent_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let task_intent_entered = intent_entered.clone();
+        let allow_intent = Arc::new(tokio::sync::Semaphore::new(0));
+        let task_allow_intent = allow_intent.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
                 let calls = task_calls.clone();
+                let hold_intents = task_hold_intents.clone();
+                let intent_entered = task_intent_entered.clone();
+                let allow_intent = task_allow_intent.clone();
                 tokio::spawn(async move {
                     let request = read_request(&mut stream).await;
                     let first = request.lines().next().unwrap_or_default();
@@ -155,6 +169,24 @@ impl FakeServer {
                             "transfer_expiry_seconds": 300,
                             "capabilities": [crate::CAUSAL_COMMIT_CAPABILITY],
                             "writer_protocols": [2]
+                        })
+                    } else if first.contains("/operations/") && first.contains("/intent ") {
+                        let request = request
+                            .split("\r\n\r\n")
+                            .nth(1)
+                            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+                            .expect("intent request body");
+                        if hold_intents.load(Ordering::SeqCst) {
+                            intent_entered.add_permits(1);
+                            allow_intent.acquire().await.unwrap().forget();
+                        }
+                        serde_json::json!({
+                            "operation_id": request["operation_id"],
+                            "lease_generation": request["lease_generation"],
+                            "binding_id": request["binding_id"],
+                            "binding_epoch": request["binding_epoch"],
+                            "acknowledged": true,
+                            "replayed": false
                         })
                     } else if first.contains("/operations/") && first.contains("/commit ") {
                         calls.fetch_add(1, Ordering::SeqCst);
@@ -185,6 +217,9 @@ impl FakeServer {
         Self {
             base_url: format!("http://{address}"),
             causal_calls: calls,
+            hold_intents,
+            intent_entered,
+            allow_intent,
             task,
         }
     }
@@ -687,110 +722,4 @@ async fn local_and_fake_pipefs_no_change_traces_are_equivalent() {
     let (_temporary, pipefs, _session, _server) = subject(false).await;
     let pipefs_trace = no_change_trace(&pipefs).await;
     assert_eq!(local_trace, pipefs_trace);
-}
-
-#[test]
-fn protocol_one_requires_the_explicit_current_client_compatibility_adapter() {
-    let config = PipeFsControllerConfig {
-        workspace_id: "workspace".into(),
-        session_id: "session".into(),
-        writer_protocol: 1,
-        causal_commit_available: false,
-        writes_available: true,
-        workspace_root: "/work".into(),
-        state_root: "/state".into(),
-        epoch: 0,
-        allow_protocol_one_writes: false,
-    };
-    assert_eq!(config.writer_mode(), PipeFsWriterMode::ReadOnly);
-    let mut server_read_only = config.clone();
-    server_read_only.writer_protocol = 2;
-    server_read_only.causal_commit_available = true;
-    server_read_only.writes_available = false;
-    assert_eq!(server_read_only.writer_mode(), PipeFsWriterMode::ReadOnly);
-    let mut legacy = config;
-    legacy.allow_protocol_one_writes = true;
-    assert_eq!(legacy.writer_mode(), PipeFsWriterMode::Compatibility);
-}
-
-#[tokio::test]
-async fn compatibility_flush_ambiguity_blocks_until_typed_recovery() {
-    let (temporary, source, session, server) = subject(false).await;
-    let controller = compatibility_controller(&source, session.clone()).await;
-    let capabilities = controller.capabilities();
-    assert!(!capabilities.causal_commit);
-    assert!(capabilities.candidate_apply);
-    assert!(!capabilities.background_writers);
-
-    session
-        .fail_compatibility_flush
-        .store(true, Ordering::SeqCst);
-    let permit = controller
-        .begin(MutationIntent::workspace("legacy foreground"))
-        .await
-        .unwrap();
-    let candidate = controller
-        .register_job(JobSpec {
-            kind: JobKind::WriteCandidate,
-            effect_scope: EffectScope::CandidateOnly,
-            name: "isolated compatibility candidate".into(),
-            limits: JobLimits::default(),
-            parent_operation: Some(permit.record().operation_id.clone()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        controller
-            .seal_job(
-                candidate.job_id,
-                JobTerminal {
-                    completion: JobCompletion::Failed,
-                    detail: None,
-                    artifacts: Vec::new(),
-                },
-            )
-            .await
-            .status,
-        JobSealStatus::Sealed
-    );
-    let outcome = controller
-        .settle(permit, ExecutionReport::succeeded(None))
-        .await;
-    assert_eq!(outcome.status, SettlementStatus::TranscriptPending);
-    assert_eq!(controller.status().state, WorkspaceState::TranscriptPending);
-    let pending_status = source.inner.workspace.status().await;
-    assert!(pending_status.transcript_pending);
-    let controller_state = find_file(temporary.path(), "controller.json");
-    let persisted: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&controller_state).unwrap()).unwrap();
-    assert!(persisted["pending_compatibility"].is_object());
-    assert!(
-        controller
-            .begin(MutationIntent::workspace("blocked"))
-            .await
-            .is_err()
-    );
-    assert_eq!(server.causal_calls.load(Ordering::SeqCst), 0);
-
-    // Simulate a process crash after workspace CAS but before transcript
-    // acknowledgement. A fresh typed controller must reconstruct recovery
-    // from the PipeFS cache instead of dead-ending on the old journal state.
-    drop(controller);
-    let restarted = compatibility_controller(&source, session.clone()).await;
-    assert_eq!(restarted.status().state, WorkspaceState::TranscriptPending);
-
-    session
-        .fail_compatibility_flush
-        .store(false, Ordering::SeqCst);
-    let recovered = restarted
-        .reconcile(restarted.status().recovery_id.unwrap())
-        .await;
-    assert_eq!(recovered.status, RecoveryStatus::Recovered);
-    assert_eq!(session.compatibility_flushes.load(Ordering::SeqCst), 1);
-    assert_eq!(restarted.status().state, WorkspaceState::Ready);
-    let recovered_status = source.inner.workspace.status().await;
-    assert!(!recovered_status.transcript_pending);
-    let persisted: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(controller_state).unwrap()).unwrap();
-    assert!(persisted["pending_compatibility"].is_null());
 }

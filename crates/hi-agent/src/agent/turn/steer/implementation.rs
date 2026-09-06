@@ -5,7 +5,7 @@ use crate::steering::{
     BACKGROUND_WAIT_FINAL_NUDGE, BACKGROUND_WAIT_STATUS_NUDGE, EvidenceTracker,
     IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker, MutationRecovery,
     REREAD_NUDGE, WAIT_POLL_STATIC_NUDGE, bash_call_waits, implementation_text_tool_nudge,
-    tool_validation_retry_nudge, unavailable_tool_retry_nudge,
+    implementation_tool_call_validates, tool_validation_retry_nudge, unavailable_tool_retry_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::ui::Ui;
@@ -20,6 +20,34 @@ use super::RoundControl;
 
 const COMPLETED_PLAN_TOOL_CLOSEOUT: &str =
     "The plan is complete and the successful tool results were retained.";
+
+fn deepseek_schema_recovery_enabled(routing: &crate::config::AgentRouting) -> bool {
+    match routing.deepseek_compat {
+        hi_ai::DeepSeekCompat::On => true,
+        hi_ai::DeepSeekCompat::Off => false,
+        hi_ai::DeepSeekCompat::Auto => {
+            let provider_is_deepseek = routing
+                .provider_route
+                .as_deref()
+                .is_some_and(route_identifies_deepseek)
+                || routing
+                    .capability_route
+                    .as_deref()
+                    .is_some_and(route_identifies_deepseek);
+            let model = routing.model.to_ascii_lowercase().replace(['_', ' '], "-");
+            provider_is_deepseek
+                || (model.contains("deepseek") && (model.contains("v4") || model.contains("flash")))
+        }
+    }
+}
+
+fn route_identifies_deepseek(route: &str) -> bool {
+    route
+        .trim()
+        .split_once('@')
+        .map_or(route.trim(), |(provider, _)| provider)
+        .eq_ignore_ascii_case("deepseek")
+}
 
 impl crate::Agent {
     /// Post-tool Steer: mutation recovery and repeat/idempotent guards.
@@ -38,6 +66,9 @@ impl crate::Agent {
         suppress_bookkeeping_tools_next: &mut bool,
         text_tool_fallback_next: &mut bool,
         tool_validation_text_fallback_used: &mut bool,
+        unavailable_tool_retry_used: &mut bool,
+        stale_workspace_retry_used: &mut bool,
+        provider_exhausted: &mut bool,
         deepseek_strict_fallback_active: &mut bool,
         deepseek_strict_fallback_used: &mut bool,
         ui: &mut dyn Ui,
@@ -91,19 +122,29 @@ impl crate::Agent {
                 .map(|failure| format!("{}: {}", failure.tool, failure.message))
                 .collect::<Vec<_>>()
                 .join("; ");
-            if protocol_validation_errors
+            let stale_workspace = protocol_validation_errors
                 .iter()
-                .any(|failure| failure.kind == ToolProtocolFailureKind::EnvelopeIntegrity)
-            {
-                progress_tracker.record(
-                    ProgressKind::None,
-                    "sealed tool envelope failed integrity validation",
-                    None,
-                );
-                *force_tools_next = false;
-                *text_tool_fallback_next = false;
+                .any(|failure| failure.kind == ToolProtocolFailureKind::StaleWorkspace);
+            if stale_workspace {
+                if !*stale_workspace_retry_used {
+                    *stale_workspace_retry_used = true;
+                    *force_tools_next = !batch.admitted_tool_names.is_empty()
+                        && batch.required_tool_choice_supported;
+                    *text_tool_fallback_next = false;
+                    progress_tracker.force_no_progress_final_answer_next = false;
+                    progress_tracker.prev_added_no_evidence = false;
+                    progress_tracker.prev_call_sig = None;
+                    ui.nudge(
+                        "the workspace changed after the request was sealed; requesting a fresh tool call",
+                    );
+                    self.messages.push_nudge(
+                        NudgeKind::Continue,
+                        "The workspace authority, binding, epoch, or version changed after your preceding request was sealed. None of that response's tool calls were executed. Re-evaluate against the current workspace context and issue a fresh call; do not assume the rejected call ran.",
+                    );
+                    return RoundControl::Continue;
+                }
                 ui.status(&format!(
-                    "sealed tool envelope failed integrity validation; stopping tool recovery ({validation_summary})"
+                    "the workspace kept changing while tool requests were in flight ({validation_summary})"
                 ));
                 return RoundControl::BreakInner(false);
             }
@@ -113,17 +154,25 @@ impl crate::Agent {
                 .map(|failure| failure.tool.as_str())
                 .collect::<Vec<_>>();
             if !unavailable_tools.is_empty() {
-                if *repeat_nudges < self.config.loop_limits.max_repeat_nudges {
-                    *repeat_nudges += 1;
-                    *force_tools_next = !batch.admitted_tool_names.is_empty();
+                let mutation_only_recovery = !implementation_tracker.mutation_seen
+                    && (expected_mutation || implementation_intent.is_some())
+                    && !batch.admitted_tool_names.is_empty()
+                    && batch.admitted_tool_names.iter().all(|name| {
+                        hi_tools::tool_metadata(name).is_some_and(|metadata| {
+                            metadata.capability == hi_tools::ToolCapability::Mutation
+                        })
+                    });
+                if !*unavailable_tool_retry_used {
+                    *unavailable_tool_retry_used = true;
+                    *force_tools_next = !batch.admitted_tool_names.is_empty()
+                        && batch.required_tool_choice_supported;
                     *text_tool_fallback_next = false;
                     progress_tracker.force_no_progress_final_answer_next = false;
                     progress_tracker.prev_added_no_evidence = false;
                     progress_tracker.prev_call_sig = None;
-                    ui.nudge(&format!(
-                        "the model called a tool outside this request's sealed envelope; retrying with the admitted tool list ({repeat_nudges}/{})",
-                        self.config.loop_limits.max_repeat_nudges,
-                    ));
+                    ui.nudge(
+                        "the model called a tool outside this request's sealed envelope; retrying once with the admitted tool list",
+                    );
                     self.messages.push_nudge(
                         NudgeKind::Continue,
                         unavailable_tool_retry_nudge(
@@ -133,14 +182,29 @@ impl crate::Agent {
                     );
                     return RoundControl::Continue;
                 }
+                if mutation_only_recovery {
+                    implementation_tracker.no_mutation_exhausted = true;
+                    progress_tracker.record(
+                        ProgressKind::None,
+                        "model ignored the mutation-only recovery envelope",
+                        None,
+                    );
+                    *force_tools_next = false;
+                    *text_tool_fallback_next = false;
+                    ui.status(
+                        "the model kept selecting unavailable inspection tools after mutation-only recovery; no file changes were made",
+                    );
+                    return RoundControl::BreakInner(false);
+                }
                 ui.status(&format!(
                     "the model kept calling tools outside the sealed envelope ({validation_summary})"
                 ));
+                *provider_exhausted = true;
                 return RoundControl::BreakInner(false);
             }
             if *repeat_nudges < self.config.loop_limits.max_repeat_nudges {
                 if !*deepseek_strict_fallback_used
-                    && self.config.routing.deepseek_compat != hi_ai::DeepSeekCompat::Off
+                    && deepseek_schema_recovery_enabled(&self.config.routing)
                 {
                     *deepseek_strict_fallback_used = true;
                     *deepseek_strict_fallback_active = true;
@@ -149,7 +213,7 @@ impl crate::Agent {
                     );
                 }
                 *repeat_nudges += 1;
-                *force_tools_next = true;
+                *force_tools_next = batch.required_tool_choice_supported;
                 *text_tool_fallback_next = false;
                 progress_tracker.force_no_progress_final_answer_next = false;
                 progress_tracker.prev_added_no_evidence = false;
@@ -241,6 +305,12 @@ impl crate::Agent {
             MutationRecoveryControl::None => {}
             MutationRecoveryControl::Continue => return RoundControl::Continue,
             MutationRecoveryControl::Break => {
+                implementation_tracker.no_mutation_exhausted = true;
+                progress_tracker.record(
+                    ProgressKind::None,
+                    "implementation discovery exhausted without a mutation",
+                    None,
+                );
                 ui.nudge(
                     "implementation discovery budget was exhausted; settling with current evidence",
                 );
@@ -323,13 +393,18 @@ impl crate::Agent {
             return RoundControl::Continue;
         }
         let repeated_result_no_progress = hash_guard_applies
-            && hashable_idempotent_results == calls.len()
-            && repeated_idempotent_results == calls.len();
+            && hashable_idempotent_results > 0
+            && repeated_idempotent_results == hashable_idempotent_results
+            && !tool_progress_labels
+                .iter()
+                .any(|label| label.kind == ProgressKind::Meaningful);
         if repeated_result_no_progress {
             progress_tracker.prev_added_no_evidence = true;
             let repeat_budget_available =
                 *repeat_nudges < self.config.loop_limits.max_repeat_nudges;
-            let no_new_after_mutation = implementation_tracker.mutation_seen;
+            let repeated_validation_result = calls
+                .iter()
+                .any(|(_, name, args)| implementation_tool_call_validates(name, args));
             if repeat_budget_available {
                 *repeat_nudges += 1;
                 let waiting_round = calls
@@ -351,6 +426,11 @@ impl crate::Agent {
                 "the wait-and-check poll returned the same output — nudging the model to diagnose the idle process ({repeat_nudges}/{})",
                 self.config.loop_limits.max_repeat_nudges
             ));
+                } else if repeated_validation_result {
+                    ui.nudge(&format!(
+                        "the model repeated validation for unchanged workspace bytes — nudging it to edit, run a different validation scope, or finish ({repeat_nudges}/{})",
+                        self.config.loop_limits.max_repeat_nudges
+                    ));
                 } else {
                     ui.nudge(&format!(
                 "the model got the same inspection output again — nudging it to act on already-returned evidence ({repeat_nudges}/{})",
@@ -359,6 +439,8 @@ impl crate::Agent {
                 }
                 let base_nudge = if waiting_round {
                     WAIT_POLL_STATIC_NUDGE
+                } else if repeated_validation_result {
+                    "This validation scope already completed with the same result for the current workspace state. Do not vary output filters, grep selectors, line numbers, or presentation flags and run it again. Make a substantive edit, run a genuinely different required validation scope, or finish with the evidence already available."
                 } else {
                     REREAD_NUDGE
                 };
@@ -374,80 +456,103 @@ impl crate::Agent {
             }
             progress_tracker.record(
                 ProgressKind::None,
-                "repeated idempotent tool output",
+                if repeated_validation_result {
+                    "repeated validation result for unchanged workspace"
+                } else {
+                    "repeated idempotent tool output"
+                },
                 no_progress_signature_for_calls(calls),
             );
-            if !no_new_after_mutation {
-                if let Some(intent) = read_only_intent {
-                    // Prefer one force-text recovery when inspection already happened.
-                    if !progress_tracker.force_no_progress_final_answer_next {
-                        progress_tracker.force_no_progress_final_answer_next = true;
-                        *force_tools_next = false;
-                        *repeat_nudges = 0;
-                        ui.nudge(
-                            "review kept getting the same inspection output; forcing a bounded answer",
-                        );
-                        self.messages.push_nudge(
-                            NudgeKind::Continue,
-                            crate::steering::repair_nudge_with_required_next(
-                                crate::steering::ReviewRepairMode::SprawlForceAnswer,
-                                crate::steering::summarize_inspected_evidence_nudge(
-                                    intent, evidence,
-                                ),
-                            ),
-                        );
-                        return RoundControl::Continue;
-                    }
-                    if self.try_no_progress_recovery(progress_tracker, force_tools_next, None, ui) {
-                        progress_tracker.prev_call_sig = None;
-                        return RoundControl::Continue;
-                    }
-                    progress_tracker.record(
-                        ProgressKind::None,
-                        "repeat_same_inspection_output",
-                        None,
+            if let Some(intent) = read_only_intent {
+                // Prefer one force-text recovery when inspection already happened.
+                if !progress_tracker.force_no_progress_final_answer_next {
+                    progress_tracker.force_no_progress_final_answer_next = true;
+                    *force_tools_next = false;
+                    *repeat_nudges = 0;
+                    ui.nudge(
+                        "review kept getting the same inspection output; forcing a bounded answer",
                     );
-                    ui.nudge("review kept getting the same inspection output");
-                    let _ = intent;
-                    return RoundControl::BreakInner(false);
+                    self.messages.push_nudge(
+                        NudgeKind::Continue,
+                        crate::steering::repair_nudge_with_required_next(
+                            crate::steering::ReviewRepairMode::SprawlForceAnswer,
+                            crate::steering::summarize_inspected_evidence_nudge(intent, evidence),
+                        ),
+                    );
+                    return RoundControl::Continue;
                 }
-                if (implementation_intent.is_some() || expected_mutation)
-                    && !implementation_tracker.mutation_seen
-                {
-                    if implementation_tracker.no_change_nudges < 2 {
-                        implementation_tracker.no_change_nudges += 1;
-                        evidence.quality_repair_nudges =
-                            evidence.quality_repair_nudges.saturating_add(1);
-                        let use_text_fallback = implementation_tracker.no_change_nudges >= 2;
-                        *force_tools_next = !use_text_fallback;
-                        *text_tool_fallback_next = use_text_fallback;
-                        ui.nudge(
+                if self.try_no_progress_recovery(progress_tracker, force_tools_next, None, ui) {
+                    progress_tracker.prev_call_sig = None;
+                    return RoundControl::Continue;
+                }
+                progress_tracker.record(ProgressKind::None, "repeat_same_inspection_output", None);
+                ui.nudge("review kept getting the same inspection output");
+                let _ = intent;
+                return RoundControl::BreakInner(false);
+            }
+            if (implementation_intent.is_some() || expected_mutation)
+                && !implementation_tracker.mutation_seen
+            {
+                if implementation_tracker.no_change_nudges < 2 {
+                    implementation_tracker.no_change_nudges += 1;
+                    evidence.quality_repair_nudges =
+                        evidence.quality_repair_nudges.saturating_add(1);
+                    let use_text_fallback = implementation_tracker.no_change_nudges >= 2;
+                    *force_tools_next = !use_text_fallback;
+                    *text_tool_fallback_next = use_text_fallback;
+                    ui.nudge(
                     "implementation repeated equivalent inspection output without editing; nudging the model to edit or scaffold",
                 );
-                        let nudge = if use_text_fallback {
-                            implementation_text_tool_nudge(IMPLEMENTATION_NO_CHANGES_NUDGE)
-                        } else {
-                            IMPLEMENTATION_NO_CHANGES_NUDGE.to_string()
-                        };
-                        self.messages.push_nudge(NudgeKind::Continue, nudge);
-                        return RoundControl::Continue;
-                    }
-
-                    if self.try_no_progress_recovery(progress_tracker, force_tools_next, None, ui) {
-                        progress_tracker.prev_call_sig = None;
-                        return RoundControl::Continue;
-                    }
-                    progress_tracker.record(
-                        ProgressKind::None,
-                        "implementation_repeat_no_edit",
-                        None,
-                    );
-                    ui.nudge(
-                        "implementation repeated equivalent inspection output without editing",
-                    );
-                    return RoundControl::BreakInner(false);
+                    let nudge = if use_text_fallback {
+                        implementation_text_tool_nudge(IMPLEMENTATION_NO_CHANGES_NUDGE)
+                    } else {
+                        IMPLEMENTATION_NO_CHANGES_NUDGE.to_string()
+                    };
+                    self.messages.push_nudge(NudgeKind::Continue, nudge);
+                    return RoundControl::Continue;
                 }
+
+                if self.try_no_progress_recovery(progress_tracker, force_tools_next, None, ui) {
+                    progress_tracker.prev_call_sig = None;
+                    return RoundControl::Continue;
+                }
+                progress_tracker.record(ProgressKind::None, "implementation_repeat_no_edit", None);
+                implementation_tracker.no_mutation_exhausted = true;
+                ui.nudge("implementation repeated equivalent inspection output without editing");
+                return RoundControl::BreakInner(false);
             }
+            // A prior mutation must not grant an unlimited exemption from
+            // convergence. It does mean there is useful work to summarize, so
+            // request one tool-free closeout before settling as typed
+            // no-progress. This preserves completed edits without executing
+            // another copy of the repeated tool.
+            if implementation_tracker.mutation_seen
+                && !progress_tracker.force_no_progress_final_answer_next
+            {
+                progress_tracker.force_no_progress_final_answer_next = true;
+                *force_tools_next = false;
+                ui.nudge(if repeated_validation_result {
+                    "validation kept repeating for unchanged workspace bytes; forcing a final answer"
+                } else {
+                    "tool results kept repeating after a workspace change; forcing a final answer"
+                });
+                self.messages
+                    .push_nudge(NudgeKind::Continue, NO_PROGRESS_FINAL_ANSWER_NUDGE);
+                return RoundControl::Continue;
+            }
+            // No completed mutation is available to summarize. Give the
+            // configured keep-working recovery one chance to choose a
+            // different action; an unchanged repeat after that is terminal.
+            if self.try_no_progress_recovery(progress_tracker, force_tools_next, None, ui) {
+                progress_tracker.prev_call_sig = None;
+                return RoundControl::Continue;
+            }
+            ui.nudge(if repeated_validation_result {
+                "validation kept repeating for unchanged workspace bytes"
+            } else {
+                "tool results kept repeating without new workspace effects"
+            });
+            return RoundControl::BreakInner(false);
         } else if !tool_progress_labels.is_empty() {
             progress_tracker.record_round_from_tools(tool_progress_labels);
             if implementation_tracker.mutation_seen
@@ -478,5 +583,85 @@ impl crate::Agent {
         }
 
         RoundControl::Continue
+    }
+}
+
+#[cfg(test)]
+mod schema_recovery_tests {
+    use super::deepseek_schema_recovery_enabled;
+
+    fn routing_with_capability(
+        compat: hi_ai::DeepSeekCompat,
+        provider: Option<&str>,
+        capability: Option<&str>,
+        model: &str,
+    ) -> crate::config::AgentRouting {
+        crate::config::AgentRouting {
+            provider_route: provider.map(str::to_string),
+            capability_route: capability.map(str::to_string),
+            model: model.to_string(),
+            deepseek_compat: compat,
+            ..crate::config::AgentRouting::default()
+        }
+    }
+
+    fn routing(
+        compat: hi_ai::DeepSeekCompat,
+        provider: Option<&str>,
+        model: &str,
+    ) -> crate::config::AgentRouting {
+        routing_with_capability(compat, provider, None, model)
+    }
+
+    #[test]
+    fn deepseek_schema_recovery_matches_the_provider_auto_identity_rules() {
+        assert!(deepseek_schema_recovery_enabled(&routing(
+            hi_ai::DeepSeekCompat::On,
+            Some("openai"),
+            "custom-alias",
+        )));
+        assert!(!deepseek_schema_recovery_enabled(&routing(
+            hi_ai::DeepSeekCompat::Off,
+            Some("deepseek"),
+            "deepseek-v4-flash",
+        )));
+        assert!(deepseek_schema_recovery_enabled(&routing(
+            hi_ai::DeepSeekCompat::Auto,
+            Some("deepseek"),
+            "custom-alias",
+        )));
+        assert!(deepseek_schema_recovery_enabled(&routing(
+            hi_ai::DeepSeekCompat::Auto,
+            Some("openai"),
+            "DeepSeek_V4_Pro_0813",
+        )));
+        assert!(!deepseek_schema_recovery_enabled(&routing(
+            hi_ai::DeepSeekCompat::Auto,
+            Some("openai"),
+            "DeepSeek-Coder-V2-Lite",
+        )));
+        assert!(!deepseek_schema_recovery_enabled(&routing(
+            hi_ai::DeepSeekCompat::Auto,
+            Some("not-deepseek"),
+            "generic-model",
+        )));
+        assert!(deepseek_schema_recovery_enabled(&routing_with_capability(
+            hi_ai::DeepSeekCompat::Auto,
+            Some("openai"),
+            Some("deepseek@endpoint:blake3:opaque"),
+            "custom-alias",
+        )));
+        assert!(!deepseek_schema_recovery_enabled(&routing_with_capability(
+            hi_ai::DeepSeekCompat::Off,
+            Some("openai"),
+            Some("deepseek@endpoint:blake3:opaque"),
+            "custom-alias",
+        )));
+        assert!(!deepseek_schema_recovery_enabled(&routing_with_capability(
+            hi_ai::DeepSeekCompat::Auto,
+            Some("openai"),
+            Some("not-deepseek@endpoint:blake3:opaque"),
+            "custom-alias",
+        )));
     }
 }

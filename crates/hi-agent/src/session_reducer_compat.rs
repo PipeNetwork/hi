@@ -110,6 +110,14 @@ pub(super) enum LegacySessionMeta {
         #[serde(default)]
         estimated: bool,
     },
+    WorkspaceExecutionStaged {
+        #[serde(default)]
+        visible_on_resume: bool,
+        execution: crate::WorkspaceTranscriptExecution,
+    },
+    WorkspaceExecutionSettled {
+        operation_id: hi_workspace::OperationId,
+    },
     Checkpoints {
         refs: Vec<String>,
     },
@@ -219,6 +227,16 @@ impl From<LegacySessionMeta> for SessionEventKind {
                 cache_creation_tokens,
                 estimated,
             },
+            LegacySessionMeta::WorkspaceExecutionStaged {
+                execution,
+                visible_on_resume,
+            } => Self::WorkspaceExecutionStaged {
+                execution,
+                visible_on_resume,
+            },
+            LegacySessionMeta::WorkspaceExecutionSettled { operation_id } => {
+                Self::WorkspaceExecutionSettled { operation_id }
+            }
             LegacySessionMeta::Checkpoints { refs } => Self::Checkpoints { refs },
             LegacySessionMeta::Compaction { messages } => Self::Compaction { messages },
             LegacySessionMeta::Goal { goal } => Self::Goal { goal },

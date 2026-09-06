@@ -3,9 +3,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-pub use crate::provider_capabilities::ProviderCapabilities;
 use crate::provider_capabilities::{CapabilityRoute, ProviderCapabilityCandidate};
+pub use crate::provider_capabilities::{ProviderCapabilities, ProviderRequestContext};
 use crate::types::{ChatRequest, Completion, StreamEvent, Usage};
+
+mod number_parse;
+use number_parse::largest_number;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderErrorKind {
@@ -622,24 +625,6 @@ fn upper_bound_in_range(text: &str) -> Option<u32> {
     largest_number(&text[open..=close])
 }
 
-fn largest_number(text: &str) -> Option<u32> {
-    let mut best = None;
-    let mut current = String::new();
-    for ch in text.chars().chain(std::iter::once(' ')) {
-        if ch.is_ascii_digit() {
-            current.push(ch);
-        } else if matches!(ch, ',' | '_') && !current.is_empty() {
-            continue;
-        } else if !current.is_empty() {
-            if let Ok(value) = current.parse::<u32>() {
-                best = Some(best.map_or(value, |prev: u32| prev.max(value)));
-            }
-            current.clear();
-        }
-    }
-    best
-}
-
 /// A model backend. Implementations own wire translation and SSE reassembly.
 /// `sink` receives incremental events; the return value is the assembled turn.
 #[async_trait]
@@ -662,6 +647,17 @@ pub trait Provider: Send + Sync {
             CapabilityRoute::new(route, model),
             self.capabilities(),
         )]
+    }
+
+    /// Every backend that may receive this exact request, including fail-open
+    /// routes, so sealing can use their conservative intersection.
+    fn capability_candidates_for_request(
+        &self,
+        route: &str,
+        model: &str,
+        _context: ProviderRequestContext<'_>,
+    ) -> Vec<ProviderCapabilityCandidate> {
+        self.capability_candidates(route, model)
     }
 
     /// Models served by the endpoint, with best-effort live metadata.

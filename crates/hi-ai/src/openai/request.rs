@@ -922,7 +922,8 @@ pub(crate) fn to_openai_messages_with_capabilities(
                         })),
                         crate::types::Content::ToolResult { .. } => {}
                         // Images don't appear in assistant turns; ignore them.
-                        crate::types::Content::Image { .. } => {}
+                        crate::types::Content::Image { .. }
+                        | crate::types::Content::ProviderReplay { .. } => {}
                     }
                 }
                 let mut msg = json!({ "role": "assistant" });

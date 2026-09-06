@@ -3,7 +3,7 @@ use super::*;
 const CLI_COMMANDS_HELP: &str = "\
 Commands:
   setup              Interactive provider wizard (bare `hi setup` only)
-  auth               Paste and verify an API key (openai / anthropic / xai)
+  auth               Paste and verify an API key (openai / anthropic / pipenetwork / xai)
   browser            Install the Chrome debugger extension (`install`)
   doctor             Diagnose config, credentials, git, and MCP
   debug tui          Deterministic TUI JSONL harness (`--stdio`)

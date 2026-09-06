@@ -5,6 +5,9 @@ use serde_json::{Map, Value, json};
 
 use crate::{EffectiveProviderCapabilities, MAX_TOOL_ARGUMENT_BYTES, ToolMode};
 
+/// Sealed response-channel marker for the one bounded text-tool recovery round.
+pub const TEXT_TOOL_FALLBACK_PERMISSION: &str = "response_channel:text_tool_fallback";
+
 /// Capability and workspace evidence attached to one exact provider request.
 /// Construction and execution stay in the workspace/tool layers; adapters
 /// only transport and audit this value.
@@ -12,6 +15,20 @@ use crate::{EffectiveProviderCapabilities, MAX_TOOL_ARGUMENT_BYTES, ToolMode};
 pub struct RequestToolEnvelope {
     pub digest: String,
     pub payload: Value,
+}
+
+impl RequestToolEnvelope {
+    /// Whether this exact request may treat tool-shaped text as protocol data.
+    pub fn requests_text_tool_fallback(&self) -> bool {
+        self.payload
+            .get("permissions")
+            .and_then(Value::as_array)
+            .is_some_and(|permissions| {
+                permissions
+                    .iter()
+                    .any(|permission| permission.as_str() == Some(TEXT_TOOL_FALLBACK_PERMISSION))
+            })
+    }
 }
 
 /// Build a canonical no-tool child envelope for provider-internal inference
@@ -47,7 +64,7 @@ pub(crate) fn derived_chat_only(
     let requested_model = provider.target.model.clone();
     let actual_model_revision = provider.capabilities.actual_model_revision.clone();
     let payload = json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "tools": [],
         "provider": {
             "route": route,
@@ -67,6 +84,7 @@ pub(crate) fn derived_chat_only(
             "max_tool_argument_bytes": argument_limit,
         },
         "tool_mode": ToolMode::ChatOnly,
+        "execution_mode": ToolMode::ChatOnly,
     });
     let canonical = canonicalize(payload);
     let digest = format!(

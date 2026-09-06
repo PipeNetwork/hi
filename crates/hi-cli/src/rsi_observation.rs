@@ -196,9 +196,8 @@ struct ModelReservation {
 }
 
 impl ModelReservation {
-    /// Commit the call immediately before entering the provider. If the
-    /// provider future is later cancelled, that accepted attempt remains
-    /// spent while the still-unknown output reservation is released by Drop.
+    /// Commit immediately before entering the provider. Cancellation leaves
+    /// the attempt spent and Drop releases only the unknown output reservation.
     fn start(&mut self) -> Result<()> {
         if let Some(call) = self.call {
             self.budget.commit(call, 1)?;
@@ -314,6 +313,7 @@ impl Provider for ObservedProvider {
                         "compatibility_fallback": audit.compatibility_fallback,
                         "accepted": audit.accepted,
                         "response_status": audit.response_status,
+                        "tool_schema": audit.tool_schema,
                     })
                 };
                 if let Ok(mut trace_event) = Observation::json(

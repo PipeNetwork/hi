@@ -13,8 +13,8 @@ use crate::agent::turn::progress::ToolProgressLabel;
 pub(in crate::agent::turn) enum ToolProtocolFailureKind {
     /// The call named a tool that this exact request did not admit.
     UnavailableTool,
-    /// The sealed envelope or its execution schema no longer matches itself.
-    EnvelopeIntegrity,
+    /// The workspace changed after the provider request was sealed.
+    StaleWorkspace,
     /// The admitted tool name was valid, but its call payload was not.
     InvalidArguments,
 }
@@ -23,7 +23,7 @@ impl ToolProtocolFailureKind {
     pub(in crate::agent::turn) const fn code(self) -> &'static str {
         match self {
             Self::UnavailableTool => "unavailable_tool",
-            Self::EnvelopeIntegrity => "envelope_integrity",
+            Self::StaleWorkspace => "stale_workspace",
             Self::InvalidArguments => "invalid_arguments",
         }
     }
@@ -36,8 +36,58 @@ pub(in crate::agent::turn) struct ToolProtocolFailure {
     pub(in crate::agent::turn) kind: ToolProtocolFailureKind,
 }
 
+impl ToolProtocolFailure {
+    pub(super) fn stale_workspace(tool: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            tool: tool.into(),
+            message: message.into(),
+            kind: ToolProtocolFailureKind::StaleWorkspace,
+        }
+    }
+}
+
+pub(super) fn tool_protocol_failure_content(failure: &ToolProtocolFailure) -> String {
+    serde_json::json!({
+        "error": {
+            "kind": "tool_protocol_error",
+            "reason": failure.kind.code(),
+            "message": failure.message,
+        }
+    })
+    .to_string()
+}
+
+/// Validate the envelope itself before any policy branch, workspace admission,
+/// or executor can observe its payload. Integrity failures are harness errors,
+/// not model-correctable tool results, and therefore fail the turn directly.
+pub(super) fn validate_sealed_tool_envelope(
+    specs: &[hi_ai::ToolSpec],
+    envelope: &hi_tools::envelope::ToolEnvelope,
+) -> anyhow::Result<()> {
+    if !envelope.digest_is_valid() {
+        anyhow::bail!("sealed tool envelope integrity failure: digest does not match its payload");
+    }
+    if !envelope.matches_specs(specs) {
+        anyhow::bail!(
+            "sealed tool envelope integrity failure: execution schemas do not match the envelope"
+        );
+    }
+    Ok(())
+}
+
+/// Compare every authority-bearing workspace field captured for the provider
+/// request with the controller's current binding. A valid digest proves only
+/// that the old payload was not tampered with; it does not make that payload
+/// current after a rebind or a successful intervening settlement.
+pub(super) fn sealed_workspace_staleness(
+    envelope: &hi_tools::envelope::ToolEnvelope,
+    current: &hi_workspace::WorkspaceBinding,
+) -> Option<String> {
+    crate::workspace_coordination::sealed_workspace_mismatch(&envelope.payload.workspace, current)
+        .map(|error| error.to_string())
+}
+
 pub(super) fn validate_sealed_tool_call(
-    envelope_error: Option<&str>,
     batch_error: Option<&str>,
     id: &str,
     name: &str,
@@ -45,18 +95,20 @@ pub(super) fn validate_sealed_tool_call(
     specs: &[hi_ai::ToolSpec],
     envelope: &hi_tools::envelope::ToolEnvelope,
 ) -> Result<(), ToolProtocolFailure> {
-    let (message, kind) = if let Some(error) = envelope_error {
-        (
-            error.to_string(),
-            ToolProtocolFailureKind::EnvelopeIntegrity,
-        )
-    } else if !envelope.admits(name) {
+    let (message, kind) = if !envelope.admits(name) {
         let mode_detail = matches!(envelope.payload.tool_mode, hi_ai::ToolMode::ChatOnly)
             .then_some("; envelope mode is chat_only and admits no executable tools")
             .unwrap_or_default();
+        let policy_detail = if matches!(envelope.payload.execution_mode, hi_ai::ToolMode::ReadOnly)
+            && crate::steering::implementation_tool_call_mutates(name, arguments)
+        {
+            format!("Tool `{name}` blocked: this request is sealed for read-only execution; ")
+        } else {
+            String::new()
+        };
         (
             format!(
-                "tool `{name}` is outside the model request's sealed envelope {}{mode_detail}",
+                "{policy_detail}tool `{name}` is outside the model request's sealed envelope {}{mode_detail}",
                 envelope.digest,
             ),
             ToolProtocolFailureKind::UnavailableTool,
@@ -140,12 +192,14 @@ pub(in crate::agent::turn) struct ToolBatchOutcome {
     pub(in crate::agent::turn) interrupted_calls: usize,
     pub(in crate::agent::turn) interrupted_coordination_calls: usize,
     /// Calls rejected at the sealed client boundary. Keeping the reason typed
-    /// prevents unavailable tools and envelope faults from being misdiagnosed
-    /// as correctable JSON-schema errors.
+    /// prevents unavailable tools from being misdiagnosed as correctable
+    /// JSON-schema errors. Envelope integrity faults fail before a batch starts.
     pub(in crate::agent::turn) protocol_validation_errors: Vec<ToolProtocolFailure>,
     /// Exact executable subset of the request catalog. `ChatOnly` therefore
     /// records an empty slice even when schemas remain attached for cache/audit.
     pub(in crate::agent::turn) admitted_tool_names: Vec<String>,
+    /// Whether changing an Auto retry to Required preserves provider support.
+    pub(in crate::agent::turn) required_tool_choice_supported: bool,
     /// Background handles named by the model this batch that the registry has
     /// never seen, most recent first.
     pub(in crate::agent::turn) unknown_background_handles: Vec<hi_tools::UnknownBackgroundHandle>,
@@ -153,4 +207,73 @@ pub(in crate::agent::turn) struct ToolBatchOutcome {
     /// rejected program was received. The turn loop must use its typed error
     /// path instead of allowing an unbounded program/fallback cycle.
     pub(in crate::agent::turn) program_fallback_exhausted: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use hi_ai::{CapabilityRoute, EffectiveProviderCapabilities, ProviderCapabilities, ToolMode};
+    use hi_tools::envelope::{
+        ProviderEnvelope, ToolEnvelope, ToolEnvelopeContext, ToolEnvelopeLimits, WorkspaceEnvelope,
+        WorkspaceTrust,
+    };
+    use hi_workspace::{WorkspaceAuthority, WorkspaceVersion};
+    use serde_json::json;
+
+    use super::validate_sealed_tool_envelope;
+
+    fn envelope(specs: &[hi_ai::ToolSpec]) -> ToolEnvelope {
+        let capabilities = EffectiveProviderCapabilities::conservative(
+            CapabilityRoute::new("test", "model"),
+            ProviderCapabilities::native_tools(true),
+        );
+        ToolEnvelope::build(
+            specs,
+            ToolEnvelopeContext {
+                provider: ProviderEnvelope::from_capability_record(capabilities),
+                workspace: WorkspaceEnvelope {
+                    authority: WorkspaceAuthority::Local,
+                    binding_id: "binding".into(),
+                    epoch: 0,
+                    version: WorkspaceVersion::Unknown,
+                },
+                trust: WorkspaceTrust::Trusted,
+                permissions: BTreeSet::new(),
+                limits: ToolEnvelopeLimits::default(),
+                tool_mode: ToolMode::Auto,
+                execution_mode: ToolMode::Auto,
+                tool_versions: BTreeMap::new(),
+            },
+        )
+    }
+
+    fn spec(name: &str) -> hi_ai::ToolSpec {
+        hi_ai::ToolSpec {
+            name: name.into(),
+            description: String::new(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn envelope_integrity_fails_before_call_level_recovery() {
+        let specs = vec![spec("read")];
+        let mut corrupt = envelope(&specs);
+        corrupt.digest.push('0');
+        assert!(
+            validate_sealed_tool_envelope(&specs, &corrupt)
+                .unwrap_err()
+                .to_string()
+                .contains("digest does not match")
+        );
+
+        let sealed = envelope(&specs);
+        assert!(
+            validate_sealed_tool_envelope(&[spec("write")], &sealed)
+                .unwrap_err()
+                .to_string()
+                .contains("execution schemas do not match")
+        );
+    }
 }

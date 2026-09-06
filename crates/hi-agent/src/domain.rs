@@ -589,6 +589,12 @@ pub(crate) struct TurnControlFlags {
     /// Sticky per-turn guard: client-side schema failures may fall back to one
     /// plain-text tool-call round after structured retries are exhausted.
     pub tool_validation_text_fallback_used: bool,
+    /// Sticky one-shot budget for correcting a tool name that was absent from
+    /// the exact request envelope. Independent from generic repeat nudges.
+    pub unavailable_tool_retry_used: bool,
+    /// Sticky one-shot budget for resealing after the workspace changes while
+    /// a provider request is in flight.
+    pub stale_workspace_retry_used: bool,
     pub force_text_answer_next: bool,
     pub suppress_bookkeeping_tools_next: bool,
     pub made_tool_call: bool,

@@ -49,6 +49,7 @@ async fn advancing_lease_generation_acknowledges_a_lost_commit_response() {
             logical_size_bytes: 7,
             idempotency_key: "old-generation".to_string(),
             snapshot: committed_snapshot.clone(),
+            background_terminal_generation: Some(0),
         });
         workspace.persist_locked(&state).unwrap();
     }
@@ -113,6 +114,7 @@ async fn advancing_lease_generation_preserves_pending_evidence_without_remote_pr
             logical_size_bytes: 0,
             idempotency_key: "old-generation".to_string(),
             snapshot: Snapshot::default(),
+            background_terminal_generation: Some(0),
         });
         workspace.persist_locked(&state).unwrap();
     }

@@ -11,7 +11,7 @@ use crate::{
     ControlJobRecord, ControlJobState, ControlStore, JournalHealthState,
     JournaledWorkspaceController, ProjectionEventReceipt, ProjectionTransition, Result,
     WorkspaceBindingRecord, WorkspaceOperationRecord, WorkspaceProjectionStore,
-    WorkspaceRecoveryRecord,
+    WorkspaceRecoveryRecord, WorkspaceRecoveryStatus,
 };
 
 #[derive(Clone)]
@@ -118,6 +118,16 @@ fn reader_spec(name: &str) -> JobSpec {
     JobSpec {
         kind: JobKind::ReadAgent,
         effect_scope: EffectScope::ReadOnly,
+        name: name.to_owned(),
+        limits: JobLimits::default(),
+        parent_operation: None,
+    }
+}
+
+fn live_process_spec(name: &str) -> JobSpec {
+    JobSpec {
+        kind: JobKind::Process,
+        effect_scope: EffectScope::LiveWriter,
         name: name.to_owned(),
         limits: JobLimits::default(),
         parent_operation: None,
@@ -545,6 +555,9 @@ async fn restart_reconciliation_is_idempotent_and_preserves_writer_evidence() {
     assert_eq!(second.recovery_ids, first.recovery_ids);
     assert_eq!(store.max_event_sequence().unwrap(), after_first);
 }
+
+#[path = "workspace_journal_restart_tests.rs"]
+mod restart_tests;
 
 #[tokio::test]
 async fn restart_reconciliation_fences_an_unsettled_foreground_operation() {

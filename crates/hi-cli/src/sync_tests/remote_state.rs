@@ -17,7 +17,7 @@ async fn remote_session_sink_flushes_records() {
     let local = crate::session::JsonlSession::new(
         std::env::temp_dir().join(format!("hi-sync-test-{}.jsonl", std::process::id())),
     );
-    let mut sync = SyncSession::new(local, sink);
+    let mut sync = SyncSession::new(local, sink).unwrap();
     let messages = vec![Message::user("hello world")];
     sync.record(&messages, Usage::default()).unwrap();
 
@@ -68,7 +68,8 @@ fn turn_record_survives_broken_outbox_store() {
         .unwrap();
 
     let jsonl_path = dir.join("session.jsonl");
-    let mut sync = SyncSession::new(crate::session::JsonlSession::new(jsonl_path.clone()), sink);
+    let mut sync =
+        SyncSession::new(crate::session::JsonlSession::new(jsonl_path.clone()), sink).unwrap();
     sync.record(&[Message::user("hello")], Usage::default())
         .expect("turn recording must not fail on outbox errors");
     assert!(
@@ -339,6 +340,7 @@ fn session_snapshot_backfills_state_and_title() {
     let sink = RemoteSessionSink::new_for_test(unreachable_config(), "snapshot".to_string());
     let loaded = crate::session::LoadedSession {
         messages: vec![Message::user("first portal prompt")],
+        workspace_execution_recovered: false,
         usage: Usage {
             input_tokens: 10,
             output_tokens: 2,
@@ -423,6 +425,7 @@ fn session_snapshot_emits_default_drive_state_to_clear_remote_stale_values() {
         RemoteSessionSink::new_for_test(unreachable_config(), "snapshot-default".to_string());
     let loaded = crate::session::LoadedSession {
         messages: Vec::new(),
+        workspace_execution_recovered: false,
         usage: Usage::default(),
         checkpoint_refs: Vec::new(),
         harness_settings: crate::session_harness::empty_layer(),

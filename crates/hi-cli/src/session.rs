@@ -2,10 +2,9 @@
 //!
 //! Sessions live under `$XDG_DATA_HOME/hi/sessions` (or `~/.local/share/...`).
 //! Resuming loads every line back as conversation history.
-
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Take, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,8 +13,17 @@ use hi_agent::SessionSink;
 use hi_ai::{Message, Role, Usage};
 use serde::{Deserialize, Serialize};
 
+#[path = "session_scan.rs"]
+mod session_scan;
 #[path = "session_shadow.rs"]
 pub(crate) mod session_shadow;
+#[path = "session_workspace_execution.rs"]
+mod session_workspace_execution;
+#[path = "session_workspace_replay.rs"]
+mod session_workspace_replay;
+use session_scan::session_line_count;
+pub(crate) use session_scan::{resume_summary, session_snapshot_reader};
+use session_workspace_replay::WorkspaceExecutionReplay;
 
 #[cfg(test)]
 #[path = "session_append_tests.rs"]
@@ -52,6 +60,15 @@ enum SessionMeta {
         cache_creation_tokens: u64,
         #[serde(default)]
         estimated: bool,
+    },
+    /// Hidden exact-result outbox entry written before local settlement.
+    WorkspaceExecutionStaged {
+        #[serde(default)]
+        visible_on_resume: bool,
+        execution: hi_agent::WorkspaceTranscriptExecution,
+    },
+    WorkspaceExecutionSettled {
+        operation_id: hi_workspace::OperationId,
     },
     Checkpoints {
         refs: Vec<String>,
@@ -147,20 +164,15 @@ enum SessionMeta {
     },
 }
 
-/// Open a stable, bounded snapshot of an append-only session. Limiting the
-/// reader to the length observed from the opened file descriptor prevents a
-/// busy writer from extending a status or resume scan indefinitely.
-pub(crate) fn session_snapshot_reader(path: &Path) -> std::io::Result<BufReader<Take<File>>> {
-    let file = File::open(path)?;
-    let snapshot_len = file.metadata()?.len();
-    Ok(BufReader::new(file.take(snapshot_len)))
-}
-
 /// Serialize appenders and separate an interrupted final record from new
 /// records. Preserve the old bytes for recovery, including a valid final
 /// record that simply lacks its newline. The lock covers both the tail check
 /// and every partial write, so concurrent writers cannot interleave records.
 pub(crate) fn append_session_records(path: &Path, payload: &str) -> Result<()> {
+    append_session_records_inner(path, payload, false)
+}
+
+fn append_session_records_inner(path: &Path, payload: &str, sync: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -182,32 +194,12 @@ pub(crate) fn append_session_records(path: &Path, payload: &str) -> Result<()> {
         }
     }
     file.write_all(payload.as_bytes())
-        .with_context(|| format!("appending to {}", path.display()))
-}
-
-/// Count JSONL records with fixed memory. A final unterminated record still
-/// counts, matching `str::lines()` and making crash-truncated tails visible in
-/// session listings without allocating their contents.
-fn session_line_count(path: &Path) -> usize {
-    let Ok(mut reader) = session_snapshot_reader(path) else {
-        return 0;
-    };
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut lines = 0_usize;
-    let mut saw_bytes = false;
-    let mut ended_with_newline = false;
-    loop {
-        let Ok(read) = reader.read(&mut buffer) else {
-            return 0;
-        };
-        if read == 0 {
-            break;
-        }
-        saw_bytes = true;
-        ended_with_newline = buffer[read - 1] == b'\n';
-        lines = lines.saturating_add(buffer[..read].iter().filter(|byte| **byte == b'\n').count());
+        .with_context(|| format!("appending to {}", path.display()))?;
+    if sync {
+        file.sync_data()
+            .with_context(|| format!("syncing {}", path.display()))?;
     }
-    lines.saturating_add(usize::from(saw_bytes && !ended_with_newline))
+    Ok(())
 }
 
 /// Appends messages to a session's JSONL file.
@@ -234,25 +226,6 @@ impl JsonlSession {
         line.push('\n');
         self.append(&line)
     }
-
-    pub fn record_remote_session_identity(&mut self, session_id: &str) -> Result<()> {
-        crate::sync::validate_session_id(session_id)?;
-        self.append_meta(&SessionMeta::RemoteSessionIdentity {
-            session_id: session_id.to_string(),
-        })
-    }
-
-    pub fn record_pipefs_mode(&mut self, enabled: bool) -> Result<()> {
-        self.append_meta(&SessionMeta::PipeFsMode { enabled })
-    }
-
-    /// Persist checkpoint refs so a resumed session knows where it branched.
-    #[allow(dead_code)]
-    pub fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
-        self.append_meta(&SessionMeta::Checkpoints {
-            refs: refs.to_vec(),
-        })
-    }
 }
 
 impl SessionSink for JsonlSession {
@@ -260,6 +233,25 @@ impl SessionSink for JsonlSession {
         self.path
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
+    }
+
+    fn requires_local_workspace_execution_stage(&self) -> bool {
+        true
+    }
+
+    fn stage_local_workspace_execution(
+        &mut self,
+        execution: &hi_agent::WorkspaceTranscriptExecution,
+        visible_on_resume: bool,
+    ) -> Result<()> {
+        self.stage_workspace_execution_durable(execution, visible_on_resume)
+    }
+
+    fn settle_local_workspace_execution(
+        &mut self,
+        operation_id: &hi_workspace::OperationId,
+    ) -> Result<()> {
+        self.settle_workspace_execution_durable(operation_id)
     }
 
     fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
@@ -406,10 +398,10 @@ impl SessionSink for JsonlSession {
         })
     }
 }
-
 #[allow(dead_code)]
 pub struct LoadedSession {
     pub messages: Vec<Message>,
+    pub(crate) workspace_execution_recovered: bool,
     pub usage: Usage,
     pub checkpoint_refs: Vec<String>,
     pub harness_settings: hi_workspace::SettingLayer,
@@ -506,25 +498,6 @@ pub fn cache_loaded_session(path: &Path, loaded: &LoadedSession) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
-}
-
-/// One-line summary shown when a session is resumed: message count and
-/// the last user instruction (clipped), so the user knows what they're walking
-/// back into.
-pub fn resume_summary(loaded: &LoadedSession) -> String {
-    let n = loaded
-        .messages
-        .iter()
-        .filter(|m| m.role != Role::System)
-        .count();
-    let last = loaded
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == Role::User)
-        .map(|m| hi_agent::ui::clip(&m.text(), 60))
-        .unwrap_or_default();
-    format!("Resumed: {n} messages, last: '{last}'")
 }
 
 /// Directory holding all session files (may not exist yet).
@@ -1162,6 +1135,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let mut loaded_goal_drive_stall = 0;
     let mut loaded_plan_drive_evidence = BTreeSet::new();
     let mut loaded_goal_drive_evidence = BTreeSet::new();
+    let mut workspace_replay = WorkspaceExecutionReplay::default();
     let mut record = Vec::new();
     loop {
         record.clear();
@@ -1225,12 +1199,20 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                         estimated,
                     };
                 }
+                SessionMeta::WorkspaceExecutionStaged {
+                    visible_on_resume,
+                    execution,
+                } => workspace_replay.stage(execution, visible_on_resume, messages.len())?,
+                SessionMeta::WorkspaceExecutionSettled { operation_id } => {
+                    workspace_replay.settle(operation_id);
+                }
                 SessionMeta::Checkpoints { refs } => {
                     checkpoint_refs = refs;
                 }
                 SessionMeta::Compaction {
                     messages: compacted,
                 } => {
+                    workspace_replay.retire_settled();
                     legacy_plan_pause.clear_boundary();
                     // Replace all prior messages with the compacted set.
                     messages = compacted;
@@ -1321,6 +1303,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                     decisions,
                     plan,
                 } => {
+                    workspace_replay.retire_settled();
                     legacy_plan_pause.note_state_replacement(&messages, &replacement);
                     messages = replacement;
                     loaded_goal = goal;
@@ -1345,6 +1328,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         legacy_plan_pause.note_message(&message);
         messages.push(message);
     }
+    let workspace_execution_recovered = workspace_replay.finish(&mut messages);
     if loaded_plan
         .iter()
         .all(|step| step.status == hi_agent::PlanStatus::Done)
@@ -1353,6 +1337,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     }
     let loaded = LoadedSession {
         messages,
+        workspace_execution_recovered,
         usage,
         checkpoint_refs,
         harness_settings,
@@ -1407,6 +1392,7 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
     let mut loaded_goal_drive_stall = 0;
     let mut loaded_plan_drive_evidence = BTreeSet::new();
     let mut loaded_goal_drive_evidence = BTreeSet::new();
+    let mut workspace_replay = WorkspaceExecutionReplay::default();
 
     for record in records {
         reducer_shadow.observe_remote(&record.record_type, &record.payload_json);
@@ -1457,12 +1443,20 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
                         estimated,
                     };
                 }
+                SessionMeta::WorkspaceExecutionStaged {
+                    visible_on_resume,
+                    execution,
+                } => workspace_replay.stage(execution, visible_on_resume, messages.len())?,
+                SessionMeta::WorkspaceExecutionSettled { operation_id } => {
+                    workspace_replay.settle(operation_id);
+                }
                 SessionMeta::Checkpoints { refs } => {
                     checkpoint_refs = refs;
                 }
                 SessionMeta::Compaction {
                     messages: compacted,
                 } => {
+                    workspace_replay.retire_settled();
                     legacy_plan_pause.clear_boundary();
                     messages = compacted;
                 }
@@ -1552,6 +1546,7 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
                     decisions,
                     plan,
                 } => {
+                    workspace_replay.retire_settled();
                     legacy_plan_pause.note_state_replacement(&messages, &replacement);
                     messages = replacement;
                     loaded_goal = goal;
@@ -1566,6 +1561,7 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
         }
     }
 
+    let workspace_execution_recovered = workspace_replay.finish(&mut messages);
     if loaded_plan
         .iter()
         .all(|step| step.status == hi_agent::PlanStatus::Done)
@@ -1574,6 +1570,7 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
     }
     let loaded = LoadedSession {
         messages,
+        workspace_execution_recovered,
         usage,
         checkpoint_refs,
         harness_settings,
@@ -1865,6 +1862,7 @@ mod tests {
         ));
         let expected = LoadedSession {
             messages: vec![Message::user("restored prompt")],
+            workspace_execution_recovered: false,
             usage: Usage {
                 input_tokens: 12,
                 output_tokens: 4,
@@ -1939,6 +1937,7 @@ mod tests {
 
         let loaded = |paused, resume_on_user_input, plan_stall, goal_stall| LoadedSession {
             messages: vec![Message::system("restored")],
+            workspace_execution_recovered: false,
             usage: Usage::default(),
             checkpoint_refs: Vec::new(),
             harness_settings: crate::session_harness::empty_layer(),

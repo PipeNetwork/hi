@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::prelude::*;
 use std::sync::Arc;
@@ -68,6 +68,9 @@ fn drain_ui_events(app: &mut App, rx: &mut mpsc::UnboundedReceiver<UiEvent>, lim
 pub(crate) struct DriveCompletion<T> {
     pub(crate) cancelled: bool,
     pub(crate) value: Option<T>,
+    /// Narrow terminal classification retained after the TUI renders and
+    /// discards the underlying `anyhow::Error`.
+    pub(crate) failure: Option<hi_agent::TurnCleanupKind>,
 }
 
 /// Turn outcomes own transcript settlement. A typed cancellation rewinds
@@ -175,6 +178,7 @@ where
     tokio::pin!(fut);
     let mut cancelled = false;
     let mut value = None;
+    let mut failure = None;
     let mut last_activity = Instant::now();
     let mut watchdog_stuck = false;
     let mut input_closed = false;
@@ -185,6 +189,9 @@ where
     let mut confirmations_open = true;
     let signal_turn_cancel = |app: &mut App, cancelled_flag: &mut bool| {
         *cancelled_flag = true;
+        app.turn_stop_requested = true;
+        app.quit_notice = Some(Instant::now() + std::time::Duration::from_millis(1800));
+        app.queue_paused = !app.queue.is_empty();
         if let Some(cancel) = turn_cancel.as_ref() {
             cancel.cancel();
         }
@@ -230,8 +237,16 @@ where
                 match result {
                     Ok(result) => value = Some(result),
                     Err(err) => {
+                        failure = Some(hi_agent::TurnCleanupKind::for_error(&err));
                         let (kind, guidance) = hi_agent::classify_error(&err);
-                        if !matches!(app.last_turn_state, TurnState::Failed(_)) {
+                        let workspace_admission = matches!(
+                            &failure,
+                            Some(hi_agent::TurnCleanupKind::FailWithStopReason(stop_reason))
+                                if stop_reason.is_workspace_admission()
+                        );
+                        if !workspace_admission
+                            && !matches!(app.last_turn_state, TurnState::Failed(_))
+                        {
                             app.note_turn_failed(&format!("{err:#}"), kind, guidance);
                         }
                         if hi_agent::ui::error_counts_as_model_issue(&err) {
@@ -284,7 +299,23 @@ where
                         // SIGWINCH landed in the idle or drive input loop.
                         app.trace_resized(width, height)?;
                     }
-                    Some(Event::Mouse(mouse)) => app.handle_mouse(mouse),
+                    Some(Event::Mouse(mouse)) => {
+                        let clicked_control = matches!(
+                            mouse.kind,
+                            MouseEventKind::Down(MouseButton::Left)
+                        ) && crate::turn_status::control_contains(app, mouse.column, mouse.row);
+                        if clicked_control {
+                            if cancelled {
+                                app.exit_requested = true;
+                            }
+                            signal_turn_cancel(app, &mut cancelled);
+                            if turn_cancel.is_none() {
+                                break;
+                            }
+                            continue;
+                        }
+                        app.handle_mouse(mouse);
+                    }
                     Some(Event::Paste(text))
                         if pending_confirmation.as_ref().is_some_and(|_| {
                             app.confirm_focus == crate::confirm_overlay::ConfirmFocus::Followup
@@ -426,6 +457,9 @@ where
                                     app.confirmation = None;
                                     app.ask_user_draft.clear();
                                     if ctrl {
+                                        if cancelled {
+                                            app.exit_requested = true;
+                                        }
                                         signal_turn_cancel(app, &mut cancelled);
                                         if turn_cancel.is_none() {
                                             break;
@@ -451,6 +485,9 @@ where
                         }
                         match key.code {
                             KeyCode::Char('c') if ctrl => {
+                                if cancelled {
+                                    app.exit_requested = true;
+                                }
                                 signal_turn_cancel(app, &mut cancelled);
                                 if turn_cancel.is_none() {
                                     break;
@@ -461,22 +498,17 @@ where
                                 continue;
                             }
                             // Esc clears a half-typed queued command, or — when the
-                            // input is empty — interrupts the current tool call
-                            // (if one is running) or cancels the whole turn.
+                            // input is empty — cancels the active turn. A running
+                            // foreground tool must use the same cancellation path:
+                            // merely setting the batch interrupt flag cannot wake an
+                            // awaited shell command, while turn cancellation kills and
+                            // reaps its process group before workspace settlement.
                             KeyCode::Esc if app.input.is_empty() => {
-                                if app.current_tool.is_some() {
-                                    // A tool is running: signal interrupt to skip
-                                    // just this tool call, not the whole turn.
-                                    if let Some(flag) = &app.interrupt {
-                                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                } else {
-                                    signal_turn_cancel(app, &mut cancelled);
-                                    if turn_cancel.is_none() {
-                                        break;
-                                    }
-                                    continue;
+                                signal_turn_cancel(app, &mut cancelled);
+                                if turn_cancel.is_none() {
+                                    break;
                                 }
+                                continue;
                             }
                             KeyCode::Esc => app.input.clear(),
                             // A line submitted while a turn runs: `/copy` reads the
@@ -493,11 +525,20 @@ where
                                     continue;
                                 }
                                 Some(ChordPipeline::PaletteAccept(cmd)) => {
+                                    let parsed = command::parse(&cmd).map(command::resolve_command);
+                                    if matches!(&parsed, Some(Command::Quit)) {
+                                        app.exit_requested = true;
+                                        signal_turn_cancel(app, &mut cancelled);
+                                        if turn_cancel.is_none() {
+                                            break;
+                                        }
+                                        continue;
+                                    }
                                     let open_tasks = matches!(
-                                        command::parse(&cmd),
+                                        &parsed,
                                         Some(Command::Tasks(_))
                                     ) || matches!(
-                                        command::parse(&cmd),
+                                        &parsed,
                                         Some(Command::Queue(arg)) if arg.trim() == "tasks"
                                     );
                                     if open_tasks {
@@ -533,7 +574,14 @@ where
                                 None => {}
                             }
                             if let Some(submitted) = app.edit_key(&key) {
-                                match command::parse(&submitted) {
+                                match command::parse(&submitted).map(command::resolve_command) {
+                                    Some(Command::Quit) => {
+                                        app.exit_requested = true;
+                                        signal_turn_cancel(app, &mut cancelled);
+                                        if turn_cancel.is_none() {
+                                            break;
+                                        }
+                                    }
                                     Some(Command::Copy(arg)) => app.copy(&arg),
                                     Some(Command::Tasks(_)) => {
                                         crate::subagent_overlay::open_tasks(
@@ -704,7 +752,11 @@ where
             "terminal input reader stopped unexpectedly; the active operation was cancelled"
         );
     }
-    Ok(DriveCompletion { cancelled, value })
+    Ok(DriveCompletion {
+        cancelled,
+        value,
+        failure,
+    })
 }
 
 fn x402_prompt_to_control(prompt: hi_ai::X402UserPrompt) -> ConfirmationControl {
@@ -755,204 +807,5 @@ fn x402_prompt_to_control(prompt: hi_ai::X402UserPrompt) -> ConfirmationControl 
 }
 
 #[cfg(test)]
-mod cancellation_settlement_tests {
-    use super::*;
-    use ratatui::backend::TestBackend;
-
-    #[tokio::test]
-    async fn typed_settlement_controls_consumed_steering_even_when_cancel_key_races() {
-        for status in [
-            hi_agent::TurnStatus::Completed,
-            hi_agent::TurnStatus::Cancelled,
-            hi_agent::TurnStatus::Blocked,
-            hi_agent::TurnStatus::Failed,
-        ] {
-            for frontend_cancelled in [false, true] {
-                let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-                let (input_tx, mut input_rx) = mpsc::unbounded_channel();
-                if frontend_cancelled {
-                    input_tx
-                        .send(Event::Key(crossterm::event::KeyEvent::new(
-                            KeyCode::Char('c'),
-                            KeyModifiers::CONTROL,
-                        )))
-                        .unwrap();
-                }
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-                let mut app = crate::tests::test_app("openai", "gpt-4o");
-                let (ui_tx, ui_rx) = mpsc::unbounded_channel();
-                let (_confirmation_tx, confirmation_rx) = mpsc::unbounded_channel();
-                let inbox = hi_agent::InterjectionInbox::default();
-                app.queue.push_back("preserve the public API".into());
-                app.mid_turn_offered
-                    .push_back("preserve the public API".into());
-                // The model drained this instruction before its terminal result.
-                inbox.push("preserve the public API");
-                inbox.drain();
-                let cancellation = hi_agent::TurnCancellation::new();
-                let future_cancellation = cancellation.clone();
-                let future = async move {
-                    while frontend_cancelled && !future_cancellation.is_cancelled() {
-                        tokio::task::yield_now().await;
-                    }
-                    let mut outcome = hi_agent::TurnOutcome::infrastructure_failure(
-                        "test-model",
-                        None,
-                        Vec::new(),
-                    );
-                    outcome.status = status;
-                    if status == hi_agent::TurnStatus::Cancelled {
-                        future_cancellation.cancel();
-                        outcome.stop_reason = hi_agent::TurnStopReason::Cancelled;
-                    }
-                    Ok(outcome)
-                };
-
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    drive(
-                        &mut terminal,
-                        &mut input_rx,
-                        &mut ticker,
-                        &mut app,
-                        ui_rx,
-                        confirmation_rx,
-                        future,
-                        true,
-                        Some(inbox),
-                        None,
-                        ui_tx,
-                        Some(cancellation),
-                        Arc::new(hi_tools::BackgroundTaskRegistry::new()),
-                    ),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-
-                assert_eq!(result.value.as_ref().unwrap().status, status);
-                assert_eq!(result.cancelled, frontend_cancelled);
-                assert_eq!(
-                    app.queue.front().map(String::as_str),
-                    (status == hi_agent::TurnStatus::Cancelled)
-                        .then_some("preserve the public API"),
-                    "status={status:?}, frontend_cancelled={frontend_cancelled}"
-                );
-                assert!(app.mid_turn_offered.is_empty());
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn closed_terminal_input_is_reported_instead_of_silently_exiting() {
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
-        drop(input_tx);
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-        let mut app = crate::tests::test_app("openai", "gpt-4o");
-        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
-        let (_confirmation_tx, confirmation_rx) = mpsc::unbounded_channel();
-
-        let result = drive(
-            &mut terminal,
-            &mut input_rx,
-            &mut ticker,
-            &mut app,
-            ui_rx,
-            confirmation_rx,
-            std::future::pending::<Result<()>>(),
-            false,
-            None,
-            None,
-            ui_tx,
-            None,
-            Arc::new(hi_tools::BackgroundTaskRegistry::new()),
-        )
-        .await;
-        let error = match result {
-            Ok(_) => panic!("closed input must be visible to the caller"),
-            Err(error) => error,
-        };
-
-        assert_eq!(
-            error.to_string(),
-            "terminal input reader stopped unexpectedly; the active operation was cancelled"
-        );
-    }
-
-    #[test]
-    fn late_cancel_preserves_committed_turn() {
-        assert_eq!(
-            settle_turn_cancellation(true, true, Some(hi_agent::TurnStatus::Completed)),
-            TurnCancellationSettlement {
-                cancelled: false,
-                agent_already_cleaned: false,
-            }
-        );
-    }
-
-    #[test]
-    fn typed_cancel_skips_frontend_cleanup_but_missing_result_needs_it() {
-        assert_eq!(
-            settle_turn_cancellation(true, true, Some(hi_agent::TurnStatus::Cancelled)),
-            TurnCancellationSettlement {
-                cancelled: true,
-                agent_already_cleaned: true,
-            }
-        );
-        assert_eq!(
-            settle_turn_cancellation(true, true, None),
-            TurnCancellationSettlement {
-                cancelled: true,
-                agent_already_cleaned: false,
-            }
-        );
-    }
-
-    #[test]
-    fn timeout_returning_the_body_error_keeps_failure_semantics() {
-        assert_eq!(
-            settle_turn_cancellation(false, true, None),
-            TurnCancellationSettlement {
-                cancelled: false,
-                agent_already_cleaned: false,
-            }
-        );
-    }
-
-    #[test]
-    fn trio_reviews_only_completed_turns() {
-        assert_eq!(
-            trio_non_reviewable_status(hi_agent::TurnStatus::Completed),
-            None
-        );
-        assert_eq!(
-            trio_non_reviewable_status(hi_agent::TurnStatus::Blocked),
-            Some("blocked")
-        );
-        assert_eq!(
-            trio_non_reviewable_status(hi_agent::TurnStatus::Failed),
-            Some("failed")
-        );
-        assert_eq!(
-            trio_non_reviewable_status(hi_agent::TurnStatus::Cancelled),
-            Some("cancelled")
-        );
-    }
-
-    #[test]
-    fn trio_default_never_settles_from_a_round_count() {
-        assert!(!trio_round_cap_reached(0, None));
-        assert!(!trio_round_cap_reached(3, None));
-        assert!(!trio_round_cap_reached(u64::MAX, None));
-        assert_eq!(trio_round_label(4, None), "4");
-    }
-
-    #[test]
-    fn trio_explicit_round_cap_still_settles_at_the_boundary() {
-        assert!(!trio_round_cap_reached(2, Some(3)));
-        assert!(trio_round_cap_reached(3, Some(3)));
-        assert!(trio_round_cap_reached(4, Some(3)));
-        assert_eq!(trio_round_label(2, Some(3)), "2/3");
-    }
-}
+#[path = "drive_cancellation_settlement_tests.rs"]
+mod cancellation_settlement_tests;

@@ -1117,7 +1117,7 @@ fn route_request(state: &ServerState, request: &RecordedRequest) -> ScriptedResp
         }
         return state.models_response.clone();
     }
-    if path.ends_with("/chat/completions") {
+    if path.ends_with("/chat/completions") || path.ends_with("/responses") {
         if request.method != "POST" {
             state.fail(
                 ScriptedFailureKind::WrongRouteMethod,

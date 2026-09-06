@@ -162,7 +162,7 @@ mod tools;
 mod transaction;
 mod web;
 pub mod worktree;
-pub use background::{BackgroundRegistry, shell_title};
+pub use background::{BackgroundRegistry, BackgroundReleaseSummary, shell_title};
 pub use background_tasks::{
     BackgroundTaskCapacityError, BackgroundTaskLimits, BackgroundTaskOutcome,
     BackgroundTaskRegistry, BackgroundTaskState, BackgroundTaskTeardown, BgFuture,

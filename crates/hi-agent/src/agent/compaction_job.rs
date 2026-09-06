@@ -86,6 +86,27 @@ impl crate::Agent {
 
     /// Reclaim context using a specific strategy (e.g. `/compact <kind>`).
     pub async fn compact_with(&mut self, kind: CompactionKind, ui: &mut dyn Ui) -> Result<()> {
+        self.compact_with_control(kind, ui, None).await
+    }
+
+    /// Compact with a frontend cancellation signal whose terminal job seal is
+    /// awaited before control returns to the caller.
+    pub async fn compact_with_cancellable(
+        &mut self,
+        kind: CompactionKind,
+        ui: &mut dyn Ui,
+        cancellation: crate::TurnCancellation,
+    ) -> Result<()> {
+        self.compact_with_control(kind, ui, Some(cancellation))
+            .await
+    }
+
+    async fn compact_with_control(
+        &mut self,
+        kind: CompactionKind,
+        ui: &mut dyn Ui,
+        cancellation: Option<crate::TurnCancellation>,
+    ) -> Result<()> {
         let source_revision = ImmutableSessionRevision::capture_at(
             self.messages.revision(),
             self.messages.as_slice(),
@@ -116,19 +137,55 @@ impl crate::Agent {
         let job = CompactionJobGuard::new(controller, permit.job_id);
         let job_id = job.job_id().clone();
         let execution_limit = self.config.harness.jobs.candidate_timeout;
-        let prepared = tokio::time::timeout(
-            execution_limit,
-            self.prepare_compaction(kind, &source_messages, ui),
-        )
-        .await
-        .map_err(|_| {
+        let prepared = {
+            let preparation = tokio::time::timeout(
+                execution_limit,
+                self.prepare_compaction(kind, &source_messages, ui),
+            );
+            tokio::pin!(preparation);
+            if let Some(signal) = cancellation.clone() {
+                tokio::select! {
+                    biased;
+                    _ = wait_for_compaction_cancellation(signal) => None,
+                    result = &mut preparation => Some(result),
+                }
+            } else {
+                Some(preparation.await)
+            }
+        };
+        let Some(prepared) = prepared else {
             ui.assistant_end();
-            anyhow!(
-                "compaction exceeded its {:.1}-second managed execution limit",
-                execution_limit.as_secs_f64()
-            )
-        })
-        .and_then(|result| result);
+            ui.status("compaction cancelled");
+            return job
+                .seal(
+                    JobCompletion::Cancelled,
+                    Some("compaction cancelled before publication".into()),
+                )
+                .await;
+        };
+        let prepared = prepared
+            .map_err(|_| {
+                ui.assistant_end();
+                anyhow!(
+                    "compaction exceeded its {:.1}-second managed execution limit",
+                    execution_limit.as_secs_f64()
+                )
+            })
+            .and_then(|result| result);
+
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::TurnCancellation::is_cancelled)
+        {
+            ui.assistant_end();
+            ui.status("compaction cancelled");
+            return job
+                .seal(
+                    JobCompletion::Cancelled,
+                    Some("compaction cancelled at the publication boundary".into()),
+                )
+                .await;
+        }
 
         let result: Result<bool> = match prepared {
             Ok(PreparedCompaction::NoChange(status)) if cleaned_revision == source_revision => {
@@ -368,6 +425,12 @@ impl crate::Agent {
                 true
             }
         }
+    }
+}
+
+async fn wait_for_compaction_cancellation(cancellation: crate::TurnCancellation) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 

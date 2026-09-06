@@ -38,11 +38,11 @@ pub enum Command {
     /// (edit an existing profile). The frontend parses these from the arg.
     Provider(String),
     /// Sign in to a provider that supports subscription auth, storing an OAuth
-    /// credential instead of an API key. Arg is the provider name (`xai`).
+    /// credential instead of a pasted API key; providers: `xai`, `pipenetwork`, `x402`.
     Login(String),
     /// Discard a stored OAuth credential. Arg is the provider name.
     Logout(String),
-    /// Paste and verify an API key (`openai` / `anthropic` / `xai`). Not pairing.
+    /// Paste and verify an API key (`openai`, `anthropic`, `pipenetwork`, or `xai`); not pairing.
     Auth(String),
     /// Show current session/runtime status.
     Status,
@@ -1735,19 +1735,17 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[
             ("xai", "forget the stored grok.com credential"),
             ("pipenetwork", "forget the stored Pipe Network credential"),
-            (
-                "x402",
-                "forget the stored x402 credit token (not the keypair file)",
-            ),
+            ("x402", "forget stored x402 credit token; keep keypair file"),
         ],
     },
     CommandSpec {
         name: "auth",
-        args: "<openai|anthropic|xai> [key]",
+        args: "<openai|anthropic|pipenetwork|xai> [key]",
         help: "paste and verify an API key (never stored in ↑ history)",
         arg_values: &[
             ("openai", "OpenRouter / OpenAI-compatible key"),
             ("anthropic", "Anthropic API key"),
+            ("pipenetwork", "Pipe API key; pairing remains /login"),
             ("xai", "xAI console API key (not grok.com pairing)"),
         ],
     },
@@ -2260,9 +2258,9 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "queue",
-        args: "[tasks]",
-        help: "show queued prompts and background work",
-        arg_values: &[("tasks", "include loops/background process detail")],
+        args: "[tasks|resume]",
+        help: "show queued work, or resume work parked by stop",
+        arg_values: &[("tasks", "show details"), ("resume", "resume parked work")],
     },
     CommandSpec {
         name: "tasks",

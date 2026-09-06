@@ -79,7 +79,7 @@ fn pipefs_subject(
 
 #[tokio::test]
 async fn synthetic_reconciliation_is_admitted_before_exact_pipefs_staging() {
-    let (subject, controller, observations) = pipefs_subject(false);
+    let (mut subject, controller, observations) = pipefs_subject(false);
     let initial_binding = controller.binding();
 
     subject.checkpoint_durable_workspace().await.unwrap();
@@ -105,7 +105,7 @@ async fn synthetic_reconciliation_is_admitted_before_exact_pipefs_staging() {
 
 #[tokio::test]
 async fn synthetic_reconciliation_stage_failure_cannot_return_success() {
-    let (subject, controller, observations) = pipefs_subject(true);
+    let (mut subject, controller, observations) = pipefs_subject(true);
 
     let error = subject.checkpoint_durable_workspace().await.unwrap_err();
 

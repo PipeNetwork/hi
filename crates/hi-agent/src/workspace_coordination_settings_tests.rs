@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,6 +15,27 @@ use crate::WorkspaceDurability;
 struct CountingDurability {
     admissions: AtomicUsize,
     checkpoints: AtomicUsize,
+}
+
+struct RebindingLegacyDurability {
+    controller: Arc<InMemoryWorkspaceController>,
+    pending_evidence: AtomicBool,
+}
+
+#[async_trait]
+impl WorkspaceDurability for RebindingLegacyDurability {
+    async fn mutation_started(&self, _dirty_paths: Option<Vec<String>>) -> Result<()> {
+        self.pending_evidence.store(true, Ordering::SeqCst);
+        let binding = self.controller.binding();
+        self.controller
+            .rebind(binding.workspace_root, binding.state_root)?;
+        Ok(())
+    }
+
+    async fn checkpoint(&self) -> Result<()> {
+        self.pending_evidence.store(false, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -54,6 +75,48 @@ async fn disabled_controller_gate_uses_legacy_admission_but_keeps_status() {
         .unwrap();
     assert_eq!(durability.admissions.load(Ordering::SeqCst), 1);
     assert_eq!(durability.checkpoints.load(Ordering::SeqCst), 1);
+    assert_eq!(subject.status().state, WorkspaceState::Ready);
+}
+
+#[tokio::test]
+async fn disabled_controller_gate_rechecks_sealed_binding_after_legacy_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let mut harness = hi_workspace::ResolvedHarnessSettings::default();
+    harness.features.workspace_controller_v2 = false;
+    let subject = WorkspaceCoordination::new_local_with_settings(root.path(), &state, harness);
+    let controller = Arc::new(InMemoryWorkspaceController::new_local(
+        "legacy-sealed-race",
+        root.path(),
+        &state,
+    ));
+    subject.install_controller(controller.clone()).unwrap();
+    let sealed = hi_tools::envelope::WorkspaceEnvelope::from(&controller.binding());
+    let durability = Arc::new(RebindingLegacyDurability {
+        controller,
+        pending_evidence: AtomicBool::new(false),
+    });
+
+    let error = subject
+        .begin_sealed_intent(
+            Some(durability.clone()),
+            MutationIntent::workspace("legacy sealed admission race"),
+            &sealed,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .downcast_ref::<super::SealedWorkspaceAdmissionError>()
+            .is_some(),
+        "legacy drift must remain a typed stale-workspace denial: {error:#}"
+    );
+    assert!(
+        durability.pending_evidence.load(Ordering::SeqCst),
+        "a raced legacy admission must retain its pending recovery evidence"
+    );
     assert_eq!(subject.status().state, WorkspaceState::Ready);
 }
 

@@ -1135,6 +1135,18 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
 /// `("error", "")` for unclassified errors.
 pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
     use hi_ai::ProviderErrorKind as K;
+    let workspace_stop = crate::TurnStopReason::for_error(err);
+    if workspace_stop.is_workspace_admission() {
+        let kind = if workspace_stop == crate::TurnStopReason::WorkspaceRecoveryRequired {
+            "recovery"
+        } else {
+            "workspace"
+        };
+        return (
+            kind,
+            "run `hi workspace status`; if a recovery ID is shown, inspect it with `hi workspace recover inspect RECOVERY_ID`",
+        );
+    }
     let external_processing_disabled_code = err
         .downcast_ref::<hi_ai::ProviderError>()
         .and_then(|error| error.code.as_deref())
@@ -1232,19 +1244,7 @@ pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
     }
 }
 
-pub fn error_counts_as_model_issue(err: &anyhow::Error) -> bool {
-    !matches!(
-        hi_ai::provider_error_kind(err),
-        Some(
-            hi_ai::ProviderErrorKind::CapacityUnavailable
-                | hi_ai::ProviderErrorKind::ModelUnavailable
-                | hi_ai::ProviderErrorKind::Outage
-                | hi_ai::ProviderErrorKind::QualityRejected
-                | hi_ai::ProviderErrorKind::ToolProtocol
-                | hi_ai::ProviderErrorKind::PaymentRequired
-        )
-    )
-}
+pub use crate::error_classification::error_counts_as_model_issue;
 
 /// A short, human-readable label for a tool call: the tool name followed by its
 /// most salient argument — a path, command, or pattern — rather than a raw JSON

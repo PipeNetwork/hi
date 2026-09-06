@@ -1015,7 +1015,13 @@ impl crate::App {
         }
         if !self.queue.is_empty() && ui_layout.show_secondary_chrome() {
             let queue_label = if ui_layout == UiLayout::Narrow {
-                format!("q{}", self.queue.len())
+                format!(
+                    "q{}{}",
+                    self.queue.len(),
+                    if self.queue_paused { "p" } else { "" }
+                )
+            } else if self.queue_paused {
+                format!("queue {} paused · /queue resume", self.queue.len())
             } else {
                 format!("queue {} · Alt-↑/↓", self.queue.len())
             };

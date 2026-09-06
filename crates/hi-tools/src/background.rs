@@ -21,6 +21,9 @@ use tokio::sync::Notify;
 mod execution;
 use execution::{drive, stop_and_reap};
 
+mod release;
+pub use release::BackgroundReleaseSummary;
+
 #[path = "background_names.rs"]
 mod names;
 
@@ -69,9 +72,23 @@ struct BgProc {
     title: String,
     pgid: Option<i32>,
     origin: BgOrigin,
+    /// Effect class registered with the durable workspace lifecycle. `None`
+    /// means this process predates/does not participate in that lifecycle and
+    /// therefore cannot prove which controller job is holding admission.
+    managed_effect: Option<crate::BackgroundJobEffect>,
     effect_baseline: Option<Arc<EffectBaseline>>,
     managed_job: Option<crate::job_lifecycle::ManagedBackgroundJob>,
+    /// The registry, rather than Tokio's driver task, owns the native process
+    /// lifetime. This is disarmed only after `--keep-background` has durably
+    /// published the process as orphaned.
+    ownership_released: std::sync::atomic::AtomicBool,
     inner: Mutex<BgInner>,
+    /// Linearizes native exit publication with an intentional
+    /// `--keep-background` ownership handoff. The process driver sets
+    /// `native_exited` and publishes its real terminal state while holding
+    /// this async gate; release takes the same gate, then re-checks
+    /// `native_running` before publishing `Orphaned`.
+    terminal_publication: tokio::sync::Mutex<()>,
     reaped: Notify,
     /// Woken on every output append and lifecycle transition, so a blocking
     /// [`BackgroundRegistry::poll_wait`] sleeps instead of spinning.
@@ -125,6 +142,11 @@ pub struct BackgroundRegistry {
     /// registry-local value keeps timing controls out of process-global
     /// environment state.
     poll_wait_base_secs: AtomicU64,
+    /// Optional per-registry foreground attachment budget in milliseconds.
+    /// Production normally resolves the environment/default policy; embedded
+    /// runtimes and tests can inject a typed value without mutating process
+    /// global environment state.
+    foreground_handoff_budget_ms: AtomicU64,
     lifecycle: crate::job_lifecycle::BackgroundJobLifecycleSlot,
 }
 
@@ -132,6 +154,7 @@ pub struct BackgroundRegistry {
 /// memory; the agent only needs the most recent misses.
 const MAX_UNKNOWN_HANDLES: usize = 16;
 const POLL_WAIT_USE_ENV: u64 = u64::MAX;
+const FOREGROUND_HANDOFF_USE_ENV: u64 = u64::MAX;
 
 impl Default for BackgroundRegistry {
     fn default() -> Self {
@@ -142,6 +165,7 @@ impl Default for BackgroundRegistry {
             quiescing: std::sync::atomic::AtomicBool::new(false),
             unknown_handles: Mutex::new(VecDeque::new()),
             poll_wait_base_secs: AtomicU64::new(POLL_WAIT_USE_ENV),
+            foreground_handoff_budget_ms: AtomicU64::new(FOREGROUND_HANDOFF_USE_ENV),
             lifecycle: crate::job_lifecycle::BackgroundJobLifecycleSlot::default(),
         }
     }
@@ -202,6 +226,29 @@ impl BgInner {
     }
 }
 
+impl BgProc {
+    fn kill_native_if_owned(&self) {
+        if self.ownership_released.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .inner
+            .lock()
+            .map(|inner| !inner.native_exited)
+            .unwrap_or(true)
+            && let Some(pgid) = self.pgid
+        {
+            crate::tools::kill_group(pgid);
+        }
+    }
+}
+
+impl Drop for BgProc {
+    fn drop(&mut self) {
+        self.kill_native_if_owned();
+    }
+}
+
 impl Drop for BackgroundRegistry {
     fn drop(&mut self) {
         kill_all_from(self);
@@ -226,6 +273,30 @@ pub(crate) fn spawn(command: &str) -> Result<String> {
 impl BackgroundRegistry {
     pub fn set_job_lifecycle(&self, lifecycle: Arc<dyn crate::BackgroundJobLifecycle>) {
         self.lifecycle.set(lifecycle);
+    }
+
+    pub(crate) fn supports_managed_effect(&self, effect: crate::BackgroundJobEffect) -> bool {
+        self.lifecycle.supports_effect(effect)
+    }
+
+    pub(crate) fn foreground_handoff_budget(&self) -> Option<std::time::Duration> {
+        match self.foreground_handoff_budget_ms.load(Ordering::Acquire) {
+            FOREGROUND_HANDOFF_USE_ENV => None,
+            millis => Some(std::time::Duration::from_millis(millis)),
+        }
+    }
+
+    /// Override the foreground attachment budget for this registry. `None`
+    /// restores environment/default policy. Values below one millisecond are
+    /// rounded up so an enabled handoff always gives the child a chance to run.
+    pub fn set_foreground_handoff_budget(&self, budget: Option<std::time::Duration>) {
+        let millis = budget.map_or(FOREGROUND_HANDOFF_USE_ENV, |budget| {
+            u64::try_from(budget.as_millis())
+                .unwrap_or(u64::MAX - 1)
+                .clamp(1, u64::MAX - 1)
+        });
+        self.foreground_handoff_budget_ms
+            .store(millis, Ordering::Release);
     }
 
     pub async fn pending_job_settlements(&self) -> Vec<crate::BackgroundJobId> {
@@ -347,14 +418,7 @@ impl BackgroundRegistry {
             // The caller has already handed ownership of this child to us.
             // Kill and reap it before returning the capacity error so a
             // timed-out foreground command cannot escape the registry.
-            if let Some(pgid) = pgid {
-                crate::tools::kill_group(pgid);
-            }
-            let mut child = child;
-            let _ = child.start_kill();
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-            });
+            stop_and_reap(child, pgid).await;
             return Err(error);
         }
         let id = handle_id(command, self.counter.fetch_add(1, Ordering::Relaxed));
@@ -390,11 +454,13 @@ impl BackgroundRegistry {
             self.release_slot();
             return Err(error.into());
         }
+        let managed_effect = managed_job.as_ref().map(|_| effect);
         let proc = Arc::new(BgProc {
             command: command.to_string(),
             title: shell_title(command),
             pgid,
             origin: BgOrigin::AutoBackgrounded,
+            managed_effect,
             effect_baseline: baseline.map(|(root, state_root, snapshot)| {
                 Arc::new(EffectBaseline {
                     root,
@@ -403,7 +469,9 @@ impl BackgroundRegistry {
                 })
             }),
             managed_job,
+            ownership_released: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(BgInner::running(seed_output)),
+            terminal_publication: tokio::sync::Mutex::new(()),
             reaped: Notify::new(),
             changed: Notify::new(),
         });
@@ -416,9 +484,7 @@ impl BackgroundRegistry {
         // pipes and reaps, which is cheap. Gating drivers behind a permit pool
         // meant the 5th+ concurrent job was never drained: it wedged on a full
         // pipe, reported "still running" forever after exiting, and leaked.
-        tokio::spawn(async move {
-            drive(proc, child, stdout, stderr).await;
-        });
+        tokio::spawn(drive(proc, child, stdout, stderr));
         Ok(id)
     }
 
@@ -438,7 +504,7 @@ impl BackgroundRegistry {
         }
 
         self.reserve_slot()?;
-        let mut child = match runner.spawn_shell(command) {
+        let mut child = match runner.spawn_background_shell(command) {
             Ok(child) => child,
             Err(error) => {
                 self.release_slot();
@@ -455,9 +521,12 @@ impl BackgroundRegistry {
             title: shell_title(command),
             pgid,
             origin: BgOrigin::Requested,
+            managed_effect: None,
             effect_baseline: effect_baseline.map(Arc::new),
             managed_job: None,
+            ownership_released: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(BgInner::running(String::new())),
+            terminal_publication: tokio::sync::Mutex::new(()),
             reaped: Notify::new(),
             changed: Notify::new(),
         });
@@ -473,9 +542,7 @@ impl BackgroundRegistry {
         // pipes and reaps, which is cheap. Gating drivers behind a permit pool
         // meant the 5th+ concurrent job was never drained: it wedged on a full
         // pipe, reported "still running" forever after exiting, and leaked.
-        tokio::spawn(async move {
-            drive(proc, child, stdout, stderr).await;
-        });
+        tokio::spawn(drive(proc, child, stdout, stderr));
         Ok(id)
     }
 
@@ -523,7 +590,7 @@ impl BackgroundRegistry {
             self.release_slot();
             return Err(error.into());
         }
-        let mut child = match runner.spawn_shell(command) {
+        let mut child = match runner.spawn_background_shell(command) {
             Ok(child) => child,
             Err(error) => {
                 if let Some(job) = &managed_job {
@@ -556,14 +623,18 @@ impl BackgroundRegistry {
         }
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let managed_effect = managed_job.as_ref().map(|_| effect);
         let proc = Arc::new(BgProc {
             command: command.to_string(),
             title: shell_title(command),
             pgid,
             origin: BgOrigin::Requested,
+            managed_effect,
             effect_baseline: effect_baseline.map(Arc::new),
             managed_job,
+            ownership_released: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(BgInner::running(String::new())),
+            terminal_publication: tokio::sync::Mutex::new(()),
             reaped: Notify::new(),
             changed: Notify::new(),
         });
@@ -572,7 +643,7 @@ impl BackgroundRegistry {
             .unwrap()
             .insert(id.clone(), proc.clone());
         self.release_slot();
-        tokio::spawn(async move { drive(proc, child, stdout, stderr).await });
+        tokio::spawn(drive(proc, child, stdout, stderr));
         Ok(id)
     }
 
@@ -746,9 +817,11 @@ impl BackgroundRegistry {
         {
             bail!("another workspace lifecycle operation is waiting for background processes");
         }
-        let result = self.ensure_quiescent_and_reaped_inner().await;
-        self.quiescing.store(false, Ordering::Release);
-        result
+        // This barrier is awaited from shutdown/rebind paths, which may
+        // themselves be cancelled. Reset admission from Drop so cancelling
+        // the future cannot permanently strand every later background spawn.
+        let _reset_quiescing = ResetQuiescingFlag(&self.quiescing);
+        self.ensure_quiescent_and_reaped_inner().await
     }
 
     async fn ensure_quiescent_and_reaped_inner(&self) -> Result<()> {
@@ -900,13 +973,6 @@ impl BackgroundRegistry {
         }
     }
 
-    /// Forget every tracked process without signalling it, so the registry's
-    /// `Drop` cannot reap survivors. Pairs with
-    /// [`Self::kill_auto_backgrounded`] at one-shot exit.
-    pub fn release_all(&self) {
-        self.processes.lock().unwrap().clear();
-    }
-
     /// The OS process id (process-group leader) behind a handle, when known.
     /// Lets callers sample live resource usage (e.g. RSS while a model
     /// server loads weights) for progress display.
@@ -917,6 +983,19 @@ impl BackgroundRegistry {
 
     pub fn ids(&self) -> Vec<String> {
         ids_from(self)
+    }
+
+    /// Whether a process introduced after `before` is the still-running,
+    /// lifecycle-managed live writer behind a controller admission fence.
+    /// Merely observing a new process is insufficient: read-only jobs and
+    /// untracked compatibility handles must never soften a pre-existing fence.
+    pub fn has_running_managed_live_writer_started_after(&self, before: &[String]) -> bool {
+        let before: HashSet<&str> = before.iter().map(String::as_str).collect();
+        self.processes.lock().unwrap().iter().any(|(id, proc)| {
+            !before.contains(id.as_str())
+                && proc.managed_effect == Some(crate::BackgroundJobEffect::LiveWriter)
+                && proc.inner.lock().unwrap().native_running()
+        })
     }
 
     /// Handles named by callers that were not in the registry, most recent
@@ -1002,6 +1081,14 @@ impl BackgroundRegistry {
             wait_for_terminal_reap(&process, &id, deadline).await?;
         }
         Ok(signalled)
+    }
+}
+
+struct ResetQuiescingFlag<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for ResetQuiescingFlag<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 

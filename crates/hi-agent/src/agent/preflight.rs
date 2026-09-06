@@ -2,6 +2,7 @@
 //! review preflight (directory listing + targeted grep + extra reads) and
 //! implementation preflight (entrypoint detection + validation command).
 
+use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use hi_ai::Content;
 use hi_tools::execute_in_runtime_shared;
@@ -40,6 +41,200 @@ fn preflight_progress(output: &hi_tools::ToolOutcome) -> (&'static str, &'static
         hi_tools::ToolStatus::Succeeded => ("meaningful", "preflight inspection evidence"),
         _ => ("weak", "preflight inspection failed"),
     }
+}
+
+fn implementation_preflight_intent() -> hi_workspace::MutationIntent {
+    // This is a fixed harness command, not model-authored shell. Its Git
+    // invocations explicitly disable index refresh, fsmonitor, external diff,
+    // and textconv, and the remaining commands only inspect local paths. Keep
+    // the effect scope conservative so an unexpected byte change is archived,
+    // but do not misclassify the inspection as a non-replayable external
+    // effect (which would unnecessarily disable protocol-1 PipeFS).
+    hi_workspace::MutationIntent {
+        effect_scope: hi_workspace::EffectScope::LiveWriter,
+        replay_class: hi_workspace::ReplayClass::PureWorkspace,
+        dirty_paths: None,
+        description: Some("implementation preflight shell inspection".into()),
+    }
+}
+
+fn implementation_preflight_report(
+    output: &hi_tools::ToolOutcome,
+    effects_known: bool,
+) -> hi_workspace::ExecutionReport {
+    let disposition = if !effects_known {
+        hi_workspace::ExecutionDisposition::Indeterminate
+    } else {
+        match output.status {
+            hi_tools::ToolStatus::Succeeded => hi_workspace::ExecutionDisposition::Succeeded,
+            hi_tools::ToolStatus::Cancelled => hi_workspace::ExecutionDisposition::Cancelled,
+            _ => hi_workspace::ExecutionDisposition::Failed,
+        }
+    };
+    let mut changed_paths = output
+        .effects
+        .file_changes
+        .iter()
+        .map(|change| change.path.clone().into())
+        .collect::<Vec<std::path::PathBuf>>();
+    changed_paths.sort();
+    changed_paths.dedup();
+    hi_workspace::ExecutionReport {
+        disposition,
+        workspace_may_have_changed: !effects_known
+            || !changed_paths.is_empty()
+            || output.effects.mutation_applied,
+        // The fixed command has no network, credential, or authority-bearing
+        // side effect. Its process existence alone is not an external effect.
+        external_effect_may_have_occurred: false,
+        content_digest: None,
+        changed_paths,
+        artifacts: Vec::new(),
+        detail: if effects_known {
+            (output.status != hi_tools::ToolStatus::Succeeded)
+                .then(|| format!("implementation preflight was {:?}", output.status))
+        } else {
+            Some("implementation preflight effects could not be reconciled".into())
+        },
+    }
+}
+
+fn implementation_preflight_publication_failure(
+    output: &hi_tools::ToolOutcome,
+    detail: impl std::fmt::Display,
+) -> hi_tools::ToolOutcome {
+    // Put the settlement failure first so bounding a large preflight result
+    // cannot hide the reason the visible tool lifecycle failed. Keep the
+    // process/effect evidence, but never reuse a rich successful display for
+    // this terminal event.
+    let combined = if output.content.is_empty() {
+        format!("Error: {detail}")
+    } else {
+        format!("Error: {detail}\n\n{}", output.content)
+    };
+    let (content, truncation) = hi_tools::bound_tool_content(combined);
+    let mut terminal = output.clone();
+    terminal.content = content;
+    terminal.display = None;
+    terminal.status = hi_tools::ToolStatus::Failed;
+    terminal.truncation = truncation;
+    terminal
+}
+
+async fn execute_implementation_preflight_process(
+    runner: &hi_tools::ProcessRunner,
+    command: &str,
+    interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (Option<anyhow::Result<hi_tools::ProcessExecution>>, bool) {
+    execute_implementation_preflight_process_after_check(runner, command, interrupt, || {}).await
+}
+
+async fn execute_implementation_preflight_process_after_check<F>(
+    runner: &hi_tools::ProcessRunner,
+    command: &str,
+    interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    after_prestart_check: F,
+) -> (Option<anyhow::Result<hi_tools::ProcessExecution>>, bool)
+where
+    F: FnOnce(),
+{
+    // An interrupt raised synchronously by the UI's tool-start callback means
+    // the command never starts. This avoids killing an empty registry and then
+    // accidentally launching the command while manufacturing Cancelled.
+    if interrupt.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return (None, true);
+    }
+    after_prestart_check();
+    let execution =
+        runner.run_shell_maybe_timeout(command, Some(std::time::Duration::from_secs(120)));
+    tokio::pin!(execution);
+    // Poll once before the cancellation select. `run_shell_maybe_timeout`
+    // spawns and registers its child on that first poll, closing the race where
+    // an interrupt could win, observe an empty registry, and then awaiting the
+    // untouched future would launch the supposedly cancelled command.
+    let completed = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(
+            match std::future::Future::poll(execution.as_mut(), context) {
+                std::task::Poll::Ready(output) => Some(output),
+                std::task::Poll::Pending => None,
+            },
+        )
+    })
+    .await;
+    if let Some(output) = completed {
+        let interrupted = interrupt.swap(false, std::sync::atomic::Ordering::AcqRel);
+        return (Some(output), interrupted);
+    }
+    tokio::select! {
+        biased;
+        _ = take_tool_interrupt(interrupt.clone()) => {
+            // Keep the capture future alive after signalling the group. It is
+            // the owner that observes exit, drains the pipes, reaps the direct
+            // child, and unregisters it from the foreground inventory.
+            runner.foreground_registry().kill_current();
+            (Some(execution.await), true)
+        }
+        output = &mut execution => {
+            interrupt.store(false, std::sync::atomic::Ordering::Release);
+            (Some(output), false)
+        }
+    }
+}
+
+fn implementation_preflight_outcome(
+    process: Option<anyhow::Result<hi_tools::ProcessExecution>>,
+    interrupted: bool,
+) -> hi_tools::ToolOutcome {
+    if process.is_none() {
+        return cancelled_preflight_outcome();
+    }
+    let mut output = match process.expect("checked above") {
+        Ok(execution) => {
+            let display = execution.display_content();
+            let model = execution.model_content();
+            let process_outcome = execution.model_outcome();
+            let status = execution.status;
+            let process_truncation = execution.truncation;
+            let (content, boundary_truncation) = hi_tools::bound_tool_content(model);
+            hi_tools::ToolOutcome {
+                display: (display != content).then_some(display),
+                content,
+                plan: None,
+                status,
+                process: Some(process_outcome),
+                background: None,
+                effects: hi_tools::ToolEffects::default(),
+                truncation: if matches!(process_truncation, hi_tools::TruncationState::Complete) {
+                    boundary_truncation
+                } else {
+                    process_truncation
+                },
+                images: Vec::new(),
+            }
+        }
+        Err(error) => {
+            let (content, truncation) = hi_tools::bound_tool_content(format!(
+                "Error: implementation preflight process failed: {error:#}"
+            ));
+            hi_tools::ToolOutcome {
+                content,
+                display: None,
+                plan: None,
+                status: hi_tools::ToolStatus::Failed,
+                process: None,
+                background: None,
+                effects: hi_tools::ToolEffects::default(),
+                truncation,
+                images: Vec::new(),
+            }
+        }
+    };
+    if interrupted {
+        output.content = "Preflight tool interrupted by user.".into();
+        output.display = None;
+        output.status = hi_tools::ToolStatus::Cancelled;
+    }
+    output
 }
 
 async fn take_tool_interrupt(interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>) {
@@ -403,45 +598,129 @@ impl crate::Agent {
         ui: &mut dyn Ui,
         tracker: &mut ImplementationTracker,
         tool_timeline: &mut crate::agent::turn::retention::ToolTimeline,
-    ) -> PreflightSummary {
+    ) -> Result<PreflightSummary> {
         let arguments = serde_json::json!({
             "command": implementation_preflight_command(),
             "timeout": 120,
         })
         .to_string();
+        let intent = implementation_preflight_intent();
+        self.begin_classified_workspace_operation(intent).await?;
         let id = format!("hi_implementation_preflight_{}", self.messages.len());
         ui.status("running implementation preflight inspection");
         self.interrupt
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        ui.tool_started_id("implementation-preflight", "bash", &arguments);
-        ui.tool_call_id("implementation-preflight", "bash", &arguments);
+        ui.tool_started_id(&id, "bash", &arguments);
+        ui.tool_call_id(&id, "bash", &arguments);
         let started = std::time::Instant::now();
-        let lsp = self.runtime.lsp();
-        let repo_map = self.runtime.repo_map_arc();
-        let output = {
-            let execution = execute_in_runtime_shared(
-                self.runtime.root(),
-                self.runtime.state_root(),
-                &lsp,
-                self.runtime.background(),
-                self.runtime.read_cache(),
-                &repo_map,
-                "bash",
-                &arguments,
-            );
-            tokio::pin!(execution);
-            tokio::select! {
-                biased;
-                _ = take_tool_interrupt(self.interrupt.clone()) => {
-                    ui.status("implementation preflight interrupted — continuing the task");
-                    cancelled_preflight_outcome()
+        let ledger_revision = self.runtime.ledger().revision();
+        let (process, interrupted) = execute_implementation_preflight_process(
+            self.runtime.process_runner(),
+            implementation_preflight_command(),
+            self.interrupt.clone(),
+        )
+        .await;
+        if interrupted {
+            ui.status("implementation preflight interrupted — continuing the task");
+        }
+        let process_started = process.is_some();
+        let mut output = implementation_preflight_outcome(process, interrupted);
+        let effects_known = if process_started {
+            match self.reconcile_workspace_changes().await {
+                Ok(()) => {
+                    let file_changes = self.runtime.ledger().changes_since(ledger_revision);
+                    if !file_changes.is_empty() && output.status == hi_tools::ToolStatus::Succeeded
+                    {
+                        output.status = hi_tools::ToolStatus::Failed;
+                        let detail = format!(
+                            "[implementation preflight unexpectedly changed {} workspace path(s)]",
+                            file_changes.len()
+                        );
+                        let (content, truncation) =
+                            hi_tools::bound_tool_content(format!("{}\n{detail}", output.content));
+                        output.content = content;
+                        output.truncation = truncation;
+                    }
+                    output.effects = hi_tools::ToolEffects {
+                        mutation_attempted: !file_changes.is_empty(),
+                        mutation_applied: !file_changes.is_empty(),
+                        file_changes,
+                    };
+                    true
                 }
-                output = &mut execution => {
-                    self.interrupt.store(false, std::sync::atomic::Ordering::Relaxed);
-                    output
+                Err(error) => {
+                    output.effects = hi_tools::ToolEffects {
+                        mutation_attempted: true,
+                        mutation_applied: true,
+                        file_changes: Vec::new(),
+                    };
+                    if output.status == hi_tools::ToolStatus::Succeeded {
+                        output.status = hi_tools::ToolStatus::Failed;
+                    }
+                    let detail = format!(
+                        "[infrastructure failure: implementation preflight effects could not be reconciled: {error:#}]"
+                    );
+                    let combined = if output.content.is_empty() {
+                        detail
+                    } else {
+                        format!("{}\n{detail}", output.content)
+                    };
+                    let (content, truncation) = hi_tools::bound_tool_content(combined);
+                    output.content = content;
+                    output.truncation = truncation;
+                    false
                 }
             }
+        } else {
+            true
         };
+        let execution = implementation_preflight_report(&output, effects_known);
+        let calls = vec![(id.clone(), "bash".to_string(), arguments.clone())];
+        let assistant_content = vec![Content::ToolCall {
+            id: id.clone(),
+            name: "bash".to_string(),
+            arguments: arguments.clone(),
+        }];
+        let results = vec![(id.clone(), output.content.clone())];
+        if let Err(stage_error) =
+            self.stage_active_workspace_execution(&calls, &assistant_content, &results, &execution)
+        {
+            let mut indeterminate = execution;
+            indeterminate.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
+            indeterminate.detail = Some(format!(
+                "preflight ran, but its transcript could not be staged: {stage_error:#}"
+            ));
+            let settlement = self
+                .checkpoint_durable_workspace_with_execution(indeterminate)
+                .await;
+            let terminal = implementation_preflight_publication_failure(
+                &output,
+                format!(
+                    "implementation preflight ran, but its transcript could not be staged; execution is indeterminate: {stage_error:#}"
+                ),
+            );
+            emit_tool_output(ui, &id, "bash", &terminal);
+            return match settlement {
+                Err(settlement) => Err(settlement).context(format!(
+                    "preflight transcript staging failed and recovery settlement also failed: {stage_error:#}"
+                )),
+                Ok(()) => Err(stage_error)
+                    .context("preflight transcript staging failed; execution is indeterminate"),
+            };
+        }
+        if let Err(settlement) = self
+            .checkpoint_durable_workspace_with_execution(execution)
+            .await
+        {
+            let terminal = implementation_preflight_publication_failure(
+                &output,
+                format!(
+                    "implementation preflight ran, but workspace/transcript settlement is indeterminate: {settlement:#}"
+                ),
+            );
+            emit_tool_output(ui, &id, "bash", &terminal);
+            return Err(settlement).context("implementation preflight settlement failed");
+        }
         let duration_ms = started.elapsed().as_millis() as u64;
         let error = output.status != hi_tools::ToolStatus::Succeeded;
         tracker.preferred_validation = preferred_validation_from_preflight(&output.content);
@@ -470,25 +749,23 @@ impl crate::Agent {
             }
             .with_tape(&arguments, &output.content),
         );
-        emit_tool_output(ui, "implementation-preflight", "bash", &output);
-        self.messages.push_assistant_with_results(
-            vec![Content::ToolCall {
-                id: id.clone(),
-                name: "bash".to_string(),
-                arguments,
-            }],
-            vec![(id, output.content)],
-        );
+        emit_tool_output(ui, &id, "bash", &output);
+        self.messages
+            .push_assistant_with_results(assistant_content, results);
         let interrupted = output.status == hi_tools::ToolStatus::Cancelled;
         if interrupted {
             self.messages
                 .push_nudge(NudgeKind::Continue, PREFLIGHT_INTERRUPTED_NUDGE);
         }
-        PreflightSummary {
+        Ok(PreflightSummary {
             executed: 1,
             max_concurrent_batch: 1,
             serial_runs: 1,
             interrupted,
-        }
+        })
     }
 }
+
+#[cfg(test)]
+#[path = "preflight_boundary_tests.rs"]
+mod boundary_tests;

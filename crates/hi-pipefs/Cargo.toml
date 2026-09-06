@@ -24,6 +24,7 @@ zstd.workspace = true
 rustix.workspace = true
 
 [dev-dependencies]
+hi-control.workspace = true
 tempfile.workspace = true
 
 [lints]

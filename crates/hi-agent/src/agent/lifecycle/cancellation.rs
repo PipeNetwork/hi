@@ -50,12 +50,19 @@ impl crate::Agent {
         workspace_reconciled: bool,
         changes: &[hi_tools::FileChange],
         current_workspace: Option<(u64, String)>,
+        allow_preexisting_fence: bool,
     ) -> Result<()> {
         // Reaping runs each process's exactly-once terminal callback. Freeze
         // the resulting durability-pending job set before publishing the
         // workspace receipt, then advance those jobs only after that receipt.
         let pending_jobs = self.runtime.background().pending_job_settlements().await;
         let Some(intent) = self.workspace_coordination.active_intent() else {
+            // Workspace admission can fail before this turn owns a permit.
+            // The existing controller fence (including another live writer or
+            // durable recovery evidence) is not ours to settle or clear.
+            if allow_preexisting_fence {
+                return Ok(());
+            }
             // A tool batch can hand its permit to the shielded settlement task
             // immediately before the outer cancellation branch wins. Do not
             // publish a terminal turn result until that task has left the
@@ -176,6 +183,7 @@ impl crate::Agent {
                     workspace_reconciled,
                     &changes,
                     current_workspace,
+                    false,
                 )
                 .await?;
                 let outcome = self.finalize_cancelled_turn_with_changes(changes)?;
@@ -184,7 +192,13 @@ impl crate::Agent {
                     killed_backgrounds: killed,
                 })
             }
-            crate::TurnCleanupKind::Fail => {
+            failure_kind @ (crate::TurnCleanupKind::Fail
+            | crate::TurnCleanupKind::FailWithStopReason(_)) => {
+                let stop_reason = match failure_kind {
+                    crate::TurnCleanupKind::Fail => crate::TurnStopReason::InfrastructureFailure,
+                    crate::TurnCleanupKind::FailWithStopReason(stop_reason) => stop_reason,
+                    crate::TurnCleanupKind::Cancel { .. } => unreachable!(),
+                };
                 let killed = self.quiesce_abnormal_turn_processes().await?;
                 let _ = self.workspace.active_turn_background_baseline.take();
                 let workspace_reconciled = self.reconcile_abnormal_turn_bounded().await;
@@ -194,12 +208,14 @@ impl crate::Agent {
                     workspace_reconciled,
                     &changes,
                     current_workspace.clone(),
+                    stop_reason.is_workspace_admission(),
                 )
                 .await?;
-                let outcome = self.finalize_failed_turn_with_changes(
+                let outcome = self.finalize_failed_turn_with_changes_and_reason(
                     changes,
                     workspace_reconciled,
                     current_workspace,
+                    stop_reason,
                 );
                 Ok(crate::TurnCleanupResult {
                     outcome,

@@ -107,6 +107,10 @@ pub(crate) struct VerifyWorkspace<'a> {
     skip_affected_checks: Option<&'a std::collections::BTreeSet<String>>,
     /// Packages mid-turn `cargo test` already sealed green — skip `affected-test:`.
     skip_affected_tests: Option<&'a std::collections::BTreeSet<String>>,
+    /// A deliberate, lifecycle-managed process currently owns the live-writer
+    /// fence. Verification must wait for a stable workspace boundary instead
+    /// of racing that process.
+    active_managed_live_writer: bool,
     /// The always-present controller used by live agent turns. Small verifier
     /// unit tests may omit it; they never model a remotely authoritative
     /// workspace.
@@ -131,6 +135,7 @@ impl<'a> VerifyWorkspace<'a> {
             mutation_seen: false,
             skip_affected_checks: None,
             skip_affected_tests: None,
+            active_managed_live_writer: false,
             coordination: None,
             durability: None,
         }
@@ -168,6 +173,11 @@ impl<'a> VerifyWorkspace<'a> {
     ) -> Self {
         self.skip_affected_checks = Some(checks);
         self.skip_affected_tests = Some(tests);
+        self
+    }
+
+    pub(crate) fn with_active_managed_live_writer(mut self, active: bool) -> Self {
+        self.active_managed_live_writer = active;
         self
     }
 
@@ -251,6 +261,19 @@ fn native_verifier_intent(stage: &VerifyStage) -> Option<hi_workspace::MutationI
             stage.name, classification.basis
         )),
     })
+}
+
+/// A running managed writer is an intentional workspace fence, not a verifier
+/// infrastructure failure. Defer only for the controller's precise
+/// `ActiveWriter` denial while the binding otherwise remains healthy. Any
+/// recovery, lease, conflict, or compatibility state keeps the fail-closed
+/// admission path below.
+fn native_verifier_deferred_by_active_writer(error: &anyhow::Error) -> bool {
+    let Some(denied) = error.downcast_ref::<hi_workspace::AdmissionDenied>() else {
+        return false;
+    };
+    denied.reason == hi_workspace::AdmissionDeniedReason::ActiveWriter
+        && denied.state == hi_workspace::WorkspaceState::Ready
 }
 
 /// RAII fence for native verifier admission. If the verifier future is
@@ -478,6 +501,11 @@ pub(crate) enum VerifyOutcome {
         output: String,
         round: u32,
     },
+    /// A configured verifier stage was not executed because a managed live
+    /// writer still owns the workspace write fence. This carries no passing or
+    /// failing verification evidence and must settle the turn without entering
+    /// another obligation/repair loop.
+    DeferredActiveWriter { stage: VerifyStage, detail: String },
     /// A validation command rewrote relevant workspace inputs. A pass for that
     /// moving target is not evidence for a stable source revision.
     Unstable {
@@ -724,6 +752,15 @@ impl WorkspaceRepairVerifier {
                 VerifyOutcome::NotRun
             };
         }
+        if workspace.active_managed_live_writer {
+            return VerifyOutcome::DeferredActiveWriter {
+                stage: stages[0].clone(),
+                detail: "managed live writer holds the workspace fence; verifier was not executed"
+                    .into(),
+            };
+        }
+        let round_before = self.round;
+        let execution_count_before_round = self.execution_count();
         self.round = self.round.saturating_add(1);
         let round = self.round;
         let max_rounds = self.max_rounds;
@@ -830,6 +867,21 @@ impl WorkspaceRepairVerifier {
             };
             let admission = match NativeVerifierAdmission::begin(workspace, stage).await {
                 Ok(admission) => admission,
+                Err(error) if native_verifier_deferred_by_active_writer(&error) => {
+                    // Admission was denied before this stage executed. If no
+                    // LSP or earlier stage produced evidence in this round,
+                    // retain the truthful "zero verification rounds ran"
+                    // telemetry value.
+                    if self.execution_count() == execution_count_before_round {
+                        self.round = round_before;
+                    }
+                    return VerifyOutcome::DeferredActiveWriter {
+                        stage: stage.clone(),
+                        detail: format!(
+                            "managed live writer holds the workspace fence; verifier command was not executed: {error:#}"
+                        ),
+                    };
+                }
                 Err(error) => {
                     self.record_execution(VerificationExecution::infrastructure_failure(
                         round, stage,
@@ -1742,6 +1794,48 @@ pub(crate) fn is_internal_runtime_artifact_path(path: &str) -> bool {
         path.replace('\\', "/").trim_start_matches("./"),
         ".hi/history" | ".hi/memory.undo.md"
     )
+}
+
+#[cfg(test)]
+#[test]
+fn only_healthy_active_writer_admission_is_a_verifier_deferral() {
+    let denied = |reason, state| {
+        anyhow::Error::from(hi_workspace::AdmissionDenied {
+            reason,
+            state,
+            detail: "test admission denial".into(),
+        })
+    };
+    assert!(native_verifier_deferred_by_active_writer(&denied(
+        hi_workspace::AdmissionDeniedReason::ActiveWriter,
+        hi_workspace::WorkspaceState::Ready,
+    )));
+    for (reason, state) in [
+        (
+            hi_workspace::AdmissionDeniedReason::NotReady,
+            hi_workspace::WorkspaceState::RecoveryRequired,
+        ),
+        (
+            hi_workspace::AdmissionDeniedReason::NotReady,
+            hi_workspace::WorkspaceState::LeaseLost,
+        ),
+        (
+            hi_workspace::AdmissionDeniedReason::NotReady,
+            hi_workspace::WorkspaceState::Conflict,
+        ),
+        (
+            hi_workspace::AdmissionDeniedReason::Incompatible,
+            hi_workspace::WorkspaceState::Incompatible,
+        ),
+        (
+            hi_workspace::AdmissionDeniedReason::ActiveMutation,
+            hi_workspace::WorkspaceState::Ready,
+        ),
+    ] {
+        assert!(!native_verifier_deferred_by_active_writer(&denied(
+            reason, state
+        )));
+    }
 }
 
 #[cfg(test)]

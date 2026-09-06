@@ -99,6 +99,7 @@ impl PipeFsWorkspaceController {
                         batch: Some(CausalTranscriptBatch {
                             records: pending.transcript_records,
                         }),
+                        registry_job: false,
                     },
                 );
                 status.state = if incompatible {
@@ -171,6 +172,7 @@ impl PipeFsWorkspaceController {
                         operation: Some(operation),
                         execution: Some(pending.operation.execution),
                         batch: None,
+                        registry_job: false,
                     },
                 );
                 status.state = if incompatible {

@@ -41,7 +41,17 @@ HI_API_KEY=sk-or-... hi -m anthropic/claude-sonnet-4 "add a --json flag"
 PIPENETWORK_API_KEY=... hi --provider pipenetwork "…"
 hi --provider ollama -m qwen2.5-coder "…"
 XAI_API_KEY=xai-... hi --provider xai "…"
+HI_API_KEY=sk-... hi --provider openai --base-url https://api.openai.com/v1 -m gpt-6-astra "add a --json flag"
 ```
+
+For persistent Pipe setup without an environment variable, run
+`hi auth pipenetwork` (or `/auth pipenetwork` inside an interactive session).
+hi verifies the key against `/models`, stores it in the private credential
+store, and creates a Pipe profile that defaults to DeepSeek V4 Flash.
+
+GPT-6 Astra uses the Responses API automatically, including tool calls and
+encrypted reasoning replay. See [Astra harness support](docs/gpt-6-astra.md)
+for parameter handling and transport limits.
 
 Profiles live in `./hi.toml` or `~/.config/hi/config.toml`. `/provider` switches mid-session.
 User-owned config stores credentials by reference (`env://...` or the private
@@ -82,7 +92,7 @@ base_url = "http://127.0.0.1:13000/v1"
 
 `json_schema` tasks can succeed without a sandbox. `cargo_test` / `cargo_clippy` / `review` need that worker plus a local `hi`. Cargo-backed `code.change` is not GA until a verified worker run.
 
-Project tickets on the dashboard Board are a different unit of work than `POST /v1/tasks`. Pair a project (`hi /login pipenetwork`), then `hi tickets` in the repo to claim local tickets and run `--goal --verify` until the report passes. Sandbox tickets stay on the control plane (`POST /v1/tasks` plus server-side `POST /v1/repairs`).
+Project tickets on the dashboard Board are a different unit of work than `POST /v1/tasks`. Start an interactive `hi`, run `/login pipenetwork`, and pick the project; then run `hi tickets` in the repo to claim local tickets and drive `--goal --verify` until the report passes. Sandbox tickets stay on the control plane (`POST /v1/tasks` plus server-side `POST /v1/repairs`).
 
 ## Trust
 

@@ -207,6 +207,7 @@ impl crate::Agent {
             (
                 self.explore_child_provider(),
                 self.build_bg_explore_config(n, kind),
+                self.provider_capability_registry.clone(),
             )
         });
         let candidate_run = (!kind.is_read_only()).then(|| {
@@ -243,11 +244,12 @@ impl crate::Agent {
                             .await
                         }
                         None => {
-                            let (provider, child_config) =
+                            let (provider, child_config, capability_registry) =
                                 read_run.expect("read-only background run was prepared");
                             run_bg_readonly(
                                 provider,
                                 child_config,
+                                capability_registry,
                                 kind,
                                 prompt_for_factory,
                                 child_teardown,
@@ -491,6 +493,7 @@ impl crate::Agent {
         // to the driver; using the raw configured override here would send a
         // dead local model id to the driver's provider.
         let explore_model = self.effective_explore_child_model();
+        let explore_route = self.explore_child_route();
         let dir_name = match kind {
             BgTaskKind::Plan => format!("bg-plan-{n}"),
             _ => format!("bg-explore-{n}"),
@@ -502,6 +505,8 @@ impl crate::Agent {
             },
             routing: crate::AgentRouting {
                 model: explore_model,
+                provider_route: Some(explore_route.label),
+                capability_route: Some(explore_route.capability_identity),
                 requested_max_tokens: self.config.routing.requested_max_tokens,
                 max_tokens: self.config.routing.max_tokens,
                 max_tokens_explicit: self.config.routing.max_tokens_explicit,
@@ -539,6 +544,21 @@ impl crate::Agent {
             },
             ..self.config.clone()
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_explore_route_for_test(&self) -> crate::AgentProviderRoute {
+        let config = self.build_bg_explore_config(0, BgTaskKind::Explore);
+        crate::AgentProviderRoute::new(
+            config
+                .routing
+                .provider_route
+                .expect("background explore provider route"),
+            config
+                .routing
+                .capability_route
+                .expect("background explore capability route"),
+        )
     }
 }
 
@@ -597,6 +617,7 @@ fn readonly_child_prompt(kind: BgTaskKind, prompt: &str) -> String {
 async fn run_bg_readonly(
     provider: std::sync::Arc<dyn hi_ai::Provider>,
     config: AgentConfig,
+    capability_registry: hi_ai::ProviderCapabilityRegistry,
     kind: BgTaskKind,
     prompt: String,
     teardown: hi_tools::BackgroundTaskTeardown,
@@ -605,7 +626,7 @@ async fn run_bg_readonly(
     let kind_label = kind.as_str();
     let child_prompt = readonly_child_prompt(kind, &prompt);
 
-    let child = match crate::Agent::new(provider, config) {
+    let mut child = match crate::Agent::new(provider, config) {
         Ok(c) => c,
         Err(e) => {
             return hi_tools::BackgroundTaskOutcome {
@@ -619,6 +640,7 @@ async fn run_bg_readonly(
             };
         }
     };
+    child.set_provider_capability_registry(capability_registry);
 
     let mut child = super::child_process_teardown::ReapingChild::new(child, Some(teardown));
     let result = child.child_mut().run_turn(&child_prompt, ui).await;

@@ -57,7 +57,7 @@ impl Provider for AnthropicProvider {
         let url = format!("{}/v1/messages", self.base_url);
         let body = build_body(&request);
 
-        let resp = crate::http::send_with_retry(
+        let resp = match crate::http::send_with_retry(
             self.http
                 .post(&url)
                 .header("x-api-key", &self.api_key)
@@ -65,13 +65,24 @@ impl Provider for AnthropicProvider {
                 .json(&body),
         )
         .await
-        .map_err(|error| {
-            ProviderError::new(
-                ProviderErrorKind::Outage,
-                format!("request to Anthropic endpoint failed: {error}"),
-            )
-            .with_api_contract(None, Some(true), None)
-        })?;
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                sink(StreamEvent::WireAudit(Box::new(wire_audit::build(
+                    &request,
+                    &self.base_url,
+                    &body,
+                    false,
+                    None,
+                ))));
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Outage,
+                    format!("request to Anthropic endpoint failed: {error}"),
+                )
+                .with_api_contract(None, Some(true), None)
+                .into());
+            }
+        };
 
         let status = resp.status();
         wire_audit::emit(sink, &request, &self.base_url, &body, status);
@@ -494,7 +505,10 @@ impl BlockBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use super::{BlockBuilder, backfill_missing_usage, build_body, to_anthropic_messages};
+    use super::{
+        AnthropicProvider, BlockBuilder, backfill_missing_usage, build_body, to_anthropic_messages,
+    };
+    use crate::provider::Provider;
     use crate::types::{
         ChatRequest, Completion, Content, Message, RequestProfile, StreamEvent, ToolMode, ToolSpec,
         Usage,
@@ -701,6 +715,61 @@ mod tests {
         let chat_only = build_body(&request(ToolMode::ChatOnly));
         assert!(chat_only.get("tools").is_some());
         assert_eq!(chat_only["tool_choice"], json!({"type": "none"}));
+    }
+
+    #[tokio::test]
+    async fn transport_failure_keeps_the_attempted_wire_schema_identity() {
+        let mut request = ChatRequest {
+            model: "claude-test".into(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: false,
+            canonical_objective: None,
+            messages: Arc::new(vec![Message::user("hello")]),
+            tools: Arc::from([ToolSpec {
+                name: "read".into(),
+                description: "Read a file".into(),
+                parameters: json!({"type": "object"}),
+            }]),
+            tool_envelope: None,
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: RequestProfile::default(),
+        };
+        request.tool_envelope = Some(Arc::new(crate::RequestToolEnvelope {
+            digest: "blake3:sealed-anthropic".into(),
+            payload: json!({"schema_version": 4}),
+        }));
+        let expected_body = build_body(&request);
+        let provider = AnthropicProvider::new("http://[invalid".into(), "test".into());
+        let mut audits = Vec::new();
+
+        provider
+            .stream(request, &mut |event| {
+                if let StreamEvent::WireAudit(audit) = event {
+                    audits.push(audit);
+                }
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(audits.len(), 1);
+        assert!(!audits[0].accepted);
+        assert_eq!(audits[0].response_status, None);
+        assert_eq!(
+            audits[0].tool_envelope_digest.as_deref(),
+            Some("blake3:sealed-anthropic")
+        );
+        assert_eq!(
+            audits[0].tool_schema.as_ref().unwrap().wire_digest,
+            Some(crate::wire_audit::canonical_value_digest(
+                &expected_body["tools"]
+            ))
+        );
     }
 
     #[test]

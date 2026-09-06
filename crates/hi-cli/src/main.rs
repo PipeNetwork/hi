@@ -29,6 +29,7 @@ mod learning_ledger;
 mod local_runtime;
 mod mcp_host;
 mod mcp_serve;
+mod one_shot_shutdown;
 mod operator_override_audit;
 mod orchestration;
 mod orchestration_benchmark;
@@ -50,6 +51,7 @@ mod team_bench;
 mod tickets;
 mod tool_trim;
 mod trace_cmd;
+mod tui_profile_callbacks;
 mod tuning_report;
 // Wired by the managed RSI entry once descriptor-driven workflow launch lands;
 // composition and contracts are complete and tested.
@@ -92,13 +94,13 @@ use landing::{effective_prompt, print_landing, profile_infos, resolve_session};
 use orchestration::{build_sync_config, run_best_of, run_hf_cli, run_mcp_cli};
 use project_context::auto_memory_enabled;
 use provider::{
-    build_chain, default_skeptic_model, effective_max_tokens_for_model, provider_label,
-    resolve_startup_route, startup_live_model_metadata,
+    agent_provider_route, build_chain, default_skeptic_model, effective_max_tokens_for_model,
+    provider_label, resolve_startup_route, startup_live_model_metadata,
 };
 use repl::repl;
 use report::{
-    finish_initialization_trace, finish_interactive_trace, finish_turn_trace, one_shot_exit_code,
-    pipeline_command, run_one_shot_cancellable, write_initialization_failure_report, write_report,
+    finish_initialization_trace, finish_interactive_trace, finish_turn_trace, pipeline_command,
+    run_one_shot_cancellable, write_initialization_failure_report, write_report,
 };
 use review_target::{absolutize_path, chdir_to_review_target, resolve_runtime_roots};
 use rsi_bootstrap::RsiBootstrap;
@@ -193,6 +195,21 @@ fn completed_session_switch(canonical_id: String, summary: String) -> hi_tui::Se
         id: canonical_id,
         summary,
     }
+}
+
+/// Finish authoritative shutdown before polling optional post-session work.
+///
+/// The futures are accepted separately so constructing a feedback/flush future
+/// cannot accidentally move it back ahead of process reaping during frontend
+/// refactors. If settlement fails, optional work is deliberately not polled.
+async fn settle_before_post_session_work<S, P>(settlement: S, post_session: P) -> Result<()>
+where
+    S: std::future::Future<Output = Result<()>>,
+    P: std::future::Future<Output = ()>,
+{
+    settlement.await?;
+    post_session.await;
+    Ok(())
 }
 
 async fn run() -> Result<()> {
@@ -932,7 +949,7 @@ async fn run() -> Result<()> {
                 .record_remote_session_identity(&session_id)
                 .context("persisting the canonical remote session identity")?;
         }
-        let sync_session = sync::SyncSession::new(local_session, remote);
+        let sync_session = sync::SyncSession::new(local_session, remote)?;
         startup_trace!("sync session reconciled");
         let handle = sync_session.remote_handle();
         agent.set_session(Box::new(sync_session));
@@ -1139,7 +1156,7 @@ async fn run() -> Result<()> {
             // tells a remote client this session can actually be steered.
             remote.set_accepts_input(true);
             let sync_session =
-                sync::SyncSession::new(JsonlSession::new(daemon_session_path), remote);
+                sync::SyncSession::new(JsonlSession::new(daemon_session_path), remote)?;
             let handle = sync_session.remote_handle();
             agent.set_session(Box::new(sync_session));
             let rui = std::sync::Arc::new(sync::RemoteUi::new(
@@ -1321,9 +1338,9 @@ async fn run() -> Result<()> {
                 {
                     agent.last_turn_outcome().cloned()
                 }
-                Err(_) => Some(
+                Err(error) => Some(
                     agent
-                        .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
+                        .cleanup_turn(hi_agent::TurnCleanupKind::for_error(error))
                         .await
                         .map(|r| r.outcome)
                         .unwrap_or_else(|_| agent.finalize_failed_turn_snapshot_only()),
@@ -1446,15 +1463,13 @@ async fn run() -> Result<()> {
         if let Err(err) = &report_result {
             eprintln!("\x1b[33mreport error: {err:#}\x1b[0m");
         }
+        let workspace_shutdown =
+            one_shot_shutdown::strategy(result.as_ref().ok().or(failed_outcome.as_ref()));
         // A one-shot turn may have started background processes; don't leak
         // them — unless the caller asked for the opposite, because the
         // deliverable is a service that must outlive this process.
-        if cli.keep_background {
-            agent.release_background_services();
-            agent.background_task_registry().kill_all().await;
-        } else {
-            agent.settle_workspace_for_exit().await?;
-        }
+        one_shot_shutdown::prepare_agent(&mut agent, cli.keep_background, workspace_shutdown)
+            .await?;
         // Flush any pending sync records and live events to ipop before
         // exiting. Silent on failure by design: sync is best-effort mirroring
         // of a local-first session — everything unsent stays queued in the
@@ -1463,15 +1478,8 @@ async fn run() -> Result<()> {
         if let Some(handle) = &sync_handle {
             let _ = handle.flush().await;
         }
-        if let Some(host) = &pipefs_host {
-            let result = host.clean_exit(&mut agent).await;
-            if let Err(error) = result {
-                eprintln!(
-                    "\x1b[31mPipeFS exit blocked: {error:#}; recovery cache was retained\x1b[0m"
-                );
-                std::process::exit(3);
-            }
-        }
+        one_shot_shutdown::finish_pipefs(pipefs_host.as_deref(), &mut agent, workspace_shutdown)
+            .await?;
         if let Some(handle) = &sync_handle {
             handle.end_session().await;
         }
@@ -1486,14 +1494,12 @@ async fn run() -> Result<()> {
         if report_result.is_err() {
             std::process::exit(3);
         }
-        let exit_code = match &result {
-            Ok(outcome) => one_shot_exit_code(
-                outcome,
-                cli.allow_unverified,
-                goal_drive::one_shot_leftover_remains(&agent),
-            ),
-            Err(_) => 3,
-        };
+        let exit_code = one_shot_shutdown::exit_code(
+            &result,
+            failed_outcome.as_ref(),
+            cli.allow_unverified,
+            goal_drive::one_shot_leftover_remains(&agent),
+        );
         if exit_code == 0 {
             return Ok(());
         }
@@ -1559,84 +1565,15 @@ async fn run() -> Result<()> {
         let tui_remote_ui = std::sync::Arc::new(std::sync::Mutex::new(remote_ui.clone()));
         let tui_active_session_id =
             std::sync::Arc::new(std::sync::Mutex::new(feedback_session_id.clone()));
-        // Build the profile list and resolver for `/provider` in the TUI.
-        let profiles: Vec<hi_tui::ProfileInfo> = profile_infos(&file);
-        let resolver: hi_tui::ProfileResolver = Box::new({
-            let file = file.clone();
-            move |name: &str| {
-                let settings = config::resolve_named_profile(&file, name)?;
-                let label = provider_label(settings.provider).to_string();
-                let model = settings.model.clone();
-                let provider = build_chain(&settings, Vec::new());
-                Ok(hi_tui::SwitchedProvider {
-                    provider,
-                    model,
-                    label,
-                    max_tokens: settings.max_tokens,
-                    max_tokens_explicit: settings.max_tokens_explicit,
-                    tool_mode: settings.tool_mode,
-                    local_runtime: None,
-                })
-            }
-        });
-        let saver: hi_tui::ProfileSaver = Box::new({
-            let file = std::sync::Mutex::new(file.clone());
-            let config_path = cli.config.clone();
-            move |data: &hi_tui::ProfileFormData| {
-                let provider = data
-                    .provider
-                    .parse::<ProviderName>()
-                    .map_err(|e| anyhow::anyhow!("invalid provider '{}': {e}", data.provider))?;
-                let form = config::ProfileForm {
-                    name: data.name.clone(),
-                    provider,
-                    api_key: data.api_key.clone(),
-                    store_as_env: data.store_as_env,
-                    model: data.model.clone(),
-                    base_url: data.base_url.clone(),
-                };
-                let mut file = file.lock().unwrap();
-                // Editing an existing profile must not wipe the fields the form
-                // doesn't cover (max_tokens, fallback, tool_mode, …).
-                let profile = match file.profiles.get(&data.name) {
-                    Some(existing) => form.apply_to(existing),
-                    None => form.to_profile(),
-                };
-                config::upsert_profile(&mut file, &data.name, profile, config_path.as_deref())?;
-                // Return the updated profile list.
-                Ok(profile_infos(&file))
-            }
-        });
-        let loader: hi_tui::ProfileLoader = Box::new({
-            let file = file.clone();
-            move |name: &str| {
-                let p = file
-                    .profiles
-                    .get(name)
-                    .ok_or_else(|| anyhow::anyhow!("no profile named '{name}'"))?;
-                let form = config::ProfileForm::from_profile(name, p);
-                Ok(hi_tui::ProfileFormData {
-                    name: form.name,
-                    provider: form.provider.as_str().to_string(),
-                    api_key: form.api_key,
-                    store_as_env: form.store_as_env,
-                    model: form.model,
-                    base_url: form.base_url,
-                })
-            }
-        });
-        let remover: hi_tui::ProfileRemover = Box::new({
-            let file = std::sync::Mutex::new(file.clone());
-            let config_path = cli.config.clone();
-            move |name: &str| {
-                let mut file = file.lock().unwrap();
-                let existed = config::remove_profile(&mut file, name, config_path.as_deref())?;
-                if !existed {
-                    anyhow::bail!("no profile named '{name}'");
-                }
-                Ok(profile_infos(&file))
-            }
-        });
+        // Build `/provider` operations over one live snapshot so `/auth` and
+        // profile edits are immediately usable in this TUI session.
+        let tui_profile_callbacks::TuiProfileCallbacks {
+            profiles,
+            resolver,
+            saver,
+            loader,
+            remover,
+        } = tui_profile_callbacks::callbacks(file.clone(), cli.config.clone());
         let reasoning_effort_saver: hi_tui::ReasoningEffortSaver = Box::new({
             let file = std::sync::Mutex::new(file.clone());
             let config_path = cli.config.clone();
@@ -1677,14 +1614,14 @@ async fn run() -> Result<()> {
                     config_path.as_deref(),
                 )?;
                 let settings = config::resolve_named_profile(&file, &run.profile_name)?;
-                let label = provider_label(settings.provider).to_string();
+                let route = agent_provider_route(&settings);
                 let model = settings.model.clone();
                 let provider = build_chain(&settings, Vec::new());
                 Ok(hi_tui::MlxProfileSwitch {
                     switched: hi_tui::SwitchedProvider {
                         provider,
                         model,
-                        label,
+                        route,
                         max_tokens: settings.max_tokens,
                         max_tokens_explicit: settings.max_tokens_explicit,
                         tool_mode: settings.tool_mode,
@@ -1744,14 +1681,14 @@ async fn run() -> Result<()> {
                     config_path.as_deref(),
                 )?;
                 let settings = config::resolve_named_profile(&file, &runtime.profile_name)?;
-                let label = provider_label(settings.provider).to_string();
+                let route = agent_provider_route(&settings);
                 let model = settings.model.clone();
                 let provider = build_chain(&settings, Vec::new());
                 Ok(hi_tui::MlxProfileSwitch {
                     switched: hi_tui::SwitchedProvider {
                         provider,
                         model,
-                        label,
+                        route,
                         max_tokens: settings.max_tokens,
                         max_tokens_explicit: settings.max_tokens_explicit,
                         tool_mode: settings.tool_mode,
@@ -1914,7 +1851,7 @@ async fn run() -> Result<()> {
                             // retried by later flushes.
                             let _ = remote.ensure_registered_now_quiet().await;
                             let synced =
-                                sync::SyncSession::new(JsonlSession::new(path.clone()), remote);
+                                sync::SyncSession::new(JsonlSession::new(path.clone()), remote)?;
                             let next_handle = synced.remote_handle();
                             let next_events = std::sync::Arc::new(sync::RemoteUi::new(
                                 config.clone(),
@@ -2131,31 +2068,44 @@ async fn run() -> Result<()> {
         .await
         {
             Ok(()) => {
-                // Back on the main screen: announcements printed here stay
-                // visible, so this is where one-shot notices may be shown and
-                // marked seen.
-                if let Some(pending) = pending_announcements.take() {
-                    announcements::show_after_session(pending).await;
-                }
+                let pending_announcement = pending_announcements.take();
                 let active_session_id = tui_active_session_id.lock().unwrap().clone();
-                feedback::maybe_prompt_and_submit(&settings, &active_session_id).await;
-                // Best-effort exit flush: anything unsent stays in the
-                // durable outbox, and portal trouble never surfaces as an
-                // error in the coding workflow.
                 let active_handle = tui_sync_handle.lock().unwrap().clone();
-                if let Some(handle) = &active_handle {
-                    let _ = handle.flush().await;
-                }
                 let active_remote_ui = tui_remote_ui.lock().unwrap().clone();
-                if let Some(rui) = &active_remote_ui {
-                    let _ = rui.flush().await;
-                }
-                agent.settle_workspace_for_exit().await?;
-                if let Some(host) = &pipefs_host {
-                    host.clean_exit(&mut agent)
-                        .await
-                        .context("persisting PipeFS workspace during TUI shutdown")?;
-                }
+                // The TUI has accepted an explicit exit. Reap managed children
+                // and settle the authoritative workspace before any optional
+                // feedback prompt or best-effort remote flush can block. In
+                // particular, Ctrl-C at the blocking feedback prompt must not
+                // be able to strand a live writer outside Hi's ownership.
+                settle_before_post_session_work(
+                    async {
+                        agent.settle_workspace_for_exit().await?;
+                        if let Some(host) = &pipefs_host {
+                            host.clean_exit(&mut agent)
+                                .await
+                                .context("persisting PipeFS workspace during TUI shutdown")?;
+                        }
+                        Ok(())
+                    },
+                    async {
+                        // Back on the main screen: announcements printed here
+                        // stay visible and are safe only after child reaping.
+                        if let Some(pending) = pending_announcement {
+                            announcements::show_after_session(pending).await;
+                        }
+                        feedback::maybe_prompt_and_submit(&settings, &active_session_id).await;
+                        // Best-effort exit flush: anything unsent stays in the
+                        // durable outbox, and portal trouble never surfaces as
+                        // an error in the coding workflow.
+                        if let Some(handle) = &active_handle {
+                            let _ = handle.flush().await;
+                        }
+                        if let Some(rui) = &active_remote_ui {
+                            let _ = rui.flush().await;
+                        }
+                    },
+                )
+                .await?;
                 if let Some(handle) = &active_handle {
                     handle.end_session().await;
                 }
@@ -2227,22 +2177,33 @@ async fn run() -> Result<()> {
     )
     .await;
     sync_handle = pipefs_sync_handle.lock().unwrap().clone();
-    if repl_result.is_ok() {
-        feedback::maybe_prompt_and_submit(&settings, &feedback_session_id).await;
-    }
-    // Best-effort exit flush: silent by design — see the TUI exit path.
-    if let Some(handle) = &sync_handle {
-        let _ = handle.flush().await;
-    }
-    if let Some(rui) = &remote_ui {
-        let _ = rui.flush().await;
-    }
-    agent.settle_workspace_for_exit().await?;
-    if let Some(host) = &pipefs_host {
-        host.clean_exit(&mut agent)
-            .await
-            .context("persisting PipeFS workspace during REPL shutdown")?;
-    }
+    // Match the TUI ordering: once interactive input ends, settle managed
+    // processes and workspace effects before optional/blocking post-session
+    // work. A signal at the feedback prompt must not bypass child teardown.
+    settle_before_post_session_work(
+        async {
+            agent.settle_workspace_for_exit().await?;
+            if let Some(host) = &pipefs_host {
+                host.clean_exit(&mut agent)
+                    .await
+                    .context("persisting PipeFS workspace during REPL shutdown")?;
+            }
+            Ok(())
+        },
+        async {
+            if repl_result.is_ok() {
+                feedback::maybe_prompt_and_submit(&settings, &feedback_session_id).await;
+            }
+            // Best-effort exit flush: silent by design — see the TUI exit path.
+            if let Some(handle) = &sync_handle {
+                let _ = handle.flush().await;
+            }
+            if let Some(rui) = &remote_ui {
+                let _ = rui.flush().await;
+            }
+        },
+    )
+    .await?;
     if let Some(handle) = &sync_handle {
         handle.end_session().await;
     }

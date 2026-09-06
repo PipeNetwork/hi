@@ -20,71 +20,32 @@ fn natural_build_continuation_uses_implementation_guards() {
 }
 
 #[tokio::test]
-async fn productive_discovery_continues_to_plan_instead_of_stalling() {
-    let workspace = IsolatedWorkspace::new("productive-discovery-continues");
+async fn bounded_discovery_seals_a_mutation_only_recovery_round() {
+    let workspace = IsolatedWorkspace::new("bounded-discovery-forces-mutation");
     let mut responses = Vec::new();
-    let mut file = 0;
-    // Exact batch cardinalities from the live failure: fourteen productive
-    // rounds and thirty-three distinct reads. This crosses the historical
-    // discovery ceiling without forcing an edit or settling the turn.
-    for batch_size in [2, 3, 3, 3, 3, 3, 4, 2, 1, 1, 2, 2, 2, 2] {
-        let mut calls = Vec::new();
-        for _ in 0..batch_size {
-            let relative = format!("src/context-{file}.rs");
-            let path = workspace.path(&relative);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &path,
-                format!("pub const CONTEXT_{file}: usize = {file};\n"),
-            )
-            .unwrap();
-            calls.push(Content::ToolCall {
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    // Twelve distinct reads reproduce the weak-model behavior from the live
+    // session without relying on exact-call repeat detection. The first ten
+    // spend the ordinary discovery budget; two bounded advisory rounds remain.
+    for file in 0..12 {
+        let relative = format!("src/context-{file}.rs");
+        std::fs::write(
+            workspace.path(&relative),
+            format!("pub const CONTEXT_{file}: usize = {file};\n"),
+        )
+        .unwrap();
+        responses.push(completion(
+            vec![Content::ToolCall {
                 id: format!("read-{file}"),
                 name: "read".into(),
                 arguments: serde_json::json!({"path": relative}).to_string(),
-            });
-            file += 1;
-        }
-        responses.push(completion(calls, 1, 1));
+            }],
+            1,
+            1,
+        ));
     }
-    responses.push(completion(
-        vec![Content::ToolCall {
-            id: "plan-active".into(),
-            name: "update_plan".into(),
-            arguments: serde_json::json!({
-                "steps": [{"title": "Implement the selected component", "status": "active"}]
-            })
-            .to_string(),
-        }],
-        1,
-        1,
-    ));
-    let post_plan = workspace.path("src/post-plan.rs");
-    std::fs::write(&post_plan, "final targeted context\n").unwrap();
-    responses.push(completion(
-        vec![Content::ToolCall {
-            id: "post-plan-read".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({"path": "src/post-plan.rs"}).to_string(),
-        }],
-        1,
-        1,
-    ));
     let changed = workspace.path("src/implemented.rs");
     responses.push(write_completion(&changed.to_string_lossy()));
-    responses.push(completion(
-        vec![Content::ToolCall {
-            id: "plan-done".into(),
-            name: "update_plan".into(),
-            arguments: serde_json::json!({
-                "steps": [{"title": "Implement the selected component", "status": "done"}]
-            })
-            .to_string(),
-        }],
-        1,
-        1,
-    ));
-    responses.push(bash_completion("true # validate"));
     responses.push(completion(vec![Content::Text("implemented".into())], 1, 1));
 
     let mut cfg = workspace.config();
@@ -99,7 +60,7 @@ async fn productive_discovery_continues_to_plan_instead_of_stalling() {
     let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
     let mut ui = RecUi::default();
     let outcome = agent
-        .run_turn("review plan.md and lets keep building this", &mut ui)
+        .run_turn("review the implementation and fix the bug", &mut ui)
         .await
         .unwrap();
 
@@ -113,34 +74,26 @@ async fn productive_discovery_continues_to_plan_instead_of_stalling() {
         .iter()
         .filter(|entry| entry.tool == "read")
         .collect::<Vec<_>>();
-    assert_eq!(read_entries.len(), 34);
+    assert_eq!(read_entries.len(), 12);
     assert!(
         read_entries
             .iter()
             .all(|entry| entry.status == hi_tools::ToolStatus::Succeeded)
     );
+    assert!(ui.statuses.iter().any(|status| {
+        status.contains("mutation request used 12 model rounds (12 tools) without editing")
+    }));
+    let recorded_tools = tool_names.lock().unwrap();
+    let recovery_tools = &recorded_tools[12];
+    assert!(!recovery_tools.is_empty());
+    assert!(recovery_tools.iter().all(|name| {
+        hi_tools::tool_metadata(name)
+            .is_some_and(|metadata| metadata.capability == hi_tools::ToolCapability::Mutation)
+    }));
     assert!(
-        ui.statuses.iter().all(
-            |status| !status.contains("requesting an implementation step")
-                && !status.contains("requiring an edit now")
-                && !status.contains("discovery budget was exhausted")
-        ),
-        "distinct productive discovery must not trip a count-only guard: {:?}",
-        ui.statuses
-    );
-    let continued_tools = tool_names.lock().unwrap()[14]
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    assert!(continued_tools.contains("read"));
-    assert!(continued_tools.contains("update_plan"));
-    assert!(continued_tools.contains("write"));
-    assert_ne!(modes.lock().unwrap()[14], ToolMode::ChatOnly);
-    assert!(
-        tool_names.lock().unwrap()[15]
+        !recovery_tools
             .iter()
-            .any(|name| name == "read")
+            .any(|name| name == "read" || name == "grep" || name == "bash")
     );
-    assert_ne!(modes.lock().unwrap()[15], ToolMode::ChatOnly);
-    assert_ne!(modes.lock().unwrap()[16], ToolMode::ChatOnly);
+    assert_eq!(modes.lock().unwrap()[12], ToolMode::Required);
 }

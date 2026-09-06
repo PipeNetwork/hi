@@ -39,15 +39,26 @@ impl WorkspaceProjectionJournal {
             .gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let unresolved = self
-            .store
-            .recoveries_for_binding(binding.binding_id.as_str())?
-            .into_iter()
-            .filter(|record| unresolved_for_binding(record, binding))
-            .collect::<Vec<_>>();
         let jobs = self.store.jobs_for_binding(binding.binding_id.as_str())?;
         let mut report = RestartReconciliation::default();
         for mut job in jobs {
+            // A local background process is not a detached candidate, and its
+            // lifecycle alone is not workspace-byte authority. Older
+            // controller-v2 builds nevertheless turned every such process
+            // into a workspace-wide recovery fence after restart. Preserve
+            // the lifecycle and artifact references, but fail open for local
+            // authority: orphan the old process and retire only its synthetic
+            // job recovery markers. PipeFS writers and detached candidates
+            // remain fail-closed.
+            if is_local_live_process(binding, &job) {
+                if !job.state.is_terminal() {
+                    report.orphaned.push(JobId::new(job.job_id.clone()));
+                    update_restarted_job(&mut job, ControlJobState::Orphaned);
+                    self.commit_job(job.clone(), binding.workspace_id.as_str())?;
+                }
+                self.resolve_local_process_recoveries(binding, &job)?;
+                continue;
+            }
             let linked_unresolved = self
                 .store
                 .recoveries_for_job(&job.job_id)?
@@ -105,6 +116,14 @@ impl WorkspaceProjectionJournal {
             }
         }
         self.reconcile_operations_after_restart(binding, &mut report)?;
+        // Reload after job reconciliation. The local compatibility path above
+        // may have resolved a marker that was required when this method began.
+        let unresolved = self
+            .store
+            .recoveries_for_binding(binding.binding_id.as_str())?
+            .into_iter()
+            .filter(|record| unresolved_for_binding(record, binding))
+            .collect::<Vec<_>>();
         for recovery in unresolved {
             let deterministic = deterministic_recovery_id(binding, &recovery);
             if deterministic
@@ -119,6 +138,36 @@ impl WorkspaceProjectionJournal {
             self.fence_binding_for_recovery(binding)?;
         }
         Ok(report)
+    }
+
+    fn resolve_local_process_recoveries(
+        &self,
+        binding: &WorkspaceBinding,
+        job: &ControlJobRecord,
+    ) -> Result<()> {
+        let now = hi_events::now_ms();
+        for mut recovery in self.store.recoveries_for_job(&job.job_id)? {
+            if !unresolved_for_binding(&recovery, binding)
+                || recovery.operation_id.is_some()
+                || !matches!(
+                    recovery.kind.as_str(),
+                    "crashed_writer_job" | "workspace_reconciliation"
+                )
+            {
+                continue;
+            }
+            recovery.status = WorkspaceRecoveryStatus::Resolved;
+            recovery.detail = Some(
+                "local background process lifecycle was orphaned after restart; no success, cancellation, rollback, or workspace-byte decision was inferred"
+                    .to_owned(),
+            );
+            recovery.error = None;
+            recovery.revision = recovery.revision.saturating_add(1);
+            recovery.updated_at_ms = now.max(recovery.created_at_ms);
+            recovery.resolved_at_ms = Some(recovery.updated_at_ms);
+            self.commit_recovery(recovery)?;
+        }
+        Ok(())
     }
 
     /// Accept the current local workspace bytes without interpreting an
@@ -588,6 +637,12 @@ fn is_writer(job: &ControlJobRecord) -> bool {
     ) || job.kind == ControlJobKind::WriteCandidate
 }
 
+fn is_local_live_process(binding: &WorkspaceBinding, job: &ControlJobRecord) -> bool {
+    matches!(&binding.authority, hi_workspace::WorkspaceAuthority::Local)
+        && job.kind == ControlJobKind::Process
+        && job.effect_scope == ControlEffectScope::LiveWriter
+}
+
 fn unresolved_for_binding(recovery: &WorkspaceRecoveryRecord, binding: &WorkspaceBinding) -> bool {
     recovery.binding_id.as_deref() == Some(binding.binding_id.as_str())
         && recovery.workspace_id == binding.workspace_id.as_str()
@@ -673,6 +728,9 @@ fn restart_detail(state: ControlJobState) -> &'static str {
         ControlJobState::Stale => "writer belongs to a stale workspace epoch",
         ControlJobState::Failed => {
             "crashed writer effects were reconciled; success was not inferred"
+        }
+        ControlJobState::Orphaned => {
+            "local background process was active when the harness stopped; its lifecycle was orphaned without inferring success, cancellation, or rollback"
         }
         _ => "read-only job was active when the harness restarted",
     }

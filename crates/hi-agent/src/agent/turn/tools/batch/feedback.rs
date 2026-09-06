@@ -25,6 +25,7 @@ pub(super) async fn append_fast_feedback(
     calls: &[(String, String, String)],
     pending_checks: Vec<PendingCheck>,
     batch_mutated_paths: BTreeSet<String>,
+    allow_process_feedback: bool,
     task_contract: &TaskContract,
     fast_feedback: &mut FastFeedbackState,
     implementation_tracker: &mut ImplementationTracker,
@@ -60,19 +61,21 @@ pub(super) async fn append_fast_feedback(
                 .last_task_contract
                 .as_ref()
                 .is_some_and(|c| c.wants_tests);
-        let report = run_fast_feedback(
-            &agent.runtime,
-            &paths,
-            fast_feedback,
-            FastFeedbackOptions { run_tests },
-            ui,
-        )
-        .await;
-        if report.tests_ran && !report.tests_failed && !report.tests_timed_out {
-            implementation_tracker.record_validation_success();
-        }
-        if let Some(text) = report.combined_feedback() {
-            fast_failures.push(text);
+        if allow_process_feedback {
+            let report = run_fast_feedback(
+                &agent.runtime,
+                &paths,
+                fast_feedback,
+                FastFeedbackOptions { run_tests },
+                ui,
+            )
+            .await;
+            if report.tests_ran && !report.tests_failed && !report.tests_timed_out {
+                implementation_tracker.record_validation_success();
+            }
+            if let Some(text) = report.combined_feedback() {
+                fast_failures.push(text);
+            }
         }
         // Edits that landed on a definition line get a reverse-reference
         // note: the model updates the callers before the compiler starts

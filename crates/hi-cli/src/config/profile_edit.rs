@@ -395,7 +395,8 @@ pub(crate) fn is_env_var_reference(s: &str) -> bool {
 /// Shown when `hi` is run with nothing configured. Actionable, not terse.
 pub(crate) const ONBOARDING: &str = "no model configured. Get started with one of:
 
-  pipenetwork.ai:   PIPENETWORK_API_KEY=...  hi --provider pipenetwork \"...\"
+  pipenetwork.ai:   hi auth pipenetwork  (verified, private credential storage)
+                    or PIPENETWORK_API_KEY=... hi --provider pipenetwork \"...\"
   OpenRouter:       OPENROUTER_API_KEY=...   hi --provider openai -m anthropic/claude-sonnet-4 \"...\"
   Anthropic:        ANTHROPIC_API_KEY=...    hi --provider anthropic \"...\"
   Local (Ollama):   hi --provider ollama -m qwen2.5-coder \"...\"
@@ -780,8 +781,10 @@ fn resolve_ambient_api_key(provider: ProviderName) -> Result<String> {
     }
     if matches!(provider, ProviderName::Pipenetwork) {
         bail!(
-            "no pipenetwork credential: run `/login pipenetwork` to sign in and \
-             receive an API key, `/login x402` to pay USDC, or set {hint}"
+            "no pipenetwork credential: run `hi auth pipenetwork` (or \
+             `/auth pipenetwork` inside hi) to paste and verify an API key, \
+             `/login pipenetwork` for subscription pairing, `/login x402` to \
+             pay USDC, or set {hint}"
         );
     }
     bail!("no API key: pass --api-key or set {hint}");

@@ -61,47 +61,58 @@ impl LeaseLossMonitor {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         tokio::spawn(async move {
-            let mut observed = *lease_status.borrow_and_update();
-            if observed == hi_pipefs::PipeFsLeaseStatus::Valid {
-                loop {
-                    tokio::select! {
-                        _ = task_cancel.cancelled() => return,
-                        changed = lease_status.changed() => {
-                            if changed.is_err() {
-                                return;
+            loop {
+                let observed = *lease_status.borrow_and_update();
+                let terminal = match observed {
+                    hi_pipefs::PipeFsLeaseStatus::Valid => false,
+                    hi_pipefs::PipeFsLeaseStatus::Lost => {
+                        let reason = "the shared HI writer lease was taken over by another machine";
+                        let detail = match workspace.mark_lease_lost(reason).await {
+                            Ok(()) => format!("lease_lost: {reason}"),
+                            Err(error) => {
+                                format!("lease_lost: {reason}; recovery marker failed: {error:#}")
                             }
-                            observed = *lease_status.borrow_and_update();
-                            if observed != hi_pipefs::PipeFsLeaseStatus::Valid {
-                                break;
-                            }
+                        };
+                        *failure
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(detail);
+                        stop_workspace_processes(&foreground, &background).await;
+                        true
+                    }
+                    hi_pipefs::PipeFsLeaseStatus::Uncertain => {
+                        *failure
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(
+                            "lease_uncertain: the shared HI writer lease could not be refreshed; live writers were stopped"
+                                .to_string(),
+                        );
+                        stop_workspace_processes(&foreground, &background).await;
+                        false
+                    }
+                };
+                if terminal {
+                    return;
+                }
+                tokio::select! {
+                    _ = task_cancel.cancelled() => return,
+                    changed = lease_status.changed() => {
+                        if changed.is_err() {
+                            return;
                         }
                     }
                 }
             }
-
-            let detail = match observed {
-                hi_pipefs::PipeFsLeaseStatus::Lost => {
-                    let reason =
-                        "the shared HI writer lease was taken over by another machine";
-                    match workspace.mark_lease_lost(reason).await {
-                        Ok(()) => format!("lease_lost: {reason}"),
-                        Err(error) => {
-                            format!("lease_lost: {reason}; recovery marker failed: {error:#}")
-                        }
-                    }
-                }
-                hi_pipefs::PipeFsLeaseStatus::Uncertain => {
-                    "lease_uncertain: the shared HI writer lease could not be refreshed; live writers were stopped"
-                        .to_string()
-                }
-                hi_pipefs::PipeFsLeaseStatus::Valid => return,
-            };
-            *failure
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(detail);
-            stop_workspace_processes(&foreground, &background).await;
         });
         Self { cancel }
+    }
+
+    pub(super) fn stop(&self) {
+        self.cancel.cancel();
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_stopped(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 }
 
@@ -223,6 +234,62 @@ mod tests {
         assert_eq!(outcome.status, hi_tools::ToolStatus::Failed);
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!root.path().join("uncertain-write").exists());
+        assert!(
+            failure
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|detail| detail.contains("lease_uncertain"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lease_monitor_rearms_after_uncertainty_is_reconfirmed() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = hi_tools::ProcessRunner::new_with_policy(
+            root.path(),
+            hi_tools::sandbox::SandboxPolicy::Off,
+        )
+        .unwrap();
+        let foreground = runner.foreground_registry();
+        let background = Arc::new(hi_tools::BackgroundRegistry::default());
+        let failure = Arc::new(Mutex::new(None));
+        let (lease_status, receiver) =
+            tokio::sync::watch::channel(hi_pipefs::PipeFsLeaseStatus::Valid);
+        let _monitor = LeaseLossMonitor::start_with_status(
+            inert_workspace(root.path()),
+            receiver,
+            background,
+            foreground.clone(),
+            failure.clone(),
+        );
+
+        for (cycle, destination) in [(1, "first-late-write"), (2, "second-late-write")] {
+            let runner = runner.clone();
+            let execution = tokio::spawn(async move {
+                runner
+                    .run_shell_maybe_timeout(&format!("sleep 1; touch {destination}"), None)
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while foreground.active_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("foreground writer for cycle {cycle} must register"));
+
+            lease_status.send_replace(hi_pipefs::PipeFsLeaseStatus::Uncertain);
+            let outcome = execution.await.unwrap().unwrap();
+            assert_eq!(outcome.status, hi_tools::ToolStatus::Failed);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(!root.path().join(destination).exists());
+
+            if cycle == 1 {
+                lease_status.send_replace(hi_pipefs::PipeFsLeaseStatus::Valid);
+                *failure.lock().unwrap() = None;
+            }
+        }
         assert!(
             failure
                 .lock()

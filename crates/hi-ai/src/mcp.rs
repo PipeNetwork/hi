@@ -176,7 +176,7 @@ impl PipeMcpClient {
                 .json(&body),
         )
         .await
-        .with_context(|| format!("requesting Pipe MCP method {method}"))?;
+        .map_err(|_| anyhow!("requesting Pipe MCP method {method} failed"))?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -277,6 +277,16 @@ impl Provider for McpDiscoveryProvider {
         model: &str,
     ) -> Vec<crate::ProviderCapabilityCandidate> {
         self.inner.capability_candidates(route, model)
+    }
+
+    fn capability_candidates_for_request(
+        &self,
+        route: &str,
+        model: &str,
+        context: crate::ProviderRequestContext<'_>,
+    ) -> Vec<crate::ProviderCapabilityCandidate> {
+        self.inner
+            .capability_candidates_for_request(route, model, context)
     }
 
     async fn stream(
@@ -498,5 +508,19 @@ mod tests {
         assert_eq!(health[0].status.as_deref(), Some("unavailable"));
         assert_eq!(health[0].available, Some(false));
         assert_eq!(health[0].unavailable_reasons, vec!["provider disabled"]);
+    }
+
+    #[tokio::test]
+    async fn transport_error_does_not_retain_endpoint_credentials() {
+        let client = PipeMcpClient::new(
+            "https://wire-user:wire-pass@?api_key=query-secret",
+            "header-secret",
+        );
+        let error = client.initialize().await.unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("requesting Pipe MCP method initialize failed"));
+        for secret in ["wire-user", "wire-pass", "query-secret", "header-secret"] {
+            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+        }
     }
 }

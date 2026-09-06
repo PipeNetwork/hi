@@ -88,6 +88,37 @@ fn capable(output_limit: u32) -> ProviderCapabilities {
     capabilities
 }
 
+#[test]
+fn endpoint_route_ignores_credentials_and_secret_query_values() {
+    let first = endpoint_capability_route(
+        "gateway",
+        "https://alice:first@example.invalid/v1?api_key=secret-one#fragment",
+    );
+    let rotated = endpoint_capability_route(
+        "gateway",
+        "https://bob:second@example.invalid/v1?api_key=secret-two&tenant=private",
+    );
+    let distinct_path =
+        endpoint_capability_route("gateway", "https://example.invalid/v2?api_key=secret-one");
+
+    assert_eq!(first, rotated, "credential rotation changed route identity");
+    assert_ne!(
+        first, distinct_path,
+        "distinct API roots must not share probes"
+    );
+    for secret in [
+        "alice",
+        "first",
+        "bob",
+        "second",
+        "secret-one",
+        "secret-two",
+    ] {
+        assert!(!first.contains(secret));
+        assert!(!rotated.contains(secret));
+    }
+}
+
 fn config(ttl_ms: u64, timeout_ms: u64) -> CapabilityRegistryConfig {
     CapabilityRegistryConfig {
         cache_ttl: Duration::from_millis(ttl_ms),
@@ -161,6 +192,44 @@ async fn cache_ttl_expiry_reprobes_at_the_exact_boundary() {
         .map(|record| record.cache_hit)
         .collect::<Vec<_>>();
     assert_eq!(hits, [false, true, false]);
+}
+
+#[tokio::test]
+async fn concurrent_cache_misses_share_one_route_probe() {
+    let route = target("gateway", "model");
+    let probe = FakeProbe::new([(route.clone(), Reply::Delay(Duration::from_millis(10)))]);
+    let registry = ProviderCapabilityRegistry::new(config(100, 50), Some(probe.clone()));
+    let declared = capable(4_096);
+
+    let first_registry = registry.clone();
+    let first_route = route.clone();
+    let first_declared = declared.clone();
+    let first = async move {
+        first_registry
+            .resolve_candidates_at(
+                first_route.clone(),
+                &[ProviderCapabilityCandidate::new(
+                    first_route,
+                    first_declared,
+                )],
+                1_000,
+            )
+            .await
+    };
+    let second_candidates = [ProviderCapabilityCandidate::new(
+        route.clone(),
+        declared.clone(),
+    )];
+    let second = registry.resolve_candidates_at(route, &second_candidates, 1_000);
+
+    let (left, right) = tokio::join!(first, second);
+
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(left.capabilities, declared);
+    assert_eq!(right.capabilities, declared);
+    let records = registry.audit_records();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records.iter().filter(|record| record.cache_hit).count(), 1);
 }
 
 #[tokio::test]
@@ -275,12 +344,14 @@ async fn fallback_route_uses_canonical_conservative_intersection() {
         Backend {
             provider: Box::new(StaticProvider(right)),
             model: secondary.model,
-            label: secondary.route,
+            label: secondary.route.clone(),
+            capability_route: secondary.route,
         },
         Backend {
             provider: Box::new(StaticProvider(left)),
             model: primary.model,
-            label: primary.route,
+            label: primary.route.clone(),
+            capability_route: primary.route,
         },
     ])
     .unwrap();

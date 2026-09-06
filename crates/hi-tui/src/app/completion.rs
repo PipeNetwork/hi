@@ -218,6 +218,12 @@ impl crate::App {
     /// of a command with enumerable values (`/compact `, `/model gp`), with
     /// matches; otherwise close it. Called after every edit to the input line.
     pub(crate) fn sync_completion(&mut self) {
+        // Pending `/auth` input is an opaque secret, even when it begins with
+        // `/`. Never let command completion rewrite it before submission.
+        if self.pending_auth.is_some() {
+            self.completion = None;
+            return;
+        }
         match completion_context(&self.input.text()) {
             Some(ctx) => {
                 let changed = self.completion.as_ref().map(|c| &c.ctx) != Some(&ctx);

@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use hi_workspace::{
-    ExecutionDisposition, ExecutionReport, InMemoryWorkspaceController, MutationIntent,
-    MutationPermit, RecoveryKind, RecoveryRecord, RecoveryStatus, SettlementOutcome,
-    SettlementStatus, WorkspaceAuthority, WorkspaceBinding, WorkspaceCapabilities,
-    WorkspaceController, WorkspaceState, WorkspaceStatus, WorkspaceVersion,
+    ExecutionReport, InMemoryWorkspaceController, MutationIntent, MutationPermit, RecoveryKind,
+    RecoveryRecord, RecoveryStatus, SettlementOutcome, SettlementStatus, WorkspaceAuthority,
+    WorkspaceBinding, WorkspaceCapabilities, WorkspaceController, WorkspaceState, WorkspaceStatus,
+    WorkspaceVersion,
 };
 
 use crate::WorkspaceDurability;
@@ -135,88 +135,6 @@ impl WorkspaceCoordination {
         Ok(())
     }
 
-    pub(crate) async fn begin(
-        &self,
-        durability: Option<Arc<dyn WorkspaceDurability>>,
-        dirty_paths: Option<Vec<String>>,
-    ) -> Result<()> {
-        let mut intent = MutationIntent::workspace("tool or lifecycle workspace mutation");
-        intent.dirty_paths = dirty_paths.map(|paths| paths.into_iter().map(Into::into).collect());
-        self.begin_intent(durability, intent).await
-    }
-
-    pub(crate) async fn begin_intent(
-        &self,
-        mut durability: Option<Arc<dyn WorkspaceDurability>>,
-        intent: MutationIntent,
-    ) -> Result<()> {
-        let _admission = self.acquire_admission().await;
-        if self.lock_active()?.is_some() {
-            bail!("a workspace mutation is already admitted and awaiting settlement");
-        }
-        let controller = self.controller();
-        let dirty_paths = intent.dirty_paths.as_ref().map(|paths| {
-            paths
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-        });
-        if !self.harness.features.workspace_controller_v2 {
-            let status = controller.status();
-            if status.recovery_id.is_some()
-                || !matches!(
-                    status.state,
-                    WorkspaceState::Ready | WorkspaceState::LeaseUncertain
-                )
-            {
-                bail!(
-                    "workspace recovery remains required while controller-v2 admission is disabled: {:?}",
-                    status.state
-                );
-            }
-            match durability {
-                Some(durability) => durability
-                    .mutation_started(dirty_paths)
-                    .await
-                    .context("legacy workspace mutation admission failed")?,
-                None if matches!(
-                    controller.binding().authority,
-                    WorkspaceAuthority::PipeFs { .. }
-                ) =>
-                {
-                    bail!(
-                        "PipeFS mutation admission requires the legacy durability fence while controller-v2 admission is disabled"
-                    )
-                }
-                None => {}
-            }
-            return Ok(());
-        }
-        if self.controller_settles_backend.load(Ordering::Acquire) {
-            durability = None;
-        }
-        let permit = controller.begin(intent).await?;
-        if let Some(durability) = durability
-            && let Err(error) = durability.mutation_started(dirty_paths).await
-        {
-            let report = ExecutionReport {
-                disposition: ExecutionDisposition::Failed,
-                workspace_may_have_changed: false,
-                external_effect_may_have_occurred: false,
-                content_digest: None,
-                changed_paths: Vec::new(),
-                artifacts: Vec::new(),
-                detail: Some(format!("mutation admission backend failed: {error:#}")),
-            };
-            let _ = controller.settle(permit, report).await;
-            return Err(
-                error.context("workspace mutation admission backend rejected the operation")
-            );
-        }
-        *self.lock_active()? = Some(ActiveMutation { controller, permit });
-        Ok(())
-    }
-
     /// Shield accepted settlement from cancellation. Once the bounded caller
     /// wait expires the task remains detached and admission stays closed until
     /// it publishes a terminal controller state.
@@ -334,6 +252,9 @@ mod jobs;
 mod rebind_admission_tests;
 #[path = "workspace_coordination_runtime_settings.rs"]
 mod runtime_settings;
+#[path = "workspace_coordination_sealed.rs"]
+mod sealed;
+pub(crate) use sealed::{SealedWorkspaceAdmissionError, sealed_workspace_mismatch};
 #[cfg(test)]
 #[path = "workspace_coordination_settings_tests.rs"]
 mod settings_tests;
@@ -639,7 +560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_writer_is_recovered_before_restart_admission_and_not_refenced() {
+    async fn local_live_process_is_orphaned_before_restart_admission() {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
@@ -653,9 +574,9 @@ mod tests {
             hi_control::JournaledWorkspaceController::attach_store(raw, store.clone()).unwrap();
         let job = original
             .register_job(JobSpec {
-                kind: JobKind::WriteCandidate,
-                effect_scope: EffectScope::CandidateOnly,
-                name: "interrupted candidate".into(),
+                kind: JobKind::Process,
+                effect_scope: EffectScope::LiveWriter,
+                name: "interrupted development server".into(),
                 limits: JobLimits::default(),
                 parent_operation: None,
             })
@@ -664,13 +585,15 @@ mod tests {
         drop(original);
 
         let restarted = WorkspaceCoordination::new_local(root.path(), &state);
-        assert_eq!(restarted.status().state, WorkspaceState::RecoveryRequired);
-        assert!(restarted.begin(None, None).await.is_err());
-        restarted.reconcile_after_external_proof().await.unwrap();
         assert_eq!(restarted.status().state, WorkspaceState::Ready);
+        restarted.begin(None, None).await.unwrap();
+        restarted
+            .checkpoint(None, ExecutionReport::succeeded(None))
+            .await
+            .unwrap();
         assert_eq!(
             store.get_job(job.job_id.as_str()).unwrap().unwrap().state,
-            hi_control::ControlJobState::Failed
+            hi_control::ControlJobState::Orphaned
         );
 
         let second_restart = WorkspaceCoordination::new_local(root.path(), &state);

@@ -72,6 +72,8 @@ pub enum PlannedFileMutation {
     },
     Delete {
         path: PathBuf,
+        /// When present, construction must observe exactly these source bytes.
+        expected_digest: Option<String>,
     },
 }
 
@@ -156,7 +158,7 @@ impl PlannedFileMutation {
         }
     }
 
-    pub(crate) fn update_from_preimage(
+    pub fn update_from_preimage(
         path: impl Into<PathBuf>,
         preimage: &[u8],
         content: impl Into<Vec<u8>>,
@@ -167,6 +169,20 @@ impl PlannedFileMutation {
             disposition: WriteDisposition::ExistingOnly,
             mode: None,
             expected_digest: Some(digest_bytes(preimage)),
+        }
+    }
+
+    /// Create or update a file only when its current bytes still match the
+    /// preimage observed by the caller. `None` seals the expectation that the
+    /// path does not exist.
+    pub fn write_from_preimage(
+        path: impl Into<PathBuf>,
+        preimage: Option<&[u8]>,
+        content: impl Into<Vec<u8>>,
+    ) -> Self {
+        match preimage {
+            Some(preimage) => Self::update_from_preimage(path, preimage, content),
+            None => Self::add(path, content),
         }
     }
 
@@ -185,7 +201,18 @@ impl PlannedFileMutation {
     }
 
     pub fn delete(path: impl Into<PathBuf>) -> Self {
-        Self::Delete { path: path.into() }
+        Self::Delete {
+            path: path.into(),
+            expected_digest: None,
+        }
+    }
+
+    /// Delete a file only when its bytes still match the caller's preimage.
+    pub fn delete_from_preimage(path: impl Into<PathBuf>, preimage: &[u8]) -> Self {
+        Self::Delete {
+            path: path.into(),
+            expected_digest: Some(digest_bytes(preimage)),
+        }
     }
 }
 
@@ -242,7 +269,10 @@ impl MutationPlan {
                         mode,
                         expected_digest,
                     ),
-                    PlannedFileMutation::Delete { path } => (path, None, None, None, None),
+                    PlannedFileMutation::Delete {
+                        path,
+                        expected_digest,
+                    } => (path, None, None, None, expected_digest),
                 };
             if let Some(mode) = requested_mode {
                 ensure!(mode <= 0o7777, "invalid file mode {mode:#o}");

@@ -11,6 +11,7 @@ use hi_workspace::{
     JobId, MutationIntent, ReplayClass, WorkspaceBinding,
 };
 
+use super::background_candidate_capabilities::CandidateCapabilityRecorder;
 use super::background_candidate_verification::{
     candidate_call_arguments, candidate_execution_report,
 };
@@ -47,7 +48,14 @@ impl crate::Agent {
             .unwrap_or_else(|| self.config.routing.model.clone());
         config.routing.provider_route = route
             .base_url
+            .as_ref()
+            .map(|_| "delegate".to_string())
             .or_else(|| self.config.routing.provider_route.clone());
+        config.routing.capability_route = route
+            .base_url
+            .as_deref()
+            .map(|endpoint| hi_ai::endpoint_capability_route("delegate", endpoint))
+            .or_else(|| self.config.routing.capability_route.clone());
         config.routing.tool_mode = ToolMode::Auto;
         config.gates.verification = verify
             .map(str::trim)
@@ -183,19 +191,6 @@ impl BackgroundCandidatePlan {
             Ok(candidate) => candidate,
             Err(error) => return failed(format!("candidate materialization failed: {error:#}")),
         };
-        let capability_target =
-            hi_ai::CapabilityRoute::new(&self.provider_route, &self.config.routing.model);
-        let capability_candidates = self
-            .provider
-            .capability_candidates(&capability_target.route, &capability_target.model);
-        let effective_capabilities = self
-            .capability_registry
-            .resolve_candidates(capability_target, &capability_candidates)
-            .await;
-        let capability_digest = effective_capabilities.canonical_digest();
-        let actual_model_revision = effective_capabilities
-            .actual_model_revision()
-            .map(str::to_owned);
         self.config.paths.workspace_root = candidate.root().to_path_buf();
         self.config.paths.state_root = owner.join("runtime-state");
         let private_temp = self.config.paths.state_root.join("private-tmp");
@@ -206,7 +201,14 @@ impl BackgroundCandidatePlan {
         sandbox_config.deny_host_temp = true;
         sandbox_config.private_temp = Some(private_temp);
         let execution_limit = self.config.harness.jobs.candidate_timeout;
-        let child = match crate::Agent::new(self.provider.clone(), self.config) {
+        let child_prompt = format!(
+            "Work only in the detached candidate workspace named by your system prompt. Implement \
+             the task completely, run the configured verification, and stop. Never access or \
+             modify a parent/source checkout outside this workspace.\n\nTask: {}",
+            prompt.trim()
+        );
+        let capability_recorder = CandidateCapabilityRecorder::new(child_prompt.clone());
+        let child = match crate::Agent::new(capability_recorder.wrap(self.provider), self.config) {
             Ok(child) => child,
             Err(error) => return failed(format!("candidate child creation failed: {error:#}")),
         };
@@ -222,12 +224,6 @@ impl BackgroundCandidatePlan {
                 .await;
             return failed(detail);
         }
-        let child_prompt = format!(
-            "Work only in the detached candidate workspace named by your system prompt. Implement \
-             the task completely, run the configured verification, and stop. Never access or \
-             modify a parent/source checkout outside this workspace.\n\nTask: {}",
-            prompt.trim()
-        );
         let turn = match tokio::time::timeout(
             execution_limit,
             child.child_mut().run_turn(&child_prompt, ui),
@@ -264,6 +260,15 @@ impl BackgroundCandidatePlan {
                 child.child().last_verification_executions()
             ));
         }
+        let accepted_route = match capability_recorder.finish() {
+            Ok(receipt) => receipt,
+            Err(error) => return failed(format!("candidate capability receipt failed: {error}")),
+        };
+        if accepted_route.requested_model != turn.effective_route.model {
+            return failed(
+                "candidate's accepted request model differed from its terminal route receipt",
+            );
+        }
         let Some(verifier_digest) = turn.verified_workspace_revision.clone() else {
             return failed("candidate verification was not bound to a workspace revision");
         };
@@ -287,9 +292,9 @@ impl BackgroundCandidatePlan {
                 binding: self.binding,
                 route: CandidateRoute {
                     provider: turn.effective_route.provider.unwrap_or(self.provider_route),
-                    model: turn.effective_route.model,
-                    actual_model_revision,
-                    capability_digest,
+                    model: accepted_route.requested_model,
+                    actual_model_revision: accepted_route.provider.actual_model_revision,
+                    capability_digest: accepted_route.provider.capability_digest,
                 },
                 verification: vec![CandidateVerification {
                     name: "candidate turn verification".into(),

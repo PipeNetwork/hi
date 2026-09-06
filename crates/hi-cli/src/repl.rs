@@ -11,7 +11,7 @@ use hi_agent::Agent;
 use crate::commands::handle_command;
 use crate::config::{self, Settings};
 use crate::goal_drive::pending_drive_prompt;
-use crate::provider::provider_label;
+use crate::provider::{agent_provider_route, provider_label};
 use crate::session;
 use crate::ui::PlainUi;
 
@@ -683,14 +683,7 @@ pub(crate) async fn repl(
                                     let provider: std::sync::Arc<dyn hi_ai::Provider> =
                                         crate::build_chain(&new_settings, Vec::new()).into();
                                     agent.clear_driver_local_server();
-                                    agent.set_provider(
-                                        provider,
-                                        model.clone(),
-                                        None,
-                                        new_settings.max_tokens,
-                                        new_settings.max_tokens_explicit,
-                                        None,
-                                    );
+                                    apply_resolved_provider(agent, &new_settings, provider, None);
                                     // Track the now-active profile so a later
                                     // `/model` persists into THIS profile, not the
                                     // startup one (which would corrupt a different
@@ -878,14 +871,16 @@ pub(crate) async fn repl(
                                         Some(cancellation.clone()),
                                     )
                                     .await;
-                                    if driven.as_ref().is_some_and(Result::is_err)
+                                    if let Some(Err(error)) = driven.as_ref()
                                         && !(cancellation.is_cancelled()
                                             && agent.last_turn_outcome().is_some_and(|outcome| {
                                                 outcome.status == hi_agent::TurnStatus::Cancelled
                                             }))
                                     {
                                         let _ = agent
-                                            .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
+                                            .cleanup_turn(hi_agent::TurnCleanupKind::for_error(
+                                                error,
+                                            ))
                                             .await;
                                     }
                                     if let Some(callback) = &after_turn {
@@ -1062,7 +1057,7 @@ pub(crate) async fn repl(
                             "\x1b[33mplan drive interrupted — paused; reply to steer and resume, or use /plan resume\x1b[0m"
                         );
                     }
-                } else if driven.as_ref().is_some_and(Result::is_err) {
+                } else if let Some(Err(error)) = driven.as_ref() {
                     // A configured hard timeout completes Agent-owned Cancel
                     // cleanup before preserving its deadline error. Avoid
                     // overwriting that terminal Cancel outcome with Fail.
@@ -1071,7 +1066,9 @@ pub(crate) async fn repl(
                             outcome.status == hi_agent::TurnStatus::Cancelled
                         });
                     if !already_cancelled {
-                        let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
+                        let _ = agent
+                            .cleanup_turn(hi_agent::TurnCleanupKind::for_error(error))
+                            .await;
                     }
                     if goal_drive_turn {
                         let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Infra);
@@ -1221,14 +1218,7 @@ async fn switch_to_mlx_profile(
         let provider: std::sync::Arc<dyn hi_ai::Provider> =
             crate::build_chain(&settings, Vec::new()).into();
         let mut window: Option<u32> = None;
-        agent.set_provider(
-            provider,
-            settings.model.clone(),
-            window,
-            settings.max_tokens,
-            settings.max_tokens_explicit,
-            None,
-        );
+        apply_resolved_provider(agent, &settings, provider, window);
         agent.register_driver_local_server(
             run.base_url.clone(),
             run.model_id.clone(),
@@ -1271,14 +1261,7 @@ async fn switch_to_managed_local_profile(
     let provider: std::sync::Arc<dyn hi_ai::Provider> =
         crate::build_chain(&settings, Vec::new()).into();
     agent.clear_driver_local_server();
-    agent.set_provider(
-        provider,
-        model.clone(),
-        None,
-        settings.max_tokens,
-        settings.max_tokens_explicit,
-        None,
-    );
+    apply_resolved_provider(agent, &settings, provider, None);
     agent.register_driver_local_server(runtime.base_url, runtime.model_id, runtime.process_id);
     if let Ok(models) = agent.list_models().await
         && let Some(served) = models.into_iter().find(|model| model.id == settings.model)
@@ -1290,6 +1273,24 @@ async fn switch_to_managed_local_profile(
         );
     }
     Ok(Some((label, model)))
+}
+
+fn apply_resolved_provider(
+    agent: &mut Agent,
+    settings: &Settings,
+    provider: std::sync::Arc<dyn hi_ai::Provider>,
+    context_window: Option<u32>,
+) {
+    agent.set_provider_with_route(
+        provider,
+        agent_provider_route(settings),
+        settings.model.clone(),
+        context_window,
+        settings.max_tokens,
+        settings.max_tokens_explicit,
+        None,
+    );
+    agent.set_tool_mode(settings.tool_mode);
 }
 
 /// Drive a model future (a turn or a compaction) to completion, showing an
@@ -1593,3 +1594,7 @@ mod mention_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "repl_tests.rs"]
+mod provider_switch_tests;

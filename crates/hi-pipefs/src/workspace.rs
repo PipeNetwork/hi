@@ -17,6 +17,7 @@ use crate::{
     revision_archive_size_upper_bound, scan_workspace,
 };
 
+mod compatibility;
 mod recovery_open;
 
 #[derive(Clone, Debug)]
@@ -262,6 +263,17 @@ struct ControllerState {
     dirty_paths: BTreeSet<String>,
     #[serde(default)]
     active_background_processes: BTreeSet<String>,
+    /// A native writer reached terminal process state, but its final workspace
+    /// image has not yet received an acknowledged checkpoint. This remains
+    /// separate from `active_background_processes`: reaping proves the process
+    /// stopped, not that its last bytes are durable.
+    #[serde(default)]
+    background_reconciliation_pending: bool,
+    /// Monotonic evidence fence for terminal native writer observations. A
+    /// checkpoint may acknowledge only the generation captured by the bytes it
+    /// staged; a later process exit must survive that older acknowledgement.
+    #[serde(default)]
+    background_terminal_generation: u64,
     retry_count: u32,
     last_error: Option<String>,
     #[serde(default)]
@@ -282,6 +294,8 @@ impl Default for ControllerState {
             materialized_root: None,
             dirty_paths: BTreeSet::new(),
             active_background_processes: BTreeSet::new(),
+            background_reconciliation_pending: false,
+            background_terminal_generation: 0,
             retry_count: 0,
             last_error: None,
             transcript_cursor: None,
@@ -387,6 +401,11 @@ struct PendingRevision {
     logical_size_bytes: u64,
     idempotency_key: String,
     snapshot: Snapshot,
+    /// `None` denotes a legacy archive whose relationship to terminal writer
+    /// observations is unknown and therefore cannot clear their recovery
+    /// fence.
+    #[serde(default)]
+    background_terminal_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -394,11 +413,53 @@ struct PendingCausalOperation {
     operation: CausalOperationReceipt,
     transcript_records: Vec<CausalTranscriptRecord>,
     receipt: Option<CausalCommitReceipt>,
+    /// Terminal-writer generation covered by this operation's staged bytes.
+    /// Missing on legacy state, which must fail closed during acknowledgement.
+    #[serde(default)]
+    background_terminal_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PendingCompatibilityOperation {
     operation: CausalOperationReceipt,
+    /// Smallest remote transcript cursor that can acknowledge this operation.
+    /// Compatibility settlement always stages one exact workspace-execution
+    /// record, so its acknowledgement must advance beyond the cursor known
+    /// before the operation. Missing legacy state cannot prove that boundary
+    /// and therefore fails closed during acknowledgement.
+    #[serde(default)]
+    minimum_transcript_cursor: Option<u64>,
+    /// Terminal-writer generation covered by this operation's staged bytes.
+    /// Missing on legacy state, which must fail closed during acknowledgement.
+    #[serde(default)]
+    background_terminal_generation: Option<u64>,
+}
+
+/// Return the newest terminal-writer observation included in the bytes that
+/// will be published by an operation. A legacy pending revision has no such
+/// proof, so propagate `None` rather than guessing from current controller
+/// state.
+fn covered_background_terminal_generation(state: &ControllerState) -> Option<u64> {
+    state
+        .pending
+        .as_ref()
+        .map_or(Some(state.background_terminal_generation), |pending| {
+            pending.background_terminal_generation
+        })
+}
+
+/// Clear only the terminal fence covered by the acknowledged operation. A
+/// process that exits after the staged scan increments the generation, and a
+/// legacy operation has no capture at all; both cases retain recovery evidence.
+fn acknowledge_covered_background_terminals(
+    state: &mut ControllerState,
+    covered_generation: Option<u64>,
+) {
+    if state.background_reconciliation_pending
+        && covered_generation.is_some_and(|covered| state.background_terminal_generation <= covered)
+    {
+        state.background_reconciliation_pending = false;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1395,7 +1456,30 @@ impl PipeFsWorkspace {
     }
 
     pub async fn mutation_started(&self, paths: Option<Vec<String>>) -> Result<()> {
+        // Protocol-1 durability callers do not carry typed intent. Preserve
+        // their compatibility path; controller-v2 uses the fenced entry point
+        // below and can distinguish reconciliation from a new writer.
+        self.mutation_started_inner(paths, true).await
+    }
+
+    pub(crate) async fn controller_mutation_started(
+        &self,
+        paths: Option<Vec<String>>,
+        reconciliation: bool,
+    ) -> Result<()> {
+        self.mutation_started_inner(paths, reconciliation).await
+    }
+
+    async fn mutation_started_inner(
+        &self,
+        paths: Option<Vec<String>>,
+        allow_terminal_reconciliation: bool,
+    ) -> Result<()> {
         let mut state = self.inner.state.lock().await;
+        ensure!(
+            allow_terminal_reconciliation || !state.background_reconciliation_pending,
+            "a terminal PipeFS writer requires reconciliation before new mutation admission"
+        );
         ensure!(
             state
                 .capabilities
@@ -1493,7 +1577,8 @@ impl PipeFsWorkspace {
                 matches!(state.phase, WorkspacePhase::Dirty | WorkspacePhase::Pending)
                     || state.pending.is_some()
                     || !state.dirty_paths.is_empty()
-                    || !state.active_background_processes.is_empty();
+                    || !state.active_background_processes.is_empty()
+                    || state.background_reconciliation_pending;
             if recovery_required {
                 write_private(
                     &self.inner.recovery_marker,
@@ -1514,6 +1599,7 @@ impl PipeFsWorkspace {
             || state.pending_causal.is_some()
             || state.pending_compatibility.is_some()
             || !state.active_background_processes.is_empty()
+            || state.background_reconciliation_pending
             || fs::symlink_metadata(&self.inner.recovery_marker).is_ok()
         {
             return true;
@@ -1536,13 +1622,20 @@ impl PipeFsWorkspace {
                 &self.inner.recovery_marker,
                 b"background process may have uncommitted workspace changes\n",
             )?;
-        } else {
+        } else if state.active_background_processes.contains(id) {
+            let next_generation = state
+                .background_terminal_generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("PipeFS terminal-process generation overflow"))?;
             state.active_background_processes.remove(id);
+            state.background_terminal_generation = next_generation;
+            state.background_reconciliation_pending = true;
+            write_private(
+                &self.inner.recovery_marker,
+                b"terminated background process requires final workspace reconciliation\n",
+            )?;
         }
         self.persist_locked(&state)?;
-        if !running {
-            self.clear_recovery_marker_if_safe(&state);
-        }
         Ok(())
     }
 
@@ -1557,108 +1650,27 @@ impl PipeFsWorkspace {
             "a compatibility PipeFS operation is awaiting transcript acknowledgement"
         );
         if state.phase == WorkspacePhase::Pending {
-            return self
+            let result = self
                 .retry_locked(&mut state, false)
                 .await
                 .map(|(head, _)| Some(head));
-        }
-        if !self.stage_checkpoint_locked(&mut state).await? {
-            return Ok(state.remote.as_ref().and_then(|remote| remote.current_head));
-        }
-        self.retry_locked(&mut state, false)
-            .await
-            .map(|(head, _)| Some(head))
-    }
-
-    /// Publish workspace bytes for the legacy CAS + transcript-flush
-    /// compatibility protocol without releasing the local archive or recovery
-    /// marker. The controller must follow with
-    /// [`finish_compatibility_checkpoint`](Self::finish_compatibility_checkpoint)
-    /// only after `flush_through` has returned an acknowledged cursor.
-    pub async fn checkpoint_for_compatibility_transcript(
-        &self,
-        operation: CausalOperationReceipt,
-    ) -> Result<Option<Uuid>> {
-        let mut state = self.inner.state.lock().await;
-        ensure!(
-            state.pending_causal.is_none(),
-            "a causal PipeFS operation is awaiting transcript acknowledgement"
-        );
-        if let Some(pending_operation) = &state.pending_compatibility {
-            ensure!(
-                pending_operation.operation == operation,
-                "compatibility PipeFS retry does not match the persisted operation"
-            );
-            if state.phase == WorkspacePhase::Pending {
-                if let Some(pending) = &state.pending
-                    && state.remote.as_ref().is_some_and(|remote| {
-                        remote.current_head.is_some()
-                            && remote.manifest_digest.as_deref()
-                                == Some(pending.manifest_digest.as_str())
-                            && remote.logical_size_bytes == pending.logical_size_bytes
-                    })
-                {
-                    return Ok(state.remote.as_ref().and_then(|remote| remote.current_head));
-                }
-                if state.pending.is_none() {
-                    return Ok(state.remote.as_ref().and_then(|remote| remote.current_head));
-                }
+            if result.is_ok() {
+                self.acknowledge_background_reconciliation_locked(&mut state)?;
             }
-        } else {
-            state.pending_compatibility = Some(PendingCompatibilityOperation { operation });
-            write_private(
-                &self.inner.recovery_marker,
-                b"compatibility workspace operation requires acknowledgement\n",
-            )?;
-            self.persist_locked(&state)?;
-        }
-        if state.phase == WorkspacePhase::Pending {
-            return self
-                .retry_locked(&mut state, true)
-                .await
-                .map(|(head, _)| Some(head));
+            return result;
         }
         if !self.stage_checkpoint_locked(&mut state).await? {
-            state.phase = WorkspacePhase::Pending;
-            state.last_error =
-                Some("workspace unchanged; transcript acknowledgement pending".into());
-            write_private(
-                &self.inner.recovery_marker,
-                b"compatibility operation requires transcript acknowledgement\n",
-            )?;
-            self.persist_locked(&state)?;
+            self.acknowledge_background_reconciliation_locked(&mut state)?;
             return Ok(state.remote.as_ref().and_then(|remote| remote.current_head));
         }
-        self.retry_locked(&mut state, true)
+        let result = self
+            .retry_locked(&mut state, false)
             .await
-            .map(|(head, _)| Some(head))
-    }
-
-    /// Complete the compatibility publication only after the transcript
-    /// outbox has durably accepted the server cursor.
-    pub async fn finish_compatibility_checkpoint(
-        &self,
-        operation_id: &str,
-        transcript_cursor: u64,
-    ) -> Result<()> {
-        let mut state = self.inner.state.lock().await;
-        let pending = state.pending_compatibility.as_ref().ok_or_else(|| {
-            anyhow!("PipeFS has no compatibility operation awaiting transcript acknowledgement")
-        })?;
-        ensure!(
-            pending.operation.operation_id == operation_id,
-            "compatibility transcript acknowledgement does not match the pending operation"
-        );
-        state.pending = None;
-        state.pending_compatibility = None;
-        state.transcript_cursor = Some(transcript_cursor);
-        state.phase = WorkspacePhase::Clean;
-        state.dirty_paths.clear();
-        state.last_error = None;
-        self.persist_locked(&state)?;
-        let _ = fs::remove_file(&self.inner.pending_archive);
-        self.clear_recovery_marker_if_safe(&state);
-        Ok(())
+            .map(|(head, _)| Some(head));
+        if result.is_ok() {
+            self.acknowledge_background_reconciliation_locked(&mut state)?;
+        }
+        result
     }
 
     /// Scan and durably stage current bytes, without publishing a head.
@@ -1844,6 +1856,7 @@ impl PipeFsWorkspace {
                 operation,
                 transcript_records,
                 receipt: None,
+                background_terminal_generation: covered_background_terminal_generation(&state),
             });
             state.phase = WorkspacePhase::Pending;
             write_private(
@@ -2004,11 +2017,17 @@ impl PipeFsWorkspace {
                 && receipt.transcript_cursor == transcript_cursor,
             "causal transcript acknowledgement does not match the pending operation"
         );
+        let background_terminal_generation = pending.background_terminal_generation;
         state.pending = None;
         state.pending_causal = None;
-        state.transcript_cursor = Some(transcript_cursor);
+        state.transcript_cursor = Some(
+            state
+                .transcript_cursor
+                .map_or(transcript_cursor, |known| known.max(transcript_cursor)),
+        );
         state.phase = WorkspacePhase::Clean;
         state.dirty_paths.clear();
+        acknowledge_covered_background_terminals(&mut state, background_terminal_generation);
         state.last_error = None;
         self.persist_locked(&state)?;
         let _ = fs::remove_file(&self.inner.pending_archive);
@@ -2078,6 +2097,7 @@ impl PipeFsWorkspace {
                 logical_size_bytes: artifact.snapshot.logical_size_bytes,
                 idempotency_key,
                 snapshot: artifact.snapshot,
+                background_terminal_generation: Some(state.background_terminal_generation),
             });
             state.phase = WorkspacePhase::Pending;
             state.last_error = None;
@@ -2391,7 +2411,8 @@ impl PipeFsWorkspace {
                 && state.pending_causal.is_none()
                 && state.pending_compatibility.is_none()
                 && state.last_error.is_none()
-                && state.active_background_processes.is_empty(),
+                && state.active_background_processes.is_empty()
+                && !state.background_reconciliation_pending,
             "PipeFS cache is not safe to remove"
         );
         drop(state);
@@ -2452,7 +2473,7 @@ impl PipeFsWorkspace {
                 .as_ref()
                 .and_then(|pending| pending.receipt.as_ref())
                 .map(|receipt| receipt.transcript_cursor)
-                .or(state.transcript_cursor),
+                .max(state.transcript_cursor),
             available_cache_bytes: available_space_bytes(&self.inner.cache_root),
         }
     }
@@ -2542,6 +2563,7 @@ impl PipeFsWorkspace {
 
     fn clear_recovery_marker_if_safe(&self, state: &ControllerState) {
         if state.active_background_processes.is_empty()
+            && !state.background_reconciliation_pending
             && matches!(
                 state.phase,
                 WorkspacePhase::Clean | WorkspacePhase::Disabled
@@ -2553,6 +2575,21 @@ impl PipeFsWorkspace {
         {
             let _ = fs::remove_file(&self.inner.recovery_marker);
         }
+    }
+
+    /// Clear the terminal-process fence only after the caller has obtained a
+    /// workspace acknowledgement. Causal/compatibility callers clear it in
+    /// their transcript-acknowledgement finish methods instead.
+    fn acknowledge_background_reconciliation_locked(
+        &self,
+        state: &mut ControllerState,
+    ) -> Result<()> {
+        if state.background_reconciliation_pending {
+            state.background_reconciliation_pending = false;
+            self.persist_locked(state)?;
+        }
+        self.clear_recovery_marker_if_safe(state);
+        Ok(())
     }
 
     /// Remove older generation caches only when their persisted clean
@@ -2663,11 +2700,13 @@ fn mark_cache_for_recovery_if_drifted(
                 || state.pending.is_some()
                 || state.pending_causal.is_some()
                 || state.pending_compatibility.is_some()
-                || !state.active_background_processes.is_empty()))
+                || !state.active_background_processes.is_empty()
+                || state.background_reconciliation_pending))
         || state.pending.is_some()
         || state.pending_causal.is_some()
         || state.pending_compatibility.is_some()
-        || !state.active_background_processes.is_empty();
+        || !state.active_background_processes.is_empty()
+        || state.background_reconciliation_pending;
     if explicitly_dirty || !materialized_snapshot_matches(cache_root, &state) {
         write_private(
             marker,
@@ -3631,6 +3670,10 @@ fn recovery_caches(session_root: &Path, current: Option<&Path>) -> Vec<PathBuf> 
 }
 
 #[cfg(test)]
+#[path = "workspace_background_reconciliation_tests.rs"]
+mod background_reconciliation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3786,6 +3829,7 @@ mod tests {
             logical_size_bytes: 42,
             idempotency_key: "retry-key".to_string(),
             snapshot: Snapshot::default(),
+            background_terminal_generation: Some(0),
         };
         let remote = PipeFsRemoteState {
             session_id: "recovered-session".to_string(),
@@ -3871,6 +3915,7 @@ mod tests {
             logical_size_bytes: 0,
             idempotency_key: old_key.clone(),
             snapshot: Snapshot::default(),
+            background_terminal_generation: Some(0),
         });
 
         workspace
@@ -4331,56 +4376,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_background_process_keeps_recovery_marker_after_clean_checkpoint() {
-        let temporary = tempfile::tempdir().unwrap();
-        let workspace_root = temporary.path().join("workspace");
-        let state_root = temporary.path().join("state");
-        fs::create_dir_all(&workspace_root).unwrap();
-        fs::create_dir_all(&state_root).unwrap();
-        let workspace = PipeFsWorkspace::new(
-            PipeFsClient::new(crate::PipeFsClientConfig::new(
-                "http://127.0.0.1:1",
-                "test-key",
-            ))
-            .unwrap(),
-            PipeFsLease {
-                token: "token".to_string(),
-                generation: 1,
-            },
-            PipeFsWorkspaceConfig {
-                session_id: "background-marker-test".to_string(),
-                cache_scope: test_cache_scope(),
-                original_workspace_root: workspace_root,
-                original_state_root: state_root,
-                cache_base: Some(temporary.path().join("cache")),
-            },
-        )
-        .unwrap();
-        {
-            let mut state = workspace.inner.state.lock().await;
-            state.phase = WorkspacePhase::Clean;
-            workspace.persist_locked(&state).unwrap();
-        }
-
-        workspace
-            .background_process_state("process-1", true)
-            .await
-            .unwrap();
-        assert!(workspace.inner.recovery_marker.is_file());
-        {
-            let state = workspace.inner.state.lock().await;
-            workspace.clear_recovery_marker_if_safe(&state);
-        }
-        assert!(workspace.inner.recovery_marker.is_file());
-
-        workspace
-            .background_process_state("process-1", false)
-            .await
-            .unwrap();
-        assert!(!workspace.inner.recovery_marker.exists());
-    }
-
-    #[tokio::test]
     async fn advancing_lease_generation_restages_a_pending_revision() {
         let temporary = tempfile::tempdir().unwrap();
         let workspace_root = temporary.path().join("workspace");
@@ -4416,6 +4411,7 @@ mod tests {
                 logical_size_bytes: 0,
                 idempotency_key: "old-generation".to_string(),
                 snapshot: Snapshot::default(),
+                background_terminal_generation: Some(0),
             });
             workspace.persist_locked(&state).unwrap();
         }
@@ -4436,95 +4432,6 @@ mod tests {
         assert!(!workspace.inner.pending_archive.exists());
         drop(state);
         assert_eq!(workspace.inner.lease.lock().await.generation, 5);
-    }
-
-    #[tokio::test]
-    async fn compatibility_transcript_boundary_retains_archive_until_acknowledgement() {
-        let temporary = tempfile::tempdir().unwrap();
-        let workspace_root = temporary.path().join("workspace");
-        let state_root = temporary.path().join("state");
-        fs::create_dir_all(&workspace_root).unwrap();
-        fs::create_dir_all(&state_root).unwrap();
-        let client = PipeFsClient::new(crate::PipeFsClientConfig::new(
-            "http://127.0.0.1:1",
-            "test-key",
-        ))
-        .unwrap();
-        let cache_scope = client.cache_scope();
-        let workspace = PipeFsWorkspace::new(
-            client,
-            PipeFsLease {
-                token: "lease-token".into(),
-                generation: 4,
-            },
-            PipeFsWorkspaceConfig {
-                session_id: "compatibility-ack-test".into(),
-                cache_scope,
-                original_workspace_root: workspace_root,
-                original_state_root: state_root,
-                cache_base: Some(temporary.path().join("cache")),
-            },
-        )
-        .unwrap();
-        let head = Uuid::new_v4();
-        let manifest = "b".repeat(64);
-        let operation = CausalOperationReceipt {
-            operation_id: "operation-1".into(),
-            idempotency_key: "idempotency-1".into(),
-            binding_id: "binding-1".into(),
-            binding_epoch: 3,
-            replay_class: hi_workspace::ReplayClass::PureWorkspace,
-            execution: hi_workspace::ExecutionReport::succeeded(Some(manifest.clone())),
-        };
-        {
-            let mut state = workspace.inner.state.lock().await;
-            state.phase = WorkspacePhase::Pending;
-            state.remote = Some(PipeFsRemoteStateDisk {
-                enabled: true,
-                current_head: Some(head),
-                sequence: 1,
-                manifest_digest: Some(manifest.clone()),
-                logical_size_bytes: 7,
-                restore_chain: Vec::new(),
-            });
-            state.pending = Some(PendingRevision {
-                expected_base_revision_id: None,
-                revision_type: RevisionKind::Full,
-                archive_blake3: "a".repeat(64),
-                archive_size_bytes: 6,
-                manifest_digest: manifest,
-                logical_size_bytes: 7,
-                idempotency_key: "revision-key".into(),
-                snapshot: Snapshot::default(),
-            });
-            state.pending_compatibility = Some(PendingCompatibilityOperation {
-                operation: operation.clone(),
-            });
-            workspace.persist_locked(&state).unwrap();
-        }
-        write_private(&workspace.inner.pending_archive, b"staged").unwrap();
-        write_private(&workspace.inner.recovery_marker, b"pending transcript\n").unwrap();
-
-        assert_eq!(
-            workspace
-                .checkpoint_for_compatibility_transcript(operation)
-                .await
-                .unwrap(),
-            Some(head)
-        );
-        assert!(workspace.inner.pending_archive.is_file());
-        assert!(workspace.inner.recovery_marker.is_file());
-
-        workspace
-            .finish_compatibility_checkpoint("operation-1", 9)
-            .await
-            .unwrap();
-        let state = workspace.inner.state.lock().await;
-        assert_eq!(state.phase, WorkspacePhase::Clean);
-        assert!(state.pending.is_none());
-        assert!(state.pending_compatibility.is_none());
-        assert!(!workspace.inner.pending_archive.exists());
-        assert!(!workspace.inner.recovery_marker.exists());
     }
 
     #[path = "tail_tests.rs"]

@@ -1,4 +1,4 @@
-//! OpenAI Chat Completions adapter.
+//! OpenAI adapter: Responses for GPT-6 Astra, Chat Completions otherwise.
 //!
 //! Covers OpenRouter, pipenetwork.ai, and local servers (Ollama, llama.cpp,
 //! LM Studio, vLLM) — they differ only by base URL and API key.
@@ -12,9 +12,12 @@ mod compatibility;
 mod compatibility_tests;
 mod deepseek;
 mod request;
+mod response_text;
+mod responses;
 mod retry_usage;
 mod stream;
 mod thinking_tags;
+mod wire_audit;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -32,7 +35,7 @@ use crate::provider::{Provider, ProviderCapabilities, ProviderError, ProviderErr
 use crate::token::{StaticToken, TokenSource};
 use crate::types::{
     ChatRequest, CompatMode, Completion, Content, OutputTokenParameter, RateLimitBucket,
-    RateLimitState, StreamEvent, ToolMode, Usage, WireAudit, estimate_request_input_tokens,
+    RateLimitState, StreamEvent, ToolMode, Usage, estimate_request_input_tokens,
 };
 use crate::x402::{self, X402Settler};
 
@@ -156,11 +159,25 @@ impl Provider for OpenAiProvider {
         ProviderCapabilities::native_tools(true)
     }
 
+    fn capability_candidates(
+        &self,
+        route: &str,
+        model: &str,
+    ) -> Vec<crate::ProviderCapabilityCandidate> {
+        vec![crate::ProviderCapabilityCandidate::new(
+            crate::CapabilityRoute::new(route, model),
+            responses::capabilities(model).unwrap_or_else(|| self.capabilities()),
+        )]
+    }
+
     async fn stream(
         &self,
         mut request: ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
+        if responses::supports_model(&request.model) {
+            return self.stream_responses(request, sink).await;
+        }
         #[cfg(test)]
         let capability_base_url = self
             .capability_base_url
@@ -253,6 +270,18 @@ impl Provider for OpenAiProvider {
             {
                 Ok(response) => response,
                 Err(error) => {
+                    // The request may have reached the endpoint even when no
+                    // response survived. Preserve the exact attempted shape
+                    // (including its wire-schema digest) for reconciliation.
+                    sink(StreamEvent::WireAudit(Box::new(wire_audit::build(
+                        &request,
+                        &self.base_url,
+                        attempt,
+                        idx,
+                        &body,
+                        false,
+                        None,
+                    ))));
                     last_error = Some(error);
                     break;
                 }
@@ -261,7 +290,7 @@ impl Provider for OpenAiProvider {
             if response.status().is_success() {
                 self.compatibility_cache.remember(&request, attempt);
                 persist_x402_credit_token(&self.auth, response.headers()).await;
-                sink(StreamEvent::WireAudit(Box::new(wire_audit(
+                sink(StreamEvent::WireAudit(Box::new(wire_audit::build(
                     &request,
                     &self.base_url,
                     attempt,
@@ -287,6 +316,11 @@ impl Provider for OpenAiProvider {
                     Box::pin(stream),
                     sink,
                     capabilities.tool_protocol,
+                    request
+                        .tool_envelope
+                        .as_deref()
+                        .is_some_and(crate::RequestToolEnvelope::requests_text_tool_fallback)
+                        .then_some(request.tools.as_ref()),
                 )
                 .await
                 .map_err(|err| {
@@ -379,7 +413,7 @@ impl Provider for OpenAiProvider {
             }
 
             let status = response.status();
-            sink(StreamEvent::WireAudit(Box::new(wire_audit(
+            sink(StreamEvent::WireAudit(Box::new(wire_audit::build(
                 &request,
                 &self.base_url,
                 attempt,
@@ -541,15 +575,13 @@ impl OpenAiProvider {
         } else {
             builder = with_optional_bearer(builder, token);
         }
-        crate::http::send_with_retry(builder)
-            .await
-            .map_err(|error| {
-                ProviderError::new(
-                    ProviderErrorKind::Outage,
-                    format!("request to model endpoint failed: {error}"),
-                )
-                .with_api_contract(None, Some(true), None)
-            })
+        crate::http::send_with_retry(builder).await.map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::Outage,
+                "request to model endpoint failed",
+            )
+            .with_api_contract(None, Some(true), None)
+        })
     }
 
     async fn dispatch_chat(
@@ -653,93 +685,6 @@ impl OpenAiProvider {
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(4));
         }
-    }
-}
-
-fn wire_audit(
-    request: &ChatRequest,
-    route: &str,
-    attempt: request::RequestAttempt,
-    index: usize,
-    body: &Value,
-    accepted: bool,
-    response_status: Option<u16>,
-) -> WireAudit {
-    let reasoning_replay = request
-        .messages
-        .iter()
-        .flat_map(|message| message.content.iter())
-        .find_map(|content| match content {
-            Content::Thinking {
-                signature: Some(_), ..
-            } => Some("signed_thinking"),
-            Content::Thinking { .. } => Some("thinking_blocks"),
-            _ => None,
-        })
-        .map(str::to_string);
-    let reasoning_request = body
-        .get("reasoning_effort")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| body.get("thinking").map(|_| "thinking".to_string()))
-        .or_else(|| {
-            request
-                .thinking_budget
-                .map(|_| "thinking_budget".to_string())
-        });
-    WireAudit {
-        provider: "openai_compatible".to_string(),
-        route: route.to_string(),
-        model: request.model.clone(),
-        output_token_parameter: attempt.output_token_parameter.label().to_string(),
-        max_output_tokens: request.max_tokens,
-        temperature: request.temperature,
-        top_p: request.top_p,
-        reasoning_request,
-        reasoning_replay,
-        native_tools_enabled: attempt.include_tools,
-        tool_count: body
-            .get("tools")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len),
-        strict_schema: attempt.strict_tools,
-        tool_choice: body
-            .get("tool_choice")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        // `ChatRequest::retry_attempt` is zero-based; the audit is a
-        // human-facing one-based ordinal for the logical request replay.  A
-        // compatibility-shape fallback is still the same logical replay and
-        // is identified separately by `compatibility_fallback`.
-        request_attempt: request.retry_attempt.saturating_add(1),
-        compatibility_fallback: compatibility_fallback(attempt, index),
-        accepted,
-        request_body: Some(body.clone()),
-        response_status,
-        tool_envelope_digest: request
-            .tool_envelope
-            .as_ref()
-            .map(|envelope| envelope.digest.clone()),
-        tool_envelope: request
-            .tool_envelope
-            .as_ref()
-            .map(|envelope| envelope.payload.clone()),
-    }
-}
-
-fn compatibility_fallback(attempt: request::RequestAttempt, index: usize) -> Option<String> {
-    if attempt.output_token_fallback {
-        Some("output_token_parameter".to_string())
-    } else if attempt.reasoning_fallback {
-        Some("reasoning".to_string())
-    } else if attempt.strict_fallback {
-        Some("strict_schema".to_string())
-    } else if index > 0 && !attempt.include_usage {
-        Some("stream_usage".to_string())
-    } else if index > 0 && !attempt.include_frequency_penalty {
-        Some("frequency_penalty".to_string())
-    } else {
-        None
     }
 }
 
@@ -960,6 +905,43 @@ mod tests {
                 .as_ref()
                 .is_some_and(|body| body["max_tokens"] == 16)
         );
+    }
+
+    #[tokio::test]
+    async fn transport_failure_keeps_the_attempted_wire_schema_identity() {
+        let provider = OpenAiProvider::new("http://[invalid".to_string(), "test".into());
+        let mut audits = Vec::new();
+        let mut sink = |event| {
+            if let StreamEvent::WireAudit(audit) = event {
+                audits.push(audit);
+            }
+        };
+
+        provider
+            .stream(request(vec![tool()], Default::default()), &mut sink)
+            .await
+            .unwrap_err();
+
+        assert_eq!(audits.len(), 1);
+        assert!(!audits[0].accepted);
+        assert_eq!(audits[0].response_status, None);
+        let schema = audits[0].tool_schema.as_ref().unwrap();
+        assert_eq!(schema.request_digest, schema.wire_digest);
+    }
+
+    #[test]
+    fn wire_audit_route_does_not_retain_endpoint_credentials() {
+        let req = request(vec![], Default::default());
+        let attempt = super::request::request_attempts(&req)[0];
+        let route = "https://wire-user:wire-pass@example.invalid/v1?api_key=query-secret";
+        let audit =
+            super::wire_audit::build(&req, route, attempt, 0, &serde_json::json!({}), true, None);
+        assert_eq!(
+            audit.route,
+            crate::endpoint_capability_route("openai_compatible", route)
+        );
+        assert!(!audit.route.contains("wire-pass"));
+        assert!(!audit.route.contains("query-secret"));
     }
 
     #[tokio::test]

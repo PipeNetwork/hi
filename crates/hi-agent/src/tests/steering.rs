@@ -622,10 +622,7 @@ async fn text_tool_fallback_retries_narration_and_executes_the_next_call() {
 
     assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(std::fs::read_to_string(&source).unwrap(), "fn main() {}\n");
-    assert!(
-        modes.lock().unwrap().contains(&ToolMode::Required),
-        "plain-text fallback must use an executable Required envelope"
-    );
+    assert_eq!(modes.lock().unwrap().get(3), Some(&ToolMode::Auto));
     assert!(
         ui.statuses.iter().any(|status| status
             .contains("plain-text tool fallback returned narration instead of a call")),

@@ -10,7 +10,7 @@ impl crate::Agent {
     /// Unlike a typed tool settlement, this boundary may not already own a
     /// permit. Admit its synthetic operation before constructing the evidence
     /// so PipeFS never commits a receipt against an empty transcript batch.
-    pub async fn checkpoint_durable_workspace(&self) -> Result<()> {
+    pub async fn checkpoint_durable_workspace(&mut self) -> Result<()> {
         if self
             .workspace_coordination
             .active_parent_operation()

@@ -171,7 +171,7 @@ impl PipeFsHost {
 
         let remote = RemoteSessionSink::new(self.sync_config.clone(), self.session_id());
         let session =
-            crate::sync::SyncSession::new(crate::session::JsonlSession::new(path), remote);
+            crate::sync::SyncSession::new(crate::session::JsonlSession::new(path), remote)?;
         let sync = session.remote_handle();
         agent.set_session(Box::new(session));
         self.sync_handle
@@ -929,6 +929,21 @@ impl PipeFsHost {
             .context("flushing transcript before removing the PipeFS cache")?;
         workspace.finish_clean_exit().await
     }
+
+    /// Stop process-local PipeFS workers after admission was blocked by an
+    /// existing durable recovery fence. This deliberately performs no lease
+    /// refresh, checkpoint, authority transition, barrier, or cache cleanup.
+    pub(crate) async fn fenced_exit(&self, agent: &mut hi_agent::Agent) -> Result<()> {
+        let durability = self.active_durability.lock().await.take();
+        let result = if let Some(durability) = &durability {
+            durability.quiesce_for_fenced_exit().await
+        } else {
+            Ok(())
+        };
+        agent.set_workspace_durability(None);
+        drop(durability);
+        result.context("stopping process-local PipeFS workers while retaining recovery evidence")
+    }
 }
 
 fn effective_startup_mode(
@@ -1088,6 +1103,11 @@ impl PipeFsDurability {
                 .with_context(|| format!("clearing background checkpoint state for {id}"))?;
         }
         Ok(())
+    }
+
+    async fn quiesce_for_fenced_exit(&self) -> Result<()> {
+        self._lease_loss_monitor.stop();
+        self.quiesce_background_checkpoints().await
     }
 }
 

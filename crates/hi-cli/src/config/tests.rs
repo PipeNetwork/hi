@@ -476,6 +476,7 @@ fn onboarding_mentions_real_interactive_flags() {
         super::ONBOARDING.contains("--plain"),
         "onboarding should point to the actual opt-out flag"
     );
+    assert!(super::ONBOARDING.contains("hi auth pipenetwork"));
 }
 
 #[test]
@@ -3649,6 +3650,7 @@ fn top_level_help_lists_everyday_commands() {
         "--best-of",
         "--judge",
         "headless form of `/race`",
+        "auth               Paste and verify an API key (openai / anthropic / pipenetwork / xai)",
     ] {
         assert!(
             help.contains(needle),

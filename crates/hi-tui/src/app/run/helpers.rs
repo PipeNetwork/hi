@@ -16,6 +16,27 @@ use crate::render::dim;
 
 pub(super) use crate::file_mentions::expand_file_mentions;
 
+pub(super) fn apply_provider_switch(
+    agent: &mut hi_agent::Agent,
+    provider: std::sync::Arc<dyn hi_ai::Provider>,
+    route: hi_agent::AgentProviderRoute,
+    model: String,
+    max_tokens: u32,
+    max_tokens_explicit: bool,
+    tool_mode: hi_ai::ToolMode,
+) {
+    agent.set_provider_with_route(
+        provider,
+        route,
+        model,
+        None,
+        max_tokens,
+        max_tokens_explicit,
+        None,
+    );
+    agent.set_tool_mode(tool_mode);
+}
+
 /// Handle a key in vim-style normal mode (Esc on empty input). Modal
 /// scroll/search/copy without leaving the keyboard. `i`, `q`, or Esc returns
 /// to insert mode; `j`/`k` scroll; `u`/`d` half-page; `g`/`G` top/bottom; `/`
@@ -470,4 +491,47 @@ pub(super) fn push_shell_output(app: &mut App, body: &str) {
     }
     app.bump_transcript();
     app.cap_transcript();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider() -> std::sync::Arc<dyn hi_ai::Provider> {
+        std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+            "http://127.0.0.1:1/v1".into(),
+            "test".into(),
+        ))
+    }
+
+    #[test]
+    fn provider_switch_replaces_tool_mode_in_both_directions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut config = hi_agent::AgentConfig::default();
+        config.paths.workspace_root = workspace.path().to_path_buf();
+        config.paths.state_root = state.path().to_path_buf();
+        let mut agent = hi_agent::Agent::new(provider(), config).unwrap();
+        apply_provider_switch(
+            &mut agent,
+            provider(),
+            hi_agent::AgentProviderRoute::new("test", "test/chat-only"),
+            "chat-only".into(),
+            1024,
+            true,
+            hi_ai::ToolMode::ChatOnly,
+        );
+        assert_eq!(agent.tool_mode(), hi_ai::ToolMode::ChatOnly);
+
+        apply_provider_switch(
+            &mut agent,
+            provider(),
+            hi_agent::AgentProviderRoute::new("test", "test/tool-capable"),
+            "tool-capable".into(),
+            1024,
+            true,
+            hi_ai::ToolMode::Auto,
+        );
+        assert_eq!(agent.tool_mode(), hi_ai::ToolMode::Auto);
+    }
 }

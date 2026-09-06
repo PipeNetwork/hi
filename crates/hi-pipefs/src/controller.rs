@@ -65,7 +65,7 @@ impl PipeFsControllerConfig {
             && self.causal_commit_available
         {
             PipeFsWriterMode::Causal
-        } else if self.allow_protocol_one_writes {
+        } else if self.writer_protocol == 1 && self.allow_protocol_one_writes {
             PipeFsWriterMode::Compatibility
         } else {
             PipeFsWriterMode::ReadOnly
@@ -139,6 +139,7 @@ impl PipeFsWorkspaceController {
                 operation: None,
                 execution: None,
                 batch: None,
+                registry_job: false,
             },
         );
         if state.status.recovery_id.is_none() {
@@ -219,7 +220,7 @@ impl PipeFsWorkspaceController {
                     .map_err(|error| BackendFailure::with_batch(error, &batch))?;
                 let status = self.inner.workspace.status().await;
                 Ok((
-                    pipefs_version(&status, Some(receipt.transcript_cursor)),
+                    pipefs_version(&status, status.transcript_cursor),
                     Some(batch),
                 ))
             }
@@ -347,11 +348,10 @@ impl WorkspaceController for PipeFsWorkspaceController {
                         | WorkspaceState::TranscriptPending
                 )
             {
-                return Err(denied(
-                    &state,
-                    AdmissionDeniedReason::NotReady,
-                    "PipeFS has unsettled work",
-                ));
+                let detail = state
+                    .status
+                    .admission_block_detail("PipeFS is not ready for mutation admission");
+                return Err(denied(&state, AdmissionDeniedReason::NotReady, detail));
             }
         }
         if self.inner.jobs.snapshot().jobs.iter().any(|job| {
@@ -412,11 +412,10 @@ impl WorkspaceController for PipeFsWorkspaceController {
                 state.status.detail = None;
             }
             if !state.status.state.admits_mutation() || state.active.is_some() {
-                return Err(denied(
-                    &state,
-                    AdmissionDeniedReason::NotReady,
-                    "PipeFS has an unsettled operation",
-                ));
+                let detail = state
+                    .status
+                    .admission_block_detail("PipeFS is not ready for mutation admission");
+                return Err(denied(&state, AdmissionDeniedReason::NotReady, detail));
             }
             state.binding.version = version;
             let record = MutationPermitRecord {
@@ -437,6 +436,12 @@ impl WorkspaceController for PipeFsWorkspaceController {
             publish(&self.inner, &mut state);
             record
         };
+        // Arm the existing synchronous abandonment fence before the first
+        // post-admission await. If cancellation drops `begin` while an intent
+        // acknowledgement or dirty-marker write is pending, this permit
+        // immediately replaces transient Mutating state with a typed recovery
+        // record instead of leaving admission stranded forever.
+        let permit = self.inner.issuer.issue_mutation(record.clone());
 
         let admission = async {
             if matches!(
@@ -450,12 +455,15 @@ impl WorkspaceController for PipeFsWorkspaceController {
             }
             self.inner
                 .workspace
-                .mutation_started(record.intent.dirty_paths.as_ref().map(|paths| {
-                    paths
-                        .iter()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .collect()
-                }))
+                .controller_mutation_started(
+                    record.intent.dirty_paths.as_ref().map(|paths| {
+                        paths
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect()
+                    }),
+                    record.intent.is_reconciliation(),
+                )
                 .await
         }
         .await;
@@ -486,7 +494,7 @@ impl WorkspaceController for PipeFsWorkspaceController {
             publish(&self.inner, &mut state);
             return Err(denied(&state, AdmissionDeniedReason::NotReady, detail));
         }
-        Ok(self.inner.issuer.issue_mutation(record))
+        Ok(permit)
     }
 
     async fn settle(
@@ -607,11 +615,10 @@ impl WorkspaceController for PipeFsWorkspaceController {
                 && active.epoch == state.binding.epoch
         });
         if !state.status.state.admits_mutation() && !belongs_to_active {
-            return Err(denied(
-                &state,
-                AdmissionDeniedReason::NotReady,
-                "PipeFS has unsettled work unrelated to this job",
-            ));
+            let detail = state
+                .status
+                .admission_block_detail("PipeFS is not ready for job admission");
+            return Err(denied(&state, AdmissionDeniedReason::NotReady, detail));
         }
         drop(state);
         let fence = self.inner.jobs.fence();

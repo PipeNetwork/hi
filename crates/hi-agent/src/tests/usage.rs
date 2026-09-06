@@ -306,7 +306,10 @@ async fn auto_compacts_when_context_fills() {
 async fn elides_old_tool_outputs_before_model_request() {
     let mut cfg = config();
     cfg.memory.auto_compact = true;
-    cfg.routing.context_window = Some(2_000);
+    // Keep enough headroom for prompt growth while preserving the intended
+    // threshold: eight outputs overflow, but eliding the oldest two makes the
+    // request fit without dropping the conversation.
+    cfg.routing.context_window = Some(15_000);
     cfg.routing.tool_mode = ToolMode::ChatOnly;
     let (mut agent, requests) = scripted_agent(
         vec![ProviderStep::Completion(completion(
@@ -330,7 +333,7 @@ async fn elides_old_tool_outputs_before_model_request() {
             }]));
         agent.messages_mut().push(Message::tool_result(
             &id,
-            format!("{i}\n{}", "x".repeat(500)),
+            format!("{i}\n{}", "x".repeat(8_000)),
         ));
     }
 
@@ -346,6 +349,7 @@ async fn elides_old_tool_outputs_before_model_request() {
             _ => None,
         })
         .collect();
+    assert_eq!(outputs.len(), 8, "tool-result request shape: {outputs:?}");
     assert!(outputs[0].starts_with("[elided"), "{outputs:?}");
     assert!(outputs[1].starts_with("[elided"), "{outputs:?}");
     assert!(outputs[2].starts_with("3\n"), "{outputs:?}");

@@ -51,6 +51,28 @@ fn visible_plan_approval_preserves_all_queued_work() {
     assert_eq!(app.queue[1], hi_agent::PLAN_DRIVE_PROMPT);
 }
 
+#[tokio::test]
+async fn stopped_queue_requires_explicit_resume() {
+    let (_root, mut agent, mut app) = fixture();
+    app.queue.push_back("do not restart automatically".into());
+    app.queue_paused = true;
+
+    assert_eq!(dequeue_ready_prompt(&mut app, &agent), None);
+    assert_eq!(app.queue.len(), 1);
+
+    super::route_submitted_line(&mut app, "/tasks".into(), false).unwrap();
+    assert!(app.queue_paused, "inspection must not restart stopped work");
+    assert_eq!(dequeue_ready_prompt(&mut app, &agent), None);
+
+    app.handle_command(&mut agent, hi_agent::Command::Queue("resume".into()))
+        .await;
+    assert!(!app.queue_paused);
+    assert_eq!(
+        dequeue_ready_prompt(&mut app, &agent).as_deref(),
+        Some("do not restart automatically")
+    );
+}
+
 #[test]
 fn parked_plan_approval_discards_synthetic_drive_and_preserves_user_work() {
     let (_root, mut agent, mut app) = fixture();

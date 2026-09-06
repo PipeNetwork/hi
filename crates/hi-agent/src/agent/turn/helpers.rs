@@ -170,8 +170,14 @@ pub(super) fn task_needs_repository_context(task: &str, contract: &TaskContract)
     .any(|marker| lower.contains(marker))
 }
 
-pub(super) fn tool_satisfies_validation(output: &hi_tools::ToolOutcome) -> bool {
+pub(super) fn tool_satisfies_validation(
+    name: &str,
+    arguments: &str,
+    output: &hi_tools::ToolOutcome,
+) -> bool {
     output.satisfies_validation()
+        && crate::steering::implementation_tool_call_validates(name, arguments)
+        && crate::steering::validation_exit_status_is_reliable(name, arguments)
 }
 
 pub(super) fn tool_entry(

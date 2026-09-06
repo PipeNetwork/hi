@@ -134,11 +134,10 @@ impl hi_ai::Provider for ModeTransitionProvider {
     native_tool_test_provider!();
 }
 #[tokio::test]
-async fn distinct_discovery_plan_transitions_to_verified_mutation_without_a_count_cap() {
+async fn bounded_discovery_plan_gets_one_targeted_read_before_mutation() {
     let workspace = IsolatedWorkspace::new("mixed-review-build");
     let mut responses = Vec::new();
-    // Reproduce thirteen reads before a concrete, uncapped plan.
-    for index in 0..13 {
+    for index in 0..9 {
         let relative = format!("src/context-{index}.rs");
         let path = workspace.path(&relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -176,6 +175,24 @@ async fn distinct_discovery_plan_transitions_to_verified_mutation_without_a_coun
             id: "post-plan-read".into(),
             name: "read".into(),
             arguments: serde_json::json!({"path": "src/post-plan-context.rs"}).to_string(),
+        }],
+        1,
+        1,
+    ));
+    // Reproduce the live Pipe/GLM failure: after the one allowed post-plan
+    // read, the model tries another inspection. This call must be rejected by
+    // the sealed mutation-only envelope (without executing) and corrected on
+    // the next request, rather than succeeding and immediately ending the turn
+    // as NoProgress.
+    responses.push(completion(
+        vec![Content::ToolCall {
+            id: "post-plan-forbidden-grep".into(),
+            name: "grep".into(),
+            arguments: serde_json::json!({
+                "path": "src",
+                "pattern": "VALUE"
+            })
+            .to_string(),
         }],
         1,
         1,
@@ -230,20 +247,19 @@ async fn distinct_discovery_plan_transitions_to_verified_mutation_without_a_coun
     assert!(outcome.verified_workspace_revision.is_some());
     assert!(changed.exists());
     assert!(
-        ui.statuses.iter().all(
-            |status| !status.contains("requesting an implementation step")
-                && !status.contains("bounded discovery")
-                && !status.contains("discovery budget")
-        ),
-        "distinct discovery must not hit a hidden count limit: {:?}",
-        ui.statuses
+        [
+            "implementation plan recorded after bounded discovery",
+            "implementation plan got its final read round",
+        ]
+        .iter()
+        .all(|needle| ui.statuses.iter().any(|status| status.contains(needle)))
     );
     let read_results = ui
         .tool_results
         .iter()
         .filter(|(name, _)| name == "read")
         .collect::<Vec<_>>();
-    assert_eq!(read_results.len(), 14, "all scripted reads must execute");
+    assert_eq!(read_results.len(), 10, "all bounded reads must execute");
     assert!(
         read_results
             .iter()
@@ -259,27 +275,44 @@ async fn distinct_discovery_plan_transitions_to_verified_mutation_without_a_coun
             .all(|entry| entry.status == hi_tools::ToolStatus::Succeeded),
         "every read must have typed Succeeded status"
     );
-    let guided_tools = tool_names.lock().unwrap()[10]
+    let guided_tools = tool_names.lock().unwrap()[9]
         .iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     assert!(guided_tools.contains("read"));
     assert!(guided_tools.contains("update_plan"));
     assert!(guided_tools.contains("write"));
-    assert_ne!(modes.lock().unwrap()[10], ToolMode::ChatOnly);
-    assert_ne!(modes.lock().unwrap()[12], ToolMode::ChatOnly);
-    let post_plan_tools = tool_names.lock().unwrap()[14]
+    assert_ne!(modes.lock().unwrap()[9], ToolMode::ChatOnly);
+    let post_plan_tools = tool_names.lock().unwrap()[10]
         .iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     assert!(post_plan_tools.contains("read"));
     assert!(post_plan_tools.contains("write"));
-    assert_ne!(modes.lock().unwrap()[14], ToolMode::ChatOnly);
-    assert_ne!(modes.lock().unwrap()[15], ToolMode::ChatOnly);
+    assert_eq!(modes.lock().unwrap()[10], ToolMode::Required);
+    let focused_requests = tool_names.lock().unwrap()[11..=12].to_vec();
+    assert!(focused_requests.iter().all(|tools| {
+        !tools.is_empty()
+            && tools.iter().all(|name| {
+                hi_tools::tool_metadata(name).is_some_and(|metadata| {
+                    metadata.capability == hi_tools::ToolCapability::Mutation
+                })
+            })
+    }));
+    assert!(focused_requests.iter().all(|tools| {
+        !tools
+            .iter()
+            .any(|name| name == "read" || name == "grep" || name == "bash")
+    }));
+    assert_eq!(modes.lock().unwrap()[11], ToolMode::Required);
+    assert_eq!(modes.lock().unwrap()[12], ToolMode::Required);
+    assert!(ui.tool_results.iter().any(|(name, result)| {
+        name == "grep" && result.contains("\"reason\":\"unavailable_tool\"")
+    }));
 }
 
 #[tokio::test]
-async fn resumed_active_plan_allows_distinct_discovery_until_mutation() {
+async fn resumed_active_plan_is_resumed_at_the_discovery_boundary() {
     let workspace = IsolatedWorkspace::new("resumed-plan-build");
     let mut responses = Vec::new();
     for index in 0..10 {
@@ -342,10 +375,13 @@ async fn resumed_active_plan_allows_distinct_discovery_until_mutation() {
     );
     assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert!(changed.exists());
-    assert!(ui.statuses.iter().all(|status| {
-        !status.contains("active implementation plan already exists")
-            && !status.contains("discovery budget")
-    }));
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("active implementation plan already exists")),
+        "the bounded guard should resume the durable plan: {:?}",
+        ui.statuses
+    );
     let recovery_tools = tool_names.lock().unwrap()[10]
         .iter()
         .cloned()

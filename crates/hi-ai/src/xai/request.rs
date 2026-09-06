@@ -238,7 +238,10 @@ fn assistant_input_items(message: &Message) -> Vec<Value> {
                     "arguments": arguments,
                 }));
             }
-            Content::Thinking { .. } | Content::ToolResult { .. } | Content::Image { .. } => {}
+            Content::Thinking { .. }
+            | Content::ToolResult { .. }
+            | Content::Image { .. }
+            | Content::ProviderReplay { .. } => {}
         }
     }
     if !text.is_empty() {
@@ -255,9 +258,14 @@ pub(crate) fn wire_audit(
     response_status: Option<u16>,
 ) -> WireAudit {
     let include_tools = body.get("tools").and_then(Value::as_array).is_some();
+    let tool_schema = crate::wire_audit::tool_schema_audit(
+        request_tool_definitions(request),
+        body.get("tools"),
+        "xai_schema_normalization_v1",
+    );
     WireAudit {
         provider: "xai".to_string(),
-        route: route.to_string(),
+        route: crate::endpoint_capability_route("xai", route),
         model: request.model.clone(),
         output_token_parameter: "max_output_tokens".to_string(),
         max_output_tokens: request.max_tokens,
@@ -301,7 +309,30 @@ pub(crate) fn wire_audit(
             .tool_envelope
             .as_ref()
             .map(|envelope| envelope.payload.clone()),
+        tool_schema,
     }
+}
+
+/// Shape the sealed request definitions like native xAI function tools before
+/// applying xAI's JSON Schema grammar normalization.
+fn request_tool_definitions(request: &ChatRequest) -> Option<Value> {
+    if request.tools.is_empty() {
+        return None;
+    }
+    Some(Value::Array(
+        request
+            .tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect(),
+    ))
 }
 
 pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErrorKind {
@@ -596,5 +627,82 @@ mod tests {
             classify_http_error(StatusCode::BAD_REQUEST, body),
             ProviderErrorKind::Auth
         );
+    }
+
+    #[test]
+    fn wire_audit_route_does_not_retain_endpoint_credentials() {
+        let req = request(vec![], Default::default());
+        let route = "https://wire-user:wire-pass@example.invalid/v1?api_key=query-secret";
+        let audit = wire_audit(&req, route, &json!({}), true, None);
+        assert_eq!(audit.route, crate::endpoint_capability_route("xai", route));
+        assert!(!audit.route.contains("wire-pass"));
+        assert!(!audit.route.contains("query-secret"));
+    }
+
+    #[test]
+    fn chat_only_keeps_exact_audited_tools() {
+        let req = request(
+            vec![bash_tool()],
+            RequestProfile {
+                tool_mode: ToolMode::ChatOnly,
+                ..Default::default()
+            },
+        );
+        let body = build_body(&req);
+        let audit = wire_audit(&req, "https://example.invalid", &body, true, Some(200));
+        let schema = audit.tool_schema.as_ref().unwrap();
+
+        assert_eq!(body["tool_choice"], "none");
+        assert!(audit.native_tools_enabled);
+        assert_eq!(schema.request_digest, schema.wire_digest);
+        assert_eq!(schema.transform, None);
+        assert_eq!(
+            schema.wire_digest,
+            Some(crate::wire_audit::canonical_value_digest(&body["tools"]))
+        );
+    }
+
+    #[test]
+    fn normalized_schema_and_omitted_tools_have_distinct_evidence() {
+        let req = request(
+            vec![ToolSpec {
+                name: "read".into(),
+                description: "Read a file".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "paths": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "oneOf": [
+                        {"required": ["path"]},
+                        {"required": ["paths"]}
+                    ]
+                }),
+            }],
+            RequestProfile {
+                tool_mode: ToolMode::Auto,
+                ..Default::default()
+            },
+        );
+        let mut body = build_body(&req);
+        let audit = wire_audit(&req, "https://example.invalid", &body, true, Some(200));
+        let schema = audit.tool_schema.as_ref().unwrap();
+        assert_ne!(schema.request_digest, schema.wire_digest);
+        assert_eq!(
+            schema.transform.as_deref(),
+            Some("xai_schema_normalization_v1")
+        );
+        assert_eq!(
+            schema.wire_digest,
+            Some(crate::wire_audit::canonical_value_digest(&body["tools"]))
+        );
+
+        body.as_object_mut().unwrap().remove("tools");
+        let omitted = wire_audit(&req, "https://example.invalid", &body, false, Some(400));
+        let schema = omitted.tool_schema.as_ref().unwrap();
+        assert!(schema.request_digest.is_some());
+        assert_eq!(schema.wire_digest, None);
+        assert_eq!(schema.transform.as_deref(), Some("tools_omitted_v1"));
     }
 }

@@ -1,8 +1,9 @@
 //! Fail-closed API-key write: probe `/models` before touching `config.toml`.
 //!
-//! `hi auth <provider>` and `/auth` paste a key. `/login` stays pairing-only
-//! (xAI / pipenetwork / x402). HTTP 401/403 never writes a profile; transport
-//! failures are unverified and may still save with a warning.
+//! `hi auth <provider>` and `/auth` paste an API key. `/login` remains the
+//! distinct subscription-pairing flow (xAI / pipenetwork / x402). HTTP 401/403
+//! never writes a profile; transport failures are unverified and may still
+//! save with a warning.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -19,15 +20,19 @@ pub fn parse_key_provider(name: &str) -> std::result::Result<ProviderName, Strin
     match name.trim().to_ascii_lowercase().as_str() {
         "openai" | "openrouter" => Ok(ProviderName::Openai),
         "anthropic" => Ok(ProviderName::Anthropic),
+        "pipenetwork" | "pipe" => Ok(ProviderName::Pipenetwork),
         "xai" | "grok" => Ok(ProviderName::Xai),
-        "pipenetwork" | "pipe" | "ollama" | "local" | "x402" => Err(format!(
-            "'{name}' is not a pasted-key provider. Use openai, anthropic, or xai. \
-             Pairing stays /login xai | /login pipenetwork | /login x402."
+        "ollama" | "local" | "x402" => Err(format!(
+            "'{name}' is not a pasted-key provider. Use openai, anthropic, pipenetwork, or xai. \
+             Subscription pairing stays /login xai | /login pipenetwork | /login x402."
         )),
-        "" => Err("usage: /auth openai|anthropic|xai [api-key]  (or `hi auth <provider>`)".into()),
+        "" => Err(
+            "usage: /auth openai|anthropic|pipenetwork|xai [api-key]  (or `hi auth <provider>`)"
+                .into(),
+        ),
         other => Err(format!(
-            "'{other}' has no pasted-key flow. Supported: openai, anthropic, xai. \
-             Pairing stays /login."
+            "'{other}' has no pasted-key flow. Supported: openai, anthropic, pipenetwork, xai. \
+             Subscription pairing stays /login."
         )),
     }
 }
@@ -105,7 +110,7 @@ fn upsert_key_profile(
 pub async fn run_cli(args: &[String]) -> Result<()> {
     let provider = match args.first().map(String::as_str) {
         Some(name) => parse_key_provider(name).map_err(|e| anyhow::anyhow!("{e}"))?,
-        None => bail!("usage: hi auth openai|anthropic|xai"),
+        None => bail!("usage: hi auth openai|anthropic|pipenetwork|xai"),
     };
     let key = if let Some(key) = args.get(1).filter(|s| !s.is_empty()) {
         key.clone()
@@ -205,6 +210,19 @@ mod tests {
     use super::*;
     use hi_ai::test_support::{FakeOpenAiServer, Response};
 
+    #[test]
+    fn pipenetwork_api_keys_use_the_pasted_key_flow() {
+        assert_eq!(
+            parse_key_provider("pipenetwork"),
+            Ok(ProviderName::Pipenetwork)
+        );
+        assert_eq!(parse_key_provider("pipe"), Ok(ProviderName::Pipenetwork));
+        assert_eq!(
+            split_auth_arg("pipe api_test"),
+            Ok((ProviderName::Pipenetwork, Some("api_test".into())))
+        );
+    }
+
     #[tokio::test]
     async fn rejected_401_does_not_write_config() {
         let Some(server) = FakeOpenAiServer::new(vec![Response::json(401, r#"{"error":"bad"}"#)])
@@ -270,5 +288,53 @@ mod tests {
         assert!(!std::fs::read_to_string(&path).unwrap().contains("sk-good"));
         hi_ai::auth_store::delete(key).unwrap();
         assert_eq!(saved.default_profile.as_deref(), Some("openai"));
+    }
+
+    #[tokio::test]
+    async fn accepted_pipenetwork_key_uses_the_flash_profile_and_private_store() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::json(
+            200,
+            r#"{"data":[{"id":"pipe/deepseek-v4-flash-0731"}]}"#,
+        )]) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        let check = apply_pasted_key(
+            &mut config,
+            ProviderName::Pipenetwork,
+            "api_test",
+            Some(server.url()),
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(check, KeyCheck::Accepted);
+
+        let saved = read_config_file(&path).unwrap();
+        let profile = saved
+            .profiles
+            .get("pipenetwork")
+            .expect("pipenetwork profile");
+        assert_eq!(
+            profile.model.as_deref(),
+            Some("pipe/deepseek-v4-flash-0731")
+        );
+        assert!(profile.api_key.is_none());
+        let reference = profile
+            .api_key_ref
+            .as_deref()
+            .expect("private credential-store reference");
+        let key = reference
+            .strip_prefix("auth-store://")
+            .expect("auth-store reference");
+        assert_eq!(
+            hi_ai::auth_store::load(key).map(|credential| credential.access),
+            Some("api_test".into())
+        );
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("api_test"));
+        hi_ai::auth_store::delete(key).unwrap();
+        assert_eq!(saved.default_profile.as_deref(), Some("pipenetwork"));
     }
 }

@@ -4,6 +4,7 @@
 
 pub(crate) mod audit_goal;
 mod background_candidate;
+mod background_candidate_capabilities;
 mod background_candidate_verification;
 mod background_task;
 mod child_process_teardown;
@@ -15,6 +16,7 @@ mod delegate_binding;
 pub(crate) mod delegate_turn;
 mod explore_turn;
 mod goal_turn;
+mod internal_workspace_mutation;
 mod lifecycle;
 mod memory_turn;
 mod mutation_recovery_turn;
@@ -33,4 +35,4 @@ pub(crate) use compaction_turn::ContextWindowLimits;
 #[cfg(test)]
 pub(crate) use delegate_turn::MAX_DELEGATE_SUBAGENTS_PER_TURN;
 #[cfg(test)]
-pub(crate) use explore_turn::MAX_EXPLORE_SUBAGENTS_PER_TURN;
+pub(crate) use explore_turn::{MAX_EXPLORE_SUBAGENTS_PER_TURN, run_explore_job};

@@ -3,7 +3,16 @@
 //! These are conservative merge-quality signals, not compile/test authority.
 //! Findings re-enter the model like an independent-review OBJECT.
 
+use std::collections::BTreeSet;
+use std::fs::Metadata;
+use std::io::Read;
+use std::path::{Component, Path};
+use std::process::Stdio;
+use std::time::Duration;
+
 use hi_tools::{FileChange, FileChangeKind};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use crate::task_contract::TaskContract;
 
@@ -15,6 +24,421 @@ const UNREFERENCED_CREATE_THRESHOLD: usize = 3;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HygieneFinding {
     pub reason: String,
+}
+
+/// Assess only changes that could appear in a repository diff.
+///
+/// Workspace effect accounting deliberately includes ignored files because
+/// configuration and runtime data still matter for durability, cancellation,
+/// and recovery. Diff hygiene is narrower: an ignored, untracked runtime file
+/// cannot be merged, so treating a database reset as a large source rewrite
+/// creates a permanent repair loop. Git's default `check-ignore` behavior does
+/// not report tracked paths, even when a later ignore rule matches them, which
+/// preserves hygiene coverage for tracked source.
+///
+/// Non-Git workspaces and Git failures fail conservatively by retaining every
+/// change.
+pub(crate) async fn assess_reviewable(
+    root: &Path,
+    contract: &TaskContract,
+    changes: &[FileChange],
+    prompt: &str,
+) -> Vec<HygieneFinding> {
+    let reviewable = reviewable_changes(root, changes).await;
+    assess(contract, &reviewable, prompt)
+}
+
+async fn reviewable_changes(root: &Path, changes: &[FileChange]) -> Vec<FileChange> {
+    let Some(ignored) = ignored_untracked_paths(root, changes).await else {
+        return changes.to_vec();
+    };
+    changes
+        .iter()
+        .filter(|change| !ignored.contains(change.path.as_bytes()))
+        .cloned()
+        .collect()
+}
+
+/// Exact content identity for the cumulative, reviewable paths changed by the
+/// turn. Unlike the workspace ledger's cheap whole-tree revision, this reads
+/// oversized files in full so an equal-length rewrite cannot masquerade as no
+/// progress. Ignored untracked runtime paths are intentionally absent because
+/// neither diff hygiene nor completion review can act on them.
+///
+/// `None` means the filesystem could not be observed consistently. Callers
+/// must treat that as inconclusive and allow the repair, never as equality.
+pub(crate) async fn reviewable_content_revision(
+    root: &Path,
+    changes: &[FileChange],
+    cancellation: Option<crate::TurnCancellation>,
+) -> Option<String> {
+    let mut paths = reviewable_changes(root, changes)
+        .await
+        .into_iter()
+        .map(|change| change.path)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        reviewable_content_revision_blocking(&root, &paths, cancellation.as_ref())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReviewableNodeKind {
+    File,
+    Symlink,
+    Directory,
+    Other,
+}
+
+impl ReviewableNodeKind {
+    fn label(self) -> &'static [u8] {
+        match self {
+            Self::File => b"file",
+            Self::Symlink => b"symlink",
+            Self::Directory => b"directory",
+            Self::Other => b"other",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewableMetadata {
+    kind: ReviewableNodeKind,
+    mode: u32,
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified: (i64, i64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ReviewableMetadata {
+    fn from(metadata: &Metadata) -> Self {
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_file() {
+            ReviewableNodeKind::File
+        } else if file_type.is_symlink() {
+            ReviewableNodeKind::Symlink
+        } else if file_type.is_dir() {
+            ReviewableNodeKind::Directory
+        } else {
+            ReviewableNodeKind::Other
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Self {
+                kind,
+                mode: reviewable_file_mode(metadata),
+                len: metadata.len(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
+                changed: (metadata.ctime(), metadata.ctime_nsec()),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                kind,
+                mode: reviewable_file_mode(metadata),
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            }
+        }
+    }
+}
+
+fn reviewable_content_revision_blocking(
+    root: &Path,
+    paths: &[String],
+    cancellation: Option<&crate::TurnCancellation>,
+) -> Option<String> {
+    let root = root.canonicalize().ok()?;
+    let mut hash = Sha256::new();
+    hash.update(b"hi-agent:reviewable-content-revision:v1\0");
+    hash.update(u64::try_from(paths.len()).ok()?.to_be_bytes());
+    for relative in paths {
+        if hashing_cancelled(cancellation) {
+            return None;
+        }
+        let relative_path = Path::new(relative);
+        if relative_path.is_absolute()
+            || relative_path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return None;
+        }
+        let path = contained_reviewable_path(&root, relative_path)?;
+        let parent = path.parent()?.to_path_buf();
+        hash_length_prefixed(&mut hash, relative.as_bytes())?;
+        hash_reviewable_node(&mut hash, &path, cancellation)?;
+        // Re-resolve the parent after reading. A directory or intermediate
+        // symlink race makes the result inconclusive rather than binding an
+        // equality decision to bytes reached outside this workspace path.
+        if parent.canonicalize().ok()? != parent || !parent.starts_with(&root) {
+            return None;
+        }
+    }
+    Some(format!(
+        "reviewable-content:v1:sha256:{:x}",
+        hash.finalize()
+    ))
+}
+
+fn contained_reviewable_path(root: &Path, relative: &Path) -> Option<std::path::PathBuf> {
+    let file_name = relative.file_name()?;
+    let parent = root.join(relative).parent()?.canonicalize().ok()?;
+    if !parent.starts_with(root) {
+        return None;
+    }
+    Some(parent.join(file_name))
+}
+
+fn hash_reviewable_node(
+    hash: &mut Sha256,
+    path: &Path,
+    cancellation: Option<&crate::TurnCancellation>,
+) -> Option<()> {
+    if hashing_cancelled(cancellation) {
+        return None;
+    }
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => ReviewableMetadata::from(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A second lookup distinguishes a stable deletion from a node
+            // appearing during the observation window.
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    hash_length_prefixed(hash, b"missing")?;
+                    hash_length_prefixed(hash, &[])?;
+                    hash_length_prefixed(hash, &[])?;
+                    hash_length_prefixed(hash, &[])?;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+        Err(_) => return None,
+    };
+
+    hash_length_prefixed(hash, before.kind.label())?;
+    hash_length_prefixed(hash, &before.mode.to_be_bytes())?;
+    hash_length_prefixed(hash, &before.len.to_be_bytes())?;
+
+    match before.kind {
+        ReviewableNodeKind::File => {
+            if hashing_cancelled(cancellation) {
+                return None;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                // Refuse a symlink swap and avoid blocking if a path is raced
+                // to a FIFO between lstat and open.
+                options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            let mut file = options.open(path).ok()?;
+            if ReviewableMetadata::from(&file.metadata().ok()?) != before {
+                return None;
+            }
+            hash.update(before.len.to_be_bytes());
+            let mut observed_len = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                if hashing_cancelled(cancellation) {
+                    return None;
+                }
+                let read = file.read(&mut buffer).ok()?;
+                if hashing_cancelled(cancellation) {
+                    return None;
+                }
+                if read == 0 {
+                    break;
+                }
+                observed_len = observed_len.checked_add(u64::try_from(read).ok()?)?;
+                if observed_len > before.len {
+                    return None;
+                }
+                hash.update(&buffer[..read]);
+            }
+            if observed_len != before.len
+                || ReviewableMetadata::from(&file.metadata().ok()?) != before
+                || ReviewableMetadata::from(&std::fs::symlink_metadata(path).ok()?) != before
+            {
+                return None;
+            }
+        }
+        ReviewableNodeKind::Symlink => {
+            if hashing_cancelled(cancellation) {
+                return None;
+            }
+            let target = std::fs::read_link(path).ok()?;
+            if hashing_cancelled(cancellation) {
+                return None;
+            }
+            let bytes = target.as_os_str().as_encoded_bytes();
+            hash_length_prefixed(hash, bytes)?;
+            if ReviewableMetadata::from(&std::fs::symlink_metadata(path).ok()?) != before {
+                return None;
+            }
+        }
+        // File changes should resolve only to regular files, links, or stable
+        // absence. Metadata alone is not exact content evidence for a
+        // directory, device, socket, or FIFO.
+        ReviewableNodeKind::Directory | ReviewableNodeKind::Other => return None,
+    }
+    Some(())
+}
+
+fn hashing_cancelled(cancellation: Option<&crate::TurnCancellation>) -> bool {
+    cancellation.is_some_and(crate::TurnCancellation::is_cancelled)
+}
+
+fn hash_length_prefixed(hash: &mut Sha256, bytes: &[u8]) -> Option<()> {
+    hash.update(u64::try_from(bytes.len()).ok()?.to_be_bytes());
+    hash.update(bytes);
+    Some(())
+}
+
+#[cfg(unix)]
+fn reviewable_file_mode(metadata: &Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn reviewable_file_mode(metadata: &Metadata) -> u32 {
+    if metadata.permissions().readonly() {
+        0o444
+    } else {
+        0o666
+    }
+}
+
+async fn ignored_untracked_paths(root: &Path, changes: &[FileChange]) -> Option<BTreeSet<Vec<u8>>> {
+    if changes.is_empty() {
+        return Some(BTreeSet::new());
+    }
+
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "-z", "--stdin"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let mut input = Vec::new();
+    for change in changes {
+        input.extend_from_slice(change.path.as_bytes());
+        input.push(0);
+    }
+
+    // Drain stdout while feeding stdin. Writing every path before reading the
+    // result can deadlock when a large ignored-path set fills Git's stdout
+    // pipe and Git stops consuming stdin.
+    let (write_result, output) = tokio::time::timeout(Duration::from_secs(5), async move {
+        tokio::join!(
+            async move {
+                stdin.write_all(&input).await?;
+                stdin.shutdown().await
+            },
+            child.wait_with_output()
+        )
+    })
+    .await
+    .ok()?;
+    write_result.ok()?;
+    let output = output.ok()?;
+    // `check-ignore` uses 1 for the successful "no paths matched" result.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return None;
+    }
+    let mut ignored = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect::<BTreeSet<_>>();
+    if !ignored.is_empty() {
+        // After `git rm`, a path is absent from the index and `check-ignore`
+        // reports it as ignored even though its staged deletion is very much
+        // part of the reviewable diff. Preserve every such deletion. If Git
+        // cannot classify it, retain all changes conservatively.
+        let staged_deletions = staged_deleted_paths(root).await?;
+        ignored.retain(|path| !staged_deletions.contains(path));
+    }
+    Some(ignored)
+}
+
+async fn staged_deleted_paths(root: &Path) -> Option<BTreeSet<Vec<u8>>> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args([
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--diff-filter=D",
+            "--no-renames",
+            "--relative",
+            "--",
+        ])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+    )
 }
 
 /// Assess a green turn's file changes against the task contract.
@@ -181,161 +605,5 @@ fn oversized_file(changes: &[FileChange]) -> Option<HygieneFinding> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::VerificationMode;
-
-    fn change(path: &str, kind: FileChangeKind, after_len: Option<u64>) -> FileChange {
-        change_with_before(path, kind, None, after_len)
-    }
-
-    fn change_with_before(
-        path: &str,
-        kind: FileChangeKind,
-        before_len: Option<u64>,
-        after_len: Option<u64>,
-    ) -> FileChange {
-        FileChange {
-            path: path.into(),
-            kind,
-            before_digest: None,
-            after_digest: None,
-            before_len,
-            after_len,
-            before_mode: None,
-            after_mode: None,
-        }
-    }
-
-    #[test]
-    fn unreferenced_creates_need_a_narrow_contract() {
-        let contract = TaskContract::derive("fix src/parser.rs", VerificationMode::Auto);
-        assert!(!contract.referenced_paths.is_empty());
-        let changes = vec![
-            change("src/parser.rs", FileChangeKind::Modify, Some(100)),
-            change("a.rs", FileChangeKind::Create, Some(10)),
-            change("b.rs", FileChangeKind::Create, Some(10)),
-            change("c.rs", FileChangeKind::Create, Some(10)),
-        ];
-        let findings = assess(&contract, &changes, "fix src/parser.rs");
-        assert!(
-            findings.iter().any(|f| f.reason.contains("unreferenced")),
-            "{findings:?}"
-        );
-        let broad = TaskContract::derive("implement the feature", VerificationMode::Auto);
-        assert!(broad.referenced_paths.is_empty());
-        assert!(
-            assess(&broad, &changes, "implement the feature")
-                .iter()
-                .all(|f| !f.reason.contains("unreferenced"))
-        );
-    }
-
-    #[test]
-    fn dependency_manifest_is_flagged_unless_asked() {
-        let contract = TaskContract::derive("fix the parser in src/lib.rs", VerificationMode::Auto);
-        let changes = vec![change("Cargo.toml", FileChangeKind::Modify, Some(200))];
-        let findings = assess(&contract, &changes, "fix the parser in src/lib.rs");
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.reason.contains("dependency manifest")),
-            "{findings:?}"
-        );
-        let asked = assess(
-            &contract,
-            &changes,
-            "add crate serde to Cargo.toml for the parser",
-        );
-        assert!(
-            asked
-                .iter()
-                .all(|f| !f.reason.contains("dependency manifest")),
-            "{asked:?}"
-        );
-
-        let broad = TaskContract::derive(
-            "connect the app to the inference API and make it work",
-            VerificationMode::Auto,
-        );
-        assert!(broad.referenced_paths.is_empty());
-        let broad_findings = assess(
-            &broad,
-            &changes,
-            "connect the app to the inference API and make it work",
-        );
-        assert!(
-            broad_findings
-                .iter()
-                .all(|f| !f.reason.contains("dependency manifest")),
-            "broad integration work may naturally require a dependency: {broad_findings:?}"
-        );
-    }
-
-    #[test]
-    fn oversized_create_is_flagged() {
-        let contract = TaskContract::derive("add a helper", VerificationMode::Auto);
-        let changes = vec![change(
-            "src/huge.rs",
-            FileChangeKind::Create,
-            Some(LARGE_FILE_BYTES + 1),
-        )];
-        let findings = assess(&contract, &changes, "add a helper");
-        assert!(
-            findings.iter().any(|f| f.reason.contains("bytes")),
-            "{findings:?}"
-        );
-    }
-
-    #[test]
-    fn small_patch_on_already_large_file_is_not_flagged() {
-        let contract =
-            TaskContract::derive("fold stream_area into the Run row", VerificationMode::Auto);
-        let changes = vec![change_with_before(
-            "crates/hi-tui/src/app/render.rs",
-            FileChangeKind::Modify,
-            Some(113_013),
-            Some(113_050),
-        )];
-        let findings = assess(&contract, &changes, "fold stream_area into the Run row");
-        assert!(
-            findings
-                .iter()
-                .all(|f| !f.reason.contains("rewriting large files")),
-            "small delta on a large file must not look like a rewrite: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn modify_without_before_len_is_not_flagged() {
-        let contract = TaskContract::derive("edit render.rs", VerificationMode::Auto);
-        let changes = vec![change(
-            "crates/hi-tui/src/app/render.rs",
-            FileChangeKind::Modify,
-            Some(LARGE_FILE_BYTES + 1),
-        )];
-        let findings = assess(&contract, &changes, "edit render.rs");
-        assert!(
-            findings
-                .iter()
-                .all(|f| !f.reason.contains("rewriting large files")),
-            "unknown baseline must not flag an already-large file: {findings:?}"
-        );
-    }
-
-    #[test]
-    fn large_growth_on_modify_is_flagged() {
-        let contract = TaskContract::derive("rewrite the renderer", VerificationMode::Auto);
-        let changes = vec![change_with_before(
-            "src/render.rs",
-            FileChangeKind::Modify,
-            Some(1_024),
-            Some(LARGE_FILE_BYTES + 2_048),
-        )];
-        let findings = assess(&contract, &changes, "rewrite the renderer");
-        assert!(
-            findings.iter().any(|f| f.reason.contains("changed by")),
-            "{findings:?}"
-        );
-    }
-}
+#[path = "hygiene_tests.rs"]
+mod tests;

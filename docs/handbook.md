@@ -30,7 +30,7 @@ cargo install --path crates/hi-cli --locked
 # OpenRouter (default endpoint)
 HI_API_KEY=sk-or-... hi -m anthropic/claude-sonnet-4 "add a --json flag to the CLI"
 
-# pipenetwork.ai (OpenAI-compatible coding endpoint; defaults to ipop/coder-balanced)
+# pipenetwork.ai (OpenAI-compatible coding endpoint; defaults to pipe/deepseek-v4-flash-0731)
 PIPENETWORK_API_KEY=... hi --provider pipenetwork "add a --json flag to the CLI"
 
 # A local Ollama model (no API key needed)
@@ -128,7 +128,9 @@ OpenAI-compatible endpoints vary in how much of Chat Completions they implement.
 | `HI_VERIFIER_QUEUE_TIMEOUT_SECS` | Optional shared verifier capacity wait timeout | off |
 | `HI_MERGE_QUEUE_TIMEOUT_SECS` | Optional exclusive destination-merge capacity wait timeout | off |
 | `HI_VERIFY_TIMEOUT_SECS` | Optional positive verification process timeout; unset or `0` allows continual execution | off |
-| `HI_BASH_TIMEOUT_SECS` | Optional positive foreground shell-command timeout; unset or `0` allows continual execution (slow commands may still be handed to the background registry) | off |
+| `HI_BASH_TIMEOUT_SECS` | Optional hard shell-command timeout; setting it keeps the command foreground until completion or timeout | off |
+| `HI_BASH_AUTO_BACKGROUND` | Hand a shell command that outlives its foreground attachment budget to the managed background registry; set `0` to opt out | on |
+| `HI_BASH_FOREGROUND_BUDGET_SECS` | Time a shell command may remain attached to the active turn before managed handoff | 30s |
 | `HI_MCP_CONNECT_TIMEOUT_SECS` | Optional positive lazy MCP handshake timeout; unset or `0` waits until connection, failure, or turn cancellation | off |
 | `HI_MCP_TOOL_TIMEOUT_SECS` | Optional positive MCP `tools/call` timeout; unset or `0` allows continual execution until completion or turn cancellation | off |
 | `HI_MODEL_REQUEST_TIMEOUT_SECS` | Optional positive absolute deadline for one model HTTP request (including bounded retries/backoffs); unset or `0` allows continual execution | off |
@@ -426,7 +428,7 @@ Slash commands (TUI or plain REPL):
 | `/commit` | commit files this session touched (never `git add -A`; refuses a secret-looking staged diff) |
 | `/status` | show provider, model, queue, context, last turn state, and session `$` when the model publishes a price |
 | `/login <provider>` | subscription pairing only: `xai`, `pipenetwork`, or `x402` |
-| `/auth <openai\|anthropic\|xai> [key]` | paste an API key, probe `/models`, then write a profile. HTTP 401/403 is never saved. The key is masked and omitted from ↑ history. `hi auth <provider>` does the same outside a session |
+| `/auth <openai\|anthropic\|pipenetwork\|xai> [key]` | paste an API key, probe `/models`, then write a profile. HTTP 401/403 is never saved. The key is masked, omitted from ↑ history, and sealed in the private credential store. Pipe subscription pairing remains `/login pipenetwork`. `hi auth <provider>` does the same outside a session |
 | `/mcp [pipe\|name reconnect\|allow\|deny]\|add` | workspace MCP status table (includes auto-attached `pipe`); `pipe` inspects the unfiltered provider `mcp_url`; `allow`/`deny` persist per-server tool lists; `add` writes `.hi/mcp/<name>.json` |
 | `/log` | write a local debug log for this session (`.hi-debug.log`) |
 | `/export [path]` | export the conversation to a file (default: `transcript.md`) |

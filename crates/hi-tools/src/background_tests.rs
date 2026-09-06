@@ -662,9 +662,12 @@ fn registry_with_retained_output(output: String) -> (BackgroundRegistry, String)
         title: "overflow-test".to_string(),
         pgid: None,
         origin: BgOrigin::Requested,
+        managed_effect: None,
         effect_baseline: None,
         managed_job: None,
+        ownership_released: std::sync::atomic::AtomicBool::new(false),
         inner: Mutex::new(BgInner::running(output)),
+        terminal_publication: tokio::sync::Mutex::new(()),
         reaped: Notify::new(),
         changed: Notify::new(),
     });

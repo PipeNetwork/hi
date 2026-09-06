@@ -2,11 +2,28 @@ use std::fs;
 use std::sync::Arc;
 
 use hi_control::{
-    ControlStore, JournaledWorkspaceController, WorkspaceOperationStatus, WorkspaceRecoveryStatus,
+    ControlJobState, ControlStore, JournaledWorkspaceController, WorkspaceOperationStatus,
+    WorkspaceProjectionJournal, WorkspaceRecoveryStatus,
 };
-use hi_workspace::{InMemoryWorkspaceController, MutationIntent, WorkspaceController};
+use hi_workspace::{
+    EffectScope, InMemoryWorkspaceController, JobKind, JobLimits, JobSpec, MutationIntent,
+    WorkspaceController, WorkspaceState, restart_job_recovery_id,
+};
 
 use super::*;
+
+struct UnusedProvider;
+
+#[async_trait::async_trait]
+impl hi_ai::Provider for UnusedProvider {
+    async fn stream(
+        &self,
+        _: hi_ai::ChatRequest,
+        _: &mut (dyn FnMut(hi_ai::StreamEvent) + Send),
+    ) -> anyhow::Result<hi_ai::Completion> {
+        panic!("the recovery startup test must not call a model provider")
+    }
+}
 
 #[test]
 fn whole_workspace_scan_tracks_content_including_vcs_and_excludes_only_runtime() {
@@ -37,6 +54,17 @@ fn whole_workspace_scan_tracks_content_including_vcs_and_excludes_only_runtime()
             .iter()
             .any(|value| value.contains("runtime state"))
     );
+}
+
+#[test]
+fn workspace_scan_byte_accounting_has_no_artificial_two_gib_ceiling() {
+    let formerly_rejected_size = 2_u64 * 1024 * 1024 * 1024 + 1;
+    let mut byte_count = 0;
+
+    add_workspace_bytes(&mut byte_count, formerly_rejected_size).unwrap();
+
+    assert_eq!(byte_count, formerly_rejected_size);
+    assert!(add_workspace_bytes(&mut byte_count, u64::MAX).is_err());
 }
 
 #[tokio::test]
@@ -119,6 +147,119 @@ async fn restart_inventory_uses_stable_id_and_discard_preserves_current_bytes() 
             .is_empty(),
         "the next startup must be able to create a fresh binding"
     );
+}
+
+#[tokio::test]
+async fn crashed_writer_discard_preserves_bytes_and_allows_ready_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let state = root.path().join("state");
+    fs::create_dir_all(workspace.join(".git")).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    fs::write(workspace.join("source.txt"), b"accepted writer bytes").unwrap();
+    fs::write(workspace.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let state = state.canonicalize().unwrap();
+    let workspace_id = workspace_id(&workspace);
+    let store = ControlStore::open_for_state(&state).unwrap();
+    let inner: Arc<dyn WorkspaceController> = Arc::new(InMemoryWorkspaceController::new_local(
+        workspace_id.clone(),
+        &workspace,
+        &state,
+    ));
+    let controller = JournaledWorkspaceController::attach_store(inner, store.clone()).unwrap();
+    let job = controller
+        .register_job(JobSpec {
+            kind: JobKind::WriteCandidate,
+            effect_scope: EffectScope::CandidateOnly,
+            name: "interrupted writer".into(),
+            limits: JobLimits::default(),
+            parent_operation: None,
+        })
+        .await
+        .unwrap();
+    let binding = controller.binding();
+    drop(controller);
+
+    let journal = WorkspaceProjectionJournal::from_control_store(store.clone());
+    let report = journal.reconcile_jobs_after_restart(&binding).unwrap();
+    let recovery_id = restart_job_recovery_id(&binding.binding_id, binding.epoch, &job.job_id);
+    assert_eq!(report.recovery_ids, vec![recovery_id.clone()]);
+    assert_eq!(
+        store.get_job(job.job_id.as_str()).unwrap().unwrap().state,
+        ControlJobState::RecoveryRequired
+    );
+    let required = store
+        .get_workspace_recovery(recovery_id.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(required.kind, "crashed_writer_job");
+    assert_eq!(required.status, WorkspaceRecoveryStatus::Required);
+
+    let service = LocalRecoveryService::new(workspace.clone(), state.clone());
+    let inventory = service.inventory().unwrap();
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].recovery_id, recovery_id.to_string());
+    assert_eq!(
+        inventory[0].job.as_ref().unwrap().state,
+        ControlJobState::RecoveryRequired
+    );
+    let confirmation = inventory[0]
+        .proof
+        .confirmation_digest
+        .clone()
+        .expect("workspace is scannable");
+    let source_before = fs::read(workspace.join("source.txt")).unwrap();
+    let git_before = fs::read(workspace.join(".git/HEAD")).unwrap();
+
+    run_at(
+        WorkspaceCommand::Recover {
+            command: RecoveryCommand::Discard(super::super::DiscardArgs {
+                recovery_id: recovery_id.to_string(),
+                session: None,
+                confirm: confirmation.clone(),
+                accept_current_bytes: true,
+            }),
+        },
+        workspace.clone(),
+        state.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read(workspace.join("source.txt")).unwrap(),
+        source_before
+    );
+    assert_eq!(fs::read(workspace.join(".git/HEAD")).unwrap(), git_before);
+    assert_eq!(
+        store.get_job(job.job_id.as_str()).unwrap().unwrap().state,
+        ControlJobState::Failed
+    );
+    let discarded = store
+        .get_workspace_recovery(recovery_id.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(discarded.kind, "crashed_writer_job");
+    assert_eq!(discarded.status, WorkspaceRecoveryStatus::Discarded);
+    assert_eq!(discarded.digest.as_deref(), Some(confirmation.as_str()));
+    assert!(service.inventory().unwrap().is_empty());
+    assert!(
+        store
+            .unsettled_workspace_bindings(&workspace_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut config = hi_agent::AgentConfig::default();
+    config.paths.workspace_root = workspace;
+    config.paths.state_root = state;
+    config.gates.lsp_mode = hi_agent::LspMode::Off;
+    let fresh = hi_agent::Agent::new(Arc::new(UnusedProvider), config).unwrap();
+    assert_eq!(
+        fresh.workspace_controller_status().state,
+        WorkspaceState::Ready
+    );
+    assert!(fresh.workspace_controller_status().recovery_id.is_none());
 }
 
 #[test]

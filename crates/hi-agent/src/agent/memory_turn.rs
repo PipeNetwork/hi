@@ -8,8 +8,9 @@ use hi_ai::{ChatRequest, Content, Message, RequestProfile, Role, StreamEvent};
 
 use crate::compaction;
 use crate::memory::{
-    cap_memory, extract_corrections, global_memory_file, memory_file_at, memory_prompt,
-    split_layers, unreferenced_bullets, verify_grounded, write_memory,
+    cap_memory, extract_corrections, global_memory_file, memory_body_from_preimage, memory_file_at,
+    memory_prompt, read_memory_preimage, split_layers, unreferenced_bullets, verify_grounded,
+    write_memory_replace_if_unchanged, write_memory_replace_if_unchanged_at,
 };
 use crate::snapshot::FileFingerprint;
 use crate::transcript::repair_invalid_tool_call_arguments_in_messages;
@@ -34,9 +35,23 @@ impl crate::Agent {
     pub(crate) async fn update_memory_at(&mut self, path: std::path::PathBuf, ui: &mut dyn Ui) {
         // Read both memory layers, stripping the schema header so the distiller
         // sees only the bullets (and tolerates a missing/legacy header).
-        let existing = crate::memory::read_layer(&path);
+        let project_preimage = match read_memory_preimage(&path) {
+            Ok(preimage) => preimage,
+            Err(error) => {
+                ui.status(&format!("(couldn't read project memory safely: {error})"));
+                return;
+            }
+        };
+        let existing = memory_body_from_preimage(project_preimage.as_deref());
         let global_path = global_memory_file();
-        let global_existing = crate::memory::read_layer(&global_path);
+        let global_preimage = match read_memory_preimage(&global_path) {
+            Ok(preimage) => preimage,
+            Err(error) => {
+                ui.status(&format!("(couldn't read global memory safely: {error})"));
+                return;
+            }
+        };
+        let global_existing = memory_body_from_preimage(global_preimage.as_deref());
 
         ui.status("distilling session memory…");
 
@@ -215,30 +230,71 @@ impl crate::Agent {
         let global_body = crate::memory::ensure_bullet_ids(&global_body, &mut next_id);
 
         // Publish each layer atomically + exclusively (temp file + rename under
-        // an O_EXCL lock). A concurrent distillation in the same dir is skipped;
-        // its revision loses to whichever process took the lock first.
+        // an O_EXCL lock). Project memory is also admitted and settled by the
+        // workspace controller. Global memory is explicitly host-local: never
+        // include it in a PipeFS manifest, and refuse an override into this
+        // workspace rather than bypassing admission.
         let mut saved_notes = 0usize;
+        let mut wrote_project = false;
         let mut wrote_global = false;
         if !project_body.trim().is_empty() {
-            match write_memory(&path, &project_body) {
-                Ok(notes) => saved_notes += notes,
-                Err(status) => ui.status(&format!("({status})")),
+            let declared_paths = crate::memory::memory_write_paths(&path);
+            let workspace_root = self.runtime.root().to_path_buf();
+            let state_root = self.runtime.state_root().to_path_buf();
+            let content_digest = hi_tools::envelope::canonical_value_digest(
+                &serde_json::Value::String(project_body.clone()),
+            );
+            let write = self
+                .run_internal_file_mutation(
+                    "distill_project_memory",
+                    "distill project memory",
+                    &declared_paths,
+                    serde_json::json!({ "content_digest": content_digest }),
+                    || {
+                        let notes = write_memory_replace_if_unchanged_at(
+                            &workspace_root,
+                            &state_root,
+                            &path,
+                            &project_body,
+                            project_preimage.as_deref(),
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                        Ok((notes, format!("saved {notes} project-memory notes")))
+                    },
+                )
+                .await;
+            match write {
+                Ok(notes) => {
+                    saved_notes += notes;
+                    wrote_project = true;
+                }
+                Err(error) => ui.status(&format!("(project memory not saved: {error})")),
             }
         }
         if !global_body.trim().is_empty() {
-            match write_memory(&global_path, &global_body) {
+            let declared_paths = crate::memory::memory_write_paths(&global_path);
+            let write = self.run_host_local_file_mutation("global memory", &declared_paths, || {
+                write_memory_replace_if_unchanged(
+                    &global_path,
+                    &global_body,
+                    global_preimage.as_deref(),
+                )
+                .map_err(anyhow::Error::msg)
+            });
+            match write {
                 Ok(notes) => {
                     saved_notes += notes;
                     wrote_global = true;
                 }
-                Err(status) => ui.status(&format!("({status})")),
+                Err(error) => ui.status(&format!("(global memory not saved: {error})")),
             }
         }
         if saved_notes > 0 {
-            let where_to = if wrote_global {
-                "project + global memory"
-            } else {
-                "project memory"
+            let where_to = match (wrote_project, wrote_global) {
+                (true, true) => "project + global memory",
+                (true, false) => "project memory",
+                (false, true) => "global memory",
+                (false, false) => unreachable!("positive saved note count has a destination"),
             };
             ui.status(&format!(
                 "✓ saved {saved_notes} memory note(s) to {where_to} — `/undo-memory`"

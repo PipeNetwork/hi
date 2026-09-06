@@ -31,6 +31,22 @@ pub(super) fn candidates(
     }
 }
 
+pub(super) fn candidates_for_request(
+    config: &MoaConfig,
+    passthrough: &dyn Provider,
+    routes: &dyn Provider,
+    route: &str,
+    model: &str,
+    context: crate::ProviderRequestContext<'_>,
+) -> Vec<ProviderCapabilityCandidate> {
+    match config.preset_for_model(model) {
+        Some(preset) => {
+            routes.capability_candidates_for_request(route, &preset.aggregator_model, context)
+        }
+        None => passthrough.capability_candidates_for_request(route, model, context),
+    }
+}
+
 pub(super) async fn reference_envelope(
     routes: &dyn Provider,
     request: &crate::ChatRequest,
@@ -38,7 +54,11 @@ pub(super) async fn reference_envelope(
     reference_model: &str,
 ) -> (u32, Arc<RequestToolEnvelope>) {
     let target = crate::CapabilityRoute::new("moa-reference", reference_model);
-    let candidates = routes.capability_candidates(&target.route, &target.model);
+    let candidates = routes.capability_candidates_for_request(
+        &target.route,
+        &target.model,
+        crate::ProviderRequestContext::auxiliary(),
+    );
     let effective = crate::ProviderCapabilityRegistry::default()
         .resolve_candidates(target, &candidates)
         .await;

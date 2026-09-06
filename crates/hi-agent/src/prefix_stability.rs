@@ -108,6 +108,18 @@ fn message_hashes(messages: &[hi_ai::Message]) -> Vec<u64> {
                         data.hash(&mut hasher);
                         media_type.hash(&mut hasher);
                     }
+                    hi_ai::Content::ProviderReplay {
+                        provider,
+                        content_digest,
+                        items,
+                    } => {
+                        5u8.hash(&mut hasher);
+                        provider.hash(&mut hasher);
+                        content_digest.hash(&mut hasher);
+                        serde_json::to_vec(items)
+                            .expect("provider output items serialize to JSON")
+                            .hash(&mut hasher);
+                    }
                 }
             }
             hasher.finish()
@@ -205,5 +217,24 @@ mod tests {
 
         tracker.record_request(&appended, &[read_tool(), bash_tool()]);
         assert_eq!(tracker.stable_rounds, 2, "frozen catalog is append-stable");
+    }
+
+    #[test]
+    fn provider_replay_changes_break_the_cached_prefix() {
+        let mut tracker = PrefixStability::default();
+        let message = Message::assistant(vec![Content::Text("Done".into())]).with_provider_replay(
+            "openai-responses",
+            vec![serde_json::json!({"type": "message", "phase": "commentary"})],
+        );
+        tracker.record_request(std::slice::from_ref(&message), &[]);
+        tracker.record_request(std::slice::from_ref(&message), &[]);
+        assert_eq!(tracker.stable_rounds, 1);
+        let updated = message.with_provider_replay(
+            "openai-responses",
+            vec![serde_json::json!({"type": "message", "phase": "final_answer"})],
+        );
+        tracker.record_request(&[updated], &[]);
+        assert_eq!(tracker.break_rounds, 1);
+        assert_eq!(tracker.earliest_break, Some(0));
     }
 }

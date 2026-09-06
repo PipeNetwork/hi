@@ -46,8 +46,12 @@ pub(super) struct VerifyOutcomeState<'a> {
     pub(super) force_tools_next: &'a mut bool,
     pub(super) independent_review_status: &'a mut ReviewStatus,
     pub(super) independent_review_repairs: &'a mut u32,
+    pub(super) last_hygiene_repair_revision: &'a mut Option<String>,
+    pub(super) last_completion_review_repair_revision: &'a mut Option<String>,
+    pub(super) last_verify_failure_repair: &'a mut Option<(String, String)>,
     pub(super) review_unavailable_reason: &'a mut Option<String>,
     pub(super) verification_infrastructure_error: &'a mut bool,
+    pub(super) verification_deferred_active_writer: &'a mut bool,
     pub(super) verification_unstable: &'a mut bool,
     pub(super) last_verify_attributions: &'a mut Vec<hi_tools::Attribution>,
     /// A successful model-run validation command after the last mutation. If
@@ -208,8 +212,43 @@ impl crate::Agent {
                 ) && let Some(contract) = self.task.last_task_contract.as_ref()
                 {
                     let prompt = self.task.last_task_prompt.as_deref().unwrap_or("");
-                    let findings = crate::hygiene::assess(contract, &current_changes, prompt);
+                    let findings = crate::hygiene::assess_reviewable(
+                        self.runtime.root(),
+                        contract,
+                        &current_changes,
+                        prompt,
+                    )
+                    .await;
                     if !findings.is_empty() {
+                        let reviewable_revision = crate::hygiene::reviewable_content_revision(
+                            self.runtime.root(),
+                            &current_changes,
+                            self.turn_cancellation.clone(),
+                        )
+                        .await;
+                        if reviewable_revision.as_deref().is_some_and(|revision| {
+                            state.last_hygiene_repair_revision.as_deref() == Some(revision)
+                        }) {
+                            // The previous objection already received a full
+                            // Model -> Tools -> Steer repair opportunity. If
+                            // the content revision is identical, another
+                            // deterministic pass can only reproduce the same
+                            // finding. Keep the green seal and finish with the
+                            // objection recorded instead of turning an
+                            // unlimited productive-repair policy into a loop.
+                            *state.independent_review_status = ReviewStatus::Objected;
+                            ui.status(
+                                "diff hygiene still objects without a workspace change; completing with the objection recorded",
+                            );
+                            return Ok(VerifyOutcomeControl::BreakTurn);
+                        }
+                        if let Some(revision) = reviewable_revision.clone() {
+                            *state.last_hygiene_repair_revision = Some(revision);
+                        } else {
+                            // Do not let an older conclusive observation stop
+                            // a later retry after a racy/inconclusive read.
+                            *state.last_hygiene_repair_revision = None;
+                        }
                         *state.independent_review_repairs =
                             state.independent_review_repairs.saturating_add(1);
                         *state.independent_review_status = ReviewStatus::Objected;
@@ -262,6 +301,27 @@ impl crate::Agent {
                         (required, large)
                     });
                 if review_required {
+                    let reviewable_revision = crate::hygiene::reviewable_content_revision(
+                        self.runtime.root(),
+                        &current_changes,
+                        self.turn_cancellation.clone(),
+                    )
+                    .await;
+                    if *state.independent_review_status == ReviewStatus::Objected
+                        && reviewable_revision.as_deref().is_some_and(|revision| {
+                            state.last_completion_review_repair_revision.as_deref()
+                                == Some(revision)
+                        })
+                    {
+                        // A reviewer already objected to these exact bytes and
+                        // the model received a complete repair opportunity.
+                        // Re-running a potentially stochastic reviewer without
+                        // a workspace change is not productive progress.
+                        ui.status(
+                            "completion review still objects without a workspace change; completing with the objection recorded",
+                        );
+                        return Ok(VerifyOutcomeControl::BreakTurn);
+                    }
                     self.refresh_active_task_context(
                         context_task,
                         repository_context_enabled,
@@ -355,6 +415,11 @@ impl crate::Agent {
                                 *state.independent_review_repairs,
                             ) =>
                         {
+                            if let Some(revision) = reviewable_revision.clone() {
+                                *state.last_completion_review_repair_revision = Some(revision);
+                            } else {
+                                *state.last_completion_review_repair_revision = None;
+                            }
                             *state.independent_review_repairs =
                                 state.independent_review_repairs.saturating_add(1);
                             *state.independent_review_status = ReviewStatus::Objected;
@@ -416,14 +481,7 @@ impl crate::Agent {
                 output,
                 round,
             } => {
-                ui.status(&format!("✗ {} failed; iterating", stage.name));
                 self.report.verify = VerifyEvidence::fail();
-                if round >= 2 && !self.repair_effort_escalated {
-                    self.repair_effort_escalated = true;
-                    ui.status(
-                        "verification failed twice — raising reasoning effort for repair rounds",
-                    );
-                }
                 let guidance = stage_guidance(&stage);
                 // Structured failure: attributions + condensed output + optional
                 // diagnostic snippet. Enrich-only relative to the raw blob.
@@ -436,6 +494,43 @@ impl crate::Agent {
                     Some(guidance),
                 );
                 *state.last_verify_attributions = structured.attributions.clone();
+                let current_changes = self.runtime.ledger().changes_since(turn_ledger_revision);
+                let reviewable_revision = crate::hygiene::reviewable_content_revision(
+                    self.runtime.root(),
+                    &current_changes,
+                    self.turn_cancellation.clone(),
+                )
+                .await;
+                let stage_identity = format!("{}\0{}", stage.name, stage.command);
+                if reviewable_revision.as_deref().is_some_and(|revision| {
+                    matches!(
+                        state.last_verify_failure_repair.as_ref(),
+                        Some((prior_revision, prior_stage))
+                            if prior_revision == revision && prior_stage == &stage_identity
+                    )
+                }) {
+                    // The model already received a full repair opportunity for
+                    // this failing stage at these exact workspace bytes. The
+                    // unlimited sentinel admits productive revisions; it must
+                    // not repeatedly execute an identical deterministic check.
+                    ui.status(&format!(
+                        "✗ {} failed again without a workspace change; stopping the repair loop",
+                        stage.name
+                    ));
+                    return Ok(VerifyOutcomeControl::BreakTurn);
+                }
+                if let Some(revision) = reviewable_revision {
+                    *state.last_verify_failure_repair = Some((revision, stage_identity));
+                } else {
+                    *state.last_verify_failure_repair = None;
+                }
+                ui.status(&format!("✗ {} failed; iterating", stage.name));
+                if round >= 2 && !self.repair_effort_escalated {
+                    self.repair_effort_escalated = true;
+                    ui.status(
+                        "verification failed twice — raising reasoning effort for repair rounds",
+                    );
+                }
                 // Replace the previous verify nudge instead of accumulating.
                 // Only the latest verification output belongs in context.
                 // `replace_last_nudge` pops trailing tool/assistant messages
@@ -458,6 +553,19 @@ impl crate::Agent {
                 self.report.verify = VerifyEvidence::none();
                 ui.status(&format!(
                     "verification infrastructure failed at {} (round {round}): {output}",
+                    stage.name,
+                ));
+                Ok(VerifyOutcomeControl::BreakTurn)
+            }
+            VerifyOutcome::DeferredActiveWriter { stage, detail } => {
+                // The verifier did not run, so retain neither a green/failing
+                // seal nor an infrastructure-failure claim. Break directly:
+                // re-entering through `NotRun` would repeatedly demand a check
+                // that the same live-writer fence cannot admit.
+                self.report.verify = VerifyEvidence::none();
+                *state.verification_deferred_active_writer = true;
+                ui.status(&format!(
+                    "verification deferred at {} — {detail}",
                     stage.name,
                 ));
                 Ok(VerifyOutcomeControl::BreakTurn)

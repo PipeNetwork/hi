@@ -27,6 +27,17 @@ macro_rules! forward_provider_capabilities {
         ) -> Vec<hi_ai::ProviderCapabilityCandidate> {
             $self.$inner.capability_candidates(route, model)
         }
+
+        fn capability_candidates_for_request(
+            &$self,
+            route: &str,
+            model: &str,
+            context: hi_ai::ProviderRequestContext<'_>,
+        ) -> Vec<hi_ai::ProviderCapabilityCandidate> {
+            $self
+                .$inner
+                .capability_candidates_for_request(route, model, context)
+        }
     };
 }
 pub(crate) use forward_provider_capabilities;
@@ -35,6 +46,52 @@ pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
     // Same string as config files and `--provider` use, so a label can't drift
     // from the name a user is expected to type.
     provider.as_str()
+}
+
+/// Keep the provider family readable while fencing capability observations by
+/// the concrete endpoint. Only a BLAKE3 digest of the endpoint enters session
+/// state or diagnostics, so embedded credentials and query tokens stay out.
+pub(crate) fn agent_provider_route(settings: &Settings) -> hi_agent::AgentProviderRoute {
+    let label = provider_label(settings.provider);
+    let base_url = resolved_credential_safe_base_url(&settings.base_url, settings.provider);
+    let capability_label =
+        capability_provider_label(settings.provider, &base_url, settings.deepseek_compat);
+    provider_route_for_endpoint(
+        label,
+        capability_label,
+        &base_url,
+        settings.api_unix_socket.as_deref(),
+    )
+}
+
+fn capability_provider_label(
+    provider: ProviderName,
+    base_url: &str,
+    deepseek_compat: hi_ai::DeepSeekCompat,
+) -> &'static str {
+    if provider == ProviderName::Openai
+        && deepseek_compat == hi_ai::DeepSeekCompat::Auto
+        && hi_provider_config::is_official_deepseek_endpoint(base_url)
+    {
+        "deepseek"
+    } else {
+        provider_label(provider)
+    }
+}
+
+fn provider_route_for_endpoint(
+    label: &str,
+    capability_label: &str,
+    base_url: &str,
+    api_unix_socket: Option<&std::path::Path>,
+) -> hi_agent::AgentProviderRoute {
+    let endpoint_identity = api_unix_socket.map_or(base_url.to_string(), |socket| {
+        format!("{base_url}\0unix-socket\0{}", socket.to_string_lossy())
+    });
+    hi_agent::AgentProviderRoute::new(
+        label,
+        hi_ai::endpoint_capability_route(capability_label, &endpoint_identity),
+    )
 }
 
 /// The independent-review / `/goal team` skeptic model when neither
@@ -74,16 +131,25 @@ fn xai_oauth_token_source(
 /// endpoint rather than leaking the credential. Same rule the sync path
 /// applies (`sync_base_url_is_safe`). Pure so the policy is testable offline.
 pub(crate) fn credential_safe_base_url(configured: &str, provider: ProviderName) -> String {
+    let resolved = resolved_credential_safe_base_url(configured, provider);
+    let trimmed = configured.trim();
+    if !trimmed.is_empty() && !crate::orchestration::sync_base_url_is_safe(trimmed) {
+        eprintln!(
+            "warning: configured {} base_url is not https (or loopback http); \
+             using the provider default '{resolved}' to avoid exposing credentials",
+            provider_label(provider),
+        );
+    }
+    resolved
+}
+
+fn resolved_credential_safe_base_url(configured: &str, provider: ProviderName) -> String {
     let trimmed = configured.trim();
     if trimmed.is_empty() || crate::orchestration::sync_base_url_is_safe(trimmed) {
-        return configured.to_string();
+        configured.to_string()
+    } else {
+        provider.default_base_url().to_string()
     }
-    let fallback = provider.default_base_url().to_string();
-    eprintln!(
-        "warning: base_url '{trimmed}' is not https (or loopback http); \
-         using the provider default '{fallback}' to avoid exposing the API key"
-    );
-    fallback
 }
 
 pub(crate) fn build_provider(settings: &Settings) -> Box<dyn Provider> {
@@ -132,6 +198,7 @@ pub(crate) fn build_backend(settings: &Settings) -> Backend {
         provider: build_provider(settings),
         model: settings.model.clone(),
         label: format!("{}/{}", provider_label(settings.provider), settings.model),
+        capability_route: agent_provider_route(settings).capability_identity,
     }
 }
 
@@ -294,11 +361,20 @@ pub(crate) async fn resolve_live_model_metadata_with_timeout(
 ) -> LiveModelMetadata {
     let declared = provider.capabilities();
     match tokio::time::timeout(timeout, provider.list_models()).await {
-        Ok(Ok(served)) => served
-            .into_iter()
-            .find(|m| m.id == model)
-            .map(|m| live_model_metadata(m, declared))
-            .unwrap_or_default(),
+        Ok(Ok(served)) => {
+            let mut metadata = served
+                .into_iter()
+                .find(|m| m.id == model)
+                .map(|m| live_model_metadata(m, declared))
+                .unwrap_or_default();
+            // `/models` came from one endpoint. It cannot safely override the
+            // conservative intersection for a fallback/MoA route whose other
+            // members may receive this exact request.
+            if provider.capability_candidates("startup", model).len() != 1 {
+                metadata.provider_capabilities = None;
+            }
+            metadata
+        }
         Ok(Err(_)) | Err(_) => LiveModelMetadata::default(),
     }
 }
@@ -314,7 +390,13 @@ fn live_model_metadata(
     // record, but never manufacture one from the requested/served model ID.
     for tag in &model.capabilities {
         match tag.trim().to_ascii_lowercase().as_str() {
-            "tools" | "tool_calls" | "function_calling" => capabilities.native_tool_calls = true,
+            "tools" | "tool_calls" | "function_calling" => {
+                capabilities.native_tool_calls = true;
+                // A generic function-calling advertisement proves the model
+                // can choose a tool automatically. It does not prove support
+                // for an enforced `required` choice.
+                capabilities.tool_choice.automatic = true;
+            }
             "parallel_tool_calls" => capabilities.parallel_tool_calls = true,
             "structured_output" | "json_schema" => capabilities.structured_output = true,
             "vision" | "image_input" => capabilities.modalities.image_input = true,
@@ -335,6 +417,49 @@ fn live_model_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct MultiRouteMetadataProvider;
+
+    #[async_trait::async_trait]
+    impl hi_ai::Provider for MultiRouteMetadataProvider {
+        async fn stream(
+            &self,
+            _: hi_ai::ChatRequest,
+            _: &mut (dyn FnMut(hi_ai::StreamEvent) + Send),
+        ) -> anyhow::Result<hi_ai::Completion> {
+            unreachable!("metadata test never performs a chat request")
+        }
+
+        fn capability_candidates(
+            &self,
+            _: &str,
+            model: &str,
+        ) -> Vec<hi_ai::ProviderCapabilityCandidate> {
+            ["primary", "fallback"]
+                .into_iter()
+                .map(|route| {
+                    hi_ai::ProviderCapabilityCandidate::new(
+                        hi_ai::CapabilityRoute::new(route, model),
+                        hi_ai::ProviderCapabilities::default(),
+                    )
+                })
+                .collect()
+        }
+
+        async fn list_models(&self) -> anyhow::Result<Vec<hi_ai::ServedModel>> {
+            Ok(vec![hi_ai::ServedModel {
+                id: "tool-model".into(),
+                context_window: Some(8_192),
+                max_output_tokens: None,
+                price: None,
+                provider_label: None,
+                status: None,
+                available: true,
+                availability_reason: None,
+                capabilities: vec!["tools".into()],
+            }])
+        }
+    }
 
     #[test]
     fn credential_safe_base_url_keeps_https_and_loopback() {
@@ -371,6 +496,76 @@ mod tests {
     }
 
     #[test]
+    fn capability_route_hashes_effective_endpoint_and_unix_socket_without_leaking_them() {
+        let unsafe_configured = "http://user:secret@remote.invalid/v1?token=also-secret";
+        let effective = resolved_credential_safe_base_url(unsafe_configured, ProviderName::Openai);
+        assert_eq!(effective, ProviderName::Openai.default_base_url());
+
+        let direct = provider_route_for_endpoint("openai", "openai", &effective, None);
+        let socket_a = provider_route_for_endpoint(
+            "openai",
+            "openai",
+            &effective,
+            Some(std::path::Path::new("/private/run/provider-a.sock")),
+        );
+        let socket_b = provider_route_for_endpoint(
+            "openai",
+            "openai",
+            &effective,
+            Some(std::path::Path::new("/private/run/provider-b.sock")),
+        );
+
+        assert_eq!(direct.label, "openai");
+        assert!(
+            direct
+                .capability_identity
+                .starts_with("openai@endpoint:blake3:")
+        );
+        assert_ne!(direct.capability_identity, socket_a.capability_identity);
+        assert_ne!(socket_a.capability_identity, socket_b.capability_identity);
+        for identity in [direct, socket_a, socket_b] {
+            assert!(!identity.capability_identity.contains("remote.invalid"));
+            assert!(!identity.capability_identity.contains("secret"));
+            assert!(!identity.capability_identity.contains("provider-a.sock"));
+            assert!(!identity.capability_identity.contains("provider-b.sock"));
+        }
+    }
+
+    #[test]
+    fn official_deepseek_auto_route_keeps_openai_display_and_uses_deepseek_identity() {
+        let endpoint = "https://api.deepseek.com/v1?token=also-secret";
+        let auto_label =
+            capability_provider_label(ProviderName::Openai, endpoint, hi_ai::DeepSeekCompat::Auto);
+        let route = provider_route_for_endpoint("openai", auto_label, endpoint, None);
+
+        assert_eq!(auto_label, "deepseek");
+        assert_eq!(route.label, "openai");
+        assert!(
+            route
+                .capability_identity
+                .starts_with("deepseek@endpoint:blake3:")
+        );
+        assert!(!route.capability_identity.contains("api.deepseek.com"));
+        assert!(!route.capability_identity.contains("secret"));
+        assert_eq!(
+            capability_provider_label(ProviderName::Openai, endpoint, hi_ai::DeepSeekCompat::Off,),
+            "openai"
+        );
+        assert_eq!(
+            capability_provider_label(ProviderName::Openai, endpoint, hi_ai::DeepSeekCompat::On,),
+            "openai"
+        );
+        assert_eq!(
+            capability_provider_label(
+                ProviderName::Openai,
+                "https://api.deepseek.com.example/v1",
+                hi_ai::DeepSeekCompat::Auto,
+            ),
+            "openai"
+        );
+    }
+
+    #[test]
     fn live_metadata_seeds_limits_without_inventing_a_revision() {
         let metadata = live_model_metadata(
             hi_ai::ServedModel {
@@ -392,6 +587,41 @@ mod tests {
         assert_eq!(capabilities.request_limits.max_output_tokens, Some(16_384));
         assert!(capabilities.parallel_tool_calls);
         assert!(capabilities.modalities.image_input);
+    }
+
+    #[test]
+    fn live_tool_metadata_enables_auto_for_a_conservative_single_route() {
+        let metadata = live_model_metadata(
+            hi_ai::ServedModel {
+                id: "tool-model".into(),
+                context_window: None,
+                max_output_tokens: None,
+                price: None,
+                provider_label: None,
+                status: None,
+                available: true,
+                availability_reason: None,
+                capabilities: vec!["function_calling".into()],
+            },
+            hi_ai::ProviderCapabilities::default(),
+        );
+        let capabilities = metadata.provider_capabilities.unwrap();
+        assert!(capabilities.native_tool_calls);
+        assert!(capabilities.tool_choice.automatic);
+        assert!(!capabilities.tool_choice.required);
+    }
+
+    #[tokio::test]
+    async fn one_endpoint_metadata_cannot_override_a_multi_route_intersection() {
+        let metadata = resolve_live_model_metadata_with_timeout(
+            &MultiRouteMetadataProvider,
+            "tool-model",
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(metadata.context_window, Some(8_192));
+        assert!(metadata.provider_capabilities.is_none());
     }
 }
 

@@ -214,13 +214,13 @@ pub(crate) fn compose_remote_event_tap(
 }
 
 pub(crate) fn prompt_summary(prompt: &str, origin: PromptOrigin, queue_depth: usize) -> Value {
+    let sensitive = hi_agent::command::hides_from_history(prompt);
+    let prompt = [prompt, "/auth [redacted]"][usize::from(sensitive)];
     json!({
         "origin": origin,
-        // Correlate lifecycle events without writing the prompt body into the
-        // semantic trace. The smoke harness uses the digest as a multiset key,
-        // so repeated identical prompts remain distinguishable by count.
         "prompt_fingerprint": blake3::hash(prompt.as_bytes()).to_hex().to_string(),
         "prompt_chars": prompt.chars().count().min(1_000_000),
+        "sensitive": sensitive,
         "command": prompt.trim_start().starts_with('/'),
         "queue_depth": queue_depth,
     })

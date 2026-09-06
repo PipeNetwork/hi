@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use super::request;
 use crate::provider::{ProviderError, ProviderErrorKind};
 use crate::types::{
-    Completion, Content, StreamEvent, ToolCallChannel, Usage, estimate_completion_output_tokens,
-    estimate_request_input_tokens,
+    Completion, Content, StreamEvent, ToolCallChannel, ToolSpec, Usage,
+    estimate_completion_output_tokens, estimate_request_input_tokens,
 };
 
 /// ChatML special tokens that some local models (Qwen, Yi, etc.) emit as text
@@ -69,25 +69,12 @@ fn find_partial_prefix_start(text: &str, from: usize) -> usize {
     }
 }
 
-/// A streaming filter that combines text-cleaning passes for local / gateway
-/// models:
-///
-/// 1. **Special-token stripping**: removes ChatML special tokens (`<|im_start|>`,
-///    `<|im_end|>`, …) that some local models emit as raw text.
-/// 2. **In-band thinking**: routes `<thinking>…</thinking>` / `<think>…</think>`
-///    to [`StreamEvent::Reasoning`] so the TUI collapsed-thought row owns them
-///    instead of dumping the tags as assistant prose.
-/// 3. **Tool-call JSON suppression**: when the model emits tool calls as text
-///    content (`{"name": "bash", …}`), suppresses the raw JSON from the live
-///    display. The post-collection `parse_text_tool_calls` promotes it to real
-///    `ToolCall` blocks; this filter only hides it while streaming so the user
-///    doesn't see a screen full of JSON.
-///
-/// Combining them into one struct avoids the borrow-conflict of chaining two
-/// `&mut dyn FnMut` filters.
+/// Streaming cleanup for special tokens, in-band thinking, native DSML, and
+/// (only for a sealed fallback response) text-form tool protocol.
 struct StreamingTextFilter<'a> {
     inner: &'a mut (dyn FnMut(StreamEvent) + Send),
     dsml_enabled: bool,
+    suppress_text_tools: bool,
     // ── Special-token pass state ──
     /// Buffered text that might be the start of a special token (`<|` without
     /// a matching `|>` yet).
@@ -129,10 +116,15 @@ struct StreamingTextFilter<'a> {
 }
 
 impl<'a> StreamingTextFilter<'a> {
-    fn new(inner: &'a mut (dyn FnMut(StreamEvent) + Send), dsml_enabled: bool) -> Self {
+    fn new(
+        inner: &'a mut (dyn FnMut(StreamEvent) + Send),
+        dsml_enabled: bool,
+        suppress_text_tools: bool,
+    ) -> Self {
         Self {
             inner,
             dsml_enabled,
+            suppress_text_tools,
             st_pending: String::new(),
             tc_pending: String::new(),
             tc_depth: 0,
@@ -179,7 +171,10 @@ impl<'a> StreamingTextFilter<'a> {
     fn feed_after_thinking(&mut self, chunk: &str) {
         for piece in self.think.push(chunk) {
             match piece {
-                super::thinking_tags::Piece::Text(text) => self.suppress_tool_calls(&text),
+                super::thinking_tags::Piece::Text(text) if self.suppress_text_tools => {
+                    self.suppress_tool_calls(&text);
+                }
+                super::thinking_tags::Piece::Text(text) => self.emit_text(text),
                 super::thinking_tags::Piece::Reasoning(text) => self.emit_reasoning(text),
             }
         }
@@ -720,7 +715,7 @@ fn strip_special_tokens(text: &str) -> String {
     out
 }
 
-fn strip_leading_open_brace_artifact(text: &str) -> String {
+pub(super) fn strip_leading_open_brace_artifact(text: &str) -> String {
     let Some(rest) = text.strip_prefix('{') else {
         return text.to_string();
     };
@@ -732,7 +727,7 @@ fn strip_leading_open_brace_artifact(text: &str) -> String {
     }
 }
 
-fn strip_text_tool_protocol_artifact(text: &str) -> String {
+pub(super) fn strip_text_tool_protocol_artifact(text: &str) -> String {
     let text = strip_leading_open_brace_artifact(text);
     let Some(index) = find_text_tool_protocol_start(&text) else {
         return text;
@@ -760,17 +755,20 @@ pub(crate) async fn collect_completion<S>(
 where
     S: Stream<Item = Result<String>> + Unpin,
 {
-    collect_completion_with_protocol(stream, sink, super::deepseek::ToolProtocol::Auto).await
+    collect_completion_with_protocol(stream, sink, super::deepseek::ToolProtocol::Auto, Some(&[]))
+        .await
 }
 
 pub(crate) async fn collect_completion_with_protocol<S>(
     mut stream: S,
     sink: &mut (dyn FnMut(StreamEvent) + Send),
     protocol: super::deepseek::ToolProtocol,
+    text_tool_fallback_tools: Option<&[ToolSpec]>,
 ) -> Result<Completion>
 where
     S: Stream<Item = Result<String>> + Unpin,
 {
+    let text_tool_fallback = text_tool_fallback_tools.is_some();
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut refusal = String::new();
@@ -783,17 +781,9 @@ where
     let mut progressed = false;
     let mut stream_complete = false;
     let mut tool_payload_bytes = 0usize;
-    // Wrap the sink so ChatML special tokens (<|im_start|>, <|im_end|>, …) are
-    // stripped from streamed text, and tool-call JSON (`{"name":…}`) that local
-    // models emit as text is suppressed from the live display. The
-    // post-collection `parse_text_tool_calls` promotes the JSON to real
-    // ToolCall blocks; this filter only hides it while streaming.
-    //
-    // Both passes are combined into a single `StreamingTextFilter` to avoid
-    // borrow-conflict chaining of two `&mut dyn FnMut` filters.
     let dsml_enabled = !matches!(protocol, super::deepseek::ToolProtocol::OpenAiJson);
     let dsml_id_prefix = format!("dsml_call_{}", uuid::Uuid::new_v4().simple());
-    let mut filter = StreamingTextFilter::new(sink, dsml_enabled);
+    let mut filter = StreamingTextFilter::new(sink, dsml_enabled, text_tool_fallback);
 
     let mut usage_seen = false;
     // Absolute deadline for the trailing-usage grace, set once the finish chunk
@@ -1050,7 +1040,7 @@ where
     // `<think>` wrappers become a Thinking block so they are not replayed as
     // visible assistant text (and so the model is less likely to keep copying
     // the tags).
-    let text = strip_text_tool_protocol_artifact(&strip_special_tokens(&text));
+    let text = strip_special_tokens(&text);
     let (inline_reasoning, text) = super::thinking_tags::split_inline_thinking(&text);
     if !inline_reasoning.is_empty() {
         if !reasoning.is_empty() && !reasoning.ends_with('\n') {
@@ -1064,33 +1054,16 @@ where
             signature: None,
         });
     }
-    let mut text_tool_calls = false;
-    if dsml_enabled && tool_calls.is_empty() {
-        if let Some(dsml_content) = super::deepseek::parse_dsml_tool_calls(&text, &dsml_id_prefix) {
-            text_tool_calls = dsml_content
-                .iter()
-                .any(|content| matches!(content, Content::ToolCall { .. }));
-            completion.content.extend(dsml_content);
-        } else {
-            let sanitized = super::deepseek::strip_dsml_artifacts(&text);
-            if !sanitized.is_empty() {
-                completion.content.push(Content::Text(sanitized));
-            }
-        }
-    } else if !text.is_empty() {
-        // Auto/native DeepSeek routes may occasionally include protocol text
-        // alongside already-normalized OpenAI tool-call deltas. Do not parse
-        // the normalized calls twice, but never replay the raw DSML markup as
-        // assistant-visible prose either.
-        let text = if dsml_enabled {
-            super::deepseek::strip_dsml_artifacts(&text)
-        } else {
-            text
-        };
-        if !text.is_empty() {
-            completion.content.push(Content::Text(text));
-        }
-    }
+    let normalized = super::response_text::normalize(
+        text,
+        text_tool_fallback_tools,
+        tool_calls.is_empty(),
+        dsml_enabled,
+        &dsml_id_prefix,
+    )
+    .map_err(stream_tool_protocol_error)?;
+    let text_tool_calls = normalized.text_tool_calls;
+    completion.content.extend(normalized.content);
     for (index, builder) in tool_calls {
         if !builder.name.is_empty() {
             completion.content.push(builder.finish(index));
@@ -1237,6 +1210,9 @@ fn classify_stream_api_error(message: &str) -> ProviderErrorKind {
     )
     .kind
 }
+
+#[cfg(test)]
+mod response_channel_tests;
 
 pub(crate) fn backfill_missing_usage(
     completion: &mut Completion,
@@ -1883,6 +1859,7 @@ mod tests {
             stream,
             &mut sink,
             super::super::deepseek::ToolProtocol::NativeDsml,
+            None,
         )
         .await
         .unwrap();
@@ -1909,6 +1886,7 @@ mod tests {
             stream,
             &mut sink,
             super::super::deepseek::ToolProtocol::NativeDsml,
+            None,
         )
         .await
         .unwrap();
@@ -1935,6 +1913,7 @@ mod tests {
             stream,
             &mut sink,
             super::super::deepseek::ToolProtocol::OpenAiJson,
+            None,
         )
         .await
         .unwrap();
@@ -2105,6 +2084,7 @@ mod tests {
             stream,
             &mut sink,
             super::super::deepseek::ToolProtocol::Auto,
+            None,
         )
         .await
         .unwrap();
@@ -2431,7 +2411,7 @@ mod tests {
                     streamed.push_str(&text);
                 }
             };
-            let mut filter = super::StreamingTextFilter::new(&mut sink, false);
+            let mut filter = super::StreamingTextFilter::new(&mut sink, false, false);
             filter.text(&chunk);
             filter.flush();
         }

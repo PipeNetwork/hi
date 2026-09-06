@@ -311,6 +311,10 @@ impl SessionSink for RecordingSession {
 pub(crate) struct RecordingUi {
     pub(crate) statuses: Vec<String>,
     pub(crate) turn_ends: Vec<String>,
+    pub(crate) tool_starts: Vec<(String, String, String)>,
+    pub(crate) tool_calls: Vec<(String, String, String)>,
+    pub(crate) tool_results: Vec<(String, String, String, hi_tools::ToolStatus)>,
+    pub(crate) terminal_events: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl Ui for RecordingUi {
@@ -319,6 +323,24 @@ impl Ui for RecordingUi {
     fn assistant_end(&mut self) {}
     fn tool_call(&mut self, _: &str, _: &str) {}
     fn tool_result(&mut self, _: &str, _: &str) {}
+    fn tool_started_id(&mut self, id: &str, name: &str, arguments: &str) {
+        self.tool_starts
+            .push((id.to_string(), name.to_string(), arguments.to_string()));
+    }
+    fn tool_call_id(&mut self, id: &str, name: &str, arguments: &str) {
+        self.tool_calls
+            .push((id.to_string(), name.to_string(), arguments.to_string()));
+    }
+    fn tool_result_id(&mut self, id: &str, name: &str, result: &str, status: hi_tools::ToolStatus) {
+        if let Some(events) = &self.terminal_events {
+            events
+                .lock()
+                .unwrap()
+                .push(format!("terminal:{id}:{status:?}"));
+        }
+        self.tool_results
+            .push((id.to_string(), name.to_string(), result.to_string(), status));
+    }
     fn status(&mut self, s: &str) {
         self.statuses.push(s.to_string());
     }

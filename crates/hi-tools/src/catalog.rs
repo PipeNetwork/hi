@@ -165,12 +165,12 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. Foreground commands wait until completion by default; omit timeout (or use 0) for no deadline, and the user can still cancel the turn cooperatively. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get a shell handle immediately, then read output with bash_output or stop it with bash_kill. For very long background work (a big download, a multi-hour job), chain the follow-up steps into the command itself (`fetch && convert`) so nothing has to babysit it. On macOS/Linux, use `python3` rather than assuming a `python` command exists. Shell handles use the `sh_` prefix; agent subagent tasks use `task_` — do not mix them. Do not curl/wget a public http(s) URL the user already gave — use `web_fetch`. Do not use the shell as a search engine — use `web_search`. To inspect a workspace file, use the `read` tool instead of `cat`/`sed`/`head`.".into(),
+            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. Commands have no implicit lifetime deadline. When the workspace supports managed background writers, an unlimited foreground command still running after the attachment budget continues as a managed background process and returns a handle so it cannot wedge the active turn; bindings such as PipeFS that forbid background writers keep it foreground and cancellable. A positive timeout is always a hard process-lifetime deadline. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get a shell handle immediately, then read output with bash_output or stop it with bash_kill. For very long background work (a big download, a multi-hour job), chain the follow-up steps into the command itself (`fetch && convert`) so nothing has to babysit it. On macOS/Linux, use `python3` rather than assuming a `python` command exists. Shell handles use the `sh_` prefix; agent subagent tasks use `task_` — do not mix them. Do not curl/wget a public http(s) URL the user already gave — use `web_fetch`. Do not use the shell as a search engine — use `web_search`. To inspect a workspace file, use the `read` tool instead of `cat`/`sed`/`head`.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "The command to run." },
-                    "timeout": { "type": "integer", "description": "Optional explicit wall-clock limit in seconds. Omit it or use 0 for no deadline. Ignored when run_in_background is true." },
+                    "timeout": { "type": "integer", "description": "Optional explicit hard wall-clock limit in seconds. Omit it or use 0 for no process-lifetime deadline; unlimited commands may be handed to the managed background registry after the foreground attachment budget. Ignored when run_in_background is true." },
                     "run_in_background": { "type": "boolean", "description": "Run detached and return a handle id immediately instead of waiting for the command to exit. Use for servers/watchers/long-lived processes." }
                 },
                 "required": ["command"]
@@ -952,7 +952,8 @@ pub static MINIMAL_TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
 /// `apply_patch`) or have ordering-sensitive external effects (`bash`,
 /// `bash_kill`) are excluded. `update_plan` and `record_decision` have no
 /// side effects beyond in-memory state, so they're read-only here.
-/// `bash_output` is a pure poll of an existing buffer.
+/// `bash_output` does not itself write workspace bytes; callers still settle a
+/// writer lifecycle when a poll observes terminal state.
 pub fn is_read_only(name: &str) -> bool {
     tool_metadata(name).is_some_and(|metadata| metadata.read_only)
 }

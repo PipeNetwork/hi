@@ -11,11 +11,14 @@ mod plan_input;
 mod queue;
 mod turn_execution;
 
-use auth::{apply_tui_auth, parse_tui_auth_arg};
+use auth::{SubmittedLine, apply_tui_auth, parse_tui_auth_arg, route_submitted_line};
 pub(crate) use drive::drive;
 #[cfg(test)]
 pub(crate) use helpers::search_transcript;
-use helpers::{ChordPipeline, expand_file_mentions, run_chord_pipeline, run_shell_escape_async};
+use helpers::{
+    ChordPipeline, apply_provider_switch, expand_file_mentions, run_chord_pipeline,
+    run_shell_escape_async,
+};
 pub(crate) use helpers::{handle_normal_mode, review_next_hunk};
 use plan_input::handle_idle_plan_approval_key;
 use queue::reconcile_queue_with_interjections;
@@ -98,7 +101,7 @@ fn ensure_owned_loop_fire_lock(
 /// and recheck synthetic continuations when dequeuing because a pause, mode
 /// change, or plan replacement may have invalidated them after they were queued.
 fn dequeue_ready_prompt(app: &mut App, agent: &Agent) -> Option<String> {
-    if app.plan_approval_capturing() {
+    if app.queue_paused || app.plan_approval_capturing() {
         return None;
     }
     while let Some(prompt) = app.queue.pop_front() {
@@ -473,6 +476,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
 
     'session: loop {
         app.check_tui_event_trace()?;
+        if app.exit_requested {
+            break;
+        }
         // Run a queued command first (typed while the previous turn ran);
         // otherwise edit the input line until the user submits.
         let mut line_was_queued = false;
@@ -653,6 +659,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         continue 'input;
                     }
                     Event::Mouse(mouse) => {
+                        if crate::turn_status::exit_escalation_contains(&app, &mouse) {
+                            app.exit_requested = true;
+                            break 'session;
+                        }
                         app.handle_mouse(mouse);
                         app.push_session_face(agent);
                     }
@@ -1114,7 +1124,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                         let history_search_was_active = app.mode.is_history_search();
                         match key.code {
-                            KeyCode::Char('c') if ctrl => app.input.clear(),
+                            KeyCode::Char('c') if ctrl => {
+                                app.input.clear();
+                                app.completion = None;
+                                app.quit_notice =
+                                    Some(Instant::now() + Duration::from_millis(1800));
+                            }
                             KeyCode::Esc => app.completion = None,
                             KeyCode::Up => app.completion_move(-1),
                             KeyCode::Down => app.completion_move(1),
@@ -1233,6 +1248,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             KeyCode::Char('c')
                                 if ctrl && app.input.is_empty() && app.quit_notice.is_some() =>
                             {
+                                app.exit_requested = true;
                                 break 'session;
                             }
                             KeyCode::Char('c') if ctrl && app.input.is_empty() => {
@@ -1283,32 +1299,24 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 }
             },
         };
-        if !line_was_queued {
-            app.trace_immediate_prompt(&line)?;
-        }
-        // A line is committed — drop any lingering completion menu state.
-        app.completion = None;
-
-        // `!cmd` shell-escape: run a read-only command locally and show its
-        // output in the transcript, without involving the model at all. Saves
-        // a whole agent turn for trivial checks like `!git status`. Runs
-        // asynchronously so a slow command (`!cargo build`) doesn't freeze the
-        // TUI — Esc or Ctrl-C cancels it.
-        if let Some(shell_cmd) = line.strip_prefix('!').filter(|s| !s.trim().is_empty()) {
-            run_shell_escape_async(&mut app, shell_cmd, &mut input_rx, &mut terminal).await?;
-            continue;
-        }
-
-        // TUI-local command: opt-in, fresh every time, and never persisted.
-        if matches!(line.trim(), "/tutorial" | "/tour" | "/onboarding") {
-            app.tutorial = Some(crate::tutorial::TutorialOverlay::fresh());
-            continue;
-        }
-
-        if let Some(provider) = app.pending_auth.take() {
-            apply_tui_auth(&mut app, &provider, line.trim()).await;
-            continue;
-        }
+        let line = match route_submitted_line(&mut app, line, line_was_queued)? {
+            SubmittedLine::Auth { provider, key } => {
+                apply_tui_auth(&mut app, &provider, &key).await;
+                continue;
+            }
+            // `!cmd` shell-escape: run a read-only command locally and show its
+            // output without involving the model. It is deliberately routed
+            // only after pending credential input has been intercepted.
+            SubmittedLine::Shell(shell_cmd) => {
+                run_shell_escape_async(&mut app, &shell_cmd, &mut input_rx, &mut terminal).await?;
+                continue;
+            }
+            SubmittedLine::Tutorial => {
+                app.tutorial = Some(crate::tutorial::TutorialOverlay::fresh());
+                continue;
+            }
+            SubmittedLine::Normal(line) => line,
+        };
 
         // Slash commands. Most are handled inline; `/compact` runs a model call
         // (driven like a turn so the spinner shows); `/retry` yields the prompt
@@ -1317,7 +1325,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         let mut restore_app_model: Option<(String, Option<u32>)> = None;
         let run_line = if let Some(cmd) = command::parse(&line).map(command::resolve_command) {
             match cmd {
-                Command::Quit => break,
+                Command::Quit => {
+                    app.exit_requested = true;
+                    break;
+                }
                 Command::Prompt(prompt) => {
                     let prompt = prompt.trim().to_string();
                     if prompt.is_empty() {
@@ -1367,7 +1378,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     };
                     {
                         let bg_tasks = agent.background_task_registry();
-                        let fut = agent.compact_with(kind, &mut sink);
+                        let cancellation = hi_agent::TurnCancellation::new();
+                        let fut =
+                            agent.compact_with_cancellable(kind, &mut sink, cancellation.clone());
                         drive(
                             &mut terminal,
                             &mut input_rx,
@@ -1380,7 +1393,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             None,
                             None,
                             tx,
-                            None,
+                            Some(cancellation),
                             bg_tasks,
                         )
                         .await?;
@@ -1501,15 +1514,16 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             }
                             match (app.mlx_switcher)(&run) {
                                 Ok(switched) => {
-                                    let label = switched.switched.label.clone();
+                                    let label = switched.switched.route.label.clone();
                                     let model = switched.switched.model.clone();
-                                    agent.set_provider(
+                                    apply_provider_switch(
+                                        agent,
                                         switched.switched.provider.into(),
+                                        switched.switched.route,
                                         model.clone(),
-                                        None,
                                         switched.switched.max_tokens,
                                         switched.switched.max_tokens_explicit,
-                                        None,
+                                        switched.switched.tool_mode,
                                     );
                                     agent.register_driver_local_server(
                                         run.base_url.clone(),
@@ -2011,7 +2025,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     }
                     match (app.resolver)(&arg) {
                         Ok(switched) => {
-                            let label = switched.label.clone();
+                            let label = switched.route.label.clone();
                             let model = switched.model.clone();
                             let needs_model = model == "__model_not_configured__";
                             // A local driver server is owned by the agent, not
@@ -2019,15 +2033,15 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             // driver switches away; shared team-role routes
                             // keep it alive through Agent's reference checks.
                             agent.clear_driver_local_server();
-                            agent.set_provider(
+                            apply_provider_switch(
+                                agent,
                                 switched.provider.into(),
+                                switched.route,
                                 model.clone(),
-                                None,
                                 switched.max_tokens,
                                 switched.max_tokens_explicit,
-                                None,
+                                switched.tool_mode,
                             );
-                            agent.set_tool_mode(switched.tool_mode);
                             app.provider = label.clone();
                             app.model = model.clone();
                             app.active_profile = Some(arg.clone());
@@ -2825,7 +2839,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     }
                                 } else if !cancelled {
                                     let outcome = agent
-                                        .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
+                                        .cleanup_turn(
+                                            driven
+                                                .failure
+                                                .clone()
+                                                .unwrap_or(hi_agent::TurnCleanupKind::Fail),
+                                        )
                                         .await
                                         .map(|r| r.outcome)
                                         .unwrap_or_else(|_| {
@@ -3571,7 +3590,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
 
     // Session ending: distill durable lessons into .hi/memory.md (loaded next
     // session), shown live so the user sees what's saved. Only if work happened.
-    if hi_agent::should_distill_memory(auto_memory, agent.totals().output_tokens) {
+    if !app.exit_requested
+        && hi_agent::should_distill_memory(auto_memory, agent.totals().output_tokens)
+    {
         app.set_working(true);
         app.follow();
         let (tx, rx) = mpsc::unbounded_channel();

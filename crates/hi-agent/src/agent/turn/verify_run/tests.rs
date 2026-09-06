@@ -1,5 +1,5 @@
 use super::*;
-use crate::tests::common::{agent, config};
+use crate::tests::common::{Canned, RecUi, agent, completion, config};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,6 +54,10 @@ async fn verification_waits_for_auto_background_reap_and_settlement() {
     }
     let mut subject = agent(vec![], config());
     let background = subject.runtime.background_arc();
+    // Exercise the unlimited-command handoff path without paying the
+    // production 30-second foreground attachment budget. A positive `timeout`
+    // is a hard process-lifetime deadline and is deliberately never adopted.
+    background.set_foreground_handoff_budget(Some(Duration::from_millis(25)));
     let gate = Arc::new(SettlementGate {
         entered: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
@@ -70,7 +74,7 @@ async fn verification_waits_for_auto_background_reap_and_settlement() {
         None,
         None,
         "bash",
-        r#"{"command":"sleep 600","timeout":1}"#,
+        r#"{"command":"sleep 600"}"#,
     )
     .await;
     let id = output
@@ -116,4 +120,177 @@ async fn verification_waits_for_auto_background_reap_and_settlement() {
         !completed_before_settlement,
         "verification continued while the terminated writer's settlement callback was still blocked"
     );
+}
+
+async fn local_service_verification_case() -> (crate::TurnOutcome, Vec<String>) {
+    let mut cfg = config();
+    cfg.gates.review = crate::ReviewPolicy::Off;
+    cfg.gates.max_verify_repairs = 0;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![crate::VerifyStage::new(
+        "test",
+        "printf verifier-ran > verifier-ran.txt",
+    )]);
+    let source = cfg.paths.workspace_root.join("source.rs");
+    let provider = Arc::new(Canned(std::sync::Mutex::new(vec![
+        completion(
+            vec![hi_ai::Content::ToolCall {
+                id: "write-source".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": source,
+                    "content": "pub fn answer() -> u32 { 42 }\n",
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![hi_ai::Content::ToolCall {
+                id: "start-service".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({
+                    "command": "sleep 600",
+                    "run_in_background": true,
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![hi_ai::Content::Text("The service is running.".into())],
+            1,
+            1,
+        ),
+    ])));
+    let mut subject = crate::Agent::new(provider.clone(), cfg).unwrap();
+    let verifier_marker = subject.runtime.root().join("verifier-ran.txt");
+    let mut ui = RecUi::default();
+
+    let outcome = subject
+        .run_turn("perform these workspace operations", &mut ui)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "turn failed: {error:#}; statuses={:?}; messages={:?}",
+                ui.statuses,
+                subject
+                    .messages()
+                    .iter()
+                    .map(hi_ai::Message::text)
+                    .collect::<Vec<_>>()
+            )
+        });
+
+    assert!(
+        provider.0.lock().unwrap().is_empty(),
+        "successful verification must not re-enter the model obligation loop"
+    );
+    assert_eq!(outcome.verification, crate::VerificationStatus::Passed);
+    assert_eq!(outcome.stop_reason, crate::TurnStopReason::Completed);
+    assert!(subject.last_verify().is_some());
+    assert_eq!(subject.last_turn_telemetry().verify_rounds, 1);
+    assert_eq!(subject.last_verification_executions().len(), 1);
+    assert!(verifier_marker.exists(), "the local verifier must execute");
+    assert!(!ui.statuses.iter().any(|line| {
+        line.contains("verification deferred")
+            || line.contains("verification infrastructure failed")
+            || line.contains("verification obligation")
+    }));
+    assert_eq!(subject.active_background_process_ids().len(), 1);
+    assert_eq!(
+        subject.workspace_controller_status().state,
+        hi_workspace::WorkspaceState::Ready
+    );
+    assert_eq!(subject.workspace_controller_status().active_jobs.len(), 1);
+
+    subject.settle_workspace_for_exit().await.unwrap();
+    (outcome, ui.statuses)
+}
+
+#[tokio::test]
+async fn local_service_does_not_defer_verification_or_reenter_obligation_loop() {
+    let (outcome, _) = local_service_verification_case().await;
+    assert_eq!(outcome.status, crate::TurnStatus::Completed);
+}
+
+#[tokio::test]
+async fn no_change_build_and_background_service_complete_without_verification_failure() {
+    let mut cfg = config();
+    cfg.gates.verification = crate::VerificationMode::Auto;
+    cfg.gates.review = crate::ReviewPolicy::Off;
+    let provider = Arc::new(Canned(std::sync::Mutex::new(vec![
+        completion(
+            vec![hi_ai::Content::ToolCall {
+                id: "build".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({
+                    "command": "sh -c 'printf build-ok'",
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![hi_ai::Content::ToolCall {
+                id: "start-service".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({
+                    "command": "sleep 600",
+                    "run_in_background": true,
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![hi_ai::Content::Text(
+                "The build passed and the service is running.".into(),
+            )],
+            1,
+            1,
+        ),
+    ])));
+    let mut subject = crate::Agent::new(provider.clone(), cfg).unwrap();
+    let mut ui = RecUi::default();
+
+    let outcome = subject
+        .run_turn(
+            "run the project check and launch its existing server",
+            &mut ui,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "turn failed: {error:#}; statuses={:?}; messages={:?}",
+                ui.statuses,
+                subject
+                    .messages()
+                    .iter()
+                    .map(hi_ai::Message::text)
+                    .collect::<Vec<_>>()
+            )
+        });
+
+    assert!(provider.0.lock().unwrap().is_empty());
+    assert_eq!(outcome.status, crate::TurnStatus::Completed);
+    assert_eq!(
+        outcome.verification,
+        crate::VerificationStatus::NotApplicable
+    );
+    assert_eq!(
+        outcome.stop_reason,
+        crate::TurnStopReason::NoApplicableVerification
+    );
+    assert!(outcome.changed_files.is_empty());
+    assert!(!ui.statuses.iter().any(|line| {
+        line.contains("infrastructure")
+            || line.contains("workspace recovery")
+            || line.contains("workspace admission")
+    }));
+    assert_eq!(subject.active_background_process_ids().len(), 1);
+    subject.settle_workspace_for_exit().await.unwrap();
 }

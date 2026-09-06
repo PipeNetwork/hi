@@ -191,6 +191,16 @@ pub enum SessionEventKind {
         #[serde(default)]
         estimated: bool,
     },
+    /// Exact operation evidence staged before local workspace settlement.
+    /// This is an outbox/audit event, not a second visible transcript copy.
+    WorkspaceExecutionStaged {
+        #[serde(default)]
+        visible_on_resume: bool,
+        execution: crate::WorkspaceTranscriptExecution,
+    },
+    WorkspaceExecutionSettled {
+        operation_id: hi_workspace::OperationId,
+    },
     Checkpoints {
         refs: Vec<String>,
     },
@@ -425,6 +435,8 @@ impl SessionReducer {
                     estimated,
                 };
             }
+            SessionEventKind::WorkspaceExecutionStaged { .. }
+            | SessionEventKind::WorkspaceExecutionSettled { .. } => {}
             SessionEventKind::Checkpoints { refs } => self.state.checkpoint_refs = refs,
             SessionEventKind::Compaction { messages } => {
                 self.compatibility.clear_boundary();

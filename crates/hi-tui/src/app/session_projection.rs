@@ -542,7 +542,9 @@ impl App {
                                 tool_names.insert(id, name.clone());
                                 self.apply_legacy(UiEvent::ToolCall { name, arguments });
                             }
-                            hi_ai::Content::ToolResult { .. } | hi_ai::Content::Image { .. } => {}
+                            hi_ai::Content::ToolResult { .. }
+                            | hi_ai::Content::Image { .. }
+                            | hi_ai::Content::ProviderReplay { .. } => {}
                         }
                     }
                     self.apply_legacy(UiEvent::AssistantEnd);

@@ -111,12 +111,12 @@ pub struct LocalRuntimeIdentity {
 }
 
 /// The result of resolving a profile name at runtime: a built provider, the
-/// model id to use, and the provider's display label. The caller swaps these
-/// into the agent via [`Agent::set_provider`].
+/// model id to use, and the provider's display/cache identities. The caller
+/// swaps these into the agent via [`Agent::set_provider_with_route`].
 pub struct SwitchedProvider {
     pub provider: Box<dyn hi_ai::Provider>,
     pub model: String,
-    pub label: String,
+    pub route: hi_agent::AgentProviderRoute,
     pub max_tokens: u32,
     pub max_tokens_explicit: bool,
     pub tool_mode: hi_ai::ToolMode,
@@ -1121,9 +1121,9 @@ pub(crate) struct App {
     /// Persistent prompt history lives in Hi's runtime state, not inside the
     /// workspace where it could be mistaken for user-visible project work.
     pub(crate) input_history_path: std::path::PathBuf,
-    /// A shared interrupt handle for the running turn. When the user presses
-    /// Esc during a tool call, this is set so the agent skips the current tool
-    /// and feeds "interrupted by user" back to the model.
+    /// A shared interrupt handle for the running turn. Frontend cancellation
+    /// sets this alongside the turn token so cooperative batch boundaries wake
+    /// promptly; process teardown and settlement are owned by turn cancellation.
     pub(crate) interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The name of the currently-active profile, if any (for marking it in the
     /// `/provider` list). Updated when the user uses `/provider <name>`.
@@ -1275,17 +1275,18 @@ pub(crate) struct App {
     /// "finish flash" on the status line. Cleared implicitly once its window
     /// elapses (the flash weight decays to zero).
     pub(crate) finished_at: Option<Instant>,
-    /// The tool currently executing (its display label) and when it started, so
-    /// Esc can interrupt just that call. `None` while the model is the active party.
+    /// The tool currently executing (its display label) and when it started.
+    /// Esc cancels its owning turn so foreground processes are reaped before
+    /// workspace settlement. `None` while the model is the active party.
     pub(crate) current_tool: Option<String>,
     pub(crate) current_tool_started: Option<Instant>,
     /// Streamed stdout already landed on the live `Run` row for this tool call.
     pub(crate) run_streamed_this_call: bool,
-    /// Lines typed while a turn was running, to run once it finishes (FIFO).
+    /// Lines typed during a turn, preserved FIFO for later execution.
     pub(crate) queue: VecDeque<String>,
-    /// Plain-text lines offered to the in-flight turn as mid-turn steering
-    /// (also present in [`Self::queue`] until applied or the turn ends). Used to
-    /// drop queue entries that the agent already consumed so they don't re-run.
+    /// An explicit stop parks queued work until the next direct submission.
+    pub(crate) queue_paused: bool,
+    /// Plain-text steering mirrored in [`Self::queue`] until applied.
     pub(crate) mid_turn_offered: VecDeque<String>,
     /// Index into `queue` for Alt-Up/Down selection (reorder / delete). `None`
     /// when nothing is highlighted; clamped whenever the queue shrinks.
@@ -1566,11 +1567,11 @@ pub(crate) struct App {
     /// Checkpoint warning retained in the composer while also pinned in
     /// `top_notice`; it is intentionally not copied into the transcript.
     pub(crate) checkpoint_warning: Option<String>,
-    /// A transient "Press Ctrl-C again to exit" notice, shown after the first
-    /// Ctrl-C when idle. Cleared after ~1.8s (see the deadline race in the idle
-    /// input loop) or when any other key is pressed. A second Ctrl-C while this
-    /// is active quits the session.
+    /// Idle Ctrl-C confirmation deadline.
     pub(crate) quit_notice: Option<Instant>,
+    /// Frontend stop/exit latches kept through safe settlement.
+    pub(crate) turn_stop_requested: bool,
+    pub(crate) exit_requested: bool,
     /// Active `/`-command completion menu: the query it's synced to and the
     /// highlighted row. `None` when the input isn't a slash-command prefix.
     pub(crate) completion: Option<CompletionState>,
@@ -1722,9 +1723,8 @@ pub(crate) enum TurnState {
     Cancelled,
 }
 
-/// Max transcript lines kept for display and scrolling. Older lines scroll off
-/// the top (the full session is still in the JSONL log). Bounds the u16 scroll
-/// range, the per-frame render clone, and memory on very long sessions.
+/// Max transcript lines retained for scrolling; the full session remains in JSONL.
+/// Bounds the u16 scroll range, per-frame render clone, and long-session memory.
 pub(crate) const MAX_TRANSCRIPT_LINES: usize = 10_000;
 
 /// Max debug-event log entries kept (one per streamed chunk / tool call /

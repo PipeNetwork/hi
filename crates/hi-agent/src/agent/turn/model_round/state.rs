@@ -149,6 +149,9 @@ pub(in crate::agent::turn) struct ModelRoundState<'a> {
     pub read_only_intent: Option<ReviewIntent>,
     pub implementation_intent: Option<ImplementationIntent>,
     pub expected_mutation: bool,
+    /// The bounded discovery state has spent its last inspection allowance;
+    /// this request must advertise mutation primitives only.
+    pub mutation_recovery_requires_focus: bool,
     pub requested_validation: bool,
     pub input: &'a str,
     pub user_prompt_tokens: u64,
