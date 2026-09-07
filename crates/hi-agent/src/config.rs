@@ -58,8 +58,7 @@ impl VerificationMode {
 /// **Completion-review** policy for post-mutation independent / large-diff review.
 ///
 /// This gates [`crate::Agent::independent_review`] / [`crate::Agent::large_diff_review`]
-/// after a green workspace verify. It does **not** control Steer-phase
-/// **answer-repair** quality nudges ([`ReviewRepairBudgets`]) or the long-horizon
+/// after a green workspace verify. It does **not** control the long-horizon
 /// **goal-skeptic** gate.
 ///
 /// Prefer the alias [`CompletionReviewPolicy`] in new code for clarity.
@@ -612,9 +611,6 @@ pub struct AgentLoopLimits {
     /// Max read-only tool calls to run concurrently within one round.
     /// Default: [`MAX_PARALLEL_TOOLS`].
     pub max_parallel_tools: usize,
-    /// Per-mode budgets for **review-answer** repair during Steer (not workspace
-    /// compile/lint/test repair — that is [`AgentGates::max_verify_repairs`]).
-    pub review_repair: ReviewRepairBudgets,
 }
 
 impl Default for AgentLoopLimits {
@@ -635,7 +631,6 @@ impl Default for AgentLoopLimits {
             max_empty_retries: MAX_EMPTY_RETRIES,
             max_truncation_retries: MAX_TRUNCATION_RETRIES,
             max_parallel_tools: MAX_PARALLEL_TOOLS,
-            review_repair: ReviewRepairBudgets::default(),
         }
     }
 }
@@ -664,76 +659,6 @@ impl AgentLoopLimits {
     /// saturation into a false cap.
     pub(crate) fn truncation_retry_available(&self, retries: u32) -> bool {
         self.max_truncation_retries == u32::MAX || retries < self.max_truncation_retries
-    }
-}
-
-/// How many times each review-answer repair mode may fire in one turn.
-///
-/// Defaults match the historical hard-coded mode limits. Operators can lower
-/// them for cheaper/stricter sessions or raise them for stubborn models.
-#[derive(Clone, Debug, PartialEq, Eq)]
-/// Per-mode budgets for **answer-repair** quality nudges (Steer phase).
-///
-/// Distinct from [`AgentGates::max_verify_repairs`] (workspace shell) and
-/// [`AgentGates::max_independent_review_repairs`] (completion-review Object cycles).
-pub struct ReviewRepairBudgets {
-    pub no_evidence: u32,
-    pub listing_only: u32,
-    pub generic_template: u32,
-    pub inspected_disclaimer: u32,
-    pub inspected_disclaimer_chat_attempt: u32,
-    pub concrete_answer: u32,
-    pub read_after_search: u32,
-    pub security_broad_search: u32,
-    pub security_scope: u32,
-    pub gap_search_overclaim: u32,
-    /// Force a chat-only answer after inspection-sprawl already fired and the
-    /// model still tries to continue inspecting. Separate from cascade quality
-    /// spends so earlier answer-repairs cannot starve this path.
-    pub sprawl_force_answer: u32,
-}
-
-/// Alias clarifying that these budgets are Steer **answer-repair**, not
-/// completion-review or workspace verify.
-pub type AnswerRepairBudgets = ReviewRepairBudgets;
-
-impl Default for ReviewRepairBudgets {
-    fn default() -> Self {
-        Self {
-            no_evidence: 4,
-            listing_only: 4,
-            generic_template: 4,
-            inspected_disclaimer: 4,
-            inspected_disclaimer_chat_attempt: 2,
-            concrete_answer: 4,
-            read_after_search: 2,
-            security_broad_search: 4,
-            security_scope: 5,
-            gap_search_overclaim: 3,
-            sprawl_force_answer: 3,
-        }
-    }
-}
-
-impl ReviewRepairBudgets {
-    /// Budget for a stable answer-repair mode key (`review_no_evidence`, …).
-    pub fn limit_for_key(&self, key: &str) -> u32 {
-        match key {
-            "review_no_evidence" => self.no_evidence,
-            "review_listing_only" => self.listing_only,
-            "review_generic_template" => self.generic_template,
-            "review_inspected_disclaimer" => self.inspected_disclaimer,
-            "review_inspected_disclaimer_chat_attempt" => self.inspected_disclaimer_chat_attempt,
-            "review_concrete_answer" => self.concrete_answer,
-            "review_read_after_search" => self.read_after_search,
-            "review_security_broad_search" => self.security_broad_search,
-            "review_security_scope" => self.security_scope,
-            "review_gap_search_overclaim" => self.gap_search_overclaim,
-            "review_sprawl_force_answer" => self.sprawl_force_answer,
-            // Unknown keys: no budget (was silent default 2). Callers should
-            // only pass ReviewRepairMode::key() values.
-            _ => 0,
-        }
     }
 }
 
@@ -991,16 +916,6 @@ mod tests {
         assert_eq!(config.program.max_speculative_calls, 2);
         assert_eq!(config.program.max_external_speculative_calls, 1);
         assert_eq!(config.program.external_ttl_seconds, 30);
-        let budgets = &config.loop_limits.review_repair;
-        assert_eq!(budgets.no_evidence, 4);
-        assert_eq!(budgets.read_after_search, 2);
-        assert_eq!(budgets.security_scope, 5);
-        assert_eq!(budgets.gap_search_overclaim, 3);
-        assert_eq!(budgets.sprawl_force_answer, 3);
-        assert_eq!(budgets.limit_for_key("review_listing_only"), 4);
-        assert_eq!(budgets.limit_for_key("review_sprawl_force_answer"), 3);
-        // Typos must not silently get budget 2 (old fail-open default).
-        assert_eq!(budgets.limit_for_key("review_typo_mode"), 0);
     }
 
     #[test]

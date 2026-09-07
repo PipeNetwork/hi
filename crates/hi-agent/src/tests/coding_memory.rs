@@ -201,7 +201,7 @@ async fn green_turn_records_coding_facts_into_decisions() {
     );
     let mut ui = RecUi::default();
     let outcome = agent
-        .run_turn("fix the helper and keep tests green", &mut ui)
+        .run_turn("fix the helper and keep checks green", &mut ui)
         .await
         .unwrap();
     assert_eq!(outcome.status, TurnStatus::Completed);
@@ -293,10 +293,10 @@ async fn task_review_survives_only_acknowledged_metadata_outside_its_scope() {
         cfg.memory.curate_skills = scenario == "owned-only";
         let mut responses = vec![
             write_content_completion("reviewed.txt", "reviewed\n"),
-            bash_completion("true # validate"),
+            bash_completion("python3 -c 'assert 2 + 2 == 4'"),
             completion(
                 vec![Content::Text(
-                    "Created reviewed.txt with the requested content and ran true # validate."
+                    "Created reviewed.txt with the requested content and ran python3 -c 'assert 2 + 2 == 4'."
                         .into(),
                 )],
                 1,

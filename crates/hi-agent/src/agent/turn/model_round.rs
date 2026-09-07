@@ -85,14 +85,20 @@ impl crate::Agent {
         let mut effective_fallback_route = std::mem::take(state.effective_fallback_route);
         let mut ranked_context_paths = std::mem::take(state.ranked_context_paths);
         let mut progress_tracker = std::mem::take(state.progress_tracker);
+        let mut evidence = std::mem::take(state.evidence);
+        if progress_tracker.observe_workspace_revision(
+            &mut evidence,
+            self.runtime.ledger().revision(),
+            false,
+        ) {
+            repeat_nudges = 0;
+        }
         let mut repeat_sampling_rounds = progress_tracker.repeat_sampling_rounds;
         let mut force_no_progress_final_answer_next =
             progress_tracker.force_no_progress_final_answer_next;
         let mut prev_added_no_evidence = progress_tracker.prev_added_no_evidence;
         let mut prev_call_sig = std::mem::take(&mut progress_tracker.prev_call_sig);
-        let mut evidence = std::mem::take(state.evidence);
         let mut implementation_tracker = std::mem::take(state.implementation_tracker);
-        let mut review_repair = std::mem::take(state.review_repair);
         let last_verify_attributions = std::mem::take(state.last_verify_attributions);
         let tool_timeline = std::mem::take(state.tool_timeline);
         let mut advertised_tool_names = std::mem::take(state.advertised_tool_names);
@@ -106,7 +112,6 @@ impl crate::Agent {
         let read_only_intent = state.read_only_intent;
         let implementation_intent = state.implementation_intent;
         let expected_mutation = state.expected_mutation;
-        let mutation_recovery_requires_focus = state.mutation_recovery_requires_focus;
         let requested_validation = state.requested_validation;
         let input = state.input;
         let _user_prompt_tokens = state.user_prompt_tokens;
@@ -295,7 +300,7 @@ impl crate::Agent {
             ToolMode::ChatOnly
         } else if request_text_tool_fallback {
             session_tool_mode
-        } else if (force_tools_next || mutation_recovery_requires_focus)
+        } else if force_tools_next
             && session_tool_mode == ToolMode::Auto
         {
             ToolMode::Required
@@ -327,21 +332,6 @@ impl crate::Agent {
             suppress_bookkeeping_tools_next = false;
             request_tools = super::model_request::apply_bookkeeping_suppress(request_tools, true);
         }
-        // `ToolMode::Required` alone means "call any advertised tool". During
-        // bounded mutation recovery that still lets a weak model pick another
-        // read indefinitely. Seal this one-shot request against mutation
-        // primitives only, so the advertised contract matches the nudge.
-        let mutation_repair_focus = !wrapping_up
-            && !implementation_tracker.mutation_seen
-            && (expected_mutation || implementation_intent.is_some())
-            && (mutation_recovery_requires_focus
-                || ((force_tools_next || request_text_tool_fallback)
-                    && (implementation_tracker.no_change_nudges >= 2
-                        || implementation_tracker.discovery_nudges >= 2)));
-        request_tools = super::model_request::apply_mutation_repair_focus(
-            request_tools,
-            mutation_repair_focus,
-        );
         let effective_provider_capabilities = self.user_turn_capabilities(context_task).await;
         self.require_tool_route(&request_tools, &effective_provider_capabilities)?;
         tool_mode = super::model_request::provider_constraints::executable_round_mode(
@@ -424,7 +414,6 @@ impl crate::Agent {
                     sched_serial_runs,
                     &tool_timeline,
                     &evidence,
-                    &review_repair,
                     &self.prefix_stability,
                 );
                 self.report
@@ -605,7 +594,6 @@ impl crate::Agent {
                 &tool_timeline,
                 state.speculation_registry,
                 &evidence,
-                &review_repair,
                 &mut compat_fallbacks,
                 &mut effective_fallback_route,
                 ui,
@@ -1266,9 +1254,8 @@ If the task is already complete, stop and give your final recap."
                     implementation_tracker.no_change_nudges += 1;
                     evidence.quality_repair_nudges =
                         evidence.quality_repair_nudges.saturating_add(1);
-                    let use_text_fallback = implementation_tracker.no_change_nudges >= 2;
-                    force_tools_next = !use_text_fallback;
-                    text_tool_fallback_next = use_text_fallback;
+                    force_tools_next = false;
+                    text_tool_fallback_next = false;
                     // Drop the sticky prev signature so the next real
                     // tool call isn't immediately compared against the
                     // bookkeeping-only round that just exhausted the
@@ -1288,11 +1275,7 @@ If the task is already complete, stop and give your final recap."
                             "implementation kept repeating without editing; nudging the model to edit or scaffold",
                         );
                     }
-                    let nudge = if use_text_fallback {
-                        implementation_text_tool_nudge(IMPLEMENTATION_NO_CHANGES_NUDGE)
-                    } else {
-                        IMPLEMENTATION_NO_CHANGES_NUDGE.to_string()
-                    };
+                    let nudge = IMPLEMENTATION_NO_CHANGES_NUDGE.to_string();
                     self.messages.push_nudge(NudgeKind::Continue, nudge);
                     return Ok(ModelRoundControl::Continue);
                 }
@@ -1487,7 +1470,7 @@ If the task is already complete, stop and give your final recap."
             // validation. Validation-only turns still require an actual model
             // tool call because the workspace verifier skips unchanged turns.
             let validation_gate_required = requested_validation
-                && !(implementation_tracker.mutation_seen && verifier.is_on());
+                && !(implementation_tracker.mutation_seen && verifier.includes_tests());
             match self.steer_without_tools(
                 &assistant_text,
                 &mut completion.content,
@@ -1497,7 +1480,6 @@ If the task is already complete, stop and give your final recap."
                 validation_gate_required,
                 &mut implementation_tracker,
                 &mut evidence,
-                &mut review_repair,
                 &mut progress_tracker,
                 &mut silent_continues,
                 &mut generic_completion_retries,
@@ -1575,7 +1557,6 @@ If the task is already complete, stop and give your final recap."
         *state.progress_tracker = progress_tracker;
         *state.evidence = evidence;
         *state.implementation_tracker = implementation_tracker;
-        *state.review_repair = review_repair;
         *state.last_verify_attributions = last_verify_attributions;
         *state.tool_timeline = tool_timeline;
         *state.advertised_tool_names = advertised_tool_names;

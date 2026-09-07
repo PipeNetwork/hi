@@ -24,6 +24,7 @@ pub(super) async fn validation_input_revision<'a>(
     let mut validation = false;
     let mut goal_input = false;
     for (name, arguments) in calls {
+        validation |= name == "bash_output";
         if implementation_tool_call_validates(name, arguments) {
             validation = true;
             goal_input |= bash_command(arguments).is_some_and(|command| {
@@ -117,22 +118,53 @@ impl ToolObservations {
         } else {
             std::borrow::Cow::Borrowed(output.content.as_str())
         };
+        progress_tracker.observe_workspace_revision(
+            evidence,
+            agent.runtime.ledger().revision(),
+            output.effects.mutation_applied,
+        );
         let signature = inspection_signature(name, arguments);
         let signature_was_seen = signature_seen(evidence, &signature);
         let before = implementation.clone();
-        let validation_succeeded =
-            input_stable && tool_satisfies_validation(name, arguments, output);
+        // A terminal poll belongs to the original command, not to the
+        // `bash_output` arguments. Credit it only on the same stable inputs.
+        let background_validation = output.background.as_ref().and_then(|background| {
+            if name == "bash_output" && background.state != hi_tools::BackgroundState::Running {
+                implementation
+                    .background_validations
+                    .remove(&background.id)
+                    .filter(|(_, revision)| input_revision == Some(revision.as_str()))
+            } else {
+                None
+            }
+        });
+        let (validation_name, validation_arguments) = background_validation
+            .as_ref()
+            .map_or((name, arguments), |(arguments, _)| {
+                ("bash", arguments.as_str())
+            });
+        let validation_succeeded = input_stable
+            && tool_satisfies_validation(validation_name, validation_arguments, output);
         evidence.record_success(name, arguments, &semantic_output);
         implementation.record_tool_result(
-            name,
-            arguments,
+            validation_name,
+            validation_arguments,
             &semantic_output,
             validation_succeeded,
             output.effects.mutation_applied,
         );
-        progress_tracker
-            .tool_guardrail
-            .observe_workspace_revision(agent.runtime.ledger().revision());
+        if name == "bash"
+            && input_stable
+            && !output.effects.mutation_applied
+            && implementation_tool_call_validates(name, arguments)
+            && let Some(revision) = input_revision
+            && let Some(background) = &output.background
+            && background.state == hi_tools::BackgroundState::Running
+        {
+            implementation
+                .background_validations
+                .insert(background.id.clone(), (arguments.into(), revision.into()));
+        }
         let progress = progress_tracker
             .tool_guardrail
             .record_tool_result_with_effects(
@@ -161,6 +193,7 @@ impl ToolObservations {
                 &semantic_output,
                 error,
                 validation_succeeded,
+                output.effects.mutation_applied,
                 signature,
                 signature_was_seen,
                 progress.repeated_idempotent_result,
@@ -182,8 +215,8 @@ impl ToolObservations {
         if let Some(input_revision) = input_revision
             && let Some(observation) = validation_observation(
                 format!("tool:{}:{index}", self.batch_id),
-                name,
-                arguments,
+                validation_name,
+                validation_arguments,
                 input_revision,
                 input_stable,
                 output,
@@ -421,8 +454,85 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(evidence.file_reads, 1);
-        assert_eq!(implementation.pre_mutation_tool_calls, 1);
         assert_eq!(labels.len(), 1);
         assert_eq!(timeline.len(), 1);
+    }
+    #[tokio::test]
+    async fn background_tests_only_count_after_a_successful_terminal_poll_on_same_inputs() {
+        for (mutate, code) in [(false, 0), (true, 0), (false, 1)] {
+            let workspace = IsolatedWorkspace::new("background-validation-inputs");
+            let mut agent =
+                crate::Agent::new(Arc::new(Canned(Mutex::new(Vec::new()))), workspace.config())
+                    .unwrap();
+            let mut observations = ToolObservations::default();
+            let mut evidence = EvidenceTracker::default();
+            let mut implementation = ImplementationTracker::default();
+            let mut progress = ProgressTracker::default();
+            let mut labels = Vec::new();
+            let mut timeline = ToolTimeline::default();
+            for (index, name, arguments, state, exit_code) in [
+                (
+                    0,
+                    "bash",
+                    r#"{"command":"cargo test", "run_in_background":true}"#,
+                    hi_tools::BackgroundState::Running,
+                    None,
+                ),
+                (
+                    1,
+                    "bash_output",
+                    r#"{"id":"test_1"}"#,
+                    hi_tools::BackgroundState::Exited,
+                    Some(code),
+                ),
+            ] {
+                if index == 1 && mutate {
+                    std::fs::write(workspace.path("source.rs"), "changed").unwrap();
+                }
+                let revision =
+                    validation_input_revision(&agent, std::iter::once((name, arguments)))
+                        .await
+                        .unwrap();
+                assert!(revision.is_some());
+                let mut output = process(
+                    if exit_code == Some(1) {
+                        hi_tools::ToolStatus::Failed
+                    } else {
+                        hi_tools::ToolStatus::Succeeded
+                    },
+                    exit_code,
+                );
+                output.background = Some(hi_tools::BackgroundOutcome {
+                    id: "test_1".into(),
+                    state,
+                    exit_code,
+                });
+                observations
+                    .record(
+                        &mut agent,
+                        CompletedTool {
+                            index,
+                            name,
+                            arguments,
+                            output: &output,
+                            input_revision: revision.as_deref(),
+                            path: String::new(),
+                            duration_ms: 1,
+                            plan_changed: false,
+                        },
+                        &mut evidence,
+                        &mut implementation,
+                        &mut progress,
+                        &mut labels,
+                        &mut timeline,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    implementation.tests_seen,
+                    index == 1 && !mutate && code == 0
+                );
+            }
+        }
     }
 }

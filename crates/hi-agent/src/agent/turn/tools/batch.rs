@@ -2123,12 +2123,6 @@ impl crate::Agent {
             });
         }
         observations::fold_completed_observations(&mut self.messages, calls, &complete_reads);
-        // A fully cancelled batch did not execute discovery or implementation
-        // work, so it must not burn the mutation-recovery round budget.
-        if interrupted_calls < calls.len() {
-            implementation_tracker.record_tool_round();
-        }
-
         Ok(ToolBatchOutcome {
             calls: calls.to_vec(),
             read_only_intent,

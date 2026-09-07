@@ -1837,7 +1837,7 @@ async fn implementation_preflight_consumes_its_interrupt_instead_of_cancelling_n
     let responses = vec![
         write_content_completion("src/lib.rs", "pub fn fixed() {}\n"),
         bash_completion("cargo test --quiet"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(
             vec![Content::Text("Implemented and verified.".into())],
             1,
@@ -1900,7 +1900,7 @@ async fn late_preflight_interrupt_signal_cannot_cancel_the_models_next_tool() {
         vec![
             write_content_completion("src/lib.rs", "pub fn fixed() {}\n"),
             bash_completion("cargo test --quiet"),
-            bash_completion("true # validate"),
+            bash_completion("python3 -c 'assert 2 + 2 == 4'"),
             completion(
                 vec![Content::Text("Implemented and verified.".into())],
                 1,
@@ -2269,7 +2269,7 @@ async fn idle_background_output_tight_poll_reports_active_work() {
             1,
         )
     };
-    // Two free idle polls, then a third that should trip the tight-loop nudge.
+    // Two free idle polls, then a voluntary status report.
     provider.0.lock().unwrap().extend(vec![
         bash_output(&id),
         bash_output(&id),
@@ -2297,8 +2297,8 @@ async fn idle_background_output_tight_poll_reports_active_work() {
     assert!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("background process is still running")),
-        "third consecutive idle poll should trigger an active-work report: {:?}",
+            .any(|s| s.contains("background work continues")),
+        "a voluntary status answer should be accepted: {:?}",
         ui.statuses
     );
     assert!(
@@ -2364,8 +2364,8 @@ async fn idle_background_poll_budget_exhaustion_reports_progress_without_stallin
     assert!(
         ui.statuses
             .iter()
-            .any(|status| status.contains("background process is still running")),
-        "expected immediate progress-report recovery: {:?}",
+            .any(|status| status.contains("background work continues")),
+        "expected voluntary status reporting: {:?}",
         ui.statuses
     );
 }
@@ -2424,6 +2424,9 @@ async fn waiting_on_live_background_with_fresh_output_ends_with_status_report() 
         ),
         bash_output(&id),
         bash_output(&id),
+        bash_output(&id),
+        bash_output(&id),
+        bash_output(&id),
         completion(
             vec![Content::Text(
                 "Work remains in progress: the download is still running; conversion has not started.".into(),
@@ -2448,11 +2451,9 @@ async fn waiting_on_live_background_with_fresh_output_ends_with_status_report() 
         agent.last_turn_telemetry()
     );
     assert!(
-        ui.statuses
+        !ui.statuses
             .iter()
-            .any(|s| s.contains("wait once with wait_secs or wrap up")),
-        "the waiting budget should trigger the wrap-up request despite fresh output: {:?}",
-        ui.statuses
+            .any(|s| s.contains("wrap-up request") || s.contains("forcing a final status"))
     );
     assert!(
         ui.statuses
@@ -3222,10 +3223,10 @@ async fn implementation_repeat_exhaustion_repairs_to_edit_instead_of_forced_fina
         read(),
         write_completion(&write_path_string),
         completion(vec![Content::Text("Implemented it.".into())], 1, 1),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(
             vec![Content::Text(format!(
-                "Changed {write_path_string} and validated with true # validate."
+                "Changed {write_path_string} and validated with python3 -c 'assert 2 + 2 == 4'."
             ))],
             1,
             1,
@@ -3551,7 +3552,7 @@ async fn nudges_when_model_cycles_compound_bash_inspections() {
         page("1p"), // first no-new-evidence round gets one grace execution
         page("2p"), // second consecutive repeat is skipped and nudged
         write_completion(output.to_string_lossy().as_ref()),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("Done.".into())], 1, 1),
     ];
     for _ in 0..4 {

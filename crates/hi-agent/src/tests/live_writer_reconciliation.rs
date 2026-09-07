@@ -293,7 +293,7 @@ async fn foreground_overrun_hands_off_and_does_not_hold_workspace_admission() {
             "overrun",
             "bash",
             serde_json::json!({
-                "command": "sleep 600",
+                "command": "while [ ! -f after-handoff.txt ]; do sleep 0.01; done; echo command-finished",
             }),
         ),
         call(
@@ -316,7 +316,7 @@ async fn foreground_overrun_hands_off_and_does_not_hold_workspace_admission() {
     subject
         .runtime
         .background()
-        .set_foreground_handoff_budget(Some(std::time::Duration::from_secs(1)));
+        .set_foreground_handoff_budget(Some(std::time::Duration::from_millis(25)));
     let mut ui = RecUi::default();
 
     let outcome = subject

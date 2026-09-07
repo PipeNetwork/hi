@@ -19,7 +19,6 @@ mod goal_turn;
 mod internal_workspace_mutation;
 mod lifecycle;
 mod memory_turn;
-mod mutation_recovery_turn;
 pub(crate) mod plan_goal;
 mod preflight;
 mod process_coordination;

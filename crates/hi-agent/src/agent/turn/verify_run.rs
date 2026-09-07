@@ -12,7 +12,7 @@ use crate::verify::{
 mod tests;
 
 impl crate::Agent {
-    /// Kill turn-scoped background processes, reconcile the ledger, and run the
+    /// Finish turn-scoped foreground work, reconcile the ledger, and run the
     /// configured [`WorkspaceRepairVerifier`] stages ([`TurnPhase::WorkspaceRepair`]).
     /// Returns [`VerifyOutcome::NotRun`] when verification is off.
     #[allow(
@@ -35,17 +35,23 @@ impl crate::Agent {
         // Reaps only auto-backgrounded foreground overruns. Deliberate
         // `run_in_background` jobs (downloads, servers) survive the turn —
         // killing them here once cost two ~800 GB downloads at turn end.
-        let killed_backgrounds = self
-            .runtime
-            .background()
-            .kill_started_after_and_reap(turn_background_baseline)
-            .await?;
-        if killed_backgrounds > 0 {
-            ui.status(&format!(
-                "stopped {killed_backgrounds} auto-backgrounded process(es) before final verification"
-            ));
-            // Native exit and the lifecycle callback have both completed;
-            // reconciliation and verification can now observe a stable tree.
+        let finished_backgrounds = if self.task_recovery.exhausted {
+            self.runtime
+                .background()
+                .kill_started_after_and_reap(turn_background_baseline)
+                .await?
+        } else {
+            self.runtime
+                .background()
+                .wait_started_after_and_reap(turn_background_baseline)
+                .await
+        };
+        if finished_backgrounds > 0 {
+            ui.status(if self.task_recovery.exhausted {
+                "stopped auto-backgrounded commands after recovery ended"
+            } else {
+                "foreground commands finished; continuing final verification"
+            });
             self.invalidate_snapshot();
             self.reconcile_workspace_changes().await?;
         }

@@ -567,44 +567,107 @@ async fn conversational_greenfield_request_cannot_complete_without_work() {
 }
 
 #[tokio::test]
-async fn explicit_validation_request_requires_an_observed_successful_command() {
+async fn explicit_validation_request_requires_tests_after_a_compile_check() {
     let workspace = IsolatedWorkspace::new("outcome-explicit-validation");
-
-    let mut agent = agent(
+    std::fs::create_dir(workspace.path("src")).unwrap();
+    std::fs::write(
+        workspace.path("Cargo.toml"),
+        "[package]\nname = \"test_obligation\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path("src/lib.rs"),
+        "#[test] fn answer() { assert_eq!(2 + 2, 4); }\n",
+    )
+    .unwrap();
+    let mut cfg = workspace.config();
+    cfg.gates.allow_unverified = true;
+    let mut subject = agent(
         vec![
+            bash_completion("cargo check --quiet"),
             completion(
-                vec![Content::Text("Completed the requested action.".into())],
+                vec![Content::Text("The compile check passed.".into())],
                 1,
                 1,
             ),
-            bash_completion("true # validate"),
+            bash_completion("cargo test --quiet"),
             completion(
-                vec![Content::Text("The requested validation passed.".into())],
+                vec![Content::Text("The requested tests passed.".into())],
                 1,
                 1,
             ),
         ],
-        workspace.config(),
+        cfg,
     );
     let mut ui = RecordingUi::default();
-
-    let outcome = agent
+    let outcome = subject
         .run_turn(
             "Run cargo test --quiet before reporting that the work passes.",
             &mut ui,
         )
         .await
         .unwrap();
-
-    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Completed,
+        "{outcome:?}; {:?}; {:?}",
+        ui.statuses,
+        subject.last_turn_telemetry()
+    );
     assert!(
         ui.statuses
             .iter()
-            .any(|status| status.contains("requested validation did not run")),
-        "the generic completion must be challenged before the command runs: {:?}",
-        ui.statuses
+            .any(|s| s.contains("requested tests have not passed"))
     );
-    assert_eq!(agent.last_turn_telemetry().tool_calls, 1);
+    assert_eq!(subject.last_turn_telemetry().tool_calls, 2);
+}
+
+#[tokio::test]
+async fn check_only_verifier_does_not_satisfy_explicit_tests() {
+    let workspace = IsolatedWorkspace::new("outcome-check-is-not-tests");
+    let mut cfg = workspace.config();
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![crate::VerifyStage::new(
+        "check",
+        "python3 -c 'assert 2 + 2 == 4'",
+    )]);
+    let mut subject = agent(
+        vec![
+            bash_completion("printf x > answer.txt"),
+            completion(
+                vec![Content::Text(
+                    "Changed answer.txt; tests are unavailable.".into(),
+                )],
+                1,
+                1,
+            ),
+            completion(vec![Content::Text("Tests cannot run here.".into())], 1, 1),
+            completion(vec![Content::Text("Tests remain unverified.".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+    let outcome = subject
+        .run_turn("fix answer.txt and run the tests", &mut ui)
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, TurnStatus::Failed, "{:?}", ui.statuses);
+    assert_eq!(outcome.verification, VerificationStatus::Unverified);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::VerificationUnavailable,
+        "{:?}; {:?}; {:?}",
+        ui.statuses,
+        subject.task_recovery,
+        subject.last_turn_telemetry()
+    );
+    assert!(!subject.task_recovery.exhausted);
+    assert_eq!(subject.last_turn_telemetry().model_requests, 4);
+    assert!(
+        !subject
+            .messages()
+            .iter()
+            .any(|m| m.text().contains("<tool_call>"))
+    );
 }
 
 #[tokio::test]
@@ -975,7 +1038,7 @@ async fn mutation_without_verify_pipeline_is_not_applicable_not_unverified() {
         1,
         1,
     );
-    let smoke = bash_completion("true # validate");
+    let smoke = bash_completion("python3 -c 'assert 2 + 2 == 4'");
     let done = completion(vec![Content::Text("done".into())], 1, 1);
     let mut cfg = workspace.config();
     cfg.gates.verification = VerificationMode::Auto;
@@ -1039,7 +1102,7 @@ async fn disabled_verification_stays_unverified_after_model_run_smoke_check() {
     let mut agent = agent(
         vec![
             write,
-            bash_completion("true # validate"),
+            bash_completion("python3 -c 'assert 2 + 2 == 4'"),
             completion(vec![Content::Text("done".into())], 1, 1),
         ],
         cfg,
@@ -1230,7 +1293,7 @@ async fn independent_review_status_is_emitted_in_turn_outcome() {
     // write → validate (satisfy implementation completeness) → done → IR APPROVE
     let responses = vec![
         write_file_completion("write-review", path, "reviewed\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("done".into())], 1, 1),
         completion(vec![Content::Text("APPROVE".into())], 1, 1),
     ];
@@ -1260,7 +1323,7 @@ async fn completion_review_receives_the_canonical_greenfield_objective() {
             "reviewed.txt",
             "reviewed\n",
         )),
-        ProviderStep::Completion(bash_completion("true # validate")),
+        ProviderStep::Completion(bash_completion("python3 -c 'assert 2 + 2 == 4'")),
         ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
         ProviderStep::Completion(completion(vec![Content::Text("APPROVE".into())], 1, 1)),
     ];
@@ -1329,7 +1392,7 @@ async fn hygiene_gate_reenters_model_on_unreferenced_creates() {
             1,
             1,
         ),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("done".into())], 1, 1),
         bash_completion("true # hygiene repair"),
         completion(vec![Content::Text("repaired".into())], 1, 1),
@@ -1352,7 +1415,7 @@ async fn independent_review_unavailable_completes_with_visible_status() {
     let path = "reviewed.txt";
     let steps = vec![
         ProviderStep::Completion(write_file_completion("write-review", path, "reviewed\n")),
-        ProviderStep::Completion(bash_completion("true # validate")),
+        ProviderStep::Completion(bash_completion("python3 -c 'assert 2 + 2 == 4'")),
         ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
         // IR retries once on transient error before Unavailable.
         ProviderStep::Error(ProviderErrorKind::Outage),
@@ -1376,7 +1439,7 @@ async fn independent_review_distinct_skeptic_model_clears_same_model_flag() {
     let path = "reviewed.txt";
     let responses = vec![
         write_file_completion("write-review", path, "reviewed\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("done".into())], 1, 1),
         completion(vec![Content::Text("APPROVE".into())], 1, 1),
     ];
@@ -1406,7 +1469,7 @@ async fn independent_review_object_allows_one_repair_then_pass() {
     let path = "fixed.txt";
     let responses = vec![
         write_file_completion("write-review", path, "v1\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("done".into())], 1, 1),
         completion(
             vec![Content::Text(
@@ -1416,7 +1479,7 @@ async fn independent_review_object_allows_one_repair_then_pass() {
             1,
         ),
         write_file_completion("repair-write", path, "v2 fixed\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("repaired".into())], 1, 1),
         completion(vec![Content::Text("APPROVE".into())], 1, 1),
     ];
@@ -1440,7 +1503,7 @@ async fn default_independent_review_repairs_continue_past_one_productive_cycle()
     let path = "reviewed-twice.txt";
     let responses = vec![
         write_file_completion("write-review", path, "v1\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("initial implementation".into())], 1, 1),
         completion(
             vec![Content::Text("OBJECT\n- first concrete defect".into())],
@@ -1448,7 +1511,7 @@ async fn default_independent_review_repairs_continue_past_one_productive_cycle()
             1,
         ),
         write_file_completion("repair-one", path, "v2\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("first repair".into())], 1, 1),
         completion(
             vec![Content::Text("OBJECT\n- second concrete defect".into())],
@@ -1456,7 +1519,7 @@ async fn default_independent_review_repairs_continue_past_one_productive_cycle()
             1,
         ),
         write_file_completion("repair-two", path, "v3 fixed\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("second repair".into())], 1, 1),
         completion(vec![Content::Text("APPROVE".into())], 1, 1),
     ];
@@ -1506,7 +1569,7 @@ async fn independent_review_escalate_allows_one_repair_then_pass() {
     let path = "escalated.txt";
     let responses = vec![
         write_file_completion("write-review", path, "v1\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("done".into())], 1, 1),
         completion(
             vec![Content::Text(
@@ -1516,7 +1579,7 @@ async fn independent_review_escalate_allows_one_repair_then_pass() {
             1,
         ),
         write_file_completion("repair-write", path, "v2 fixed\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("repaired".into())], 1, 1),
         completion(vec![Content::Text("APPROVE".into())], 1, 1),
     ];
@@ -1543,7 +1606,7 @@ async fn independent_review_object_again_after_repair_completes_with_scar() {
     let path = "stuck.txt";
     let responses = vec![
         write_file_completion("write-review", path, "v1\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("done".into())], 1, 1),
         completion(
             vec![Content::Text("OBJECT\n- incomplete implementation".into())],
@@ -1551,7 +1614,7 @@ async fn independent_review_object_again_after_repair_completes_with_scar() {
             1,
         ),
         write_file_completion("repair-write", path, "v2 still broken\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("tried".into())], 1, 1),
         completion(
             vec![Content::Text(
@@ -1583,7 +1646,7 @@ async fn independent_review_zero_repair_budget_records_scar_immediately() {
     let path = "no-repair.txt";
     let responses = vec![
         write_file_completion("write-review", path, "v1\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("done".into())], 1, 1),
         completion(vec![Content::Text("OBJECT\n- defect".into())], 1, 1),
     ];

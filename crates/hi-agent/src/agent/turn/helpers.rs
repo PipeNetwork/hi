@@ -10,7 +10,6 @@ use crate::{
 
 use super::progress::{ProgressTracker, ToolProgressLabel};
 use super::retention::ToolTimeline;
-use super::retry::ReviewRepairState;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_turn_telemetry(
@@ -33,7 +32,6 @@ pub(super) fn build_turn_telemetry(
     serial_runs: u32,
     tool_timeline: &ToolTimeline,
     evidence: &EvidenceTracker,
-    review_repair: &ReviewRepairState,
     prefix_stability: &crate::prefix_stability::PrefixStability,
 ) -> TurnTelemetry {
     TurnTelemetry {
@@ -67,9 +65,9 @@ pub(super) fn build_turn_telemetry(
         first_tool_kind: evidence.first_tool_kind().to_string(),
         discovery_depth: evidence.discovery_depth().to_string(),
         quality_repair_nudges: evidence.quality_repair_nudges,
-        review_repair_exhaustion_reason: review_repair.exhaustion_reason.clone(),
-        review_repair_counts: review_repair.counts.clone(),
-        review_repair_stopped_by_exhaustion: !review_repair.exhaustion_reason.is_empty(),
+        review_repair_exhaustion_reason: String::new(),
+        review_repair_counts: Default::default(),
+        review_repair_stopped_by_exhaustion: false,
         skeptic_unavailable_count: 0,
         skeptic_last_status: None,
         review_unavailable_reason: None,

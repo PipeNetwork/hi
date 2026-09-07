@@ -10,7 +10,6 @@ use hi_ai::{Content, Message};
 
 use super::implementation::{
     bash_inspection_signature, bash_no_progress_signature, implementation_tool_call_validates,
-    implementation_tool_result_landed_mutation, implementation_tool_result_landed_substantive_edit,
 };
 use super::intent::{
     compact_search_hit_line, evidence_kind_for_tool, grep_match_line_count, search_hit_score,
@@ -34,7 +33,6 @@ pub(crate) struct ImplementationIntent {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ImplementationTracker {
     pub(crate) mutation_seen: bool,
-    pub(crate) substantive_edit_seen: bool,
     /// Sticky terminal evidence that a turn which owed a workspace mutation
     /// exhausted its bounded recovery without landing one. Earlier diagnosis
     /// prose is useful context, but must not turn an unimplemented fix into a
@@ -47,22 +45,12 @@ pub(crate) struct ImplementationTracker {
     /// in this turn. This is separate from post-mutation validation because a
     /// user may ask only to run an existing test suite.
     pub(crate) validation_seen: bool,
+    pub(crate) tests_seen: bool,
+    /// Original validation command and input revision for a live shell job.
+    pub(crate) background_validations: HashMap<String, (String, String)>,
     pub(crate) validation_after_last_mutation: bool,
     pub(crate) preferred_validation: Option<String>,
-    /// Tool results observed before the first successful mutation. Unlike the
-    /// evidence counter this includes coordination, LSP, and subagent calls,
-    /// all of which can otherwise sustain an expensive inspect/plan loop.
-    pub(crate) pre_mutation_tool_calls: u32,
-    /// Model tool-call batches observed before the first successful mutation.
-    /// Parallel reads belong to one reasoning round and must not exhaust the
-    /// discovery budget faster merely because the model batched them.
-    pub(crate) pre_mutation_rounds: u32,
-    /// Nudges spent specifically by the bounded pre-mutation discovery guard.
-    /// Kept separate from text/repeat repair budgets.
-    pub(crate) discovery_nudges: u32,
     pub(crate) no_change_nudges: u32,
-    pub(crate) scaffold_only_nudges: u32,
-    pub(crate) missing_validation_nudges: u32,
     pub(crate) requested_validation_nudges: u32,
 }
 
@@ -78,45 +66,39 @@ impl ImplementationTracker {
         }
     }
 
-    pub(crate) fn record_tool_round(&mut self) {
-        if !self.mutation_seen {
-            self.pre_mutation_rounds = self.pre_mutation_rounds.saturating_add(1);
-        }
-    }
-
     pub(crate) fn record_tool_result(
         &mut self,
         name: &str,
         arguments: &str,
-        output: &str,
+        _output: &str,
         validation_succeeded: bool,
         mutation_applied: bool,
     ) {
         let validation_observed =
             validation_succeeded && implementation_tool_call_validates(name, arguments);
+        let tests_passed =
+            validation_observed && super::tool_guardrail::command_runs_tests(arguments);
         // Some mutation-capable tools (notably `delegate`) report their exact
         // applied effects in the typed outcome rather than in display text.
         // Keep the typed effect authoritative so a successful delegated edit
         // does not get mistaken for a no-op by the completeness gate.
-        if mutation_applied || implementation_tool_result_landed_mutation(name, arguments, output) {
+        if mutation_applied {
             self.mutation_seen = true;
-            if implementation_tool_result_landed_substantive_edit(name, arguments, output) {
-                self.substantive_edit_seen = true;
-            }
+            self.tests_seen = false;
+            self.background_validations.clear();
             // A successful validation command can itself create or update a
             // lockfile. Its validation completed after that side effect, so it
             // satisfies both the requested-validation and post-mutation gates.
             self.validation_after_last_mutation = validation_observed;
             if validation_observed {
                 self.record_validation_success();
+                self.tests_seen |= tests_passed;
             }
             return;
         }
-        if !self.mutation_seen {
-            self.pre_mutation_tool_calls = self.pre_mutation_tool_calls.saturating_add(1);
-        }
         if validation_observed {
             self.record_validation_success();
+            self.tests_seen |= tests_passed;
         }
     }
 }
@@ -162,7 +144,7 @@ pub(crate) struct EvidenceTracker {
     pub(crate) search_hit_snippets: Vec<String>,
     pub(crate) first_tool_kind: Option<EvidenceKind>,
     pub(crate) quality_repair_nudges: u32,
-    /// Inspection signatures already seen this turn, used by the no-new-evidence
+    /// Inspection signatures seen at the current workspace revision, used by the no-new-evidence
     /// cycle guard. Each entry is a stable key derived from a read-only tool
     /// call's identity: `read:<path>:<offset>:<limit>`,
     /// `list:<path>`, `grep:<pattern>:<glob>:<path>:<context>`,
@@ -197,6 +179,15 @@ impl EvidenceTracker {
 
     pub(crate) fn has_seen_signature(&self, signature: &str) -> bool {
         self.seen_signature_set.contains(signature)
+    }
+
+    /// A workspace change starts a new inspection pass. Retain the turn's
+    /// diagnostic counts and paths, but do not treat prior context as current.
+    pub(crate) fn invalidate_workspace_inspections(&mut self) {
+        self.seen_signatures.clear();
+        self.seen_signature_set.clear();
+        self.completed_read_paths.clear();
+        self.truncated_read_paths.clear();
     }
 
     fn record_signature(&mut self, signature: String) {
@@ -344,9 +335,7 @@ impl EvidenceTracker {
     }
 
     fn path_already_inspected(&self, path: &str) -> bool {
-        self.inspected_paths
-            .iter()
-            .any(|seen| paths_refer_to_same_file(seen, path))
+        self.path_read_is_complete(path) || self.path_read_is_truncated(path)
     }
 
     fn path_read_is_truncated(&self, path: &str) -> bool {
@@ -781,5 +770,37 @@ mod tests {
             "read".into(),
             serde_json::json!({"path": "src/large.rs", "offset": 901}).to_string(),
         )]));
+    }
+}
+
+#[cfg(test)]
+mod implementation_effect_tests {
+    use super::*;
+    #[test]
+    fn only_typed_effects_credit_mutations() {
+        let mut tracker = ImplementationTracker::default();
+        tracker.record_tool_result(
+            "bash",
+            r#"{"command":"echo 'git add source.rs'"}"#,
+            "source.rs written",
+            false,
+            false,
+        );
+        assert!(!tracker.mutation_seen);
+        tracker.record_tool_result("write", "{}", "File written successfully", false, false);
+        assert!(!tracker.mutation_seen);
+        tracker.record_tool_result("delegate", "{}", "Completed", false, true);
+        assert!(tracker.mutation_seen);
+    }
+    #[test]
+    fn checks_do_not_satisfy_tests_and_edits_invalidate_prior_tests() {
+        let mut tracker = ImplementationTracker::default();
+        tracker.record_tool_result("bash", r#"{"command":"cargo check"}"#, "", true, false);
+        assert!(tracker.validation_seen);
+        assert!(!tracker.tests_seen);
+        tracker.record_tool_result("bash", r#"{"command":"cargo test"}"#, "", true, false);
+        assert!(tracker.tests_seen);
+        tracker.record_tool_result("delegate", "{}", "", false, true);
+        assert!(!tracker.tests_seen);
     }
 }

@@ -229,19 +229,6 @@ pub(crate) fn implementation_tool_call_mutates(name: &str, arguments: &str) -> b
     shell_command_likely_mutates_workspace(&command)
 }
 
-pub(crate) fn implementation_tool_call_substantively_edits(name: &str, arguments: &str) -> bool {
-    if matches!(name, "write" | "edit" | "multi_edit" | "apply_patch") {
-        return true;
-    }
-    if name != "bash" {
-        return false;
-    }
-    let Some(command) = bash_command(arguments) else {
-        return false;
-    };
-    shell_command_likely_edits_files(&command)
-}
-
 pub(crate) fn implementation_tool_call_validates(name: &str, arguments: &str) -> bool {
     if name != "bash" {
         return false;
@@ -250,72 +237,6 @@ pub(crate) fn implementation_tool_call_validates(name: &str, arguments: &str) ->
         return false;
     };
     shell_command_likely_validates(&command)
-}
-
-pub(crate) fn implementation_tool_result_landed_mutation(
-    name: &str,
-    arguments: &str,
-    output: &str,
-) -> bool {
-    if tool_result_is_failure(output) {
-        return false;
-    }
-    if filesystem_mutation_result_landed(name, output) {
-        return true;
-    }
-    if name != "bash" || !implementation_tool_call_mutates(name, arguments) {
-        return false;
-    }
-    bash_result_likely_succeeded(output)
-}
-
-pub(crate) fn implementation_tool_result_landed_substantive_edit(
-    name: &str,
-    arguments: &str,
-    output: &str,
-) -> bool {
-    if tool_result_is_failure(output) {
-        return false;
-    }
-    if filesystem_substantive_edit_result_landed(name, output) {
-        return true;
-    }
-    if name != "bash" || !implementation_tool_call_substantively_edits(name, arguments) {
-        return false;
-    }
-    bash_result_likely_succeeded(output)
-}
-
-fn tool_result_is_failure(output: &str) -> bool {
-    let trimmed = output.trim_start();
-    trimmed.starts_with("Error:")
-        || trimmed.starts_with("⚠ refused:")
-        || trimmed.contains("[exit code ")
-        || trimmed.contains("[timed out after ")
-}
-
-fn filesystem_mutation_result_landed(name: &str, output: &str) -> bool {
-    filesystem_substantive_edit_result_landed(name, output)
-}
-
-fn filesystem_substantive_edit_result_landed(name: &str, output: &str) -> bool {
-    let trimmed = output.trim_start();
-    let lower = trimmed.to_ascii_lowercase();
-    match name {
-        "write" => lower.starts_with("wrote ") && lower.contains(" bytes to "),
-        "edit" => {
-            lower.starts_with("edited ") || lower.starts_with("replaced ") && lower.contains(" in ")
-        }
-        "multi_edit" => lower.starts_with("applied ") && lower.contains(" edits to "),
-        "apply_patch" => trimmed
-            .lines()
-            .any(|line| matches!(line.trim_start().chars().next(), Some('+' | '-' | '~'))),
-        _ => false,
-    }
-}
-
-fn bash_result_likely_succeeded(output: &str) -> bool {
-    !tool_result_is_failure(output)
 }
 
 fn simple_shell_words(command: &str) -> Option<Vec<String>> {
@@ -541,90 +462,7 @@ pub(crate) fn shell_command_likely_edits_files(command: &str) -> bool {
 }
 
 pub(crate) fn shell_command_likely_validates(command: &str) -> bool {
-    if let Some(words) = simple_shell_words(command)
-        && shell_command_directly_runs_code(&words)
-    {
-        return true;
-    }
-    let compact = command
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    contains_any(
-        &compact,
-        &[
-            "cargo test",
-            "cargo check",
-            "cargo build",
-            "cargo clippy",
-            "npm test",
-            "npm run test",
-            "npm run build",
-            "npm run check",
-            "npm run lint",
-            "pnpm test",
-            "pnpm build",
-            "pnpm check",
-            "pnpm lint",
-            "yarn test",
-            "yarn build",
-            "bun test",
-            "bun run build",
-            "pytest",
-            "python -m pytest",
-            "python -c",
-            "python3 -c",
-            "python -m",
-            "python3 -m",
-            "node -e",
-            "node --eval",
-            "go test",
-            "make test",
-            "make check",
-            "make build",
-            "just test",
-            "just check",
-            "just build",
-            "timeout 5s cargo run",
-            "cargo run --",
-            // Lightweight fixtures for canned-provider tests: must not contend
-            // on the workspace cargo lock the way `cargo test --help` can.
-            "true # validate",
-        ],
-    )
-}
-
-/// Treat a direct script invocation as executable validation. The explicit
-/// command list below covers inline snippets and project runners, but a newly
-/// created file is often checked with the cheapest possible command:
-/// `python3 hello.py` or `node script.js`. Recognize only unambiguous source
-/// file invocations so an interactive interpreter (`python3`) or an arbitrary
-/// shell command is not mistaken for evidence.
-fn shell_command_directly_runs_code(words: &[String]) -> bool {
-    let Some(command) = words.first().map(String::as_str) else {
-        return false;
-    };
-    let Some(argument) = words.get(1).map(String::as_str) else {
-        return false;
-    };
-    let has_extension = |extensions: &[&str]| {
-        words[1..].iter().any(|word| {
-            let path = word.trim_matches(|character| matches!(character, ';' | ','));
-            extensions.iter().any(|extension| path.ends_with(extension))
-        })
-    };
-    match command {
-        "python" | "python3" | "pypy" | "pypy3" => {
-            !argument.starts_with('-') && has_extension(&[".py", ".pyc"])
-        }
-        "node" => !argument.starts_with('-') && has_extension(&[".js", ".mjs", ".cjs"]),
-        "ruby" => !argument.starts_with('-') && has_extension(&[".rb"]),
-        "perl" => !argument.starts_with('-') && has_extension(&[".pl", ".pm"]),
-        "php" => !argument.starts_with('-') && has_extension(&[".php"]),
-        "go" => argument == "run" && words.len() > 2,
-        _ => false,
-    }
+    super::tool_guardrail::is_validation_command(command)
 }
 
 #[cfg(test)]
@@ -657,8 +495,10 @@ mod tests {
     }
 
     #[test]
-    fn lightweight_fixture_validation_command_is_recognized() {
-        assert!(shell_command_likely_validates("true # validate"));
+    fn executable_smoke_checks_are_recognized() {
+        assert!(shell_command_likely_validates(
+            "python3 -c 'assert 2 + 2 == 4'"
+        ));
         for command in [
             "python3 hello.py",
             "python ./scripts/check.py",
@@ -685,52 +525,13 @@ mod tests {
         ));
         assert!(implementation_tool_call_validates(
             "bash",
-            r#"{"command":"true # validate"}"#
+            r#"{"command":"python3 -c 'assert 2 + 2 == 4'"}"#
         ));
         assert_eq!(
-            shell_command_no_progress_signature("true # validate"),
+            shell_command_no_progress_signature("python3 -c 'assert 2 + 2 == 4'"),
             None,
-            "comment-tagged true must not collapse to the bare noop signature"
+            "an executable assertion must not collapse to a no-op signature"
         );
-    }
-
-    #[test]
-    fn landed_filesystem_edits_are_result_based() {
-        assert!(implementation_tool_result_landed_mutation(
-            "write",
-            r#"{"path":"a.rs","content":"x"}"#,
-            "Wrote 1 bytes to a.rs"
-        ));
-        assert!(implementation_tool_result_landed_substantive_edit(
-            "apply_patch",
-            r#"{"patch":"..."}"#,
-            "~ updated src/lib.rs (2 changes)\n+ added src/new.rs"
-        ));
-        assert!(!implementation_tool_result_landed_mutation(
-            "edit",
-            r#"{"path":"a.rs"}"#,
-            "Error: editing a.rs: old string not found"
-        ));
-    }
-
-    #[test]
-    fn failed_bash_edit_does_not_count_as_landed_mutation() {
-        let args = r#"{"command":"sed -i s/nope/yep/ src/lib.rs"}"#;
-        assert!(!implementation_tool_result_landed_mutation(
-            "bash",
-            args,
-            "sed: src/lib.rs: No such file\n[exit code 2]"
-        ));
-        assert!(!implementation_tool_result_landed_mutation(
-            "bash",
-            args,
-            "⚠ refused: this command cannot be safely checkpointed"
-        ));
-        assert!(implementation_tool_result_landed_mutation(
-            "bash",
-            args,
-            "[no output]"
-        ));
     }
 
     #[test]

@@ -337,6 +337,22 @@ pub(crate) async fn signature_impact_notes(
 }
 
 impl FastFeedbackReport {
+    /// Credit stable successful checks without making the model rerun them.
+    /// Compilation alone cannot satisfy a task that explicitly requires tests.
+    pub(crate) fn validates_implementation(&self, requires_tests: bool) -> bool {
+        !self.observations.is_empty()
+            && self
+                .observations
+                .iter()
+                .all(|o| o.status == crate::recovery::ValidationResult::Passed)
+            && self.failures.is_empty()
+            && self.lsp_errors == 0
+            && !self.cargo_failed
+            && !self.tests_failed
+            && !self.tests_timed_out
+            && (!requires_tests || self.tests_ran)
+    }
+
     pub fn combined_feedback(&self) -> Option<String> {
         let mut blocks = Vec::with_capacity(self.passes.len() + self.failures.len());
         blocks.extend(self.passes.iter().cloned());
@@ -728,3 +744,43 @@ fn remove_new_lsp_lockfile(path: &std::path::Path, preexisting: bool) {
 #[cfg(test)]
 #[path = "fast_feedback_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod implementation_validation_tests {
+    use super::*;
+    use crate::recovery::{ValidationObservation, ValidationResult};
+
+    #[test]
+    fn checks_count_but_missing_failed_or_stale_tests_do_not() {
+        let mut report = FastFeedbackReport::default();
+        assert!(!report.validates_implementation(false));
+        report.observations.push(ValidationObservation::command(
+            "check".into(),
+            "cargo check",
+            "revision".into(),
+            ValidationResult::Passed,
+            "",
+            std::path::Path::new("."),
+            false,
+        ));
+        assert!(report.validates_implementation(false));
+        assert!(!report.validates_implementation(true));
+        report.tests_ran = true;
+        assert!(report.validates_implementation(true));
+        for status in [
+            ValidationResult::Failed,
+            ValidationResult::Deferred,
+            ValidationResult::Infrastructure,
+        ] {
+            report.observations[0].status = status;
+            assert!(!report.validates_implementation(false));
+            assert!(!report.validates_implementation(true));
+        }
+        report.observations[0].status = ValidationResult::Passed;
+        report.tests_timed_out = true;
+        assert!(!report.validates_implementation(false));
+        report.tests_timed_out = false;
+        report.lsp_errors = 1;
+        assert!(!report.validates_implementation(false));
+    }
+}

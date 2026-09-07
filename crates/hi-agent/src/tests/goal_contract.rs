@@ -503,7 +503,7 @@ async fn exact_plan_goal_continuation_uses_real_context_and_implementation_guard
     let (mut agent, requests) = scripted_agent(
         vec![
             ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
-            ProviderStep::Completion(bash_completion("true # validate")),
+            ProviderStep::Completion(bash_completion("python3 -c 'assert 2 + 2 == 4'")),
             ProviderStep::Completion(completion(
                 vec![Content::Text("Implemented and validated.".into())],
                 1,

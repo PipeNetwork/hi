@@ -2,18 +2,8 @@
 //! [`constants`](super::constants), [`contains_any`] from [`intent`](super::intent),
 //! and tracker types from [`types`](super::types).
 
-use super::constants::IMPLEMENTATION_MISSING_VALIDATION_NUDGE;
 use super::intent::contains_any;
-use super::types::{EvidenceTracker, ImplementationTracker, ReviewIntent};
-pub(crate) fn implementation_missing_validation_nudge(tracker: &ImplementationTracker) -> String {
-    let preferred = tracker
-        .preferred_validation
-        .as_deref()
-        .map(|command| format!(" Prefer `{command}`."))
-        .unwrap_or_default();
-    format!("{IMPLEMENTATION_MISSING_VALIDATION_NUDGE}{preferred}")
-}
-
+use super::types::{EvidenceTracker, ReviewIntent};
 pub(crate) fn implementation_text_tool_nudge(reason: &str) -> String {
     format!(
         "{reason}\n\nThe next request will describe the plain-text call format from its sealed tool envelope."

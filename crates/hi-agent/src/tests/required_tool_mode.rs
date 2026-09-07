@@ -156,7 +156,7 @@ async fn required_mode_rejects_narration_without_weakening_the_request() {
 }
 
 #[tokio::test]
-async fn steering_required_mode_retries_narration_without_weakening_the_request() {
+async fn fresh_discovery_does_not_turn_narration_into_a_protocol_error() {
     let workspace = IsolatedWorkspace::new("required-mutation-repair");
     std::fs::create_dir_all(workspace.path("src")).unwrap();
     for round in 0..12 {
@@ -190,14 +190,14 @@ async fn steering_required_mode_retries_narration_without_weakening_the_request(
     assert_eq!(modes.len(), 14);
     assert_eq!(
         &modes[12..],
-        &[ToolMode::Required, ToolMode::Required],
-        "a rejected mutation-only response must retry the same Required contract"
+        &[ToolMode::Auto, ToolMode::Auto],
+        "investigation must not force a Required contract"
     );
     assert!(
-        ui.statuses
+        !ui.statuses
             .iter()
             .any(|status| status.contains("invalid tool turn")),
-        "missing protocol-retry status: {:?}",
+        "valid narration must not trigger protocol recovery: {:?}",
         ui.statuses
     );
 }

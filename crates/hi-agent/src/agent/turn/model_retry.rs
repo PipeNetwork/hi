@@ -12,10 +12,10 @@ use crate::{MAX_TOOL_PROTOCOL_RETRIES, Ui};
 use super::helpers::{build_turn_telemetry, effective_model_route};
 use super::progress::ProgressTracker;
 use super::retry::{
-    MAX_CAPACITY_RETRIES, MAX_PROVIDER_ROUTE_RETRIES, ReviewRepairState, TurnRetryState,
-    capacity_retry_delay, delay_label, output_cap_retry_tokens,
-    provider_error_is_backoff_retryable, provider_error_is_capacity_retryable,
-    provider_overload_retry_delay, transient_route_retry_delay,
+    MAX_CAPACITY_RETRIES, MAX_PROVIDER_ROUTE_RETRIES, TurnRetryState, capacity_retry_delay,
+    delay_label, output_cap_retry_tokens, provider_error_is_backoff_retryable,
+    provider_error_is_capacity_retryable, provider_overload_retry_delay,
+    transient_route_retry_delay,
 };
 use super::speculation::SpeculationRegistry;
 
@@ -81,7 +81,6 @@ impl crate::Agent {
         tool_timeline: &super::retention::ToolTimeline,
         speculation_registry: &SpeculationRegistry,
         evidence: &EvidenceTracker,
-        review_repair: &ReviewRepairState,
         compat_fallbacks: &mut Vec<String>,
         effective_fallback_route: &mut Option<String>,
         ui: &mut dyn Ui,
@@ -415,7 +414,6 @@ impl crate::Agent {
                     sched_serial_runs,
                     tool_timeline,
                     evidence,
-                    review_repair,
                     &self.prefix_stability,
                 );
                 self.report.last_turn_telemetry.wire_audit = wire_audit;
@@ -687,7 +685,6 @@ impl crate::Agent {
                     sched_serial_runs,
                     tool_timeline,
                     evidence,
-                    review_repair,
                     &self.prefix_stability,
                 );
                 self.report.last_turn_telemetry.wire_audit = wire_audit;
@@ -773,7 +770,6 @@ impl crate::Agent {
                     sched_serial_runs,
                     tool_timeline,
                     evidence,
-                    review_repair,
                     &self.prefix_stability,
                 );
                 self.report.last_turn_telemetry.wire_audit = wire_audit;

@@ -1,6 +1,6 @@
-//! Provider retries, historical answer-repair telemetry, and output-cap backoff.
+//! Provider retries and output-cap backoff.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use hi_ai::{Content, OutputCapError};
 use sha2::{Digest, Sha256};
@@ -82,13 +82,6 @@ pub(super) fn keep_working_nudge(no_progress_reason: &str, signature: Option<&st
         ));
     }
     out
-}
-
-/// Retained empty telemetry fields for compatibility with older turn reports.
-#[derive(Default)]
-pub(super) struct ReviewRepairState {
-    pub(super) counts: BTreeMap<String, u32>,
-    pub(super) exhaustion_reason: String,
 }
 
 #[derive(Default)]
@@ -299,9 +292,8 @@ pub(super) fn delay_label(delay: std::time::Duration) -> String {
 }
 
 #[cfg(test)]
-mod review_repair_budget_tests {
+mod retry_and_historical_telemetry_tests {
     use super::*;
-    use crate::config::ReviewRepairBudgets;
     use crate::steering::ReviewRepairMode;
 
     #[test]
@@ -319,16 +311,9 @@ mod review_repair_budget_tests {
     }
 
     #[test]
-    fn every_mode_has_default_budget_and_stable_keys() {
-        let budgets = ReviewRepairBudgets::default();
+    fn historical_modes_have_stable_keys() {
         let mut keys = std::collections::BTreeSet::new();
         for mode in ReviewRepairMode::ALL {
-            assert!(
-                mode.limit_with(&budgets) > 0,
-                "{} default budget must be positive",
-                mode.key()
-            );
-            assert_eq!(budgets.limit_for_key(mode.key()), mode.limit_with(&budgets));
             assert!(keys.insert(mode.key()), "duplicate key {}", mode.key());
             assert!(
                 mode.exhaustion_key().ends_with("_exhausted")

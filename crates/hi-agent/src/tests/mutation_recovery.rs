@@ -20,14 +20,12 @@ fn natural_build_continuation_uses_implementation_guards() {
 }
 
 #[tokio::test]
-async fn bounded_discovery_seals_a_mutation_only_recovery_round() {
-    let workspace = IsolatedWorkspace::new("bounded-discovery-forces-mutation");
+async fn fresh_discovery_keeps_inspection_tools_past_former_cap() {
+    let workspace = IsolatedWorkspace::new("fresh-discovery-retains-tools");
     let mut responses = Vec::new();
     std::fs::create_dir_all(workspace.path("src")).unwrap();
-    // Twelve distinct reads reproduce the weak-model behavior from the live
-    // session without relying on exact-call repeat detection. The first ten
-    // spend the ordinary discovery budget; two bounded advisory rounds remain.
-    for file in 0..12 {
+    // Fresh evidence must remain available regardless of investigation length.
+    for file in 0..24 {
         let relative = format!("src/context-{file}.rs");
         std::fs::write(
             workspace.path(&relative),
@@ -74,26 +72,28 @@ async fn bounded_discovery_seals_a_mutation_only_recovery_round() {
         .iter()
         .filter(|entry| entry.tool == "read")
         .collect::<Vec<_>>();
-    assert_eq!(read_entries.len(), 12);
+    assert_eq!(read_entries.len(), 24);
     assert!(
         read_entries
             .iter()
             .all(|entry| entry.status == hi_tools::ToolStatus::Succeeded)
     );
-    assert!(ui.statuses.iter().any(|status| {
-        status.contains("mutation request used 12 model rounds (12 tools) without editing")
-    }));
-    let recorded_tools = tool_names.lock().unwrap();
-    let recovery_tools = &recorded_tools[12];
-    assert!(!recovery_tools.is_empty());
-    assert!(recovery_tools.iter().all(|name| {
-        hi_tools::tool_metadata(name)
-            .is_some_and(|metadata| metadata.capability == hi_tools::ToolCapability::Mutation)
-    }));
     assert!(
-        !recovery_tools
+        !ui.statuses
             .iter()
-            .any(|name| name == "read" || name == "grep" || name == "bash")
+            .any(|status| status.contains("without editing"))
     );
-    assert_eq!(modes.lock().unwrap()[12], ToolMode::Required);
+    let recorded_tools = tool_names.lock().unwrap();
+    for tools in recorded_tools.iter().take(25) {
+        assert!(tools.iter().any(|name| name == "read"));
+        assert!(tools.iter().any(|name| name == "bash"));
+    }
+    assert!(
+        modes
+            .lock()
+            .unwrap()
+            .iter()
+            .take(25)
+            .all(|mode| *mode == ToolMode::Auto)
+    );
 }

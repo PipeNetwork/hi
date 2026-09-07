@@ -104,10 +104,9 @@ pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 pub use config::{
     AgentConfig, AgentGates, AgentLoopLimits, AgentMemory, AgentPaths, AgentProgramConfig,
-    AgentProviderRoute, AgentRouting, AgentRsi, AgentSubagents, AnswerRepairBudgets,
-    CompletionReviewPolicy, ExecutionMode, LspMode, ProgramMode, ReviewPolicy, ReviewRepairBudgets,
-    ToolSet, VerificationMode, VerifyStage, WriteSubagentPolicy, detect_verify_pipeline,
-    detect_verify_pipeline_with,
+    AgentProviderRoute, AgentRouting, AgentRsi, AgentSubagents, CompletionReviewPolicy,
+    ExecutionMode, LspMode, ProgramMode, ReviewPolicy, ToolSet, VerificationMode, VerifyStage,
+    WriteSubagentPolicy, detect_verify_pipeline, detect_verify_pipeline_with,
 };
 pub use doctor::{Check as DoctorCheck, DoctorInput, DoctorReport, render_report_text, run_doctor};
 pub use heuristics::{humanize_count, looks_like_new_task};
@@ -536,15 +535,11 @@ pub struct TurnTelemetry {
     pub discovery_depth: String,
     /// Times the harness nudged a read-only review to inspect beyond a listing.
     pub quality_repair_nudges: u32,
-    /// Review-repair exhaustion reason, when a read-only review stopped
-    /// incomplete after exhausting a local repair mode.
+    /// Historical review-repair exhaustion reason; empty for new turns.
     pub review_repair_exhaustion_reason: String,
-    /// Per-mode review repair counts. `quality_repair_nudges` remains the
-    /// compatibility aggregate; this map explains which repair modes spent it.
+    /// Historical per-mode review-repair counts; empty for new turns.
     pub review_repair_counts: BTreeMap<String, u32>,
-    /// Whether the turn stopped because a review-repair mode exhausted its
-    /// local budget. Compare with `hit_step_cap` and `hit_tool_cap` to
-    /// distinguish repair exhaustion from explicit turn-wide ceilings.
+    /// Historical review-repair exhaustion marker; false for new turns.
     pub review_repair_stopped_by_exhaustion: bool,
     pub skeptic_unavailable_count: u32,
     pub skeptic_last_status: Option<SkepticStatus>,

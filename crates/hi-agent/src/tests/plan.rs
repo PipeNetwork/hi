@@ -134,7 +134,7 @@ impl hi_ai::Provider for ModeTransitionProvider {
     native_tool_test_provider!();
 }
 #[tokio::test]
-async fn bounded_discovery_plan_gets_one_targeted_read_before_mutation() {
+async fn planned_implementation_keeps_inspection_available() {
     let workspace = IsolatedWorkspace::new("mixed-review-build");
     let mut responses = Vec::new();
     for index in 0..9 {
@@ -179,14 +179,10 @@ async fn bounded_discovery_plan_gets_one_targeted_read_before_mutation() {
         1,
         1,
     ));
-    // Reproduce the live Pipe/GLM failure: after the one allowed post-plan
-    // read, the model tries another inspection. This call must be rejected by
-    // the sealed mutation-only envelope (without executing) and corrected on
-    // the next request, rather than succeeding and immediately ending the turn
-    // as NoProgress.
+    // Further inspection after a plan must execute before the eventual edit.
     responses.push(completion(
         vec![Content::ToolCall {
-            id: "post-plan-forbidden-grep".into(),
+            id: "post-plan-grep".into(),
             name: "grep".into(),
             arguments: serde_json::json!({
                 "path": "src",
@@ -211,7 +207,7 @@ async fn bounded_discovery_plan_gets_one_targeted_read_before_mutation() {
         1,
         1,
     ));
-    responses.push(bash_completion("true # validate"));
+    responses.push(bash_completion("python3 -c 'assert 2 + 2 == 4'"));
     responses.push(completion(vec![Content::Text("implemented".into())], 1, 1));
 
     let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -251,20 +247,16 @@ async fn bounded_discovery_plan_gets_one_targeted_read_before_mutation() {
     );
     assert!(outcome.verified_workspace_revision.is_some());
     assert!(changed.exists());
-    assert!(
-        [
-            "implementation plan recorded after bounded discovery",
-            "implementation plan got its final read round",
-        ]
-        .iter()
-        .all(|needle| ui.statuses.iter().any(|status| status.contains(needle)))
-    );
     let read_results = ui
         .tool_results
         .iter()
         .filter(|(name, _)| name == "read")
         .collect::<Vec<_>>();
-    assert_eq!(read_results.len(), 10, "all bounded reads must execute");
+    assert_eq!(
+        read_results.len(),
+        10,
+        "all investigation reads must execute"
+    );
     assert!(
         read_results
             .iter()
@@ -294,30 +286,26 @@ async fn bounded_discovery_plan_gets_one_targeted_read_before_mutation() {
         .collect::<std::collections::BTreeSet<_>>();
     assert!(post_plan_tools.contains("read"));
     assert!(post_plan_tools.contains("write"));
-    assert_eq!(modes.lock().unwrap()[10], ToolMode::Required);
-    let focused_requests = tool_names.lock().unwrap()[11..=12].to_vec();
-    assert!(focused_requests.iter().all(|tools| {
-        !tools.is_empty()
-            && tools.iter().all(|name| {
-                hi_tools::tool_metadata(name).is_some_and(|metadata| {
-                    metadata.capability == hi_tools::ToolCapability::Mutation
-                })
-            })
-    }));
-    assert!(focused_requests.iter().all(|tools| {
-        !tools
+    for tools in &tool_names.lock().unwrap()[10..=12] {
+        assert!(tools.iter().any(|name| name == "read"));
+        assert!(tools.iter().any(|name| name == "grep"));
+    }
+    assert!(
+        modes.lock().unwrap()[10..=12]
             .iter()
-            .any(|name| name == "read" || name == "grep" || name == "bash")
-    }));
-    assert_eq!(modes.lock().unwrap()[11], ToolMode::Required);
-    assert_eq!(modes.lock().unwrap()[12], ToolMode::Required);
-    assert!(ui.tool_results.iter().any(|(name, result)| {
-        name == "grep" && result.contains("\"reason\":\"unavailable_tool\"")
-    }));
+            .all(|mode| *mode == ToolMode::Auto)
+    );
+    assert!(
+        agent
+            .last_turn_telemetry()
+            .tool_timeline
+            .iter()
+            .any(|entry| entry.tool == "grep" && entry.status == hi_tools::ToolStatus::Succeeded)
+    );
 }
 
 #[tokio::test]
-async fn resumed_active_plan_is_resumed_at_the_discovery_boundary() {
+async fn resumed_active_plan_keeps_inspection_available() {
     let workspace = IsolatedWorkspace::new("resumed-plan-build");
     let mut responses = Vec::new();
     for index in 0..10 {
@@ -348,7 +336,7 @@ async fn resumed_active_plan_is_resumed_at_the_discovery_boundary() {
         1,
         1,
     ));
-    responses.push(bash_completion("true # validate"));
+    responses.push(bash_completion("python3 -c 'assert 2 + 2 == 4'"));
     responses.push(completion(vec![Content::Text("implemented".into())], 1, 1));
 
     let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -380,13 +368,6 @@ async fn resumed_active_plan_is_resumed_at_the_discovery_boundary() {
     );
     assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert!(changed.exists());
-    assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("active implementation plan already exists")),
-        "the bounded guard should resume the durable plan: {:?}",
-        ui.statuses
-    );
     let recovery_tools = tool_names.lock().unwrap()[10]
         .iter()
         .cloned()
@@ -985,7 +966,7 @@ async fn plan_off_removes_stale_controls_and_executes_build_all_follow_up() {
             1,
         ),
         write_completion("implemented.txt"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(
             vec![Content::ToolCall {
                 id: "implemented".into(),
@@ -1178,8 +1159,7 @@ async fn long_plan_10_steps_runs_to_completion() {
     let mut ui = RecUi::default();
     agent
         // This fixture exercises plan continuation with inspection-only tool
-        // calls. Keep the request explicitly read-only so the mutation
-        // contract does not correctly stop it after bounded discovery.
+        // calls. Keep the request explicitly read-only to match that work.
         .run_turn("review the feature plan", &mut ui)
         .await
         .unwrap();
@@ -2000,7 +1980,11 @@ async fn generic_completion_after_validation_keeps_final_plan_step_alive() {
         )
     };
     let mut agent = agent(
-        vec![bash_completion("true # validate"), generic(), generic()],
+        vec![
+            bash_completion("python3 -c 'assert 2 + 2 == 4'"),
+            generic(),
+            generic(),
+        ],
         cfg,
     );
     agent.restore_plan(vec![pending_step("run the final verification")]);

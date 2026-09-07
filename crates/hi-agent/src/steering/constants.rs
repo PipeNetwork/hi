@@ -105,24 +105,6 @@ re-run the same poll. Check the underlying process directly (bash_output on its 
 to block for new output instead of re-polling — its log file, or the process list), fix what is stuck if \
 you can, or if the wait is genuinely still in progress use a much longer interval. If you cannot make \
 progress now, stop and report the current state and what remains.";
-/// Sent when the turn has spent its waiting budget: several consecutive tool
-/// rounds did nothing but watch still-running background work (with or without
-/// fresh output — a live progress bar makes every poll look new). Babysitting a
-/// long process one model round at a time is the most expensive failure mode
-/// observed in real transcripts (hundreds of rounds re-polling two downloads).
-/// Steer the model to either block once server-side or end the turn honestly.
-pub(crate) const BACKGROUND_WAIT_STATUS_NUDGE: &str = "The background process is still running. Stop \
-polling it round after round. If it should produce output or finish within a few minutes, make ONE \
-bash_output call with wait_secs (up to 600) to block until then. Otherwise stop now and give a concise \
-final status: the work remains in progress, what has been completed so far, and what remains once it \
-finishes. Do not claim completion or failure, and do not keep watching a process that will run for a \
-long time.";
-/// Sent when the model keeps polling after [`BACKGROUND_WAIT_STATUS_NUDGE`] —
-/// the next round is forced tool-free so the status answer actually lands.
-pub(crate) const BACKGROUND_WAIT_FINAL_NUDGE: &str = "The background process is still running and you \
-were already asked to stop polling it. Give your final status answer now: state that the work remains \
-in progress, what has been completed so far, and what remains. Do not call any tools and do not claim \
-completion or failure.";
 pub(crate) const SECURITY_PREFLIGHT_PATTERN: &str = "unsafe|unwrap\\(|expect\\(|panic!|std::process|process::Command|Command::new|spawn\\(|std::fs|fs::|read_to_string|std::env|env::|secret|token|auth|api_key|apikey|password|credential|bearer";
 pub(crate) const GAP_PREFLIGHT_PATTERN: &str =
     "TODO|FIXME|todo!|unimplemented!|missing|gap|needs coverage|not implemented";
@@ -131,16 +113,11 @@ successful file changes are in the transcript yet. Do not finalize a diagnosis. 
 workspace if needed, then create or edit the necessary files with write/edit/multi_edit/apply_patch \
 or a project-local scaffold command. If after inspection the task genuinely requires no edits, \
 state plainly that no file changes are needed and explain why.";
-pub(crate) const IMPLEMENTATION_MISSING_VALIDATION_NUDGE: &str = "Files changed for this implementation \
-request, but no successful noninteractive validation command ran after the last change. Do not \
-finalize. Run the detected build/test/check command now, then finish with changed files and the \
-validation command.";
-pub(crate) const REQUESTED_VALIDATION_NUDGE: &str = "The user explicitly asked you to run validation, \
-but no successful build/test/check command is in the transcript. Run the requested command now and \
+
+pub(crate) const REQUESTED_VALIDATION_NUDGE: &str = "The user explicitly asked you to run tests, \
+but no successful test run is in the transcript. Run the requested command now and \
 report its actual result. Do not claim completion without tool evidence.";
-pub(crate) const IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE: &str = "This implementation request has only scaffold \
-or dependency/setup changes so far. Do not finalize yet. Edit the actual source/config files that \
-implement the requested behavior, then run validation after the final edit.";
+
 pub(crate) const IMPLEMENTATION_EMPTY_TUI_NUDGE: &str = "The implementation preflight found no project \
 manifest. This is a TUI request, so scaffold the Rust binary in the current directory now with \
 `cargo init --bin .`, then add Ratatui/Crossterm, implement the requested behavior, and validate with \

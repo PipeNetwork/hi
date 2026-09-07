@@ -100,8 +100,9 @@ pub(super) async fn append_fast_feedback(
                 ui,
             )
             .await;
-            if report.tests_ran && !report.tests_failed && !report.tests_timed_out {
+            if report.validates_implementation(run_tests) {
                 implementation_tracker.record_validation_success();
+                implementation_tracker.tests_seen |= report.tests_ran;
             }
             if let Some(text) = report.combined_feedback() {
                 fast_failures.push(text);

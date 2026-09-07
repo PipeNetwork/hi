@@ -154,7 +154,9 @@ async fn fallback_rejects_multiple_calls_before_executing_any_prefix() {
     steps.extend([
         ProviderStep::Completion(completion(vec![Content::Text(multi)], 1, 1)),
         ProviderStep::Completion(completion(vec![Content::Text(single)], 1, 1)),
-        ProviderStep::Completion(bash_completion("true # validate exact fallback")),
+        ProviderStep::Completion(bash_completion(
+            "python3 -c 'assert 2 + 2 == 4' exact fallback",
+        )),
         ProviderStep::Completion(completion(
             vec![Content::Text(
                 "Created accepted.txt and validated it.".into(),
@@ -236,7 +238,7 @@ async fn openai_sse_fallback_is_promoted_and_executed_by_the_agent() {
         failures: AtomicUsize::new(0),
         openai: OpenAiProvider::new(server.url().to_string(), "test".into()),
         tail: Mutex::new(vec![
-            bash_completion("true # validate streamed fallback"),
+            bash_completion("python3 -c 'assert 2 + 2 == 4' streamed fallback"),
             completion(
                 vec![Content::Text(
                     "Created streamed.txt and validated it.".into(),

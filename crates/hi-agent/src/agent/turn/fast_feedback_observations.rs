@@ -251,7 +251,7 @@ mod tests {
         let mut agent = crate::Agent::new(Arc::new(Canned(Mutex::new(responses))), cfg).unwrap();
         let mut ui = RecordingUi::default();
         let outcome = agent
-            .run_turn("Implement the answer function in src/lib.rs", &mut ui)
+            .run_turn("Build the answer function in src/lib.rs", &mut ui)
             .await
             .unwrap();
         assert_eq!(
@@ -263,6 +263,13 @@ mod tests {
         assert_eq!(outcome.verification, crate::VerificationStatus::Passed);
         assert!(!agent.task_recovery.exhausted);
         assert_eq!(agent.task_recovery.interventions, 0);
+        assert!(
+            !ui.statuses
+                .iter()
+                .any(|s| s.contains("missing validation") || s.contains("without validation")),
+            "{:?}",
+            ui.statuses
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
             source

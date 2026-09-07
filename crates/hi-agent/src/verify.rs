@@ -600,6 +600,15 @@ impl WorkspaceRepairVerifier {
         !self.stages.is_empty() || self.include_affected_packages
     }
 
+    /// Only a pipeline with a real test command owns an explicit test request.
+    pub(crate) fn includes_tests(&self) -> bool {
+        self.stages.iter().any(|stage| {
+            crate::steering::command_runs_tests(
+                &serde_json::json!({"command": stage.command}).to_string(),
+            )
+        })
+    }
+
     /// The current round (0 before any verify run, 1-based after).
     #[allow(dead_code)]
     pub(crate) fn round(&self) -> u32 {
@@ -653,9 +662,9 @@ impl WorkspaceRepairVerifier {
 
     fn record_execution(&mut self, execution: VerificationExecution) {
         if execution.status == hi_tools::ToolStatus::Succeeded
-            && (execution.name.contains("test")
-                || execution.command.contains("test")
-                || execution.command.contains("pytest"))
+            && crate::steering::command_runs_tests(
+                &serde_json::json!({"command": execution.command}).to_string(),
+            )
         {
             self.successful_test_stage = true;
         }

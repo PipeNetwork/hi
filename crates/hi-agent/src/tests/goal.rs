@@ -1308,7 +1308,9 @@ async fn scaffolding_only_turn_does_not_invent_a_goal_failure() {
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
     let responses = vec![
-        bash_completion(&format!("mkdir -p {dir_string}")),
+        bash_completion(&format!(
+            "mkdir -p {dir_string} && printf scaffold > {dir_string}/README.md"
+        )),
         completion(vec![Content::Text("Implemented it.".into())], 1, 1),
         completion(vec![Content::Text("Done.".into())], 1, 1),
         completion(vec![Content::Text("Final recap.".into())], 1, 1),
@@ -1338,8 +1340,15 @@ async fn scaffolding_only_turn_does_not_invent_a_goal_failure() {
         Some(0),
         "bounded settlement leaves the current goal active"
     );
-    assert_eq!(goal.sub_goals[0].attempts, 0);
-    assert!(goal.sub_goals[0].notes.is_empty());
+    assert_eq!(goal.sub_goals[0].attempts, 1);
+    assert!(
+        goal.sub_goals[0]
+            .notes
+            .iter()
+            .all(|note| !note.to_lowercase().contains("fail")),
+        "{:?}",
+        goal.sub_goals[0].notes
+    );
 }
 
 #[tokio::test]

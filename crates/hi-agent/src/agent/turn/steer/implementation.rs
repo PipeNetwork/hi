@@ -1,9 +1,7 @@
 //! Post-tool Steer: mutation recovery, repeat/no-progress, implementation stalls.
 
-use crate::agent::mutation_recovery_turn::MutationRecoveryControl;
 use crate::steering::{
-    BACKGROUND_WAIT_FINAL_NUDGE, BACKGROUND_WAIT_STATUS_NUDGE, EvidenceTracker,
-    IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker, MutationRecovery,
+    EvidenceTracker, IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker,
     REREAD_NUDGE, WAIT_POLL_STATIC_NUDGE, bash_call_waits, implementation_text_tool_nudge,
     implementation_tool_call_validates, tool_validation_retry_nudge, unavailable_tool_retry_nudge,
 };
@@ -13,7 +11,7 @@ use crate::ui::Ui;
 use super::super::phase::TurnPhase;
 use super::super::progress::{
     AWAITING_BACKGROUND_REASON, NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker,
-    WAITING_ROUND_BUDGET, no_progress_signature_for_calls,
+    no_progress_signature_for_calls,
 };
 use super::super::tools::{ToolBatchOutcome, ToolProtocolFailureKind};
 use super::RoundControl;
@@ -59,7 +57,6 @@ impl crate::Agent {
         implementation_intent: Option<ImplementationIntent>,
         implementation_tracker: &mut ImplementationTracker,
         evidence: &mut EvidenceTracker,
-        mutation_recovery: &mut MutationRecovery,
         progress_tracker: &mut ProgressTracker,
         repeat_nudges: &mut u32,
         force_tools_next: &mut bool,
@@ -293,56 +290,14 @@ impl crate::Agent {
             ui.status("plan completed; settling from successful tool evidence");
             return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
         }
-        match self.handle_mutation_recovery(
-            mutation_recovery,
-            expected_mutation,
-            implementation_tracker,
-            evidence,
-            plan_changed_this_batch,
-            force_tools_next,
-            ui,
-        ) {
-            MutationRecoveryControl::None => {}
-            MutationRecoveryControl::Continue => return RoundControl::Continue,
-            MutationRecoveryControl::Break => {
-                implementation_tracker.no_mutation_exhausted = true;
-                progress_tracker.record(
-                    ProgressKind::None,
-                    "implementation discovery exhausted without a mutation",
-                    None,
-                );
-                ui.nudge(
-                    "implementation discovery budget was exhausted; settling with current evidence",
-                );
-                return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
-            }
-        }
-        // Waiting-round detection keys on the process *lifecycle*, not output
-        // novelty: a live progress bar makes every poll deliver fresh bytes,
-        // which defeated the byte-identical idle guard for hours while the
-        // turn burned a model round per poll. A round that only watched
-        // still-running background work is waiting, full stop. After the
-        // budget, steer to a terminal status answer; a quiet-but-running
-        // process is not a no-progress turn, so no repeat budgets are consumed.
-        //
-        // Exception: a poll whose fresh output carried failure diagnostics
-        // (compiler errors, test failures, panics) is new work arriving, not
-        // waiting — falling through to the else arm resets the whole streak
-        // so the model may act on the evidence. A live turn was once forced
-        // tool-free one round after its poll finally surfaced the compile
-        // error it needed to fix; that must not happen again.
+        // A live command is still doing work. Poll counts say nothing about
+        // whether it is stuck, and must not remove the tools needed to finish.
+        // Failure diagnostics still fall through so the model can act on them.
         let waiting_round = running_background_poll_results > 0
             && wait_flavored_results == calls.len()
             && actionable_poll_results == 0;
+        progress_tracker.awaiting_background = waiting_round;
         if waiting_round {
-            progress_tracker.waiting_rounds = progress_tracker.waiting_rounds.saturating_add(1);
-        } else {
-            progress_tracker.waiting_rounds = 0;
-            progress_tracker.awaiting_background = false;
-        }
-        if waiting_round && progress_tracker.waiting_rounds >= WAITING_ROUND_BUDGET {
-            let first_request = !progress_tracker.awaiting_background;
-            progress_tracker.awaiting_background = true;
             *repeat_nudges = 0;
             *force_tools_next = false;
             progress_tracker.force_no_progress_final_answer_next = false;
@@ -351,20 +306,6 @@ impl crate::Agent {
                 AWAITING_BACKGROUND_REASON,
                 no_progress_signature_for_calls(calls),
             );
-            if first_request {
-                ui.nudge(
-                    "the background process is still running; asking the model to wait once with wait_secs or wrap up with a status report",
-                );
-                self.messages
-                    .push_nudge(NudgeKind::Continue, BACKGROUND_WAIT_STATUS_NUDGE);
-            } else {
-                // Still polling after the wrap-up request — force the next
-                // round tool-free so the status answer actually lands.
-                progress_tracker.force_no_progress_final_answer_next = true;
-                ui.nudge("still polling after the wrap-up request — forcing a final status answer");
-                self.messages
-                    .push_nudge(NudgeKind::Continue, BACKGROUND_WAIT_FINAL_NUDGE);
-            }
             return RoundControl::Continue;
         }
         // A handle the model named that the registry has never seen. The
@@ -497,18 +438,15 @@ impl crate::Agent {
                     implementation_tracker.no_change_nudges += 1;
                     evidence.quality_repair_nudges =
                         evidence.quality_repair_nudges.saturating_add(1);
-                    let use_text_fallback = implementation_tracker.no_change_nudges >= 2;
-                    *force_tools_next = !use_text_fallback;
-                    *text_tool_fallback_next = use_text_fallback;
+                    *force_tools_next = false;
+                    *text_tool_fallback_next = false;
                     ui.nudge(
-                    "implementation repeated equivalent inspection output without editing; nudging the model to edit or scaffold",
-                );
-                    let nudge = if use_text_fallback {
-                        implementation_text_tool_nudge(IMPLEMENTATION_NO_CHANGES_NUDGE)
-                    } else {
-                        IMPLEMENTATION_NO_CHANGES_NUDGE.to_string()
-                    };
-                    self.messages.push_nudge(NudgeKind::Continue, nudge);
+                        "repeated inspection made no progress; requesting an edit or explanation",
+                    );
+                    self.messages.push_nudge(
+                        NudgeKind::Continue,
+                        IMPLEMENTATION_NO_CHANGES_NUDGE.to_string(),
+                    );
                     return RoundControl::Continue;
                 }
 
@@ -555,6 +493,12 @@ impl crate::Agent {
             return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
         } else if !tool_progress_labels.is_empty() {
             progress_tracker.record_round_from_tools(tool_progress_labels);
+            if tool_progress_labels
+                .iter()
+                .any(|label| label.kind == ProgressKind::Meaningful)
+            {
+                *repeat_nudges = 0;
+            }
         }
 
         RoundControl::Continue

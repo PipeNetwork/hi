@@ -50,7 +50,7 @@ fn narrow_success_cannot_clear_a_broader_failure_even_after_inputs_change() {
 }
 
 #[test]
-fn regressing_a_historical_pass_reopens_failure_without_reearning_credit() {
+fn repairing_a_new_revision_reopens_progress() {
     let mut state = TaskRecoveryState::default();
     state.observe_validation("full suite", "revision-a", failures(), false, true);
     state.intervene("repair");
@@ -65,8 +65,8 @@ fn regressing_a_historical_pass_reopens_failure_without_reearning_credit() {
     state.observe_validation("full suite", "revision-d", None, true, true);
     assert_eq!(state.unresolved_validation_status("revision-d"), None);
     assert_eq!(
-        state.remaining, 2,
-        "an old best pass cannot replenish recovery again"
+        state.remaining, 3,
+        "a new checked revision replenishes recovery"
     );
 }
 
@@ -128,7 +128,7 @@ fn legacy_failure_migrates_and_ambiguous_pass_history_requires_revalidation() {
 }
 
 #[test]
-fn a_real_pass_can_resolve_an_unrecognized_failure_once() {
+fn a_real_pass_resolves_unrecognized_failures_on_new_revisions() {
     let mut state = TaskRecoveryState::default();
     state.observe_validation("custom check", "a", None, false, false);
     state.intervene("repair");
@@ -137,6 +137,27 @@ fn a_real_pass_can_resolve_an_unrecognized_failure_once() {
     state.intervene("repair");
     state.observe_validation("custom check", "c", None, false, false);
     state.observe_validation("custom check", "d", None, true, false);
-    assert_eq!(state.remaining, 2);
+    assert_eq!(state.remaining, 3);
     assert_eq!(state.unresolved_validation_status("d"), None);
+}
+
+#[test]
+fn successful_revision_credit_survives_resume_and_rejects_cycles() {
+    let mut state = TaskRecoveryState::default();
+    assert!(state.observe_validation("check", "a", None, true, true));
+    assert!(state.intervene("first warning"));
+    assert!(!state.observe_validation("check", "a", None, true, true));
+    assert_eq!(state.remaining, 2);
+    assert!(state.observe_validation("check", "b", None, true, true));
+    assert_eq!(state.remaining, 3);
+    let mut restored: TaskRecoveryState =
+        serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert!(restored.intervene("another warning"));
+    assert!(!restored.observe_validation("check", "a", None, true, true));
+    assert!(!restored.observe_validation("check", "b", None, true, true));
+    assert_eq!(restored.remaining, 2);
+    restored.stop("provider stopped");
+    restored.observe_validation("check", "c", None, true, true);
+    assert!(restored.exhausted);
+    assert_eq!(restored.remaining, 0);
 }

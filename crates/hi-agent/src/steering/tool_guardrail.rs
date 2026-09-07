@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 mod validation;
+pub(crate) use validation::{command_runs_tests, is_validation_command};
 
 use validation::bash_validation_scope;
 pub(crate) use validation::{tool_result_hash_guard_applies, validation_exit_status_is_reliable};
@@ -127,9 +128,7 @@ impl ToolLoopGuardrail {
         // are distinct events, not a static state.
         let key = if let Some(validation) = validation {
             format!(
-                "bash-validation:{:?}:{}:{}:{}",
-                self.workspace_revision,
-                self.workspace_mutation_epoch,
+                "bash-validation:{}:{}",
                 stable_result_hash(&validation),
                 stable_result_hash(output)
             )
@@ -150,6 +149,13 @@ impl ToolLoopGuardrail {
         } else {
             format!("{name}:{}", stable_result_hash(output))
         };
+        // Identical context may be needed again after an edit elsewhere in
+        // the project. Both inspection and validation repeats are local to the
+        // current revision, including effects without a ledger revision yet.
+        let key = format!(
+            "{:?}:{}:{key}",
+            self.workspace_revision, self.workspace_mutation_epoch
+        );
         let repeated = self.seen_idempotent_result_hashes.contains(&key);
         if !repeated {
             self.seen_idempotent_result_hashes.insert(key.clone());
@@ -479,6 +485,46 @@ mod tests {
                 .repeated_idempotent_result,
             "a landed mutation starts a new validation epoch"
         );
+    }
+
+    #[test]
+    fn context_result_repeats_are_scoped_to_workspace_revision_and_effects() {
+        for (name, arguments) in [
+            ("read", r#"{"path":"context.rs"}"#),
+            ("grep", r#"{"pattern":"caller"}"#),
+            ("list", r#"{"path":"src"}"#),
+            ("bash", r#"{"command":"sed -n '1,20p' context.rs"}"#),
+        ] {
+            let mut guard = ToolLoopGuardrail::default();
+            guard.observe_workspace_revision(7);
+            assert!(
+                !guard
+                    .record_tool_result(name, arguments, "same context")
+                    .repeated_idempotent_result
+            );
+            assert!(
+                guard
+                    .record_tool_result(name, arguments, "same context")
+                    .repeated_idempotent_result
+            );
+            guard.observe_workspace_revision(8);
+            assert!(
+                !guard
+                    .record_tool_result(name, arguments, "same context")
+                    .repeated_idempotent_result
+            );
+            assert!(
+                guard
+                    .record_tool_result(name, arguments, "same context")
+                    .repeated_idempotent_result
+            );
+            guard.record_tool_result_with_effects("delegate", "{}", "edited", true);
+            assert!(
+                !guard
+                    .record_tool_result(name, arguments, "same context")
+                    .repeated_idempotent_result
+            );
+        }
     }
 
     #[test]

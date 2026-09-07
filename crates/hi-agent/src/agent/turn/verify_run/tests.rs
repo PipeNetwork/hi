@@ -74,7 +74,7 @@ async fn verification_waits_for_auto_background_reap_and_settlement() {
         None,
         None,
         "bash",
-        r#"{"command":"sleep 600"}"#,
+        r#"{"command":"sleep 0.2; echo foreground-finished"}"#,
     )
     .await;
     let id = output
@@ -116,6 +116,11 @@ async fn verification_waits_for_auto_background_reap_and_settlement() {
     }
     drop(verification);
     // Also clean up the failing-before case before reporting the regression.
+    assert_eq!(
+        background.outcome(&id).unwrap().state,
+        hi_tools::BackgroundState::Exited
+    );
+    assert_eq!(background.outcome(&id).unwrap().exit_code, Some(0));
     background.kill_and_reap(&id).await.unwrap();
     assert!(
         !completed_before_settlement,

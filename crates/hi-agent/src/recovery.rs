@@ -11,9 +11,14 @@ const COMPLETED_OBSERVATIONS: usize = 4096;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 struct ValidationFrontier {
+    // Historical wire name; now the most recent recognized failure set.
     best_failures: Option<BTreeSet<String>>,
     passed: bool,
+    // Omitted for historical sessions so their stored digests remain valid.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    passed_revisions: BTreeSet<String>,
     failed_states: Vec<String>,
+    // Retained for old session digests; diagnostic recurrence no longer stops work.
     #[serde(default)]
     diagnostic_states: Vec<String>,
     #[serde(default)]
@@ -26,6 +31,8 @@ impl<'de> Deserialize<'de> for ValidationFrontier {
         struct StoredFrontier {
             best_failures: Option<BTreeSet<String>>,
             passed: bool,
+            #[serde(default)]
+            passed_revisions: BTreeSet<String>,
             failed_states: Vec<String>,
             #[serde(default)]
             diagnostic_states: Vec<String>,
@@ -75,6 +82,7 @@ impl<'de> Deserialize<'de> for ValidationFrontier {
         Ok(Self {
             best_failures: stored.best_failures,
             passed: stored.passed,
+            passed_revisions: stored.passed_revisions,
             failed_states: stored.failed_states,
             diagnostic_states: stored.diagnostic_states,
             current_failure,
@@ -367,7 +375,9 @@ impl TaskRecoveryState {
             &observation.input_revision,
             observation.diagnostics.clone(),
             observation.status == ValidationResult::Passed,
-            observation.required_stage,
+            // Automatic checks are selected for the actual edited paths. A
+            // stable pass is progress even when no final stage requires it.
+            observation.required_stage || !repair,
         );
         if observation.status == ValidationResult::Passed {
             for alias in &observation.equivalent_scopes {
@@ -414,7 +424,8 @@ impl TaskRecoveryState {
     }
 
     /// Exact scope matching intentionally does not infer that a narrow check
-    /// proves a broader one. Unrecognized diagnostics never establish progress.
+    /// proves a broader one. Changed diagnostics on a fresh workspace revision
+    /// establish progress; error counts and subset ordering do not.
     pub(crate) fn observe_validation(
         &mut self,
         scope: &str,
@@ -431,9 +442,16 @@ impl TaskRecoveryState {
         let frontier = self.validations.entry(scope.to_owned()).or_default();
         if passed {
             let repaired_failure = frontier.current_failure.take().is_some();
-            if !frontier.passed && (required_stage || repaired_failure) {
+            if required_stage || repaired_failure || frontier.passed {
+                // A check passing on new source bytes is fresh progress. The
+                // same check on the same bytes (even after resume or a cycle)
+                // cannot keep buying retries. Never reopen a terminal stop.
+                improvement = if input_revision.is_empty() {
+                    !frontier.passed
+                } else {
+                    frontier.passed_revisions.insert(input_revision.to_owned())
+                };
                 frontier.passed = true;
-                improvement = true;
             }
         } else {
             frontier.current_failure = Some(CurrentValidationFailure {
@@ -443,20 +461,12 @@ impl TaskRecoveryState {
             // Bind failure identity to input bytes as well as diagnostic scope.
             let failed_state =
                 serde_json::to_string(&(input_revision, &failures)).expect("string state");
-            if let Some(failures) = &failures {
-                let identity = serde_json::to_string(failures).expect("string set");
-                if frontier.diagnostic_states.last() != Some(&identity) {
-                    if frontier.diagnostic_states.contains(&identity) {
-                        self.stop("verification returned to a previous failure set");
-                        return false;
-                    }
-                    frontier.diagnostic_states.push(identity);
-                    if frontier.diagnostic_states.len() > FAILED_STATE_HISTORY {
-                        frontier.diagnostic_states.remove(0);
-                    }
-                }
-            }
-            if frontier.failed_states.contains(&failed_state) {
+            if frontier.failed_states.iter().any(|previous| {
+                previous == &failed_state
+                    || (!input_revision.is_empty()
+                        && serde_json::from_str::<(String, Option<BTreeSet<String>>)>(previous)
+                            .is_ok_and(|(revision, _)| revision == input_revision))
+            }) {
                 self.stop("verification revisited an unsuccessful workspace state");
                 return false;
             }
@@ -465,17 +475,16 @@ impl TaskRecoveryState {
                 frontier.failed_states.remove(0);
             }
             if let Some(failures) = failures.filter(|failures| !failures.is_empty()) {
-                if !frontier.passed
+                // Compilers reveal later errors as earlier ones are fixed. A
+                // changed failure set need not be smaller or a strict subset.
+                // The historical field name is retained for session compatibility;
+                // it now tracks the most recent recognized diagnostics.
+                improvement = !input_revision.is_empty()
                     && frontier
                         .best_failures
                         .as_ref()
-                        .is_some_and(|best| failures.len() < best.len() && failures.is_subset(best))
-                {
-                    improvement = true;
-                    frontier.best_failures = Some(failures);
-                } else if frontier.best_failures.is_none() {
-                    frontier.best_failures = Some(failures);
-                }
+                        .is_some_and(|previous| previous != &failures);
+                frontier.best_failures = Some(failures);
             }
         }
         if improvement {
@@ -745,20 +754,26 @@ mod tests {
     }
 
     #[test]
-    fn only_a_new_best_failure_set_replenishes() {
+    fn changed_diagnostics_on_fresh_revisions_replenish() {
         let mut state = TaskRecoveryState::default();
         state.observe_validation("full", "a", failures(&["x", "y"]), false, true);
         assert!(state.intervene("fix"));
         state.observe_validation("narrow", "b", None, true, false);
         assert_eq!(state.remaining, 2);
-        state.observe_validation("full", "b", failures(&["x"]), false, true);
+        state.observe_validation("full", "b", failures(&["z", "w", "v"]), false, true);
         assert_eq!(state.remaining, 3);
         assert!(state.intervene("fix"));
         state.observe_validation("full", "c", failures(&["x", "y"]), false, true);
         state.observe_validation("full", "d", failures(&["x"]), false, true);
         assert!(
+            !state.exhausted,
+            "diagnostics can recur on different source revisions"
+        );
+        assert_eq!(state.remaining, 3);
+        state.observe_validation("full", "a", failures(&["x", "y"]), false, true);
+        assert!(
             state.exhausted,
-            "regressing and reclaiming a prior best is a failure cycle"
+            "revisiting the same failed workspace still stops"
         );
     }
 

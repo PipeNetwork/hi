@@ -7,12 +7,10 @@ use std::collections::BTreeSet;
 
 use crate::agent::turn::fast_feedback::FastFeedbackState;
 use crate::agent::turn::progress::ProgressTracker;
-use crate::agent::turn::retry::{ReviewRepairState, TurnRetryState};
+use crate::agent::turn::retry::TurnRetryState;
 use crate::agent::turn::speculation::SpeculationRegistry;
 use crate::domain::TurnControlFlags;
-use crate::steering::{
-    EvidenceTracker, ImplementationIntent, ImplementationTracker, MutationRecovery, ReviewIntent,
-};
+use crate::steering::{EvidenceTracker, ImplementationIntent, ImplementationTracker, ReviewIntent};
 use crate::verify::{Snapshot, WorkspaceRepairVerifier};
 use crate::{ReviewStatus, TaskContract, TurnPhaseLatencies};
 
@@ -59,14 +57,12 @@ pub(super) struct TurnState {
 
     // --- control / trackers ---
     pub flags: TurnControlFlags,
-    pub mutation_recovery: MutationRecovery,
     pub plan_updated_goal: bool,
     pub proposed_goal: Option<crate::Goal>,
     pub goal_before: Option<crate::Goal>,
     pub progress_tracker: ProgressTracker,
     pub evidence: EvidenceTracker,
     pub implementation_tracker: ImplementationTracker,
-    pub review_repair: ReviewRepairState,
     pub empty_tui_needs_project: bool,
 
     // --- scheduler / tools ---
@@ -136,7 +132,6 @@ pub(super) struct TurnState {
 impl TurnState {
     /// Project model-round mutables from this owned bag.
     pub(super) fn as_model_round_state(&mut self) -> super::model_round::ModelRoundState<'_> {
-        let mutation_recovery_requires_focus = self.mutation_recovery.requires_mutation_focus();
         super::model_round::ModelRoundState {
             steps: &mut self.steps,
             empty_retries: &mut self.empty_retries,
@@ -171,7 +166,6 @@ impl TurnState {
             progress_tracker: &mut self.progress_tracker,
             evidence: &mut self.evidence,
             implementation_tracker: &mut self.implementation_tracker,
-            review_repair: &mut self.review_repair,
             last_verify_attributions: &mut self.last_verify_attributions,
             tool_timeline: &mut self.tool_timeline,
             speculation_registry: &self.speculation_registry,
@@ -187,7 +181,6 @@ impl TurnState {
             read_only_intent: self.read_only_intent,
             implementation_intent: self.implementation_intent,
             expected_mutation: self.expected_mutation,
-            mutation_recovery_requires_focus,
             requested_validation: self.requested_validation,
             input: &self.turn_input,
             user_prompt_tokens: self.user_prompt_tokens,

@@ -1,8 +1,4 @@
 const VALIDATION_FAMILIES: &[(&str, &str)] = &[
-    // Lightweight fixture used by turn-level tests. Keep it in the same
-    // normalization path as real validators so those tests exercise the
-    // semantic result guard rather than an exact-call fallback.
-    ("true # validate", "fixture:validate"),
     ("cargo test", "cargo:test"),
     ("cargo check", "cargo:check"),
     ("cargo build", "cargo:build"),
@@ -21,6 +17,8 @@ const VALIDATION_FAMILIES: &[(&str, &str)] = &[
     ("yarn build", "yarn:build"),
     ("bun run build", "bun:build"),
     ("bun test", "bun:test"),
+    ("python3 -m unittest", "unittest"),
+    ("python -m unittest", "unittest"),
     ("python -m pytest", "pytest"),
     ("python3 -m pytest", "pytest"),
     ("python -c", "python:inline"),
@@ -91,9 +89,6 @@ pub(crate) fn validation_exit_status_is_reliable(name: &str, arguments: &str) ->
     let Some(command) = super::super::implementation::bash_command(arguments) else {
         return false;
     };
-    if !super::super::implementation::shell_command_likely_validates(&command) {
-        return true;
-    }
     let Some((_, phrase_end, family)) = validation_match(&command) else {
         return false;
     };
@@ -102,6 +97,12 @@ pub(crate) fn validation_exit_status_is_reliable(name: &str, arguments: &str) ->
 }
 
 fn validation_match(command: &str) -> Option<(usize, usize, &'static str)> {
+    validation_matches(command)
+        .into_iter()
+        .min_by_key(|(start, _, _)| *start)
+}
+
+fn validation_matches(command: &str) -> Vec<(usize, usize, &'static str)> {
     let lower = command.to_ascii_lowercase();
     VALIDATION_FAMILIES
         .iter()
@@ -114,7 +115,7 @@ fn validation_match(command: &str) -> Option<(usize, usize, &'static str)> {
                 .then_some((start, end, *family))
             })
         })
-        .min_by_key(|(start, _, _)| *start)
+        .collect()
 }
 
 fn validation_family_applies(command: &str, phrase_end: usize, family: &str) -> bool {
@@ -582,5 +583,84 @@ mod tests {
         assert!(
             bash_validation_scope(&python).is_some_and(|scope| scope.contains("python:script"))
         );
+    }
+}
+
+pub(crate) fn is_validation_command(command: &str) -> bool {
+    validation_match(command).is_some()
+}
+
+/// Tests are a distinct obligation; compilation alone does not satisfy it.
+pub(crate) fn command_runs_tests(arguments: &str) -> bool {
+    let Some(command) = super::super::implementation::bash_command(arguments) else {
+        return false;
+    };
+    validation_matches(&command)
+        .into_iter()
+        .any(|(_, end, family)| {
+            let suffix = &command[end..];
+            let flags = &suffix[..first_shell_boundary(suffix)];
+            if validation_requests_metadata(family, suffix)
+                || flags.split_whitespace().any(|word| {
+                    matches!(
+                        word.trim_matches(['\'', '"']),
+                        "--no-run" | "--list" | "--collect-only" | "--collectonly" | "--listTests"
+                    )
+                })
+                || !shell_command_preserves_exit_status(&command)
+            {
+                return false;
+            }
+            matches!(
+                family,
+                "cargo:test"
+                    | "npm:test"
+                    | "pnpm:test"
+                    | "yarn:test"
+                    | "bun:test"
+                    | "pytest"
+                    | "unittest"
+                    | "go:test"
+                    | "make:test"
+                    | "just:test"
+            )
+        })
+}
+
+#[cfg(test)]
+mod test_obligation_tests {
+    use super::*;
+    #[test]
+    fn tests_must_execute_and_propagate_failure() {
+        for command in [
+            "cargo test",
+            "cargo check && cargo test --quiet",
+            "python3 -m unittest test_answer",
+            "npm test",
+        ] {
+            assert!(
+                command_runs_tests(&serde_json::json!({"command":command}).to_string()),
+                "{command}"
+            );
+        }
+        for command in [
+            "cargo check",
+            "true # validate",
+            "echo cargo test",
+            "echo 'cargo test'",
+            "cargo test --no-run",
+            "cargo test -- --list",
+            "pytest --collect-only",
+            "cargo test || true",
+            "cargo test | head",
+            "cargo test --help",
+        ] {
+            assert!(
+                !command_runs_tests(&serde_json::json!({"command":command}).to_string()),
+                "{command}"
+            );
+        }
+        assert!(!is_validation_command("true # validate"));
+        assert!(!is_validation_command("echo cargo test"));
     }
 }

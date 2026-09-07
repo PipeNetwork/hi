@@ -17,12 +17,9 @@
 //! - WorkspaceRepair → Model (failed verify / coding obligation)
 //! - Any → Done (outer `run_turn` wrapper, including `?` exits)
 //!
-//! Three distinct "review/repair" concepts touch this pipeline:
+//! Two distinct "review/repair" concepts touch this pipeline:
 //! - [`TurnPhase::WorkspaceRepair`] — compile/lint/test via
 //!   [`crate::verify::WorkspaceRepairVerifier`]; failures re-enter Model.
-//! - **Answer repair** — quality nudges inside [`TurnPhase::Steer`] via
-//!   [`crate::steering::ReviewRepairMode`] / `ReviewRepairState`; never runs
-//!   shell stages and never writes [`crate::ReviewStatus`].
 //! - **Completion review** — independent/large-diff skeptic after a green
 //!   WorkspaceRepair (`ReviewPolicy` → [`crate::ReviewStatus`]); Object may
 //!   re-enter Model up to `max_independent_review_repairs`.

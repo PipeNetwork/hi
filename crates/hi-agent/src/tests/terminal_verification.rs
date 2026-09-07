@@ -24,8 +24,15 @@ async fn exhausted_edit_case(
     let receipts = tempfile::NamedTempFile::new().unwrap();
     let receipt_path = serde_json::to_string(receipts.path().to_str().unwrap()).unwrap();
     std::fs::write(workspace.path("state.rs"), "baseline\n").unwrap();
+    // An unchanged failure set keeps this fixture focused on exhaustion.
+    // Newly revealed diagnostics correctly earn another repair attempt.
+    let diagnostic_state = if verification_cap_spent && final_state == "still-broken" {
+        "'still-broken'"
+    } else {
+        "state"
+    };
     std::fs::write(workspace.path("validate.py"), format!(
-        "from pathlib import Path\nimport sys\nstate = Path('state.rs').read_text().strip()\nwith open({receipt_path}, 'a') as receipt: receipt.write(state + '\\n')\nif state == 'unavailable':\n print('Operation not permitted')\n sys.exit(1)\nif state != 'fixed':\n print('test current::' + state + ' ... FAILED')\n sys.exit(1)\nprint('test result: ok. 1 passed; 0 failed')\n"
+        "from pathlib import Path\nimport sys\nstate = Path('state.rs').read_text().strip()\nwith open({receipt_path}, 'a') as receipt: receipt.write(state + '\\n')\nif state == 'unavailable':\n print('Operation not permitted')\n sys.exit(1)\nif state != 'fixed':\n print('test current::' + {diagnostic_state} + ' ... FAILED')\n sys.exit(1)\nprint('test result: ok. 1 passed; 0 failed')\n"
     )).unwrap();
     let command = "python3 validate.py";
     let mut cfg = workspace.config();
@@ -47,7 +54,7 @@ async fn exhausted_edit_case(
     let steps = if verification_cap_spent {
         vec![
             ProviderStep::Completion(edit_state("baseline", "broken")),
-            ProviderStep::Completion(bash_completion("true # validate")),
+            ProviderStep::Completion(bash_completion("python3 -c 'assert 2 + 2 == 4'")),
             ProviderStep::Completion(completion(vec![Content::Text("Updated state.rs with the requested implementation and checked the edited source. The source is ready for the configured verification stage.".into())], 1, 1)),
             ProviderStep::Completion(edit_state("broken", final_state)),
             if current_check_failed {

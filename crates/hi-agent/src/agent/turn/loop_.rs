@@ -19,9 +19,9 @@ use crate::domain::VerifyEvidence;
 use crate::heuristics::{looks_like_continue, looks_like_new_task, tool_mode_label};
 use crate::steering::{
     EvidenceTracker, IMPLEMENTATION_EMPTY_TUI_NUDGE, ImplementationIntent, ImplementationTracker,
-    MutationRecovery, classify_implementation_intent, classify_read_only_intent,
-    implementation_mentions_tui, implementation_turn_prompt, implicit_read_only_review_intent,
-    is_bounded_file_review, preflight_is_redundant_for_prompt, read_only_turn_prompt,
+    classify_implementation_intent, classify_read_only_intent, implementation_mentions_tui,
+    implementation_turn_prompt, implicit_read_only_review_intent, is_bounded_file_review,
+    preflight_is_redundant_for_prompt, read_only_turn_prompt,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::{Snapshot, WorkspaceRepairVerifier, is_internal_runtime_artifact_path};
@@ -38,7 +38,7 @@ use super::helpers::{
 };
 use super::phase::TurnPhase;
 use super::progress::ProgressTracker;
-use super::retry::{ReviewRepairState, TurnRetryState};
+use super::retry::TurnRetryState;
 
 impl crate::Agent {
     pub(in crate::agent::turn) async fn run_turn_core(
@@ -469,7 +469,7 @@ impl crate::Agent {
                 // includes the initial verification pass.
                 self.config.gates.max_verify_repairs.saturating_add(1)
             };
-        // Workspace repair only — not review-answer repair (see ReviewRepairState).
+        // Workspace verification repair.
         let mut verifier = if matches!(&self.config.gates.verification, VerificationMode::Auto) {
             WorkspaceRepairVerifier::automatic(resolved_verify_stages, verify_rounds)
         } else {
@@ -494,9 +494,6 @@ impl crate::Agent {
         // Per-turn control flags (force-next-tool, stalls, caps, obligation).
         // See [`TurnControlFlags`] — field projection keeps call sites direct.
         let mut flags = TurnControlFlags::default();
-        // Bounded discovery narrows the advertised catalog until the model
-        // records a plan or makes the requested edit.
-        let mutation_recovery = MutationRecovery::default();
         // A model-authored plan is only a proposal until deterministic
         // verification passes for the settled workspace revision. Keeping it
         // turn-local prevents failed, unverified, cancelled, or infrastructure-
@@ -522,7 +519,6 @@ impl crate::Agent {
         let advertised_tool_names = BTreeSet::new();
         let tool_schema_tokens = 0_u64;
         let mut evidence = EvidenceTracker::default();
-        let review_repair = ReviewRepairState::default();
         let independent_review_status = ReviewStatus::NotRequired;
         let independent_review_repairs = 0_u32;
         let last_hygiene_repair_revision = None;
@@ -679,14 +675,12 @@ impl crate::Agent {
             continue_total_nudges,
             repeat_nudges,
             flags,
-            mutation_recovery,
             plan_updated_goal,
             proposed_goal,
             goal_before: goal_before.clone(),
             progress_tracker,
             evidence,
             implementation_tracker,
-            review_repair,
             empty_tui_needs_project,
             sched_tool_calls,
             sched_max_concurrent,
@@ -872,7 +866,7 @@ impl crate::Agent {
                             .saturating_add(tool_started.elapsed().as_millis() as u64);
                         let batch = batch_result?;
                         if turn.expected_mutation
-                            && turn.implementation_tracker.substantive_edit_seen
+                            && turn.implementation_tracker.mutation_seen
                         {
                             self.task_recovery.observe_requested_mutation();
                         }
@@ -890,7 +884,6 @@ impl crate::Agent {
                             turn.implementation_intent,
                             &mut turn.implementation_tracker,
                             &mut turn.evidence,
-                            &mut turn.mutation_recovery,
                             &mut turn.progress_tracker,
                             &mut turn.repeat_nudges,
                             &mut turn.flags.force_tools_next,
@@ -1253,7 +1246,6 @@ impl crate::Agent {
             turn.sched_serial_runs,
             &turn.tool_timeline,
             &turn.evidence,
-            &turn.review_repair,
             &self.prefix_stability,
         );
         self.report.last_turn_telemetry.model_requests = model_telemetry.model_requests;
@@ -1585,6 +1577,15 @@ impl crate::Agent {
                 classified_stop_reason = TurnStopReason::VerificationUnavailable;
                 self.report.verify = crate::domain::VerifyEvidence::none();
             }
+        }
+        if turn.requested_validation
+            && !turn.implementation_tracker.tests_seen
+            && !turn.verifier.successful_test_stage()
+            && status == TurnStatus::Completed
+        {
+            status = TurnStatus::Failed;
+            verification = VerificationStatus::Unverified;
+            classified_stop_reason = TurnStopReason::VerificationUnavailable;
         }
         let no_progress_exhausted = self.task_recovery.exhausted
             || turn.implementation_tracker.no_mutation_exhausted

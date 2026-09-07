@@ -177,7 +177,6 @@ fn review_repair_modes_map_stable_metadata() {
             "review_no_evidence_exhausted",
             "inspect_files_before_answering",
             "no_evidence",
-            4,
         ),
         (
             ReviewRepairMode::ListingOnly,
@@ -185,7 +184,6 @@ fn review_repair_modes_map_stable_metadata() {
             "review_listing_only_exhausted",
             "inspect_one_concrete_file_before_answering",
             "listing",
-            4,
         ),
         (
             ReviewRepairMode::GenericTemplate,
@@ -193,7 +191,6 @@ fn review_repair_modes_map_stable_metadata() {
             "review_generic_disclaimer_exhausted",
             "produce_concrete_bounded_review",
             "generic",
-            4,
         ),
         (
             ReviewRepairMode::InspectedDisclaimer,
@@ -201,7 +198,6 @@ fn review_repair_modes_map_stable_metadata() {
             "review_generic_disclaimer_exhausted",
             "chat_only_bounded_answer_from_inspected_files",
             "disclaimer",
-            4,
         ),
         (
             ReviewRepairMode::InspectedDisclaimerChatAttempt,
@@ -209,7 +205,6 @@ fn review_repair_modes_map_stable_metadata() {
             "review_generic_disclaimer_exhausted",
             "chat_only_bounded_answer_from_inspected_files",
             "disclaimer_chat",
-            2,
         ),
         (
             ReviewRepairMode::ConcreteAnswer,
@@ -217,7 +212,6 @@ fn review_repair_modes_map_stable_metadata() {
             "review_concrete_answer_exhausted",
             "cite_findings_plus_limits",
             "concrete",
-            4,
         ),
         (
             ReviewRepairMode::ReadAfterSearch,
@@ -225,7 +219,6 @@ fn review_repair_modes_map_stable_metadata() {
             "review_read_after_search_exhausted",
             "read_one_matching_file_before_answering",
             "read_after_search",
-            2,
         ),
         (
             ReviewRepairMode::SecurityBroadSearch,
@@ -233,7 +226,6 @@ fn review_repair_modes_map_stable_metadata() {
             "review_security_broad_search_exhausted",
             "search_required_security_patterns_before_answering",
             "security_broad",
-            4,
         ),
         (
             ReviewRepairMode::SecurityScope,
@@ -241,7 +233,6 @@ fn review_repair_modes_map_stable_metadata() {
             "review_security_scope_exhausted",
             "bound_security_claims_to_inspected_evidence",
             "security_scope",
-            5,
         ),
         (
             ReviewRepairMode::GapSearchOverclaim,
@@ -249,7 +240,6 @@ fn review_repair_modes_map_stable_metadata() {
             "review_gap_search_overclaim_exhausted",
             "cite_search_matches_plus_limits",
             "gap_overclaim",
-            3,
         ),
         (
             ReviewRepairMode::SprawlForceAnswer,
@@ -257,18 +247,16 @@ fn review_repair_modes_map_stable_metadata() {
             "review_sprawl_force_answer_exhausted",
             "chat_only_bounded_answer_from_inspected_files",
             "sprawl_force",
-            3,
         ),
     ];
 
     assert_eq!(ReviewRepairMode::ALL.len(), expected.len());
-    for (mode, key, exhaustion, required_next, compact, limit) in expected {
+    for (mode, key, exhaustion, required_next, compact) in expected {
         assert!(ReviewRepairMode::ALL.contains(&mode));
         assert_eq!(mode.key(), key);
         assert_eq!(mode.exhaustion_key(), exhaustion);
         assert_eq!(mode.required_next(), required_next);
         assert_eq!(mode.compact_label(), compact);
-        assert_eq!(mode.default_limit(), limit);
         assert_eq!(crate::compact_review_repair_label(key), compact);
     }
     assert_eq!(
@@ -541,61 +529,33 @@ fn implementation_preflight_detects_rust_validation() {
 }
 
 #[tokio::test]
-async fn implementation_turn_repairs_no_changes_and_missing_validation() {
-    let path = temp_file("implementation-repair");
-    let path_string = path.to_string_lossy().to_string();
+async fn final_verifier_owns_post_edit_validation_without_an_extra_model_round() {
+    let mut cfg = config();
+    let path = cfg.paths.workspace_root.join("answer.txt");
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![crate::VerifyStage::new(
+        "check",
+        "python3 -c 'from pathlib import Path; assert Path(\"answer.txt\").read_text() == \"x\"'",
+    )]);
     let responses = vec![
+        completion(vec![Content::Text("I will implement it.".into())], 1, 1),
+        write_completion(path.to_str().unwrap()),
         completion(
-            vec![Content::Text("Completed the requested action.".into())],
-            1,
-            1,
-        ),
-        write_completion(&path_string),
-        completion(
-            vec![Content::Text("Implemented the calculator.".into())],
-            1,
-            1,
-        ),
-        bash_completion("true # validate"),
-        completion(
-            vec![Content::Text(format!(
-                "Changed {path_string} and validated with true # validate."
-            ))],
+            vec![Content::Text("Implemented the requested change.".into())],
             1,
             1,
         ),
     ];
-    let mut agent = agent(responses, config());
+    let mut agent = agent(responses, cfg);
     let mut ui = RecordingUi::default();
-    agent
+    let outcome = agent
         .run_turn("/build a small CLI project tracker", &mut ui)
         .await
         .unwrap();
-    let _ = std::fs::remove_file(&path);
-
-    assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("no file changes")),
-        "expected no-change repair status: {:?}",
-        ui.statuses
-    );
-    assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("without validation")),
-        "expected validation repair status: {:?}",
-        ui.statuses
-    );
-    assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 2);
-    assert!(
-        agent
-            .messages()
-            .last()
-            .unwrap()
-            .text()
-            .contains("validated with true # validate")
-    );
+    assert_eq!(outcome.status, TurnStatus::Completed, "{:?}", ui.statuses);
+    assert_eq!(outcome.verification, crate::VerificationStatus::Passed);
+    assert_eq!(agent.last_turn_telemetry().model_requests, 3);
+    assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 1);
+    assert!(!ui.statuses.iter().any(|s| s.contains("without validation")));
 }
 
 #[tokio::test]
@@ -667,7 +627,7 @@ async fn no_change_challenge_keeps_structured_tools_and_accepts_edit() {
             1,
         ),
         completion(vec![Content::Text("Implemented the app.".into())], 1, 1),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(
             vec![Content::Text(
                 "Implemented src/main.rs and validated it successfully.".into(),
@@ -731,7 +691,7 @@ async fn implementation_with_accepted_answer_settles_without_recap_inference() {
             .last()
             .unwrap()
             .text()
-            .contains("Final recap"),
+            .contains("Implemented it."),
         "normal settlement preserves the accepted model answer"
     );
     assert_eq!(outcome.status, TurnStatus::Completed);
@@ -746,98 +706,40 @@ async fn implementation_with_accepted_answer_settles_without_recap_inference() {
 }
 
 #[tokio::test]
-async fn scaffold_only_implementation_gets_source_edit_nudge() {
-    let dir = temp_file("implementation-scaffold-only");
-    let dir_string = dir.to_string_lossy().to_string();
-    let responses = vec![
-        bash_completion(&format!("mkdir -p {dir_string}")),
-        completion(vec![Content::Text("Implemented it.".into())], 1, 1),
-        completion(vec![Content::Text("Done.".into())], 1, 1),
-        completion(vec![Content::Text("Final recap.".into())], 1, 1),
-    ];
-    let mut agent = agent(responses, config());
+async fn shell_generated_source_is_a_complete_mutation_without_scaffold_or_xml_repair() {
+    let mut cfg = config();
+    cfg.gates.verification = crate::VerificationMode::Disabled;
+    cfg.gates.allow_unverified = true;
+    let source = cfg.paths.workspace_root.join("source.txt");
+    let mut agent = agent(
+        vec![
+            bash_completion(
+                "python3 -c 'from pathlib import Path; Path(\"source.txt\").write_text(\"implemented\")'",
+            ),
+            completion(
+                vec![Content::Text(
+                    "Created source.txt with the requested content.".into(),
+                )],
+                1,
+                1,
+            ),
+        ],
+        cfg,
+    );
     let mut ui = RecordingUi::default();
-    agent
-        .run_turn("/build a small CLI project tracker", &mut ui)
+    let outcome = agent
+        .run_turn("create source.txt containing implemented", &mut ui)
         .await
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-
-    assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("only scaffolded setup files")),
-        "expected scaffold-only repair status: {:?}",
-        ui.statuses
-    );
-    assert!(
-        agent
-            .messages()
-            .last()
-            .unwrap()
-            .text()
-            .contains("Final recap"),
-        "normal settlement preserves the accepted model answer"
-    );
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "implemented");
+    assert_eq!(outcome.status, TurnStatus::Completed, "{:?}", ui.statuses);
+    assert_eq!(agent.last_turn_telemetry().model_requests, 2);
+    assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 0);
     assert!(
         !agent
-            .last_turn_telemetry()
-            .last_no_progress_reason
-            .contains("stalled"),
-        "internal no-progress bookkeeping must not expose the removed stall state"
-    );
-}
-
-#[tokio::test]
-async fn scaffold_only_repair_can_use_text_tool_fallback_for_source_edit() {
-    let scaffold_dir = temp_file("implementation-scaffold-text-fallback-dir");
-    let scaffold_dir_string = scaffold_dir.to_string_lossy().to_string();
-    let source_path = temp_file("implementation-scaffold-text-fallback-src");
-    let source_path_string = source_path.to_string_lossy().to_string();
-    let xmlish_write = format!(
-        "<tool_call>write<arg_key>path</arg_key><arg_value>{source_path_string}</arg_value><arg_key>content</arg_key><arg_value>implemented\n</arg_value></tool_call>"
-    );
-    let responses = vec![
-        bash_completion(&format!("mkdir -p {scaffold_dir_string}")),
-        completion(vec![Content::Text("Implemented it.".into())], 1, 1),
-        completion(vec![Content::Text("Done.".into())], 1, 1),
-        completion(vec![Content::Text(xmlish_write)], 1, 1),
-        bash_completion("true # validate"),
-        completion(
-            vec![Content::Text(format!(
-                "Changed {source_path_string} and validated with true # validate."
-            ))],
-            1,
-            1,
-        ),
-    ];
-    let mut agent = agent(responses, config());
-    let mut ui = RecordingUi::default();
-    agent
-        .run_turn("/build a small CLI project tracker", &mut ui)
-        .await
-        .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&source_path).unwrap(),
-        "implemented\n"
-    );
-    let _ = std::fs::remove_dir_all(&scaffold_dir);
-    let _ = std::fs::remove_file(&source_path);
-
-    assert!(
-        agent
             .messages()
-            .last()
-            .unwrap()
-            .text()
-            .contains("validated with true # validate")
-    );
-    assert!(
-        ui.statuses
             .iter()
-            .any(|status| status.contains("only scaffolded setup files")),
-        "expected scaffold repair status: {:?}",
-        ui.statuses
+            .any(|m| m.text().contains("<tool_call>"))
     );
 }
 
@@ -1562,4 +1464,293 @@ async fn read_only_review_repeated_search_returns_typed_no_progress() {
     assert_eq!(outcome.status, TurnStatus::Failed);
     assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
     assert!(ui.assistant.contains("Automatic recovery stopped."));
+}
+
+#[tokio::test]
+async fn repeated_inspection_challenges_allow_a_plain_text_explanation() {
+    let workspace = IsolatedWorkspace::new("repeat-inspection-explanation");
+    let mut responses = Vec::new();
+    for n in 0..3 {
+        let path = workspace.path(&format!("empty-{n}"));
+        std::fs::create_dir(&path).unwrap();
+        responses.push(completion(
+            vec![Content::ToolCall {
+                id: format!("list-{n}"),
+                name: "list".into(),
+                arguments: serde_json::json!({"path": path}).to_string(),
+            }],
+            1,
+            1,
+        ));
+    }
+    responses.push(completion(
+        vec![Content::Text(
+            "No file changes are needed because the requested empty directories already exist."
+                .into(),
+        )],
+        1,
+        1,
+    ));
+    let mut cfg = workspace.config();
+    cfg.loop_limits.max_repeat_nudges = 0;
+    cfg.gates.allow_unverified = true;
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordToolModes {
+        responses: Mutex::new(responses),
+        modes: modes.clone(),
+    };
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    let mut ui = RecUi::default();
+    let outcome = agent
+        .run_turn("Build three empty directories if missing", &mut ui)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Completed,
+        "{outcome:?}: {:?}",
+        ui.statuses
+    );
+    assert_eq!(
+        ui.statuses
+            .iter()
+            .filter(|s| s.contains("requesting an edit or explanation"))
+            .count(),
+        2,
+        "{:?}",
+        ui.statuses
+    );
+    assert!(
+        modes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|mode| *mode == ToolMode::Auto)
+    );
+    assert!(
+        !agent
+            .messages()
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|c| matches!(c, Content::Text(text) if text.contains("<tool_call>")))
+    );
+}
+
+#[tokio::test]
+async fn successful_edits_between_rereads_do_not_force_an_incomplete_closeout() {
+    let workspace = IsolatedWorkspace::new("chat-productive-rereads");
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    std::fs::write(
+        workspace.path("Cargo.toml"),
+        "[package]\nname = \"productive_rereads\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path("src/lib.rs"),
+        "pub fn answer() -> u32 { 0 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path("context.txt"),
+        "Neighboring API used by every implementation step.\n",
+    )
+    .unwrap();
+    assert!(
+        tokio::process::Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(workspace.path(""))
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    let read_context = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "read-context".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"context.txt"}"#.into(),
+            }],
+            1,
+            1,
+        )
+    };
+    let mut responses = vec![read_context()];
+    for step in 1..=5 {
+        responses.push(completion(vec![Content::ToolCall {
+            id: format!("edit-{step}"), name: "edit".into(),
+            arguments: serde_json::json!({"path":"src/lib.rs", "old_string": format!("pub fn answer() -> u32 {{ {} }}", step - 1), "new_string": format!("pub fn answer() -> u32 {{ {step} }}")}).to_string(),
+        }], 1, 1));
+        responses.push(read_context());
+    }
+    responses.push(completion(
+        vec![Content::Text(
+            "Implemented all five changes. Cargo check passed for the final source.".into(),
+        )],
+        1,
+        1,
+    ));
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordToolModes {
+        responses: Mutex::new(responses),
+        modes: modes.clone(),
+    };
+    let mut cfg = workspace.config();
+    cfg.gates.lsp_mode = LspMode::Off;
+    cfg.gates.verification = VerificationMode::Explicit(vec![
+        VerifyStage::new("check", "cargo check --quiet"),
+        VerifyStage::new("test", "cargo test --quiet"),
+    ]);
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    let mut ui = RecUi::default();
+    let outcome = agent
+        .run_turn("fix and build all of that", &mut ui)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Completed,
+        "{outcome:?}: {:?}",
+        ui.statuses
+    );
+    assert_eq!(outcome.verification, VerificationStatus::Passed);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path("src/lib.rs")).unwrap(),
+        "pub fn answer() -> u32 { 5 }\n"
+    );
+    assert!(!agent.task_recovery().exhausted);
+    assert_eq!(
+        agent.task_recovery().interventions,
+        0,
+        "post-edit context refreshes must not consume recovery"
+    );
+    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 0);
+    assert!(
+        modes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|mode| *mode != ToolMode::ChatOnly)
+    );
+}
+
+#[tokio::test]
+async fn post_edit_context_refresh_does_not_spend_the_stall_budget() {
+    let workspace = IsolatedWorkspace::new("chat-post-edit-context");
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    std::fs::write(
+        workspace.path("Cargo.toml"),
+        "[package]\nname = \"context_refresh\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path("src/lib.rs"),
+        "pub mod server; pub mod db; pub fn answer() -> u32 { 0 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path("src/server.rs"),
+        "pub const LIMIT: u32 = 1;\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.path("src/db.rs"), "pub const LIMIT: u32 = 2;\n").unwrap();
+    assert!(
+        tokio::process::Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(workspace.path(""))
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    let read = |path: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "read-context".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path":path}).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let edit = |path: &str, old: &str, new: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "edit-context".into(),
+                name: "edit".into(),
+                arguments: serde_json::json!({"path":path,"old_string":old,"new_string":new})
+                    .to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    // The live session: inspect the project, land two green edits, refresh
+    // neighboring context, repeat one read, then continue the remaining fix.
+    let responses = vec![
+        read("Cargo.toml"),
+        read("src/lib.rs"),
+        read("src/server.rs"),
+        read("src/db.rs"),
+        edit("src/lib.rs", "{ 0 }", "{ 1 }"),
+        read("src/lib.rs"),
+        edit("src/lib.rs", "{ 1 }", "{ 2 }"),
+        read("Cargo.toml"),
+        read("src/server.rs"),
+        read("src/db.rs"),
+        read("src/db.rs"),
+        edit("src/server.rs", "= 1;", "= 3;"),
+        completion(
+            vec![Content::Text(
+                "Updated the parser and server limits; all requested changes are complete.".into(),
+            )],
+            1,
+            1,
+        ),
+    ];
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordToolModes {
+        responses: Mutex::new(responses),
+        modes: modes.clone(),
+    };
+    let mut cfg = workspace.config();
+    cfg.gates.lsp_mode = LspMode::Off;
+    cfg.gates.verification = VerificationMode::Explicit(vec![
+        VerifyStage::new("check", "cargo check --quiet"),
+        VerifyStage::new("test", "cargo test --quiet"),
+    ]);
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    let mut ui = RecUi::default();
+    let outcome = agent
+        .run_turn("fix and build all of that", &mut ui)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Completed,
+        "{outcome:?}; {:?}",
+        ui.statuses
+    );
+    assert_eq!(
+        outcome.verification,
+        VerificationStatus::Passed,
+        "{outcome:?}; {:?}",
+        ui.statuses
+    );
+    assert!(
+        std::fs::read_to_string(workspace.path("src/server.rs"))
+            .unwrap()
+            .contains("= 3;")
+    );
+    assert!(!agent.task_recovery().exhausted);
+    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 0);
+    assert!(
+        modes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|mode| *mode != ToolMode::ChatOnly)
+    );
+    assert!(!ui.assistant.contains("Automatic recovery stopped."));
 }

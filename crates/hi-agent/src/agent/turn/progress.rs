@@ -9,7 +9,6 @@ use crate::heuristics::{looks_like_unfinished_step, parse_text_tool_calls};
 use crate::steering::{
     EvidenceTracker, ImplementationTracker, ToolLoopGuardrail, bash_no_progress_signature,
     classify_bash_command, evidence_kind_for_tool, implementation_tool_call_validates,
-    implementation_tool_result_landed_mutation, implementation_tool_result_landed_substantive_edit,
     inspection_signature,
 };
 
@@ -27,10 +26,6 @@ pub(super) const TOOL_LIMIT_WRAP_UP_NUDGE: &str = "You have reached this turn's 
 /// final-answer acceptance paths: it marks the turn as blocked only on live
 /// background work, so a status answer is a valid terminal outcome.
 pub(super) const AWAITING_BACKGROUND_REASON: &str = "background process is still running";
-/// Consecutive waiting rounds tolerated before the turn is steered to end with
-/// a status report. This catches fast completions without allowing unbounded
-/// model-driven polling.
-pub(super) const WAITING_ROUND_BUDGET: u32 = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProgressKind {
     Meaningful,
@@ -76,9 +71,7 @@ pub(super) struct ProgressTracker {
     pub(super) forced_final_answer_attempts: u32,
     pub(super) last_progress_reason: String,
     pub(super) last_no_progress_reason: String,
-    /// Consecutive tool rounds that only watched still-running background work.
-    pub(super) waiting_rounds: u32,
-    /// Sticky once the waiting budget is spent, until a round does real work.
+    /// The latest tool round only watched still-running background work.
     pub(super) awaiting_background: bool,
     /// Extra recoveries after a no-progress budget was spent (`max_keep_working`).
     pub(super) keep_working_rounds: u32,
@@ -95,6 +88,8 @@ pub(super) struct ProgressTracker {
     /// Settlement owns this as a typed no-progress outcome; it is not a
     /// provider transport or verification-infrastructure failure.
     pub(super) bounded_plan_answer_recovery_exhausted: bool,
+    /// Revision shared by the pre-call signature and post-call result guards.
+    inspection_revision: Option<u64>,
     pub(super) prev_added_no_evidence: bool,
     pub(super) prev_call_sig: Option<Vec<(String, String)>>,
     pub(super) tool_guardrail: ToolLoopGuardrail,
@@ -109,6 +104,35 @@ pub(super) struct ProgressTracker {
 }
 
 impl ProgressTracker {
+    pub(super) fn observe_workspace_revision(
+        &mut self,
+        evidence: &mut EvidenceTracker,
+        revision: u64,
+        mutation_applied: bool,
+    ) -> bool {
+        let changed = self
+            .inspection_revision
+            .replace(revision)
+            .is_some_and(|previous| previous != revision)
+            || mutation_applied;
+        self.tool_guardrail.observe_workspace_revision(revision);
+        if changed {
+            evidence.invalidate_workspace_inspections();
+            // The just-completed mutation remains eligible for exact-call
+            // deduplication (e.g. writing identical bytes again). External
+            // changes invalidate even the immediately preceding inspection.
+            if !mutation_applied {
+                self.prev_call_sig = None;
+            }
+            self.prev_added_no_evidence = false;
+            self.no_progress_nudges = 0;
+            self.no_progress_streak = 0;
+            self.last_no_progress_reason.clear();
+            self.force_no_progress_final_answer_next = false;
+        }
+        changed
+    }
+
     pub(super) fn push_event(
         &mut self,
         kind: ProgressKind,
@@ -174,6 +198,16 @@ impl ProgressTracker {
         signature: Option<String>,
     ) {
         let reason = reason.into();
+        if kind == ProgressKind::Meaningful {
+            // Warnings describe a consecutive stall, not lifetime debt. New
+            // edits/evidence must not inherit a forced closeout from earlier work.
+            self.no_progress_nudges = 0;
+            self.force_no_progress_final_answer_next = false;
+            self.repeat_sampling_rounds = 0;
+            self.keep_working_rounds = 0;
+            self.keep_working_blocked_signature = None;
+            self.last_no_progress_reason.clear();
+        }
         match kind {
             ProgressKind::Meaningful | ProgressKind::Weak => {
                 self.no_progress_streak = 0;
@@ -301,6 +335,7 @@ pub(super) fn classify_tool_progress(
     output: &str,
     error: bool,
     validation_succeeded: bool,
+    mutation_applied: bool,
     signature: Option<String>,
     signature_was_seen: bool,
     repeated_idempotent_result: bool,
@@ -310,6 +345,9 @@ pub(super) fn classify_tool_progress(
 ) -> ToolProgressLabel {
     if plan_changed {
         return ToolProgressLabel::new(ProgressKind::Meaningful, "changed plan state", signature);
+    }
+    if mutation_applied {
+        return ToolProgressLabel::new(ProgressKind::Meaningful, "successful mutation", signature);
     }
     if repeated_idempotent_result {
         return ToolProgressLabel::new(
@@ -352,12 +390,6 @@ pub(super) fn classify_tool_progress(
         }
         return ToolProgressLabel::new(ProgressKind::Weak, "tool returned an error", signature);
     }
-    if implementation_tool_result_landed_substantive_edit(name, arguments, output) {
-        return ToolProgressLabel::new(ProgressKind::Meaningful, "substantive edit", signature);
-    }
-    if implementation_tool_result_landed_mutation(name, arguments, output) {
-        return ToolProgressLabel::new(ProgressKind::Meaningful, "successful mutation", signature);
-    }
     if tracker_before.mutation_seen
         && validation_succeeded
         && implementation_tool_call_validates(name, arguments)
@@ -394,6 +426,54 @@ pub(super) fn classify_tool_progress(
 #[cfg(test)]
 mod progress_retention_tests {
     use super::*;
+
+    #[test]
+    fn workspace_revision_reopens_inspection_without_erasing_diagnostics() {
+        let mut tracker = ProgressTracker::default();
+        let mut evidence = EvidenceTracker::default();
+        let args = r#"{"path":"src/context.rs"}"#;
+        let calls = vec![("read".into(), "read".into(), args.into())];
+        assert!(!tracker.observe_workspace_revision(&mut evidence, 7, false));
+        evidence.record_success("read", args, "complete source");
+        tracker.prev_added_no_evidence = true;
+        tracker.no_progress_nudges = 2;
+        tracker.force_no_progress_final_answer_next = true;
+        assert!(!evidence.round_adds_evidence(&calls));
+        assert!(evidence.rereads_only_completed_files(&calls));
+        assert!(!tracker.observe_workspace_revision(&mut evidence, 7, false));
+        assert!(!evidence.round_adds_evidence(&calls));
+        assert!(tracker.force_no_progress_final_answer_next);
+
+        assert!(tracker.observe_workspace_revision(&mut evidence, 8, false));
+        assert!(evidence.round_adds_evidence(&calls));
+        assert!(!evidence.rereads_only_completed_files(&calls));
+        assert!(!tracker.force_no_progress_final_answer_next);
+        assert!(!tracker.prev_added_no_evidence);
+        assert_eq!(tracker.no_progress_nudges, 0);
+        assert_eq!(evidence.file_reads, 1);
+        assert_eq!(
+            evidence.inspected_paths.front().map(String::as_str),
+            Some("src/context.rs")
+        );
+
+        evidence.record_success("read", args, "complete source");
+        assert!(!evidence.round_adds_evidence(&calls));
+        assert!(tracker.observe_workspace_revision(&mut evidence, 8, true));
+        assert!(evidence.round_adds_evidence(&calls));
+    }
+
+    #[test]
+    fn meaningful_work_resets_stall_warnings_but_tool_errors_do_not() {
+        let mut tracker = ProgressTracker::default();
+        assert!(!tracker.record_no_progress_nudge("repeated read", None));
+        tracker.record(ProgressKind::Meaningful, "substantive edit", None);
+        assert!(!tracker.record_no_progress_nudge("repeated read", None));
+        tracker.record(ProgressKind::Weak, "tool returned an error", None);
+        assert!(tracker.record_no_progress_nudge("repeated read", None));
+        tracker.record_forced_final_answer_attempt();
+        tracker.record_final_answer();
+        assert_eq!(tracker.forced_final_answer_attempts, 1);
+    }
 
     #[test]
     fn plan_drive_progress_is_pinned_across_bounded_middle_compaction() {

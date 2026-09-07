@@ -1549,7 +1549,7 @@ async fn repeated_invalid_mutation_arguments_fall_back_to_text_and_survive_narra
         ),
         completion(vec![Content::Text(xmlish_write)], 1, 1),
         completion(vec![Content::Text("Implemented the app.".into())], 1, 1),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(
             vec![Content::Text(
                 "Implemented src/main.rs and validated it successfully.".into(),

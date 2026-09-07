@@ -11,7 +11,7 @@ use crate::steering::{
 use crate::verify::WorkspaceRepairVerifier;
 
 use super::super::progress::ProgressTracker;
-use super::super::retry::{ReviewRepairState, TurnRetryState};
+use super::super::retry::TurnRetryState;
 
 pub(super) fn deepseek_thinking_for_round(
     read_only_intent: Option<ReviewIntent>,
@@ -133,7 +133,6 @@ pub(in crate::agent::turn) struct ModelRoundState<'a> {
     pub progress_tracker: &'a mut ProgressTracker,
     pub evidence: &'a mut EvidenceTracker,
     pub implementation_tracker: &'a mut ImplementationTracker,
-    pub review_repair: &'a mut ReviewRepairState,
     pub last_verify_attributions: &'a mut Vec<hi_tools::Attribution>,
     pub tool_timeline: &'a mut super::super::retention::ToolTimeline,
     pub speculation_registry: &'a super::super::speculation::SpeculationRegistry,
@@ -149,9 +148,6 @@ pub(in crate::agent::turn) struct ModelRoundState<'a> {
     pub read_only_intent: Option<ReviewIntent>,
     pub implementation_intent: Option<ImplementationIntent>,
     pub expected_mutation: bool,
-    /// The bounded discovery state has spent its last inspection allowance;
-    /// this request must advertise mutation primitives only.
-    pub mutation_recovery_requires_focus: bool,
     pub requested_validation: bool,
     pub input: &'a str,
     pub user_prompt_tokens: u64,

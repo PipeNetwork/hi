@@ -129,10 +129,10 @@ async fn implementation_tool_protocol_exhaustion_falls_back_to_text_tool_calls()
             ProviderStep::Error(ProviderErrorKind::ToolProtocol),
             ProviderStep::Error(ProviderErrorKind::ToolProtocol),
             ProviderStep::Completion(completion(vec![Content::Text(xmlish_write)], 5, 3)),
-            ProviderStep::Completion(bash_completion("true # validate")),
+            ProviderStep::Completion(bash_completion("python3 -c 'assert 2 + 2 == 4'")),
             ProviderStep::Completion(completion(
                 vec![Content::Text(format!(
-                    "Changed {path_string} and validated with true # validate."
+                    "Changed {path_string} and validated with python3 -c 'assert 2 + 2 == 4'."
                 ))],
                 5,
                 3,
@@ -161,7 +161,7 @@ async fn implementation_tool_protocol_exhaustion_falls_back_to_text_tool_calls()
             .last()
             .unwrap()
             .text()
-            .contains("validated with true # validate")
+            .contains("validated with python3 -c 'assert 2 + 2 == 4'")
     );
     assert_eq!(
         requests.lock().unwrap().len(),

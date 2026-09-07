@@ -8,7 +8,6 @@ use crate::{GOAL_CONTINUE_NUDGE, PLAN_CONTINUE_NUDGE, Ui};
 
 use super::super::phase::TurnPhase;
 use super::super::progress::{AWAITING_BACKGROUND_REASON, ProgressKind, ProgressTracker};
-use super::super::retry::ReviewRepairState;
 use super::RoundControl;
 
 impl crate::Agent {
@@ -24,7 +23,6 @@ impl crate::Agent {
         requested_validation: bool,
         implementation_tracker: &mut ImplementationTracker,
         evidence: &mut EvidenceTracker,
-        _review_repair: &mut ReviewRepairState,
         progress_tracker: &mut ProgressTracker,
         silent_continues: &mut u32,
         generic_completion_retries: &mut u32,
@@ -169,13 +167,18 @@ impl crate::Agent {
                     self.messages.push_nudge(NudgeKind::Continue, nudge_body);
                     return Ok(RoundControl::Continue);
                 }
-                Some(super::impl_cascade::ImplementationCascadeAction::Exhausted { status }) => {
-                    if self.try_no_progress_recovery(
-                        progress_tracker,
-                        force_tools_next,
-                        Some(continue_total_nudges),
-                        ui,
-                    ) {
+                Some(super::impl_cascade::ImplementationCascadeAction::Exhausted {
+                    gate,
+                    status,
+                }) => {
+                    if gate == super::impl_cascade::ImplementationGate::NoChanges
+                        && self.try_no_progress_recovery(
+                            progress_tracker,
+                            force_tools_next,
+                            Some(continue_total_nudges),
+                            ui,
+                        )
+                    {
                         self.messages
                             .push_assistant(std::mem::take(completion_content));
                         return Ok(RoundControl::Continue);

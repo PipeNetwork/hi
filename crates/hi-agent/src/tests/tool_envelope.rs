@@ -430,7 +430,7 @@ async fn plain_text_fallback_stays_executable_on_an_auto_only_provider() {
                 1,
                 1,
             ),
-            bash_completion("true # validate"),
+            bash_completion("python3 -c 'assert 2 + 2 == 4'"),
             completion(
                 vec![Content::Text("Created and validated `result.txt`.".into())],
                 1,

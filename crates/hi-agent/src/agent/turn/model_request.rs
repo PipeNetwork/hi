@@ -57,30 +57,6 @@ pub(super) fn apply_bookkeeping_suppress(
     }
 }
 
-/// Narrow a bounded no-change recovery request to tools that can actually
-/// satisfy its mutation obligation. A Required round over the ordinary
-/// catalog is not a force-edit round: weak models can legally choose `read`
-/// forever. Preserve the original catalog when no mutation primitive is
-/// available so request construction never manufactures an impossible round.
-pub(super) fn apply_mutation_repair_focus(tools: Arc<[ToolSpec]>, focus: bool) -> Arc<[ToolSpec]> {
-    if !focus {
-        return tools;
-    }
-    let selected = tools
-        .iter()
-        .filter(|tool| {
-            hi_tools::tool_metadata(&tool.name)
-                .is_some_and(|metadata| metadata.capability == hi_tools::ToolCapability::Mutation)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if selected.is_empty() {
-        tools
-    } else {
-        selected.into()
-    }
-}
-
 /// Track advertised names and peak schema tokens for telemetry.
 pub(super) fn note_advertised_tools(
     tools: &[ToolSpec],
@@ -370,27 +346,5 @@ mod tests {
         let selected = ensure_plan_tool(tools, true);
         assert_eq!(selected[0].name, "update_plan");
         assert_eq!(selected[1].name, "read");
-    }
-
-    #[test]
-    fn mutation_repair_focus_excludes_inspection_and_process_tools() {
-        let tools: Arc<[ToolSpec]> = hi_tools::TOOL_SPECS
-            .iter()
-            .filter(|tool| {
-                matches!(
-                    tool.name.as_str(),
-                    "read" | "grep" | "bash" | "edit" | "write" | "apply_patch"
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-            .into();
-
-        let selected = apply_mutation_repair_focus(tools, true);
-        let names = selected
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["write", "edit", "apply_patch"]);
     }
 }

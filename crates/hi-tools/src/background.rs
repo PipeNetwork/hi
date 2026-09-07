@@ -1082,6 +1082,37 @@ impl BackgroundRegistry {
         .await
     }
 
+    /// Wait for foreground commands that exceeded the initial tool wait window.
+    /// Deliberate background jobs survive turn boundaries. Dropping this future
+    /// leaves process ownership with the registry for cancellation cleanup.
+    pub async fn wait_started_after_and_reap(&self, before: &[String]) -> usize {
+        let targets = {
+            let processes = self.processes.lock().unwrap();
+            processes
+                .iter()
+                .filter(|(id, process)| {
+                    !before.contains(id)
+                        && process.origin == BgOrigin::AutoBackgrounded
+                        && !process.inner.lock().unwrap().reaped
+                })
+                .map(|(_, process)| Arc::clone(process))
+                .collect::<Vec<_>>()
+        };
+        futures_util::future::join_all(targets.iter().map(|process| async move {
+            loop {
+                let notified = process.reaped.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if process.inner.lock().unwrap().reaped {
+                    break;
+                }
+                notified.await;
+            }
+        }))
+        .await;
+        targets.len()
+    }
+
     pub async fn kill_started_after_and_reap_before(
         &self,
         before: &[String],

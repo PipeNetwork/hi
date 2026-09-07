@@ -11,7 +11,7 @@ async fn changing_validation_output_selectors_cannot_loop_on_the_same_result() {
     let mut responses = Vec::new();
     for line in 1605..1611 {
         responses.push(bash_completion(&format!(
-            "true # validate 2>&1 | grep 'src/main.rs:{line}' | head -40"
+            "python3 -c 'assert 2 + 2 == 4' 2>&1 | grep 'src/main.rs:{line}' | head -40"
         )));
     }
     // If the convergence guard regresses, the provider reaches this answer
@@ -67,7 +67,7 @@ async fn weak_companion_call_cannot_hide_a_repeated_validation_result() {
                     name: "bash".into(),
                     arguments: serde_json::json!({
                         "command": format!(
-                            "true # validate 2>&1 | grep 'src/main.rs:{line}' | head -40"
+                            "python3 -c 'assert 2 + 2 == 4' 2>&1 | grep 'src/main.rs:{line}' | head -40"
                         )
                     })
                     .to_string(),

@@ -15,7 +15,6 @@
 mod constants;
 mod implementation;
 mod intent;
-mod mutation_recovery;
 mod nudges;
 mod preflight;
 mod review_repair;
@@ -25,7 +24,6 @@ mod types;
 pub(crate) use constants::*;
 pub(crate) use implementation::*;
 pub(crate) use intent::*;
-pub(crate) use mutation_recovery::*;
 pub(crate) use nudges::*;
 pub(crate) use preflight::*;
 pub(crate) use review_repair::*;

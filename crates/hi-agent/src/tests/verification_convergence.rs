@@ -213,7 +213,7 @@ async fn default_unlimited_hygiene_stops_after_an_unchanged_repair() {
     );
     let responses = vec![
         write_file_completion("large-source", "src/generated.rs", &large_source),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("initial implementation".into())], 1, 1),
         bash_completion("true # hygiene repair"),
         completion(
@@ -251,7 +251,7 @@ async fn default_unlimited_completion_review_stops_without_a_workspace_change() 
     let workspace = IsolatedWorkspace::new("outcome-review-unlimited-no-progress");
     let responses = vec![
         write_file_completion("write-review", "reviewed.txt", "v1\n"),
-        bash_completion("true # validate"),
+        bash_completion("python3 -c 'assert 2 + 2 == 4'"),
         completion(vec![Content::Text("initial implementation".into())], 1, 1),
         completion(
             vec![Content::Text("OBJECT\n- concrete defect".into())],
