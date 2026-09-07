@@ -5,7 +5,7 @@ use super::{
 };
 use crate::config::{Cli, ProviderName, Settings};
 use crate::landing::write_landing;
-use crate::project_context::{auto_memory_enabled, memory_context};
+use crate::project_context::auto_memory_enabled;
 use crate::provider::{
     default_skeptic_model, effective_max_tokens_for_model, startup_live_model_metadata,
 };
@@ -535,14 +535,6 @@ fn initialization_failure_still_writes_a_v2_report() {
     assert_eq!(report["rsi"]["candidate_evidence"], true);
     assert_eq!(report["telemetry"]["effective_max_steps"], 11);
     assert_eq!(report["telemetry"]["effective_max_tool_calls"], 7);
-}
-
-#[test]
-fn memory_context_wraps_nonempty_and_skips_blank() {
-    let section = memory_context("- run cargo fmt before commits").unwrap();
-    assert!(section.starts_with("# Memory (from past sessions)"));
-    assert!(section.contains("- run cargo fmt before commits"));
-    assert!(memory_context("   \n  ").is_none(), "blank → no section");
 }
 
 fn test_settings() -> Settings {

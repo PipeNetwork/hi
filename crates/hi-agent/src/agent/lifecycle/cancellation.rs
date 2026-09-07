@@ -8,9 +8,18 @@ impl crate::Agent {
     /// rollback, and wait for its native child/lifecycle callback to finish.
     /// Deliberate `run_in_background:true` services are not turn-scoped and are
     /// intentionally preserved.
+    #[cfg(test)]
     pub(crate) async fn quiesce_abnormal_turn_processes(&self) -> Result<usize> {
-        const FOREGROUND_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-        const CANDIDATE_PUBLICATION_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+        self.quiesce_abnormal_turn_processes_before(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .await
+    }
+
+    pub(crate) async fn quiesce_abnormal_turn_processes_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<usize> {
         let foreground = self.foreground_process_registry();
         foreground.kill_current();
 
@@ -22,15 +31,26 @@ impl crate::Agent {
         let background = self.runtime.background_arc();
         let wait_background = async move {
             match baseline {
-                Some(before) => background.kill_started_after_and_reap(&before).await,
+                Some(before) => {
+                    background
+                        .kill_started_after_and_reap_before(&before, deadline)
+                        .await
+                }
                 None => Ok(0),
             }
         };
-        let (foreground_reaped, background_reaped, candidates_settled) = tokio::join!(
-            foreground.wait_until_empty(FOREGROUND_REAP_GRACE),
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let task_baseline = self
+            .workspace
+            .active_turn_task_baseline
+            .as_deref()
+            .unwrap_or(&[]);
+        let (foreground_reaped, background_reaped, tasks, publications_settled) = tokio::join!(
+            foreground.wait_until_empty(remaining),
             wait_background,
             self.bg_tasks
-                .wait_for_candidate_publications(CANDIDATE_PUBLICATION_GRACE),
+                .kill_started_after_before(task_baseline, deadline),
+            self.bg_tasks.wait_for_candidate_publications(remaining),
         );
         anyhow::ensure!(
             foreground_reaped,
@@ -38,7 +58,7 @@ impl crate::Agent {
         );
         background_reaped.context("reaping auto-backgrounded turn processes")?;
         anyhow::ensure!(
-            candidates_settled,
+            publications_settled && tasks.iter().all(|task| task.state.is_terminal()),
             "timed out waiting for candidate publication rollback or recovery settlement"
         );
         Ok(signalled)
@@ -123,8 +143,9 @@ impl crate::Agent {
         let cancellation_record = [Content::Text(
             "Workspace operation ended during abnormal-turn cleanup.".into(),
         )];
-        if let Err(error) =
-            self.stage_active_workspace_execution(&[], &cancellation_record, &[], &execution)
+        if let Err(error) = self
+            .stage_active_workspace_execution(&[], &cancellation_record, &[], &execution)
+            .await
         {
             execution.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
             execution.detail = Some(format!(
@@ -152,11 +173,33 @@ impl crate::Agent {
         &mut self,
         kind: crate::TurnCleanupKind,
     ) -> Result<crate::TurnCleanupResult> {
+        let deadline = self.turn_cancellation.as_ref().map_or_else(
+            || tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            crate::TurnCancellation::settlement_deadline,
+        );
+        match tokio::time::timeout_at(deadline, self.cleanup_turn_before(kind, deadline)).await {
+            Ok(result) => result,
+            Err(_) => Err(self
+                .fenced_turn_failure(
+                    anyhow::anyhow!("turn cleanup exceeded the shared settlement deadline"),
+                    vec!["accepted writes remain owned; workspace and session recovery remain fenced".into()],
+                )
+                .into()),
+        }
+    }
+
+    pub(crate) async fn cleanup_turn_before(
+        &mut self,
+        kind: crate::TurnCleanupKind,
+        deadline: tokio::time::Instant,
+    ) -> Result<crate::TurnCleanupResult> {
         self.disarm_btw_dispatcher();
         match kind {
             crate::TurnCleanupKind::Cancel { session } => {
-                let killed = self.quiesce_abnormal_turn_processes().await?;
-                let _ = self.workspace.active_turn_background_baseline.take();
+                let killed = self
+                    .quiesce_abnormal_turn_processes_before(deadline)
+                    .await?;
+                self.session_barrier().await?;
                 match session {
                     crate::SessionRollback::AlreadyApplied => {
                         let _ = self.workspace.active_turn_message_start.take();
@@ -186,6 +229,9 @@ impl crate::Agent {
                     false,
                 )
                 .await?;
+                self.require_abnormal_turn_barrier(deadline).await?;
+                self.persist_async().await?;
+                self.session_barrier().await?;
                 let outcome = self.finalize_cancelled_turn_with_changes(changes)?;
                 Ok(crate::TurnCleanupResult {
                     outcome,
@@ -199,8 +245,9 @@ impl crate::Agent {
                     crate::TurnCleanupKind::FailWithStopReason(stop_reason) => stop_reason,
                     crate::TurnCleanupKind::Cancel { .. } => unreachable!(),
                 };
-                let killed = self.quiesce_abnormal_turn_processes().await?;
-                let _ = self.workspace.active_turn_background_baseline.take();
+                let killed = self
+                    .quiesce_abnormal_turn_processes_before(deadline)
+                    .await?;
                 let workspace_reconciled = self.reconcile_abnormal_turn_bounded().await;
                 let (changes, current_workspace) = self.take_abnormal_turn_ledger_snapshot();
                 self.settle_abnormal_workspace_operation(
@@ -211,6 +258,10 @@ impl crate::Agent {
                     stop_reason.is_workspace_admission(),
                 )
                 .await?;
+                if !stop_reason.is_workspace_admission() {
+                    self.require_abnormal_turn_barrier(deadline).await?;
+                }
+                self.session_barrier().await?;
                 let outcome = self.finalize_failed_turn_with_changes_and_reason(
                     changes,
                     workspace_reconciled,
@@ -223,6 +274,34 @@ impl crate::Agent {
                 })
             }
         }
+    }
+
+    async fn require_abnormal_turn_barrier(&self, deadline: tokio::time::Instant) -> Result<()> {
+        let mut preserved = self
+            .runtime
+            .background()
+            .running_preserved_workspace_jobs(
+                self.workspace
+                    .active_turn_background_baseline
+                    .as_deref()
+                    .unwrap_or(&[]),
+            )
+            .await;
+        if let Some(before) = &self.workspace.active_turn_task_baseline {
+            for id in before {
+                if let Some(job) = self.bg_tasks.candidate_workspace_job_id(id).await {
+                    preserved.push(hi_workspace::JobId::new(job));
+                }
+            }
+        }
+        self.workspace_coordination
+            .require_barrier_preserving_jobs(
+                hi_workspace::BarrierKind::Publish,
+                deadline.into_std(),
+                &preserved,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Restore the checkpoint created by the active turn, if one is still on
@@ -254,9 +333,9 @@ impl crate::Agent {
             return Ok(restored_files);
         }
 
-        if let Some(session) = self.session.as_mut() {
-            session.record_checkpoints(checkpoint_refs_before)?;
-        }
+        let checkpoints = checkpoint_refs_before.to_vec();
+        self.write_session(move |session| session.record_checkpoints(&checkpoints))
+            .await?;
         self.workspace.checkpoints = checkpoint_refs_before.to_vec();
         Ok(restored_files)
     }

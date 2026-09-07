@@ -166,3 +166,62 @@ async fn barrier_rejects_a_controller_swap_before_accepting_passed() {
     let error = barrier.await.unwrap().unwrap_err();
     assert!(error.to_string().contains("controller changed"));
 }
+
+#[tokio::test]
+async fn preserved_service_does_not_hide_an_unrelated_pending_job() {
+    let (_root, subject) = subject();
+    let controller = subject.job_controller();
+    let spec = |name: &str| JobSpec {
+        kind: JobKind::ReadAgent,
+        effect_scope: EffectScope::ReadOnly,
+        name: name.into(),
+        limits: JobLimits::default(),
+        parent_operation: None,
+    };
+    let service = controller
+        .register_job(spec("persistent service"))
+        .await
+        .unwrap();
+    let unrelated = controller
+        .register_job(spec("pending writer acknowledgement"))
+        .await
+        .unwrap();
+    let preserved = [service.job_id.clone()];
+    let error = subject
+        .require_barrier_preserving_jobs(BarrierKind::Publish, Instant::now(), &preserved)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains(unrelated.job_id.as_str()));
+    controller
+        .seal_job(
+            unrelated.job_id,
+            JobTerminal {
+                completion: JobCompletion::Cancelled,
+                detail: None,
+                artifacts: Vec::new(),
+            },
+        )
+        .await;
+    subject
+        .require_barrier_preserving_jobs(BarrierKind::Publish, Instant::now(), &preserved)
+        .await
+        .unwrap();
+    controller
+        .seal_job(
+            service.job_id.clone(),
+            JobTerminal {
+                completion: JobCompletion::DurabilityPending,
+                detail: None,
+                artifacts: Vec::new(),
+            },
+        )
+        .await;
+    let error = subject
+        .require_barrier_preserving_jobs(BarrierKind::Publish, Instant::now(), &preserved)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(service.job_id.as_str()),
+        "service exit publication must lose its exemption"
+    );
+}

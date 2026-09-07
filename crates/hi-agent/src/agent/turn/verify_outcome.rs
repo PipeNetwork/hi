@@ -178,17 +178,13 @@ impl crate::Agent {
                 }
                 Ok(VerifyOutcomeControl::BreakTurn)
             }
-            VerifyOutcome::Passed => {
+            VerifyOutcome::Passed {
+                revision: verified_revision,
+                digest: verified_digest,
+            } => {
                 ui.status("✓ verification passed");
                 self.reconcile_workspace_changes().await?;
-                let (verified_revision, verified_digest, current_changes) = {
-                    let mut ledger = self.runtime.ledger();
-                    (
-                        ledger.revision(),
-                        ledger.workspace_revision(),
-                        ledger.changes_since(turn_ledger_revision),
-                    )
-                };
+                let current_changes = self.runtime.ledger().changes_since(turn_ledger_revision);
                 // Fuse verdict + evidence in one assignment: a Passed verdict
                 // cannot exist without its bound (revision, digest).
                 self.report.verify =

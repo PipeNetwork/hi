@@ -36,7 +36,7 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
-            http: crate::http::agent_http_client(),
+            http: crate::http::inference_http_client_for_socket(None),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
         }
@@ -54,63 +54,91 @@ impl Provider for AnthropicProvider {
         request: ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
-        let url = format!("{}/v1/messages", self.base_url);
-        let body = build_body(&request);
-
-        let resp = match crate::http::send_with_retry(
-            self.http
-                .post(&url)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", API_VERSION)
-                .json(&body),
-        )
-        .await
-        {
-            Ok(resp) => resp,
-            Err(error) => {
-                sink(StreamEvent::WireAudit(Box::new(wire_audit::build(
-                    &request,
-                    &self.base_url,
-                    &body,
-                    false,
-                    None,
-                ))));
-                return Err(ProviderError::new(
-                    ProviderErrorKind::Outage,
-                    format!("request to Anthropic endpoint failed: {error}"),
-                )
-                .with_api_contract(None, Some(true), None)
-                .into());
+        let execution = request.execution.clone();
+        let progress = execution.progress();
+        let mut physical_attempt = None;
+        let estimated_input =
+            crate::types::estimate_request_input_tokens(&request.messages, &request.tools);
+        let mut observed_sink = |event| {
+            if let StreamEvent::ProviderAttempt(attempt) = &event
+                && matches!(attempt.state, crate::ProviderAttemptState::Started { .. })
+            {
+                physical_attempt = Some(attempt.physical_attempt);
             }
+            progress.observe(&event);
+            sink(event);
         };
+        let sink: &mut (dyn FnMut(StreamEvent) + Send) = &mut observed_sink;
+        progress
+            .watch(async {
+                let url = format!("{}/v1/messages", self.base_url);
+                let body = build_body(&request);
 
-        let status = resp.status();
-        wire_audit::emit(sink, &request, &self.base_url, &body, status);
+                let resp = match request
+                    .execution
+                    .dispatch(
+                        self.http
+                            .post(&url)
+                            .header("x-api-key", &self.api_key)
+                            .header("anthropic-version", API_VERSION)
+                            .json(&body),
+                        "anthropic",
+                        &request.model,
+                        sink,
+                    )
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(error) => {
+                        sink(StreamEvent::WireAudit(Box::new(wire_audit::build(
+                            &request,
+                            &self.base_url,
+                            &body,
+                            false,
+                            None,
+                        ))));
+                        return Err(error.into());
+                    }
+                };
 
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let kind = if is_policy_blocked_text(&text) {
-                ProviderErrorKind::PolicyBlocked
-            } else {
-                classify_http_error(status)
-            };
-            return Err(
-                ProviderError::new(kind, format!("API error {status}: {text}"))
-                    .with_http_status(Some(status.as_u16()))
-                    .into(),
-            );
-        }
+                let status = resp.status();
+                wire_audit::emit(sink, &request, &self.base_url, &body, status);
 
-        // `debug_tap` optionally echoes the raw wire bytes when HI_DEBUG_STREAM
-        // is set; `idle_guard` applies the optional operator silence deadline.
-        let stream = Box::pin(
-            crate::http::idle_guard(
-                crate::http::debug_tap(resp.bytes_stream()),
-                crate::http::stream_idle_window(),
-            )
-            .eventsource(),
-        );
-        stream::collect_completion(stream, &request, sink).await
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    let kind = if is_policy_blocked_text(&text) {
+                        ProviderErrorKind::PolicyBlocked
+                    } else {
+                        classify_http_error(status)
+                    };
+                    return Err(
+                        ProviderError::new(kind, format!("API error {status}: {text}"))
+                            .with_api_contract(None, crate::openai::explicit_retryable(&text), None)
+                            .with_http_status(Some(status.as_u16()))
+                            .into(),
+                    );
+                }
+
+                // `debug_tap` optionally echoes the raw wire bytes when HI_DEBUG_STREAM
+                // is set; `idle_guard` applies the optional operator silence deadline.
+                let stream = Box::pin(
+                    crate::http::idle_guard(
+                        crate::http::debug_tap(resp.bytes_stream()),
+                        crate::http::stream_idle_window(),
+                    )
+                    .eventsource(),
+                );
+                stream::collect_completion(stream, &request, sink).await
+            })
+            .await
+            .map_err(|error| {
+                execution.record_provider_failure(physical_attempt, &error);
+                crate::request_execution::include_stalled_usage(
+                    error,
+                    estimated_input,
+                    crate::Usage::default(),
+                )
+            })
     }
 
     async fn list_models(&self) -> Result<Vec<crate::provider::ServedModel>> {
@@ -685,6 +713,7 @@ mod tests {
             model: "test-model".into(),
             request_id: None,
             retry_attempt: 0,
+            execution: Default::default(),
             user_turn: false,
             canonical_objective: None,
             messages: Arc::new(vec![Message::user("hello")]),
@@ -723,6 +752,7 @@ mod tests {
             model: "claude-test".into(),
             request_id: None,
             retry_attempt: 0,
+            execution: Default::default(),
             user_turn: false,
             canonical_objective: None,
             messages: Arc::new(vec![Message::user("hello")]),
@@ -778,6 +808,7 @@ mod tests {
             model: "test-model".into(),
             request_id: None,
             retry_attempt: 0,
+            execution: Default::default(),
             user_turn: false,
             canonical_objective: None,
             messages: Arc::new(vec![Message::user("cached prompt")]),

@@ -531,7 +531,7 @@ fn tool_protocol(message: &str) -> ProviderError {
 }
 
 pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
-    if let Some(provider) = err.downcast_ref::<ProviderError>() {
+    if let Some(provider) = crate::provider::provider_error_details(&err) {
         return provider.clone();
     }
     let text = err.to_string();

@@ -167,6 +167,7 @@ pub(crate) fn apply_loaded_session(
         goal_drive_stall,
         plan_drive_evidence,
         goal_drive_evidence,
+        task_recovery,
         ..
     } = loaded;
     agent.apply_loaded_session(messages, usage, checkpoint_refs, goal, decisions, plan)?;
@@ -178,6 +179,7 @@ pub(crate) fn apply_loaded_session(
     );
     agent.restore_plan_approval_parked(plan_approval_parked);
     agent.restore_goal_drive(goal_drive_stall, goal_drive_evidence);
+    agent.restore_task_recovery(task_recovery);
     Ok(())
 }
 

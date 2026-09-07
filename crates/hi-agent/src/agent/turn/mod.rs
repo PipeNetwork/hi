@@ -22,8 +22,10 @@
 
 pub(crate) mod btw;
 mod btw_snapshot;
+mod enrichment;
 mod entry;
 mod fast_feedback;
+mod fast_feedback_observations;
 mod finalize;
 mod helpers;
 mod hooks;
@@ -31,7 +33,6 @@ mod loop_;
 mod model_request;
 mod model_retry;
 mod model_round;
-mod native_director;
 mod obligation;
 pub mod phase;
 mod progress;
@@ -43,9 +44,23 @@ mod speculation;
 mod state;
 mod steer;
 mod suggest;
+mod terminal_receipt;
+mod terminal_verification;
+mod terminal_workspace;
 mod tools;
 mod verify_outcome;
 mod verify_run;
+
+/// A model/tool loop can request verification or an absorbing settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::agent) enum ModelLoopDecision {
+    Verify,
+    VerifyAtLimit,
+    /// Inspect retained edits once within existing verification limits, then
+    /// settle without permitting another model, review, or repair request.
+    VerifyAfterRecoveryExhaustion,
+    Settle(crate::TurnStopReason),
+}
 
 pub use phase::TurnPhase;
 

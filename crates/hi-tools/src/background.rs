@@ -303,6 +303,33 @@ impl BackgroundRegistry {
         self.lifecycle.pending().await
     }
 
+    /// Exact controller identities of intentionally persistent processes that
+    /// are still running. A turn barrier may preserve these identities while
+    /// continuing to fence every other job and every pending publication.
+    pub async fn running_preserved_workspace_jobs(
+        &self,
+        before: &[String],
+    ) -> Vec<hi_workspace::JobId> {
+        let jobs = self
+            .processes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, process)| {
+                (process.origin == BgOrigin::Requested || before.contains(id))
+                    && process.inner.lock().unwrap().native_running()
+            })
+            .filter_map(|(_, process)| process.managed_job.clone())
+            .collect::<Vec<_>>();
+        let mut ids = Vec::new();
+        for job in jobs {
+            if let Some(id) = job.workspace_job_id().await {
+                ids.push(hi_workspace::JobId::new(id));
+            }
+        }
+        ids
+    }
+
     pub async fn settle_jobs_after_workspace(
         &self,
         pending: &[crate::BackgroundJobId],
@@ -1048,6 +1075,18 @@ impl BackgroundRegistry {
     /// bytes. Merely observing the public `Killed` state is insufficient: the
     /// child can still execute a final write until its driver has reaped it.
     pub async fn kill_started_after_and_reap(&self, before: &[String]) -> Result<usize> {
+        self.kill_started_after_and_reap_before(
+            before,
+            tokio::time::Instant::now() + QUIESCENT_REAP_TIMEOUT,
+        )
+        .await
+    }
+
+    pub async fn kill_started_after_and_reap_before(
+        &self,
+        before: &[String],
+        deadline: tokio::time::Instant,
+    ) -> Result<usize> {
         let before: HashSet<&str> = before.iter().map(String::as_str).collect();
         let targets = {
             let processes = self.processes.lock().unwrap();
@@ -1076,9 +1115,14 @@ impl BackgroundRegistry {
             }
         }
 
-        let deadline = tokio::time::Instant::now() + QUIESCENT_REAP_TIMEOUT;
-        for (id, process) in targets {
-            wait_for_terminal_reap(&process, &id, deadline).await?;
+        let results = futures_util::future::join_all(
+            targets
+                .iter()
+                .map(|(id, process)| wait_for_terminal_reap(process, id, deadline)),
+        )
+        .await;
+        for result in results {
+            result?;
         }
         Ok(signalled)
     }

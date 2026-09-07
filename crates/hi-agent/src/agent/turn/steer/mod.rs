@@ -17,5 +17,5 @@ pub(super) enum RoundControl {
     Continue,
     /// `true` means a configured model/tool work cap fired; `false` means a
     /// natural or otherwise bounded end of the tools loop.
-    BreakInner(bool),
+    Finish(crate::agent::turn::ModelLoopDecision),
 }

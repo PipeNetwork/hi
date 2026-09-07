@@ -448,7 +448,7 @@ async fn gitignored_inputs_still_trigger_verification() {
         )
         .await;
 
-    assert!(matches!(outcome, VerifyOutcome::Passed));
+    assert!(matches!(outcome, VerifyOutcome::Passed { .. }));
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -668,7 +668,7 @@ async fn late_mutation_requires_a_fresh_current_revision_pass() {
                 &mut ui,
             )
             .await,
-        VerifyOutcome::Passed
+        VerifyOutcome::Passed { .. }
     ));
 
     std::fs::write(root.join("state.txt"), "late mutation broke it\n").unwrap();
@@ -722,7 +722,7 @@ async fn broken_attribution_checkpoint_is_infrastructure_error() {
 }
 
 #[tokio::test]
-async fn repeatedly_mutating_verification_stage_is_unstable_not_a_pass() {
+async fn mutating_verification_stage_is_immediately_unstable() {
     let (base, root, state) = roots("unstable");
     std::fs::write(root.join("source.rs"), "before\n").unwrap();
     let turn_snapshot = workspace_snapshot(&root).await.unwrap();
@@ -746,14 +746,10 @@ async fn repeatedly_mutating_verification_stage_is_unstable_not_a_pass() {
             &mut ui,
         )
         .await;
-    assert!(matches!(
-        first,
-        VerifyOutcome::Failed {
-            round: 1,
-            ref output,
-            ..
-        } if output.contains("modified relevant source files")
-    ));
+    assert!(
+        matches!(first, VerifyOutcome::Unstable { round: 1, ref changed_files, .. }
+        if changed_files == &["source.rs"])
+    );
     let outcome = verifier
         .check(
             &VerifyWorkspace::new(&root, &state, None, &lsp),

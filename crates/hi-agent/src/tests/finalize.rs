@@ -54,12 +54,9 @@ async fn does_not_nudge_a_plain_answer() {
 }
 
 #[tokio::test]
-async fn finalizes_with_a_recap_when_files_changed() {
-    // A turn that changes a file ends with a dedicated recap call. The recap
-    // is emitted to the UI (so the user sees it) and its usage is counted,
-    // but the [user: finalize-nudge][assistant: recap] pair is stripped from
-    // the persisted transcript at turn end — the FINALIZE_PROMPT's "don't
-    // take any further action" instruction must not bleed into the next turn.
+async fn closes_changed_files_without_an_additional_recap_request() {
+    // A private answer marker must produce a visible deterministic closeout;
+    // the extra scripted completion remains unused and unbilled.
     let workspace = IsolatedWorkspace::new("finalize-recap");
     let mut cfg = workspace.config();
     cfg.memory.finalize = true;
@@ -89,7 +86,8 @@ async fn finalizes_with_a_recap_when_files_changed() {
 
     // The recap was emitted to the UI (the user sees it).
     assert!(
-        ui.assistant.contains("## Summary"),
+        ui.assistant
+            .contains("The turn is closed with retained changes"),
         "recap is emitted to the UI: {}",
         ui.assistant
     );
@@ -120,13 +118,17 @@ async fn finalizes_with_a_recap_when_files_changed() {
         m.windows(2).all(|w| w[0].role != w[1].role),
         "roles must alternate"
     );
-    // The recap call's usage (3/4) is folded into the running totals.
-    assert_eq!(agent.totals().input_tokens, 1 + 1 + 3);
-    assert_eq!(agent.totals().output_tokens, 1 + 1 + 4);
+    // Only the two execution requests consume usage.
+    assert_eq!(agent.totals().input_tokens, 2, "no recap input is charged");
+    assert_eq!(
+        agent.totals().output_tokens,
+        2,
+        "no recap output is charged"
+    );
 }
 
 #[tokio::test]
-async fn finalize_recap_is_emitted_to_the_ui() {
+async fn deterministic_closeout_is_emitted_and_persisted() {
     // The Canned provider never calls the stream sink — it returns text
     // only in the completion object. The finalize fallback must emit that
     // text through ui.assistant_text so the user sees the recap, not just
@@ -159,17 +161,27 @@ async fn finalize_recap_is_emitted_to_the_ui() {
 
     // The recap text must have been emitted to the UI, not just recorded.
     assert!(
-        ui.assistant.contains("## Summary"),
+        ui.assistant
+            .contains("The turn is closed with retained changes"),
         "recap text should be emitted to the UI, got assistant: {:?}",
         ui.assistant
     );
 }
 
 #[tokio::test]
-async fn hanging_finalize_cannot_hold_a_settled_turn_working() {
+async fn a_hanging_third_request_is_never_started_after_settlement() {
+    missing_answer_never_starts_aftercare(false).await;
+    missing_answer_never_starts_aftercare(true).await;
+}
+
+async fn missing_answer_never_starts_aftercare(capped: bool) {
     let workspace = IsolatedWorkspace::new("hanging-finalize");
     let mut cfg = workspace.config();
     cfg.memory.finalize = true;
+    cfg.memory.suggest_next_prompt = true;
+    if capped {
+        cfg.loop_limits.max_steps = 1;
+    }
     let path = workspace.path("changed.rs").to_string_lossy().to_string();
     let provider = std::sync::Arc::new(HangAfterTwoCalls {
         path,
@@ -189,21 +201,19 @@ async fn hanging_finalize_cannot_hold_a_settled_turn_working() {
 
     assert_eq!(outcome.status, TurnStatus::Failed);
     assert_eq!(outcome.verification, VerificationStatus::Unverified);
+    assert_ne!(agent.answer_state, crate::recovery::AnswerState::Accepted);
     assert_eq!(
         outcome.stop_reason,
         crate::TurnStopReason::VerificationUnavailable
     );
-    assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("final summary timed out")),
-        "the skipped optional recap should be explained once: {:?}",
-        ui.statuses
-    );
+    if capped {
+        assert!(ui.statuses.iter().any(|s| s.contains("reached step limit")));
+    }
+    assert!(ui.assistant.contains("The turn is closed"));
     assert_eq!(
         provider.calls.load(std::sync::atomic::Ordering::SeqCst),
-        3,
-        "the primary tool call, answer, and bounded recap call should run"
+        2,
+        "missing-final closeout never requests a recap or suggestion, capped={capped}"
     );
 }
 
@@ -386,11 +396,12 @@ async fn answerless_tool_turn_returns_provider_error_without_finalizing() {
     let mut ui = RecUi::default();
     let error = agent.run_turn("check it", &mut ui).await.unwrap_err();
     assert!(
-        error.to_string().contains("model returned no response"),
+        format!("{error:#}").contains("model returned no response"),
         "unexpected error: {error:#}"
     );
     assert!(
-        !ui.assistant.contains("## Summary"),
+        !ui.assistant
+            .contains("The turn is closed with retained changes"),
         "provider failure must not run the success recap: {:?}",
         ui.assistant
     );
@@ -414,12 +425,12 @@ async fn empty_recap_response_cannot_hide_an_answerless_provider_failure() {
     let error = agent.run_turn("check it", &mut ui).await.unwrap_err();
 
     assert!(
-        error.to_string().contains("model returned no response"),
+        format!("{error:#}").contains("model returned no response"),
         "unexpected error: {error:#}"
     );
     assert!(
-        ui.assistant.trim().is_empty(),
-        "provider failure must not be presented as a completed answer: {:?}",
+        ui.assistant.contains("No accepted final answer"),
+        "provider failure needs a deterministic non-success closeout: {:?}",
         ui.assistant
     );
 }

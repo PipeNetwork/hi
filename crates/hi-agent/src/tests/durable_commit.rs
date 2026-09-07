@@ -382,15 +382,10 @@ async fn post_execution_batch_failure_is_settled_by_failed_turn_cleanup() {
         std::fs::read_to_string(target).unwrap(),
         "applied before persistence failed"
     );
-    let unsettled = subject.workspace_controller_status();
-    assert_eq!(unsettled.state, hi_workspace::WorkspaceState::Mutating);
-    assert!(unsettled.active_operation.is_some());
-
-    let cleanup = subject
-        .cleanup_turn(crate::TurnCleanupKind::Fail)
-        .await
-        .unwrap();
-    assert_eq!(cleanup.outcome.status, crate::TurnStatus::Failed);
+    let failure = crate::TurnFailure::from_error(&error)
+        .expect("failed-turn settlement belongs to the Agent entry point");
+    assert_eq!(failure.outcome.status, crate::TurnStatus::Failed);
+    assert!(!failure.settlement_pending);
     let settled = subject.workspace_controller_status();
     assert_eq!(settled.state, hi_workspace::WorkspaceState::Ready);
     assert!(settled.active_operation.is_none());

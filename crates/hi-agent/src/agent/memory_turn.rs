@@ -127,6 +127,7 @@ impl crate::Agent {
         let model = self.config.routing.model.clone();
         let request_policy = self.seal_chat_only_auxiliary_request(&model, 1024).await;
         let request = ChatRequest {
+            execution: self.request_execution(),
             model,
             request_id: None,
             retry_attempt: 0,
@@ -161,7 +162,7 @@ impl crate::Agent {
             StreamEvent::Status(text) => ui.status(&text),
             StreamEvent::Warning(text) => ui.top_status(&text),
             StreamEvent::Reasoning(_) => {}
-            StreamEvent::WireAudit(_) => {}
+            StreamEvent::WireAudit(_) | StreamEvent::ProviderAttempt(_) => {}
             StreamEvent::ToolCallDelta { .. } => {}
         };
         let timeout = self.side_call_timeout();
@@ -173,7 +174,7 @@ impl crate::Agent {
         {
             Err(timeout) => {
                 ui.assistant_end();
-                let _ = self.persist();
+                let _ = self.persist_async().await;
                 ui.status(&format!(
                     "(memory update timed out after {:.1}s)",
                     timeout.as_secs_f64()
@@ -185,13 +186,13 @@ impl crate::Agent {
                 self.add_side_error_usage(&err);
                 // Flush any partially-streamed memory text before the status.
                 ui.assistant_end();
-                let _ = self.persist();
+                let _ = self.persist_async().await;
                 ui.status(&format!("(couldn't update memory: {err})"));
                 return;
             }
         };
         self.add_side_usage(completion.usage);
-        let _ = self.persist();
+        let _ = self.persist_async().await;
 
         // Fall back to the final content if the provider didn't stream text.
         // Emit it through the UI before assistant_end so the user sees the
@@ -250,7 +251,7 @@ impl crate::Agent {
                     "distill project memory",
                     &declared_paths,
                     serde_json::json!({ "content_digest": content_digest }),
-                    || {
+                    move || {
                         let notes = write_memory_replace_if_unchanged_at(
                             &workspace_root,
                             &state_root,
@@ -273,14 +274,16 @@ impl crate::Agent {
         }
         if !global_body.trim().is_empty() {
             let declared_paths = crate::memory::memory_write_paths(&global_path);
-            let write = self.run_host_local_file_mutation("global memory", &declared_paths, || {
-                write_memory_replace_if_unchanged(
-                    &global_path,
-                    &global_body,
-                    global_preimage.as_deref(),
-                )
-                .map_err(anyhow::Error::msg)
-            });
+            let write = self
+                .run_host_local_file_mutation("global memory", &declared_paths, move || {
+                    write_memory_replace_if_unchanged(
+                        &global_path,
+                        &global_body,
+                        global_preimage.as_deref(),
+                    )
+                    .map_err(anyhow::Error::msg)
+                })
+                .await;
             match write {
                 Ok(notes) => {
                     saved_notes += notes;

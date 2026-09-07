@@ -1,4 +1,4 @@
-//! Durable local event store and live bus for interactive lifecycle events.
+//! Durable local event store for interactive lifecycle events.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -7,13 +7,11 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow};
 use hi_events::{EventBus, EventError, EventReceipt, EventSink, RunEvent};
 use rusqlite::{Connection, OptionalExtension, params};
-use tokio::sync::broadcast;
 
 #[derive(Clone)]
 pub(crate) struct EventStore {
     connection: Arc<Mutex<Connection>>,
     control: hi_control::ControlStore,
-    live: broadcast::Sender<RunEvent>,
     compatibility_activity: Option<PathBuf>,
 }
 
@@ -31,15 +29,7 @@ impl EventStore {
         let connection = hi_sqlite_journal::JournalMode::for_db_path(path).open(path)?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS run_events (
-               sequence INTEGER PRIMARY KEY,
-               event_id TEXT NOT NULL UNIQUE,
-               occurred_at_ms INTEGER NOT NULL,
-               event_json TEXT NOT NULL,
-               event_bytes INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS run_events_event_id ON run_events(event_id);
-             CREATE TABLE IF NOT EXISTS event_dispatch (
+            "CREATE TABLE IF NOT EXISTS event_dispatch (
                trigger_id TEXT NOT NULL,
                source_event_id TEXT NOT NULL,
                state TEXT NOT NULL,
@@ -57,43 +47,15 @@ impl EventStore {
                PRIMARY KEY(trigger_id, concurrency_key)
              );",
         )?;
-        let (live, _) = broadcast::channel(512);
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             control,
-            live,
             compatibility_activity: compatibility_activity.map(Path::to_path_buf),
         })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<RunEvent> {
-        self.live.subscribe()
-    }
-
     pub(crate) fn load_since(&self, sequence: u64) -> Result<Vec<RunEvent>> {
-        let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare(
-            "SELECT event_json FROM run_events WHERE sequence > ?1 ORDER BY sequence ASC",
-        )?;
-        let rows = statement.query_map([sequence as i64], |row| row.get::<_, String>(0))?;
-        rows.map(|row| {
-            let json = row?;
-            serde_json::from_str(&json)
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-        })
-        .collect::<rusqlite::Result<Vec<RunEvent>>>()
-        .map_err(Into::into)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn max_sequence(&self) -> Result<u64> {
-        let connection = self.connection.lock().unwrap();
-        Ok(connection.query_row(
-            "SELECT COALESCE(MAX(sequence), 0) FROM run_events",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? as u64)
+        Ok(self.control.replay_events(sequence)?)
     }
 
     pub(crate) fn claim_trigger(&self, trigger_id: &str, event_id: &str) -> Result<bool> {
@@ -132,11 +94,6 @@ impl EventSink for EventStore {
         // canonical source and contains the full redacted event envelope.
         self.project_compatibility_activity(&event);
 
-        let receipt = EventReceipt {
-            event_id: event.event_id.clone(),
-            sequence: event.sequence,
-        };
-        let _ = self.live.send(event);
         Ok(receipt)
     }
 }

@@ -26,6 +26,85 @@ Both modes therefore exercise the same state machine and job callbacks. Local
 mode is not a mock PipeFS implementation, and PipeFS does not turn every local
 filesystem action into a bespoke remote code path.
 
+## Native execution and recovery
+
+One native turn loop owns model, tool, verification and settlement decisions.
+The WASM host, guest, engine API and shadow NativeDirector are removed. Evaluation
+identities use `native_turn_policy` version 3. Recovery exhaustion forbids further
+model requests while retaining one deterministic check of the final workspace.
+After tool work, a terminal provider error follows that same verification and
+settlement path, preserving its original typed cause. Validation activity can
+admit a check of the current revision even when this turn made no edits. An
+unfiltered native check supplies the exit status that shell output filters may
+hide. Passing verification does not mark an unfinished task complete.
+
+Each inference operation has one shared request context across transport,
+authentication, compatibility repair and fallback. The default allowance is
+four physical dispatches including the first, with at most 60 seconds of total
+backoff. Exact replays retain their request identity; changed routes or payloads
+receive another request identity within the same operation. Configured MoA
+children and its reserved aggregation dispatch have three shared recovery sends.
+Only accepted, usable completions start another inference operation.
+Local request-limit failures retain bounded, redacted attempt evidence and
+remain distinct from an upstream rejection. A completed plan with concrete tool
+evidence closes deterministically when its final recap is empty, without asking
+the model to generate another recap.
+
+Provider silence is measured from physical dispatch across response headers and
+streaming. Advancing text, reasoning or tool arguments resets the clock;
+keepalives and repeated status events do not. The default is five minutes.
+Queue and explicit approval waiting are excluded. The TUI renders typed attempt
+and progress events without making a second timeout decision.
+
+Typed settings `provider.max_attempts` (default 4),
+`provider.no_progress_timeout` (milliseconds, default 300000; 0 disables silence
+recovery), and `recovery.max_interventions` (default 3) resolve centrally.
+Existing explicit request/turn/tool/step/verification limits remain additional
+ceilings. Productive work receives no new overall duration or step limit.
+
+Automatic answer, protocol, inspection, verification and reviewer corrections
+share one durable task-recovery allowance. Only a new best objective result can
+replenish it. Cosmetic changes, different labels, unrelated passing checks and
+regressing to a previously achieved result do not. Canonical observations bind
+validation scope and stable diagnostic identities to exact input revisions.
+Failure cycles stop recovery; infrastructure failures do not request code repair.
+Current unresolved failures are tracked separately from historical best results.
+A same-scope pass clears the obligation; changing input leaves it unverified.
+Recovery schema 2 retains that current result explicitly. Development schema 1
+records migrate after snapshot integrity validation; ambiguous historical
+fail/pass ordering requires revalidation while keeping the session readable.
+Automatic plan/goal drives and session resume retain exhausted recovery state;
+explicit user retries start a fresh episode with diagnostic evidence retained.
+New automatic goal completions remain conservative in intermediate saved records.
+The final outcome record commits the settled goal and earned recovery credit
+together; a crash before that receipt cannot skip the unfinished step on resume.
+
+A successful check carries its immutable input revision and digest. Later
+changes to canonical inputs invalidate that evidence, including prose changes;
+settlement cannot transfer a pass to new bytes. Optional skill curation and
+automatic coding memory run once before settlement. If they change inputs, the
+existing deterministic verifier checks the final revision within its existing
+ceiling, without another main-model request. Task review precedes those automatic
+writes so generated memory does not trigger unrelated task-repair requests.
+An applicable task review can survive those writes only when the reviewed files
+remain identical and changes are limited to acknowledged metadata outputs outside
+the requested task. Explicitly requested metadata and any source/external changes
+invalidate review. The full workspace still requires a fresh verification pass;
+changes during that recheck also invalidate the retained review.
+An invalidated pass cannot become success through the unverified-work override.
+The generated goal checklist is a derived view unless explicitly edited or named
+as a validation input.
+
+Selecting settlement closes the execution loop and starts its one 60-second
+caller deadline. The agent runner owns writer shutdown, rollback policy,
+transcript reconciliation, durable settlement and terminal publication. A typed
+`TurnFailure` retains its outcome, original error, cleanup diagnostics and pending
+settlement disposition. Frontend failure cancels the runner and continues polling
+it without rendering. Accepted writes and ambiguous publication retain their
+recovery owners beyond the caller deadline. Cancellation before commit follows
+rollback policy; cancellation after commit preserves the committed result.
+Missing final answers receive a deterministic closeout without another inference.
+
 ## Workspace lifecycle
 
 Every session has an always-present `WorkspaceController`. A mutation first
@@ -125,18 +204,30 @@ entry commit in one `BEGIN IMMEDIATE` transaction with foreign keys enabled and
 `synchronous=FULL`. Future schema versions are rejected. The schema version is
 the last write of a successful migration transaction.
 
-The pure versioned session reducer now shadows both JSONL compatibility import
-and remote replay. With `session_projection_v2` enabled, a parity-checked
-projection becomes the restore result and replay failures fail closed. The
-versioned snapshot/patch transport is also consumed by the deterministic TUI
-harness. Its durable model now assigns stable session-scoped IDs to transcript
-blocks, validates open/update/settle transitions, rejects ID reuse and duplicate
-terminal settlement, and refuses a turn outcome while any projected block is
-still open. Snapshot restore revalidates those invariants; legacy snapshots
-without block state continue to decode as message-only sessions. Promoting the
-reducer to the live interactive state authority, then moving retry/rewind and
-every presentation client onto that authority, remains a separately gated
-rollout step.
+The versioned `SessionReducer` is authoritative for both local JSONL and remote
+restoration. Readers translate old records into the same events; interrupted
+workspace executions are repaired once by the reducer. Snapshot version 3 adds
+persisted task-recovery state and pending execution recovery. Version 2 snapshots
+are migrated after validating their original integrity; unsupported future
+versions fail closed. Tail replay applies events directly and hashes only at
+snapshot boundaries. The live snapshot/patch presentation transport remains a
+separate consumer, controlled by `session_projection_v2`.
+
+Asynchronous journal writes use one dedicated writer thread per canonical
+`events.sqlite3` path and a bounded queue of 128 requests. The entire
+read/validate/update/commit operation runs there. Transition, binding and event
+updates share one transaction. An accepted request survives a dropped waiter:
+its publication owner retains the identity and recovery fence until the durable
+acknowledgment is resolved. Queue rejection is distinct from accepted work with
+an outstanding acknowledgment.
+
+Runtime session persistence also uses a retained owner with a bounded queue of
+128 operations around the existing session sink. Active turns await commit
+receipts without blocking runtime threads. Dropping an accepted waiter does not
+discard its write, and a barrier reports late errors. Synchronous compatibility
+commands reject admission while asynchronous persistence is outstanding. A turn
+whose publication remains ambiguous requires authoritative restoration before
+another turn can use that Agent. This introduces no new database or wire format.
 
 Interactive compaction now registers a bounded, read-only `Compaction` job and
 prepares every strategy from an owned transcript snapshot. Publication checks a
@@ -148,7 +239,7 @@ compatibility rather than becoming a free-running background command, but its
 work and terminal callback use the unified job lifecycle.
 
 Manifest evaluation identities seal the binary, Git state, fixtures, limits,
-provider/model policy, tool-envelope schema, reducer/director versions,
+provider/model policy, tool-envelope schema, reducer/native turn-policy versions,
 workspace backend, materializer, OS/architecture, MCP, and network policy.
 Reports separate different identities as `incomparable_records`; they are never
 reported as regressions.
@@ -226,14 +317,7 @@ General tool, provider, and workspace failures still use their existing typed or
 text error paths in several places, so migration of every diagnostic producer is
 a remaining rollout item rather than a compatibility promise.
 
-## Director and presentation rollout
-
-`NativeDirector` emits versioned shadow traces from the existing
-`EngineInput -> EngineAction` boundary. The first promoted phase is limited to
-model-continuation decisions for plan, goal, reminder, forced-tool, and
-verify-before-yield requirements; managed RSI remains on its separate,
-higher-trust state machine. Effect actions stay rejected until their router has
-replay parity.
+## Presentation transport
 
 `hi debug tui --stdio` provides deterministic JSONL input, resize, focus,
 component-tree, transcript-block, and versioned session snapshot/patch tests.
@@ -308,10 +392,8 @@ Typed feature settings are independent:
 
 ```text
 features.workspace_controller_v2
-features.session_reducer_v2
 features.candidate_jobs_v2
 features.pipefs_causal_commit_v1
-features.native_director_v2
 features.session_projection_v2
 ```
 
@@ -319,10 +401,12 @@ Rollback may stop new v2 admission but must leave status, inspect, retry,
 recovery export, and PipeFS export operational. Databases are not down-migrated
 and recovery caches are not deleted by feature rollback.
 
-`workspace_controller_v2` and `session_reducer_v2` are enabled by default.
-Detached candidate jobs, causal PipeFS publication, director promotion, and
-presentation promotion remain independently disabled until their staged
-rollout gates are selected. The client protocol, request validation, recovery
+`workspace_controller_v2` is enabled by default. Session restoration always
+uses the reducer. Historical `features.session_reducer_v2` records remain
+readable and no longer select a runtime. Historical NativeDirector settings
+remain readable; actively enabling that removed engine returns a migration
+error. Detached candidate jobs, causal PipeFS publication and presentation
+promotion retain their independent gates. The client protocol, request validation, recovery
 paths, and fake server tests for `causal_commit_v1` live in this repository;
 the corresponding service transaction must be deployed and advertised by the
 PipeFS server before the client gate can take effect. PipeFS live background

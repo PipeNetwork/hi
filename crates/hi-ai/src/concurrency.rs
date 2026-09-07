@@ -300,6 +300,7 @@ mod tests {
 
     fn request() -> ChatRequest {
         ChatRequest {
+            execution: Default::default(),
             model: "test".into(),
             request_id: None,
             user_turn: true,

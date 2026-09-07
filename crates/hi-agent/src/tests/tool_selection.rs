@@ -469,7 +469,9 @@ async fn bare_review_codebase_first_request_advertises_inspection_tools() {
 
     let outcome = agent.run_turn("review codebase", &mut ui).await.unwrap();
 
-    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
+    assert!(agent.task_recovery().exhausted);
     let requests = tool_names.lock().unwrap();
     let modes = modes.lock().unwrap();
     assert!(

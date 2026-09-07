@@ -301,20 +301,6 @@ pub(super) fn combined_review_status(
     }
 }
 
-/// Late workspace deltas that only touch prose (docs, learned skills under
-/// `.hi/skills/`, etc.) must not wipe a deterministic verification pass. The
-/// auto-pipeline never covers those paths (`SkippedProseOnly`), so treating a
-/// skill-curation write as "unverified changes" is a false alarm users hate.
-///
-/// An **empty** delta is also benign: the ledger revision/digest can move from
-/// reconcile bookkeeping without any file change. Treating that as a wipe was
-/// flipping green turns into failed, unverified outcomes.
-pub(super) fn post_verify_delta_is_benign(changes: &[hi_tools::FileChange]) -> bool {
-    changes
-        .iter()
-        .all(|change| crate::verify::is_prose_only_path(&change.path))
-}
-
 /// Conservative fallback used only when a checkpoint-backed unified diff is
 /// unavailable (for example, the user explicitly allowed mutation without an
 /// undo snapshot). It prevents that escape hatch from also bypassing the
@@ -425,7 +411,6 @@ pub(super) fn format_rate_limit_reset(seconds: u64) -> String {
 #[cfg(test)]
 mod step_cap_tests {
     use super::*;
-    use hi_tools::{FileChange, FileChangeKind};
 
     fn cfg(long_horizon: bool) -> crate::AgentConfig {
         crate::AgentConfig {
@@ -435,36 +420,6 @@ mod step_cap_tests {
             },
             ..Default::default()
         }
-    }
-
-    fn change(path: &str) -> FileChange {
-        FileChange {
-            path: path.into(),
-            kind: FileChangeKind::Modify,
-            before_digest: None,
-            after_digest: None,
-            before_len: None,
-            after_len: None,
-            before_mode: None,
-            after_mode: None,
-        }
-    }
-
-    #[test]
-    fn post_verify_prose_delta_is_benign_code_is_not() {
-        assert!(post_verify_delta_is_benign(&[change(
-            ".hi/skills/retry/SKILL.md"
-        )]));
-        assert!(post_verify_delta_is_benign(&[change("README.md")]));
-        assert!(post_verify_delta_is_benign(&[change(".hi/memory.md")]));
-        assert!(post_verify_delta_is_benign(&[change(".hi/memory.undo.md")]));
-        assert!(!post_verify_delta_is_benign(&[change("src/lib.rs")]));
-        assert!(!post_verify_delta_is_benign(&[
-            change("README.md"),
-            change("src/lib.rs"),
-        ]));
-        // No files changed after verify — keep the pass (revision-only drift).
-        assert!(post_verify_delta_is_benign(&[]));
     }
 
     #[test]

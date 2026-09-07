@@ -19,46 +19,11 @@ use super::retry::{
 };
 use super::speculation::SpeculationRegistry;
 
-const COMPAT_FALLBACK_LIMIT: usize = 64;
-const COMPAT_FALLBACK_PREFIX: usize = 62;
-const COMPAT_FALLBACK_OMITTED_PREFIX: &str = "[diagnostic truncation: ";
+mod compat_telemetry;
+use compat_telemetry::record_compat_fallback;
+#[cfg(test)]
+use compat_telemetry::{COMPAT_FALLBACK_LIMIT, COMPAT_FALLBACK_PREFIX};
 pub(super) const COMPLETED_PLAN_EMPTY_RECAP_FALLBACK: &str = "The plan is complete and the successful tool results were retained. The provider did not return a final recap.";
-
-fn record_compat_fallback(fallbacks: &mut Vec<String>, fallback: String) {
-    if fallbacks.iter().any(|seen| seen == &fallback) {
-        return;
-    }
-    if fallbacks.len() < COMPAT_FALLBACK_LIMIT {
-        fallbacks.push(fallback);
-        return;
-    }
-
-    let already_compacted = fallbacks
-        .last()
-        .and_then(|marker| marker.strip_prefix(COMPAT_FALLBACK_OMITTED_PREFIX))
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|count| count.parse::<u64>().ok());
-    let dropped = match already_compacted {
-        Some(dropped) => {
-            fallbacks[COMPAT_FALLBACK_PREFIX] = fallback;
-            dropped.saturating_add(1)
-        }
-        None => {
-            // The marker itself consumes one slot: retain the first 62 and the
-            // newest event, and explicitly account for the two displaced rows.
-            fallbacks.truncate(COMPAT_FALLBACK_PREFIX);
-            fallbacks.push(fallback);
-            fallbacks.push(String::new());
-            2
-        }
-    };
-    let last = fallbacks
-        .last_mut()
-        .expect("bounded compatibility trail always retains a marker slot");
-    *last = format!(
-        "{COMPAT_FALLBACK_OMITTED_PREFIX}{dropped} additional compatibility events omitted]"
-    );
-}
 
 #[allow(
     clippy::large_enum_variant,
@@ -75,7 +40,7 @@ pub(super) enum ProviderStreamResult {
     /// End the bounded model loop without turning a recoverable protocol
     /// exhaustion into an unhandled provider error. The outer turn still owns
     /// settlement, telemetry, and the deterministic user-facing closeout.
-    BreakInner(bool),
+    Finish(crate::agent::turn::ModelLoopDecision),
 }
 
 impl crate::Agent {
@@ -141,6 +106,9 @@ impl crate::Agent {
             && (self.effective_tool_mode() == hi_ai::ToolMode::Required || mutation_only_repair);
         let mut sink = |event: StreamEvent| match event {
             StreamEvent::Text(text) => {
+                if !text.is_empty() {
+                    ui.provider_progress();
+                }
                 if buffer_read_only_review_text {
                     buffered_assistant_text.push_str(&text);
                 } else {
@@ -148,7 +116,12 @@ impl crate::Agent {
                     ui.assistant_text(&text);
                 }
             }
-            StreamEvent::Reasoning(text) => ui.assistant_reasoning(&text),
+            StreamEvent::Reasoning(text) => {
+                if !text.is_empty() {
+                    ui.provider_progress();
+                }
+                ui.assistant_reasoning(&text);
+            }
             StreamEvent::WireAudit(audit) => {
                 // Deliver wire evidence before execution or approval can
                 // suspend settlement. The report copy is separately redacted.
@@ -160,12 +133,19 @@ impl crate::Agent {
                 }
                 self.report.last_turn_telemetry.record_wire_audit(value);
             }
+            StreamEvent::ProviderAttempt(event) => {
+                ui.provider_attempt(&event);
+                if matches!(event.state, hi_ai::ProviderAttemptState::Started { .. }) {
+                    *effective_fallback_route = Some(format!("{}/{}", event.provider, event.model));
+                    buffered_assistant_text.clear();
+                }
+                self.report
+                    .last_turn_telemetry
+                    .record_wire_audit(serde_json::to_value(event.as_ref()).unwrap_or_default());
+            }
             StreamEvent::Status(text) => {
                 if let Some(fallback) = text.strip_prefix("compat: ") {
                     record_compat_fallback(compat_fallbacks, fallback.to_string());
-                }
-                if let Some(route) = text.rsplit_once("falling back to ").map(|(_, r)| r) {
-                    *effective_fallback_route = Some(route.trim().to_string());
                 }
                 ui.status(&text);
             }
@@ -176,7 +156,13 @@ impl crate::Agent {
             // completion path validates the admitted `run_program` call first,
             // then launches the same conservative shadow reads while the Rhai
             // host starts.
-            StreamEvent::ToolCallDelta { .. } => {}
+            StreamEvent::ToolCallDelta {
+                arguments_delta, ..
+            } => {
+                if !arguments_delta.is_empty() {
+                    ui.provider_progress();
+                }
+            }
         };
         let protocol_retry_nudge =
             tool_protocol_retry_nudge(&request.tools, request.profile.tool_mode);
@@ -198,7 +184,8 @@ impl crate::Agent {
                             &completion,
                             &response_tools,
                             response_tool_mode,
-                        )?;
+                        )
+                        .map_err(|error| error.with_usage(completion.usage))?;
                     }
                     Ok(completion)
                 });
@@ -227,6 +214,24 @@ impl crate::Agent {
                     buffer_read_only_review_text,
                     streamed_assistant_text,
                 })
+            }
+            Err(err) if hi_ai::provider_error_retryable(&err) == Some(false) => {
+                ui.assistant_end();
+                self.add_error_usage(&err);
+                self.emit_usage(ui);
+                // The model-round boundary owns terminal provider failures
+                // after tool work, including failures whose retry policy ended.
+                if !made_tool_call {
+                    *provider_exhausted = true;
+                    self.task_recovery
+                        .stop(format!("provider terminated recovery: {err}"));
+                    if let Err(persistence) = self.persist_task_recovery_async().await {
+                        return Err(err.context(format!(
+                            "persisting provider exhaustion failed: {persistence:#}"
+                        )));
+                    }
+                }
+                Err(err)
             }
             Err(err)
                 if !retry_state.output_cap_retry_attempted
@@ -270,7 +275,7 @@ impl crate::Agent {
                     delay_label(delay)
                 ));
                 if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+                    retry_state.execution.backoff(delay).await?;
                 }
                 Ok(ProviderStreamResult::Continue)
             }
@@ -295,7 +300,7 @@ impl crate::Agent {
                     delay_label(delay)
                 ));
                 if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+                    retry_state.execution.backoff(delay).await?;
                 }
                 Ok(ProviderStreamResult::Continue)
             }
@@ -316,7 +321,7 @@ impl crate::Agent {
                     delay_label(delay)
                 ));
                 if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+                    retry_state.execution.backoff(delay).await?;
                 }
                 Ok(ProviderStreamResult::Continue)
             }
@@ -427,7 +432,7 @@ impl crate::Agent {
                 self.report
                     .last_turn_telemetry
                     .inherit_model_diagnostics(model_telemetry);
-                let _ = self.persist();
+                let _ = self.persist_async().await;
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
                 self.report.last_effective_route =
@@ -438,6 +443,14 @@ impl crate::Agent {
                 if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
                     && hi_ai::provider_error_retryable(&err) != Some(false)
                     && retry_state.protocol_retries < MAX_TOOL_PROTOCOL_RETRIES
+                    // Reserve the last physical send for a sealed text-tool
+                    // repair when this Auto implementation route admits one.
+                    && !(implementation_intent.is_some()
+                        && !request_no_progress_final_answer
+                        && self.effective_tool_mode() == hi_ai::ToolMode::Auto
+                        && retry_state.protocol_text_fallbacks == 0
+                        && (retry_state.execution.remaining_attempts() <= 1
+                            || retry_state.protocol_retries >= retry_state.execution.attempt_limit().saturating_sub(2)))
                     && retry_state.protocol_failures_total < crate::MAX_TOOL_PROTOCOL_FAILURES =>
             {
                 ui.assistant_end();
@@ -490,7 +503,8 @@ impl crate::Agent {
                     && !request_no_progress_final_answer
                     && implementation_intent.is_some()
                     && self.effective_tool_mode() == hi_ai::ToolMode::Auto
-                    && retry_state.protocol_text_fallbacks < 1 =>
+                    && retry_state.protocol_text_fallbacks < 1
+                    && retry_state.execution.remaining_attempts() > 0 =>
             {
                 ui.assistant_end();
                 self.add_error_usage(&err);
@@ -534,9 +548,14 @@ impl crate::Agent {
                     return Ok(ProviderStreamResult::Continue);
                 }
 
+                if made_tool_call {
+                    return Err(err);
+                }
                 ui.status("invalid tool turns exhausted; ending this bounded turn");
                 *provider_exhausted = true;
-                Ok(ProviderStreamResult::BreakInner(false))
+                Ok(ProviderStreamResult::Finish(
+                    crate::agent::turn::ModelLoopDecision::Verify,
+                ))
             }
             Err(err)
                 if matches!(
@@ -551,6 +570,34 @@ impl crate::Agent {
                 ui.assistant_end();
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
+                // If the checklist is complete and the turn has concrete
+                // mutation/validation evidence, the missing prose recap is
+                // optional. Pipe-compatible routes occasionally return an
+                // accepted but empty stream at exactly this boundary. Preserve
+                // the completed work and synthesize a truthful closeout instead
+                // of misclassifying the entire turn as infrastructure failure.
+                let completed_plan_with_tool_evidence = productive_tool_evidence
+                    && !self.goals.plan().is_empty()
+                    && !self.goals.plan_incomplete();
+                if completed_plan_with_tool_evidence
+                    && provider_error_kind(&err) == Some(ProviderErrorKind::EmptyCompletion)
+                {
+                    self.emit_assistant_text(ui, COMPLETED_PLAN_EMPTY_RECAP_FALLBACK);
+                    ui.assistant_end();
+                    self.messages.push_assistant(vec![hi_ai::Content::Text(
+                        COMPLETED_PLAN_EMPTY_RECAP_FALLBACK.into(),
+                    )]);
+                    progress_tracker.no_progress_streak = 0;
+                    progress_tracker.last_no_progress_reason.clear();
+                    progress_tracker.record_final_answer();
+                    self.answer_state = crate::recovery::AnswerState::Deterministic;
+                    ui.status(
+                        "provider returned no final recap; closing from the completed plan and tool evidence",
+                    );
+                    return Ok(ProviderStreamResult::Finish(
+                        crate::agent::turn::ModelLoopDecision::Verify,
+                    ));
+                }
                 let empty_or_malformed = matches!(
                     provider_error_kind(&err),
                     Some(ProviderErrorKind::MalformedStream | ProviderErrorKind::EmptyCompletion)
@@ -586,40 +633,10 @@ impl crate::Agent {
                     *empty_retries = 0;
                     return Ok(ProviderStreamResult::Continue);
                 }
-                // If the checklist is complete and the turn has concrete
-                // mutation/validation evidence, the missing prose recap is
-                // optional. Pipe-compatible routes occasionally return an
-                // accepted but empty stream at exactly this boundary. Preserve
-                // the completed work and synthesize a truthful closeout instead
-                // of misclassifying the entire turn as infrastructure failure.
-                let completed_plan_with_tool_evidence = productive_tool_evidence
-                    && !self.goals.plan().is_empty()
-                    && !self.goals.plan_incomplete();
-                if completed_plan_with_tool_evidence {
-                    self.emit_assistant_text(ui, COMPLETED_PLAN_EMPTY_RECAP_FALLBACK);
-                    ui.assistant_end();
-                    self.messages.push_assistant(vec![hi_ai::Content::Text(
-                        COMPLETED_PLAN_EMPTY_RECAP_FALLBACK.into(),
-                    )]);
-                    progress_tracker.no_progress_streak = 0;
-                    progress_tracker.last_no_progress_reason.clear();
-                    progress_tracker.record_final_answer();
-                    ui.status(
-                        "provider returned no final recap; closing from the completed plan and tool evidence",
-                    );
-                    return Ok(ProviderStreamResult::BreakInner(false));
-                }
-                // Once a tool has already produced a result, an exhausted
-                // empty-response retry is a bounded settling condition, not a
-                // provider failure. The outer turn still owns finalization
-                // (including changed-file reconciliation and verification),
-                // and returning through that path keeps a partially completed
-                // implementation usable instead of surfacing a raw scripted
-                // provider error or making the caller retry indefinitely.
+                // Return the original terminal cause to the common model-round
+                // boundary; it owns verification and retained-work settlement.
                 if made_tool_call {
-                    ui.status("model returned no response after tool results; settling the turn");
-                    *provider_exhausted = true;
-                    return Ok(ProviderStreamResult::BreakInner(false));
+                    return Err(err);
                 }
                 self.reconcile_error_turn_changes(turn_ledger_revision)
                     .await?;
@@ -687,11 +704,17 @@ impl crate::Agent {
                 self.report
                     .last_turn_telemetry
                     .inherit_model_diagnostics(model_telemetry);
-                let _ = self.persist();
+                let _ = self.persist_async().await;
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
                 self.report.last_effective_route =
                     effective_model_route(&self.config, effective_fallback_route.as_deref());
+                Err(err)
+            }
+            Err(err) if made_tool_call && hi_ai::provider_error_details(&err).is_some() => {
+                ui.assistant_end();
+                self.add_error_usage(&err);
+                self.emit_usage(ui);
                 Err(err)
             }
             Err(err) => {
@@ -767,7 +790,7 @@ impl crate::Agent {
                 self.report
                     .last_turn_telemetry
                     .inherit_model_diagnostics(model_telemetry);
-                let _ = self.persist();
+                let _ = self.persist_async().await;
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
                 self.report.last_effective_route =

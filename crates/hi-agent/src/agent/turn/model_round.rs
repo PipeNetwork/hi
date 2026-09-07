@@ -126,7 +126,7 @@ impl crate::Agent {
             .tool_call_cap_reached(sched_tool_calls);
         if step_cap_reached || tool_cap_reached {
             if cap_wrap_up_requested {
-                return Ok(ModelRoundControl::BreakInner(true));
+                return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::VerifyAtLimit));
             }
             cap_wrap_up_requested = true;
             request_cap_wrap_up = true;
@@ -430,7 +430,7 @@ impl crate::Agent {
                 self.report
                     .last_turn_telemetry
                     .inherit_model_diagnostics(model_telemetry);
-                let _ = self.persist();
+                let _ = self.persist_async().await;
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
                 self.report.last_effective_route = effective_model_route(
@@ -475,7 +475,12 @@ impl crate::Agent {
         // previous one append-only (cacheable prefix) or rewrote history.
         self.prefix_stability
             .record_request(self.messages.as_slice(), &request_tools);
+        if !self.admit_recovery_request().await? {
+            ui.status("automatic recovery exhausted; settling the current workspace");
+            return Ok(ModelRoundControl::Finish(self.recovery_terminal_decision(turn_ledger_revision)));
+        }
         let request = ChatRequest {
+            execution: retry_state.execution.clone(),
             model: self.config.routing.model.clone(),
             request_id: Some(retry_state.request_id()),
             retry_attempt: retry_state.request_attempt(),
@@ -622,8 +627,8 @@ impl crate::Agent {
                 super::model_retry::ProviderStreamResult::Continue => {
                     return Ok(ModelRoundControl::Continue);
                 }
-                super::model_retry::ProviderStreamResult::BreakInner(hit) => {
-                    return Ok(ModelRoundControl::BreakInner(hit));
+                super::model_retry::ProviderStreamResult::Finish(hit) => {
+                    return Ok(ModelRoundControl::Finish(hit));
                 }
             };
         self.report.last_turn_telemetry.accepted_completions = self
@@ -760,7 +765,7 @@ impl crate::Agent {
                 return Ok(ModelRoundControl::Continue);
             }
             provider_exhausted = true;
-            return Ok(ModelRoundControl::BreakInner(false));
+            return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
         }
         // A public RSI response is terminal, not a local planning round to nudge.
         if completion.stop_reason.as_deref() == Some("rsi_remote_completed") {
@@ -781,8 +786,10 @@ impl crate::Agent {
             }
             self.messages
                 .push_assistant(std::mem::take(&mut completion.content));
+            retry_state.accepted_completion();
+            self.answer_state = crate::recovery::AnswerState::Accepted;
             progress_tracker.record_final_answer();
-            return Ok(ModelRoundControl::BreakInner(false));
+            return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
         }
 
         let calls: Vec<(String, String, String)> =
@@ -1154,7 +1161,7 @@ If the task is already complete, stop and give your final recap."
                     prev_call_sig = None;
                     return Ok(ModelRoundControl::Continue);
                 }
-                return Ok(ModelRoundControl::BreakInner(false));
+                return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
             }
             if has_no_progress_bash {
                 if self.try_no_progress_recovery(
@@ -1172,7 +1179,7 @@ If the task is already complete, stop and give your final recap."
                     None,
                 );
                 ui.nudge("model repeated no-op shell commands");
-                return Ok(ModelRoundControl::BreakInner(false));
+                return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
             }
             if read_only_intent.is_some() && evidence.saw_search && !evidence.saw_read {
                 if self.try_no_progress_recovery(
@@ -1190,7 +1197,7 @@ If the task is already complete, stop and give your final recap."
                     None,
                 );
                 ui.nudge("review repeated the same search without reading files");
-                return Ok(ModelRoundControl::BreakInner(false));
+                return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
             }
             if let Some(intent) = read_only_intent
                 && (evidence.saw_read || evidence.saw_search)
@@ -1232,7 +1239,7 @@ If the task is already complete, stop and give your final recap."
                 );
                 ui.nudge("review repeated the same command after inspection");
                 let _ = (intent, &evidence);
-                return Ok(ModelRoundControl::BreakInner(false));
+                return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
             }
             // Implementation / explicit-mutation turns that burned the
             // repeat budget on non-mutating work must not hard-stop yet.
@@ -1308,7 +1315,7 @@ If the task is already complete, stop and give your final recap."
                 ui.nudge(
                     "implementation kept repeating without editing; no file changes were made",
                 );
-                return Ok(ModelRoundControl::BreakInner(false));
+                return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
             }
             if self.try_no_progress_recovery(
                 &mut progress_tracker,
@@ -1319,7 +1326,7 @@ If the task is already complete, stop and give your final recap."
                 prev_call_sig = None;
                 return Ok(ModelRoundControl::Continue);
             }
-            return Ok(ModelRoundControl::BreakInner(false));
+            return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
         }
         // A different set of calls (or none) this round — the model moved
         // on. A wait-poll
@@ -1370,7 +1377,7 @@ If the task is already complete, stop and give your final recap."
             }
             self.messages
                 .push_assistant_text_only(std::mem::take(&mut completion.content));
-            return Ok(ModelRoundControl::BreakInner(true));
+            return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::VerifyAtLimit));
         }
 
         if request_no_progress_final_answer {
@@ -1394,41 +1401,19 @@ If the task is already complete, stop and give your final recap."
                 ui.assistant_end();
             }
             if unusable {
-                // Weak-but-non-empty forced answers still count as a deliverable.
-                if has_text && !assistant_text.trim().is_empty() {
-                    force_no_progress_final_answer_next = false;
-                    self.messages
-                        .push_assistant(std::mem::take(&mut completion.content));
-                    progress_tracker.no_progress_streak = 0;
-                    progress_tracker.last_no_progress_reason.clear();
-                    progress_tracker.record_final_answer();
-                    ui.status("forced final answer was weak; accepting available text");
-                    return Ok(ModelRoundControl::BreakInner(false));
-                }
-                if empty_retries < self.config.loop_limits.max_empty_retries {
-                    empty_retries += 1;
-                    ui.nudge(&format!(
-                        "the forced final answer was empty; retrying tool-free ({empty_retries}/{})",
-                        self.config.loop_limits.max_empty_retries
-                    ));
-                    return Ok(ModelRoundControl::Continue);
-                }
-                self.messages
-                    .push_assistant_text_only(std::mem::take(&mut completion.content));
-                progress_tracker.record(
-                    ProgressKind::None,
-                    "forced_final_unusable",
-                    None,
-                );
-                return Err(anyhow::anyhow!(
-                    "model returned no usable final answer after bounded recovery"
-                ));
+                self.messages.push_assistant_text_only(std::mem::take(&mut completion.content));
+                self.answer_state = crate::recovery::AnswerState::Commentary;
+                self.task_recovery.stop("forced final answer did not satisfy the task");
+                self.persist_task_recovery_async().await?;
+                return Ok(ModelRoundControl::Finish(self.recovery_terminal_decision(turn_ledger_revision)));
             }
             force_no_progress_final_answer_next = false;
             self.messages
                 .push_assistant(std::mem::take(&mut completion.content));
+            retry_state.accepted_completion();
+            self.answer_state = crate::recovery::AnswerState::Accepted;
             progress_tracker.record_final_answer();
-            return Ok(ModelRoundControl::BreakInner(false));
+            return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
         }
 
         // Auto-recover from a content-less response — no tool calls and no
@@ -1438,20 +1423,6 @@ If the task is already complete, stop and give your final recap."
         // dead round isn't recorded, so each retry re-runs with the
         // original context.
         if calls.is_empty() && !has_text {
-            if empty_retries < self.config.loop_limits.max_empty_retries {
-                empty_retries += 1;
-                if made_tool_call {
-                    self.nudge_after_post_tool_empty_response(
-                        &mut force_tools_next,
-                        implementation_intent.is_some(),
-                    );
-                }
-                ui.status(&format!(
-                    "⚠ the model returned no response — retrying ({empty_retries}/{})",
-                    self.config.loop_limits.max_empty_retries
-                ));
-                return Ok(ModelRoundControl::Continue);
-            }
             // The provider can occasionally return accepted-but-empty streams
             // after every requested tool has already succeeded (observed on the
             // live Pipe route immediately after a write + final update_plan).
@@ -1475,11 +1446,29 @@ If the task is already complete, stop and give your final recap."
                 )]);
                 progress_tracker.no_progress_streak = 0;
                 progress_tracker.last_no_progress_reason.clear();
-                progress_tracker.record_final_answer();
+                retry_state.accepted_completion();
+            self.answer_state = crate::recovery::AnswerState::Deterministic;
+            progress_tracker.record_final_answer();
                 ui.status(
                     "provider returned no final recap; closing from the completed plan and tool evidence",
                 );
-                return Ok(ModelRoundControl::BreakInner(false));
+                return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
+            }
+            self.messages.push_nudge_or_fold(crate::transcript::NudgeKind::Continue,
+                "The response contained no usable answer or tool call. Continue from the existing evidence.");
+            if empty_retries < self.config.loop_limits.max_empty_retries {
+                empty_retries += 1;
+                if made_tool_call {
+                    self.nudge_after_post_tool_empty_response(
+                        &mut force_tools_next,
+                        implementation_intent.is_some(),
+                    );
+                }
+                ui.status(&format!(
+                    "⚠ the model returned no response — retrying ({empty_retries}/{})",
+                    self.config.loop_limits.max_empty_retries
+                ));
+                return Ok(ModelRoundControl::Continue);
             }
             ui.status("⚠ the model returned no response after retrying — ending this bounded turn");
             return Err(anyhow::anyhow!("model returned no response after retrying"));
@@ -1522,10 +1511,23 @@ If the task is already complete, stop and give your final recap."
                 ui,
             )? {
                 super::steer::RoundControl::Continue => return Ok(ModelRoundControl::Continue),
-                super::steer::RoundControl::BreakInner(hit) => return Ok(ModelRoundControl::BreakInner(hit)),
+                super::steer::RoundControl::Finish(hit) => {
+                    self.answer_state = crate::recovery::AnswerState::Candidate;
+                    if super::finalize::text_is_user_visible_answer(&assistant_text)
+                        && !implementation_tracker.no_mutation_exhausted
+                        && progress_tracker.no_progress_streak == 0
+                        && !self.task_recovery.exhausted
+                    {
+                        self.answer_state = crate::recovery::AnswerState::Accepted;
+                        retry_state.accepted_completion();
+                    }
+                    return Ok(ModelRoundControl::Finish(hit));
+                },
             }
         }
 
+        self.answer_state = crate::recovery::AnswerState::Commentary;
+        retry_state.accepted_completion();
         Ok(ModelRoundControl::RunTools {
             calls,
             completion_content: completion.content,

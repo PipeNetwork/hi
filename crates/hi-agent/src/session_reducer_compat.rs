@@ -3,11 +3,112 @@
 use hi_ai::{Message, Role};
 use serde::Deserialize;
 
-use crate::session_reducer::SessionEventKind;
+use crate::session_reducer::{
+    SESSION_EVENT_SCHEMA_VERSION, SessionEvent, SessionEventKind, SessionReduceError,
+};
 use crate::{
     Decision, Goal, PlanStep, TranscriptBlockId, TranscriptBlockKind, TranscriptBlockTerminal,
     TurnStatus, TurnStopReason,
 };
+
+impl SessionEvent {
+    /// Strict decoding for restoration. Torn/unknown legacy records remain
+    /// opaque; recognized safety/recovery records and canonical envelopes must
+    /// not silently disappear and reset durable control state.
+    pub fn decode_legacy_json(line: &str) -> Result<Option<Self>, SessionReduceError> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(None);
+        }
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => return Ok(Some(Self::opaque_boundary())),
+        };
+        if value.get("kind").is_some() && value.get("schema_version").is_some() {
+            let schema = value["schema_version"].as_u64().unwrap_or(u64::MAX);
+            if schema != u64::from(SESSION_EVENT_SCHEMA_VERSION) {
+                return Err(SessionReduceError::InvalidRecord(format!(
+                    "unsupported session event schema {schema}; this binary supports {SESSION_EVENT_SCHEMA_VERSION}"
+                )));
+            }
+            return serde_json::from_value(value).map(Some).map_err(|error| {
+                SessionReduceError::InvalidRecord(format!(
+                    "invalid canonical session event: {error}"
+                ))
+            });
+        }
+        let settlement_state = value.get("type").and_then(serde_json::Value::as_str)
+            == Some("turn_outcome")
+            && (value.get("task_recovery").is_some() || value.get("settled_goal").is_some());
+        let critical = settlement_state
+            || matches!(
+                value.get("type").and_then(serde_json::Value::as_str),
+                Some(
+                    "task_recovery"
+                        | "workspace_execution_staged"
+                        | "workspace_execution_settled"
+                        | "remote_session_identity"
+                )
+            );
+        if value.get("type").is_some() {
+            return match serde_json::from_value::<LegacySessionMeta>(value) {
+                Ok(meta) => Ok(Some(Self::new(meta.into()))),
+                Err(error) if critical => Err(SessionReduceError::InvalidRecord(format!(
+                    "invalid durable session record: {error}"
+                ))),
+                Err(_) => Ok(Some(Self::opaque_boundary())),
+            };
+        }
+        Ok(Some(Self::new(
+            serde_json::from_value::<Message>(value)
+                .map(|message| SessionEventKind::Message { message })
+                .unwrap_or(SessionEventKind::OpaqueBoundary),
+        )))
+    }
+
+    /// Decode an existing remote record. Remote messages are bare messages;
+    /// all metadata retains the tagged local wire representation.
+    pub fn decode_remote_record(
+        record_type: &str,
+        payload_json: &str,
+    ) -> Result<Self, SessionReduceError> {
+        if record_type == "message" {
+            return Ok(Self::new(
+                serde_json::from_str::<Message>(payload_json)
+                    .map(|message| SessionEventKind::Message { message })
+                    .unwrap_or(SessionEventKind::OpaqueBoundary),
+            ));
+        }
+        let mut event =
+            Self::decode_legacy_json(payload_json)?.unwrap_or_else(Self::opaque_boundary);
+        let wrong_critical_type = match record_type {
+            "task_recovery" => !matches!(event.kind, SessionEventKind::TaskRecovery { .. }),
+            "turn_outcome" => !matches!(event.kind, SessionEventKind::TurnOutcome { .. }),
+            "workspace_execution_staged" => !matches!(
+                event.kind,
+                SessionEventKind::WorkspaceExecutionStaged { .. }
+            ),
+            "workspace_execution_settled" => !matches!(
+                event.kind,
+                SessionEventKind::WorkspaceExecutionSettled { .. }
+            ),
+            "remote_session_identity" => {
+                !matches!(event.kind, SessionEventKind::RemoteSessionIdentity { .. })
+            }
+            _ => false,
+        };
+        if wrong_critical_type {
+            return Err(SessionReduceError::InvalidRecord(format!(
+                "invalid remote {record_type} record"
+            )));
+        }
+        if record_type != "session_event" && matches!(event.kind, SessionEventKind::Message { .. })
+        {
+            event = Self::opaque_boundary();
+        }
+        Ok(event)
+    }
+}
 
 #[derive(Clone, Debug, Default, serde::Serialize, Deserialize)]
 pub(super) struct LegacyPlanPauseMigration {
@@ -128,6 +229,9 @@ pub(super) enum LegacySessionMeta {
         goal: Goal,
     },
     GoalCleared,
+    TaskRecovery {
+        state: crate::TaskRecoveryState,
+    },
     Decisions {
         decisions: Vec<Decision>,
     },
@@ -162,6 +266,10 @@ pub(super) enum LegacySessionMeta {
     TurnOutcome {
         status: TurnStatus,
         stop_reason: TurnStopReason,
+        #[serde(default)]
+        task_recovery: Option<crate::TaskRecoveryState>,
+        #[serde(default)]
+        settled_goal: Option<Box<Goal>>,
     },
     StateReplacement {
         messages: Vec<Message>,
@@ -241,6 +349,7 @@ impl From<LegacySessionMeta> for SessionEventKind {
             LegacySessionMeta::Compaction { messages } => Self::Compaction { messages },
             LegacySessionMeta::Goal { goal } => Self::Goal { goal },
             LegacySessionMeta::GoalCleared => Self::GoalCleared,
+            LegacySessionMeta::TaskRecovery { state } => Self::TaskRecovery { state },
             LegacySessionMeta::Decisions { decisions } => Self::Decisions { decisions },
             LegacySessionMeta::Plan { steps } => Self::Plan { steps },
             LegacySessionMeta::PlanCleared => Self::PlanCleared,
@@ -270,9 +379,13 @@ impl From<LegacySessionMeta> for SessionEventKind {
             LegacySessionMeta::TurnOutcome {
                 status,
                 stop_reason,
+                task_recovery,
+                settled_goal,
             } => Self::TurnOutcome {
                 status,
                 stop_reason,
+                task_recovery,
+                settled_goal,
             },
             LegacySessionMeta::StateReplacement {
                 messages,

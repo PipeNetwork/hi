@@ -2,6 +2,8 @@
 //! that advances/retries the active sub-goal, and `handle_record_decision`
 //! for the `record_decision` tool.
 
+mod decisions;
+
 use crate::Ui;
 use crate::agent::skeptic::SkepticVerdict;
 use crate::decision::Decision;
@@ -25,7 +27,7 @@ pub(crate) struct GoalTurnState<'a> {
 
 impl crate::Agent {
     pub(crate) fn goal_continuation_context(&self, input: &str) -> Option<String> {
-        if self.plan_mode || input != crate::GOAL_CONTINUE_PROMPT {
+        if self.plan_mode || input.trim() != crate::GOAL_CONTINUE_PROMPT {
             return None;
         }
         let goal = self
@@ -89,11 +91,11 @@ impl crate::Agent {
         // Verification can pass for a partial edit even when the provider
         // failed before finishing the milestone. Keep that work and its pass,
         // but neither advance the goal nor charge a failed-work attempt.
-        if provider_exhausted {
+        if provider_exhausted || self.task_recovery.exhausted {
             self.goals.structured = goal_before;
             self.refresh_system_message();
             if blocked_this_turn {
-                self.persist_goal(ui);
+                self.persist_goal_async(ui).await;
             }
             return false;
         }
@@ -105,9 +107,8 @@ impl crate::Agent {
         }
         let start_active_index = start_goal.active_index();
         let mut verification_invalidated = false;
-        // Ordinary goal work retries without an implicit count ceiling. The
-        // frontend's drive-stall tracker remains the independent circuit breaker
-        // for turns that land no new evidence or workspace progress.
+        // Productive goal work has no new cap; automatic corrections share
+        // the persisted task recovery allowance across drive turns.
         let max_retries = DEFAULT_SUBGOAL_RETRIES;
         let hit_work_cap = hit_step_cap || hit_tool_cap;
         let cap_label = match (hit_step_cap, hit_tool_cap) {
@@ -182,6 +183,7 @@ impl crate::Agent {
         {
             match self.skeptic_gate(&objective, &sub_goal, &prior_notes).await {
                 SkepticVerdict::Object(items) => {
+                    self.task_recovery.request_correction("reviewer objection");
                     let objections = items.join("\n");
                     // Objection: revert the turn's goal progress and record it.
                     self.goals.structured = goal_before;
@@ -196,7 +198,7 @@ impl crate::Agent {
                     let first = objections.lines().next().unwrap_or("see notes");
                     ui.status(&format!("🔍 skeptic objected — retrying: {first}"));
                     self.refresh_system_message();
-                    self.persist_goal(ui);
+                    self.persist_goal_async(ui).await;
                     self.report.last_turn_telemetry.skeptic_last_status =
                         Some(SkepticStatus::Objected);
                     return false;
@@ -223,7 +225,7 @@ impl crate::Agent {
                     self.report.last_turn_telemetry.skeptic_last_status =
                         Some(SkepticStatus::Escalated);
                     self.refresh_system_message();
-                    self.persist_goal(ui);
+                    self.persist_goal_async(ui).await;
                     return false;
                 }
                 SkepticVerdict::Approve => {
@@ -351,7 +353,7 @@ impl crate::Agent {
             // step the model already reported as impossible.
             if blocked_this_turn {
                 self.refresh_system_message();
-                self.persist_goal(ui);
+                self.persist_goal_async(ui).await;
             }
             return verification_invalidated;
         }
@@ -443,7 +445,7 @@ impl crate::Agent {
                 }
             }
             self.refresh_system_message();
-            self.persist_goal(ui);
+            self.persist_goal_async(ui).await;
             return verification_invalidated;
         }
         // A turn that reached an explicit work cap and made real progress
@@ -485,7 +487,7 @@ impl crate::Agent {
                         "🧩 milestone too large for one turn — split into {spliced} turn-sized sub-steps"
                     ));
                     self.refresh_system_message();
-                    self.persist_goal(ui);
+                    self.persist_goal_async(ui).await;
                     return verification_invalidated;
                 }
             }
@@ -529,7 +531,7 @@ impl crate::Agent {
                     };
                     ui.status(&msg);
                     self.refresh_system_message();
-                    self.persist_goal(ui);
+                    self.persist_goal_async(ui).await;
                     return verification_invalidated;
                 }
             }
@@ -561,7 +563,7 @@ impl crate::Agent {
                 ));
             }
             self.refresh_system_message();
-            self.persist_goal(ui);
+            self.persist_goal_async(ui).await;
             return verification_invalidated;
         }
         let reason = if hit_step_cap && hit_tool_cap {
@@ -626,7 +628,7 @@ impl crate::Agent {
             }
         }
         self.refresh_system_message();
-        self.persist_goal(ui);
+        self.persist_goal_async(ui).await;
         verification_invalidated
     }
 
@@ -696,57 +698,6 @@ impl crate::Agent {
             )
         };
         decision_tool_outcome(message, hi_tools::ToolStatus::Succeeded)
-    }
-
-    /// Handle a `record_decision` tool call: parse the args, append to the
-    /// durable decision log (which feeds the system prompt), and return a
-    /// terse confirmation for the model. Malformed args yield an error string
-    /// (the model sees it and can retry), not a panic.
-    pub(crate) fn handle_record_decision(&mut self, arguments: &str) -> hi_tools::ToolOutcome {
-        #[derive(serde::Deserialize)]
-        struct DecisionArgs {
-            summary: String,
-            rationale: String,
-            #[serde(default)]
-            files: Vec<String>,
-        }
-        match serde_json::from_str::<DecisionArgs>(arguments) {
-            Ok(args) => {
-                let summary = args.summary.trim().to_string();
-                if summary.is_empty() {
-                    return decision_tool_outcome(
-                        "Error: record_decision needs a non-empty summary".to_string(),
-                        hi_tools::ToolStatus::Failed,
-                    );
-                }
-                let mut next = self.decisions.clone();
-                next.record(Decision {
-                    summary,
-                    rationale: args.rationale.trim().to_string(),
-                    files: args.files,
-                });
-                if let Some(session) = self.session.as_mut()
-                    && let Err(err) = session.record_decisions(&next)
-                {
-                    return decision_tool_outcome(
-                        format!("Error: couldn't persist decision: {err}"),
-                        hi_tools::ToolStatus::Failed,
-                    );
-                }
-                self.decisions = next;
-                // Refresh the system prompt so the decision is injected on the
-                // next turn (and visible to the model immediately in history).
-                self.refresh_system_message();
-                decision_tool_outcome(
-                    "Decision recorded — it will persist across compaction.".to_string(),
-                    hi_tools::ToolStatus::Succeeded,
-                )
-            }
-            Err(err) => decision_tool_outcome(
-                format!("Error: bad record_decision arguments: {err}"),
-                hi_tools::ToolStatus::Failed,
-            ),
-        }
     }
 
     /// Pause for a product/design choice. Headless frontends get a continue

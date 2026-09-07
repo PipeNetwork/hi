@@ -5,7 +5,7 @@ use hi_ai::Content;
 
 impl crate::Agent {
     /// Stage an audit-only execution before workspace settlement.
-    pub(crate) fn stage_active_workspace_execution(
+    pub(crate) async fn stage_active_workspace_execution(
         &mut self,
         calls: &[(String, String, String)],
         assistant_content: &[Content],
@@ -13,12 +13,13 @@ impl crate::Agent {
         execution: &hi_workspace::ExecutionReport,
     ) -> Result<()> {
         self.stage_workspace_execution_inner(calls, assistant_content, results, execution, false)
+            .await
     }
 
     /// Stage a provider-visible tool batch. If the process exits after local
     /// settlement but before ordinary turn persistence, resume reconstructs
     /// this exact assistant/result sequence once from the durable stage.
-    pub(crate) fn stage_visible_workspace_execution(
+    pub(crate) async fn stage_visible_workspace_execution(
         &mut self,
         calls: &[(String, String, String)],
         assistant_content: &[Content],
@@ -26,9 +27,10 @@ impl crate::Agent {
         execution: &hi_workspace::ExecutionReport,
     ) -> Result<()> {
         self.stage_workspace_execution_inner(calls, assistant_content, results, execution, true)
+            .await
     }
 
-    fn stage_workspace_execution_inner(
+    async fn stage_workspace_execution_inner(
         &mut self,
         calls: &[(String, String, String)],
         assistant_content: &[Content],
@@ -81,19 +83,22 @@ impl crate::Agent {
             calls: transcript_calls,
             execution: execution.clone(),
         };
-        let session = self
-            .session
-            .as_mut()
-            .context("workspace execution requires a durable session sink")?;
-        if pipefs {
-            session
-                .stage_workspace_execution(&record)
-                .context("staging PipeFS workspace execution transcript")
-        } else {
-            session
-                .stage_local_workspace_execution(&record, visible_on_resume)
-                .context("staging local workspace execution transcript")
-        }
+        anyhow::ensure!(
+            self.session.is_some(),
+            "workspace execution requires a durable session sink"
+        );
+        self.write_session(move |session| {
+            if pipefs {
+                session
+                    .stage_workspace_execution(&record)
+                    .context("staging PipeFS workspace execution transcript")
+            } else {
+                session
+                    .stage_local_workspace_execution(&record, visible_on_resume)
+                    .context("staging local workspace execution transcript")
+            }
+        })
+        .await
     }
 
     /// Settle an admitted operation using the executor's real typed result.
@@ -123,11 +128,15 @@ impl crate::Agent {
             .checkpoint(self.workspace_durability.clone(), execution)
             .await?;
         if let Some(operation_id) = local_operation {
-            self.session
-                .as_mut()
-                .context("local workspace settlement lost its durable session sink")?
-                .settle_local_workspace_execution(&operation_id)
-                .context("recording local workspace transcript settlement")?;
+            anyhow::ensure!(
+                self.session.is_some(),
+                "local workspace settlement lost its durable session sink"
+            );
+            self.write_session(move |session| {
+                session.settle_local_workspace_execution(&operation_id)
+            })
+            .await
+            .context("recording local workspace transcript settlement")?;
         }
         self.runtime
             .background()

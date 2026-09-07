@@ -13,8 +13,7 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 
 use super::{
-    OpenAiProvider, canonical_request_id, rate_limits_from_headers, request_idempotency_key,
-    retry_after_header_seconds,
+    OpenAiProvider, canonical_request_id, rate_limits_from_headers, retry_after_header_seconds,
 };
 use crate::provider::{ProviderError, ProviderErrorKind};
 use crate::{ChatRequest, Completion, Content, StreamEvent, Usage};
@@ -48,18 +47,10 @@ impl OpenAiProvider {
         }
         let url = format!("{}/responses", self.base_url);
         let correlation_id = canonical_request_id(request.request_id.as_deref());
-        let idempotency_key = request_idempotency_key(&correlation_id, &body);
         let mut auth_refreshed = false;
         loop {
             let response = match self
-                .dispatch_chat(
-                    &url,
-                    &body,
-                    &correlation_id,
-                    request.retry_attempt,
-                    &idempotency_key,
-                    sink,
-                )
+                .dispatch_chat(&url, &body, &correlation_id, &request.execution, sink)
                 .await
             {
                 Ok(response) => response,
@@ -143,9 +134,11 @@ impl OpenAiProvider {
             }
             let retry_after = retry_after_header_seconds(&response);
             let text = response.text().await.unwrap_or_default();
-            let mut error = super::request::parse_api_error(Some(status), &text)
-                .into_provider_error(Some(status));
-            if error.kind == ProviderErrorKind::Auth
+            let parsed = super::request::parse_api_error(Some(status), &text);
+            let explicit_retryable = parsed.explicit_retryable;
+            let mut error = parsed.into_provider_error(Some(status));
+            if explicit_retryable != Some(false)
+                && error.kind == ProviderErrorKind::Auth
                 && !crate::is_billing_or_quota_text(&text)
                 && !auth_refreshed
                 && self.auth.refresh().await

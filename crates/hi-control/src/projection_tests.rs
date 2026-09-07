@@ -388,3 +388,42 @@ fn store_uses_schema_v2_with_foreign_keys_enabled() {
         .unwrap();
     assert_eq!(enabled, 1);
 }
+
+#[test]
+fn lifecycle_batch_rolls_back_every_projection_and_event_on_conflict() {
+    let store = store();
+    let batch = vec![
+        (
+            ProjectionTransition::WorkspaceBinding(binding(1, WorkspaceProjectionState::Ready)),
+            required_event("binding"),
+        ),
+        // A new job must begin at revision one. This late conflict must undo
+        // the earlier binding and required event in the same transaction.
+        (
+            ProjectionTransition::Job(job(2, ControlJobState::Running)),
+            required_event("invalid job"),
+        ),
+    ];
+    assert!(store.commit_projection_events(batch).is_err());
+    assert!(store.get_workspace_binding("binding-1").unwrap().is_none());
+    assert!(store.get_job("job-1").unwrap().is_none());
+    assert_eq!(store.max_event_sequence().unwrap(), 0);
+}
+
+#[test]
+fn lifecycle_batch_retries_exactly_without_duplicate_events() {
+    let store = store();
+    let batch = vec![
+        (
+            ProjectionTransition::WorkspaceBinding(binding(1, WorkspaceProjectionState::Ready)),
+            required_event("binding"),
+        ),
+        (
+            ProjectionTransition::Job(job(1, ControlJobState::Running)),
+            required_event("job"),
+        ),
+    ];
+    let receipts = store.commit_projection_events(batch.clone()).unwrap();
+    assert_eq!(store.commit_projection_events(batch).unwrap(), receipts);
+    assert_eq!(store.max_event_sequence().unwrap(), 2);
+}

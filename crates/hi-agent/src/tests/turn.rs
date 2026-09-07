@@ -157,7 +157,7 @@ async fn durable_mode_requires_a_session_sink() {
         .await
         .expect_err("durable execution without storage must fail closed");
 
-    assert!(error.to_string().contains("persisted session"));
+    assert!(format!("{error:#}").contains("persisted session"));
 }
 
 #[test]
@@ -884,11 +884,9 @@ async fn repeated_tool_calls_return_a_bounded_provider_error() {
     }
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
-    let error = agent.run_turn("check it", &mut ui).await.unwrap_err();
-    assert!(
-        error.to_string().contains("no usable final answer"),
-        "unexpected error: {error:#}"
-    );
+    let outcome = agent.run_turn("check it", &mut ui).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
     assert_eq!(
         ui.statuses
             .iter()
@@ -968,8 +966,7 @@ async fn bash_stop_word_cycle_settles_as_typed_no_progress() {
     assert_eq!(agent.last_turn_telemetry().repeat_nudges, 1);
     assert!(agent.last_turn_telemetry().no_progress_streak > 0);
     assert!(
-        ui.assistant
-            .contains("could not complete this request after repeated attempts made no progress"),
+        ui.assistant.contains("Automatic recovery stopped."),
         "the bounded no-op loop should emit an honest terminal closeout: {}",
         ui.assistant
     );
@@ -1171,10 +1168,14 @@ async fn forced_final_contentless_retry_stays_chat_only() {
         .unwrap();
 
     let modes = modes.lock().unwrap();
+    assert_eq!(modes.last(), Some(&ToolMode::ChatOnly));
     assert_eq!(
-        &modes[modes.len() - 2..],
-        &[ToolMode::ChatOnly, ToolMode::ChatOnly],
-        "a contentless forced-final completion must retry tool-free: {modes:?}"
+        modes
+            .iter()
+            .filter(|mode| **mode == ToolMode::ChatOnly)
+            .count(),
+        1,
+        "missing terminal output closes deterministically without another model request"
     );
     drop(modes);
     let requests = requests.lock().unwrap();
@@ -1191,7 +1192,7 @@ async fn forced_final_contentless_retry_stays_chat_only() {
         !retry_user_text.contains("previous model response after the tool results was empty"),
         "contentless retry appended tool guidance: {retry_user_text}"
     );
-    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 2);
+    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 1);
 }
 
 #[tokio::test]
@@ -2724,14 +2725,9 @@ async fn missing_background_output_after_prior_mutation_returns_a_bounded_error(
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    let error = agent
-        .run_turn("fix the harness", &mut ui)
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("no usable final answer"),
-        "unexpected error: {error:#}"
-    );
+    let outcome = agent.run_turn("fix the harness", &mut ui).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
 
     assert_eq!(
         ui.statuses
@@ -2795,14 +2791,9 @@ async fn missing_background_kill_after_prior_mutation_returns_a_bounded_error() 
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    let error = agent
-        .run_turn("fix the harness", &mut ui)
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("no usable final answer"),
-        "unexpected error: {error:#}"
-    );
+    let outcome = agent.run_turn("fix the harness", &mut ui).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
 
     assert_eq!(
         ui.statuses
@@ -2897,8 +2888,7 @@ async fn implementation_re_read_exhaustion_settles_as_typed_no_progress() {
         ui.statuses
     );
     assert!(
-        ui.assistant
-            .contains("could not complete this request after repeated attempts made no progress"),
+        ui.assistant.contains("Automatic recovery stopped."),
         "implementation exhaustion should emit an honest terminal closeout: {}",
         ui.assistant
     );
@@ -2962,7 +2952,8 @@ async fn re_read_after_prior_mutation_forces_bounded_closeout() {
             .iter()
             .any(|s| s.contains("forcing a final answer"))
     );
-    assert_eq!(ui.assistant, "Done.");
+    assert!(ui.assistant.starts_with("Done."));
+    assert!(ui.assistant.contains("Verification did not establish"));
     let read_results = ui
         .tool_results
         .iter()
@@ -3243,26 +3234,18 @@ async fn implementation_repeat_exhaustion_repairs_to_edit_instead_of_forced_fina
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    agent
+    let outcome = agent
         .run_turn("/build parser implementation", &mut ui)
         .await
         .unwrap();
 
-    assert_eq!(std::fs::read_to_string(&write_path).unwrap(), "x");
-    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 0);
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
     assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("repeating without editing")),
-        "expected implementation repeat repair status: {:?}",
-        ui.statuses
+        !write_path.exists(),
+        "exhausted recovery cannot reach the surplus scripted edit"
     );
-    assert_eq!(
-        agent.last_turn_telemetry().no_progress_streak,
-        0,
-        "turn should recover by editing and validating, statuses: {:?}",
-        ui.statuses
-    );
+    assert!(agent.task_recovery().exhausted);
     let _ = std::fs::remove_file(inspect_path);
     let _ = std::fs::remove_file(write_path);
 }
@@ -3714,6 +3697,15 @@ async fn next_prompt_does_not_fold_into_stale_nudge() {
     let mut ui = RecUi::default();
     let _ = agent.run_turn("first task", &mut ui).await;
 
+    // Install only the second response: the first turn now exhausts recovery
+    // sooner, leaving deliberately surplus loop responses unused.
+    agent.provider = std::sync::Arc::new(Canned(std::sync::Mutex::new(vec![completion(
+        vec![Content::Text(
+            "The answer to the second task is four.".into(),
+        )],
+        1,
+        1,
+    )])));
     // Second turn — should start clean, not folded into a nudge.
     let mut ui2 = RecUi::default();
     agent
@@ -4482,7 +4474,11 @@ async fn capped_mutating_turn_still_runs_workspace_verification() {
         agent.report.verify.passed(),
         "cap exit must not skip verification"
     );
-    assert_eq!(agent.last_turn_telemetry().verification_executions.len(), 1);
+    assert_eq!(agent.last_turn_telemetry().verification_executions.len(), 2);
+    assert_eq!(
+        outcome.verified_workspace_revision,
+        Some(agent.runtime.ledger().workspace_revision())
+    );
     assert_eq!(
         std::fs::read_to_string(workspace.path("result.txt")).unwrap(),
         "verified\n"
@@ -5915,6 +5911,8 @@ async fn productive_program_host_waits_past_the_legacy_total_deadline() {
             result = &mut turn => panic!("turn settled before the delayed host decision: {result:?}"),
         }
         tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        // Durability now runs on a real writer thread; only approval uses virtual time.
+        tokio::time::resume();
         turn.await.unwrap()
     };
 

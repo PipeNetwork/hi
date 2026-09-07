@@ -79,6 +79,7 @@ enum WorkerCommand {
         future_factory: SharedBgFutureFactory,
         result_tx: oneshot::Sender<BackgroundTaskOutcome>,
         handle_tx: oneshot::Sender<AbortHandle>,
+        execution_done: watch::Sender<bool>,
         activation_rx: oneshot::Receiver<Option<crate::job_lifecycle::ManagedBackgroundJob>>,
         dispatch_cancelled: Arc<AtomicBool>,
         task_id: String,
@@ -211,6 +212,7 @@ struct BgTaskEntry {
     terminal_outcome: Arc<std::sync::Mutex<Option<BackgroundTaskOutcome>>>,
     /// Abort handle for the LocalSet task — used by `kill_task`.
     abort_handle: Option<AbortHandle>,
+    execution_done: watch::Receiver<bool>,
     /// Notify for `wait_tasks` — signalled when the task reaches a terminal state.
     notify: Arc<Notify>,
     managed_job: Option<crate::job_lifecycle::ManagedBackgroundJob>,
@@ -339,6 +341,7 @@ fn dispatch_worker_command(local_set: &tokio::task::LocalSet, cmd: WorkerCommand
         future_factory,
         result_tx,
         handle_tx,
+        execution_done,
         activation_rx,
         dispatch_cancelled,
         task_id,
@@ -361,7 +364,11 @@ fn dispatch_worker_command(local_set: &tokio::task::LocalSet, cmd: WorkerCommand
 
     let worker_abort_handles = abort_handles.clone();
     let worker_task_id = task_id.clone();
-    let handle = local_set.spawn_local(async move {
+    let execution_task_id = worker_task_id.clone();
+    let execution_abort_handles = worker_abort_handles.clone();
+    let execution = local_set.spawn_local(async move {
+        let worker_task_id = execution_task_id;
+        let worker_abort_handles = execution_abort_handles;
         // The registry activates the task only after it has installed the
         // worker handle into the provisional entry. A timed-out or dropped
         // dispatcher closes this channel, so late commands cannot execute.
@@ -370,10 +377,10 @@ fn dispatch_worker_command(local_set: &tokio::task::LocalSet, cmd: WorkerCommand
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&worker_task_id);
-            return;
+            return None;
         };
         if dispatch_cancelled.load(Ordering::Acquire) {
-            return;
+            return None;
         }
 
         let Some(future_factory) = future_factory
@@ -385,12 +392,12 @@ fn dispatch_worker_command(local_set: &tokio::task::LocalSet, cmd: WorkerCommand
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&worker_task_id);
-            return;
+            return None;
         };
         let started_failure =
             hi_workspace::hit_harness_failpoint(hi_workspace::HarnessFailpoint::JobAfterSpawn)
                 .err();
-        let mut outcome = if let Some(error) = started_failure {
+        let outcome = if let Some(error) = started_failure {
             BackgroundTaskOutcome {
                 id: worker_task_id.clone(),
                 description: String::new(),
@@ -427,6 +434,22 @@ fn dispatch_worker_command(local_set: &tokio::task::LocalSet, cmd: WorkerCommand
                 }
             }
         };
+        Some((managed_job, outcome))
+    });
+    let abort_handle = execution.abort_handle();
+    // Finalization is a separate owner: cancelling execution cannot drop an
+    // accepted journal publication or a parent-owned candidate application.
+    local_set.spawn_local(async move {
+        let result = execution.await;
+        execution_done.send_replace(true);
+        let Ok(Some((managed_job, mut outcome))) = result else {
+            return;
+        };
+        // A cancellation reserved while execution was still live owns its
+        // terminal callback, including a natural-exit race with AbortHandle.
+        if candidates.cancel_requested(&worker_task_id) {
+            return;
+        }
         if let Err(error) = teardown.wait().await {
             outcome.state = BackgroundTaskState::Failed;
             outcome.output = format!("child process teardown was not proven: {error}");
@@ -477,7 +500,6 @@ fn dispatch_worker_command(local_set: &tokio::task::LocalSet, cmd: WorkerCommand
         task_notify.notify_waiters();
         completed_notify.notify_waiters();
     });
-    let abort_handle = handle.abort_handle();
     abort_handles
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -862,6 +884,7 @@ impl BackgroundTaskRegistry {
 
         let (tx, rx) = oneshot::channel::<BackgroundTaskOutcome>();
         let (handle_tx, handle_rx) = oneshot::channel::<AbortHandle>();
+        let (execution_done_tx, execution_done) = watch::channel(false);
         let (activation_tx, activation_rx) = oneshot::channel();
         let dispatch_cancelled = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(Notify::new());
@@ -926,6 +949,7 @@ impl BackgroundTaskRegistry {
                 observed: false,
                 terminal_outcome: terminal_outcome.clone(),
                 abort_handle: None,
+                execution_done,
                 notify: notify.clone(),
                 managed_job: None,
                 lifecycle_gate: lifecycle_gate.clone(),
@@ -961,6 +985,7 @@ impl BackgroundTaskRegistry {
                 future_factory: gated_factory,
                 result_tx: tx,
                 handle_tx,
+                execution_done: execution_done_tx,
                 activation_rx,
                 dispatch_cancelled,
                 task_id: id.clone(),
@@ -1370,13 +1395,87 @@ impl BackgroundTaskRegistry {
     }
 
     pub async fn kill_all(&self) {
-        let ids: Vec<String> = {
-            let tasks = self.tasks.lock().await;
-            tasks.keys().cloned().collect()
-        };
+        self.kill_all_before(tokio::time::Instant::now() + Duration::from_secs(60))
+            .await;
+    }
+
+    /// Signal every eligible execution before waiting for any publication.
+    /// The caller owns one shutdown budget; timeout retains completion owners.
+    pub async fn kill_all_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Vec<BackgroundTaskOutcome> {
+        let ids: Vec<_> = self.tasks.lock().await.keys().cloned().collect();
+        self.kill_ids_before(ids, deadline).await
+    }
+
+    pub async fn kill_started_after_before(
+        &self,
+        before: &[String],
+        deadline: tokio::time::Instant,
+    ) -> Vec<BackgroundTaskOutcome> {
+        let ids = self
+            .tasks
+            .lock()
+            .await
+            .keys()
+            .filter(|id| !before.contains(id))
+            .cloned()
+            .collect();
+        self.kill_ids_before(ids, deadline).await
+    }
+
+    /// Request cancellation without waiting for native teardown or publication.
+    /// Existing cancellation monitors retain ownership; a later drain observes
+    /// their receipts even when a foreground turn is blocked on persistence.
+    pub async fn signal_started_after(&self, before: &[String]) {
+        let ids = self
+            .tasks
+            .lock()
+            .await
+            .keys()
+            .filter(|id| !before.contains(id))
+            .cloned()
+            .collect::<Vec<_>>();
         for id in ids {
-            self.kill(&id).await;
+            let _ = self.request_kill(&id).await;
         }
+    }
+
+    async fn kill_ids_before(
+        &self,
+        ids: Vec<String>,
+        deadline: tokio::time::Instant,
+    ) -> Vec<BackgroundTaskOutcome> {
+        let mut requests = Vec::new();
+        for id in ids {
+            if let Some(request) = self.request_kill(&id).await {
+                requests.push((id, request));
+            }
+        }
+        let mut results =
+            join_all(requests.into_iter().map(|(id, request)| async move {
+                self.finish_kill(&id, request, deadline).await
+            }))
+            .await;
+        let pending = results
+            .iter()
+            .filter(|outcome| !outcome.state.is_terminal())
+            .map(|outcome| outcome.id.clone())
+            .collect::<Vec<_>>();
+        if !pending.is_empty() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !remaining.is_zero() {
+                for settled in self.wait_all(&pending, remaining).await {
+                    if let Some(outcome) =
+                        results.iter_mut().find(|outcome| outcome.id == settled.id)
+                    {
+                        *outcome = settled;
+                    }
+                }
+            }
+        }
+        results
     }
 }
 
@@ -2232,415 +2331,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capacity_pruning_preserves_dependency_entries() {
-        let registry = BackgroundTaskRegistry::new();
-        let mut completed = Vec::with_capacity(MAX_BG_TASKS);
-        for index in 0..MAX_BG_TASKS {
-            completed.push(
-                registry
-                    .spawn(
-                        &format!("completed-{index}"),
-                        "explore",
-                        Box::new(|| {
-                            Box::pin(async {
-                                BackgroundTaskOutcome {
-                                    id: String::new(),
-                                    description: String::new(),
-                                    subagent_type: String::new(),
-                                    state: BackgroundTaskState::Completed,
-                                    output: "done".into(),
-                                    applied: false,
-                                    changed_files: vec![],
-                                }
-                            })
-                        }),
-                    )
-                    .await
-                    .unwrap(),
-            );
-        }
-        let _ = registry.wait_all(&completed, Duration::from_secs(2)).await;
-
-        // The registry is at capacity, but the first completed task is still
-        // a valid dependency. Pruning must not remove it between validation
-        // and dependency-gate construction.
-        let dependent = registry
-            .spawn_after(
-                "after-completed",
-                "explore",
-                std::slice::from_ref(&completed[0]),
-                Box::new(|| {
-                    Box::pin(async {
-                        BackgroundTaskOutcome {
-                            id: String::new(),
-                            description: String::new(),
-                            subagent_type: String::new(),
-                            state: BackgroundTaskState::Completed,
-                            output: "after".into(),
-                            applied: false,
-                            changed_files: vec![],
-                        }
-                    })
-                }),
-            )
-            .await
-            .unwrap();
-        let outcome = registry
-            .poll(&dependent, Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert_eq!(outcome.state, BackgroundTaskState::Completed);
-    }
-
-    #[tokio::test]
-    async fn queued_dependency_gate_survives_capacity_pruning() {
-        let registry = BackgroundTaskRegistry::new();
-        let release = Arc::new(Notify::new());
-        let release_in_task = release.clone();
-        let prerequisite = registry
-            .spawn(
-                "queued-prerequisite",
-                "explore",
-                Box::new(move || {
-                    Box::pin(async move {
-                        release_in_task.notified().await;
-                        BackgroundTaskOutcome {
-                            id: String::new(),
-                            description: String::new(),
-                            subagent_type: String::new(),
-                            state: BackgroundTaskState::Completed,
-                            output: "ready".into(),
-                            applied: false,
-                            changed_files: Vec::new(),
-                        }
-                    })
-                }),
-            )
-            .await
-            .unwrap();
-        // Capture exactly the stable gate an already-queued dependent owns,
-        // but intentionally do not poll it until after capacity pruning.
-        let queued_gate = {
-            let tasks = registry.tasks.lock().await;
-            let entry = tasks.get(&prerequisite).unwrap();
-            DependencyGate {
-                id: prerequisite.clone(),
-                terminal_outcome: entry.terminal_outcome.clone(),
-                notify: entry.notify.clone(),
-            }
-        };
-
-        let mut fillers = Vec::with_capacity(MAX_BG_TASKS - 1);
-        for index in 0..(MAX_BG_TASKS - 1) {
-            fillers.push(
-                registry
-                    .spawn(
-                        &format!("prune-filler-{index}"),
-                        "explore",
-                        Box::new(|| {
-                            Box::pin(async {
-                                BackgroundTaskOutcome {
-                                    id: String::new(),
-                                    description: String::new(),
-                                    subagent_type: String::new(),
-                                    state: BackgroundTaskState::Completed,
-                                    output: "done".into(),
-                                    applied: false,
-                                    changed_files: Vec::new(),
-                                }
-                            })
-                        }),
-                    )
-                    .await
-                    .unwrap(),
-            );
-        }
-        let filler_results = registry.wait_all(&fillers, Duration::from_secs(2)).await;
-        assert!(
-            filler_results
-                .iter()
-                .all(|outcome| outcome.state.is_terminal())
-        );
-
-        release.notify_one();
-        assert_eq!(
-            registry
-                .poll(&prerequisite, Duration::from_secs(2))
-                .await
-                .unwrap()
-                .state,
-            BackgroundTaskState::Completed
-        );
-
-        let replacement = registry
-            .spawn(
-                "forces-capacity-prune",
-                "explore",
-                Box::new(|| {
-                    Box::pin(async {
-                        BackgroundTaskOutcome {
-                            id: String::new(),
-                            description: String::new(),
-                            subagent_type: String::new(),
-                            state: BackgroundTaskState::Completed,
-                            output: "replacement".into(),
-                            applied: false,
-                            changed_files: Vec::new(),
-                        }
-                    })
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(
-            !registry.tasks.lock().await.contains_key(&prerequisite),
-            "capacity pruning should remove the registry entry in this regression"
-        );
-
-        let gate_result = tokio::time::timeout(
-            Duration::from_millis(250),
-            wait_for_dependencies(vec![queued_gate]),
-        )
-        .await
-        .expect("a pruned prerequisite must not strand an existing dependent");
-        assert_eq!(gate_result, Ok(()));
-        assert_eq!(
-            registry
-                .poll(&replacement, Duration::from_secs(2))
-                .await
-                .unwrap()
-                .state,
-            BackgroundTaskState::Completed
-        );
-    }
-
-    #[tokio::test]
-    async fn capacity_preserves_unobserved_completed_tasks_for_retrieval() {
-        let registry = BackgroundTaskRegistry::new();
-        let mut ids = Vec::with_capacity(MAX_BG_TASKS);
-        for index in 0..MAX_BG_TASKS {
-            ids.push(
-                registry
-                    .spawn(
-                        &format!("unpolled-{index}"),
-                        "explore",
-                        Box::new(move || {
-                            Box::pin(async move {
-                                BackgroundTaskOutcome {
-                                    id: String::new(),
-                                    description: String::new(),
-                                    subagent_type: String::new(),
-                                    state: BackgroundTaskState::Completed,
-                                    output: format!("done-{index}"),
-                                    applied: false,
-                                    changed_files: vec![],
-                                }
-                            })
-                        }),
-                    )
-                    .await
-                    .unwrap(),
-            );
-        }
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let terminal = registry
-                    .outcomes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .values()
-                    .filter(|outcome| outcome.state.is_terminal())
-                    .count();
-                if terminal == MAX_BG_TASKS {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("all tasks should publish terminal results");
-        let intermediate = registry.poll_many_inner(&ids, Duration::ZERO, false).await;
-        assert!(
-            intermediate
-                .iter()
-                .all(|outcome| outcome.state == BackgroundTaskState::Completed)
-        );
-        assert!(
-            registry
-                .tasks
-                .lock()
-                .await
-                .values()
-                .all(|entry| !entry.observed),
-            "an internal wait snapshot must not acknowledge results before return"
-        );
-
-        let error = registry
-            .spawn(
-                "after-unpolled",
-                "explore",
-                Box::new(|| {
-                    Box::pin(async {
-                        BackgroundTaskOutcome {
-                            id: String::new(),
-                            description: String::new(),
-                            subagent_type: String::new(),
-                            state: BackgroundTaskState::Completed,
-                            output: "ran".into(),
-                            applied: false,
-                            changed_files: vec![],
-                        }
-                    })
-                }),
-            )
-            .await
-            .expect_err("unobserved terminal results must retain their slots");
-        let capacity = error
-            .downcast_ref::<BackgroundTaskCapacityError>()
-            .expect("capacity admission should return its typed error");
-        assert_eq!(capacity.maximum, MAX_BG_TASKS);
-        assert_eq!(capacity.running, 0);
-        assert_eq!(capacity.unobserved_terminal, MAX_BG_TASKS);
-        assert!(error.to_string().contains("get_task_output or wait_tasks"));
-
-        for (index, id) in ids.iter().enumerate() {
-            let outcome = registry.poll(id, Duration::ZERO).await.unwrap();
-            assert_eq!(outcome.state, BackgroundTaskState::Completed);
-            assert_eq!(outcome.output, format!("done-{index}"));
-        }
-    }
-
-    #[tokio::test]
-    async fn acknowledged_completed_tasks_are_pruned_to_admit_later_work() {
-        let registry = BackgroundTaskRegistry::new();
-        let mut ids = Vec::with_capacity(MAX_BG_TASKS);
-        for index in 0..MAX_BG_TASKS {
-            ids.push(
-                registry
-                    .spawn(
-                        &format!("observed-{index}"),
-                        "explore",
-                        Box::new(|| {
-                            Box::pin(async {
-                                BackgroundTaskOutcome {
-                                    id: String::new(),
-                                    description: String::new(),
-                                    subagent_type: String::new(),
-                                    state: BackgroundTaskState::Completed,
-                                    output: "observed".into(),
-                                    applied: false,
-                                    changed_files: vec![],
-                                }
-                            })
-                        }),
-                    )
-                    .await
-                    .unwrap(),
-            );
-        }
-        let observed = registry.wait_all(&ids, Duration::from_secs(2)).await;
-        assert!(observed.iter().all(|outcome| outcome.state.is_terminal()));
-
-        let next = registry
-            .spawn(
-                "seventeenth-cumulative-task",
-                "explore",
-                Box::new(|| {
-                    Box::pin(async {
-                        BackgroundTaskOutcome {
-                            id: String::new(),
-                            description: String::new(),
-                            subagent_type: String::new(),
-                            state: BackgroundTaskState::Completed,
-                            output: "later".into(),
-                            applied: false,
-                            changed_files: vec![],
-                        }
-                    })
-                }),
-            )
-            .await
-            .expect("acknowledged terminal entries should be reclaimable");
-        let outcome = registry.poll(&next, Duration::from_secs(1)).await.unwrap();
-        assert_eq!(outcome.state, BackgroundTaskState::Completed);
-        assert_eq!(outcome.output, "later");
-    }
-
-    #[tokio::test]
-    async fn capacity_pruning_reclaims_observed_panicked_futures() {
-        let registry = BackgroundTaskRegistry::new();
-        let mut ids = Vec::with_capacity(MAX_BG_TASKS);
-        for index in 0..MAX_BG_TASKS {
-            ids.push(
-                registry
-                    .spawn(
-                        &format!("panicked-{index}"),
-                        "explore",
-                        Box::new(|| Box::pin(async { panic!("future boom") })),
-                    )
-                    .await
-                    .unwrap(),
-            );
-        }
-        // Wait for the workers to publish every caught panic without polling
-        // any registry entry. A fixed sleep made this regression sensitive to
-        // slow or heavily loaded CI hosts.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let panicked = registry
-                    .outcomes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .values()
-                    .filter(|outcome| {
-                        outcome.state == BackgroundTaskState::Failed
-                            && outcome.output.contains("future boom")
-                    })
-                    .count();
-                if panicked == MAX_BG_TASKS {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("all panicked futures should publish terminal failures");
-        let observed = registry.poll_many(&ids, Duration::ZERO).await;
-        assert!(observed.iter().all(|outcome| {
-            outcome.state == BackgroundTaskState::Failed && outcome.output.contains("future boom")
-        }));
-
-        let next = registry
-            .spawn(
-                "after-panics",
-                "explore",
-                Box::new(|| {
-                    Box::pin(async {
-                        BackgroundTaskOutcome {
-                            id: String::new(),
-                            description: String::new(),
-                            subagent_type: String::new(),
-                            state: BackgroundTaskState::Completed,
-                            output: "ran".into(),
-                            applied: false,
-                            changed_files: Vec::new(),
-                        }
-                    })
-                }),
-            )
-            .await
-            .expect("observed panics should be reclaimable terminal tasks");
-        assert_eq!(
-            registry
-                .poll(&next, Duration::from_secs(1))
-                .await
-                .unwrap()
-                .state,
-            BackgroundTaskState::Completed
-        );
-    }
-
-    #[tokio::test]
     async fn rejects_unknown_dependency() {
         let registry = BackgroundTaskRegistry::new();
         let result = registry
@@ -2663,3 +2353,7 @@ mod tests {
 #[cfg(test)]
 #[path = "background_task_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "background_task_capacity_tests.rs"]
+mod capacity_tests;

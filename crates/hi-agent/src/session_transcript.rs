@@ -5,7 +5,7 @@
 //! lifecycle settlement matter. A block ID is never reused, and a settled
 //! block cannot be updated or settled a second time.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -199,14 +199,50 @@ pub(crate) enum TranscriptBlockMutation<'a> {
     },
 }
 
+/// Derived lookup state; snapshots persist blocks, never redundant indexes.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TranscriptBlockIndex {
+    positions: HashMap<TranscriptBlockId, usize>,
+    open: BTreeSet<TranscriptBlockId>,
+}
+
+impl TranscriptBlockIndex {
+    pub(crate) fn from_blocks(blocks: &[TranscriptBlock]) -> Self {
+        Self {
+            positions: blocks
+                .iter()
+                .enumerate()
+                .map(|(i, block)| (block.id.clone(), i))
+                .collect(),
+            open: blocks
+                .iter()
+                .filter(|block| !block.lifecycle.is_terminal())
+                .map(|block| block.id.clone())
+                .collect(),
+        }
+    }
+
+    pub(crate) fn ensure_settled(&self) -> Result<(), TranscriptBlockTransitionError> {
+        if self.open.is_empty() {
+            Ok(())
+        } else {
+            Err(TranscriptBlockTransitionError::UnsettledAtTurnEnd {
+                ids: self.open.iter().cloned().collect(),
+            })
+        }
+    }
+}
+
 pub(crate) fn apply_transcript_mutation(
     blocks: &mut Vec<TranscriptBlock>,
+    index: &mut TranscriptBlockIndex,
     mutation: TranscriptBlockMutation<'_>,
     sequence: u64,
 ) -> Result<(), TranscriptBlockTransitionError> {
     match mutation {
         TranscriptBlockMutation::Open { id, kind, content } => {
-            ensure_new(blocks, id)?;
+            ensure_new(index, id)?;
+            index.positions.insert(id.clone(), blocks.len());
             blocks.push(TranscriptBlock {
                 id: id.clone(),
                 kind,
@@ -215,21 +251,23 @@ pub(crate) fn apply_transcript_mutation(
                 opened_sequence: sequence,
                 last_transition_sequence: sequence,
             });
+            index.open.insert(id.clone());
         }
         TranscriptBlockMutation::Append { id, delta } => {
-            let block = open_block_mut(blocks, id)?;
+            let block = open_block_mut(blocks, index, id)?;
             block.content.push_str(delta);
             block.last_transition_sequence = sequence;
         }
         TranscriptBlockMutation::Replace { id, content } => {
-            let block = open_block_mut(blocks, id)?;
+            let block = open_block_mut(blocks, index, id)?;
             content.clone_into(&mut block.content);
             block.last_transition_sequence = sequence;
         }
         TranscriptBlockMutation::Settle { id, terminal } => {
-            let block = open_block_mut(blocks, id)?;
+            let block = open_block_mut(blocks, index, id)?;
             block.lifecycle = TranscriptBlockLifecycle::Settled { terminal, sequence };
             block.last_transition_sequence = sequence;
+            index.open.remove(id);
         }
         TranscriptBlockMutation::Record {
             id,
@@ -237,7 +275,8 @@ pub(crate) fn apply_transcript_mutation(
             content,
             terminal,
         } => {
-            ensure_new(blocks, id)?;
+            ensure_new(index, id)?;
+            index.positions.insert(id.clone(), blocks.len());
             blocks.push(TranscriptBlock {
                 id: id.clone(),
                 kind,
@@ -249,21 +288,6 @@ pub(crate) fn apply_transcript_mutation(
         }
     }
     Ok(())
-}
-
-pub(crate) fn ensure_all_transcript_blocks_settled(
-    blocks: &[TranscriptBlock],
-) -> Result<(), TranscriptBlockTransitionError> {
-    let ids = blocks
-        .iter()
-        .filter(|block| !block.lifecycle.is_terminal())
-        .map(|block| block.id.clone())
-        .collect::<Vec<_>>();
-    if ids.is_empty() {
-        Ok(())
-    } else {
-        Err(TranscriptBlockTransitionError::UnsettledAtTurnEnd { ids })
-    }
 }
 
 pub(crate) fn validate_transcript_snapshot(
@@ -294,10 +318,10 @@ pub(crate) fn validate_transcript_snapshot(
 }
 
 fn ensure_new(
-    blocks: &[TranscriptBlock],
+    index: &TranscriptBlockIndex,
     id: &TranscriptBlockId,
 ) -> Result<(), TranscriptBlockTransitionError> {
-    if blocks.iter().any(|block| block.id == *id) {
+    if index.positions.contains_key(id) {
         Err(TranscriptBlockTransitionError::DuplicateId { id: id.clone() })
     } else {
         Ok(())
@@ -306,12 +330,15 @@ fn ensure_new(
 
 fn open_block_mut<'a>(
     blocks: &'a mut [TranscriptBlock],
+    index: &TranscriptBlockIndex,
     id: &TranscriptBlockId,
 ) -> Result<&'a mut TranscriptBlock, TranscriptBlockTransitionError> {
-    let block = blocks
-        .iter_mut()
-        .find(|block| block.id == *id)
+    let position = index
+        .positions
+        .get(id)
+        .copied()
         .ok_or_else(|| TranscriptBlockTransitionError::UnknownId { id: id.clone() })?;
+    let block = &mut blocks[position];
     if block.lifecycle.is_terminal() {
         Err(TranscriptBlockTransitionError::AlreadySettled { id: id.clone() })
     } else {

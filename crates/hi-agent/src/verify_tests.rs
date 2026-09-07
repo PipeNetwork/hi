@@ -283,7 +283,7 @@ async fn closed_admission_blocks_opaque_verifier_but_allows_proven_read() {
             &mut ui,
         )
         .await;
-    assert!(matches!(outcome, VerifyOutcome::Passed));
+    assert!(matches!(outcome, VerifyOutcome::Passed { .. }));
     let _ = std::fs::remove_dir_all(base);
 }
 

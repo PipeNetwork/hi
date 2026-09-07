@@ -51,20 +51,16 @@ async fn default_unlimited_verification_stops_after_an_unchanged_repair() {
         .unwrap();
 
     assert_eq!(outcome.status, TurnStatus::Failed);
-    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationFailed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
     assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
     assert!(
-        ui.statuses.iter().any(|status| {
-            status.contains("failed again without a workspace change")
-                && status.contains("stopping the repair loop")
-        }),
-        "an unchanged failure must settle instead of consuming unlimited rounds: {:?}",
-        ui.statuses
+        agent.task_recovery().exhausted,
+        "an unchanged failed revision exhausts the shared recovery episode"
     );
 }
 
 #[tokio::test]
-async fn ignored_runtime_database_reset_does_not_repeat_green_cargo_verification() {
+async fn ignored_runtime_database_reset_requires_only_memory_revalidation() {
     let workspace = IsolatedWorkspace::new("outcome-hygiene-ignored-runtime-db");
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
@@ -164,14 +160,22 @@ async fn ignored_runtime_database_reset_does_not_repeat_green_cargo_verification
         .collect::<Vec<_>>();
     assert_eq!(
         verification.len(),
-        2,
-        "one check and one test should run exactly once: {verification:?}"
+        4,
+        "one check and one test run for the edit and final memory revision: {verification:?}"
     );
-    assert!(
-        verification
-            .iter()
-            .all(|status| status.contains("verifying (1/unlimited)")),
-        "green verification must not be reopened: {verification:?}"
+    for round in [1, 2] {
+        assert_eq!(
+            verification
+                .iter()
+                .filter(|status| status.contains(&format!("verifying ({round}/unlimited)")))
+                .count(),
+            2,
+            "each revision should execute one pipeline: {verification:?}"
+        );
+    }
+    assert_eq!(
+        outcome.verified_workspace_revision,
+        Some(agent.runtime.ledger().workspace_revision())
     );
     let database_change = agent
         .last_file_changes()
@@ -232,7 +236,7 @@ async fn default_unlimited_hygiene_stops_after_an_unchanged_repair() {
     assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert_eq!(outcome.review, ReviewStatus::Objected);
     assert_eq!(outcome.stop_reason, TurnStopReason::ReviewObjected);
-    assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 3);
     assert!(
         ui.statuses
             .iter()
@@ -279,7 +283,7 @@ async fn default_unlimited_completion_review_stops_without_a_workspace_change() 
     assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert_eq!(outcome.review, ReviewStatus::Objected);
     assert_eq!(outcome.stop_reason, TurnStopReason::ReviewObjected);
-    assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 3);
     assert!(
         ui.statuses
             .iter()
@@ -288,4 +292,53 @@ async fn default_unlimited_completion_review_stops_without_a_workspace_change() 
         "an unchanged review objection must settle instead of being re-reviewed forever: {:?}",
         ui.statuses
     );
+}
+
+#[tokio::test]
+async fn genuinely_reducing_failures_continues_beyond_three_repairs() {
+    let workspace = IsolatedWorkspace::new("shared-recovery-improves");
+    let mut cfg = workspace.config();
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new(
+        "required",
+        "cat remaining.rs; test ! -s remaining.rs",
+    )]);
+    cfg.gates.max_verify_repairs = crate::UNLIMITED_REPAIR_CYCLES;
+    cfg.memory.tool_set = ToolSet::Full;
+    cfg.gates.lsp_mode = LspMode::Off;
+    let path = workspace.path("remaining.rs").to_string_lossy().to_string();
+    let mut responses = Vec::new();
+    for remaining in (0..=5).rev() {
+        let output = (0..remaining)
+            .map(|i| format!("error: failure_{i}\n"))
+            .collect::<String>();
+        responses.push(write_file_completion(
+            &format!("write-{remaining}"),
+            &path,
+            &output,
+        ));
+        responses.push(completion(
+            vec![Content::Text(format!("Applied repair {remaining}."))],
+            1,
+            1,
+        ));
+    }
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    let outcome = agent
+        .run_turn(
+            "/build remaining.rs, reducing its diagnostic failures until the required check passes",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Completed,
+        "{outcome:?}; {:?}; {:?}",
+        ui.statuses,
+        agent.task_recovery()
+    );
+    assert_eq!(outcome.verification, VerificationStatus::Passed);
+    assert!(agent.last_turn_telemetry().verify_rounds > 3);
+    assert!(!agent.task_recovery().exhausted);
 }

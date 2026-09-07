@@ -11,6 +11,7 @@ fn request() -> ChatRequest {
         model: "gpt-6-astra".into(),
         request_id: Some("astra_test".into()),
         retry_attempt: 0,
+        execution: Default::default(),
         user_turn: true,
         canonical_objective: None,
         messages: vec![

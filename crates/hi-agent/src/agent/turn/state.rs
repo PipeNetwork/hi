@@ -35,7 +35,6 @@ pub(super) struct TurnState {
     pub expected_mutation: bool,
     pub requested_validation: bool,
     pub turn_input: String,
-    pub native_director: super::native_director::TurnNativeDirector,
 
     // --- checkpoints / verify harness ---
     pub turn_checkpoint_allowed: Option<bool>,
@@ -92,11 +91,16 @@ pub(super) struct TurnState {
 
     // --- provider retry ---
     pub retry_state: TurnRetryState,
+    /// A terminal provider error retained while deterministic settlement runs.
+    pub pending_provider_error: Option<anyhow::Error>,
     pub request_max_tokens_override: Option<u32>,
     pub compat_fallbacks: Vec<String>,
     pub effective_fallback_route: Option<String>,
 
     // --- verify / settle ---
+    /// Optional learned skill / coding memory publication runs at most once,
+    /// even if later review or verification requests another repair cycle.
+    pub enrichment_attempted: bool,
     pub independent_review_status: ReviewStatus,
     pub independent_review_repairs: u32,
     /// Exact content revision of cumulative reviewable turn paths that most

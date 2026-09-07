@@ -12,8 +12,8 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use tokio::sync::mpsc;
 
+use crate::App;
 use crate::event::ChannelUi;
-use crate::{App, TurnState};
 
 use super::drive;
 
@@ -62,7 +62,6 @@ pub(super) async fn run_agent_turn(
     app.set_working(true);
     app.follow();
     let checkpoint = agent.messages().len();
-    let checkpoint_count = agent.checkpoint_count();
     app.last_turn_start = checkpoint;
     app.last_prompt = Some(run_line.to_string());
     // Long-horizon auto-drive bookkeeping: whether this is a synthetic drive
@@ -90,7 +89,6 @@ pub(super) async fn run_agent_turn(
         event_sink: app.event_sink.clone(),
         approval_store: app.approval_store.clone(),
     };
-    let _background_before = agent.background_process_ids();
     // A line typed during an autonomous drive is explicit user work, so it
     // owns the next turn ahead of any newly synthesized continuation. Feeding
     // it into the active drive used to let the model consume it as an
@@ -119,99 +117,15 @@ pub(super) async fn run_agent_turn(
         )
         .await?
     };
-    // A late cancel request must not roll back a turn whose committed
-    // result won the race. Only a typed Cancelled outcome (or no value
-    // because cleanup itself failed) enters frontend rollback.
-    let shared_token_cancelled = turn_cancel.is_cancelled();
-    let stop_requested = driven.cancelled || shared_token_cancelled;
-    let settled_status = driven
-        .value
-        .as_ref()
-        .map(|outcome| outcome.status)
-        .or_else(|| {
-            if shared_token_cancelled {
-                agent.last_turn_outcome().map(|outcome| outcome.status)
-            } else {
-                None
-            }
-        });
-    let cancellation =
-        drive::settle_turn_cancellation(driven.cancelled, shared_token_cancelled, settled_status);
-    let cancelled = cancellation.cancelled;
-    let agent_already_cleaned = cancellation.agent_already_cleaned;
-    if let Some(outcome) = &driven.value {
+    // The returned value or failure carries this turn's settled outcome.
+    let stop_requested = driven.cancelled || turn_cancel.is_cancelled();
+    let outcome = driven.value.as_ref().or(driven.failure.as_ref());
+    let cancelled =
+        outcome.is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Cancelled);
+    if let Some(outcome) = outcome {
         app.note_turn_outcome(outcome);
-    } else if agent_already_cleaned {
-        // A hard timeout is surfaced as an Err after Agent-owned Cancel
-        // cleanup. Replace drive's transient failure presentation with the
-        // terminal typed outcome the agent already published.
-        if let Some(outcome) = agent.last_turn_outcome() {
-            app.note_turn_outcome(outcome);
-        }
-    } else if !cancelled {
-        // `run_turn` can return early on provider/runner/session failures
-        // before its normal finalizer. Reconcile the surviving workspace
-        // effects and retain the same typed infrastructure outcome used by
-        // one-shot reports.
-        let outcome = agent
-            .cleanup_turn(
-                driven
-                    .failure
-                    .clone()
-                    .unwrap_or(hi_agent::TurnCleanupKind::Fail),
-            )
-            .await
-            .map(|r| r.outcome)
-            .unwrap_or_else(|_| agent.finalize_failed_turn_snapshot_only());
-        app.note_turn_outcome(&outcome);
     }
-
     if cancelled {
-        // When cooperative cancel already returned Cancelled, the agent
-        // undid its own checkpoints — skip a second undo.
-        if !agent_already_cleaned
-            && agent.checkpoint_count() > checkpoint_count
-            && let Err(err) = agent.undo().await
-        {
-            app.push(Line::styled(
-                format!("couldn't roll back interrupted workspace edits: {err:#}"),
-                Style::default().fg(crate::theme::theme().warning),
-            ));
-        }
-        if !agent_already_cleaned
-            && let Err(err) = agent.rewind_to_snapshot_durable(checkpoint, &turn_snapshot)
-        {
-            app.push(Line::styled(
-                format!("couldn't persist interrupted turn discard: {err:#}"),
-                Style::default().fg(crate::theme::theme().warning),
-            ));
-            agent.truncate_messages(checkpoint);
-            agent.restore_state_snapshot(&turn_snapshot);
-        }
-        let killed = if agent_already_cleaned {
-            0
-        } else {
-            match agent
-                .cleanup_turn(hi_agent::TurnCleanupKind::Cancel {
-                    session: hi_agent::SessionRollback::AlreadyApplied,
-                })
-                .await
-            {
-                Ok(r) => {
-                    app.note_turn_outcome(&r.outcome);
-                    r.killed_backgrounds
-                }
-                Err(err) => {
-                    app.last_turn_state = TurnState::Cancelled;
-                    app.status = "cancelled".to_string();
-                    app.push(Line::styled(
-                        format!("couldn't finalize typed cancellation outcome: {err:#}"),
-                        Style::default().fg(crate::theme::theme().warning),
-                    ));
-                    0
-                }
-            }
-        };
         // Keep the next-turn queue. `drive` already reconciled mid-turn
         // steers (consumed → removed; leftovers stay queued). Wiping the
         // backlog on interrupt was the main way a large prompt queue was
@@ -228,11 +142,6 @@ pub(super) async fn run_agent_turn(
             format!("{stop_label}; turn discarded ({kept} queued command(s) kept and paused)")
         } else {
             format!("{stop_label}; turn discarded")
-        };
-        let msg = if killed > 0 {
-            format!("{msg}; killed {killed} background process(es) started by it")
-        } else {
-            msg
         };
         app.push(Line::styled(
             msg,
@@ -416,7 +325,7 @@ pub(super) async fn run_agent_turn(
         app.push_session_face(agent);
         app.maybe_queue_drive(agent, driven.value.as_ref());
     }
-    app.trace_turn_settled(agent, agent.last_turn_outcome())?;
+    app.trace_turn_settled(agent, outcome)?;
     if cancelled && !app.exit_requested {
         // Start the escalation window after cleanup, not at the original key
         // press, so a second Ctrl-C queued during slow settlement still exits.

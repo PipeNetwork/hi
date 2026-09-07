@@ -35,6 +35,7 @@ mod orchestration;
 mod orchestration_benchmark;
 mod orchestration_metrics;
 mod outcome_route;
+mod pipefs;
 mod project_context;
 mod provider;
 mod race;
@@ -47,17 +48,6 @@ mod rsi_dev;
 mod rsi_observation;
 mod rsi_policy;
 mod rsi_remote;
-mod team_bench;
-mod tickets;
-mod tool_trim;
-mod trace_cmd;
-mod tui_profile_callbacks;
-mod tuning_report;
-// Wired by the managed RSI entry once descriptor-driven workflow launch lands;
-// composition and contracts are complete and tested.
-mod pipefs;
-#[allow(dead_code)]
-mod rsi_stage_model;
 mod scheduler_ops;
 mod session;
 mod session_harness;
@@ -65,6 +55,12 @@ mod setup;
 mod skeptic_review;
 mod sync;
 mod sync_store;
+mod team_bench;
+mod tickets;
+mod tool_trim;
+mod trace_cmd;
+mod tui_profile_callbacks;
+mod tuning_report;
 mod ui;
 mod workflow;
 mod workflow_cmd;
@@ -94,8 +90,8 @@ use landing::{effective_prompt, print_landing, profile_infos, resolve_session};
 use orchestration::{build_sync_config, run_best_of, run_hf_cli, run_mcp_cli};
 use project_context::auto_memory_enabled;
 use provider::{
-    agent_provider_route, build_chain, default_skeptic_model, effective_max_tokens_for_model,
-    provider_label, resolve_startup_route, startup_live_model_metadata,
+    build_chain, default_skeptic_model, effective_max_tokens_for_model, provider_label,
+    resolve_startup_route, startup_live_model_metadata,
 };
 use repl::repl;
 use report::{
@@ -360,10 +356,6 @@ async fn run() -> Result<()> {
             }
         }
     };
-    session::session_shadow::configure(
-        settings.harness.features.session_reducer_v2,
-        settings.harness.features.session_projection_v2,
-    );
     if settings.execution.is_durable() && cli.no_save && !cli.subagent {
         anyhow::bail!(
             "durable execution requires a persisted session; remove --no-save or disable durable mode"
@@ -1325,28 +1317,11 @@ async fn run() -> Result<()> {
                 (result, interrupted, cancellation.is_cancelled())
             };
             result = turn_result;
-            failed_outcome = match &result {
-                // A hard turn timeout signals the same cancellation token,
-                // waits for Agent-owned rollback, then preserves the historic
-                // deadline error at the API boundary. Do not immediately run
-                // Fail cleanup over that already-finalized Cancel outcome.
-                Err(_)
-                    if cancellation_requested
-                        && agent.last_turn_outcome().is_some_and(|outcome| {
-                            outcome.status == hi_agent::TurnStatus::Cancelled
-                        }) =>
-                {
-                    agent.last_turn_outcome().cloned()
-                }
-                Err(error) => Some(
-                    agent
-                        .cleanup_turn(hi_agent::TurnCleanupKind::for_error(error))
-                        .await
-                        .map(|r| r.outcome)
-                        .unwrap_or_else(|_| agent.finalize_failed_turn_snapshot_only()),
-                ),
-                Ok(_) => None,
-            };
+            failed_outcome = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<hi_agent::TurnFailure>())
+                .map(|failure| failure.outcome.clone());
             // Ctrl-C and the configured turn timeout both stop synthetic drive.
             // A turn may have committed immediately before either signal and
             // legitimately return Completed, but that is not permission to
@@ -1614,17 +1589,14 @@ async fn run() -> Result<()> {
                     config_path.as_deref(),
                 )?;
                 let settings = config::resolve_named_profile(&file, &run.profile_name)?;
-                let route = agent_provider_route(&settings);
-                let model = settings.model.clone();
-                let provider = build_chain(&settings, Vec::new());
+                let provider = build_chain(
+                    &settings,
+                    config::resolve_profile_fallbacks(&file, &run.profile_name),
+                );
                 Ok(hi_tui::MlxProfileSwitch {
                     switched: hi_tui::SwitchedProvider {
                         provider,
-                        model,
-                        route,
-                        max_tokens: settings.max_tokens,
-                        max_tokens_explicit: settings.max_tokens_explicit,
-                        tool_mode: settings.tool_mode,
+                        routing: provider::switched_routing(&settings),
                         local_runtime: Some(hi_tui::LocalRuntimeIdentity {
                             backend: "MLX".into(),
                             model_id: run.model_id.clone(),
@@ -1681,17 +1653,14 @@ async fn run() -> Result<()> {
                     config_path.as_deref(),
                 )?;
                 let settings = config::resolve_named_profile(&file, &runtime.profile_name)?;
-                let route = agent_provider_route(&settings);
-                let model = settings.model.clone();
-                let provider = build_chain(&settings, Vec::new());
+                let provider = build_chain(
+                    &settings,
+                    config::resolve_profile_fallbacks(&file, &runtime.profile_name),
+                );
                 Ok(hi_tui::MlxProfileSwitch {
                     switched: hi_tui::SwitchedProvider {
                         provider,
-                        model,
-                        route,
-                        max_tokens: settings.max_tokens,
-                        max_tokens_explicit: settings.max_tokens_explicit,
-                        tool_mode: settings.tool_mode,
+                        routing: provider::switched_routing(&settings),
                         local_runtime: Some(hi_tui::LocalRuntimeIdentity {
                             backend: runtime.backend.serve_flag().to_ascii_uppercase(),
                             model_id: runtime.model_id.clone(),

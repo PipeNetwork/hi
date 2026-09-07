@@ -133,7 +133,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "path": { "type": "string", "description": "Path to the file to edit." },
                     "old_string": { "type": "string", "description": "Exact text to replace; must be unique in the file unless replace_all is set. Do not include line numbers." },
-                    "new_string": { "type": "string", "description": "Replacement text." },
+                    "new_string": { "type": "string", "description": "Replacement text; must differ from old_string. Omit edits that would make no change." },
                     "replace_all": { "type": "boolean", "description": "If true, replace every occurrence of old_string (default: false, requires uniqueness)." }
                 },
                 "required": ["path", "old_string", "new_string"]
@@ -154,7 +154,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                             "type": "object",
                             "properties": {
                                 "old_string": { "type": "string", "description": "Exact text to replace; unique at the time this edit applies. No line numbers." },
-                                "new_string": { "type": "string", "description": "Replacement text." }
+                                "new_string": { "type": "string", "description": "Replacement text; must differ from old_string. Omit edits that would make no change." }
                             },
                             "required": ["old_string", "new_string"]
                         }

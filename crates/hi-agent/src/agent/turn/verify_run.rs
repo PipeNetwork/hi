@@ -4,7 +4,9 @@ use anyhow::Result;
 
 use super::phase::TurnPhase;
 use crate::ui::Ui;
-use crate::verify::{Snapshot, VerifyOutcome, VerifyWorkspace, WorkspaceRepairVerifier};
+use crate::verify::{
+    Snapshot, VerificationAdmission, VerifyOutcome, VerifyWorkspace, WorkspaceRepairVerifier,
+};
 
 #[cfg(test)]
 mod tests;
@@ -25,6 +27,7 @@ impl crate::Agent {
         turn_checkpoint_created: bool,
         turn_ledger_revision: u64,
         fast_feedback: &super::fast_feedback::FastFeedbackState,
+        admission: VerificationAdmission,
         ui: &mut dyn Ui,
     ) -> Result<VerifyOutcome> {
         // Caller stamps WorkspaceRepair before invoking; keep phase sticky here.
@@ -65,6 +68,16 @@ impl crate::Agent {
         // still running and the later reconcile will treat that post-stage
         // state as the initial snapshot.
         self.runtime.ensure_ledger_scan_complete_async().await?;
+        let names_goal_export = self
+            .task
+            .last_task_prompt
+            .as_deref()
+            .is_some_and(|prompt| crate::goal_export::is_referenced(prompt, self.runtime.root()))
+            || matches!(&self.config.gates.verification, crate::VerificationMode::Explicit(stages)
+            if stages.iter().any(|stage| crate::goal_export::is_referenced(&stage.command, self.runtime.root())));
+        if names_goal_export {
+            self.runtime.register_goal_validation_input().await?;
+        }
         self.reconcile_workspace_changes().await?;
         let (ledger_touched_files, ledger_mutation_seen, current_revision) = {
             let ledger = self.runtime.ledger();
@@ -97,13 +110,14 @@ impl crate::Agent {
         .with_process_runner(self.runtime.process_runner())
         .with_changed_files(&ledger_touched_files)
         .with_mutation_seen(ledger_mutation_seen)
+        .with_admission(admission)
         .with_skippable_affected(&skip_checks, &skip_tests)
         .with_active_managed_live_writer(active_managed_live_writer)
         .with_workspace_coordination(
             self.workspace_coordination.clone(),
             self.workspace_durability.clone(),
         );
-        Ok(verifier
+        let outcome = verifier
             .check(
                 &workspace,
                 &baseline,
@@ -111,6 +125,13 @@ impl crate::Agent {
                 Some(self.runtime.ledger_arc()),
                 ui,
             )
-            .await)
+            .await;
+        let observations = verifier.take_observations();
+        if !matches!(outcome, VerifyOutcome::Unstable { .. }) {
+            for observation in observations {
+                self.observe_validation(observation).await?;
+            }
+        }
+        Ok(outcome)
     }
 }

@@ -1,7 +1,5 @@
 //! Typed turn-outcome presentation and terminal failure messaging.
 
-use std::time::Duration;
-
 use hi_agent::{ReviewStatus, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus};
 use ratatui::style::Style;
 
@@ -115,16 +113,6 @@ impl crate::App {
         self.push(accent_line(
             theme().warning,
             format!("⚠ {kind}: {error}{guidance_line}"),
-            Style::default().fg(theme().warning),
-        ));
-        self.follow();
-    }
-
-    pub(crate) fn note_backend_waiting(&mut self, idle: Duration, threshold: Duration) {
-        let _ = (idle, threshold);
-        self.push(accent_line(
-            theme().warning,
-            "⚠ Still thinking. Ctrl-C cancels; keep waiting to continue.",
             Style::default().fg(theme().warning),
         ));
         self.follow();

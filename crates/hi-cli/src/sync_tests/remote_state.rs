@@ -338,9 +338,14 @@ fn reconcile_jsonl_streams_a_large_backlog_and_leaves_partial_tail_uncommitted()
 #[test]
 fn session_snapshot_backfills_state_and_title() {
     let sink = RemoteSessionSink::new_for_test(unreachable_config(), "snapshot".to_string());
+    let mut recovery = hi_agent::TaskRecoveryState::new("remote continuation".into(), 3);
+    recovery.remaining = 1;
+    recovery.interventions = 2;
     let loaded = crate::session::LoadedSession {
+        pending_execution_snapshot: None,
         messages: vec![Message::user("first portal prompt")],
         workspace_execution_recovered: false,
+        task_recovery: recovery,
         usage: Usage {
             input_tokens: 10,
             output_tokens: 2,
@@ -389,6 +394,7 @@ fn session_snapshot_backfills_state_and_title() {
         record_types,
         vec![
             RECORD_TYPE_STATE_REPLACEMENT.to_string(),
+            "task_recovery".to_string(),
             RECORD_TYPE_USAGE.to_string(),
             RECORD_TYPE_CHECKPOINTS.to_string(),
             crate::session_harness::RECORD_TYPE.to_string(),
@@ -417,6 +423,7 @@ fn session_snapshot_backfills_state_and_title() {
     assert_eq!(restored.plan_drive_evidence, vec!["a".repeat(64)]);
     assert_eq!(restored.goal_drive_evidence, vec!["b".repeat(64)]);
     assert_eq!(restored.harness_settings, loaded.harness_settings);
+    assert_eq!(restored.task_recovery, loaded.task_recovery);
 }
 
 #[test]
@@ -424,8 +431,10 @@ fn session_snapshot_emits_default_drive_state_to_clear_remote_stale_values() {
     let sink =
         RemoteSessionSink::new_for_test(unreachable_config(), "snapshot-default".to_string());
     let loaded = crate::session::LoadedSession {
+        pending_execution_snapshot: None,
         messages: Vec::new(),
         workspace_execution_recovered: false,
+        task_recovery: hi_agent::TaskRecoveryState::default(),
         usage: Usage::default(),
         checkpoint_refs: Vec::new(),
         harness_settings: crate::session_harness::empty_layer(),
@@ -457,6 +466,7 @@ fn session_snapshot_emits_default_drive_state_to_clear_remote_stale_values() {
         record_types,
         vec![
             RECORD_TYPE_STATE_REPLACEMENT.to_string(),
+            "task_recovery".to_string(),
             crate::session_harness::RECORD_TYPE.to_string(),
             RECORD_TYPE_PLAN_DRIVE.to_string(),
             RECORD_TYPE_PLAN_APPROVAL.to_string(),

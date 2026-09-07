@@ -333,6 +333,34 @@ impl ControlStore {
     pub fn commit_projection_event(
         &self,
         transition: ProjectionTransition,
+        event: RunEvent,
+    ) -> Result<ProjectionEventReceipt> {
+        self.commit_projection_events(vec![(transition, event)])?
+            .pop()
+            .ok_or_else(|| ControlError::Invalid("projection receipt was missing".into()))
+    }
+
+    /// Commit a lifecycle transition and its binding projection together. Each
+    /// event retains the exact identity/conflict checks of a single commit.
+    pub fn commit_projection_events(
+        &self,
+        updates: Vec<(ProjectionTransition, RunEvent)>,
+    ) -> Result<Vec<ProjectionEventReceipt>> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipts = updates
+            .into_iter()
+            .map(|(transition, event)| {
+                Self::commit_projection_in_transaction(&tx, transition, event)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        tx.commit()?;
+        Ok(receipts)
+    }
+
+    fn commit_projection_in_transaction(
+        tx: &Transaction<'_>,
+        transition: ProjectionTransition,
         mut event: RunEvent,
     ) -> Result<ProjectionEventReceipt> {
         transition.validate()?;
@@ -352,10 +380,8 @@ impl ControlStore {
         let projection_id = projection_id.to_owned();
         let transition_json = serde_json::to_vec(&transition)?;
         let digest = blake3::hash(&transition_json).to_hex().to_string();
-        let mut connection = self.lock()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        if let Some(existing) = existing_projection_event(&tx, &event.event_id)? {
+        if let Some(existing) = existing_projection_event(tx, &event.event_id)? {
             event.sequence = existing.event.sequence;
             if existing.kind != kind.as_str()
                 || existing.id != projection_id
@@ -368,7 +394,6 @@ impl ControlStore {
                     event.event_id
                 )));
             }
-            tx.commit()?;
             return Ok(ProjectionEventReceipt {
                 projection_kind: kind,
                 projection_id,
@@ -392,8 +417,8 @@ impl ControlStore {
             )));
         }
 
-        let event_receipt = append_event_in_transaction(&tx, &mut event)?;
-        write::apply_transition(&tx, &transition, &event.event_id)?;
+        let event_receipt = append_event_in_transaction(tx, &mut event)?;
+        write::apply_transition(tx, &transition, &event.event_id)?;
         tx.execute(
             "INSERT INTO control_projection_events
              (event_id, projection_kind, projection_id, projection_revision, projection_digest)
@@ -406,7 +431,6 @@ impl ControlStore {
                 digest
             ],
         )?;
-        tx.commit()?;
 
         Ok(ProjectionEventReceipt {
             projection_kind: kind,

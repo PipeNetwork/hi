@@ -67,7 +67,7 @@ exact = 2
 [[assertions]]
 kind = "screen"
 snapshot = "bounded_failure"
-contains = ["repeated attempts made no progress", "no progress"]
+contains = ["Automatic recovery stopped.", "no progress"]
 excludes = ["Completed the requested action.", "verification infrastructure failure"]
 
 [[assertions]]

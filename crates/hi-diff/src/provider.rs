@@ -25,6 +25,7 @@ pub async fn run_provider_targets(
     for (target, provider) in targets {
         let mut request = request.clone();
         request.model = target.model.clone();
+        request.execution = request.execution.fresh_operation();
         jobs.spawn(async move {
             // Fan-out changes the concrete provider/model identity, so seal at
             // this final boundary rather than cloning a stale source envelope.
@@ -44,6 +45,7 @@ pub async fn run_provider_targets(
             let mut sink = |event: StreamEvent| match event {
                 StreamEvent::Text(delta) => text.push_str(&delta),
                 StreamEvent::Reasoning(delta) => reasoning.push_str(&delta),
+                StreamEvent::ProviderAttempt(_) => {}
                 StreamEvent::WireAudit(_) => {}
                 StreamEvent::Status(_) => {}
                 StreamEvent::Warning(_) => {}
@@ -171,6 +173,7 @@ mod tests {
 
     fn request() -> ChatRequest {
         ChatRequest {
+            execution: Default::default(),
             model: "placeholder".into(),
             request_id: Some("test-request".into()),
             retry_attempt: 0,

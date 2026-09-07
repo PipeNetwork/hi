@@ -11,7 +11,7 @@ pub enum Command {
     Clear,
     /// Set the model for subsequent turns (empty = report current).
     Model(String),
-    /// Inspect, switch, reload, or watch the optional WASM decision engine.
+    /// Historical command retained to report the removed-engine migration.
     Engine(String),
     /// Show or set request config live: reasoning, temperature, step limit,
     /// RSI, and similar controls. Empty arg reports current values.
@@ -1117,8 +1117,7 @@ pub enum ConfigArg {
     Verify(String),
     Lsp(String),
     Delegate(String),
-    /// `/config engine …` — inspect, select, reload, or watch the optional
-    /// hot-swappable decision engine.
+    /// Historical `/config engine …` input reports a migration diagnostic.
     Engine(String),
     Theme(String),
     Density(String),
@@ -1296,7 +1295,7 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
         "ui" => parse_ui_config_arg(val),
         other => ConfigArg::Invalid(format!(
             "unknown /config option '{other}' — try: show, model, provider, auth, \
-reasoning, temp, steps, verify, lsp, delegate, engine, moe-streaming, skeptic-local, suggest, rsi, \
+reasoning, temp, steps, verify, lsp, delegate, moe-streaming, skeptic-local, suggest, rsi, \
 ui theme|density|mouse"
         )),
     }
@@ -1582,16 +1581,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "[id]",
         help: "show or set the model (alias of /config model)",
         arg_values: &[],
-    },
-    CommandSpec {
-        name: "engine",
-        args: "[status|native|wasm|reload|watch]",
-        help: "inspect or hot-reload the optional WASM decision engine",
-        arg_values: &[
-            ("status", "show active and pending module generations"),
-            ("reload", "validate a module for the next turn"),
-            ("native", "use the native decision engine"),
-        ],
     },
     CommandSpec {
         name: "config",

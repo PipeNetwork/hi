@@ -42,7 +42,7 @@ impl crate::Agent {
 
         let mut execution =
             ExecutionReport::succeeded(Some(self.runtime.ledger().workspace_revision()));
-        let stage_error = self.stage_final_reconciliation(&execution).err();
+        let stage_error = self.stage_final_reconciliation(&execution).await.err();
         if let Some(error) = &stage_error {
             execution.disposition = ExecutionDisposition::Indeterminate;
             execution.content_digest = None;
@@ -66,7 +66,7 @@ impl crate::Agent {
         }
     }
 
-    fn stage_final_reconciliation(&self, execution: &ExecutionReport) -> Result<()> {
+    async fn stage_final_reconciliation(&mut self, execution: &ExecutionReport) -> Result<()> {
         let binding = self.workspace_controller_binding();
         if !matches!(binding.authority, WorkspaceAuthority::PipeFs { .. }) {
             return Ok(());
@@ -92,10 +92,13 @@ impl crate::Agent {
             calls: Vec::new(),
             execution: execution.clone(),
         };
-        self.workspace_durability
+        let durability = self
+            .workspace_durability
             .as_ref()
             .context("PipeFS reconciliation requires a durable transcript stager")?
-            .stage_workspace_execution(&record)
+            .clone();
+        crate::workspace_durability::stage_execution_owned(durability, record)
+            .await
             .context("staging final PipeFS workspace reconciliation")
     }
 }

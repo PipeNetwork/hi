@@ -91,7 +91,13 @@ async fn unsupported_explicit_required_mode_fails_before_provider_send() {
         Some(ProviderErrorKind::UnsupportedTools)
     );
     assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 0);
-    assert!(agent.last_assistant_text().is_none());
+    let failure = crate::TurnFailure::from_error(&error).expect("settled failure receipt");
+    assert_eq!(failure.outcome.status, TurnStatus::Failed);
+    assert!(
+        agent.last_assistant_text().is_some(),
+        "failure has a durable closeout"
+    );
+    assert_ne!(agent.last_assistant_text().as_deref(), Some("narrative"));
 }
 
 #[tokio::test]
@@ -126,6 +132,19 @@ async fn required_mode_rejects_narration_without_weakening_the_request() {
     );
     let modes = modes.lock().unwrap();
     assert_eq!(modes.len(), MAX_TOOL_PROTOCOL_RETRIES as usize + 1);
+    assert_eq!(
+        agent.last_turn_usage().input_tokens,
+        u64::from(MAX_TOOL_PROTOCOL_RETRIES) + 1
+    );
+    assert_eq!(
+        agent.last_turn_usage().output_tokens,
+        u64::from(MAX_TOOL_PROTOCOL_RETRIES) + 1
+    );
+    assert_eq!(
+        agent.last_turn_telemetry().accepted_completions,
+        0,
+        "rejected narration must not establish accepted occupancy"
+    );
     assert!(modes.iter().all(|mode| *mode == hi_ai::ToolMode::Required));
     assert!(
         !ui.statuses

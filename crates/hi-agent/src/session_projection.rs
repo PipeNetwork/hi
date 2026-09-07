@@ -28,6 +28,12 @@ pub struct SessionProjectionSnapshot {
 impl SessionProjectionSnapshot {
     pub fn validate(&self) -> Result<(), SessionProjectionError> {
         validate_versions(self.schema_version, self.reducer_version)?;
+        if self.reducer_version != self.reducer.reducer_version {
+            return Err(SessionProjectionError::UnsupportedReducer {
+                found: self.reducer.reducer_version,
+                supported: self.reducer_version,
+            });
+        }
         if self.revision != self.reducer.through_sequence {
             return Err(SessionProjectionError::RevisionMismatch {
                 declared: self.revision,
@@ -113,6 +119,14 @@ impl SessionProjection {
         patch: SessionProjectionPatch,
     ) -> Result<SessionProjectionSnapshot, SessionProjectionError> {
         validate_versions(patch.schema_version, patch.reducer_version)?;
+        // A v2 snapshot can be migrated, but an old producer's patch digests
+        // describe old reduction rules. Request a current snapshot instead.
+        if patch.reducer_version != SESSION_REDUCER_VERSION {
+            return Err(SessionProjectionError::UnsupportedReducer {
+                found: patch.reducer_version,
+                supported: SESSION_REDUCER_VERSION,
+            });
+        }
         let current = self.snapshot();
         if patch.base_revision != current.revision || patch.base_digest != current.digest {
             return Err(SessionProjectionError::StaleBase {
@@ -211,7 +225,7 @@ fn validate_versions(schema: u16, reducer: u32) -> Result<(), SessionProjectionE
             supported: SESSION_PROJECTION_SCHEMA_VERSION,
         });
     }
-    if reducer != SESSION_REDUCER_VERSION {
+    if !crate::session_reducer::supported_reducer_version(reducer) {
         return Err(SessionProjectionError::UnsupportedReducer {
             found: reducer,
             supported: SESSION_REDUCER_VERSION,
@@ -231,7 +245,17 @@ fn snapshot_for(reducer: &SessionReducer) -> SessionProjectionSnapshot {
     }
 }
 
+#[cfg(test)]
+thread_local! { static DIGEST_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+pub(crate) fn digest_calls() -> u64 {
+    DIGEST_CALLS.with(std::cell::Cell::get)
+}
+
 fn reducer_digest(snapshot: &SessionReducerSnapshot) -> String {
+    #[cfg(test)]
+    DIGEST_CALLS.with(|calls| calls.set(calls.get() + 1));
     let bytes = serde_json::to_vec(snapshot).expect("session reducer snapshot serializes");
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
@@ -273,6 +297,123 @@ mod tests {
                 .state()
                 .semantically_eq(projection.reducer().state())
         );
+    }
+
+    #[test]
+    fn version_two_snapshot_digest_is_checked_before_migration() {
+        let mut reducer = SessionReducer::new();
+        reducer.apply_event(message(1, "old conversation")).unwrap();
+        let mut old = snapshot_for(&reducer);
+        old.reducer_version = 2;
+        old.reducer.reducer_version = 2;
+        old.reducer.state.reducer_version = 2;
+        old.digest = reducer_digest(&old.reducer);
+        let encoded = serde_json::to_value(&old).unwrap();
+        assert!(encoded["reducer"]["state"].get("task_recovery").is_none());
+        assert!(encoded["reducer"].get("workspace_execution").is_none());
+        let decoded = serde_json::from_value(encoded).unwrap();
+        let migrated = SessionProjection::from_snapshot(decoded).unwrap();
+        assert_eq!(migrated.snapshot().reducer_version, SESSION_REDUCER_VERSION);
+        assert_eq!(
+            migrated.reducer().state().messages[0].text(),
+            "old conversation"
+        );
+        assert_eq!(
+            migrated.reducer().state().task_recovery,
+            crate::TaskRecoveryState::default()
+        );
+
+        old.reducer.state.name = Some("tampered".into());
+        assert!(matches!(
+            SessionProjection::from_snapshot(old),
+            Err(SessionProjectionError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn an_ephemeral_callback_cache_cannot_change_snapshot_digest() {
+        let mut recovery = crate::TaskRecoveryState::default();
+        recovery.observe(&crate::recovery::ValidationObservation::command(
+            "callback".into(),
+            "unrelated check",
+            "revision".into(),
+            crate::recovery::ValidationResult::Passed,
+            "",
+            std::path::Path::new("."),
+            false,
+        ));
+        let mut reducer = SessionReducer::new();
+        reducer
+            .apply_event(SessionEvent::new(SessionEventKind::TaskRecovery {
+                state: recovery,
+            }))
+            .unwrap();
+        let snapshot = snapshot_for(&reducer);
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert!(encoded["reducer"]["state"].get("task_recovery").is_none());
+        let restored =
+            SessionProjection::from_snapshot(serde_json::from_value(encoded).unwrap()).unwrap();
+        assert_eq!(restored.snapshot().digest, snapshot.digest);
+    }
+
+    #[test]
+    fn recovery_v1_digest_is_checked_before_obligation_migration() {
+        // Literal V1 struct field order and presence are intentional: hashing a
+        // sorted Value or serializing migrated fields would change this wire.
+        let legacy = r#"{"schema_version":1,"objective":"repair suite","limit":3,"remaining":2,"exhausted":false,"interventions":1,"last_reason":"repair","mutation_credited":true,"validations":{"full":{"best_failures":["suite::failure"],"passed":true,"failed_states":["[\"rev-a\",[\"suite::failure\"]]"]}},"observed_executions":["old-execution"]}"#;
+        let recovery: crate::TaskRecoveryState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(serde_json::to_string(&recovery).unwrap(), legacy);
+        let mut reducer = SessionReducer::new();
+        reducer
+            .apply_event(message(1, "retained conversation"))
+            .unwrap();
+        let mut old = snapshot_for(&reducer);
+        old.reducer.state.task_recovery = recovery;
+        old.digest = reducer_digest(&old.reducer);
+        let encoded = serde_json::to_string(&old).unwrap();
+        let decoded: SessionProjectionSnapshot = serde_json::from_str(&encoded).unwrap();
+        let mut tampered = decoded.clone();
+        tampered.reducer.state.task_recovery.remaining = 3;
+        assert!(matches!(
+            tampered.validate(),
+            Err(SessionProjectionError::DigestMismatch { .. })
+        ));
+        let migrated = SessionProjection::from_snapshot(decoded).unwrap();
+        assert_eq!(
+            migrated.reducer().state().messages[0].text(),
+            "retained conversation"
+        );
+        let state = &migrated.reducer().state().task_recovery;
+        assert_eq!(state.schema_version, 2);
+        assert_eq!(state.remaining, 2);
+        assert_eq!(
+            state.unresolved_validation_status("rev-a"),
+            Some(crate::recovery::ValidationResult::Deferred)
+        );
+        assert_ne!(migrated.snapshot().digest, old.digest);
+        assert!(
+            serde_json::to_value(state)
+                .unwrap()
+                .get("observed_executions")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mismatched_snapshot_versions_and_old_rule_patches_require_new_snapshot() {
+        let mut snapshot = SessionProjection::new().snapshot();
+        snapshot.reducer_version = 2;
+        assert!(snapshot.validate().is_err());
+        let mut projection = SessionProjection::new();
+        let mut patch = projection
+            .prepare_patch(vec![message(1, "old producer")])
+            .unwrap();
+        patch.reducer_version = 2;
+        assert!(matches!(
+            projection.apply_patch(patch),
+            Err(SessionProjectionError::UnsupportedReducer { found: 2, .. })
+        ));
+        assert_eq!(projection.snapshot().revision, 0);
     }
 
     #[test]

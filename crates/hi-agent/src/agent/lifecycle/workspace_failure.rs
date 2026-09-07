@@ -18,7 +18,9 @@ pub(super) fn verification_after_turn_failure(
             (crate::VerificationStatus::Passed, Some(digest.clone()))
         }
         crate::domain::VerifyEvidence::Failed => (crate::VerificationStatus::Failed, None),
-        crate::domain::VerifyEvidence::None | crate::domain::VerifyEvidence::Passed { .. } => {
+        crate::domain::VerifyEvidence::None
+        | crate::domain::VerifyEvidence::Invalidated { .. }
+        | crate::domain::VerifyEvidence::Passed { .. } => {
             (crate::VerificationStatus::Unverified, None)
         }
     }

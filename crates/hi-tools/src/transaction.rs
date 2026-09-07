@@ -22,6 +22,9 @@ static TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
 #[path = "transaction/path_tests.rs"]
 mod path_tests;
 
+#[cfg(test)]
+mod shared_journal_tests;
+
 #[cfg(all(test, unix))]
 #[path = "transaction/restore_path_tests.rs"]
 mod restore_path_tests;
@@ -577,7 +580,6 @@ impl MutationPlan {
             cleanup_empty_dirs(&created_dirs);
             if !journal_dir_existed {
                 let _ = fs::remove_dir(&journal_dir);
-                let _ = fs::remove_dir(journal_dir.parent().unwrap_or(&journal_dir));
             }
             return Err(
                 error.context("transaction journal setup failed; no target changes were made")
@@ -660,10 +662,10 @@ impl MutationPlan {
         let _ = fs::remove_file(&journal_path);
         if !journal_dir_existed {
             let _ = fs::remove_dir(&journal_dir);
-            if let Some(parent) = journal_dir.parent() {
-                let _ = fs::remove_dir(parent);
-            }
         }
+        // The shared transactions/ container may be between another
+        // workspace's parent mkdir and hash-child mkdir. Keep its lifetime
+        // independent of this transaction's cleanup.
         cleanup_empty_dirs(&created_dirs);
         Ok(self.file_changes())
     }

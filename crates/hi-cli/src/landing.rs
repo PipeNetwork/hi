@@ -124,8 +124,34 @@ pub(crate) struct LoadedAgentSession {
     pub(crate) goal_drive_stall: u32,
     pub(crate) plan_drive_evidence: Vec<String>,
     pub(crate) goal_drive_evidence: Vec<String>,
+    pub(crate) task_recovery: hi_agent::TaskRecoveryState,
     /// A one-line summary of the resumed session, shown to the user on startup.
     pub(crate) resume_summary: Option<String>,
+}
+
+impl LoadedAgentSession {
+    fn from_loaded(loaded: session::LoadedSession, resume_summary: Option<String>) -> Self {
+        Self {
+            messages: loaded.messages,
+            usage: loaded.usage,
+            checkpoint_refs: loaded.checkpoint_refs,
+            harness_settings: loaded.harness_settings,
+            remote_session_id: loaded.remote_session_id,
+            pipefs_enabled: loaded.pipefs_enabled,
+            structured_goal: loaded.goal,
+            decisions: loaded.decisions,
+            plan: loaded.plan,
+            plan_drive_paused: loaded.plan_drive_paused,
+            plan_drive_resume_on_user_input: loaded.plan_drive_resume_on_user_input,
+            plan_approval_parked: loaded.plan_approval_parked,
+            plan_drive_stall: loaded.plan_drive_stall,
+            goal_drive_stall: loaded.goal_drive_stall,
+            plan_drive_evidence: loaded.plan_drive_evidence,
+            goal_drive_evidence: loaded.goal_drive_evidence,
+            task_recovery: loaded.task_recovery,
+            resume_summary,
+        }
+    }
 }
 
 /// Load the evaluator's role-preserving input document. The evaluator owns the
@@ -198,6 +224,7 @@ pub(crate) fn eval_loaded_session(input: &EvalInput) -> Result<Option<LoadedAgen
         goal_drive_stall: 0,
         plan_drive_evidence: Vec::new(),
         goal_drive_evidence: Vec::new(),
+        task_recovery: hi_agent::TaskRecoveryState::default(),
         resume_summary: None,
     }))
 }
@@ -353,25 +380,7 @@ pub(crate) fn resolve_session(
             let loaded = session::load_history(path)?;
             return Ok((
                 path.clone(),
-                Some(LoadedAgentSession {
-                    messages: loaded.messages,
-                    usage: loaded.usage,
-                    checkpoint_refs: loaded.checkpoint_refs,
-                    harness_settings: loaded.harness_settings,
-                    remote_session_id: loaded.remote_session_id,
-                    pipefs_enabled: loaded.pipefs_enabled,
-                    structured_goal: loaded.goal,
-                    decisions: loaded.decisions,
-                    plan: loaded.plan,
-                    plan_drive_paused: loaded.plan_drive_paused,
-                    plan_drive_resume_on_user_input: loaded.plan_drive_resume_on_user_input,
-                    plan_approval_parked: loaded.plan_approval_parked,
-                    plan_drive_stall: loaded.plan_drive_stall,
-                    goal_drive_stall: loaded.goal_drive_stall,
-                    plan_drive_evidence: loaded.plan_drive_evidence,
-                    goal_drive_evidence: loaded.goal_drive_evidence,
-                    resume_summary: None,
-                }),
+                Some(LoadedAgentSession::from_loaded(loaded, None)),
             ));
         }
         return Ok((path.clone(), None));
@@ -382,25 +391,7 @@ pub(crate) fn resolve_session(
         let summary = session::resume_summary(&loaded);
         return Ok((
             path,
-            Some(LoadedAgentSession {
-                messages: loaded.messages,
-                usage: loaded.usage,
-                checkpoint_refs: loaded.checkpoint_refs,
-                harness_settings: loaded.harness_settings,
-                remote_session_id: loaded.remote_session_id,
-                pipefs_enabled: loaded.pipefs_enabled,
-                structured_goal: loaded.goal,
-                decisions: loaded.decisions,
-                plan: loaded.plan,
-                plan_drive_paused: loaded.plan_drive_paused,
-                plan_drive_resume_on_user_input: loaded.plan_drive_resume_on_user_input,
-                plan_approval_parked: loaded.plan_approval_parked,
-                plan_drive_stall: loaded.plan_drive_stall,
-                goal_drive_stall: loaded.goal_drive_stall,
-                plan_drive_evidence: loaded.plan_drive_evidence,
-                goal_drive_evidence: loaded.goal_drive_evidence,
-                resume_summary: Some(summary),
-            }),
+            Some(LoadedAgentSession::from_loaded(loaded, Some(summary))),
         ));
     }
     if cli.cont {
@@ -409,25 +400,7 @@ pub(crate) fn resolve_session(
             let summary = session::resume_summary(&loaded);
             return Ok((
                 path,
-                Some(LoadedAgentSession {
-                    messages: loaded.messages,
-                    usage: loaded.usage,
-                    checkpoint_refs: loaded.checkpoint_refs,
-                    harness_settings: loaded.harness_settings,
-                    remote_session_id: loaded.remote_session_id,
-                    pipefs_enabled: loaded.pipefs_enabled,
-                    structured_goal: loaded.goal,
-                    decisions: loaded.decisions,
-                    plan: loaded.plan,
-                    plan_drive_paused: loaded.plan_drive_paused,
-                    plan_drive_resume_on_user_input: loaded.plan_drive_resume_on_user_input,
-                    plan_approval_parked: loaded.plan_approval_parked,
-                    plan_drive_stall: loaded.plan_drive_stall,
-                    goal_drive_stall: loaded.goal_drive_stall,
-                    plan_drive_evidence: loaded.plan_drive_evidence,
-                    goal_drive_evidence: loaded.goal_drive_evidence,
-                    resume_summary: Some(summary),
-                }),
+                Some(LoadedAgentSession::from_loaded(loaded, Some(summary))),
             ));
         }
         eprintln!("\x1b[33mno previous session; starting a new one\x1b[0m");

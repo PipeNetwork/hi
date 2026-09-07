@@ -150,12 +150,11 @@ fn one_shot_report_creates_parent_directories() {
 }
 
 #[test]
-fn review_repair_report_settles_without_obsolete_failure_states() {
+fn review_repair_report_retains_typed_failure_at_shared_limit() {
     let weak_review = "The repository looks healthy and organized.";
-    // Surplus responses: the weak review triggers 4 quality-repair nudges
-    // plus keep-working recoveries (14 model calls total), all served by this
-    // one fake server. Extra responses sit unused but prevent a dead-connection
-    // error that would mask the settled review outcome.
+    // Surplus responses keep a transport failure from masking the policy result.
+    // One initial weak answer and three corrective requests must exhaust shared
+    // recovery, with no automatic continuation or recap inference.
     let Some(server) = FakeOpenAiServer::new(
         (0..20)
             .map(|_| Response::sse(sse_with_usage(weak_review)))
@@ -182,8 +181,8 @@ fn review_repair_report_settles_without_obsolete_failure_states() {
     );
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "bounded review repair should settle normally\nstdout: {}\nstderr: {}",
+        Some(1),
+        "exhausted review repair must return a non-success exit\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -202,10 +201,12 @@ fn review_repair_report_settles_without_obsolete_failure_states() {
         "review repair text should not leak visibly:\n{visible}"
     );
     let bodies = server.bodies();
-    assert!(
-        bodies.len() > 1,
-        "weak review answer should trigger additional model calls"
+    assert_eq!(
+        bodies.len(),
+        4,
+        "initial request plus three shared corrections"
     );
+    assert!(visible.contains("Automatic recovery stopped."));
     assert!(
         bodies
             .iter()
@@ -221,16 +222,10 @@ fn review_repair_report_settles_without_obsolete_failure_states() {
 
     let text = std::fs::read_to_string(&report).expect("report should be written");
     let json: serde_json::Value = serde_json::from_str(&text).expect("report json");
-    assert_eq!(json["outcome"]["status"], "completed");
-    assert_eq!(json["outcome"]["stop_reason"], "no_applicable_verification");
+    assert_eq!(json["outcome"]["status"], "failed");
+    assert_eq!(json["outcome"]["stop_reason"], "no_progress");
     let telemetry = &json["telemetry"];
     assert_eq!(telemetry["quality_repair_nudges"], 4);
-    assert_eq!(
-        telemetry["review_repair_exhaustion_reason"],
-        "review_listing_only_exhausted"
-    );
-    assert_eq!(telemetry["review_repair_counts"]["review_listing_only"], 4);
-    assert_eq!(telemetry["review_repair_stopped_by_exhaustion"], true);
     assert_eq!(telemetry["stopped_by_step_cap"], false);
     assert_eq!(telemetry["stopped_by_tool_cap"], false);
     assert!(telemetry.get("stalled_unfinished").is_none());
@@ -239,14 +234,6 @@ fn review_repair_report_settles_without_obsolete_failure_states() {
     assert_eq!(telemetry["hit_tool_cap"], false);
     assert!(telemetry["progress_events"].is_array());
     assert!(telemetry["tool_timeline"].is_array());
-    assert!(
-        telemetry["progress_events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|event| event["reason"] == "review_listing_only_exhausted"),
-        "progress events should include review exhaustion reason: {telemetry}"
-    );
 }
 
 #[test]

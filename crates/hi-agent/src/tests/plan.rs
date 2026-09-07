@@ -237,7 +237,12 @@ async fn bounded_discovery_plan_gets_one_targeted_read_before_mutation() {
         ui.statuses
     );
     assert_eq!(outcome.verification, VerificationStatus::Passed);
-    assert_eq!(outcome.stop_reason, TurnStopReason::Completed);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::Completed,
+        "{outcome:?}; {:?}",
+        ui.statuses
+    );
     assert!(
         outcome
             .changed_files
@@ -786,11 +791,7 @@ async fn failed_plan_persistence_does_not_publish_live_only_state() {
         .await
         .expect_err("injected durable write must fail the tool batch");
 
-    assert!(
-        error
-            .to_string()
-            .contains("injected plan persistence failure")
-    );
+    assert!(format!("{error:#}").contains("injected plan persistence failure"));
     assert!(
         agent.current_plan().is_empty(),
         "a plan that never became durable leaked into live state: {:?}",
@@ -1105,6 +1106,9 @@ async fn long_plan_10_steps_runs_to_completion() {
     // until all 10 steps are done. The silent_continues counter resets on
     // each tool call, so this should work regardless of plan length.
     let mut cfg = config();
+    // This fixture tests plan mechanics using repetitive inspection, rather
+    // than objective improvement. Exercise an explicit recovery override.
+    cfg.loop_limits.max_recovery_interventions = 20;
     cfg.loop_limits.max_silent_continues = 3; // the default
     // The dynamic catalog omits coordination tools for ordinary read-only
     // requests; this fixture specifically exercises update_plan mechanics.
@@ -1209,6 +1213,9 @@ async fn long_plan_survives_text_only_response_to_nudge() {
     // exhausted. This test has 3 text-only responses (within budget)
     // before the model finally acts.
     let mut cfg = config();
+    // This fixture tests plan mechanics using repetitive inspection, rather
+    // than objective improvement. Exercise an explicit recovery override.
+    cfg.loop_limits.max_recovery_interventions = 20;
     cfg.loop_limits.max_silent_continues = 3;
     let plan_call = |id: &str, s1: &str, s2: &str, s3: &str| {
         completion(
@@ -1639,7 +1646,7 @@ async fn repeated_generic_completion_settles_one_plan_drive_as_no_progress() {
         "plan leftover must be reported"
     );
     assert!(
-        ui.assistant.contains("repeated attempts made no progress"),
+        ui.assistant.contains("Automatic recovery stopped."),
         "a truthful deterministic closeout should be shown: {}",
         ui.assistant
     );
@@ -1734,10 +1741,17 @@ async fn provider_exhaustion_after_mutation_is_infrastructure_and_does_not_auto_
     ]);
     let mut ui = RecUi::default();
 
-    let outcome = agent
+    let error = agent
         .run_turn(crate::PLAN_DRIVE_PROMPT, &mut ui)
         .await
-        .expect("a landed tool result must settle even if the provider then exhausts");
+        .expect_err("the original provider failure must survive retained-work settlement");
+    let failure = TurnFailure::from_error(&error).expect("typed settled failure");
+    assert!(failure.body_settled());
+    assert_eq!(
+        hi_ai::provider_error_details(&error).unwrap().kind,
+        hi_ai::ProviderErrorKind::EmptyCompletion
+    );
+    let outcome = &failure.outcome;
 
     assert!(changed.exists(), "the landed mutation must be retained");
     assert_eq!(outcome.status, TurnStatus::Failed);
@@ -1747,9 +1761,11 @@ async fn provider_exhaustion_after_mutation_is_infrastructure_and_does_not_auto_
         "provider exhaustion must not masquerade as a verification failure"
     );
     assert_eq!(
-        agent.drive_decision(Some(&outcome)),
+        agent.drive_decision(Some(outcome)),
         crate::DriveAction::Idle {
-            reason: crate::DriveIdleReason::Infrastructure,
+            // The persisted recovery stop blocks drive admission before the
+            // per-turn infrastructure disposition is consulted.
+            reason: crate::DriveIdleReason::NoProgress,
         },
         "an unavailable provider must not be restarted autonomously"
     );
@@ -1765,6 +1781,7 @@ async fn completed_plan_settles_without_an_optional_provider_recap() {
     let changed = workspace.path("completed.txt");
     let mut cfg = workspace.config();
     cfg.gates.allow_unverified = true;
+    cfg.memory.suggest_next_prompt = true;
     let done = completion(
         vec![Content::ToolCall {
             id: "plan-done".into(),
@@ -1822,12 +1839,18 @@ async fn completed_plan_settles_without_an_optional_provider_recap() {
 
 #[tokio::test]
 async fn empty_stream_error_after_completed_plan_preserves_productive_outcome() {
+    completed_plan_without_model_answer(false).await;
+    completed_plan_without_model_answer(true).await;
+}
+
+async fn completed_plan_without_model_answer(stream_error: bool) {
     let workspace = IsolatedWorkspace::new("plan-drive-empty-stream-after-complete");
     let changed = workspace.path("completed.txt");
     let mut cfg = workspace.config();
     cfg.gates.allow_unverified = true;
-    cfg.loop_limits.max_empty_retries = 0;
-    cfg.loop_limits.max_keep_working = 0;
+    cfg.memory.suggest_next_prompt = true;
+    cfg.loop_limits.max_empty_retries = 8;
+    cfg.loop_limits.max_keep_working = 3;
     // Put the mutation and final bookkeeping in one model batch so the
     // bookkeeping-only early-settlement path does not apply. This directly
     // exercises the defensive provider-error fallback for a completed plan.
@@ -1857,7 +1880,11 @@ async fn empty_stream_error_after_completed_plan_preserves_productive_outcome() 
     let (mut agent, requests) = scripted_agent(
         vec![
             ProviderStep::Completion(work_and_done),
-            ProviderStep::Error(hi_ai::ProviderErrorKind::EmptyCompletion),
+            if stream_error {
+                ProviderStep::Error(hi_ai::ProviderErrorKind::EmptyCompletion)
+            } else {
+                ProviderStep::Completion(completion(Vec::new(), 1, 1))
+            },
         ],
         cfg,
     );
@@ -1872,6 +1899,11 @@ async fn empty_stream_error_after_completed_plan_preserves_productive_outcome() 
     assert!(changed.exists(), "the successful write was not retained");
     assert!(!agent.plan_incomplete(), "the completed plan was reopened");
     assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        agent.answer_state,
+        crate::recovery::AnswerState::Deterministic
+    );
+    assert!(!ui.assistant.contains("The turn is closed"));
     assert_eq!(
         outcome.stop_reason,
         TurnStopReason::NoApplicableVerification
@@ -3390,157 +3422,4 @@ fn ingest_prose_plan_falls_back_to_planner() {
     assert!(agent.try_ingest_goal("implement plan.md").is_none());
 }
 
-#[test]
-fn goal_drive_stall_skips_stuck_step_and_keeps_driving() {
-    let mut agent = goal_agent();
-    assert!(
-        agent
-            .set_structured_goal(Some(crate::Goal::new(
-                "ship it",
-                vec!["first".into(), "second".into(), "third".into()],
-            )))
-            .unwrap()
-    );
-    let outcome = completed_outcome(agent.leftover_work());
-    let mut last = crate::GoalDriveProgress::Unchanged;
-    for _ in 0..crate::GOAL_DRIVE_STALL_LIMIT {
-        last = agent.note_goal_drive_progress(false);
-    }
-    assert!(
-        matches!(
-            last,
-            crate::GoalDriveProgress::Skipped { ref failed, .. } if failed == "first"
-        ),
-        "{last:?}"
-    );
-    assert_eq!(
-        agent.drive_decision(Some(&outcome)),
-        crate::DriveAction::Enqueue(crate::DriveKind::Goal)
-    );
-    assert_eq!(agent.goal_drive_stall(), 0);
-    let goal = agent.structured_goal().expect("goal");
-    assert_eq!(goal.sub_goals[0].status, crate::GoalStatus::Failed);
-    assert_eq!(goal.sub_goals[1].status, crate::GoalStatus::Active);
-    assert_eq!(goal.pause_reason, crate::GoalPauseReason::None);
-}
-
-#[test]
-fn goal_drive_two_skips_without_completion_parks() {
-    let mut agent = goal_agent();
-    assert!(
-        agent
-            .set_structured_goal(Some(crate::Goal::new(
-                "ship it",
-                vec!["first".into(), "second".into(), "third".into()],
-            )))
-            .unwrap()
-    );
-    let outcome = completed_outcome(agent.leftover_work());
-    for _ in 0..crate::GOAL_DRIVE_STALL_LIMIT {
-        agent.note_goal_drive_progress(false);
-    }
-    let mut last = crate::GoalDriveProgress::Unchanged;
-    for _ in 0..crate::GOAL_DRIVE_STALL_LIMIT {
-        last = agent.note_goal_drive_progress(false);
-    }
-    assert_eq!(last, crate::GoalDriveProgress::Parked);
-    assert_eq!(
-        agent.drive_decision(Some(&outcome)),
-        crate::DriveAction::Idle {
-            reason: crate::DriveIdleReason::GoalParked
-        }
-    );
-    let goal = agent.structured_goal().expect("goal");
-    assert!(goal.is_thrashing());
-    assert_eq!(goal.pause_reason, crate::GoalPauseReason::None);
-    assert_eq!(goal.sub_goals[0].status, crate::GoalStatus::Failed);
-    assert_eq!(goal.sub_goals[1].status, crate::GoalStatus::Failed);
-}
-
-#[test]
-fn stall_skip_then_completion_requeues_failed_step() {
-    let mut agent = goal_agent();
-    assert!(
-        agent
-            .set_structured_goal(Some(crate::Goal::new(
-                "ship it",
-                vec!["first".into(), "second".into(), "third".into()],
-            )))
-            .unwrap()
-    );
-    let mut last = crate::GoalDriveProgress::Unchanged;
-    for _ in 0..crate::GOAL_DRIVE_STALL_LIMIT {
-        last = agent.note_goal_drive_progress(false);
-    }
-    assert!(
-        matches!(
-            last,
-            crate::GoalDriveProgress::Skipped { ref failed, .. } if failed == "first"
-        ),
-        "{last:?}"
-    );
-    agent
-        .update_structured_goal(|goal| {
-            goal.sub_goals[1].status = crate::GoalStatus::Done;
-            goal.sub_goals[2].status = crate::GoalStatus::Done;
-            goal.rederive_status();
-        })
-        .unwrap();
-    let progress = agent.note_goal_drive_progress(true);
-    assert_eq!(progress, crate::GoalDriveProgress::Requeued { count: 1 });
-    let goal = agent.structured_goal().expect("goal");
-    assert_eq!(goal.sub_goals[0].status, crate::GoalStatus::Active);
-    assert!(goal.sub_goals[0].stall_skipped);
-    assert!(goal.sub_goals[0].requeued);
-    assert_eq!(goal.pause_reason, crate::GoalPauseReason::None);
-    let outcome = completed_outcome(agent.leftover_work());
-    assert_eq!(
-        agent.drive_decision(Some(&outcome)),
-        crate::DriveAction::Enqueue(crate::DriveKind::Goal)
-    );
-}
-
-#[test]
-fn requeued_step_that_stalls_again_stays_failed_and_parks() {
-    let mut agent = goal_agent();
-    assert!(
-        agent
-            .set_structured_goal(Some(crate::Goal::new(
-                "ship it",
-                vec!["first".into(), "second".into(), "third".into()],
-            )))
-            .unwrap()
-    );
-    for _ in 0..crate::GOAL_DRIVE_STALL_LIMIT {
-        agent.note_goal_drive_progress(false);
-    }
-    agent
-        .update_structured_goal(|goal| {
-            goal.sub_goals[1].status = crate::GoalStatus::Done;
-            goal.sub_goals[2].status = crate::GoalStatus::Done;
-            goal.rederive_status();
-        })
-        .unwrap();
-    assert_eq!(
-        agent.note_goal_drive_progress(true),
-        crate::GoalDriveProgress::Requeued { count: 1 }
-    );
-    let mut last = crate::GoalDriveProgress::Unchanged;
-    for _ in 0..crate::GOAL_DRIVE_STALL_LIMIT {
-        last = agent.note_goal_drive_progress(false);
-    }
-    assert_eq!(last, crate::GoalDriveProgress::Parked);
-    let goal = agent.structured_goal().expect("goal");
-    assert_eq!(goal.sub_goals[0].status, crate::GoalStatus::Failed);
-    assert!(goal.sub_goals[0].requeued);
-    assert_eq!(goal.pause_reason, crate::GoalPauseReason::None);
-    assert!(!goal.has_drive_work());
-    let outcome = completed_outcome(agent.leftover_work());
-    assert!(
-        !matches!(
-            agent.drive_decision(Some(&outcome)),
-            crate::DriveAction::Enqueue(_)
-        ),
-        "failed requeued step must not keep driving"
-    );
-}
+mod stall;

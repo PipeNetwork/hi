@@ -1,6 +1,5 @@
 //! Per-session agent configuration and the layered-verification stage type.
 
-use hi_engine_api::EngineMode;
 use serde::{Deserialize, Serialize};
 
 mod routing;
@@ -152,68 +151,6 @@ pub struct AgentProgramConfig {
     pub max_speculative_calls: usize,
     pub max_external_speculative_calls: usize,
     pub external_ttl_seconds: u64,
-}
-
-/// Configuration for the optional hot-swappable decision engine. The native
-/// decision path remains the safe migration default; callers can opt into a
-/// validated component with `engine_mode = "wasm"` or `HI_ENGINE_MODE=wasm`.
-#[derive(Clone, Debug)]
-pub struct AgentEngineConfig {
-    pub mode: EngineMode,
-    pub module_path: Option<std::path::PathBuf>,
-    pub allow_unsigned: bool,
-    pub trusted_key_hex: Vec<String>,
-    pub watch: bool,
-    pub max_guest_fuel: u64,
-    pub max_guest_memory_bytes: usize,
-    pub max_guest_step_ms: u64,
-}
-
-impl Default for AgentEngineConfig {
-    fn default() -> Self {
-        let mode = std::env::var("HI_ENGINE_MODE")
-            .ok()
-            .and_then(|value| EngineMode::parse(&value))
-            .unwrap_or_default();
-        let module_path = std::env::var_os("HI_ENGINE_MODULE").map(std::path::PathBuf::from);
-        let allow_unsigned = std::env::var("HI_ENGINE_ALLOW_UNSIGNED")
-            .ok()
-            .is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            });
-        let trusted_key_hex = std::env::var("HI_ENGINE_TRUSTED_KEYS")
-            .or_else(|_| std::env::var("HI_ENGINE_TRUSTED_KEY"))
-            .ok()
-            .into_iter()
-            .flat_map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let watch = std::env::var("HI_ENGINE_WATCH").ok().is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        });
-        Self {
-            mode,
-            module_path,
-            allow_unsigned,
-            trusted_key_hex,
-            watch,
-            max_guest_fuel: hi_engine_host::DEFAULT_GUEST_FUEL,
-            max_guest_memory_bytes: hi_engine_host::DEFAULT_GUEST_MEMORY_BYTES,
-            max_guest_step_ms: hi_engine_host::DEFAULT_GUEST_STEP_TIMEOUT_MS,
-        }
-    }
 }
 
 impl Default for AgentProgramConfig {
@@ -469,8 +406,6 @@ pub struct AgentConfig {
     pub subagents: AgentSubagents,
     /// Native Rhai program negotiation and speculative execution controls.
     pub program: AgentProgramConfig,
-    /// Native/WASM decision engine selection and module limits.
-    pub engine: AgentEngineConfig,
     /// Optional RSI control-plane hooks (interactive path stays thin).
     pub rsi: AgentRsi,
     /// Suppress repository-provided executable hooks while constructing the
@@ -625,6 +560,8 @@ pub(crate) fn repair_limit_reached(limit: u32, used: u32) -> bool {
 /// Caps that bound a single turn's model/tool loops.
 #[derive(Clone, Debug)]
 pub struct AgentLoopLimits {
+    /// Shared corrective interventions without new objective evidence.
+    pub max_recovery_interventions: u32,
     /// Optional **hard** wall-clock budget through the turn's settlement commit:
     /// active model/tool work is cancelled when it expires, cancellation
     /// cleanup is allowed to settle, and `run_turn` returns a deadline error.
@@ -683,6 +620,7 @@ pub struct AgentLoopLimits {
 impl Default for AgentLoopLimits {
     fn default() -> Self {
         Self {
+            max_recovery_interventions: crate::DEFAULT_RECOVERY_INTERVENTIONS,
             // Ordinary productive work has no whole-turn wall-clock ceiling.
             // Frontends and harnesses can still install explicit soft/hard
             // deadlines; individual provider/tool operations retain their own
@@ -813,8 +751,8 @@ pub struct AgentMemory {
     /// Strategy used by `/compact` (no arg) and the summarizing tier of
     /// auto-compaction.
     pub compaction: CompactionKind,
-    /// After a mutating turn — or a tool-using turn that produced no visible
-    /// answer — make one dedicated tool-free model call to produce a recap.
+    /// Historical configuration field. Closeout is now deterministic and does
+    /// not dispatch another model request, regardless of this setting.
     pub finalize: bool,
     /// Auto-compact once the context window is at least this percent full.
     /// Default: [`AUTO_COMPACT_PERCENT`].

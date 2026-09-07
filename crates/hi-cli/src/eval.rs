@@ -12,10 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use hi_eval::backends::{DockerMount, DockerRunSpec, HarborDockerBackend};
 use hi_eval::{
-    ArtifactSpec, AttemptRecord, AttemptStatus, ClaimLevel, EnvironmentSpec, EvalEvidence,
-    EvalInput, EvalManifest, EvalProfile, EvalScore, EvalStateStore, ImportStore,
-    PreparationReceipt, ProgressEvent, RunIdentity, RunRecord, RunStatus, TaskPackage,
-    VerifierSpec, command_output_with_timeout,
+    ArtifactSpec, AttemptRecord, AttemptStatus, EnvironmentSpec, EvalEvidence, EvalInput,
+    EvalManifest, EvalProfile, EvalScore, EvalStateStore, ImportStore, PreparationReceipt,
+    ProgressEvent, RunIdentity, RunRecord, RunStatus, TaskPackage, VerifierSpec,
+    command_output_with_timeout,
 };
 use hi_eval_adapters::plan_directory;
 
@@ -1350,14 +1350,4 @@ fn print_help() {
          not beside hi. Docker/Harbor profiles use HI_DOCKER_BIN when Docker\n\
          is not on PATH."
     );
-}
-
-#[allow(dead_code)]
-fn _claim_level_name(level: ClaimLevel) -> &'static str {
-    match level {
-        ClaimLevel::Official => "official",
-        ClaimLevel::PublicReproduction => "public_reproduction",
-        ClaimLevel::Smoke => "smoke",
-        ClaimLevel::EvidenceOnly => "evidence_only",
-    }
 }

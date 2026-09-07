@@ -8,8 +8,6 @@ hi-observability.workspace = true
 hi-events.workspace = true
 hi-policy.workspace = true
 hi-ai.workspace = true
-hi-engine-api.workspace = true
-hi-engine-host.workspace = true
 hi-tools.workspace = true
 hi-workflow.workspace = true
 hi-workspace.workspace = true
@@ -34,13 +32,13 @@ libc.workspace = true
 [dev-dependencies]
 async-trait = { workspace = true }
 hi-ai = { workspace = true, features = ["test-support"] }
+rusqlite.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
 codebase-graph = ["hi-tools/codebase-graph"]
-native-director-v2-promotion = []
 # INTERNAL SMOKE NEGATIVE CONTROL ONLY. Enabling this intentionally accepts
 # low-information generic completion claims. It exists solely to demonstrate
 # that the interactive smoke regressions fail when their production guard is absent.

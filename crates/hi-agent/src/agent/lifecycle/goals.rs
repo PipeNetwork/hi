@@ -38,6 +38,15 @@ impl crate::Agent {
         if !self.config.subagents.long_horizon && goal.is_some() {
             return Ok(false);
         }
+        if let Some(next) = goal.as_ref()
+            && self
+                .goals
+                .structured
+                .as_ref()
+                .is_none_or(|current| current.objective != next.objective)
+        {
+            self.start_task_recovery(next.objective.clone())?;
+        }
         let migrated_legacy_goal_budget = goal
             .as_mut()
             .is_some_and(Goal::clear_legacy_automatic_budget);

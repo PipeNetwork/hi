@@ -28,6 +28,7 @@ mod notify;
 mod palette;
 mod plan_approval;
 mod profiling;
+mod provider_activity;
 mod race;
 pub use app::run;
 pub use daemon::run_loops_daemon;
@@ -112,14 +113,10 @@ pub struct LocalRuntimeIdentity {
 
 /// The result of resolving a profile name at runtime: a built provider, the
 /// model id to use, and the provider's display/cache identities. The caller
-/// swaps these into the agent via [`Agent::set_provider_with_route`].
+/// swaps the complete routing snapshot into the agent atomically.
 pub struct SwitchedProvider {
     pub provider: Box<dyn hi_ai::Provider>,
-    pub model: String,
-    pub route: hi_agent::AgentProviderRoute,
-    pub max_tokens: u32,
-    pub max_tokens_explicit: bool,
-    pub tool_mode: hi_ai::ToolMode,
+    pub routing: hi_agent::AgentRouting,
     pub local_runtime: Option<LocalRuntimeIdentity>,
 }
 
@@ -679,28 +676,9 @@ pub(crate) fn diff_for_files_sync(root: &std::path::Path, files: &[String]) -> S
 }
 
 pub(crate) const TICK: Duration = Duration::from_millis(120);
-/// Informational notice for a quiet backend. This is not a health verdict;
-/// cancellation and any explicitly configured deadline remain completion controls.
-const DEFAULT_WATCHDOG_STUCK_SECS: u64 = 180;
-const MIN_WATCHDOG_STUCK_SECS: u64 = 30;
-const MAX_WATCHDOG_STUCK_SECS: u64 = 1_800;
 /// On terminals that don't report focus, notify after a turn at least this long
 /// (a proxy for "you probably stepped away").
 pub(crate) const NOTIFY_THRESHOLD: Duration = Duration::from_secs(30);
-
-pub(crate) fn watchdog_stuck_timeout() -> Duration {
-    let configured = std::env::var("HI_TUI_WATCHDOG_SECS").ok();
-    watchdog_stuck_timeout_from_value(configured.as_deref())
-}
-
-fn watchdog_stuck_timeout_from_value(value: Option<&str>) -> Duration {
-    let seconds = value
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or(DEFAULT_WATCHDOG_STUCK_SECS)
-        .clamp(MIN_WATCHDOG_STUCK_SECS, MAX_WATCHDOG_STUCK_SECS);
-    Duration::from_secs(seconds)
-}
 
 /// Apply a freshly fetched `/models` result: update the served-metadata map,
 /// re-apply the current model (so its window/price refresh), and persist the
@@ -761,10 +739,6 @@ pub(crate) enum TranscriptEntry {
         line: Line<'static>,
         at: SystemTime,
     },
-    /// A line of assistant prose. It stays separate from status/tool lines so
-    /// the renderer can add the assistant gutter without changing copied text.
-    #[allow(dead_code)]
-    Assistant(Line<'static>),
     /// One grok-build assistant reply (markdown source), flattened as a block.
     AssistantMessage {
         text: String,
@@ -854,7 +828,6 @@ impl TranscriptEntry {
                 }
                 vec![prompt]
             }
-            TranscriptEntry::Assistant(line) => crate::render::wrap_line_to_width(line, 120),
             TranscriptEntry::AssistantMessage { text } => {
                 let mut lines = Vec::new();
                 for line in crate::render::markdown_body_lines(text) {
@@ -949,9 +922,7 @@ impl TranscriptEntry {
     /// content regardless of collapse state).
     pub(crate) fn text(&self) -> String {
         match self {
-            TranscriptEntry::Line(line) | TranscriptEntry::Assistant(line) => {
-                crate::render::copy_line_text(line)
-            }
+            TranscriptEntry::Line(line) => crate::render::copy_line_text(line),
             TranscriptEntry::AssistantMessage { text } => text.clone(),
             // User prompts are stored without a semantic gutter. Preserve
             // literal leading glyphs the user typed instead of normalizing
@@ -1553,6 +1524,7 @@ pub(crate) struct App {
     /// so the activity line can show "round 3 · 5 tool calls" for multi-step turns.
     pub(crate) turn_rounds: u32,
     pub(crate) waiting_for: Option<Duration>,
+    pub(crate) provider_activity: crate::provider_activity::ProviderActivity,
     pub(crate) last_turn_state: TurnState,
     pub(crate) last_error: Option<String>,
     pub(crate) event_log: Vec<String>,

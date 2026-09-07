@@ -1,0 +1,91 @@
+schema_version = 1
+name = "post-test-provider-failure-keeps-real-verification"
+tags = ["curated", "pr", "post-test-exhaustion"]
+timeout_ms = 45000
+
+[workspace]
+fixture = "fixture"
+git = "clean"
+
+[hi]
+args = ["--verify", "cargo test --quiet --locked --offline"]
+
+[session]
+plan_drive_paused = true
+
+[[session.plan]]
+title = "Implement rate limiting and run the existing tests"
+status = "active"
+
+[[provider.steps]]
+id = "passing-filtered-tests"
+[provider.steps.response]
+kind = "tool_call"
+name = "bash"
+arguments = { command = "cargo test --quiet --locked --offline 2>&1 | tail -6" }
+
+[[provider.steps]]
+id = "outage-response-1"
+[provider.steps.response]
+kind = "http_error"
+status = 503
+body = '{"error":{"message":"temporary model service outage","code":"service_unavailable","retryable":true}}'
+
+[[provider.steps]]
+id = "outage-response-2"
+[provider.steps.response]
+kind = "http_error"
+status = 503
+body = '{"error":{"message":"temporary model service outage","code":"service_unavailable","retryable":true}}'
+
+[[actions]]
+kind = "send_line"
+text = "Build all of that."
+
+[[actions]]
+kind = "wait_provider_request"
+count = 3
+timeout_ms = 20000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/verification" = "passed", "/data/outcome/stop_reason" = "infrastructure_failure" }
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_quiescent"
+source = "provider"
+quiet_ms = 400
+timeout_ms = 3000
+
+[[actions]]
+kind = "capture_screen"
+name = "checked-but-incomplete"
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 3
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/verification" = "passed", "/data/outcome/stop_reason" = "infrastructure_failure", "/data/plan/incomplete" = true, "/data/next_drive/action" = "idle" }
+exact = 1
+
+[[assertions]]
+kind = "screen"
+snapshot = "checked-but-incomplete"
+contains = ["Final verification passed", "temporary model service outage"]
+excludes = ["the request was rejected", "current workspace remains unverified"]
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

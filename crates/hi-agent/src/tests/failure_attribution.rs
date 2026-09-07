@@ -45,13 +45,11 @@ async fn provider_outage_after_failed_verification_is_not_verifier_infrastructur
         .run_turn("implement src.rs", &mut NullUi)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("503 Service Unavailable"));
+    assert!(format!("{error:#}").contains("503 Service Unavailable"));
     assert_eq!(requests.lock().unwrap().len(), 4);
 
-    let outcome = agent
-        .cleanup_turn(crate::TurnCleanupKind::Fail)
-        .await
-        .unwrap()
+    let outcome = &crate::TurnFailure::from_error(&error)
+        .expect("Agent returns the reconciled failed-turn receipt")
         .outcome;
     assert_eq!(outcome.status, TurnStatus::Failed);
     assert_eq!(outcome.stop_reason, TurnStopReason::InfrastructureFailure);

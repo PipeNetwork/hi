@@ -19,22 +19,10 @@ pub(super) use crate::file_mentions::expand_file_mentions;
 pub(super) fn apply_provider_switch(
     agent: &mut hi_agent::Agent,
     provider: std::sync::Arc<dyn hi_ai::Provider>,
-    route: hi_agent::AgentProviderRoute,
-    model: String,
-    max_tokens: u32,
-    max_tokens_explicit: bool,
-    tool_mode: hi_ai::ToolMode,
+    mut routing: hi_agent::AgentRouting,
 ) {
-    agent.set_provider_with_route(
-        provider,
-        route,
-        model,
-        None,
-        max_tokens,
-        max_tokens_explicit,
-        None,
-    );
-    agent.set_tool_mode(tool_mode);
+    routing.temperature = agent.temperature();
+    agent.set_provider_with_routing(provider, routing);
 }
 
 /// Handle a key in vim-style normal mode (Esc on empty input). Modal
@@ -505,33 +493,49 @@ mod tests {
     }
 
     #[test]
-    fn provider_switch_replaces_tool_mode_in_both_directions() {
+    fn provider_switch_replaces_request_policy_and_preserves_session_temperature() {
         let workspace = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut config = hi_agent::AgentConfig::default();
+        config.routing.temperature = Some(0.25);
         config.paths.workspace_root = workspace.path().to_path_buf();
         config.paths.state_root = state.path().to_path_buf();
         let mut agent = hi_agent::Agent::new(provider(), config).unwrap();
         apply_provider_switch(
             &mut agent,
             provider(),
-            hi_agent::AgentProviderRoute::new("test", "test/chat-only"),
-            "chat-only".into(),
-            1024,
-            true,
-            hi_ai::ToolMode::ChatOnly,
+            hi_agent::AgentRouting {
+                provider_route: Some("test".into()),
+                capability_route: Some("test/chat-only".into()),
+                model: "chat-only".into(),
+                requested_max_tokens: 1024,
+                max_tokens: 1024,
+                max_tokens_explicit: true,
+                tool_mode: hi_ai::ToolMode::ChatOnly,
+                reasoning_effort: Some(hi_ai::ReasoningEffort::High),
+                ..Default::default()
+            },
         );
         assert_eq!(agent.tool_mode(), hi_ai::ToolMode::ChatOnly);
+        assert_eq!(agent.reasoning_effort(), Some(hi_ai::ReasoningEffort::High));
+        assert_eq!(agent.temperature(), Some(0.25));
 
         apply_provider_switch(
             &mut agent,
             provider(),
-            hi_agent::AgentProviderRoute::new("test", "test/tool-capable"),
-            "tool-capable".into(),
-            1024,
-            true,
-            hi_ai::ToolMode::Auto,
+            hi_agent::AgentRouting {
+                provider_route: Some("test".into()),
+                capability_route: Some("test/tool-capable".into()),
+                model: "tool-capable".into(),
+                requested_max_tokens: 1024,
+                max_tokens: 1024,
+                max_tokens_explicit: true,
+                tool_mode: hi_ai::ToolMode::Auto,
+                ..Default::default()
+            },
         );
         assert_eq!(agent.tool_mode(), hi_ai::ToolMode::Auto);
+        assert_eq!(agent.reasoning_effort(), None);
+        assert_eq!(agent.temperature(), Some(0.25));
     }
 }

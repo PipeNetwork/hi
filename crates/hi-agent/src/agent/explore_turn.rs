@@ -330,17 +330,10 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
                 });
                 explore_tool_outcome(answer, status)
             }
-            Err(err) => {
-                // Nested escapes: typed fail cleanup (turn-scoped bg kill).
-                let _ = child
-                    .child_mut()
-                    .cleanup_turn(crate::TurnCleanupKind::Fail)
-                    .await;
-                explore_tool_outcome(
-                    format!("explore subagent error: {err}"),
-                    hi_tools::ToolStatus::Failed,
-                )
-            }
+            Err(err) => explore_tool_outcome(
+                format!("explore subagent error: {err}"),
+                hi_tools::ToolStatus::Failed,
+            ),
         }
     };
     let outcome = match child.stop_and_reap().await {

@@ -371,7 +371,11 @@ pub(crate) fn provider_error_from_http(status: StatusCode, text: &str) -> Provid
     let message = api_error_message(text).unwrap_or_else(|| text.to_string());
     ProviderError::new(kind, format!("API error {status}: {message}"))
         .with_http_status(Some(status.as_u16()))
-        .with_api_contract(None, Some(kind_retryable(kind)), None)
+        .with_api_contract(
+            None,
+            crate::openai::explicit_retryable(text).or(Some(kind_retryable(kind))),
+            None,
+        )
 }
 
 fn kind_retryable(kind: ProviderErrorKind) -> bool {
@@ -447,6 +451,7 @@ mod tests {
             model: "grok-4.6".into(),
             request_id: None,
             retry_attempt: 0,
+            execution: Default::default(),
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),

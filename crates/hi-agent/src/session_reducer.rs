@@ -5,15 +5,15 @@
 //! use the same state transition rules. Legacy JSONL remains a wire projection;
 //! the helpers here only read it and do not change its format.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use hi_ai::{Message, Usage};
 use serde::{Deserialize, Serialize};
 
-use crate::session_reducer_compat::{LegacyPlanPauseMigration, LegacySessionMeta};
+use crate::session_reducer_compat::LegacyPlanPauseMigration;
 use crate::session_transcript::{
-    TranscriptBlockMutation, apply_transcript_mutation, ensure_all_transcript_blocks_settled,
+    TranscriptBlockIndex, TranscriptBlockMutation, apply_transcript_mutation,
     validate_transcript_snapshot,
 };
 use crate::{Decision, Goal, PlanStatus, PlanStep, TurnStatus, TurnStopReason};
@@ -25,7 +25,19 @@ use crate::{
 /// Current event envelope understood by [`SessionReducer`].
 pub const SESSION_EVENT_SCHEMA_VERSION: u16 = 1;
 /// Version of the deterministic state transition rules.
-pub const SESSION_REDUCER_VERSION: u32 = 2;
+pub const SESSION_REDUCER_VERSION: u32 = 3;
+
+#[path = "session_workspace_replay.rs"]
+mod workspace_replay;
+use workspace_replay::WorkspaceExecutionReplay;
+
+pub(crate) fn supported_reducer_version(version: u32) -> bool {
+    matches!(version, 2 | SESSION_REDUCER_VERSION)
+}
+
+fn default_task_recovery(state: &crate::TaskRecoveryState) -> bool {
+    state == &crate::TaskRecoveryState::default()
+}
 
 /// One ordered input to the session reducer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,39 +62,6 @@ impl SessionEvent {
     pub fn at_sequence(mut self, sequence: u64) -> Self {
         self.sequence = Some(sequence);
         self
-    }
-
-    /// Decode one existing session JSONL record without changing its wire
-    /// representation. Empty records are ignored; malformed records become an
-    /// opaque boundary so legacy migration state cannot bridge corruption.
-    pub fn from_legacy_json(line: &str) -> Option<Self> {
-        let line = line.trim();
-        if line.is_empty() {
-            return None;
-        }
-        if let Ok(meta) = serde_json::from_str::<LegacySessionMeta>(line) {
-            return Some(Self::new(meta.into()));
-        }
-        Some(Self::new(
-            serde_json::from_str::<Message>(line)
-                .map(|message| SessionEventKind::Message { message })
-                .unwrap_or(SessionEventKind::OpaqueBoundary),
-        ))
-    }
-
-    /// Decode an existing remote record. Remote `message` payloads are bare
-    /// messages; all other record types retain the tagged JSONL metadata body.
-    pub fn from_remote_record(record_type: &str, payload_json: &str) -> Self {
-        let kind = if record_type == "message" {
-            serde_json::from_str::<Message>(payload_json)
-                .map(|message| SessionEventKind::Message { message })
-                .unwrap_or(SessionEventKind::OpaqueBoundary)
-        } else {
-            serde_json::from_str::<LegacySessionMeta>(payload_json)
-                .map(Into::into)
-                .unwrap_or(SessionEventKind::OpaqueBoundary)
-        };
-        Self::new(kind)
     }
 
     pub fn opaque_boundary() -> Self {
@@ -126,6 +105,9 @@ pub struct SessionState {
     pub plan_drive_evidence: BTreeSet<String>,
     #[serde(default)]
     pub goal_drive_evidence: BTreeSet<String>,
+    /// Recovery survives synthetic continuation and transcript replacement.
+    #[serde(default, skip_serializing_if = "default_task_recovery")]
+    pub task_recovery: crate::TaskRecoveryState,
     /// Stable presentation identities. Empty for legacy message-only sessions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transcript_blocks: Vec<TranscriptBlock>,
@@ -151,6 +133,7 @@ impl Default for SessionState {
             goal_drive_stall: 0,
             plan_drive_evidence: BTreeSet::new(),
             goal_drive_evidence: BTreeSet::new(),
+            task_recovery: crate::TaskRecoveryState::default(),
             transcript_blocks: Vec::new(),
         }
     }
@@ -211,6 +194,12 @@ pub enum SessionEventKind {
         goal: Goal,
     },
     GoalCleared,
+    TaskRecovery {
+        state: crate::TaskRecoveryState,
+    },
+    /// A recognized extension record with no reducer-owned state. Unlike an
+    /// opaque/corrupt record, it only breaks adjacency-sensitive migration.
+    ExtensionBoundary,
     Decisions {
         decisions: Vec<Decision>,
     },
@@ -245,6 +234,10 @@ pub enum SessionEventKind {
     TurnOutcome {
         status: TurnStatus,
         stop_reason: TurnStopReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_recovery: Option<crate::TaskRecoveryState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settled_goal: Option<Box<Goal>>,
     },
     StateReplacement {
         messages: Vec<Message>,
@@ -300,6 +293,8 @@ pub struct SessionReducerSnapshot {
     pub through_sequence: u64,
     pub state: SessionState,
     compatibility: LegacyPlanPauseMigration,
+    #[serde(default, skip_serializing_if = "WorkspaceExecutionReplay::is_empty")]
+    workspace_execution: WorkspaceExecutionReplay,
 }
 
 /// Deterministic session projection. Applying an event either updates the
@@ -309,6 +304,8 @@ pub struct SessionReducer {
     state: SessionState,
     through_sequence: u64,
     compatibility: LegacyPlanPauseMigration,
+    workspace_execution: WorkspaceExecutionReplay,
+    transcript_index: TranscriptBlockIndex,
 }
 
 impl SessionReducer {
@@ -316,20 +313,41 @@ impl SessionReducer {
         Self::default()
     }
 
-    pub fn from_snapshot(snapshot: SessionReducerSnapshot) -> Result<Self, SessionReduceError> {
-        if snapshot.reducer_version != SESSION_REDUCER_VERSION
-            || snapshot.state.reducer_version != SESSION_REDUCER_VERSION
-        {
+    pub fn from_snapshot(mut snapshot: SessionReducerSnapshot) -> Result<Self, SessionReduceError> {
+        if !supported_reducer_version(snapshot.reducer_version) {
             return Err(SessionReduceError::UnsupportedReducerVersion {
                 found: snapshot.reducer_version,
                 supported: SESSION_REDUCER_VERSION,
             });
         }
+        if snapshot.state.reducer_version != snapshot.reducer_version {
+            return Err(SessionReduceError::InvalidRecord(format!(
+                "session snapshot versions disagree: envelope {}, state {}",
+                snapshot.reducer_version, snapshot.state.reducer_version
+            )));
+        }
         validate_transcript_snapshot(&snapshot.state.transcript_blocks, snapshot.through_sequence)?;
+        snapshot
+            .state
+            .task_recovery
+            .validate()
+            .map_err(SessionReduceError::TaskRecovery)?;
+        snapshot.state.task_recovery.migrate();
+        if let Some(session_id) = &snapshot.state.remote_session_id {
+            validate_session_id(session_id)?;
+        }
+        snapshot
+            .workspace_execution
+            .restore_indexes(snapshot.state.messages.len())?;
+        let transcript_index = TranscriptBlockIndex::from_blocks(&snapshot.state.transcript_blocks);
+        snapshot.state.reducer_version = SESSION_REDUCER_VERSION;
+        clear_completed_plan(&mut snapshot.state.plan);
         Ok(Self {
             state: snapshot.state,
             through_sequence: snapshot.through_sequence,
             compatibility: snapshot.compatibility,
+            workspace_execution: snapshot.workspace_execution,
+            transcript_index,
         })
     }
 
@@ -347,11 +365,21 @@ impl SessionReducer {
             through_sequence: self.through_sequence,
             state: self.state.clone(),
             compatibility: self.compatibility.clone(),
+            workspace_execution: self.workspace_execution.clone(),
         }
     }
 
-    /// Apply exactly one event and return the complete new projection.
-    pub fn apply(&mut self, event: SessionEvent) -> Result<SessionState, SessionReduceError> {
+    /// A portable cache must retain exact pending outbox evidence, not only
+    /// the visible recovery warning. Ordinary completed histories need no copy.
+    pub fn pending_execution_snapshot(&self) -> Option<SessionReducerSnapshot> {
+        self.workspace_execution
+            .has_pending()
+            .then(|| self.snapshot())
+    }
+
+    /// Apply one event without copying the accumulated conversation. Streaming
+    /// readers use this path; snapshots are materialized only when requested.
+    pub fn apply_event(&mut self, event: SessionEvent) -> Result<(), SessionReduceError> {
         if event.schema_version != SESSION_EVENT_SCHEMA_VERSION {
             return Err(SessionReduceError::UnsupportedEventVersion {
                 found: event.schema_version,
@@ -370,7 +398,26 @@ impl SessionReducer {
             validate_session_id(session_id)?;
         }
         if matches!(&event.kind, SessionEventKind::TurnOutcome { .. }) {
-            ensure_all_transcript_blocks_settled(&self.state.transcript_blocks)?;
+            self.transcript_index.ensure_settled()?;
+        }
+        if let SessionEventKind::TaskRecovery { state }
+        | SessionEventKind::TurnOutcome {
+            task_recovery: Some(state),
+            ..
+        } = &event.kind
+        {
+            state.validate().map_err(SessionReduceError::TaskRecovery)?;
+        }
+        if let SessionEventKind::WorkspaceExecutionStaged {
+            execution,
+            visible_on_resume,
+        } = &event.kind
+        {
+            self.workspace_execution.stage(
+                execution.clone(),
+                *visible_on_resume,
+                self.state.messages.len(),
+            )?;
         }
         let transcript_applied = self.apply_transcript_event(&event.kind, sequence)?;
         if transcript_applied {
@@ -380,25 +427,30 @@ impl SessionReducer {
         }
         self.through_sequence = sequence;
         self.state.reducer_version = SESSION_REDUCER_VERSION;
-        if self
-            .state
-            .plan
-            .iter()
-            .all(|step| step.status == PlanStatus::Done)
-        {
-            self.state.plan.clear();
-        }
+        Ok(())
+    }
+
+    /// Apply an event and explicitly request an owned projection snapshot.
+    pub fn apply(&mut self, event: SessionEvent) -> Result<SessionState, SessionReduceError> {
+        self.apply_event(event)?;
         Ok(self.state.clone())
+    }
+
+    /// Consume a completed replay and materialize any interrupted outbox
+    /// results exactly once. The bool requests durable recovery materialization.
+    pub fn into_restored_state(mut self) -> (SessionState, bool) {
+        let recovered = self.workspace_execution.finish(&mut self.state.messages);
+        (self.state, recovered)
     }
 
     pub fn apply_all(
         &mut self,
         events: impl IntoIterator<Item = SessionEvent>,
-    ) -> Result<SessionState, SessionReduceError> {
+    ) -> Result<(), SessionReduceError> {
         for event in events {
-            self.apply(event)?;
+            self.apply_event(event)?;
         }
-        Ok(self.state.clone())
+        Ok(())
     }
 
     fn apply_kind(&mut self, kind: SessionEventKind) {
@@ -435,10 +487,13 @@ impl SessionReducer {
                     estimated,
                 };
             }
-            SessionEventKind::WorkspaceExecutionStaged { .. }
-            | SessionEventKind::WorkspaceExecutionSettled { .. } => {}
+            SessionEventKind::WorkspaceExecutionStaged { .. } => {}
+            SessionEventKind::WorkspaceExecutionSettled { operation_id } => {
+                self.workspace_execution.settle(operation_id);
+            }
             SessionEventKind::Checkpoints { refs } => self.state.checkpoint_refs = refs,
             SessionEventKind::Compaction { messages } => {
+                self.workspace_execution.replace_messages(messages.len());
                 self.compatibility.clear_boundary();
                 self.state.messages = messages;
             }
@@ -451,6 +506,12 @@ impl SessionReducer {
                 self.state.goal = None;
                 self.state.goal_drive_evidence.clear();
             }
+            SessionEventKind::TaskRecovery { mut state } => {
+                self.compatibility.clear_boundary();
+                state.migrate();
+                self.state.task_recovery = state;
+            }
+            SessionEventKind::ExtensionBoundary => self.compatibility.clear_boundary(),
             SessionEventKind::Decisions { decisions } => {
                 self.compatibility.clear_boundary();
                 self.state.decisions = normalize_decisions(decisions);
@@ -458,6 +519,7 @@ impl SessionReducer {
             SessionEventKind::Plan { steps } => {
                 self.compatibility.clear_boundary();
                 self.state.plan = steps;
+                clear_completed_plan(&mut self.state.plan);
             }
             SessionEventKind::PlanCleared => {
                 self.compatibility.clear_boundary();
@@ -501,7 +563,16 @@ impl SessionReducer {
             SessionEventKind::TurnOutcome {
                 status,
                 stop_reason,
+                task_recovery,
+                settled_goal,
             } => {
+                if let Some(mut state) = task_recovery {
+                    state.migrate();
+                    self.state.task_recovery = state;
+                }
+                if let Some(goal) = settled_goal {
+                    self.state.goal = Some(*goal);
+                }
                 if status != TurnStatus::Cancelled
                     && !matches!(
                         stop_reason,
@@ -526,12 +597,14 @@ impl SessionReducer {
                 decisions,
                 plan,
             } => {
+                self.workspace_execution.replace_messages(messages.len());
                 self.compatibility
                     .note_state_replacement(&self.state.messages, &messages);
                 self.state.messages = messages;
                 self.state.goal = goal;
                 self.state.decisions = normalize_decisions(decisions);
                 self.state.plan = plan;
+                clear_completed_plan(&mut self.state.plan);
             }
             SessionEventKind::TranscriptBlockOpened { .. }
             | SessionEventKind::TranscriptBlockAppended { .. }
@@ -590,7 +663,12 @@ impl SessionReducer {
             },
             _ => return Ok(false),
         };
-        apply_transcript_mutation(&mut self.state.transcript_blocks, mutation, sequence)?;
+        apply_transcript_mutation(
+            &mut self.state.transcript_blocks,
+            &mut self.transcript_index,
+            mutation,
+            sequence,
+        )?;
         Ok(true)
     }
 }
@@ -602,6 +680,9 @@ pub enum SessionReduceError {
     UnsupportedReducerVersion { found: u32, supported: u32 },
     NonContiguousSequence { expected: u64, found: u64 },
     InvalidRemoteSessionIdentity,
+    WorkspaceExecution(String),
+    TaskRecovery(String),
+    InvalidRecord(String),
     TranscriptBlock(TranscriptBlockTransitionError),
 }
 
@@ -622,6 +703,9 @@ impl fmt::Display for SessionReduceError {
             ),
             Self::InvalidRemoteSessionIdentity => write!(f, "invalid remote session identity"),
             Self::TranscriptBlock(error) => error.fmt(f),
+            Self::WorkspaceExecution(error)
+            | Self::TaskRecovery(error)
+            | Self::InvalidRecord(error) => f.write_str(error),
         }
     }
 }
@@ -637,6 +721,7 @@ impl From<TranscriptBlockTransitionError> for SessionReduceError {
 fn validate_session_id(session_id: &str) -> Result<(), SessionReduceError> {
     if session_id.is_empty()
         || session_id.len() > 128
+        || matches!(session_id, "." | "..")
         || !session_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -646,15 +731,20 @@ fn validate_session_id(session_id: &str) -> Result<(), SessionReduceError> {
     Ok(())
 }
 
+fn clear_completed_plan(plan: &mut Vec<PlanStep>) {
+    if plan.iter().all(|step| step.status == PlanStatus::Done) {
+        plan.clear();
+    }
+}
+
 fn normalize_decisions(decisions: Vec<Decision>) -> Vec<Decision> {
     let mut normalized: Vec<Decision> = Vec::new();
+    let mut indexes = HashMap::new();
     for decision in decisions {
-        if let Some(existing) = normalized
-            .iter_mut()
-            .find(|existing| existing.summary == decision.summary)
-        {
-            *existing = decision;
+        if let Some(index) = indexes.get(&decision.summary).copied() {
+            normalized[index] = decision;
         } else {
+            indexes.insert(decision.summary.clone(), normalized.len());
             normalized.push(decision);
         }
     }
@@ -676,3 +766,7 @@ fn apply_evidence_delta(evidence: &mut BTreeSet<String>, reset: bool, added: Vec
 #[cfg(test)]
 #[path = "session_reducer_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_recovery_tests.rs"]
+mod recovery_tests;

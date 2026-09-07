@@ -1,21 +1,20 @@
-//! Post-turn finalize recap, usage/steer formatting, and text-tool cleanup.
+//! Deterministic turn closeout, outcome classification, and text-tool cleanup.
 
 use std::sync::Arc;
 
-use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode, ToolSpec};
+#[cfg(test)]
+use hi_ai::Message;
+use hi_ai::{Content, ToolMode, ToolSpec};
 
 use crate::heuristics::{
     humanize_count, looks_mutating, parse_text_tool_calls, textcall_id_offset,
 };
-use crate::transcript::{
-    NudgeKind, PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER,
-    repair_invalid_tool_call_arguments_in_messages,
-};
-use crate::{FINALIZE_PROMPT, Ui, partial_text_tool_call_start};
+use crate::transcript::PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER;
+use crate::{Ui, partial_text_tool_call_start};
 
 use super::helpers::rate_limit_summary;
 
-fn text_is_user_visible_answer(text: &str) -> bool {
+pub(super) fn text_is_user_visible_answer(text: &str) -> bool {
     let trimmed = text.trim();
     !trimmed.is_empty()
         && trimmed != PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER
@@ -29,6 +28,7 @@ fn text_is_user_visible_answer(text: &str) -> bool {
         .any(|prefix| trimmed.starts_with(prefix))
 }
 
+#[cfg(test)]
 pub(super) fn turn_has_visible_assistant_text(messages: &[Message], turn_start: usize) -> bool {
     messages
         .get(turn_start..)
@@ -44,131 +44,41 @@ pub(super) fn turn_has_visible_assistant_text(messages: &[Message], turn_start: 
 }
 
 impl crate::Agent {
-    /// Generate and display the user-facing closeout. Returns `true` only when
-    /// the provider supplied non-empty recap text.
-    pub(super) async fn finalize_turn(&mut self, turn_start: usize, ui: &mut dyn Ui) -> bool {
-        // Only send the current turn's messages (plus the system prompt for
-        // context), not the entire session history. The recap only needs to
-        // know what happened *this turn* — sending 40K tokens of old context
-        // to produce a 200-token summary is pure waste.
-        let Some(turn) = self.messages.as_slice().get(turn_start..) else {
-            // Transcript replacement paths should re-anchor `turn_start`, but
-            // finalization is a best-effort side call and must never crash a
-            // completed turn if a future compaction path forgets to do so.
-            return false;
-        };
-        let mut messages = Vec::with_capacity(turn.len() + 2);
-        messages.push(self.minimal_system_message());
-        messages.extend_from_slice(turn);
-        messages.push(Message::user(FINALIZE_PROMPT));
-        repair_invalid_tool_call_arguments_in_messages(&mut messages);
-
-        let model = self.config.routing.model.clone();
-        let request_policy = self.seal_chat_only_auxiliary_request(&model, 2048).await;
-        let request = ChatRequest {
-            model,
-            request_id: None,
-            retry_attempt: 0,
-            user_turn: false,
-            canonical_objective: None,
-            messages: Arc::from(messages),
-            tools: request_policy.tools,
-            tool_envelope: Some(request_policy.envelope),
-            max_tokens: request_policy.max_tokens,
-            temperature: self.config.routing.temperature,
-            top_p: None,
-            frequency_penalty: None,
-            thinking_budget: None,
-            reasoning_effort: None,
-            profile: RequestProfile {
-                compat: self.config.routing.compat,
-                tool_mode: request_policy.tool_mode,
-                stream_usage: None,
-                deepseek_compat: self.config.routing.deepseek_compat,
-                deepseek_strict: None,
-                deepseek_thinking: None,
-                output_token_parameter: self.config.routing.output_token_parameter,
-            },
-        };
-
-        let mut recap = String::new();
-        // Buffer the side-call response until it has passed the same answer
-        // checks as a normal model response. Streaming a canned completion
-        // claim here would briefly show the exact text the main loop rejected.
-        let mut sink = |event: StreamEvent| match event {
-            StreamEvent::Text(text) => recap.push_str(&text),
-            StreamEvent::Status(text) => ui.status(&text),
-            StreamEvent::Warning(text) => ui.top_status(&text),
-            StreamEvent::Reasoning(_) => {}
-            StreamEvent::WireAudit(_) => {}
-            StreamEvent::ToolCallDelta { .. } => {}
-        };
-        let timeout = self.side_call_timeout();
-        let completion =
-            match super::await_side_call(timeout, self.provider.stream(request, &mut sink)).await {
-                Err(timeout) => {
-                    // A recap is optional and the main turn has already settled.
-                    ui.status(&format!(
-                        "(final summary timed out after {:.1}s; turn already completed)",
-                        timeout.as_secs_f64()
-                    ));
-                    return false;
-                }
-                Ok(Ok(completion)) => completion,
-                Ok(Err(err)) => {
-                    // Finalize is a side call — book its error usage without resetting
-                    // the main conversation's `context_used` gauge.
-                    self.add_side_error_usage(&err);
-                    self.emit_usage(ui);
-                    ui.status(&format!("(couldn't generate the final summary: {err})"));
-                    return false;
-                }
-            };
-
-        // Side call: spend counts, but its small request must not clobber the
-        // main conversation's context gauge (see add_side_usage).
-        self.add_side_usage(completion.usage);
-        self.emit_usage(ui);
-
-        // Fall back to the final content if the provider didn't stream text.
-        if recap.trim().is_empty() {
-            for c in &completion.content {
-                if let Content::Text(t) = c {
-                    recap.push_str(t);
-                }
-            }
-        }
-        if !text_is_user_visible_answer(&recap) {
-            if !recap.trim().is_empty() {
-                ui.status("(final summary was unusable; using a deterministic closeout)");
-            }
-            return false;
-        }
-
-        ui.assistant_text(&recap);
-        ui.assistant_end();
-        // Record both the synthetic request and the recap so roles alternate.
-        // The recap is a text-only assistant message (no tool calls).
-        self.messages
-            .push_nudge(NudgeKind::Finalize, FINALIZE_PROMPT);
-        self.messages.push_assistant(vec![Content::Text(recap)]);
-        true
-    }
-
-    /// Always leave a settled turn with a concrete terminal message, even when
-    /// the model-side recap timed out or returned another canned placeholder.
+    /// Always leave a settled turn with a concrete terminal message when the
+    /// model did not supply an accepted final answer.
     /// This path makes no completion claim that verification cannot support.
     pub(super) fn emit_deterministic_closeout(&mut self, ui: &mut dyn Ui) {
-        let closeout = if self.report.verify.failed() {
-            "I stopped after the latest verification failed. I left the current changes in place for inspection instead of repeating the same repair; the failing check is shown above."
+        let closeout = if self.task_recovery.exhausted
+            || self
+                .report
+                .last_turn_outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.stop_reason == crate::TurnStopReason::NoProgress)
+        {
+            if self.report.verify.passed() {
+                "Automatic recovery stopped. Final verification passed for the retained workspace, but the overall request was not confirmed complete."
+            } else if self.report.verify.failed() {
+                "Automatic recovery stopped. Current edits are retained; verification failed for the current workspace."
+            } else {
+                "Automatic recovery stopped. Current edits are retained; the current workspace remains unverified."
+            }
+        } else if self.report.verify.failed() {
+            "The turn stopped with verification failures. Current edits and the failing diagnostics are retained."
         } else if self.report.verify.passed() {
-            "The code changes are in place and verification passed. The model did not produce a usable summary, so I closed the turn with this verified status instead of leaving it running."
+            "Verification passed for the recorded workspace revision. The turn is closed; the changed files and checks are shown above."
         } else if !self.workspace.last_changed_files.is_empty() {
-            "I stopped before the current changes could be verified. I left them in place for inspection instead of continuing without evidence."
+            "The turn is closed with retained changes. Verification did not establish a passing result for the current workspace."
         } else {
-            "I could not complete this request after repeated attempts made no progress. I stopped instead of continuing to repeat the same steps; the last diagnostic is shown above."
+            "The turn is closed. No accepted final answer was produced; available results and diagnostics are shown above."
         };
-        ui.assistant_text(closeout);
+        let closeout = match self
+            .task_recovery
+            .unresolved_validation_summary(&self.runtime.ledger().workspace_revision())
+        {
+            Some(summary) => format!("{closeout}\n{summary}"),
+            None => closeout.to_owned(),
+        };
+        ui.assistant_text(&closeout);
         ui.assistant_end();
 
         // Persist the terminal answer too. When the last assistant entry is a
@@ -194,6 +104,7 @@ impl crate::Agent {
             self.messages
                 .push_assistant(vec![Content::Text(closeout.to_string())]);
         }
+        self.messages.repair_consecutive_assistant_messages();
     }
 
     /// Format the completed-turn usage marker with explicitly scoped metrics.
@@ -371,7 +282,7 @@ impl crate::Agent {
 pub(super) fn classify_turn_outcome(
     verification_infrastructure_error: bool,
     verification_unstable: bool,
-    last_verify: Option<bool>,
+    verify: &crate::domain::VerifyEvidence,
     changed_files: &[String],
     turn_had_mutation: bool,
     no_applicable_check: bool,
@@ -404,9 +315,11 @@ pub(super) fn classify_turn_outcome(
     // nudge and transcript, not by reclassifying the turn.
     let verification = if verification_infrastructure_error {
         VerificationStatus::InfrastructureError
-    } else if last_verify == Some(true) {
+    } else if verification_unstable || verify.invalidated() {
+        VerificationStatus::Unverified
+    } else if verify.passed() {
         VerificationStatus::Passed
-    } else if last_verify == Some(false) {
+    } else if verify.failed() {
         VerificationStatus::Failed
     } else if (changed_files.is_empty() && !turn_had_mutation)
         || no_applicable_check
@@ -440,6 +353,8 @@ pub(super) fn classify_turn_outcome(
     // cap is a failure unless the caller deliberately excludes an accepted
     // read-only wrap-up from `ended_at_cap`.
     let status = if verification_infrastructure_error
+        || verification_unstable
+        || verify.invalidated()
         || verification == VerificationStatus::Failed
         || objection_overrides
         || (verification == VerificationStatus::Unverified && !allow_unverified)
@@ -481,6 +396,7 @@ pub(super) fn classify_turn_outcome(
 #[cfg(test)]
 mod classify_tests {
     use super::{classify_turn_outcome, turn_has_visible_assistant_text};
+    use crate::domain::VerifyEvidence;
     use crate::{ReviewStatus, TurnStatus, TurnStopReason, VerificationStatus};
     use hi_ai::{Content, Message};
 
@@ -510,11 +426,36 @@ mod classify_tests {
     }
 
     #[test]
+    fn invalidated_pass_cannot_complete_even_prose_with_unverified_override() {
+        for allow_unverified in [false, true] {
+            let (status, verification, _, stop) = classify_turn_outcome(
+                false,
+                false,
+                &VerifyEvidence::Invalidated {
+                    revision: 1,
+                    digest: "checked".into(),
+                },
+                &["README.md".into()],
+                true,
+                true,
+                ReviewStatus::NotRequired,
+                None,
+                false,
+                false,
+                allow_unverified,
+            );
+            assert_eq!(status, TurnStatus::Failed);
+            assert_eq!(verification, VerificationStatus::Unverified);
+            assert_eq!(stop, TurnStopReason::VerificationUnavailable);
+        }
+    }
+
+    #[test]
     fn completed_when_verify_passed() {
         let (status, verification, review, stop) = classify_turn_outcome(
             false,
             false,
-            Some(true),
+            &VerifyEvidence::pass(1, "checked".into()),
             &["src/lib.rs".into()],
             true,
             false,
@@ -537,7 +478,7 @@ mod classify_tests {
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
-            None,
+            &VerifyEvidence::None,
             &[],
             false,
             true,
@@ -557,7 +498,7 @@ mod classify_tests {
         let (status, _, _, stop) = classify_turn_outcome(
             false,
             false,
-            None,
+            &VerifyEvidence::None,
             &[],
             false,
             true,
@@ -576,7 +517,7 @@ mod classify_tests {
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
-            None,
+            &VerifyEvidence::None,
             &["src/lib.rs".into()],
             true,
             false,
@@ -596,7 +537,7 @@ mod classify_tests {
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
-            None,
+            &VerifyEvidence::None,
             &["README.md".into()],
             true,
             true,
@@ -617,7 +558,7 @@ mod classify_tests {
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
-            None,
+            &VerifyEvidence::None,
             &["src/lib.rs".into()],
             true,
             true, // no_applicable_check
@@ -641,7 +582,7 @@ mod classify_tests {
         let (status, verification, review, stop) = classify_turn_outcome(
             false,
             false,
-            Some(true),
+            &VerifyEvidence::pass(1, "checked".into()),
             &["src/lib.rs".into()],
             true,
             false,
@@ -664,7 +605,7 @@ mod classify_tests {
         let (status, verification, review, stop) = classify_turn_outcome(
             false,
             false,
-            Some(true),
+            &VerifyEvidence::pass(1, "checked".into()),
             &["src/lib.rs".into()],
             true,
             false,
@@ -685,7 +626,7 @@ mod classify_tests {
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
-            Some(true),
+            &VerifyEvidence::pass(1, "checked".into()),
             &[],
             true,
             false,
@@ -705,7 +646,7 @@ mod classify_tests {
         let (status, _, review, stop) = classify_turn_outcome(
             false,
             false,
-            Some(true),
+            &VerifyEvidence::pass(1, "checked".into()),
             &["src/lib.rs".into()],
             true,
             false,
@@ -727,7 +668,7 @@ mod classify_tests {
         let (status, _, review, stop) = classify_turn_outcome(
             false,
             false,
-            Some(true),
+            &VerifyEvidence::pass(1, "checked".into()),
             &["src/lib.rs".into()],
             true,
             false,
@@ -752,7 +693,7 @@ mod classify_tests {
         let (status, _, review, stop) = classify_turn_outcome(
             false,
             false,
-            Some(true),
+            &VerifyEvidence::pass(1, "checked".into()),
             &["src/lib.rs".into()],
             true,
             false,
@@ -775,7 +716,7 @@ mod classify_tests {
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
-            Some(true),
+            &VerifyEvidence::pass(1, "checked".into()),
             &["src/lib.rs".into()],
             true,
             false,
@@ -797,7 +738,7 @@ mod classify_tests {
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
-            None,
+            &VerifyEvidence::None,
             &["src/lib.rs".into()],
             true,
             false,
@@ -817,7 +758,7 @@ mod classify_tests {
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
-            None,
+            &VerifyEvidence::None,
             &["src/lib.rs".into()],
             true,
             false,
@@ -837,7 +778,7 @@ mod classify_tests {
         let (status, verification, _, stop) = classify_turn_outcome(
             false,
             false,
-            Some(true),
+            &VerifyEvidence::pass(1, "checked".into()),
             &["src/lib.rs".into()],
             true,
             false,
@@ -859,7 +800,7 @@ mod classify_tests {
         let (status, _, review, stop) = classify_turn_outcome(
             false,
             false,
-            None,
+            &VerifyEvidence::None,
             &["src/lib.rs".into()],
             true,
             false,
@@ -881,7 +822,7 @@ mod classify_tests {
         let (status, _, review, stop) = classify_turn_outcome(
             false,
             false,
-            None,
+            &VerifyEvidence::None,
             &["README.md".into()],
             true,
             true, // no_applicable_check → NotApplicable

@@ -322,31 +322,6 @@ impl acp::Agent for HiShell {
             .run_turn_cancellable(&input, &mut ui, cancellation)
             .await;
         session.active_turn.lock().await.take();
-        let cancellation_already_finalized = result.is_err()
-            && agent
-                .last_turn_outcome()
-                .is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Cancelled);
-        let failed_outcome = if let Err(error) = &result
-            && !cancellation_already_finalized
-        {
-            // `run_turn_cancellable` only performs the turn-scoped background
-            // kill for ordinary errors before returning; reconcile and
-            // finalize those here before persisting the session snapshot. A
-            // configured hard timeout already ran Agent-owned Cancel cleanup
-            // and intentionally returns its deadline as an Err.
-            match agent
-                .cleanup_turn(hi_agent::TurnCleanupKind::for_error(error))
-                .await
-            {
-                Ok(cleanup) => Some(cleanup.outcome),
-                Err(_) => {
-                    let _ = agent.finalize_failed_turn_snapshot_only();
-                    None
-                }
-            }
-        } else {
-            None
-        };
         self.store_snapshot(
             args.session_id.clone(),
             StoredSession {
@@ -367,14 +342,14 @@ impl acp::Agent for HiShell {
                 Ok(acp::PromptResponse::new(stop_reason(&outcome)))
             }
             Err(error) => {
-                if let Some(outcome) = failed_outcome
-                    && outcome.stop_reason.is_workspace_admission()
+                if let Some(failure) = hi_agent::TurnFailure::from_error(&error)
+                    && failure.outcome.stop_reason.is_workspace_admission()
                 {
-                    if let Some(status) = stop_status(&outcome) {
+                    if let Some(status) = stop_status(&failure.outcome) {
                         ui.status(status);
                     }
                     ui.flush().await?;
-                    return Ok(acp::PromptResponse::new(stop_reason(&outcome)));
+                    return Ok(acp::PromptResponse::new(stop_reason(&failure.outcome)));
                 }
                 let delivery = ui.flush().await;
                 eprintln!("hi-shell: agent turn failed: {error:#}");

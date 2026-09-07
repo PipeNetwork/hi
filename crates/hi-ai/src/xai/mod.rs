@@ -39,7 +39,7 @@ impl XaiProvider {
     /// refresh-and-retry instead of failing the turn.
     pub fn with_token_source(base_url: String, auth: Arc<dyn TokenSource>) -> Self {
         Self {
-            http: crate::http::agent_http_client_xai(),
+            http: crate::http::inference_http_client_for_socket(None),
             base_url: base_url.trim_end_matches('/').to_string(),
             auth,
         }
@@ -57,130 +57,158 @@ impl Provider for XaiProvider {
         request: ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
-        let body = request::build_body(&request);
-        let url = format!("{}/responses", self.base_url);
-        let correlation_id = canonical_request_id(request.request_id.as_deref());
-        let idempotency_key = request_idempotency_key(&correlation_id, &body);
-        let mut auth_refreshed = false;
-
-        loop {
-            let token = self.auth.token().await;
-            let response = match crate::http::send_with_retry(
-                self.http
-                    .post(&url)
-                    .bearer_auth(&token)
-                    .header("x-request-id", &correlation_id)
-                    .header("x-request-attempt", request.retry_attempt.to_string())
-                    .header("idempotency-key", &idempotency_key)
-                    .json(&body),
-            )
-            .await
+        let execution = request.execution.clone();
+        let progress = execution.progress();
+        let mut physical_attempt = None;
+        let estimated_input =
+            crate::types::estimate_request_input_tokens(&request.messages, &request.tools);
+        let mut observed_sink = |event| {
+            if let StreamEvent::ProviderAttempt(attempt) = &event
+                && matches!(attempt.state, crate::ProviderAttemptState::Started { .. })
             {
-                Ok(response) => response,
-                Err(error) => {
+                physical_attempt = Some(attempt.physical_attempt);
+            }
+            progress.observe(&event);
+            sink(event);
+        };
+        let sink: &mut (dyn FnMut(StreamEvent) + Send) = &mut observed_sink;
+        progress
+            .watch(async {
+                let body = request::build_body(&request);
+                let url = format!("{}/responses", self.base_url);
+                let correlation_id = canonical_request_id(request.request_id.as_deref());
+                let idempotency_key = request_idempotency_key(&correlation_id, &body);
+                let mut auth_refreshed = false;
+
+                loop {
+                    let token = self.auth.token().await;
+                    let response = match request
+                        .execution
+                        .dispatch(
+                            self.http
+                                .post(&url)
+                                .bearer_auth(&token)
+                                .header("x-request-id", &correlation_id)
+                                .header("x-request-attempt", request.retry_attempt.to_string())
+                                .header("idempotency-key", &idempotency_key)
+                                .json(&body),
+                            "xai",
+                            &request.model,
+                            sink,
+                        )
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            sink(StreamEvent::WireAudit(Box::new(request::wire_audit(
+                                &request,
+                                &self.base_url,
+                                &body,
+                                false,
+                                None,
+                            ))));
+                            return Err(error.into());
+                        }
+                    };
+
+                    if response.status().is_success() {
+                        sink(StreamEvent::WireAudit(Box::new(request::wire_audit(
+                            &request,
+                            &self.base_url,
+                            &body,
+                            true,
+                            Some(response.status().as_u16()),
+                        ))));
+                        let rate_limits = rate_limits_from_headers(response.headers());
+                        // The optional byte-idle guard supplements the decoded
+                        // model-progress deadline around this whole request.
+                        let stream = crate::http::idle_guard(
+                            crate::http::debug_tap(response.bytes_stream()),
+                            crate::http::xai_stream_idle_window(),
+                        )
+                        .eventsource()
+                        .map(|res| {
+                            res.map_err(|err| anyhow::anyhow!(err))
+                                .context("error reading stream")
+                        });
+                        let estimated_input_tokens =
+                            estimate_request_input_tokens(&request.messages, &request.tools);
+                        let mut completion = stream::collect_completion(Box::pin(stream), sink)
+                            .await
+                            .map_err(|err| {
+                                stream::classify_stream_error(err).with_usage(Usage {
+                                    input_tokens: estimated_input_tokens,
+                                    output_tokens: 0,
+                                    cache_read_tokens: 0,
+                                    cache_creation_tokens: 0,
+                                    input_includes_cache: true,
+                                    context_occupancy: estimated_input_tokens,
+                                    rate_limits,
+                                    estimated: true,
+                                })
+                            })?;
+                        stream::backfill_missing_usage(&mut completion, &request);
+                        completion.usage.rate_limits = completion.usage.rate_limits.or(rate_limits);
+                        if completion.content.is_empty()
+                            && completion.refusal.is_none()
+                            && completion.stop_reason.as_deref() != Some("refusal")
+                        {
+                            return Err(ProviderError::new(
+                                ProviderErrorKind::EmptyCompletion,
+                                "model returned an empty completion",
+                            )
+                            .with_usage(completion.usage)
+                            .into());
+                        }
+                        return Ok(completion);
+                    }
+
+                    let status = response.status();
                     sink(StreamEvent::WireAudit(Box::new(request::wire_audit(
                         &request,
                         &self.base_url,
                         &body,
                         false,
-                        None,
+                        Some(status.as_u16()),
                     ))));
-                    return Err(ProviderError::new(
-                        ProviderErrorKind::Outage,
-                        format!("request to xAI Responses endpoint failed: {error}"),
-                    )
-                    .with_api_contract(None, Some(true), None)
-                    .into());
+                    let retry_after = retry_after_header_seconds(&response);
+                    let rate_limits = rate_limits_from_headers(response.headers());
+                    let text = response.text().await.unwrap_or_default();
+                    let kind = request::classify_http_error(status, &text);
+                    if crate::openai::explicit_retryable(&text) != Some(false)
+                        && kind == ProviderErrorKind::Auth
+                        && !crate::is_billing_or_quota_text(&text)
+                        && !auth_refreshed
+                        && self.auth.refresh().await
+                    {
+                        auth_refreshed = true;
+                        sink(StreamEvent::Status(
+                            "credential expired; refreshed it — retrying".to_string(),
+                        ));
+                        continue;
+                    }
+                    let mut error = request::provider_error_from_http(status, &text);
+                    if error.retry_after_seconds.is_none() {
+                        error.retry_after_seconds = retry_after;
+                    }
+                    if let Some(rate_limits) = rate_limits {
+                        error = error.with_usage(Usage {
+                            rate_limits: Some(rate_limits),
+                            ..Default::default()
+                        });
+                    }
+                    return Err(error.into());
                 }
-            };
-
-            if response.status().is_success() {
-                sink(StreamEvent::WireAudit(Box::new(request::wire_audit(
-                    &request,
-                    &self.base_url,
-                    &body,
-                    true,
-                    Some(response.status().as_u16()),
-                ))));
-                let rate_limits = rate_limits_from_headers(response.headers());
-                // Long reasoning silence is unlimited by default; the guard
-                // activates only when the operator configured an idle window.
-                let stream = crate::http::idle_guard(
-                    crate::http::debug_tap(response.bytes_stream()),
-                    crate::http::xai_stream_idle_window(),
+            })
+            .await
+            .map_err(|error| {
+                execution.record_provider_failure(physical_attempt, &error);
+                crate::request_execution::include_stalled_usage(
+                    error,
+                    estimated_input,
+                    crate::Usage::default(),
                 )
-                .eventsource()
-                .map(|res| {
-                    res.map_err(|err| anyhow::anyhow!(err))
-                        .context("error reading stream")
-                });
-                let estimated_input_tokens =
-                    estimate_request_input_tokens(&request.messages, &request.tools);
-                let mut completion = stream::collect_completion(Box::pin(stream), sink)
-                    .await
-                    .map_err(|err| {
-                        stream::classify_stream_error(err).with_usage(Usage {
-                            input_tokens: estimated_input_tokens,
-                            output_tokens: 0,
-                            cache_read_tokens: 0,
-                            cache_creation_tokens: 0,
-                            input_includes_cache: true,
-                            context_occupancy: estimated_input_tokens,
-                            rate_limits,
-                            estimated: true,
-                        })
-                    })?;
-                stream::backfill_missing_usage(&mut completion, &request);
-                completion.usage.rate_limits = completion.usage.rate_limits.or(rate_limits);
-                if completion.content.is_empty()
-                    && completion.refusal.is_none()
-                    && completion.stop_reason.as_deref() != Some("refusal")
-                {
-                    return Err(ProviderError::new(
-                        ProviderErrorKind::EmptyCompletion,
-                        "model returned an empty completion",
-                    )
-                    .with_usage(completion.usage)
-                    .into());
-                }
-                return Ok(completion);
-            }
-
-            let status = response.status();
-            sink(StreamEvent::WireAudit(Box::new(request::wire_audit(
-                &request,
-                &self.base_url,
-                &body,
-                false,
-                Some(status.as_u16()),
-            ))));
-            let retry_after = retry_after_header_seconds(&response);
-            let rate_limits = rate_limits_from_headers(response.headers());
-            let text = response.text().await.unwrap_or_default();
-            let kind = request::classify_http_error(status, &text);
-            if kind == ProviderErrorKind::Auth
-                && !crate::is_billing_or_quota_text(&text)
-                && !auth_refreshed
-                && self.auth.refresh().await
-            {
-                auth_refreshed = true;
-                sink(StreamEvent::Status(
-                    "credential expired; refreshed it — retrying".to_string(),
-                ));
-                continue;
-            }
-            let mut error = request::provider_error_from_http(status, &text);
-            if error.retry_after_seconds.is_none() {
-                error.retry_after_seconds = retry_after;
-            }
-            if let Some(rate_limits) = rate_limits {
-                error = error.with_usage(Usage {
-                    rate_limits: Some(rate_limits),
-                    ..Default::default()
-                });
-            }
-            return Err(error.into());
-        }
+            })
     }
 
     async fn list_models(&self) -> Result<Vec<crate::provider::ServedModel>> {
@@ -306,6 +334,7 @@ mod tests {
             model: "grok-4.6".into(),
             request_id: Some("req_test".into()),
             retry_attempt: 0,
+            execution: Default::default(),
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),

@@ -132,7 +132,6 @@ fn transcript_kind(entry: &TranscriptEntry) -> &'static str {
     match entry {
         TranscriptEntry::Line(_) => "line",
         TranscriptEntry::UserPrompt { .. } => "user_prompt",
-        TranscriptEntry::Assistant(_) => "assistant",
         TranscriptEntry::AssistantMessage { .. } => "assistant_message",
         TranscriptEntry::Reasoning { .. } => "reasoning",
         TranscriptEntry::Btw { .. } => "btw",

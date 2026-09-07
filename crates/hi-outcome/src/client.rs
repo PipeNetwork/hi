@@ -35,6 +35,7 @@ impl OutcomeClient {
         }
         validate_credential_origin(&origin)?;
         let http = Client::builder()
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(90))
             .build()
@@ -71,6 +72,12 @@ impl OutcomeClient {
             .send()
             .await
             .map_err(|error| OutcomeError::hard(error.to_string()))?;
+        Self::decode_response(response).await
+    }
+
+    pub async fn decode_response<T: DeserializeOwned>(
+        response: reqwest::Response,
+    ) -> Result<T, OutcomeError> {
         let status = response.status();
         let bytes = response
             .bytes()
@@ -139,9 +146,13 @@ impl OutcomeClient {
         .await
     }
 
+    /// Build the exact submission so a caller can apply shared dispatch accounting.
+    pub fn task_submission(&self, request: &TaskCreateRequest) -> RequestBuilder {
+        self.mutating(Method::POST, TASKS_PATH).json(request)
+    }
+
     pub async fn create_task(&self, request: &TaskCreateRequest) -> Result<TaskView, OutcomeError> {
-        self.send_json(self.mutating(Method::POST, TASKS_PATH).json(request))
-            .await
+        self.send_json(self.task_submission(request)).await
     }
 
     pub async fn get_task(&self, task_id: &str) -> Result<TaskView, OutcomeError> {

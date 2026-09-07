@@ -27,25 +27,13 @@ id = "empty-keep-working-primary"
 kind = "raw_sse"
 body = "data: [DONE]\n\n"
 
-[[provider.steps]]
-id = "empty-keep-working-retry-1"
-[provider.steps.response]
-kind = "raw_sse"
-body = "data: [DONE]\n\n"
-
-[[provider.steps]]
-id = "empty-keep-working-retry-2"
-[provider.steps.response]
-kind = "raw_sse"
-body = "data: [DONE]\n\n"
-
 [[actions]]
 kind = "send_line"
 text = "Reply with a short acknowledgement without using tools."
 
 [[actions]]
 kind = "wait_provider_request"
-count = 6
+count = 4
 timeout_ms = 15000
 
 [[actions]]
@@ -66,7 +54,7 @@ kind = "quit"
 kind = "records"
 source = "provider_requests"
 equals = { "/method" = "POST" }
-exact = 6
+exact = 4
 
 [[assertions]]
 kind = "records"
@@ -77,7 +65,7 @@ exact = 1
 [[assertions]]
 kind = "records"
 source = "events"
-equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/stop_reason" = "infrastructure_failure", "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "infrastructure" }
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/stop_reason" = "infrastructure_failure", "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "no_progress" }
 exact = 1
 
 [[assertions]]

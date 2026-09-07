@@ -287,7 +287,7 @@ async fn typed_settlement_controls_consumed_steering_even_when_cancel_key_races(
             assert_eq!(result.cancelled, frontend_cancelled);
             assert_eq!(
                 app.queue.front().map(String::as_str),
-                (status == hi_agent::TurnStatus::Cancelled).then_some("preserve the public API"),
+                (status != hi_agent::TurnStatus::Completed).then_some("preserve the public API"),
                 "status={status:?}, frontend_cancelled={frontend_cancelled}"
             );
             assert!(app.mid_turn_offered.is_empty());
@@ -333,46 +333,6 @@ async fn closed_terminal_input_is_reported_instead_of_silently_exiting() {
 }
 
 #[test]
-fn late_cancel_preserves_committed_turn() {
-    assert_eq!(
-        settle_turn_cancellation(true, true, Some(hi_agent::TurnStatus::Completed)),
-        TurnCancellationSettlement {
-            cancelled: false,
-            agent_already_cleaned: false,
-        }
-    );
-}
-
-#[test]
-fn typed_cancel_skips_frontend_cleanup_but_missing_result_needs_it() {
-    assert_eq!(
-        settle_turn_cancellation(true, true, Some(hi_agent::TurnStatus::Cancelled)),
-        TurnCancellationSettlement {
-            cancelled: true,
-            agent_already_cleaned: true,
-        }
-    );
-    assert_eq!(
-        settle_turn_cancellation(true, true, None),
-        TurnCancellationSettlement {
-            cancelled: true,
-            agent_already_cleaned: false,
-        }
-    );
-}
-
-#[test]
-fn timeout_returning_the_body_error_keeps_failure_semantics() {
-    assert_eq!(
-        settle_turn_cancellation(false, true, None),
-        TurnCancellationSettlement {
-            cancelled: false,
-            agent_already_cleaned: false,
-        }
-    );
-}
-
-#[test]
 fn trio_reviews_only_completed_turns() {
     assert_eq!(
         trio_non_reviewable_status(hi_agent::TurnStatus::Completed),
@@ -406,4 +366,81 @@ fn trio_explicit_round_cap_still_settles_at_the_boundary() {
     assert!(trio_round_cap_reached(3, Some(3)));
     assert!(trio_round_cap_reached(4, Some(3)));
     assert_eq!(trio_round_label(2, Some(3)), "2/3");
+}
+
+#[tokio::test]
+async fn drawing_failure_still_polls_cleanup_and_keeps_its_receipt() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct BrokenWriter(Arc<AtomicUsize>);
+    impl std::io::Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("display disconnected"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut terminal = Terminal::with_options(
+        ratatui::backend::CrosstermBackend::new(BrokenWriter(writes.clone())),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+        },
+    )
+    .unwrap();
+    let (_input_tx, mut input_rx) = mpsc::unbounded_channel();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut app = crate::tests::test_app("openai", "test");
+    let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+    let (_confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+    let cancellation = hi_agent::TurnCancellation::new();
+    let future_cancel = cancellation.clone();
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let future_cleaned = cleaned.clone();
+    let future = async move {
+        assert!(future_cancel.is_cancelled());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        future_cleaned.store(true, Ordering::SeqCst);
+        let outcome = hi_agent::TurnOutcome::infrastructure_failure("test", None, vec![]);
+        let mut failure = hi_agent::TurnFailure::new(anyhow::anyhow!("turn interrupted"), outcome);
+        failure
+            .cleanup_diagnostics
+            .push("settlement remains owned".into());
+        failure.settlement_pending = true;
+        Err::<hi_agent::TurnOutcome, _>(failure.into())
+    };
+    let error = drive(
+        &mut terminal,
+        &mut input_rx,
+        &mut ticker,
+        &mut app,
+        ui_rx,
+        confirm_rx,
+        future,
+        true,
+        None,
+        None,
+        ui_tx,
+        Some(cancellation),
+        Arc::new(hi_tools::BackgroundTaskRegistry::new()),
+    )
+    .await
+    .err()
+    .unwrap();
+    let receipt = error.downcast_ref::<hi_agent::TurnFailure>().unwrap();
+    assert!(cleaned.load(Ordering::SeqCst));
+    assert!(
+        receipt
+            .original
+            .to_string()
+            .contains("display disconnected")
+    );
+    assert!(receipt.settlement_pending);
+    assert_eq!(receipt.cleanup_diagnostics, ["settlement remains owned"]);
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        1,
+        "cleanup must not redraw a failed surface"
+    );
 }

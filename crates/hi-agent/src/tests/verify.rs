@@ -84,48 +84,6 @@ async fn layered_verify_passes_when_all_stages_pass() {
 }
 
 #[tokio::test]
-async fn green_turn_records_coding_facts_into_decisions() {
-    let workspace = IsolatedWorkspace::new("coding-facts");
-    let mut cfg = workspace.config();
-    cfg.gates.verification =
-        crate::VerificationMode::Explicit(vec![VerifyStage::new("check", "true")]);
-    let tmp = workspace.path("src/lib.rs");
-    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
-    let p = tmp.to_string_lossy().to_string();
-    let mut agent = agent(
-        vec![
-            write_completion(&p),
-            completion(vec![Content::Text("done".into())], 1, 1),
-        ],
-        cfg,
-    );
-    let mut ui = RecUi::default();
-    agent
-        .run_turn("fix the helper and keep tests green", &mut ui)
-        .await
-        .unwrap();
-    assert_eq!(agent.last_verify(), Some(true));
-    assert!(
-        !agent.decisions().is_empty(),
-        "expected auto coding facts in decision log"
-    );
-    assert!(
-        agent
-            .decisions()
-            .entries()
-            .iter()
-            .any(|d| d.summary.starts_with("verify:") || d.summary.starts_with("stack:")),
-        "facts: {:?}",
-        agent.decisions().entries()
-    );
-    assert!(
-        ui.statuses.iter().any(|s| s.contains("coding memory")),
-        "status: {:?}",
-        ui.statuses
-    );
-}
-
-#[tokio::test]
 async fn verify_failure_exhausts_retries() {
     let workspace = IsolatedWorkspace::new("verify-exhaust");
     let mut cfg = workspace.config();
@@ -147,7 +105,7 @@ async fn verify_failure_exhausts_retries() {
     assert_eq!(agent.last_verify(), Some(false));
     assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
     assert_eq!(outcome.status, TurnStatus::Failed);
-    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationFailed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
 }
 
 #[tokio::test]
@@ -181,7 +139,7 @@ async fn default_verification_repairs_continue_past_two_productive_cycles() {
 
     assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(agent.last_verify(), Some(true));
-    assert_eq!(agent.last_turn_telemetry().verify_rounds, 4);
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 5);
     assert_eq!(
         std::fs::read_to_string(workspace.path("changed.rs")).unwrap(),
         "3\n"

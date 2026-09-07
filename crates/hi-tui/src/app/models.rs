@@ -16,7 +16,14 @@ impl crate::App {
 
     /// Apply `id` as the model: prefer live endpoint metadata (window/price) when
     /// we have it. Updates the agent and the gauge.
-    pub(crate) fn apply_model(&mut self, agent: &mut Agent, id: &str) {
+    pub(crate) fn apply_model(&mut self, agent: &mut Agent, id: &str) -> bool {
+        if let Err(error) = agent.ensure_session_reusable() {
+            self.push(Line::styled(
+                format!("model unchanged: {error:#}"),
+                Style::default().fg(crate::theme::theme().warning),
+            ));
+            return false;
+        }
         let served = self.served.get(id);
         let window = served.and_then(|m| m.context_window);
         let price = served.and_then(|m| m.price);
@@ -29,6 +36,7 @@ impl crate::App {
         self.usage_pricing = price;
         self.model = id.to_string();
         self.context_window = window;
+        true
     }
 
     /// `$1.23` status-bar chip when the active model publishes a price.
@@ -86,7 +94,9 @@ impl crate::App {
 
     /// Apply an explicit user model selection and save it to the active profile.
     pub(crate) fn select_model(&mut self, agent: &mut Agent, id: &str) {
-        self.apply_model(agent, id);
+        if !self.apply_model(agent, id) {
+            return;
+        }
         match self.persist_active_profile_model(id) {
             Ok(Some(name)) => self.push(Line::styled(
                 format!("model set to {id} (saved to profile {name})"),

@@ -202,6 +202,42 @@ pub(crate) fn build_backend(settings: &Settings) -> Backend {
     }
 }
 
+/// The complete routing snapshot shared by startup and every frontend switch.
+pub(crate) fn resolved_agent_routing(
+    settings: &Settings,
+    context_window: Option<u32>,
+    max_tokens: u32,
+    temperature: Option<f32>,
+) -> hi_agent::AgentRouting {
+    let route = agent_provider_route(settings);
+    hi_agent::AgentRouting {
+        model: settings.model.clone(),
+        provider_route: Some(route.label),
+        capability_route: Some(route.capability_identity),
+        requested_max_tokens: settings.max_tokens,
+        max_tokens,
+        max_tokens_explicit: settings.max_tokens_explicit,
+        temperature,
+        top_p: settings.top_p,
+        output_token_parameter: settings.output_token_parameter,
+        thinking_budget: settings.thinking_budget,
+        reasoning_effort: settings.reasoning_effort,
+        tool_mode: settings.tool_mode,
+        compat: settings.compat,
+        deepseek_compat: settings.deepseek_compat,
+        context_window,
+    }
+}
+
+pub(crate) fn switched_routing(settings: &Settings) -> hi_agent::AgentRouting {
+    resolved_agent_routing(
+        settings,
+        None,
+        effective_max_tokens_for_model(settings, None),
+        None,
+    )
+}
+
 /// The primary backend, plus any fallbacks, as a single rate-bounded [`Provider`].
 pub(crate) fn build_chain(primary: &Settings, fallbacks: Vec<Settings>) -> Box<dyn Provider> {
     let passthrough: Box<dyn Provider> = if fallbacks.is_empty() {

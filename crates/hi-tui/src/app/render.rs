@@ -164,6 +164,11 @@ impl crate::App {
                 _ => "Working",
             }
         };
+        if self.current_tool.is_none()
+            && let Some(activity) = self.provider_activity.label()
+        {
+            return format!("{verb}… {} · {activity}", fmt_elapsed(secs));
+        }
         format!("{verb}… {}", fmt_elapsed(secs))
     }
 

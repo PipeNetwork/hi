@@ -365,40 +365,8 @@ fn profile_for_route(
     }
 }
 
-/// The fallback chain (excluding the primary) — `--fallback` flags first, then
-/// the selected profile's `fallback` list, deduped. Profiles that don't resolve
-/// (missing key/model) are skipped with a warning rather than blocking startup.
-pub fn resolve_fallbacks(cli: &Cli, config: &Config) -> Vec<Settings> {
-    let primary_name = cli.profile.as_ref().or(config.default_profile.as_ref());
-    let primary_route_profile = profile_for_route(
-        primary_name.and_then(|name| config.profiles.get(name)),
-        cli.provider,
-    );
-
-    let mut names: Vec<String> = cli.fallback.clone();
-    if let Some(list) = primary_route_profile.and_then(|profile| profile.fallback.as_ref()) {
-        names.extend(list.iter().cloned());
-    }
-
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Some(name) = primary_name {
-        seen.insert(name.clone()); // don't fall back to the primary itself
-    }
-
-    let mut out = Vec::new();
-    for name in names {
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        match resolve_named_profile(config, &name) {
-            Ok(settings) => out.push(settings),
-            Err(err) => {
-                eprintln!("\x1b[33mwarning: skipping fallback profile '{name}': {err}\x1b[0m")
-            }
-        }
-    }
-    out
-}
+mod fallbacks;
+pub use fallbacks::{resolve_fallbacks, resolve_profile_fallbacks};
 
 /// Resolve a named profile into [`Settings`] from its own fields + environment
 /// (no CLI overrides — those belong to the primary). Used both for fallback

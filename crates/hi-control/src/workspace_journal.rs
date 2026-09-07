@@ -18,6 +18,9 @@ use crate::{
     WorkspaceRecoveryStatus,
 };
 
+#[path = "workspace_journal_job.rs"]
+mod job;
+
 #[path = "workspace_journal_operation.rs"]
 mod operation;
 use operation::{OperationJournalFence, apply_overlays, overlay_barrier};
@@ -232,6 +235,16 @@ impl JournaledWorkspaceController {
         self.publish_status();
     }
 
+    async fn journal_work<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(Self) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let controller = self.clone();
+        self.journal
+            .run_when_available(move |_| work(controller))
+            .await
+    }
+
     fn journal_fence_denial(&self) -> Option<&'static str> {
         if lock(&self.operation_journal_fence).is_some() {
             return Some("workspace operation publication requires journal settlement");
@@ -292,6 +305,14 @@ impl WorkspaceController for JournaledWorkspaceController {
         self.status_tx.subscribe()
     }
 
+    fn job_state(&self, job: &JobId) -> Option<JobState> {
+        match lock(&self.job_journal_fences).get(job) {
+            Some(JobJournalFence::Pending) => Some(JobState::Settling),
+            Some(JobJournalFence::RecoveryRequired { .. }) => Some(JobState::RecoveryRequired),
+            None => self.inner.job_state(job),
+        }
+    }
+
     async fn begin(
         &self,
         intent: MutationIntent,
@@ -302,6 +323,10 @@ impl WorkspaceController for JournaledWorkspaceController {
         if self.journal_health().state == JournalHealthState::PipeFsFailClosed {
             return Err(self.deny("PipeFS mutation admission is closed until journal recovery"));
         }
+        let reservation = self
+            .journal
+            .reserve_async()
+            .map_err(|error| self.deny(error.to_string()))?;
         let permit = self.inner.begin(intent).await?;
         if let Err(error) = hi_workspace::hit_harness_failpoint(
             hi_workspace::HarnessFailpoint::AdmissionBeforeJournal,
@@ -310,21 +335,32 @@ impl WorkspaceController for JournaledWorkspaceController {
             self.publish_status();
             return Err(self.deny(error.to_string()));
         }
-        if self.journal_is_healthy() {
-            let binding = self.inner.binding();
-            if let Err(error) = self
-                .journal
-                .record_operation_admitted(&binding, &permit.snapshot())
-            {
-                self.note_journal_failure(&error);
-                if self.journal_health().policy == JournalFailurePolicy::PipeFsFailClosed {
-                    drop(permit);
-                    self.publish_status();
-                    return Err(
-                        self.deny("PipeFS operation admission could not be durably journaled")
-                    );
+        let controller = self.clone();
+        let record = permit.snapshot();
+        let journal_result = self
+            .journal
+            .run_reserved(reservation, move |journal| {
+                if controller.journal_is_healthy()
+                    && let Err(error) = journal.record_admission_with_binding(
+                        &controller.inner.binding(),
+                        &controller.inner.status(),
+                        &controller.inner.capabilities(),
+                        &record,
+                    )
+                {
+                    controller.note_journal_failure(&error);
+                    return Err(error);
                 }
-            }
+                controller.publish_status();
+                Ok(())
+            })
+            .await;
+        if journal_result.is_err()
+            && self.journal_health().policy == JournalFailurePolicy::PipeFsFailClosed
+        {
+            drop(permit);
+            self.publish_status();
+            return Err(self.deny("PipeFS operation admission could not be durably journaled"));
         }
         if let Err(error) = hi_workspace::hit_harness_failpoint(
             hi_workspace::HarnessFailpoint::AdmissionAfterJournal,
@@ -333,11 +369,128 @@ impl WorkspaceController for JournaledWorkspaceController {
             self.publish_status();
             return Err(self.deny(error.to_string()));
         }
-        self.project_binding();
         Ok(permit)
     }
 
     async fn settle(
+        &self,
+        permit: MutationPermit,
+        execution: ExecutionReport,
+    ) -> SettlementOutcome {
+        let operation_id = permit.record().operation_id.clone();
+        let controller = self.clone();
+        tokio::spawn(async move { controller.settle_owned(permit, execution).await })
+            .await
+            .unwrap_or_else(|error| SettlementOutcome {
+                status: SettlementStatus::RecoveryRequired,
+                operation_id,
+                receipt: None,
+                recovery_id: self.status().recovery_id,
+                detail: Some(format!("workspace settlement owner failed: {error}")),
+            })
+    }
+
+    async fn register_job(&self, spec: JobSpec) -> std::result::Result<JobPermit, AdmissionDenied> {
+        let controller = self.clone();
+        let (reply, accepted) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = controller.register_job_owned(spec).await;
+            if let Err(Ok(permit)) = reply.send(result) {
+                controller
+                    .seal_job_owned(
+                        permit.job_id,
+                        JobTerminal {
+                            completion: JobCompletion::Failed,
+                            detail: Some(
+                                "job admission caller disappeared before execution".into(),
+                            ),
+                            artifacts: Vec::new(),
+                        },
+                    )
+                    .await;
+            }
+        });
+        accepted.await.unwrap_or_else(|error| {
+            Err(self.deny(format!("workspace job admission owner failed: {error}")))
+        })
+    }
+
+    async fn seal_job(&self, job: JobId, terminal: JobTerminal) -> JobSealOutcome {
+        let controller = self.clone();
+        let job_id = job.clone();
+        tokio::spawn(async move { controller.seal_job_owned(job_id, terminal).await })
+            .await
+            .unwrap_or_else(|error| JobSealOutcome {
+                job_id: job.clone(),
+                status: JobSealStatus::Rejected,
+                state: self.job_state(&job),
+                recovery_id: self.status().recovery_id,
+                detail: Some(format!("workspace job publication owner failed: {error}")),
+            })
+    }
+
+    async fn barrier(&self, reason: BarrierKind, deadline: Instant) -> BarrierReceipt {
+        let receipt = self.inner.barrier(reason, deadline).await;
+        overlay_barrier(
+            receipt,
+            &self.journal_health(),
+            &lock(&self.job_journal_fences),
+            lock(&self.operation_journal_fence).as_ref(),
+            deadline,
+        )
+    }
+
+    async fn reconcile(&self, recovery: RecoveryId) -> RecoveryOutcome {
+        let recovery_copy = recovery.clone();
+        match self
+            .journal_work(move |controller| {
+                Ok(controller.reconcile_operation_publication(&recovery_copy))
+            })
+            .await
+        {
+            Ok(Some(outcome)) => return outcome,
+            Ok(None) => {}
+            Err(error) => {
+                self.note_journal_failure(&error);
+            }
+        }
+        if let Some((_job, detail)) = self.forced_job_recovery(&recovery) {
+            return RecoveryOutcome {
+                recovery_id: recovery,
+                status: RecoveryStatus::Pending,
+                binding: self.inner.binding(),
+                detail: Some(format!(
+                    "{detail}; restart or restore the workspace journal before recovery can complete"
+                )),
+            };
+        }
+        let mut outcome = self.inner.reconcile(recovery).await;
+        let recovered = outcome.clone();
+        if let Err(error) = self
+            .journal_work(move |controller| {
+                controller
+                    .journal
+                    .record_recovery_outcome(&controller.inner.binding(), &recovered)?;
+                controller.project_binding();
+                Ok(())
+            })
+            .await
+        {
+            self.note_journal_failure(&error);
+        }
+        if self.journal_health().state == JournalHealthState::PipeFsFailClosed {
+            outcome.status = RecoveryStatus::Pending;
+            outcome.detail = Some(
+                "workspace recovery cannot complete until the PipeFS journal is reconciled"
+                    .to_owned(),
+            );
+        }
+        outcome
+    }
+}
+
+impl JournaledWorkspaceController {
+    async fn settle_owned(
         &self,
         permit: MutationPermit,
         mut execution: ExecutionReport,
@@ -354,12 +507,19 @@ impl WorkspaceController for JournaledWorkspaceController {
             execution.detail = Some(error.to_string());
         }
         let execution_record = execution.clone();
-        if self.journal_is_healthy()
-            && let Err(error) =
-                self.journal
-                    .record_operation_execution(&binding_before, &permit_record, &execution)
-        {
-            self.note_journal_failure(&error);
+        if self.journal_is_healthy() {
+            let record = permit_record.clone();
+            let report = execution.clone();
+            if let Err(error) = self
+                .journal_work(move |controller| {
+                    controller
+                        .journal
+                        .record_operation_execution(&binding_before, &record, &report)
+                })
+                .await
+            {
+                self.note_journal_failure(&error);
+            }
         }
 
         // Once execution has been accepted, settlement is always attempted,
@@ -372,31 +532,59 @@ impl WorkspaceController for JournaledWorkspaceController {
                 SettlementStatus::Durable | SettlementStatus::NoChange
             )
         {
-            return self.finish_operation_publication(permit_record, execution_record, outcome);
+            let fallback = outcome.clone();
+            return self
+                .journal_work(move |controller| {
+                    Ok(controller.finish_operation_publication(
+                        permit_record,
+                        execution_record,
+                        outcome,
+                    ))
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    self.note_journal_failure(&error);
+                    let mut outcome = fallback;
+                    outcome.status = SettlementStatus::RecoveryRequired;
+                    outcome.detail = Some(error.to_string());
+                    outcome
+                });
         }
         if pipefs_publication {
             self.release_pending_operation(&permit_record.operation_id);
         }
-        let binding_after = self.inner.binding();
-        if let Err(error) =
-            self.journal
-                .record_operation_settled(&binding_after, &permit_record, &outcome)
+        let publication = outcome.clone();
+        if let Err(error) = self
+            .journal_work(move |controller| {
+                let binding = controller.inner.binding();
+                if let Err(error) = controller.journal.record_settlement_with_binding(
+                    &binding,
+                    &controller.inner.status(),
+                    &controller.inner.capabilities(),
+                    &permit_record,
+                    &publication,
+                ) {
+                    controller.note_journal_failure(&error);
+                }
+                if let Some(recovery_id) = &publication.recovery_id
+                    && let Err(error) = controller.journal.record_recovery(
+                        &binding,
+                        recovery_id,
+                        Some(permit_record.operation_id.to_string()),
+                        None,
+                        WorkspaceRecoveryStatus::Required,
+                        publication.detail.clone(),
+                    )
+                {
+                    controller.note_journal_failure(&error);
+                }
+                controller.publish_status();
+                Ok(())
+            })
+            .await
         {
             self.note_journal_failure(&error);
         }
-        if let Some(recovery_id) = &outcome.recovery_id
-            && let Err(error) = self.journal.record_recovery(
-                &binding_after,
-                recovery_id,
-                Some(permit_record.operation_id.to_string()),
-                None,
-                WorkspaceRecoveryStatus::Required,
-                outcome.detail.clone(),
-            )
-        {
-            self.note_journal_failure(&error);
-        }
-        self.project_binding();
 
         let health = self.journal_health();
         match health.state {
@@ -419,229 +607,6 @@ impl WorkspaceController for JournaledWorkspaceController {
                         .to_owned(),
                 );
             }
-        }
-        outcome
-    }
-
-    async fn register_job(&self, spec: JobSpec) -> std::result::Result<JobPermit, AdmissionDenied> {
-        if let Some(detail) = self.journal_fence_denial() {
-            return Err(self.deny(detail));
-        }
-        let writer = !matches!(spec.effect_scope, hi_workspace::EffectScope::ReadOnly);
-        if writer && !self.writer_jobs_allowed() {
-            return Err(self
-                .deny("resumable and background writer jobs require a healthy workspace journal"));
-        }
-        if self.journal_health().state == JournalHealthState::PipeFsFailClosed {
-            return Err(self.deny("PipeFS job admission is closed until journal recovery"));
-        }
-
-        let permit = self.inner.register_job(spec).await?;
-        lock(&self.permits).insert(permit.job_id.clone(), permit.clone());
-        if let Err(error) = self
-            .journal
-            .record_job_registered(&self.inner.binding(), &permit)
-        {
-            self.note_journal_failure(&error);
-            if writer || self.journal_health().policy == JournalFailurePolicy::PipeFsFailClosed {
-                let _ = self
-                    .inner
-                    .seal_job(
-                        permit.job_id.clone(),
-                        JobTerminal {
-                            completion: JobCompletion::Failed,
-                            detail: Some(
-                                "job admission failed before execution because it was not durably journaled"
-                                    .to_owned(),
-                            ),
-                            artifacts: Vec::new(),
-                        },
-                    )
-                    .await;
-                self.publish_status();
-                return Err(self.deny("job admission could not be durably journaled"));
-            }
-        }
-        self.project_binding();
-        Ok(permit)
-    }
-
-    async fn seal_job(&self, job: JobId, terminal: JobTerminal) -> JobSealOutcome {
-        let permit = lock(&self.permits).get(&job).cloned();
-        let local_process_audit_only = permit.as_ref().is_some_and(|permit| {
-            self.journal_health().policy == JournalFailurePolicy::LocalContinueForeground
-                && permit.spec.kind == hi_workspace::JobKind::Process
-                && permit.spec.effect_scope == hi_workspace::EffectScope::LiveWriter
-        });
-        let must_fence = permit.as_ref().is_some_and(|permit| {
-            !matches!(
-                permit.spec.effect_scope,
-                hi_workspace::EffectScope::ReadOnly
-            ) && !local_process_audit_only
-        }) || self.journal_health().policy
-            == JournalFailurePolicy::PipeFsFailClosed;
-        if must_fence {
-            let mut fences = lock(&self.job_journal_fences);
-            match fences.get(&job) {
-                Some(JobJournalFence::RecoveryRequired {
-                    recovery_id,
-                    detail,
-                }) => {
-                    return JobSealOutcome {
-                        job_id: job,
-                        status: JobSealStatus::Rejected,
-                        state: Some(JobState::RecoveryRequired),
-                        recovery_id: Some(recovery_id.clone()),
-                        detail: Some(detail.clone()),
-                    };
-                }
-                Some(JobJournalFence::Pending) => {
-                    return JobSealOutcome {
-                        job_id: job,
-                        status: JobSealStatus::Rejected,
-                        state: Some(JobState::Settling),
-                        recovery_id: None,
-                        detail: Some("job publication is already settling".to_owned()),
-                    };
-                }
-                None => {
-                    fences.insert(job.clone(), JobJournalFence::Pending);
-                }
-            }
-            drop(fences);
-            self.publish_status();
-        }
-
-        let outcome = self.inner.seal_job(job.clone(), terminal.clone()).await;
-        if outcome.status == JobSealStatus::Sealed {
-            if let Some(permit) = permit {
-                if let Err(error) = self.journal.record_job_sealed(
-                    &self.inner.binding(),
-                    &permit,
-                    &outcome,
-                    &terminal,
-                ) {
-                    self.note_journal_failure(&error);
-                    if must_fence {
-                        let binding = self.inner.binding();
-                        let recovery_id = journal_job_recovery_id(&binding, &job);
-                        let detail = format!(
-                            "job reached inner state {:?}, but its lifecycle transition was not durably journaled: {error}",
-                            outcome.state.unwrap_or(JobState::RecoveryRequired)
-                        );
-                        lock(&self.job_journal_fences).insert(
-                            job.clone(),
-                            JobJournalFence::RecoveryRequired {
-                                recovery_id: recovery_id.clone(),
-                                detail: detail.clone(),
-                            },
-                        );
-                        if let Err(recovery_error) = self.journal.record_recovery(
-                            &binding,
-                            &recovery_id,
-                            None,
-                            Some(job.to_string()),
-                            WorkspaceRecoveryStatus::Required,
-                            Some(detail.clone()),
-                        ) {
-                            self.note_journal_failure(&recovery_error);
-                        }
-                        self.project_binding();
-                        return JobSealOutcome {
-                            job_id: job,
-                            status: JobSealStatus::Rejected,
-                            state: Some(JobState::RecoveryRequired),
-                            recovery_id: Some(recovery_id),
-                            detail: Some(detail),
-                        };
-                    }
-                }
-                lock(&self.job_journal_fences).remove(&job);
-                if outcome.state.is_some_and(JobState::is_terminal) {
-                    lock(&self.permits).remove(&job);
-                }
-            } else {
-                let error = ControlError::Invalid(format!(
-                    "missing job permit for lifecycle callback {job}"
-                ));
-                self.note_journal_failure(&error);
-                let binding = self.inner.binding();
-                let recovery_id = journal_job_recovery_id(&binding, &job);
-                let detail = error.to_string();
-                lock(&self.job_journal_fences).insert(
-                    job.clone(),
-                    JobJournalFence::RecoveryRequired {
-                        recovery_id: recovery_id.clone(),
-                        detail: detail.clone(),
-                    },
-                );
-                self.project_binding();
-                return JobSealOutcome {
-                    job_id: job,
-                    status: JobSealStatus::Rejected,
-                    state: Some(JobState::RecoveryRequired),
-                    recovery_id: Some(recovery_id),
-                    detail: Some(detail),
-                };
-            }
-        } else if must_fence {
-            lock(&self.job_journal_fences).remove(&job);
-        }
-        if let Some(recovery_id) = &outcome.recovery_id
-            && let Err(error) = self.journal.record_recovery(
-                &self.inner.binding(),
-                recovery_id,
-                None,
-                Some(job.to_string()),
-                WorkspaceRecoveryStatus::Required,
-                outcome.detail.clone(),
-            )
-        {
-            self.note_journal_failure(&error);
-        }
-        self.project_binding();
-        outcome
-    }
-
-    async fn barrier(&self, reason: BarrierKind, deadline: Instant) -> BarrierReceipt {
-        let receipt = self.inner.barrier(reason, deadline).await;
-        overlay_barrier(
-            receipt,
-            &self.journal_health(),
-            &lock(&self.job_journal_fences),
-            lock(&self.operation_journal_fence).as_ref(),
-            deadline,
-        )
-    }
-
-    async fn reconcile(&self, recovery: RecoveryId) -> RecoveryOutcome {
-        if let Some(outcome) = self.reconcile_operation_publication(&recovery) {
-            return outcome;
-        }
-        if let Some((_job, detail)) = self.forced_job_recovery(&recovery) {
-            return RecoveryOutcome {
-                recovery_id: recovery,
-                status: RecoveryStatus::Pending,
-                binding: self.inner.binding(),
-                detail: Some(format!(
-                    "{detail}; restart or restore the workspace journal before recovery can complete"
-                )),
-            };
-        }
-        let mut outcome = self.inner.reconcile(recovery).await;
-        if let Err(error) = self
-            .journal
-            .record_recovery_outcome(&self.inner.binding(), &outcome)
-        {
-            self.note_journal_failure(&error);
-        }
-        self.project_binding();
-        if self.journal_health().state == JournalHealthState::PipeFsFailClosed {
-            outcome.status = RecoveryStatus::Pending;
-            outcome.detail = Some(
-                "workspace recovery cannot complete until the PipeFS journal is reconciled"
-                    .to_owned(),
-            );
         }
         outcome
     }

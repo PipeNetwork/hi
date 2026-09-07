@@ -63,6 +63,7 @@ impl crate::Agent {
         let results = [(call_id, commit.content.clone())];
         let stage_error = self
             .stage_active_workspace_execution(&calls, &assistant_content, &results, &execution)
+            .await
             .err();
         if let Some(error) = &stage_error {
             execution.disposition = hi_workspace::ExecutionDisposition::Indeterminate;

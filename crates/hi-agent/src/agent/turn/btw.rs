@@ -61,6 +61,7 @@ const BTW_TOOL_ALLOWLIST: &[&str] = &[
 
 /// Detached `/btw` work item — everything needed to answer without `&mut Agent`.
 struct BtwJob {
+    execution: Arc<hi_ai::RequestExecution>,
     provider: Arc<dyn Provider>,
     model: String,
     temperature: Option<f32>,
@@ -166,6 +167,7 @@ impl Ui for BtwEventUi {
 /// Live context refreshed as the main turn progresses (plan/jobs/transcript).
 #[derive(Clone)]
 pub(crate) struct BtwLiveContext {
+    execution: Arc<hi_ai::RequestExecution>,
     snapshot: String,
     recent: String,
     system: Message,
@@ -344,6 +346,7 @@ impl BtwDispatcher {
                 return false;
             };
             BtwJob {
+                execution: live.execution.fresh_operation(),
                 provider,
                 model: live.model.clone(),
                 temperature: live.temperature,
@@ -392,6 +395,7 @@ impl crate::Agent {
     pub(crate) async fn arm_btw_dispatcher(&mut self) {
         let (model, read_policy, chat_policy) = request_policy::seal(self).await;
         let live = BtwLiveContext {
+            execution: self.request_execution(),
             snapshot: self.btw_session_snapshot(),
             recent: recent_transcript_excerpt(self.messages.as_slice(), BTW_CONTEXT_CHARS),
             system: {
@@ -487,6 +491,7 @@ impl crate::Agent {
 
         let (model, read_policy, chat_policy) = request_policy::seal(self).await;
         let job = BtwJob {
+            execution: self.request_execution(),
             provider: self.provider.clone(),
             model,
             temperature: self.config.routing.temperature,
@@ -714,6 +719,7 @@ async fn answer_one_btw_question(
         };
 
         let request = ChatRequest {
+            execution: job.execution.fresh_operation(),
             model: job.model.clone(),
             request_id: None,
             retry_attempt: 0,
@@ -747,7 +753,7 @@ async fn answer_one_btw_question(
             StreamEvent::Status(text) => ui.status(&text),
             StreamEvent::Warning(text) => ui.top_status(&text),
             StreamEvent::Reasoning(_) => {}
-            StreamEvent::WireAudit(_) => {}
+            StreamEvent::WireAudit(_) | StreamEvent::ProviderAttempt(_) => {}
             StreamEvent::ToolCallDelta { .. } => {}
         };
 

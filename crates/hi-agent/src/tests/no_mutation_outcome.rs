@@ -44,11 +44,12 @@ async fn explicit_mutation_request_without_changes_settles_as_no_progress() {
     assert_eq!(outcome.verification, VerificationStatus::NotApplicable);
     assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
     assert!(ui.statuses.iter().any(|s| s.contains("no file changes")));
-    assert!(agent.messages().iter().any(|message| {
-        message
-            .text()
-            .contains("could not complete this request after repeated attempts made no progress")
-    }));
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .any(|message| { message.text().contains("Automatic recovery stopped.") })
+    );
 }
 
 #[tokio::test]
@@ -69,11 +70,12 @@ async fn review_and_fix_without_changes_settles_as_no_progress() {
             .text()
             .contains("Implementation guard: inspect the workspace")
     }));
-    assert!(agent.messages().iter().any(|message| {
-        message
-            .text()
-            .contains("could not complete this request after repeated attempts made no progress")
-    }));
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .any(|message| { message.text().contains("Automatic recovery stopped.") })
+    );
 }
 
 #[tokio::test]

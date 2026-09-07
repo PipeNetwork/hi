@@ -16,10 +16,20 @@ impl WorkspaceCoordination {
         self.require_barrier_before(reason, deadline).await
     }
 
-    async fn require_barrier_before(
+    pub(crate) async fn require_barrier_before(
         &self,
         reason: BarrierKind,
         deadline: Instant,
+    ) -> Result<BarrierReceipt> {
+        self.require_barrier_preserving_jobs(reason, deadline, &[])
+            .await
+    }
+
+    pub(crate) async fn require_barrier_preserving_jobs(
+        &self,
+        reason: BarrierKind,
+        deadline: Instant,
+        preserved: &[hi_workspace::JobId],
     ) -> Result<BarrierReceipt> {
         let controller = self.controller();
         let expected = controller.binding();
@@ -29,7 +39,7 @@ impl WorkspaceCoordination {
                 Arc::ptr_eq(&controller, &self.controller()),
                 "workspace controller changed while completing the {reason:?} barrier"
             );
-            let receipt = controller.barrier(reason, deadline).await;
+            let mut receipt = controller.barrier(reason, deadline).await;
             ensure!(
                 receipt.binding_id == expected.binding_id && receipt.epoch == expected.epoch,
                 "workspace barrier changed binding from {}@{} to {}@{}",
@@ -38,6 +48,26 @@ impl WorkspaceCoordination {
                 receipt.binding_id,
                 receipt.epoch
             );
+            // Exempt only explicitly preserved, still-running service jobs.
+            // A service whose exit has entered durability publication loses
+            // its exemption; unrelated pending jobs can never be hidden.
+            if matches!(
+                receipt.status,
+                BarrierStatus::Blocked | BarrierStatus::TimedOut
+            ) && receipt.active_operation.is_none()
+                && receipt.recovery_id.is_none()
+            {
+                receipt.pending_jobs.retain(|job| {
+                    !(preserved.contains(job)
+                        && matches!(
+                            controller.job_state(job),
+                            Some(hi_workspace::JobState::Running)
+                        ))
+                });
+                if receipt.pending_jobs.is_empty() {
+                    receipt.status = BarrierStatus::Passed;
+                }
+            }
             match receipt.status {
                 BarrierStatus::Passed => {
                     let current_controller = self.controller();

@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    ApiOutcome, CaseVerdict, Difference, EquivalenceContract, LocalOutcome, TensorSummary,
-    ToolCallRecord, Verdict,
+    ApiOutcome, CaseVerdict, Difference, EquivalenceContract, LocalOutcome, ToolCallRecord, Verdict,
 };
 
 pub fn compare_tensor(
@@ -315,14 +314,10 @@ fn first_difference<T: PartialEq>(left: &[T], right: &[T]) -> Option<usize> {
         .or_else(|| (left.len() != right.len()).then(|| left.len().min(right.len())))
 }
 
-#[allow(dead_code)]
-fn _summary_has_bad_values(summary: &TensorSummary) -> bool {
-    summary.nan_count > 0 || summary.inf_count > 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TensorSummary;
 
     #[test]
     fn reports_first_bad_tensor_index() {

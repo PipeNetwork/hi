@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 use crate::agent::turn::fast_feedback::{
     FastFeedbackOptions, FastFeedbackState, run_fast_feedback, signature_impact_notes,
 };
+use crate::agent::turn::fast_feedback_observations;
+use crate::recovery::ValidationResult;
 use crate::steering::ImplementationTracker;
 use crate::transcript::NudgeKind;
 use crate::{TaskContract, Ui};
@@ -13,11 +15,12 @@ use crate::{TaskContract, Ui};
 /// remain owned by that turn. A plain `JoinHandle` detaches on drop; wrapping it
 /// makes cancellation abort the task, which drops the process future and lets
 /// `ProcessRunner` kill the check's complete process group.
-pub(super) type PendingCheck = (
-    String,
-    String,
-    tokio_util::task::AbortOnDropHandle<(bool, String)>,
-);
+pub(super) struct PendingCheck {
+    pub path: String,
+    pub check: String,
+    pub input_revision: Option<String>,
+    pub handle: tokio_util::task::AbortOnDropHandle<hi_tools::ToolOutcome>,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn append_fast_feedback(
@@ -31,7 +34,7 @@ pub(super) async fn append_fast_feedback(
     implementation_tracker: &mut ImplementationTracker,
     results: &mut [(String, String)],
     ui: &mut dyn Ui,
-) {
+) -> anyhow::Result<()> {
     // Await the proactive per-edit checks kicked off during the
     // batch. A syntax/lint error appears here, during the turn, before
     // turn-end verify. Keep successful checks in the next model-facing
@@ -39,15 +42,42 @@ pub(super) async fn append_fast_feedback(
     // shell validation even though the result is already available.
     let mut proactive_failures = Vec::new();
     let mut proactive_passes = Vec::new();
-    for (path, check, handle) in pending_checks {
-        if let Ok((passed, output)) = handle.await {
-            if passed {
+    for PendingCheck {
+        path,
+        check,
+        input_revision,
+        handle,
+    } in pending_checks
+    {
+        if let Ok(output) = handle.await {
+            let stable =
+                fast_feedback_observations::unchanged(&agent.runtime, input_revision.as_deref())
+                    .await;
+            let observation = fast_feedback_observations::file_check(
+                &check,
+                &path,
+                input_revision.as_deref().unwrap_or_default(),
+                &output,
+                stable,
+                agent.runtime.root(),
+            );
+            let status = observation.status;
+            agent.observe_validation(observation).await?;
+            if status == ValidationResult::Passed {
                 proactive_passes.push(format!("✓ fast check passed for {path} ({check})"));
-                continue;
+            } else {
+                let msg = match status {
+                    ValidationResult::Failed => {
+                        format!("⚠ proactive check failed for {path}:\n{}", output.content)
+                    }
+                    ValidationResult::Deferred => format!(
+                        "Fast check for {path} is unverified: its input changed or execution was cancelled."
+                    ),
+                    _ => format!("Fast check for {path} is unavailable: {}", output.content),
+                };
+                ui.status(&msg);
+                proactive_failures.push(msg);
             }
-            let msg = format!("⚠ proactive check failed for {path}:\n{output}");
-            ui.status(&msg);
-            proactive_failures.push(msg);
         }
     }
     // Mid-turn Rust fast path: LSP → affected cargo check → (if
@@ -75,6 +105,9 @@ pub(super) async fn append_fast_feedback(
             }
             if let Some(text) = report.combined_feedback() {
                 fast_failures.push(text);
+            }
+            for observation in report.observations {
+                agent.observe_validation(observation).await?;
             }
         }
         // Edits that landed on a definition line get a reverse-reference
@@ -143,6 +176,7 @@ pub(super) async fn append_fast_feedback(
     );
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -163,14 +197,18 @@ mod tests {
         let handle = tokio::spawn(async move {
             let _guard = Dropped(task_dropped);
             std::future::pending::<()>().await;
-            (true, String::new())
+            crate::agent::turn::helpers::synthetic_tool_outcome(
+                String::new(),
+                hi_tools::ToolStatus::Succeeded,
+            )
         });
         tokio::task::yield_now().await;
-        let pending: PendingCheck = (
-            "src/lib.rs".into(),
-            "check".into(),
-            tokio_util::task::AbortOnDropHandle::new(handle),
-        );
+        let pending = PendingCheck {
+            path: "src/lib.rs".into(),
+            check: "check".into(),
+            input_revision: None,
+            handle: tokio_util::task::AbortOnDropHandle::new(handle),
+        };
 
         drop(pending);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {

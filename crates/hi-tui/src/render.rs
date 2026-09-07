@@ -913,16 +913,6 @@ pub(crate) fn markdown_heading(s: &str) -> Option<(u8, &str)> {
     None
 }
 
-/// Whether a rendered assistant line was committed as an ATX heading.
-pub(crate) fn line_looks_like_heading(line: &Line<'_>) -> bool {
-    let th = theme();
-    line.spans.iter().any(|span| {
-        !span.content.is_empty()
-            && span.style.add_modifier.contains(Modifier::BOLD)
-            && matches!(span.style.fg, Some(fg) if fg == th.text_primary || fg == th.gray_bright)
-    })
-}
-
 /// Source or already-rendered list item (`- item`, `1. item`, or `• item`).
 pub(crate) fn is_markdown_list_line(s: &str) -> bool {
     let t = s.trim_start();

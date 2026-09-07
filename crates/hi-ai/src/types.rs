@@ -451,6 +451,8 @@ pub struct ChatRequest {
     /// Zero-based replay number for the same logical request. Routed APIs use
     /// this to correlate a successful replay with an earlier failed attempt.
     pub retry_attempt: u32,
+    /// Shared physical dispatch and recovery budget; never reset by a retry.
+    pub execution: Arc<crate::RequestExecution>,
     /// True only for the primary request that answers the user's current turn.
     /// Provider wrappers may use this to keep auxiliary compaction, memory, and
     /// review requests on their normal route.
@@ -489,6 +491,8 @@ pub struct ChatRequest {
 /// Incremental output streamed to the caller as it arrives.
 #[derive(Debug)]
 pub enum StreamEvent {
+    /// Typed physical inference attempt and concrete route provenance.
+    ProviderAttempt(Box<crate::ProviderAttemptEvent>),
     Text(String),
     Reasoning(String),
     /// Provider-native tool-call fragments. These are intentionally separate

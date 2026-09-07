@@ -75,6 +75,7 @@ pub(crate) async fn observe_natural_exit(
 
 pub(crate) struct CancelSettlement {
     pub abort_handle: AbortHandle,
+    pub execution_done: tokio::sync::watch::Receiver<bool>,
     pub managed_job: Option<crate::job_lifecycle::ManagedBackgroundJob>,
     pub lifecycle_gate: Arc<tokio::sync::Mutex<()>>,
     pub outcome: BackgroundTaskOutcome,
@@ -90,6 +91,12 @@ impl CancelSettlement {
     /// Abort is a request, not terminal proof. Publish cancellation only after
     /// Tokio has dropped the worker future and the workspace callback settles.
     pub(crate) async fn run(mut self) -> BackgroundTaskOutcome {
+        self.abort_handle.abort();
+        while !*self.execution_done.borrow_and_update() {
+            if self.execution_done.changed().await.is_err() {
+                break;
+            }
+        }
         let _settlement = self.lifecycle_gate.lock().await;
         if let Some(mut existing) = self
             .terminal_outcome
@@ -104,14 +111,10 @@ impl CancelSettlement {
             }
             return existing;
         }
-        self.abort_handle.abort();
         let failpoint = hi_workspace::hit_harness_failpoint(
             hi_workspace::HarnessFailpoint::JobAfterCancelRequest,
         )
         .err();
-        while !self.abort_handle.is_finished() {
-            tokio::task::yield_now().await;
-        }
         if let Err(error) = self.teardown.wait().await {
             self.outcome.state = BackgroundTaskState::Failed;
             self.outcome.output =

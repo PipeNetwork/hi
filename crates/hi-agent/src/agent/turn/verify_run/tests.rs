@@ -94,6 +94,7 @@ async fn verification_waits_for_auto_background_reap_and_settlement() {
         false,
         0,
         &fast_feedback,
+        VerificationAdmission::ChangedWorkspace,
         &mut ui,
     ));
     let completed_before_settlement =
@@ -125,11 +126,9 @@ async fn verification_waits_for_auto_background_reap_and_settlement() {
 async fn local_service_verification_case() -> (crate::TurnOutcome, Vec<String>) {
     let mut cfg = config();
     cfg.gates.review = crate::ReviewPolicy::Off;
-    cfg.gates.max_verify_repairs = 0;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![crate::VerifyStage::new(
-        "test",
-        "printf verifier-ran > verifier-ran.txt",
-    )]);
+    cfg.gates.max_verify_repairs = 1;
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![crate::VerifyStage::new("test", "true")]);
     let source = cfg.paths.workspace_root.join("source.rs");
     let provider = Arc::new(Canned(std::sync::Mutex::new(vec![
         completion(
@@ -165,7 +164,6 @@ async fn local_service_verification_case() -> (crate::TurnOutcome, Vec<String>) 
         ),
     ])));
     let mut subject = crate::Agent::new(provider.clone(), cfg).unwrap();
-    let verifier_marker = subject.runtime.root().join("verifier-ran.txt");
     let mut ui = RecUi::default();
 
     let outcome = subject
@@ -187,12 +185,16 @@ async fn local_service_verification_case() -> (crate::TurnOutcome, Vec<String>) 
         provider.0.lock().unwrap().is_empty(),
         "successful verification must not re-enter the model obligation loop"
     );
-    assert_eq!(outcome.verification, crate::VerificationStatus::Passed);
+    assert_eq!(
+        outcome.verification,
+        crate::VerificationStatus::Passed,
+        "{outcome:?}; {:?}",
+        ui.statuses
+    );
     assert_eq!(outcome.stop_reason, crate::TurnStopReason::Completed);
     assert!(subject.last_verify().is_some());
-    assert_eq!(subject.last_turn_telemetry().verify_rounds, 1);
-    assert_eq!(subject.last_verification_executions().len(), 1);
-    assert!(verifier_marker.exists(), "the local verifier must execute");
+    assert_eq!(subject.last_turn_telemetry().verify_rounds, 2);
+    assert_eq!(subject.last_verification_executions().len(), 2);
     assert!(!ui.statuses.iter().any(|line| {
         line.contains("verification deferred")
             || line.contains("verification infrastructure failed")

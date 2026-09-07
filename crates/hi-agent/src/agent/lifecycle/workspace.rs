@@ -237,7 +237,7 @@ impl crate::Agent {
         // roots so a crash or later resume can never apply an old root's undo
         // snapshot to the newly activated workspace.
         if record_checkpoint_boundary {
-            self.record_workspace_checkpoint_boundary()?;
+            self.record_workspace_checkpoint_boundary_async().await?;
         }
         self.workspace_coordination.install_local_during_rebind(
             replacement.root(),
@@ -387,12 +387,10 @@ impl crate::Agent {
     }
 
     /// Kill turn-scoped background processes started after this turn's
-    /// baseline, without running the full failed-turn finalizer. Used on the
-    /// `run_turn_cancellable` error path so a mid-turn provider/tool failure
-    /// does not leak delegate/explore subagents started this turn, while
-    /// leaving ledger reconciliation and `last_changed_files` to the caller's
-    /// own `cleanup_turn(Fail)` / `finalize_failed_turn` (idempotent via
-    /// `.take()` on the baseline).
+    /// baseline, without running the full failed-turn finalizer. This is a
+    /// compatibility helper for explicit runtime management. Turn callers
+    /// consume the receipt returned by `run_turn_cancellable`, whose owner
+    /// already handles cancellation, reconciliation, and finalization.
     pub fn kill_turn_backgrounds(&mut self) -> usize {
         self.take_and_kill_turn_backgrounds()
     }
@@ -501,75 +499,6 @@ impl crate::Agent {
         Ok(())
     }
 
-    /// Legacy synchronous cancelled-turn finalizer.
-    ///
-    /// Use [`Self::cleanup_turn`] so background kill and bounded ledger
-    /// reconciliation stay consistent across frontends. Call
-    /// [`Self::finalize_cancelled_turn_snapshot_only`] only when a deliberately
-    /// incomplete, nonblocking fallback is required.
-    #[deprecated(
-        since = "0.3.1",
-        note = "use async Agent::cleanup_turn; use finalize_cancelled_turn_snapshot_only only for an incomplete nonblocking fallback"
-    )]
-    pub fn finalize_cancelled_turn(&mut self) -> Result<crate::TurnOutcome> {
-        let _ = self.take_and_kill_turn_backgrounds();
-        // Preserve the historical public API's ordering and full, blocking
-        // reconciliation for downstream callers while steering new async
-        // frontends to `cleanup_turn`. Truncate before the fallible scan just
-        // as the pre-deprecation implementation did.
-        if let Some(start) = self.workspace.active_turn_message_start.take() {
-            self.truncate_messages(start);
-        }
-        let explicit_baseline = self.workspace.active_turn_ledger_revision;
-        let changes = {
-            let mut ledger = self.runtime.ledger();
-            ledger.reconcile()?;
-            let baseline = explicit_baseline.unwrap_or_else(|| ledger.revision());
-            ledger.changes_since(baseline)
-        };
-        self.workspace.active_turn_ledger_revision = None;
-        self.finalize_cancelled_turn_with_changes(changes)
-    }
-
-    /// Finalize a cancelled turn using only changes already present in the
-    /// ledger. This never starts or waits for a workspace scan, so unobserved
-    /// shell/editor effects may be absent from `TurnOutcome::changed_files`.
-    pub fn finalize_cancelled_turn_snapshot_only(&mut self) -> Result<crate::TurnOutcome> {
-        let _ = self.take_and_kill_turn_backgrounds();
-        self.finalize_cancelled_turn_inner()
-    }
-
-    /// Legacy synchronous failed-turn finalizer.
-    ///
-    /// Use [`Self::cleanup_turn`] with [`TurnCleanupKind::Fail`], which performs
-    /// a bounded scan for otherwise-unobserved shell/editor effects. Call
-    /// [`Self::finalize_failed_turn_snapshot_only`] only when a deliberately
-    /// incomplete, nonblocking fallback is required.
-    #[deprecated(
-        since = "0.3.1",
-        note = "use async Agent::cleanup_turn; use finalize_failed_turn_snapshot_only only for an incomplete nonblocking fallback"
-    )]
-    pub fn finalize_failed_turn(&mut self) -> crate::TurnOutcome {
-        let _ = self.take_and_kill_turn_backgrounds();
-        // Compatibility wrapper: the legacy method attempted a synchronous
-        // full scan and ignored its error. It also selected the fallback
-        // baseline before that scan, so callers without an explicit active
-        // turn still observed the resulting delta. Keep both behaviors for
-        // external callers; in-tree async paths use bounded cleanup instead.
-        let explicit_baseline = self.workspace.active_turn_ledger_revision.take();
-        let (changes, current_workspace, workspace_reconciled) = {
-            let mut ledger = self.runtime.ledger();
-            let baseline = explicit_baseline.unwrap_or_else(|| ledger.revision());
-            let workspace_reconciled = ledger.reconcile().is_ok();
-            (
-                ledger.changes_since(baseline),
-                Some((ledger.revision(), ledger.workspace_revision())),
-                workspace_reconciled,
-            )
-        };
-        self.finalize_failed_turn_with_changes(changes, workspace_reconciled, current_workspace)
-    }
-
     /// Finalize a failed turn using only changes already present in the ledger.
     /// This never starts or waits for a workspace scan or a busy ledger mutex,
     /// so unobserved shell/editor effects may be absent from
@@ -577,15 +506,6 @@ impl crate::Agent {
     pub fn finalize_failed_turn_snapshot_only(&mut self) -> crate::TurnOutcome {
         let _ = self.take_and_kill_turn_backgrounds();
         self.finalize_failed_turn_inner(false)
-    }
-
-    fn finalize_cancelled_turn_inner(&mut self) -> Result<crate::TurnOutcome> {
-        // Message truncate only if still set (AlreadyApplied path takes it first).
-        if let Some(start) = self.workspace.active_turn_message_start.take() {
-            self.truncate_messages(start);
-        }
-        let changes = self.take_abnormal_turn_ledger_changes();
-        self.finalize_cancelled_turn_with_changes(changes)
     }
 
     pub(super) fn finalize_cancelled_turn_with_changes(
@@ -608,7 +528,6 @@ impl crate::Agent {
             plan_leftover: None,
         };
         self.report.set_outcome(outcome.clone());
-        let _ = self.persist();
         Ok(outcome)
     }
 
@@ -708,10 +627,6 @@ impl crate::Agent {
         }
         let _ = self.runtime.wait_for_ledger_available(RELEASE_GRACE).await;
         false
-    }
-
-    fn take_abnormal_turn_ledger_changes(&mut self) -> Vec<hi_tools::FileChange> {
-        self.take_abnormal_turn_ledger_snapshot().0
     }
 
     pub(super) fn take_abnormal_turn_ledger_snapshot(

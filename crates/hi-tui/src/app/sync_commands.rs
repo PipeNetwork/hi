@@ -2541,6 +2541,15 @@ impl crate::App {
         agent: &mut hi_agent::Agent,
         runtime: hi_agent::local_skeptic::ManagedLocalRuntime,
     ) {
+        if let Err(error) = agent.ensure_session_reusable() {
+            hi_tools::stop_local_server(&runtime.process_id);
+            self.local_startup_error = Some(format!("provider unchanged: {error:#}"));
+            self.push(Line::styled(
+                format!("provider unchanged: {error:#}"),
+                Style::default().fg(crate::theme::theme().warning),
+            ));
+            return;
+        }
         let switched = match (self.local_runtime_switcher)(&runtime) {
             Ok(switched) => switched,
             Err(error) => {
@@ -2555,24 +2564,22 @@ impl crate::App {
                 return;
             }
         };
-        let label = switched.switched.route.label.clone();
-        let model = switched.switched.model.clone();
+        let label = switched
+            .switched
+            .routing
+            .provider_route
+            .clone()
+            .unwrap_or_default();
+        let model = switched.switched.routing.model.clone();
         let profile = runtime.profile_name.clone();
         agent.register_driver_local_server(
             runtime.base_url.clone(),
             runtime.model_id.clone(),
             runtime.process_id.clone(),
         );
-        agent.set_provider_with_route(
-            switched.switched.provider.into(),
-            switched.switched.route,
-            model.clone(),
-            None,
-            switched.switched.max_tokens,
-            switched.switched.max_tokens_explicit,
-            None,
-        );
-        agent.set_tool_mode(switched.switched.tool_mode);
+        let mut routing = switched.switched.routing;
+        routing.temperature = agent.temperature();
+        agent.set_provider_with_routing(switched.switched.provider.into(), routing);
         if let Ok(models) = agent.list_models().await {
             self.served = models
                 .into_iter()

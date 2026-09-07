@@ -10,6 +10,7 @@ mod observations;
 mod outcome;
 mod plan_updates;
 mod policy;
+mod postprocess;
 mod program_guard;
 mod program_output;
 mod program_settlement;
@@ -29,8 +30,8 @@ use plan_updates::{normalize_plan_mode_update, normalize_unsupported_plan_comple
 use policy::{
     ProgramPreflightDenial, dry_run_message, execution_mode_denial, parked_or_denied_delegate,
     parked_or_denied_shell, permitted_call_prefix, remaining_program_call_budget,
-    terminal_background_requires_reconciliation, wait_flavored_call,
-    workspace_operation_requires_settlement, workspace_program_execution_report,
+    terminal_background_requires_reconciliation, workspace_operation_requires_settlement,
+    workspace_program_execution_report,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,6 +59,7 @@ use hi_ai::Content;
 use hi_workflow::{
     ProgramCall, ProgramHostRequest, ProgramOutcome, ProgramRunParams, extract_safe_literal_calls,
 };
+use postprocess::{CompletedTool, ToolObservations};
 use program_guard::ProgramRunGuard;
 pub(crate) use program_speculation::ProgramSpeculator;
 use terminal::DeferredToolTerminals;
@@ -144,13 +146,9 @@ use crate::heuristics::plan_has_pending_steps;
 use crate::steering::implementation_tool_call_mutates;
 use hi_tools::PlanStatus;
 
-use super::super::helpers::{
-    synthetic_tool_outcome, tool_entry, tool_entry_with_args, tool_satisfies_validation,
-};
+use super::super::helpers::{synthetic_tool_outcome, tool_entry, tool_satisfies_validation};
 use super::super::phase::TurnPhase;
-use super::super::progress::{
-    ProgressKind, ProgressTracker, ToolProgressLabel, classify_tool_progress, signature_seen,
-};
+use super::super::progress::{ProgressKind, ProgressTracker, ToolProgressLabel};
 use super::super::retention::ToolTimeline;
 
 /// Add a scheduler count without allowing a very long unlimited turn to wrap
@@ -304,6 +302,8 @@ impl crate::Agent {
                     tool_specs,
                     tool_envelope,
                     read_only_intent,
+                    evidence,
+                    implementation_tracker,
                     progress_tracker,
                     tool_timeline,
                     sched_tool_calls,
@@ -325,11 +325,7 @@ impl crate::Agent {
         let hash_guard_applies = calls
             .iter()
             .any(|(_, name, args)| tool_result_hash_guard_applies(name, args));
-        let mut hashable_idempotent_results = 0usize;
-        let mut repeated_idempotent_results = 0usize;
-        let mut running_background_poll_results = 0usize;
-        let mut actionable_poll_results = 0usize;
-        let mut wait_flavored_results = 0usize;
+        let mut tool_observations = ToolObservations::default();
         self.set_turn_phase(TurnPhase::Tools);
         let mut tool_progress_labels: Vec<ToolProgressLabel> = Vec::new();
         let mut plan_changed_this_batch = false;
@@ -813,7 +809,8 @@ impl crate::Agent {
                         .await;
                     if decision != ConfirmationResult::Approved {
                         if decision == ConfirmationResult::Parked {
-                            self.note_approval_parked(ui);
+                            let parked = self.note_approval_parked_async(ui).await;
+                            terminals.guard(ui, parked)?;
                         }
                         ui.tool_call_id(id, name, arguments);
                         let (msg, status) = parked_or_denied_shell(&decision);
@@ -900,6 +897,14 @@ impl crate::Agent {
                 if workspace_operation_requires_settlement(name, arguments) {
                     *effects_may_have_begun = true;
                 }
+                let input_revision = terminals.guard(
+                    ui,
+                    postprocess::validation_input_revision(
+                        self,
+                        std::iter::once((name.as_str(), arguments.as_str())),
+                    )
+                    .await,
+                )?;
                 let ui_ref: &mut dyn Ui = &mut *ui;
                 let lsp = self.runtime.lsp();
                 let output = execute_streaming_in_runtime_with_runner(
@@ -940,73 +945,29 @@ impl crate::Agent {
                 for change in &output.effects.file_changes {
                     batch_mutated_paths.insert(change.path.clone());
                 }
-                let error = output.status != hi_tools::ToolStatus::Succeeded;
-                let semantic_output = if error && !output.content.starts_with("Error:") {
-                    std::borrow::Cow::Owned(format!("Error: {}", output.content))
-                } else {
-                    std::borrow::Cow::Borrowed(output.content.as_str())
-                };
-                let signature = inspection_signature(name, arguments);
-                let signature_was_seen = signature_seen(evidence, &signature);
-                let tracker_before = implementation_tracker.clone();
-                let validation_succeeded = tool_satisfies_validation(name, arguments, &output);
-                evidence.record_success(name, arguments, &semantic_output);
-                implementation_tracker.record_tool_result(
-                    name,
-                    arguments,
-                    &semantic_output,
-                    validation_succeeded,
-                    output.effects.mutation_applied,
-                );
-                progress_tracker
-                    .tool_guardrail
-                    .observe_workspace_revision(self.runtime.ledger().revision());
-                let progress = progress_tracker
-                    .tool_guardrail
-                    .record_tool_result_with_effects(
-                        name,
-                        arguments,
-                        &semantic_output,
-                        output.effects.mutation_applied,
-                    );
-                if progress.running_background_poll {
-                    running_background_poll_results += 1;
-                }
-                if progress.actionable_background_output {
-                    actionable_poll_results += 1;
-                }
-                if wait_flavored_call(name, arguments, &output) {
-                    wait_flavored_results += 1;
-                }
-                if progress.hashable_idempotent {
-                    hashable_idempotent_results += 1;
-                    if progress.repeated_idempotent_result {
-                        repeated_idempotent_results += 1;
-                    }
-                }
-                let progress_label = classify_tool_progress(
-                    name,
-                    arguments,
-                    &semantic_output,
-                    error,
-                    validation_succeeded,
-                    signature,
-                    signature_was_seen,
-                    progress.repeated_idempotent_result,
-                    &tracker_before,
-                    false,
-                    self.runtime.root(),
-                );
-                progress_tracker.record_tool(&progress_label);
-                tool_progress_labels.push(progress_label.clone());
-                tool_timeline.push(tool_entry_with_args(
-                    name.clone(),
-                    path,
-                    duration_ms,
-                    &output,
-                    &progress_label,
-                    arguments,
-                ));
+                terminals.guard(
+                    ui,
+                    tool_observations
+                        .record(
+                            self,
+                            CompletedTool {
+                                index: i,
+                                name,
+                                arguments,
+                                output: &output,
+                                input_revision: input_revision.as_deref(),
+                                path,
+                                duration_ms,
+                                plan_changed: false,
+                            },
+                            evidence,
+                            implementation_tracker,
+                            progress_tracker,
+                            &mut tool_progress_labels,
+                            tool_timeline,
+                        )
+                        .await,
+                )?;
                 terminals.emit(&mut *ui, id, name, &output);
                 append_tool_images(&output, &mut vision);
                 results[i] = Some((id.clone(), output.content));
@@ -1120,64 +1081,29 @@ impl crate::Agent {
                         duration_ms,
                         &finish_summary,
                     );
-                    let error = output.status != hi_tools::ToolStatus::Succeeded;
-                    let semantic_output = if error && !output.content.starts_with("Error:") {
-                        std::borrow::Cow::Owned(format!("Error: {}", output.content))
-                    } else {
-                        std::borrow::Cow::Borrowed(output.content.as_str())
-                    };
-                    let signature = inspection_signature("explore", arguments);
-                    let signature_was_seen = signature_seen(evidence, &signature);
-                    let tracker_before = implementation_tracker.clone();
-                    let validation_succeeded =
-                        tool_satisfies_validation("explore", arguments, &output);
-                    evidence.record_success("explore", arguments, &semantic_output);
-                    implementation_tracker.record_tool_result(
-                        "explore",
-                        arguments,
-                        &semantic_output,
-                        validation_succeeded,
-                        output.effects.mutation_applied,
-                    );
-                    progress_tracker
-                        .tool_guardrail
-                        .observe_workspace_revision(self.runtime.ledger().revision());
-                    let progress = progress_tracker
-                        .tool_guardrail
-                        .record_tool_result_with_effects(
-                            "explore",
-                            arguments,
-                            &semantic_output,
-                            output.effects.mutation_applied,
-                        );
-                    if progress.hashable_idempotent {
-                        hashable_idempotent_results += 1;
-                        if progress.repeated_idempotent_result {
-                            repeated_idempotent_results += 1;
-                        }
-                    }
-                    let progress_label = classify_tool_progress(
-                        "explore",
-                        arguments,
-                        &semantic_output,
-                        error,
-                        validation_succeeded,
-                        signature,
-                        signature_was_seen,
-                        progress.repeated_idempotent_result,
-                        &tracker_before,
-                        false,
-                        self.runtime.root(),
-                    );
-                    progress_tracker.record_tool(&progress_label);
-                    tool_progress_labels.push(progress_label.clone());
-                    tool_timeline.push(tool_entry(
-                        "explore".to_string(),
-                        String::new(),
-                        duration_ms,
-                        &output,
-                        &progress_label,
-                    ));
+                    terminals.guard(
+                        ui,
+                        tool_observations
+                            .record(
+                                self,
+                                CompletedTool {
+                                    index: i,
+                                    name: "explore",
+                                    arguments,
+                                    output: &output,
+                                    input_revision: None,
+                                    path: String::new(),
+                                    duration_ms,
+                                    plan_changed: false,
+                                },
+                                evidence,
+                                implementation_tracker,
+                                progress_tracker,
+                                &mut tool_progress_labels,
+                                tool_timeline,
+                            )
+                            .await,
+                    )?;
                     terminals.emit(&mut *ui, id, "explore", &output);
                     append_tool_images(&output, &mut vision);
                     results[i] = Some((id.clone(), output.content));
@@ -1349,72 +1275,29 @@ impl crate::Agent {
                         let output = self
                             .finish_delegate(result, ledger_rev, &mut *ui, duration_ms)
                             .await;
-                        let error = output.status != hi_tools::ToolStatus::Succeeded;
-                        let semantic_output = if error && !output.content.starts_with("Error:") {
-                            std::borrow::Cow::Owned(format!("Error: {}", output.content))
-                        } else {
-                            std::borrow::Cow::Borrowed(output.content.as_str())
-                        };
-                        let signature = inspection_signature("delegate", arguments);
-                        let signature_was_seen = signature_seen(evidence, &signature);
-                        let tracker_before = implementation_tracker.clone();
-                        let validation_succeeded =
-                            tool_satisfies_validation("delegate", arguments, &output);
-                        evidence.record_success("delegate", arguments, &semantic_output);
-                        implementation_tracker.record_tool_result(
-                            "delegate",
-                            arguments,
-                            &semantic_output,
-                            validation_succeeded,
-                            output.effects.mutation_applied,
-                        );
-                        progress_tracker
-                            .tool_guardrail
-                            .observe_workspace_revision(self.runtime.ledger().revision());
-                        let progress = progress_tracker
-                            .tool_guardrail
-                            .record_tool_result_with_effects(
-                                "delegate",
-                                arguments,
-                                &semantic_output,
-                                output.effects.mutation_applied,
-                            );
-                        if progress.hashable_idempotent {
-                            hashable_idempotent_results += 1;
-                            if progress.repeated_idempotent_result {
-                                repeated_idempotent_results += 1;
-                            }
-                        }
-                        let progress_label = if output.effects.mutation_applied {
-                            ToolProgressLabel::new(
-                                ProgressKind::Meaningful,
-                                "successful delegated mutation",
-                                signature,
-                            )
-                        } else {
-                            classify_tool_progress(
-                                "delegate",
-                                arguments,
-                                &semantic_output,
-                                error,
-                                validation_succeeded,
-                                signature,
-                                signature_was_seen,
-                                progress.repeated_idempotent_result,
-                                &tracker_before,
-                                false,
-                                self.runtime.root(),
-                            )
-                        };
-                        progress_tracker.record_tool(&progress_label);
-                        tool_progress_labels.push(progress_label.clone());
-                        tool_timeline.push(tool_entry(
-                            "delegate".to_string(),
-                            String::new(),
-                            duration_ms,
-                            &output,
-                            &progress_label,
-                        ));
+                        terminals.guard(
+                            ui,
+                            tool_observations
+                                .record(
+                                    self,
+                                    CompletedTool {
+                                        index: i,
+                                        name: "delegate",
+                                        arguments,
+                                        output: &output,
+                                        input_revision: None,
+                                        path: String::new(),
+                                        duration_ms,
+                                        plan_changed: false,
+                                    },
+                                    evidence,
+                                    implementation_tracker,
+                                    progress_tracker,
+                                    &mut tool_progress_labels,
+                                    tool_timeline,
+                                )
+                                .await,
+                        )?;
                         terminals.emit(&mut *ui, id, "delegate", &output);
                         append_tool_images(&output, &mut vision);
                         results[i] = Some((id.clone(), output.content));
@@ -1481,7 +1364,8 @@ impl crate::Agent {
                     .await;
                         if decision != ConfirmationResult::Approved {
                             if decision == ConfirmationResult::Parked {
-                                self.note_approval_parked(ui);
+                                let parked = self.note_approval_parked_async(ui).await;
+                                terminals.guard(ui, parked)?;
                             }
                             ui.tool_call_id(id, name, arguments);
                             let (msg, status) = parked_or_denied_delegate(&decision);
@@ -1578,7 +1462,7 @@ impl crate::Agent {
                     "block_step" => self.handle_block_step(arguments),
                     "ask_user" => self.handle_ask_user(arguments, &mut *ui).await,
                     "new_context" => self.handle_new_context(),
-                    _ => self.handle_record_decision(arguments),
+                    _ => self.handle_record_decision(arguments).await,
                 };
                 let duration_ms = started.elapsed().as_millis() as u64;
                 if name == "delegate" {
@@ -1586,71 +1470,29 @@ impl crate::Agent {
                     // delegate paths before returning its typed outcome.
                     self.invalidate_snapshot();
                 }
-                let error = output.status != hi_tools::ToolStatus::Succeeded;
-                let semantic_output = if error && !output.content.starts_with("Error:") {
-                    std::borrow::Cow::Owned(format!("Error: {}", output.content))
-                } else {
-                    std::borrow::Cow::Borrowed(output.content.as_str())
-                };
-                let signature = inspection_signature(name, arguments);
-                let signature_was_seen = signature_seen(evidence, &signature);
-                let tracker_before = implementation_tracker.clone();
-                let validation_succeeded = tool_satisfies_validation(name, &calls[i].2, &output);
-                evidence.record_success(name, arguments, &semantic_output);
-                implementation_tracker.record_tool_result(
-                    name,
-                    arguments,
-                    &semantic_output,
-                    validation_succeeded,
-                    output.effects.mutation_applied,
-                );
-                progress_tracker
-                    .tool_guardrail
-                    .observe_workspace_revision(self.runtime.ledger().revision());
-                let progress = progress_tracker
-                    .tool_guardrail
-                    .record_tool_result_with_effects(
-                        name,
-                        arguments,
-                        &semantic_output,
-                        output.effects.mutation_applied,
-                    );
-                if progress.hashable_idempotent {
-                    hashable_idempotent_results += 1;
-                    if progress.repeated_idempotent_result {
-                        repeated_idempotent_results += 1;
-                    }
-                }
-                let progress_label = if output.effects.mutation_applied {
-                    ToolProgressLabel::new(
-                        ProgressKind::Meaningful,
-                        "successful delegated mutation",
-                        signature,
-                    )
-                } else {
-                    classify_tool_progress(
-                        name,
-                        arguments,
-                        &semantic_output,
-                        error,
-                        validation_succeeded,
-                        signature,
-                        signature_was_seen,
-                        progress.repeated_idempotent_result,
-                        &tracker_before,
-                        false,
-                        self.runtime.root(),
-                    )
-                };
-                progress_tracker.record_tool(&progress_label);
-                tool_progress_labels.push(progress_label.clone());
-                tool_timeline.push(tool_entry(
-                    name.clone(),
-                    String::new(),
-                    duration_ms,
-                    &output,
-                    &progress_label,
-                ));
+                terminals.guard(
+                    ui,
+                    tool_observations
+                        .record(
+                            self,
+                            CompletedTool {
+                                index: i,
+                                name,
+                                arguments,
+                                output: &output,
+                                input_revision: None,
+                                path: String::new(),
+                                duration_ms,
+                                plan_changed: false,
+                            },
+                            evidence,
+                            implementation_tracker,
+                            progress_tracker,
+                            &mut tool_progress_labels,
+                            tool_timeline,
+                        )
+                        .await,
+                )?;
                 terminals.emit(&mut *ui, id, name, &output);
                 append_tool_images(&output, &mut vision);
                 results[i] = Some((id.clone(), output.content));
@@ -1776,7 +1618,8 @@ impl crate::Agent {
                             .await;
                         if decision != ConfirmationResult::Approved {
                             if decision == ConfirmationResult::Parked {
-                                self.note_approval_parked(ui);
+                                let parked = self.note_approval_parked_async(ui).await;
+                                terminals.guard(ui, parked)?;
                             } else if decision == ConfirmationResult::Unavailable {
                                 ui.status("confirmation required, but this frontend cannot answer it; rerun interactively or disable --confirm-edits");
                             }
@@ -1798,7 +1641,8 @@ impl crate::Agent {
                             .await;
                         if decision != ConfirmationResult::Approved {
                             if decision == ConfirmationResult::Parked {
-                                self.note_approval_parked(ui);
+                                let parked = self.note_approval_parked_async(ui).await;
+                                terminals.guard(ui, parked)?;
                             } else if decision == ConfirmationResult::Unavailable {
                                 ui.status("confirmation required, but this frontend cannot answer it; rerun interactively or disable --confirm-edits");
                             }
@@ -1840,6 +1684,16 @@ impl crate::Agent {
             let state_root = self.runtime.state_root().to_path_buf();
             let lsp = self.runtime.lsp();
             let process_runner = self.runtime.process_runner().clone();
+            let input_revision = terminals.guard(
+                ui,
+                postprocess::validation_input_revision(
+                    self,
+                    approved
+                        .iter()
+                        .map(|&i| (calls[i].1.as_str(), calls[i].2.as_str())),
+                )
+                .await,
+            )?;
             let executions = approved
                 .iter()
                 .map(|&i| {
@@ -2040,79 +1894,35 @@ impl crate::Agent {
                 for change in &output.effects.file_changes {
                     batch_mutated_paths.insert(change.path.clone());
                 }
-                let error = output.status != hi_tools::ToolStatus::Succeeded;
-                let semantic_output = if error && !output.content.starts_with("Error:") {
-                    std::borrow::Cow::Owned(format!("Error: {}", output.content))
-                } else {
-                    std::borrow::Cow::Borrowed(output.content.as_str())
-                };
-                let signature = inspection_signature(name, &calls[i].2);
-                let signature_was_seen = signature_seen(evidence, &signature);
-                let tracker_before = implementation_tracker.clone();
-                let validation_succeeded = tool_satisfies_validation(name, &calls[i].2, &output);
                 let plan_changed = calls[i].1 == "update_plan"
                     && output
                         .plan
                         .as_deref()
                         .is_some_and(|plan| self.goals.plan() != plan);
                 plan_changed_this_batch |= plan_changed;
-                evidence.record_success(name, &calls[i].2, &semantic_output);
-                implementation_tracker.record_tool_result(
-                    name,
-                    &calls[i].2,
-                    &semantic_output,
-                    validation_succeeded,
-                    output.effects.mutation_applied,
-                );
-                progress_tracker
-                    .tool_guardrail
-                    .observe_workspace_revision(self.runtime.ledger().revision());
-                let progress = progress_tracker
-                    .tool_guardrail
-                    .record_tool_result_with_effects(
-                        name,
-                        &calls[i].2,
-                        &semantic_output,
-                        output.effects.mutation_applied,
-                    );
-                if progress.running_background_poll {
-                    running_background_poll_results += 1;
-                }
-                if progress.actionable_background_output {
-                    actionable_poll_results += 1;
-                }
-                if wait_flavored_call(name, &calls[i].2, &output) {
-                    wait_flavored_results += 1;
-                }
-                if progress.hashable_idempotent {
-                    hashable_idempotent_results += 1;
-                    if progress.repeated_idempotent_result {
-                        repeated_idempotent_results += 1;
-                    }
-                }
-                let progress_label = classify_tool_progress(
-                    name,
-                    &calls[i].2,
-                    &semantic_output,
-                    error,
-                    validation_succeeded,
-                    signature,
-                    signature_was_seen,
-                    progress.repeated_idempotent_result,
-                    &tracker_before,
-                    plan_changed,
-                    self.runtime.root(),
-                );
-                progress_tracker.record_tool(&progress_label);
-                tool_progress_labels.push(progress_label.clone());
-                tool_timeline.push(tool_entry_with_args(
-                    name.clone(),
-                    path,
-                    batch_duration_ms,
-                    &output,
-                    &progress_label,
-                    &calls[i].2,
-                ));
+                terminals.guard(
+                    ui,
+                    tool_observations
+                        .record(
+                            self,
+                            CompletedTool {
+                                index: i,
+                                name,
+                                arguments: &calls[i].2,
+                                output: &output,
+                                input_revision: input_revision.as_deref(),
+                                path,
+                                duration_ms: batch_duration_ms,
+                                plan_changed,
+                            },
+                            evidence,
+                            implementation_tracker,
+                            progress_tracker,
+                            &mut tool_progress_labels,
+                            tool_timeline,
+                        )
+                        .await,
+                )?;
                 terminals.emit(&mut *ui, &calls[i].0, name, &output);
                 append_tool_images(&output, &mut vision);
                 results[i] = Some((calls[i].0.clone(), output.content));
@@ -2123,15 +1933,17 @@ impl crate::Agent {
                 if calls[i].1 == "update_plan"
                     && let Some(plan) = output.plan.as_deref()
                 {
-                    if let Some(session) = self.session.as_mut() {
-                        if plan_has_pending_steps(plan) {
-                            terminals.guard(ui, session.record_plan(plan))?;
-                        } else {
-                            // Keep the completed checklist visible for this live
-                            // turn, but do not resurrect it after a restart.
-                            terminals.guard(ui, session.clear_plan())?;
-                        }
-                    }
+                    let durable_plan = plan.to_vec();
+                    let persistence = self
+                        .write_session(move |session| {
+                            if plan_has_pending_steps(&durable_plan) {
+                                session.record_plan(&durable_plan)
+                            } else {
+                                session.clear_plan()
+                            }
+                        })
+                        .await;
+                    terminals.guard(ui, persistence)?;
                     // Publish live state only after its durable write succeeds.
                     // Otherwise an I/O error leaves this process showing a new
                     // plan while restart restores the old one.
@@ -2176,6 +1988,11 @@ impl crate::Agent {
                         && let Some(path) = hi_tools::target_path(&calls[i].1, &calls[i].2)
                         && let Some(cmd) = hi_tools::fast_check_for(&path)
                     {
+                        let input_revision =
+                            crate::agent::turn::fast_feedback_observations::input_revision(
+                                &self.runtime,
+                            )
+                            .await;
                         let root = self.runtime.root().to_path_buf();
                         let check = cmd.to_string();
                         let check_label = check.clone();
@@ -2183,11 +2000,12 @@ impl crate::Agent {
                         let handle = tokio::spawn(async move {
                             hi_tools::run_fast_check_in(&root, &check, &check_path).await
                         });
-                        pending_checks.push((
+                        pending_checks.push(PendingCheck {
                             path,
-                            check_label,
-                            tokio_util::task::AbortOnDropHandle::new(handle),
-                        ));
+                            check: check_label,
+                            input_revision,
+                            handle: tokio_util::task::AbortOnDropHandle::new(handle),
+                        });
                     }
                 }
                 completed[i] = true;
@@ -2251,7 +2069,7 @@ impl crate::Agent {
         }
         let reconcile_after_feedback =
             !pending_checks.is_empty() || !batch_mutated_paths.is_empty();
-        append_fast_feedback(
+        let feedback_result = append_fast_feedback(
             self,
             calls,
             pending_checks,
@@ -2264,6 +2082,7 @@ impl crate::Agent {
             ui,
         )
         .await;
+        terminals.guard(ui, feedback_result)?;
         let feedback_changes = if reconcile_after_feedback && allow_process_feedback {
             terminals.guard(ui, self.runtime.reconcile_ledger_async().await)?
         } else {
@@ -2314,11 +2133,11 @@ impl crate::Agent {
             calls: calls.to_vec(),
             read_only_intent,
             hash_guard_applies,
-            hashable_idempotent_results,
-            repeated_idempotent_results,
-            running_background_poll_results,
-            actionable_poll_results,
-            wait_flavored_results,
+            hashable_idempotent_results: tool_observations.hashable_idempotent_results,
+            repeated_idempotent_results: tool_observations.repeated_idempotent_results,
+            running_background_poll_results: tool_observations.running_background_poll_results,
+            actionable_poll_results: tool_observations.actionable_poll_results,
+            wait_flavored_results: tool_observations.wait_flavored_results,
             tool_progress_labels,
             plan_changed_this_batch,
             interrupted_calls,
@@ -2355,6 +2174,8 @@ impl crate::Agent {
         tool_specs: &[hi_ai::ToolSpec],
         tool_envelope: &hi_tools::envelope::ToolEnvelope,
         read_only_intent: Option<crate::steering::ReviewIntent>,
+        evidence_tracker: &mut EvidenceTracker,
+        implementation_tracker: &mut ImplementationTracker,
         progress_tracker: &mut ProgressTracker,
         tool_timeline: &mut ToolTimeline,
         sched_tool_calls: &mut u32,
@@ -2366,6 +2187,7 @@ impl crate::Agent {
         ui: &mut dyn Ui,
     ) -> Result<ToolBatchOutcome> {
         let started = std::time::Instant::now();
+        let mut completed_program_tools = Vec::new();
         let mut program_fallback_exhausted = false;
         let (program_index, (id, _, arguments)) = calls
             .iter()
@@ -2469,9 +2291,10 @@ impl crate::Agent {
                                     speculation_registry,
                                     remaining_calls,
                                     tool_envelope,
+                                    &mut completed_program_tools,
                                     ui,
                                 )
-                                .await;
+                                .await?;
                             speculation_registry.cancel_all();
                             if !terminal_backgrounds.is_empty() {
                                 speculation_registry.invalidate_all();
@@ -2581,12 +2404,10 @@ impl crate::Agent {
                 program_effect_may_have_occurred,
             );
             let results = vec![(id.clone(), content.clone())];
-            if let Err(stage_error) = self.stage_visible_workspace_execution(
-                calls,
-                completion_content,
-                &results,
-                &execution,
-            ) {
+            if let Err(stage_error) = self
+                .stage_visible_workspace_execution(calls, completion_content, &results, &execution)
+                .await
+            {
                 let mut indeterminate = execution;
                 indeterminate.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
                 indeterminate.detail = Some(format!(
@@ -2612,23 +2433,56 @@ impl crate::Agent {
         output.truncation = truncation;
         ui.tool_call_id(id, "run_program", arguments);
         emit_tool_output(&mut *ui, id, "run_program", &output);
-        let label = ToolProgressLabel::new(
-            if outer_status == hi_tools::ToolStatus::Succeeded {
-                ProgressKind::Meaningful
-            } else {
-                ProgressKind::Weak
-            },
-            "program execution",
-            inspection_signature("run_program", arguments),
-        );
-        progress_tracker.record_tool(&label);
-        tool_timeline.push(tool_entry(
-            "run_program".into(),
-            String::new(),
-            started.elapsed().as_millis() as u64,
-            &output,
-            &label,
-        ));
+        let mut observations = ToolObservations::default();
+        let mut labels = Vec::new();
+        for (call, nested_output) in completed_program_tools {
+            let arguments = serde_json::to_string(&call.arguments)?;
+            observations
+                .record(
+                    self,
+                    CompletedTool {
+                        index: call.occurrence,
+                        name: &call.name,
+                        arguments: &arguments,
+                        output: &nested_output,
+                        input_revision: None,
+                        path: hi_tools::target_path(&call.name, &arguments).unwrap_or_default(),
+                        duration_ms: nested_output
+                            .process
+                            .as_ref()
+                            .map_or(0, |process| process.duration_ms),
+                        plan_changed: false,
+                    },
+                    evidence_tracker,
+                    implementation_tracker,
+                    progress_tracker,
+                    &mut labels,
+                    tool_timeline,
+                )
+                .await?;
+        }
+        // The envelope supplies no independent evidence. Real nested calls
+        // determine progress; an empty successful program cannot buy recovery.
+        observations
+            .record(
+                self,
+                CompletedTool {
+                    index: usize::MAX,
+                    name: "run_program",
+                    arguments,
+                    output: &output,
+                    input_revision: None,
+                    path: String::new(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    plan_changed: false,
+                },
+                evidence_tracker,
+                implementation_tracker,
+                progress_tracker,
+                &mut labels,
+                tool_timeline,
+            )
+            .await?;
         let nested_calls = match &outcome {
             ProgramOutcome::Succeeded { calls, .. }
             | ProgramOutcome::Failed { calls, .. }
@@ -2650,12 +2504,12 @@ impl crate::Agent {
             calls: calls.to_vec(),
             read_only_intent,
             hash_guard_applies: false,
-            hashable_idempotent_results: 0,
-            repeated_idempotent_results: 0,
-            running_background_poll_results: 0,
-            actionable_poll_results: 0,
-            wait_flavored_results: 0,
-            tool_progress_labels: vec![label],
+            hashable_idempotent_results: observations.hashable_idempotent_results,
+            repeated_idempotent_results: observations.repeated_idempotent_results,
+            running_background_poll_results: observations.running_background_poll_results,
+            actionable_poll_results: observations.actionable_poll_results,
+            wait_flavored_results: observations.wait_flavored_results,
+            tool_progress_labels: labels,
             plan_changed_this_batch: false,
             interrupted_calls: usize::from(outer_status == hi_tools::ToolStatus::Cancelled),
             interrupted_coordination_calls: 0,
@@ -2738,6 +2592,10 @@ impl crate::Agent {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host shares sealed request, UI, and exact completed-tool observations"
+    )]
     async fn run_program_host(
         &mut self,
         source: String,
@@ -2745,8 +2603,9 @@ impl crate::Agent {
         speculation_registry: &SpeculationRegistry,
         max_calls: Option<usize>,
         tool_envelope: &hi_tools::envelope::ToolEnvelope,
+        completed_tools: &mut Vec<(ProgramCall, hi_tools::ToolOutcome)>,
         ui: &mut dyn Ui,
-    ) -> (ProgramOutcome, bool, BTreeSet<String>) {
+    ) -> Result<(ProgramOutcome, bool, BTreeSet<String>)> {
         let tool_specs = tool_envelope.program_specs();
         let cancel = CancellationToken::new();
         let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2783,7 +2642,7 @@ impl crate::Agent {
                             Ok(outcome) => outcome,
                             Err(error) => ProgramOutcome::Failed { error: format!("program worker failed: {error}"), calls: Vec::new() },
                         };
-                        break (outcome, mutated_workspace, terminal_backgrounds);
+                        break Ok((outcome, mutated_workspace, terminal_backgrounds));
                     }
                     request = host_rx.recv() => {
                         let Some(request) = request else {
@@ -2798,13 +2657,13 @@ impl crate::Agent {
                                     calls: Vec::new(),
                                 },
                             };
-                            break (outcome, mutated_workspace, terminal_backgrounds);
+                            break Ok((outcome, mutated_workspace, terminal_backgrounds));
                         };
                         match request {
                             ProgramHostRequest::ExecuteTool { call, reply } => {
                                 let authorized = self
                                     .authorize_program_call(&call, &tool_specs, tool_envelope, ui)
-                                    .await;
+                                    .await?;
                                 let mutates = authorized.is_none()
                                     && self.program_call_requires_settlement(&call);
                                 mutated_workspace |= mutates;
@@ -2824,6 +2683,7 @@ impl crate::Agent {
                                 terminal_backgrounds.extend(terminal);
                                 ui.tool_call_id(&format!("program:{}", call.occurrence), &call.name, &serde_json::to_string(&call.arguments).unwrap_or_default());
                                 emit_tool_output(ui, &format!("program:{}", call.occurrence), &call.name, &output);
+                                completed_tools.push((call, output));
                                 let _ = reply.send(result);
                             }
                             ProgramHostRequest::ParallelTools { calls, reply } => {
@@ -2840,7 +2700,7 @@ impl crate::Agent {
                                             tool_envelope,
                                             ui,
                                         )
-                                        .await;
+                                        .await?;
                                     authorized_calls.push((call, denied));
                                 }
                                 let agent = &*self;
@@ -2904,11 +2764,11 @@ impl crate::Agent {
                                     let args = serde_json::to_string(&call.arguments).unwrap_or_default();
                                     ui.tool_call_id(&nested_id, &call.name, &args);
                                     emit_tool_output(ui, &nested_id, &call.name, &output);
+                                    completed_tools.push((call, output));
                                     match result {
                                         Ok(value) => results.push(value),
                                         Err(error) => {
-                                            parallel_error = Some(error);
-                                            break;
+                                            parallel_error.get_or_insert(error);
                                         }
                                     }
                                 }
@@ -3004,27 +2864,29 @@ impl crate::Agent {
         tool_specs: &[hi_ai::ToolSpec],
         tool_envelope: &hi_tools::envelope::ToolEnvelope,
         ui: &mut dyn Ui,
-    ) -> Option<(
-        std::result::Result<hi_workflow::ProgramToolResult, String>,
-        hi_tools::ToolOutcome,
-    )> {
+    ) -> Result<
+        Option<(
+            std::result::Result<hi_workflow::ProgramToolResult, String>,
+            hi_tools::ToolOutcome,
+        )>,
+    > {
         let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
         if !tool_envelope.digest_is_valid()
             || !tool_envelope.matches_program_specs(tool_specs)
             || !tool_envelope.admits_program(&call.name)
         {
-            return Some(program_denied_result(
+            return Ok(Some(program_denied_result(
                 call,
                 format!(
                     "tool `{}` is outside the model request's sealed envelope {}",
                     call.name, tool_envelope.digest
                 ),
-            ));
+            )));
         }
         if let Some(message) =
             sealed_workspace_staleness(tool_envelope, &self.workspace_controller_binding())
         {
-            return Some(program_denied_result(call, message));
+            return Ok(Some(program_denied_result(call, message)));
         }
         if let Err(error) = hi_ai::validate_client_tool_call_with_limit(
             &format!("program_{}", call.occurrence),
@@ -3033,33 +2895,36 @@ impl crate::Agent {
             tool_specs,
             tool_envelope.payload.limits.max_tool_argument_bytes as usize,
         ) {
-            return Some(program_denied_result(call, error.to_string()));
+            return Ok(Some(program_denied_result(call, error.to_string())));
         }
         if let Some(reason) = execution_mode_denial(
             tool_envelope.payload.execution_mode,
             self.effective_tool_mode(),
             &call.name,
         ) {
-            return Some(program_denied_result(call, reason));
+            return Ok(Some(program_denied_result(call, reason)));
         }
         if !egress_confirm_required(
             self.permission_mode,
             self.config.gates.confirm_edits,
             &call.name,
         ) {
-            return None;
+            return Ok(None);
         }
         if self.approval_parked {
-            return Some(program_denied_result(call, PARKED_TOOL_RESULT.to_string()));
+            return Ok(Some(program_denied_result(
+                call,
+                PARKED_TOOL_RESULT.to_string(),
+            )));
         }
         let decision = ui
             .confirm(confirmation_for_egress_tool(&call.name, &arguments))
             .await;
         if decision == ConfirmationResult::Approved {
-            return None;
+            return Ok(None);
         }
         if decision == ConfirmationResult::Parked {
-            self.note_approval_parked(ui);
+            self.note_approval_parked_async(ui).await?;
         } else if decision == ConfirmationResult::Unavailable {
             ui.status("confirmation required, but this frontend cannot answer it; rerun interactively or disable --confirm-edits");
         }
@@ -3070,7 +2935,7 @@ impl crate::Agent {
             }
             _ => "External tool call denied by confirmation.".to_string(),
         };
-        Some(program_denied_result(call, message))
+        Ok(Some(program_denied_result(call, message)))
     }
 
     fn program_call_requires_settlement(&self, call: &ProgramCall) -> bool {

@@ -192,7 +192,7 @@ impl crate::Agent {
                 ui.status(status);
                 Ok(false)
             }
-            Ok(PreparedCompaction::NoChange(status)) => self
+            Ok(PreparedCompaction::NoChange(status)) => match self
                 .publish_prepared_compaction(
                     &job_id,
                     source_revision,
@@ -200,12 +200,16 @@ impl crate::Agent {
                     status.to_owned(),
                     false,
                 )
-                .map(|publication| self.finish_compaction_publication(publication, ui)),
+                .await
+            {
+                Ok(publication) => self.finish_compaction_publication(publication, ui).await,
+                Err(error) => Err(error),
+            },
             Ok(PreparedCompaction::Replace {
                 messages,
                 status,
                 fresh_window,
-            }) => self
+            }) => match self
                 .publish_prepared_compaction(
                     &job_id,
                     source_revision,
@@ -213,7 +217,11 @@ impl crate::Agent {
                     status,
                     fresh_window,
                 )
-                .map(|publication| self.finish_compaction_publication(publication, ui)),
+                .await
+            {
+                Ok(publication) => self.finish_compaction_publication(publication, ui).await,
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
 
@@ -358,7 +366,7 @@ impl crate::Agent {
         })
     }
 
-    fn publish_prepared_compaction(
+    async fn publish_prepared_compaction(
         &mut self,
         job_id: &JobId,
         source_revision: ImmutableSessionRevision,
@@ -383,14 +391,12 @@ impl crate::Agent {
                 current: current_revision.digest,
             }),
             TranscriptCompactionClaim::Current { messages, .. } => {
-                // No await is permitted between the revision claim above and
-                // these two writes. The exclusive Agent borrow prevents a
-                // concurrent transcript event from crossing the boundary.
-                if let Some(session) = self.session.as_mut() {
-                    session
-                        .record_compaction(&messages)
-                        .context("persisting the speculative compaction boundary")?;
-                }
+                // Hold the exclusive Agent borrow across commit so no live
+                // transcript event can overtake this claimed revision.
+                let durable_messages = messages.clone();
+                self.write_session(move |session| session.record_compaction(&durable_messages))
+                    .await
+                    .context("persisting the speculative compaction boundary")?;
                 self.messages.replace_all(messages);
                 self.persisted = self.messages.len();
                 Ok(CompactionPublication::Committed {
@@ -401,11 +407,11 @@ impl crate::Agent {
         }
     }
 
-    fn finish_compaction_publication(
+    async fn finish_compaction_publication(
         &mut self,
         publication: CompactionPublication,
         ui: &mut dyn Ui,
-    ) -> bool {
+    ) -> Result<bool> {
         match publication {
             CompactionPublication::Committed {
                 fresh_window,
@@ -413,16 +419,16 @@ impl crate::Agent {
             } => {
                 self.runtime.invalidate_context_after_compaction();
                 if fresh_window {
-                    self.finish_fresh_window_compaction();
+                    self.finish_fresh_window_compaction_async().await?;
                 }
                 ui.status(&status);
-                false
+                Ok(false)
             }
             CompactionPublication::Stale { source, current } => {
                 ui.status(&format!(
                     "compaction result discarded because the session advanced ({source} -> {current})"
                 ));
-                true
+                Ok(true)
             }
         }
     }

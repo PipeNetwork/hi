@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use super::plan_input::handle_working_plan_approval_key;
 use super::{ChordPipeline, reconcile_queue_with_interjections, run_chord_pipeline};
 use crate::event::{ConfirmationControl, UiEvent};
-use crate::{App, TurnState, dim, watchdog_stuck_timeout};
+use crate::{App, TurnState, dim};
 use hi_agent::{Command, command};
 
 fn apply_ui_event(app: &mut App, event: UiEvent) {
@@ -68,53 +68,31 @@ fn drain_ui_events(app: &mut App, rx: &mut mpsc::UnboundedReceiver<UiEvent>, lim
 pub(crate) struct DriveCompletion<T> {
     pub(crate) cancelled: bool,
     pub(crate) value: Option<T>,
-    /// Narrow terminal classification retained after the TUI renders and
-    /// discards the underlying `anyhow::Error`.
-    pub(crate) failure: Option<hi_agent::TurnCleanupKind>,
+    /// This invocation's settled failure, retained after its error is rendered.
+    pub(crate) failure: Option<hi_agent::TurnOutcome>,
 }
 
-/// Turn outcomes own transcript settlement. A typed cancellation rewinds
-/// consumed steering, while completed/blocked/failed turns keep their messages
-/// even if a late frontend interrupt raced their committed result.
+/// A completed turn acknowledges consumed steering. Failed, blocked or cancelled
+/// work retains queued user instructions for a fresh user turn.
 pub(crate) trait DriveResult {
     fn interjections_committed(&self, frontend_cancelled: bool) -> bool;
+    fn turn_outcome(&self) -> Option<hi_agent::TurnOutcome> {
+        None
+    }
 }
 
 impl DriveResult for hi_agent::TurnOutcome {
+    fn turn_outcome(&self) -> Option<hi_agent::TurnOutcome> {
+        Some(self.clone())
+    }
     fn interjections_committed(&self, _frontend_cancelled: bool) -> bool {
-        self.status != hi_agent::TurnStatus::Cancelled
+        self.status == hi_agent::TurnStatus::Completed
     }
 }
 
 impl DriveResult for () {
     fn interjections_committed(&self, frontend_cancelled: bool) -> bool {
         !frontend_cancelled
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TurnCancellationSettlement {
-    /// The frontend should present cancellation and, if needed, clean up.
-    pub(crate) cancelled: bool,
-    /// The agent returned its typed Cancelled outcome and already performed
-    /// rollback/cleanup; the frontend must not repeat either operation.
-    pub(crate) agent_already_cleaned: bool,
-}
-
-/// Resolve a cancel-key/result race. A committed result that wins before the
-/// cancellation token is observed remains committed. Only an explicit
-/// frontend cancellation may use the no-result fallback: an internal hard
-/// timeout can also leave the token set while returning the turn body's
-/// original error, which must retain failure (rather than rollback) semantics.
-pub(crate) fn settle_turn_cancellation(
-    frontend_cancel_requested: bool,
-    token_cancelled: bool,
-    status: Option<hi_agent::TurnStatus>,
-) -> TurnCancellationSettlement {
-    let agent_already_cleaned = token_cancelled && status == Some(hi_agent::TurnStatus::Cancelled);
-    TurnCancellationSettlement {
-        cancelled: agent_already_cleaned || (frontend_cancel_requested && status.is_none()),
-        agent_already_cleaned,
     }
 }
 
@@ -150,7 +128,7 @@ pub(crate) async fn drive<T, B>(
     mut rx: mpsc::UnboundedReceiver<UiEvent>,
     mut confirmations: mpsc::UnboundedReceiver<ConfirmationControl>,
     fut: impl std::future::Future<Output = Result<T>>,
-    expect_turn_end: bool,
+    _expect_turn_end: bool,
     // When set, plain-text lines submitted while the turn runs are injected
     // into the *current* turn (mid-turn steering) instead of queued for the
     // next one. Slash-commands always queue.
@@ -180,9 +158,6 @@ where
     let mut value = None;
     let mut failure = None;
     let mut last_activity = Instant::now();
-    let mut watchdog_stuck = false;
-    let mut input_closed = false;
-    let watchdog_timeout = watchdog_stuck_timeout();
     let mut pending_confirmation: Option<ConfirmationControl> = None;
     let mut confirm_queue: std::collections::VecDeque<ConfirmationControl> =
         std::collections::VecDeque::new();
@@ -199,6 +174,7 @@ where
             flag.store(true, std::sync::atomic::Ordering::Release);
         }
     };
+    let frontend_result: Result<()> = async {
     loop {
         app.check_tui_event_trace()?;
         // After a cancel request with a shared TurnCancellation, keep the
@@ -237,11 +213,11 @@ where
                 match result {
                     Ok(result) => value = Some(result),
                     Err(err) => {
-                        failure = Some(hi_agent::TurnCleanupKind::for_error(&err));
+                        failure = err.downcast_ref::<hi_agent::TurnFailure>().map(|failure| failure.outcome.clone());
                         let (kind, guidance) = hi_agent::classify_error(&err);
                         let workspace_admission = matches!(
-                            &failure,
-                            Some(hi_agent::TurnCleanupKind::FailWithStopReason(stop_reason))
+                            hi_agent::TurnCleanupKind::for_error(&err),
+                            hi_agent::TurnCleanupKind::FailWithStopReason(stop_reason)
                                 if stop_reason.is_workspace_admission()
                         );
                         if !workspace_admission
@@ -282,16 +258,9 @@ where
                 app.drain_voice();
                 let idle = last_activity.elapsed();
                 app.waiting_for = Some(idle);
-                if expect_turn_end
-                    && !watchdog_stuck
-                    && app.current_tool.is_none()
-                    && idle >= watchdog_timeout
-                {
-                    watchdog_stuck = true;
-                    app.note_backend_waiting(idle, watchdog_timeout);
-                }
+
             },
-            maybe = input.recv(), if !input_closed => {
+            maybe = input.recv() => {
                 match maybe {
                     Some(Event::Resize(width, height)) => {
                         // Keep resize synchronization available while a turn is
@@ -700,14 +669,54 @@ where
                     Some(Event::FocusGained) => app.set_focus(true),
                     Some(Event::FocusLost) => app.set_focus(false),
                     None => {
-                        input_closed = true;
-                        signal_turn_cancel(app, &mut cancelled);
-                        if turn_cancel.is_none() {
-                            break;
-                        }
+                        anyhow::bail!("terminal input reader stopped unexpectedly; the active operation was cancelled");
                     }
                     _ => {}
                 }
+            }
+        }
+    }
+    Ok(())
+    }.await;
+    let mut frontend_error = frontend_result.err();
+    if frontend_error.is_some() {
+        signal_turn_cancel(app, &mut cancelled);
+        // Resolve outstanding prompts before driving cancellation without the
+        // failed terminal/trace/input surface. Agent owns the shared deadline.
+        if let Some(request) = pending_confirmation.take() {
+            let _ = request
+                .response
+                .send(hi_agent::ConfirmationResult::Cancelled);
+        }
+        for request in confirm_queue.drain(..) {
+            let _ = request
+                .response
+                .send(hi_agent::ConfirmationResult::Cancelled);
+        }
+        if turn_cancel.is_some() {
+            let mut cleanup_diagnostics = Vec::new();
+            let mut settlement_pending = false;
+            let settled = match (&mut fut).await {
+                Ok(result) => {
+                    let outcome = result.turn_outcome();
+                    value = Some(result);
+                    outcome
+                }
+                Err(error) => error
+                    .downcast_ref::<hi_agent::TurnFailure>()
+                    .map(|failure| {
+                        cleanup_diagnostics = failure.cleanup_diagnostics.clone();
+                        settlement_pending = failure.settlement_pending;
+                        failure.outcome.clone()
+                    }),
+            };
+            if let Some(outcome) = settled {
+                failure = Some(outcome.clone());
+                let mut receipt =
+                    hi_agent::TurnFailure::new(frontend_error.take().unwrap(), outcome);
+                receipt.cleanup_diagnostics = cleanup_diagnostics;
+                receipt.settlement_pending = settlement_pending;
+                frontend_error = Some(receipt.into());
             }
         }
     }
@@ -742,15 +751,19 @@ where
     if let Some(inbox) = interject.as_ref() {
         let committed = value
             .as_ref()
-            .is_some_and(|value| value.interjections_committed(cancelled));
+            .map(|value| value.interjections_committed(cancelled))
+            .or_else(|| {
+                failure
+                    .as_ref()
+                    .map(|outcome| outcome.status == hi_agent::TurnStatus::Completed)
+            })
+            .unwrap_or(false);
         reconcile_queue_with_interjections(app, inbox, committed);
     } else {
         app.mid_turn_offered.clear();
     }
-    if input_closed {
-        anyhow::bail!(
-            "terminal input reader stopped unexpectedly; the active operation was cancelled"
-        );
+    if let Some(error) = frontend_error {
+        return Err(error);
     }
     Ok(DriveCompletion {
         cancelled,

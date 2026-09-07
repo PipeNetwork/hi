@@ -136,6 +136,7 @@ impl ReviewRepairState {
 
 #[derive(Default)]
 pub(super) struct TurnRetryState {
+    pub(super) execution: std::sync::Arc<hi_ai::RequestExecution>,
     /// Stable across every recovery attempt for one logical model request.
     /// The OpenAI adapter includes the payload digest in its idempotency key,
     /// so payload-changing repairs can safely retain this correlation id.
@@ -194,6 +195,12 @@ impl TurnRetryState {
     pub(super) fn reset_truncation_progress(&mut self) {
         self.truncated_fragments.clear();
         self.repeated_truncations = 0;
+    }
+
+    pub(super) fn accepted_completion(&mut self) {
+        self.execution = self.execution.fresh_operation();
+        self.request_id = None;
+        self.request_attempt = 0;
     }
 
     pub(super) fn request_id(&mut self) -> String {

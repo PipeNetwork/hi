@@ -444,7 +444,7 @@ async fn empty_response_gives_up_after_retries() {
     let mut ui = RecUi::default();
     let error = agent.run_turn("hello", &mut ui).await.unwrap_err();
     assert!(
-        error.to_string().contains("no response after retrying"),
+        format!("{error:#}").contains("no response after retrying"),
         "bounded empty-response failure should remain typed: {error:#}"
     );
     assert!(

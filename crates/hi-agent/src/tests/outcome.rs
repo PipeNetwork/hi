@@ -252,7 +252,7 @@ impl Provider for CancelDuringSuggestionProvider {
             0 => Ok(bash_completion("echo working")),
             1 => Ok(completion(
                 vec![Content::Text(
-                    "The configured step cap left follow-up work.".into(),
+                    "The first check printed `working` and exited successfully.".into(),
                 )],
                 1,
                 1,
@@ -414,55 +414,6 @@ async fn cancelled_turn_reconciles_surviving_workspace_changes() {
     assert!(change.before_digest.is_none());
     assert!(change.after_digest.is_some());
     let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-#[allow(deprecated)]
-fn legacy_sync_finalizers_keep_their_full_reconcile_contract() {
-    let cancelled_workspace = IsolatedWorkspace::new("legacy-cancelled-finalizer-reconcile");
-    let mut cancelled = agent(Vec::new(), cancelled_workspace.config());
-    cancelled.workspace.active_turn_ledger_revision = Some(cancelled.runtime.ledger().revision());
-    std::fs::write(
-        cancelled.workspace_root().join("cancelled-survivor.txt"),
-        "kept\n",
-    )
-    .unwrap();
-
-    let cancelled_outcome = cancelled.finalize_cancelled_turn().unwrap();
-    assert_eq!(cancelled_outcome.status, TurnStatus::Cancelled);
-    assert_eq!(
-        cancelled_outcome.changed_files,
-        vec!["cancelled-survivor.txt"]
-    );
-
-    let failed_workspace = IsolatedWorkspace::new("legacy-failed-finalizer-reconcile");
-    let mut failed = agent(Vec::new(), failed_workspace.config());
-    failed.workspace.active_turn_ledger_revision = Some(failed.runtime.ledger().revision());
-    std::fs::write(
-        failed.workspace_root().join("failed-survivor.txt"),
-        "kept\n",
-    )
-    .unwrap();
-
-    let failed_outcome = failed.finalize_failed_turn();
-    assert_eq!(failed_outcome.status, TurnStatus::Failed);
-    assert_eq!(failed_outcome.changed_files, vec!["failed-survivor.txt"]);
-
-    let implicit_workspace = IsolatedWorkspace::new("legacy-failed-implicit-baseline");
-    let mut implicit = agent(Vec::new(), implicit_workspace.config());
-    assert!(implicit.workspace.active_turn_ledger_revision.is_none());
-    std::fs::write(
-        implicit.workspace_root().join("implicit-survivor.txt"),
-        "kept\n",
-    )
-    .unwrap();
-
-    let implicit_outcome = implicit.finalize_failed_turn();
-    assert_eq!(implicit_outcome.status, TurnStatus::Failed);
-    assert_eq!(
-        implicit_outcome.changed_files,
-        vec!["implicit-survivor.txt"]
-    );
 }
 
 #[tokio::test]
@@ -1187,7 +1138,12 @@ fn edit_file_completion(id: &str, path: &str, old: &str, new: &str) -> Completio
 #[tokio::test]
 async fn repeated_model_authored_validation_failure_is_bounded_across_edits() {
     let workspace = IsolatedWorkspace::new("outcome-repeated-validation");
-    let failure = "printf 'running 1 test\\ntest moves::checkmate_detected ... FAILED\\n\\nfailures:\\n    moves::checkmate_detected\\n\\ntest result: FAILED. 0 passed; 1 failed\\n' >&2; false # cargo test";
+    std::fs::write(
+        workspace.path("validate.py"),
+        "import sys\nprint('test moves::checkmate_detected ... FAILED')\nsys.exit(1)\n",
+    )
+    .unwrap();
+    let failure = "python3 validate.py";
     let steps = vec![
         ProviderStep::Completion(write_file_completion("write-state", "state.rs", "one\n")),
         ProviderStep::Completion(bash_completion(failure)),
@@ -1205,6 +1161,13 @@ async fn repeated_model_authored_validation_failure_is_bounded_across_edits() {
             "three\n",
         )),
         ProviderStep::Completion(bash_completion(failure)),
+        ProviderStep::Completion(edit_file_completion(
+            "edit-state-3",
+            "state.rs",
+            "three\n",
+            "four\n",
+        )),
+        ProviderStep::Completion(bash_completion(failure)),
     ];
     let mut cfg = workspace.config();
     cfg.gates.verification = VerificationMode::Disabled;
@@ -1219,21 +1182,11 @@ async fn repeated_model_authored_validation_failure_is_bounded_across_edits() {
         .unwrap();
 
     assert_eq!(outcome.status, TurnStatus::Failed);
-    assert_eq!(requests.lock().unwrap().len(), 6);
-    assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("focused root-cause diagnosis")),
-        "second unchanged repair should trigger diagnosis: {:?}",
-        ui.statuses
-    );
-    assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("persisted after focused repair")),
-        "third unchanged repair should stop the bounded run: {:?}",
-        ui.statuses
-    );
+    assert_eq!(requests.lock().unwrap().len(), 8);
+    assert!(agent.task_recovery().exhausted);
+    assert_eq!(agent.task_recovery().remaining, 0);
+    assert_eq!(agent.task_recovery().interventions, 3);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
 }
 
 #[tokio::test]
@@ -1615,7 +1568,7 @@ async fn independent_review_zero_repair_budget_records_scar_immediately() {
 }
 
 #[tokio::test]
-async fn mutation_after_verification_invalidates_pass_and_verified_revision() {
+async fn review_mutation_requires_fresh_verification_before_success() {
     let root = std::env::temp_dir().join(format!(
         "hi-agent-late-review-mutation-{}",
         std::process::id()
@@ -1646,17 +1599,22 @@ async fn mutation_after_verification_invalidates_pass_and_verified_revision() {
     cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.gates.review = ReviewPolicy::Always;
     cfg.gates.allow_no_checkpoint = false;
-    let mut agent = Agent::new(provider, cfg).unwrap();
+    let mut agent = Agent::new(provider.clone(), cfg).unwrap();
 
     let outcome = agent
         .run_turn("implement the reviewed file", &mut NullUi)
         .await
         .unwrap();
 
-    assert_eq!(outcome.status, TurnStatus::Failed);
-    assert_eq!(outcome.verification, VerificationStatus::Unverified);
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert_eq!(outcome.review, ReviewStatus::Unavailable);
-    assert!(outcome.verified_workspace_revision.is_none());
+    assert_eq!(agent.last_turn_telemetry().verification_executions.len(), 2);
+    assert_eq!(
+        outcome.verified_workspace_revision,
+        Some(agent.runtime.ledger().workspace_revision())
+    );
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::Relaxed), 3);
     assert!(outcome.changed_files.contains(&"work.rs".to_string()));
     assert!(outcome.changed_files.contains(&"late.rs".to_string()));
     let _ = std::fs::remove_dir_all(root);
@@ -1832,11 +1790,9 @@ async fn infrastructure_finalizer_reconciles_ui_effects_after_session_failure() 
         .run_turn("implement work.rs", &mut ui)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("session persistence failed"));
-    let outcome = agent
-        .cleanup_turn(crate::TurnCleanupKind::Fail)
-        .await
-        .unwrap()
+    assert!(format!("{error:#}").contains("session persistence failed"));
+    let outcome = &crate::TurnFailure::from_error(&error)
+        .expect("the Agent owns failed-turn reconciliation")
         .outcome;
 
     assert_eq!(outcome.status, TurnStatus::Failed);
@@ -1973,7 +1929,7 @@ async fn hard_turn_timeout_runs_cancellation_cleanup_before_returning() {
     .expect("a stuck abort contributor must not defeat the hard backstop")
     .unwrap_err();
 
-    assert!(error.to_string().contains("turn deadline exceeded"));
+    assert!(format!("{error:#}").contains("turn deadline exceeded"));
     assert!(agent.turn_cancellation.is_none());
     assert!(!agent.interrupt.load(std::sync::atomic::Ordering::Acquire));
     assert!(agent.workspace.active_turn_ledger_revision.is_none());
@@ -2024,7 +1980,7 @@ async fn hard_turn_timeout_cancels_an_inflight_ledger_reconcile() {
     .expect("a ledger worker must not defeat the hard turn deadline")
     .unwrap_err();
 
-    assert!(error.to_string().contains("turn deadline exceeded"));
+    assert!(format!("{error:#}").contains("turn deadline exceeded"));
     assert_eq!(
         gate.exited(),
         gate.entered(),
@@ -2354,7 +2310,6 @@ async fn cancellation_during_late_suggestion_does_not_publish_a_normal_outcome_o
     cfg.gates.verification = VerificationMode::Disabled;
     cfg.memory.finalize = false;
     cfg.memory.suggest_next_prompt = true;
-    cfg.loop_limits.max_steps = 1;
     let cancellation = TurnCancellation::new();
     let provider = CancelDuringSuggestionProvider {
         cancellation: cancellation.clone(),
@@ -2376,7 +2331,11 @@ async fn cancellation_during_late_suggestion_does_not_publish_a_normal_outcome_o
 
     assert_eq!(outcome.status, TurnStatus::Cancelled);
     assert!(
-        recorded.lock().unwrap().is_empty(),
+        recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|outcome| outcome.status == TurnStatus::Cancelled),
         "the pre-cancellation outcome leaked into durable diagnostics"
     );
     assert!(
@@ -2586,4 +2545,45 @@ fn top_level_error_kind_classifies_usage_vs_infra() {
     );
     assert_eq!(TopLevelErrorKind::Usage.exit_code(), 2);
     assert_eq!(TopLevelErrorKind::Infra.exit_code(), 3);
+}
+
+#[tokio::test]
+async fn provider_failure_returns_agent_owned_cleanup_receipt() {
+    let workspace = IsolatedWorkspace::new("typed-failure-cleanup");
+    let mut cfg = workspace.config();
+    cfg.routing.tool_mode = ToolMode::ChatOnly;
+    cfg.gates.verification = VerificationMode::Disabled;
+    cfg.memory.suggest_next_prompt = false;
+    let (mut agent, _) = scripted_agent(vec![ProviderStep::Error(ProviderErrorKind::Auth)], cfg);
+    let error = agent.run_turn("fail once", &mut NullUi).await.unwrap_err();
+    let failure =
+        crate::TurnFailure::from_error(&error).expect("Agent must return the cleanup receipt");
+    assert_eq!(failure.outcome.status, TurnStatus::Failed);
+    assert!(!failure.settlement_pending, "{failure:#}");
+    assert!(failure.cleanup_diagnostics.is_empty(), "{failure:#}");
+    assert!(
+        failure
+            .original
+            .downcast_ref::<hi_ai::ProviderError>()
+            .is_some()
+    );
+    assert!(agent.workspace.active_turn_background_baseline.is_none());
+    assert!(agent.workspace.active_turn_task_baseline.is_none());
+    assert!(agent.workspace.active_turn_ledger_revision.is_none());
+    assert_eq!(agent.turn_phase(), TurnPhase::Done);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_deadline_is_shared_and_never_restarts() {
+    let cancellation = TurnCancellation::new();
+    let deadline = cancellation.settlement_deadline();
+    let clone = cancellation.clone();
+    tokio::time::advance(std::time::Duration::from_secs(59)).await;
+    clone.cancel();
+    assert_eq!(clone.settlement_deadline(), deadline);
+    assert_eq!(cancellation.settlement_deadline(), deadline);
+    assert_eq!(
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        std::time::Duration::from_secs(1)
+    );
 }

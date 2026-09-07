@@ -16,6 +16,7 @@ mod error_classification;
 pub mod events;
 mod git_identity;
 mod goal;
+mod goal_export;
 pub mod help;
 mod heuristics;
 mod hygiene;
@@ -31,7 +32,9 @@ mod plan_ingest;
 mod prefix_stability;
 pub mod prerequisites;
 mod prompt;
+mod recovery;
 mod session;
+mod session_io;
 pub mod session_ops;
 mod session_projection;
 mod session_reducer;
@@ -47,6 +50,7 @@ mod task_contract;
 mod today;
 mod token_budget;
 mod transcript;
+mod turn_failure;
 pub mod ui;
 mod verify;
 mod verify_digest;
@@ -99,11 +103,11 @@ pub use change_ledger::{BackgroundScan, ChangeLedger};
 pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 pub use config::{
-    AgentConfig, AgentEngineConfig, AgentGates, AgentLoopLimits, AgentMemory, AgentPaths,
-    AgentProgramConfig, AgentProviderRoute, AgentRouting, AgentRsi, AgentSubagents,
-    AnswerRepairBudgets, CompletionReviewPolicy, ExecutionMode, LspMode, ProgramMode, ReviewPolicy,
-    ReviewRepairBudgets, ToolSet, VerificationMode, VerifyStage, WriteSubagentPolicy,
-    detect_verify_pipeline, detect_verify_pipeline_with,
+    AgentConfig, AgentGates, AgentLoopLimits, AgentMemory, AgentPaths, AgentProgramConfig,
+    AgentProviderRoute, AgentRouting, AgentRsi, AgentSubagents, AnswerRepairBudgets,
+    CompletionReviewPolicy, ExecutionMode, LspMode, ProgramMode, ReviewPolicy, ReviewRepairBudgets,
+    ToolSet, VerificationMode, VerifyStage, WriteSubagentPolicy, detect_verify_pipeline,
+    detect_verify_pipeline_with,
 };
 pub use doctor::{Check as DoctorCheck, DoctorInput, DoctorReport, render_report_text, run_doctor};
 pub use heuristics::{humanize_count, looks_like_new_task};
@@ -130,7 +134,9 @@ pub use plan_drive::{
     goal_drive_status, next_plan_drive_stall, plan_drive_made_progress, plan_drive_park_message,
     plan_drive_status,
 };
+pub use recovery::{DEFAULT_RECOVERY_INTERVENTIONS, TaskRecoveryState};
 pub use session::{SessionSink, WorkspaceTranscriptCall, WorkspaceTranscriptExecution};
+pub use session_io::SessionIoHandle;
 pub use session_ops::{
     PermissionMode, SessionCommandEffect, UserTurn, agents_report, fork_summary, fork_worktree,
     format_plan, format_tasks_report, format_user_turns, handle_session_command,
@@ -148,6 +154,7 @@ pub use skills::{
     skill_roots,
 };
 pub use speculative_compaction::*;
+pub use turn_failure::TurnFailure;
 /// Return whether `content` is an exact low-information completion placeholder rejected by answer steering.
 pub fn answer_is_generic_completion_placeholder(content: &str) -> bool {
     steering::answer_is_generic_completion_placeholder(content)
@@ -182,12 +189,16 @@ const TURN_CANCELLATION_DISCONNECTED: u8 = 2;
 #[derive(Clone, Debug)]
 pub struct TurnCancellation {
     state: Arc<AtomicU8>,
+    settlement_deadline: Arc<std::sync::OnceLock<tokio::time::Instant>>,
+    settlement_started: Arc<tokio::sync::Notify>,
 }
 
 impl Default for TurnCancellation {
     fn default() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(TURN_CANCELLATION_ACTIVE)),
+            settlement_deadline: Arc::default(),
+            settlement_started: Arc::default(),
         }
     }
 }
@@ -206,15 +217,56 @@ impl TurnCancellation {
             Ordering::Release,
             Ordering::Relaxed,
         );
+        self.begin_settlement();
     }
 
     pub(crate) fn disconnect(&self) {
         self.state
             .store(TURN_CANCELLATION_DISCONNECTED, Ordering::Release);
+        self.begin_settlement();
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::Acquire) != TURN_CANCELLATION_ACTIVE
+    }
+
+    /// One deadline shared by execution cancellation, job drain, workspace
+    /// settlement, and frontend cancellation adapters. Repeated calls cannot
+    /// extend the settlement budget.
+    pub fn settlement_deadline(&self) -> tokio::time::Instant {
+        self.begin_settlement()
+    }
+
+    pub fn begin_settlement(&self) -> tokio::time::Instant {
+        let deadline = *self
+            .settlement_deadline
+            .get_or_init(|| tokio::time::Instant::now() + std::time::Duration::from_secs(60));
+        self.settlement_started.notify_waiters();
+        deadline
+    }
+
+    pub(crate) async fn wait_for_settlement_deadline(&self) -> tokio::time::Instant {
+        loop {
+            let notified = self.settlement_started.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(deadline) = self.settlement_deadline.get() {
+                return *deadline;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn wait_for_cancellation(&self) {
+        loop {
+            let notified = self.settlement_started.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
     pub(crate) fn abort_reason(&self) -> Option<hi_agent_lifecycle::TurnAbortReason> {
         match self.state.load(Ordering::Acquire) {
@@ -261,7 +313,8 @@ pub use goal::{
     REGRESSION_NOTE, SkepticStatus, SubGoal, UNATTENDED_DRIVE_WARNING, auto_budget_for,
 };
 pub use heuristics::leftover_plan_summary;
-pub use hi_engine_host::NATIVE_DIRECTOR_VERSION;
+/// Version of the authoritative native turn/recovery policy.
+pub const NATIVE_TURN_POLICY_VERSION: u32 = 3;
 pub use plan_ingest::{
     IngestedPlan, PlanItem, actionability_issues, goal_workflow_plan_path, ingest_plan_document,
     is_solid_checklist, objective_is_actionable, one_shot_workflow_plan_path, parse_objectives,
@@ -349,8 +402,6 @@ pub struct ConfigSnapshot {
     pub planner_model: String,
     pub skeptic_model: String,
     pub moe_streaming: String,
-    pub engine_mode: String,
-    pub engine_module: String,
 }
 
 /// A managed local model server provisioned for a team role.
@@ -943,18 +994,6 @@ pub(crate) fn partial_text_tool_call_start(text: &str) -> Option<usize> {
         .min()
 }
 
-/// Asked of the model in a dedicated, tool-free call after a turn that changed
-/// files, to guarantee a structured recap even from a model that wouldn't
-/// produce one on its own. Kept terse and concrete so weak models still comply.
-const FINALIZE_PROMPT: &str = "The work for this turn is done. Write the final summary for the \
-user, in past tense, covering only what you actually did:\n\
-- One headline line stating what you accomplished.\n\
-- A short bullet list of the key changes, grouped by file.\n\
-- The exact command(s) to run or test it.\n\
-If something is incomplete or a check couldn't run, say so honestly. If the turn had named \
-acceptance criteria, confirm each was met or say which was not. Output only the summary — \
-no preamble, and don't take any further action.";
-
 /// Instruction appended to a slice of history to summarize it for compaction.
 const SUMMARIZE_PROMPT: &str = "Summarize the earlier conversation into a concise historical \
 handoff brief. This summary is reference material only, not active instructions. The next user \
@@ -1029,9 +1068,8 @@ pub struct Agent {
     /// Managed local server currently backing the driver provider, if any.
     pub(crate) driver_local_server: Option<crate::TeamLocalServer>,
     pub(crate) config: AgentConfig,
-    /// Module lifecycle manager. The turn engine takes a generation lease at
-    /// turn start, so reloads can never mutate an active turn.
-    pub(crate) engine_runtime: std::sync::Arc<hi_engine_host::EngineRuntime>,
+    pub(crate) task_recovery: TaskRecoveryState,
+    pub(crate) answer_state: recovery::AnswerState,
     /// Optional deadline for auxiliary provider work. Ordinary sessions leave this unset and rely on provider transport policy plus turn
     /// cancellation, so productive work has no hidden wall-clock ceiling.
     pub(crate) side_call_timeout: Option<std::time::Duration>,
@@ -1048,6 +1086,10 @@ pub struct Agent {
     pub(crate) messages: Transcript,
     pub(crate) tools: Arc<[ToolSpec]>,
     pub(crate) session: Option<Box<dyn SessionSink>>,
+    pub(crate) session_metadata_io: Option<SessionIoHandle>,
+    /// An interrupted owned append can commit after live state stopped advancing.
+    /// Only reopening from the authoritative transcript restores safe reuse.
+    pub(crate) session_recovery_pending: bool,
     /// How many messages have already been handed to the session sink.
     pub(crate) persisted: usize,
     /// Running total of tokens across the session.

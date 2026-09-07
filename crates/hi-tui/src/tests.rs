@@ -3499,9 +3499,9 @@ fn session_render_snapshots_cover_responsive_chrome() {
         app.push_user_prompt(Line::raw("review the responsive layout"));
         app.page_flip_on_send = false;
         app.following = true;
-        app.transcript.push(TranscriptEntry::Assistant(Line::raw(
-            "The layout is stable.",
-        )));
+        app.transcript.push(TranscriptEntry::AssistantMessage {
+            text: "The layout is stable.".into(),
+        });
         app.transcript.push(TranscriptEntry::Reasoning {
             text: "Check spacing and preserve the active input.".into(),
             elapsed: Duration::from_secs(3),
@@ -3609,12 +3609,7 @@ fn transcript_roles_get_display_gutters_without_polluting_copy_text() {
     let assistant = app
         .transcript
         .iter()
-        .find(|entry| {
-            matches!(
-                entry,
-                TranscriptEntry::Assistant(_) | TranscriptEntry::AssistantMessage { .. }
-            )
-        })
+        .find(|entry| matches!(entry, TranscriptEntry::AssistantMessage { .. }))
         .unwrap();
     let assistant_lines = assistant.flatten(false, false, Density::Comfortable);
     assert_eq!(crate::render::line_text(&assistant_lines[0]), "answer");
@@ -5105,8 +5100,9 @@ fn page_flip_pins_sent_prompt_when_working() {
     let mut app = test_app("openai", "gpt-4o");
     app.following = true;
     for i in 0..20 {
-        app.transcript
-            .push(TranscriptEntry::Assistant(Line::raw(format!("pad {i}"))));
+        app.transcript.push(TranscriptEntry::AssistantMessage {
+            text: format!("pad {i}"),
+        });
     }
     app.working = true;
     app.push_user_prompt(Line::raw("new task"));
@@ -5114,8 +5110,9 @@ fn page_flip_pins_sent_prompt_when_working() {
     let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
     for i in 0..30 {
-        app.transcript
-            .push(TranscriptEntry::Assistant(Line::raw(format!("later {i}"))));
+        app.transcript.push(TranscriptEntry::AssistantMessage {
+            text: format!("later {i}"),
+        });
     }
     terminal.draw(|frame| app.render(frame)).unwrap();
     assert!(
@@ -5351,42 +5348,6 @@ fn failed_turn_shows_reason_and_keeps_error() {
         "reason inline: {screen}"
     );
     assert!(screen.contains("/retry"), "recovery hint: {screen}");
-}
-
-#[test]
-fn backend_wait_notice_does_not_mark_model_degraded() {
-    let mut app = test_app("pipenetwork", "ipop/coder-balanced");
-    app.note_backend_waiting(Duration::from_secs(181), Duration::from_secs(180));
-
-    assert_eq!(app.model_issues.get("ipop/coder-balanced"), None);
-    assert_eq!(app.last_error, None);
-    let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let screen = dump(&term);
-    assert!(
-        screen.contains("Still thinking. Ctrl-C cancels; keep waiting to continue."),
-        "soft wait notice shown: {screen}"
-    );
-    assert!(
-        !screen.contains("degraded in-session"),
-        "soft wait notice should not surface model health: {screen}"
-    );
-}
-
-#[test]
-fn watchdog_timeout_default_is_longer_than_client_warning_window() {
-    assert_eq!(
-        watchdog_stuck_timeout_from_value(None),
-        Duration::from_secs(180)
-    );
-    assert_eq!(
-        watchdog_stuck_timeout_from_value(Some("5")),
-        Duration::from_secs(30)
-    );
-    assert_eq!(
-        watchdog_stuck_timeout_from_value(Some("9999")),
-        Duration::from_secs(1_800)
-    );
 }
 
 #[test]
@@ -7096,8 +7057,9 @@ fn jump_picker_scrolls_and_esc_restores() {
     let mut app = test_app("openai", "gpt-4o");
     app.push_user_prompt(Line::raw("first prompt"));
     for i in 0..40 {
-        app.transcript
-            .push(TranscriptEntry::Assistant(Line::raw(format!("pad {i}"))));
+        app.transcript.push(TranscriptEntry::AssistantMessage {
+            text: format!("pad {i}"),
+        });
     }
     app.push_user_prompt(Line::raw("second prompt"));
     app.view_max_scroll = 200;
@@ -7119,11 +7081,13 @@ fn jump_picker_scrolls_and_esc_restores() {
 fn rewind_transcript_drops_chosen_prompt_and_later_rows() {
     let mut app = test_app("openai", "gpt-4o");
     app.push_user_prompt(Line::raw("keep me"));
-    app.transcript
-        .push(TranscriptEntry::Assistant(Line::raw("kept answer")));
+    app.transcript.push(TranscriptEntry::AssistantMessage {
+        text: "kept answer".into(),
+    });
     app.push_user_prompt(Line::raw("drop me"));
-    app.transcript
-        .push(TranscriptEntry::Assistant(Line::raw("later answer")));
+    app.transcript.push(TranscriptEntry::AssistantMessage {
+        text: "later answer".into(),
+    });
     app.rewind_transcript_to_user_turn(2);
     let text: String = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(text.contains("keep me"), "{text}");
@@ -7163,11 +7127,13 @@ fn timeline_rail_ticks_with_two_prompts() {
     let mut app = test_app("openai", "gpt-4o");
     app.timeline_enabled = true;
     app.push_user_prompt(Line::raw("turn one"));
-    app.transcript
-        .push(TranscriptEntry::Assistant(Line::raw("answer one")));
+    app.transcript.push(TranscriptEntry::AssistantMessage {
+        text: "answer one".into(),
+    });
     app.push_user_prompt(Line::raw("turn two"));
-    app.transcript
-        .push(TranscriptEntry::Assistant(Line::raw("answer two")));
+    app.transcript.push(TranscriptEntry::AssistantMessage {
+        text: "answer two".into(),
+    });
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);

@@ -96,8 +96,8 @@ fn new_context_rejects_low_occupancy_and_a_second_call() {
     );
 }
 
-#[test]
-fn fresh_window_keeps_goal_and_current_task_without_a_summary() {
+#[tokio::test]
+async fn fresh_window_keeps_goal_and_current_task_without_a_summary() {
     let mut agent = agent(vec![], config());
     agent.set_goal(Some("keep this goal".into()));
     agent.task.set_task(Some("fix the parser".into()), None);
@@ -108,7 +108,7 @@ fn fresh_window_keeps_goal_and_current_task_without_a_summary() {
     agent.messages_mut().push(Message::user("later aside"));
 
     let mut ui = RecordingUi::default();
-    agent.compact_fresh_window(&mut ui).unwrap();
+    agent.apply_fresh_window_async(&mut ui, None).await.unwrap();
 
     assert_eq!(agent.messages().len(), 2, "{:?}", agent.messages());
     assert_eq!(agent.messages()[0].role, Role::System);
@@ -153,8 +153,8 @@ async fn compact_window_kind_uses_the_no_summary_path() {
     );
 }
 
-#[test]
-fn applying_new_context_drops_conversation_and_keeps_the_task() {
+#[tokio::test]
+async fn applying_new_context_drops_conversation_and_keeps_the_task() {
     let mut cfg = config();
     cfg.routing.context_window = Some(100_000);
     let mut agent = agent(vec![], cfg);
@@ -171,7 +171,10 @@ fn applying_new_context_drops_conversation_and_keeps_the_task() {
 
     let mut ui = RecordingUi::default();
     let task = agent.task.last_task_prompt.clone();
-    agent.apply_fresh_window(&mut ui, task.as_deref()).unwrap();
+    agent
+        .apply_fresh_window_async(&mut ui, task.as_deref())
+        .await
+        .unwrap();
 
     assert_eq!(agent.messages().len(), 2);
     assert!(agent.messages()[1].text().contains("fix the parser"));
@@ -245,8 +248,8 @@ async fn new_context_during_turn_reanchors_turn_boundaries() {
     );
 }
 
-#[test]
-fn fresh_window_resets_drive_stall_so_the_goal_can_keep_running() {
+#[tokio::test]
+async fn fresh_window_resets_drive_stall_so_the_goal_can_keep_running() {
     let mut cfg = config();
     cfg.subagents.long_horizon = true;
     let mut agent = agent(vec![], cfg);
@@ -258,7 +261,10 @@ fn fresh_window_resets_drive_stall_so_the_goal_can_keep_running() {
     agent.restore_goal_drive(3, Vec::new());
     assert_eq!(agent.goal_drive_stall(), 3);
 
-    agent.compact_fresh_window(&mut NullUi).unwrap();
+    agent
+        .apply_fresh_window_async(&mut NullUi, None)
+        .await
+        .unwrap();
 
     assert_eq!(agent.goal_drive_stall(), 0);
     assert!(
@@ -270,8 +276,8 @@ fn fresh_window_resets_drive_stall_so_the_goal_can_keep_running() {
     );
 }
 
-#[test]
-fn plan_recovery_window_drops_poisoned_history_but_keeps_stall_evidence() {
+#[tokio::test]
+async fn plan_recovery_window_drops_poisoned_history_but_keeps_stall_evidence() {
     let mut agent = agent(vec![], config());
     let evidence_hash = "a".repeat(64);
     agent.restore_plan(vec![hi_tools::PlanStep {
@@ -293,7 +299,10 @@ fn plan_recovery_window_drops_poisoned_history_but_keeps_stall_evidence() {
         .push(Message::tool_result("read-again", "same old output"));
 
     let mut ui = RecordingUi::default();
-    agent.apply_plan_recovery_window(&mut ui).unwrap();
+    agent
+        .apply_plan_recovery_window_async(&mut ui)
+        .await
+        .unwrap();
 
     assert_eq!(agent.messages().len(), 1, "old loop history was retained");
     assert_eq!(agent.messages()[0].role, Role::System);

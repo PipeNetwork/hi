@@ -3,6 +3,9 @@ name = "held-request-cancel-resume"
 tags = ["curated", "pr", "fuzz_state_template"]
 timeout_ms = 45000
 
+[hi]
+args = ["--allow-unverified"]
+
 [session]
 plan_drive_paused = true
 
@@ -17,27 +20,20 @@ kind = "hold"
 gate = "held-drive"
 
 [[provider.steps]]
+id = "resume-writes-proof"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "resumed.txt", content = "Resumed after cancellation.\n" }
+
+[[provider.steps]]
 id = "resume-completes-plan"
 [provider.steps.expect]
 body_contains = ["Finish the resumable step"]
 [provider.steps.response]
 kind = "tool_call"
 name = "update_plan"
-arguments = { steps = [{ title = "Finish the resumable step", status = "done", completion_evidence = "This smoke scenario only verifies persisted cancellation and resume state; no workspace change is required." }] }
-
-[[provider.steps]]
-id = "resume-final-answer"
-[provider.steps.response]
-kind = "text"
-text = "The resumed plan step is complete."
-
-[[provider.steps]]
-id = "resume-no-file-change-explanation"
-[provider.steps.expect]
-body_contains = ["no successful file changes"]
-[provider.steps.response]
-kind = "text"
-text = "No file changes are needed; this smoke case only resumes and completes the persisted checklist state."
+arguments = { steps = [{ title = "Finish the resumable step", status = "done", completion_evidence = "Created resumed.txt after explicit resume, proving the requested workspace effect completed." }] }
 
 [[actions]]
 kind = "send_line"

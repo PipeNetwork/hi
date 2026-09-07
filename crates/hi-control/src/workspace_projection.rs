@@ -1,3 +1,6 @@
+#[path = "workspace_projection_commit.rs"]
+mod commit;
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use hi_events::{
@@ -18,11 +21,24 @@ use crate::{
 };
 
 pub trait WorkspaceProjectionStore: Send + Sync {
+    /// Stores sharing a database also share its bounded async writer.
+    fn writer_key(&self) -> Option<String> {
+        None
+    }
     fn commit(
         &self,
         transition: ProjectionTransition,
         event: RunEvent,
     ) -> Result<ProjectionEventReceipt>;
+    fn commit_batch(
+        &self,
+        updates: Vec<(ProjectionTransition, RunEvent)>,
+    ) -> Result<Vec<ProjectionEventReceipt>> {
+        updates
+            .into_iter()
+            .map(|(transition, event)| self.commit(transition, event))
+            .collect()
+    }
     fn binding(&self, id: &str) -> Result<Option<WorkspaceBindingRecord>>;
     fn operation(&self, id: &str) -> Result<Option<WorkspaceOperationRecord>>;
     fn operations_for_binding(&self, binding_id: &str) -> Result<Vec<WorkspaceOperationRecord>>;
@@ -37,12 +53,27 @@ pub trait WorkspaceProjectionStore: Send + Sync {
 }
 
 impl WorkspaceProjectionStore for ControlStore {
+    fn writer_key(&self) -> Option<String> {
+        Some(
+            std::fs::canonicalize(self.path())
+                .unwrap_or_else(|_| self.path().to_owned())
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
     fn commit(
         &self,
         transition: ProjectionTransition,
         event: RunEvent,
     ) -> Result<ProjectionEventReceipt> {
         self.commit_projection_event(transition, event)
+    }
+
+    fn commit_batch(
+        &self,
+        updates: Vec<(ProjectionTransition, RunEvent)>,
+    ) -> Result<Vec<ProjectionEventReceipt>> {
+        self.commit_projection_events(updates)
     }
 
     fn binding(&self, id: &str) -> Result<Option<WorkspaceBindingRecord>> {
@@ -86,6 +117,7 @@ impl WorkspaceProjectionStore for ControlStore {
 pub struct WorkspaceProjectionJournal {
     pub(crate) store: Arc<dyn WorkspaceProjectionStore>,
     pub(crate) gate: Arc<Mutex<()>>,
+    pub(crate) writer: crate::workspace_journal_writer::JournalWriter,
 }
 
 struct OperationProjectionUpdate {
@@ -98,7 +130,9 @@ struct OperationProjectionUpdate {
 
 impl WorkspaceProjectionJournal {
     pub fn new(store: Arc<dyn WorkspaceProjectionStore>) -> Self {
+        let writer = crate::workspace_journal_writer::JournalWriter::for_store(&store);
         Self {
+            writer,
             store,
             gate: Arc::new(Mutex::new(())),
         }
@@ -115,6 +149,16 @@ impl WorkspaceProjectionJournal {
         capabilities: &WorkspaceCapabilities,
     ) -> Result<()> {
         let _gate = lock(&self.gate);
+        let record = self.prepare_binding(binding, status, capabilities)?;
+        self.commit_binding(record)
+    }
+
+    fn prepare_binding(
+        &self,
+        binding: &WorkspaceBinding,
+        status: &WorkspaceStatus,
+        capabilities: &WorkspaceCapabilities,
+    ) -> Result<WorkspaceBindingRecord> {
         let existing = self.store.binding(binding.binding_id.as_str())?;
         let now = hi_events::now_ms();
         let record = WorkspaceBindingRecord {
@@ -131,7 +175,7 @@ impl WorkspaceProjectionJournal {
             updated_at_ms: now,
             closed_at_ms: None,
         };
-        self.commit_binding(record)
+        Ok(record)
     }
 
     pub fn record_operation_admitted(
@@ -201,6 +245,16 @@ impl WorkspaceProjectionJournal {
         update: OperationProjectionUpdate,
     ) -> Result<()> {
         let _gate = lock(&self.gate);
+        let record = self.prepare_operation(binding, permit, update)?;
+        self.commit_operation(record, binding.workspace_id.as_str())
+    }
+
+    fn prepare_operation(
+        &self,
+        binding: &WorkspaceBinding,
+        permit: &MutationPermitRecord,
+        update: OperationProjectionUpdate,
+    ) -> Result<WorkspaceOperationRecord> {
         let existing = self.store.operation(permit.operation_id.as_str())?;
         let now = hi_events::now_ms();
         let settled = operation_is_settled(update.status);
@@ -241,7 +295,7 @@ impl WorkspaceProjectionJournal {
             updated_at_ms: now.max(permit.issued_at_ms),
             settled_at_ms: settled.then_some(now.max(permit.issued_at_ms)),
         };
-        self.commit_operation(record, binding.workspace_id.as_str())
+        Ok(record)
     }
 
     pub fn record_job_registered(
@@ -324,6 +378,18 @@ impl WorkspaceProjectionJournal {
         candidate_ref: Option<String>,
     ) -> Result<()> {
         let _gate = lock(&self.gate);
+        let record = self.prepare_job(binding, permit, state, detail, candidate_ref)?;
+        self.commit_job(record, binding.workspace_id.as_str())
+    }
+
+    fn prepare_job(
+        &self,
+        binding: &WorkspaceBinding,
+        permit: &JobPermit,
+        state: JobState,
+        detail: Option<String>,
+        candidate_ref: Option<String>,
+    ) -> Result<ControlJobRecord> {
         let existing = self.store.job(permit.job_id.as_str())?;
         let now = hi_events::now_ms();
         let control_state = job_state(state);
@@ -359,7 +425,7 @@ impl WorkspaceProjectionJournal {
                 .then_some(now),
             finished_at_ms: control_state.is_terminal().then_some(now),
         };
-        self.commit_job(record, binding.workspace_id.as_str())
+        Ok(record)
     }
 
     pub fn record_recovery(
@@ -440,70 +506,6 @@ impl WorkspaceProjectionJournal {
             self.settle_recovered_job(&outcome.recovery_id)?;
             self.settle_recovered_operation(&outcome.recovery_id)?;
         }
-        Ok(())
-    }
-
-    pub(crate) fn commit_binding(&self, record: WorkspaceBindingRecord) -> Result<()> {
-        let event = projection_event(
-            "workspace_binding",
-            &record.binding_id,
-            record.revision,
-            record.updated_at_ms,
-            &record.workspace_id,
-            record.session_id.as_deref(),
-            workspace_activity_state(record.state),
-        );
-        self.store
-            .commit(ProjectionTransition::WorkspaceBinding(record), event)?;
-        Ok(())
-    }
-
-    pub(crate) fn commit_operation(
-        &self,
-        record: WorkspaceOperationRecord,
-        workspace_id: &str,
-    ) -> Result<()> {
-        let event = projection_event(
-            "workspace_operation",
-            &record.operation_id,
-            record.revision,
-            record.updated_at_ms,
-            workspace_id,
-            record.session_id.as_deref(),
-            operation_activity_state(record.status),
-        );
-        self.store
-            .commit(ProjectionTransition::WorkspaceOperation(record), event)?;
-        Ok(())
-    }
-
-    pub(crate) fn commit_job(&self, record: ControlJobRecord, workspace_id: &str) -> Result<()> {
-        let event = projection_event(
-            "workspace_job",
-            &record.job_id,
-            record.revision,
-            record.updated_at_ms,
-            workspace_id,
-            record.session_id.as_deref(),
-            job_activity_state(record.state),
-        );
-        self.store
-            .commit(ProjectionTransition::Job(record), event)?;
-        Ok(())
-    }
-
-    pub(crate) fn commit_recovery(&self, record: WorkspaceRecoveryRecord) -> Result<()> {
-        let event = projection_event(
-            "workspace_recovery",
-            &record.recovery_id,
-            record.revision,
-            record.updated_at_ms,
-            &record.workspace_id,
-            record.session_id.as_deref(),
-            recovery_activity_state(record.status),
-        );
-        self.store
-            .commit(ProjectionTransition::WorkspaceRecovery(record), event)?;
         Ok(())
     }
 }

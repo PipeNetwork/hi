@@ -88,6 +88,8 @@ pub struct ProviderError {
     /// supply one and callers may apply the bounded kind-based fallback.
     pub retryable: Option<bool>,
     pub retry_after_seconds: Option<u64>,
+    /// Locally enforced request bounds, separate from an upstream rejection.
+    pub request_failure: Option<Box<crate::RequestFailureEvidence>>,
 }
 
 impl ProviderError {
@@ -100,6 +102,7 @@ impl ProviderError {
             http_status: None,
             retryable: None,
             retry_after_seconds: None,
+            request_failure: None,
         }
     }
 
@@ -134,20 +137,6 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
-pub fn provider_error_kind(err: &anyhow::Error) -> Option<ProviderErrorKind> {
-    err.downcast_ref::<ProviderError>().map(|e| e.kind)
-}
-
-/// True when a models/probe request failed because the credential was refused
-/// (HTTP 401/403), as opposed to a transport timeout the user might still save.
-pub fn is_http_auth_rejection(err: &anyhow::Error) -> bool {
-    if provider_error_kind(err) == Some(ProviderErrorKind::Auth) {
-        return true;
-    }
-    let msg = err.to_string();
-    msg.contains("returned 401") || msg.contains("returned 403")
-}
-
 /// Outcome of probing an API key against `/models` before writing config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyCheck {
@@ -164,30 +153,6 @@ impl KeyCheck {
             Err(err) => Self::Unverified(format!("{err:#}")),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OutputCapError {
-    pub available_output_tokens: Option<u32>,
-}
-
-pub fn provider_output_cap_error(err: &anyhow::Error) -> Option<OutputCapError> {
-    output_cap_error_from_text(&provider_error_text(err))
-}
-
-pub fn provider_retry_after_seconds(err: &anyhow::Error) -> Option<u64> {
-    if let Some(error) = err.downcast_ref::<ProviderError>()
-        && error.retry_after_seconds.is_some()
-    {
-        return error.retry_after_seconds;
-    }
-    retry_after_seconds_from_text(&provider_error_text(err))
-}
-
-pub fn provider_error_retryable(err: &anyhow::Error) -> Option<bool> {
-    err.downcast_ref::<ProviderError>()
-        .and_then(|error| error.retryable)
-        .or_else(|| json_bool_field(&provider_error_text(err), "retryable"))
 }
 
 pub fn provider_route_error_is_retryable(err: &anyhow::Error) -> bool {
@@ -311,18 +276,6 @@ pub fn provider_error_is_temporary_overload(err: &anyhow::Error) -> bool {
         ],
     ) || (mentions_any(&lower, &["overloaded", "over capacity"])
         && mentions_any(&lower, &["try again", "retry", "temporarily", "temporary"]))
-}
-
-fn provider_error_text(err: &anyhow::Error) -> String {
-    err.downcast_ref::<ProviderError>()
-        .map(|e| e.message.clone())
-        .unwrap_or_else(|| err.to_string())
-}
-
-pub fn provider_error_usage(err: &anyhow::Error) -> Usage {
-    err.downcast_ref::<ProviderError>()
-        .map(|e| e.usage)
-        .unwrap_or_default()
 }
 
 /// A model the endpoint serves, with whatever live metadata it reports via its
@@ -912,3 +865,14 @@ mod tests {
         assert!(!is_billing_or_quota_text("expired token"));
     }
 }
+
+#[cfg(test)]
+mod error_chain_tests;
+
+mod error_details;
+use error_details::provider_error_text;
+pub use error_details::{
+    OutputCapError, is_http_auth_rejection, provider_error_details, provider_error_kind,
+    provider_error_retryable, provider_error_usage, provider_output_cap_error,
+    provider_retry_after_seconds,
+};

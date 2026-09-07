@@ -186,6 +186,7 @@ impl RsiRemoteProvider {
             settings,
             persist_config,
             http: Client::builder()
+                .retry(reqwest::retry::never())
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(90))
                 .build()?,
@@ -228,20 +229,31 @@ impl RsiRemoteProvider {
         submission_material.update(&maximum_cost_microusd.to_le_bytes());
         submission_material.update(channel.as_bytes());
         let submission_key = idempotency_key("run", submission_material.finalize().as_bytes());
-        let created: RunView = self
-            .send_json(
-                self.http
-                    .post(format!("{}/v1/rsi/runs", self.settings.base_url))
-                    .header("idempotency-key", &submission_key)
-                    .json(&RunSubmission {
-                        repository_id: &repository.repository_id,
-                        objective: &objective,
-                        context: &context,
-                        maximum_cost_microusd,
-                        channel,
-                    }),
+        let response = request
+            .execution
+            .dispatch_once(
+                self.authorized(
+                    self.http
+                        .post(format!("{}/v1/rsi/runs", self.settings.base_url))
+                        .header("idempotency-key", &submission_key)
+                        .json(&RunSubmission {
+                            repository_id: &repository.repository_id,
+                            objective: &objective,
+                            context: &context,
+                            maximum_cost_microusd,
+                            channel,
+                        }),
+                ),
+                "rsi_remote",
+                &request.model,
+                sink,
             )
             .await?;
+        let created: RunView = ensure_success(response)
+            .await?
+            .json()
+            .await
+            .context("decoding RSI run submission")?;
         sink(StreamEvent::Status(format!(
             "RSI: {} · channel {}",
             format_candidate(created.candidate.as_ref()),
@@ -1758,6 +1770,7 @@ mod tests {
     #[test]
     fn bounded_context_uses_canonical_objective_and_stops_before_active_turn() {
         let request = ChatRequest {
+            execution: Default::default(),
             model: "m".into(),
             request_id: None,
             retry_attempt: 0,

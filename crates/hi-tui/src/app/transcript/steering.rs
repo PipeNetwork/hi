@@ -2,8 +2,6 @@
 
 use std::time::Duration;
 
-use ratatui::text::Line;
-
 use crate::TranscriptEntry;
 
 pub(super) fn append_assistant_line(
@@ -28,9 +26,7 @@ pub(super) fn append_assistant_line(
 pub(super) fn last_entry_is_blank(transcript: &[TranscriptEntry]) -> bool {
     match transcript.last() {
         None => true,
-        Some(TranscriptEntry::Assistant(line) | TranscriptEntry::Line(line)) => {
-            crate::render::line_text(line).trim().is_empty()
-        }
+        Some(TranscriptEntry::Line(line)) => crate::render::line_text(line).trim().is_empty(),
         Some(TranscriptEntry::AssistantMessage { text }) => {
             text.lines().last().is_none_or(|l| l.trim().is_empty())
         }
@@ -90,27 +86,6 @@ pub(super) fn is_steering_assistant_text(text: &str) -> bool {
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix))
-}
-
-pub(super) fn is_steering_assistant_line(line: &Line<'_>) -> bool {
-    let text = crate::render::line_text(line);
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    if trimmed.chars().count() > STEERING_MAX_CHARS {
-        return false;
-    }
-    if crate::render::line_looks_like_heading(line) {
-        return false;
-    }
-    if trimmed.starts_with('▏') || trimmed.starts_with('─') || trimmed.contains('│') {
-        return false;
-    }
-    if crate::render::is_markdown_list_line(&text) {
-        return false;
-    }
-    is_steering_assistant_text(trimmed)
 }
 
 pub(super) fn normalize_steering_text(text: &str) -> String {

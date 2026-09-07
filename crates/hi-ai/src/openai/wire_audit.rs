@@ -313,6 +313,7 @@ mod tests {
             model: "m".into(),
             request_id: None,
             retry_attempt: 0,
+            execution: Default::default(),
             user_turn: true,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),

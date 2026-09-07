@@ -63,8 +63,8 @@ pub(crate) fn build_identity(
         ("materializer".into(), materializer.into()),
         ("mcp".into(), mcp_configuration_digest.clone()),
         (
-            "native_director".into(),
-            hi_agent::NATIVE_DIRECTOR_VERSION.to_string(),
+            "native_turn_policy".into(),
+            hi_agent::NATIVE_TURN_POLICY_VERSION.to_string(),
         ),
         ("network".into(), network_digest),
         ("os_arch".into(), runtime_identity.clone()),

@@ -1,0 +1,6 @@
+[package]
+name = "post-test-request-exhaustion"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

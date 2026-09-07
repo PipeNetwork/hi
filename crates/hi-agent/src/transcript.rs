@@ -511,6 +511,7 @@ pub(crate) fn strip_turn_scoped_user_text(text: &str) -> String {
 pub(crate) struct Transcript {
     messages: Arc<Vec<Message>>,
     revision: u64,
+    pending_recovery: Option<NudgeKind>,
 }
 
 impl Transcript {
@@ -537,6 +538,7 @@ impl Transcript {
         Self {
             messages: Arc::new(messages),
             revision: 0,
+            pending_recovery: None,
         }
     }
 
@@ -933,6 +935,22 @@ impl Transcript {
         self.repair_consecutive_user_messages();
     }
 
+    fn note_recovery(&mut self, kind: NudgeKind) {
+        if matches!(
+            kind,
+            NudgeKind::Repeat | NudgeKind::Continue | NudgeKind::Verify { .. } | NudgeKind::Review
+        ) {
+            self.pending_recovery = Some(kind);
+        }
+    }
+
+    /// Multiple corrections folded into one prompt are one intervention.
+    pub(crate) fn take_recovery_request(&mut self) -> Option<String> {
+        self.pending_recovery
+            .take()
+            .map(|kind| marker_for(kind).to_owned())
+    }
+
     // ---- synthetic nudges ----------------------------------------------
 
     /// Append a synthetic user nudge of `kind`, tagging it so it can be found
@@ -941,6 +959,7 @@ impl Transcript {
     ///
     /// [`replace_last_nudge`]: Self::replace_last_nudge
     pub(crate) fn push_nudge(&mut self, kind: NudgeKind, text: impl Into<String>) {
+        self.note_recovery(kind);
         let body = text.into();
         let tagged = format!("{}\n{}", marker_for(kind), body);
         self.make_mut().push(Message::user(tagged));
@@ -951,6 +970,7 @@ impl Transcript {
     /// replace it; otherwise fold without discarding user text or attachments.
     /// Interjections are genuine user input and are always retained.
     pub(crate) fn push_nudge_or_fold(&mut self, kind: NudgeKind, text: impl Into<String>) {
+        self.note_recovery(kind);
         let marker = marker_for(kind);
         let body = text.into();
         let tagged = format!("{marker}\n{body}");
@@ -985,6 +1005,7 @@ impl Transcript {
     /// nudge from an *earlier* turn erased the current turn's work and left
     /// two consecutive user messages.
     pub(crate) fn replace_last_nudge(&mut self, kind: NudgeKind, text: impl Into<String>) {
+        self.note_recovery(kind);
         let marker = marker_for(kind);
         let body = text.into();
         let tagged = format!("{}\n{}", marker, body);

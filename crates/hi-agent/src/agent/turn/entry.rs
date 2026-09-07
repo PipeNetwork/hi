@@ -50,84 +50,33 @@ impl crate::Agent {
         ui: &mut dyn Ui,
         cancellation: crate::TurnCancellation,
     ) -> Result<TurnOutcome> {
-        if let Some(timeout) = self.config.loop_limits.turn_timeout {
-            // Keep the very large turn state machine behind one pointer. In
-            // debug builds an inline copy here is also embedded in every
-            // caller's future (including multi-case async tests), which can
-            // exhaust the default test-thread stack before the first poll.
-            // Boxing also guarantees the timeout and cancellation-settlement
-            // branches keep polling the exact same future allocation.
-            let mut turn =
-                Box::pin(self.run_turn_cancellable_inner(input, ui, cancellation.clone()));
+        let configured_timeout = self.config.loop_limits.turn_timeout;
+        let mut turn = Box::pin(self.run_turn_cancellable_inner(input, ui, cancellation.clone()));
+        if let Some(timeout) = configured_timeout {
             match tokio::time::timeout(timeout, turn.as_mut()).await {
                 Ok(result) => result,
                 Err(_) => {
-                    // Do not drop a live turn future: that bypasses its cleanup
-                    // path and can leave cancellation flags, transcript/ledger
-                    // baselines, and turn-scoped background jobs attached to the
-                    // reusable Agent. Signal the same future and let its bounded
-                    // cooperative-cancel path settle before reporting timeout.
                     cancellation.cancel();
-                    const DEADLINE_SETTLEMENT_GRACE: std::time::Duration =
-                        std::time::Duration::from_secs(30);
-                    let settled =
-                        tokio::time::timeout(DEADLINE_SETTLEMENT_GRACE, turn.as_mut()).await;
-                    let settled = match settled {
-                        Ok(settled) => settled,
-                        Err(_) => {
-                            // A rollback/cleanup implementation must not turn the
-                            // hard deadline into another unbounded wait. Drop the
-                            // in-flight cleanup future and leave an explicit
-                            // terminal diagnostic; the workspace state is
-                            // intentionally reported as uncertain.
-                            drop(turn);
-                            // If cleanup was dropped before it transferred the
-                            // admitted permit to shielded settlement, dropping
-                            // it here synchronously publishes RecoveryRequired.
-                            // A hard-deadline error is preferable to falsely
-                            // claiming a clean cancellation.
-                            let _ = self.workspace_coordination.abandon_active();
-                            self.foreground_process_registry().kill_current();
-                            self.turn_cancellation = None;
-                            self.interrupt
-                                .store(false, std::sync::atomic::Ordering::Release);
-                            self.finish_drive_turn();
-                            let _ = self.kill_turn_backgrounds();
-                            if crate::DriveKind::from_prompt(input) == crate::DriveKind::Plan
-                                || self.pending_plan_interruption_resume
-                                || self.turn_consumed_plan_interruption
-                            {
-                                self.pause_plan_drive_until_user_input().context(
-                                    "persisting plan interruption after cleanup deadline",
-                                )?;
-                            }
-                            ui.assistant_text(
-                                "The turn hit its hard deadline and cleanup did not settle in time. I stopped waiting; the workspace may contain partial changes and should be inspected before continuing.",
-                            );
-                            ui.assistant_end();
-                            anyhow::bail!(
-                                "turn deadline exceeded after {}s; cleanup exceeded its {}s grace period",
-                                timeout.as_secs(),
-                                DEADLINE_SETTLEMENT_GRACE.as_secs()
-                            );
-                        }
-                    };
-                    match settled {
+                    // The Agent's inner owner enforces the same deadline and
+                    // publishes its receipt. Keep polling it through cleanup.
+                    let result = turn.as_mut().await;
+                    match result {
                         Ok(outcome) if outcome.stop_reason == TurnStopReason::Cancelled => {
-                            anyhow::bail!("turn deadline exceeded after {}s", timeout.as_secs())
+                            Err(crate::TurnFailure::new(
+                                anyhow::anyhow!(
+                                    "turn deadline exceeded after {}s",
+                                    timeout.as_secs()
+                                ),
+                                outcome,
+                            )
+                            .into())
                         }
-                        // The body can win and commit immediately before the
-                        // deadline while a bounded lifecycle callback or
-                        // post-turn hook is still settling. In that case the
-                        // token only skips/cancels best-effort notices; report
-                        // the already-committed body result instead of claiming
-                        // that its transcript/workspace were rolled back.
-                        settled => settled,
+                        result => result,
                     }
                 }
             }
         } else {
-            Box::pin(self.run_turn_cancellable_inner(input, ui, cancellation)).await
+            turn.as_mut().await
         }
     }
 
@@ -138,58 +87,90 @@ impl crate::Agent {
         cancellation: crate::TurnCancellation,
     ) -> Result<TurnOutcome> {
         let requested_drive_kind = crate::DriveKind::from_prompt(input);
-        // A frontend may use the terminal report to decide whether an Err
-        // already passed through Agent-owned cancellation cleanup (notably the
-        // hard-timeout path, which preserves its deadline error). Clear the
-        // previous turn before setup too, so an early setup failure cannot be
-        // mistaken for the preceding turn's cancellation.
+        if let Err(error) = self.ensure_session_reusable() {
+            let mut outcome = self.finalize_failed_turn_snapshot_only();
+            outcome.stop_reason = TurnStopReason::InfrastructureFailure;
+            let mut failure = crate::TurnFailure::new(error, outcome);
+            failure.settlement_pending = true;
+            return Err(failure.into());
+        }
+        let task_baseline = self.bg_tasks.list().await;
+        self.workspace.active_turn_task_baseline = Some(task_baseline.clone());
+        // Reports are telemetry. Returned receipts own terminal semantics.
         self.report.last_turn_outcome = None;
-        // Pin the currently active decision-engine generation for the whole
-        // turn. A reload requested during streaming becomes pending and is
-        // promoted only after this lease is dropped.
-        let engine_lease = match self
-            .engine_runtime
-            .begin_turn()
-            .context("pinning decision engine generation")
+        self.report.terminal_input_digest = None;
+        self.report.provisional_goal_baseline = None;
+        // A permit admitted before this call belongs to its existing owner.
+        // Reject before starting a body, so failure cleanup cannot consume it.
+        if self
+            .workspace_coordination
+            .active_parent_operation()
+            .is_some()
         {
-            Ok(lease) => lease,
-            Err(error) => {
-                if requested_drive_kind == crate::DriveKind::Plan
-                    || self.pending_plan_interruption_resume
-                    || self.turn_consumed_plan_interruption
-                {
-                    self.pause_plan_drive_until_user_input().context(
-                        "restoring plan interruption after decision-engine setup failed",
-                    )?;
-                }
-                return Err(error);
-            }
+            self.workspace.active_turn_task_baseline = None;
+            let route = self.report.last_effective_route.clone();
+            let outcome = TurnOutcome::workspace_admission_blocked(
+                route.model,
+                route.provider,
+                Vec::new(),
+                TurnStopReason::WorkspaceNotReady,
+            );
+            self.report.set_outcome(outcome.clone());
+            return Err(crate::TurnFailure::new(
+                anyhow::anyhow!("a workspace mutation is already admitted and awaiting settlement"),
+                outcome,
+            )
+            .into());
+        }
+        let foreground_processes = self.foreground_process_registry();
+        let background_processes = self.runtime.background_arc();
+        let background_baseline = background_processes.ids();
+        self.workspace.active_turn_background_baseline = Some(background_baseline.clone());
+        let background_tasks = self.bg_tasks.clone();
+        let signal_processes = || async {
+            foreground_processes.kill_current();
+            background_processes.kill_started_after(&background_baseline);
+            background_tasks.signal_started_after(&task_baseline).await;
         };
         if cancellation.is_cancelled() {
-            let restore_plan_pause = requested_drive_kind == crate::DriveKind::Plan
-                || self.pending_plan_interruption_resume
-                || self.turn_consumed_plan_interruption;
-            let pause_result = if restore_plan_pause {
-                self.pause_plan_drive_until_user_input()
-                    .map(|_| ())
-                    .context("persisting plan interruption before cancellation cleanup")
-            } else {
-                Ok(())
-            };
-            self.pending_plan_interruption_resume = false;
-            self.turn_consumed_plan_interruption = false;
-            let cleanup_result = self
-                .cleanup_turn(crate::TurnCleanupKind::Cancel {
-                    session: crate::SessionRollback::AgentOwned {
-                        checkpoint_refs_before: self.checkpoint_refs().to_vec(),
+            signal_processes().await;
+            let deadline = cancellation.settlement_deadline();
+            let cleanup = async {
+                let restore_plan_pause = requested_drive_kind == crate::DriveKind::Plan
+                    || self.pending_plan_interruption_resume
+                    || self.turn_consumed_plan_interruption;
+                let pause_result = if restore_plan_pause {
+                    self.pause_plan_drive_until_user_input_async()
+                        .await
+                        .map(|_| ())
+                        .context("persisting plan interruption before cancellation cleanup")
+                } else {
+                    Ok(())
+                };
+                self.pending_plan_interruption_resume = false;
+                self.turn_consumed_plan_interruption = false;
+                let deadline = cancellation.settlement_deadline();
+                let cleanup = self.cleanup_turn_before(
+                    crate::TurnCleanupKind::Cancel {
+                        session: crate::SessionRollback::AgentOwned {
+                            checkpoint_refs_before: self.checkpoint_refs().to_vec(),
+                        },
                     },
-                })
-                .await
-                .map(|cleanup| cleanup.outcome);
-            return cleanup_result.and_then(|outcome| {
+                    deadline,
+                );
+                let outcome = cleanup.await?.outcome;
                 pause_result?;
                 Ok(outcome)
-            });
+            };
+            let result: Result<TurnOutcome> = tokio::time::timeout_at(deadline, cleanup)
+                .await
+                .map_err(|_| anyhow::anyhow!("turn cancellation settlement deadline exceeded"))
+                .and_then(|result| result);
+            let result = match result {
+                Ok(outcome) => Ok(outcome),
+                Err(error) => Err(self.fenced_turn_failure(error, Vec::new()).into()),
+            };
+            return self.publish_terminal_receipt(result, deadline, None).await;
         }
         let message_count_before = self.messages.len();
         let state_before = self.state_snapshot();
@@ -204,25 +185,30 @@ impl crate::Agent {
         // future must be dropped before cleanup_turn borrows `self` again.
         const COOPERATIVE_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
         let interrupt = std::sync::Arc::clone(&self.interrupt);
-        let foreground_processes = self.foreground_process_registry();
-        let (body_result, cancellation_observed, foreground_reap_proven) = {
-            let body = self.run_turn_body(input, ui, engine_lease);
+        let (body_result, cancellation_observed, foreground_reap_proven, settlement_expired) = {
+            let body = self.run_turn_body(input, ui);
             tokio::pin!(body);
             tokio::select! {
                 biased;
-                result = &mut body => (Some(result), false, true),
-                _ = wait_for_turn_cancellation(cancellation.clone()) => {
+                result = &mut body => (Some(result), false, true, false),
+                _ = cancellation.wait_for_cancellation() => {
                     interrupt.store(true, std::sync::atomic::Ordering::Release);
                     // Wake an in-flight foreground shell/program immediately.
                     // Its owning capture future remains alive during the grace
                     // window so it can observe exit and reap the direct child.
-                    foreground_processes.kill_current();
+                    signal_processes().await;
                     let mut result = tokio::select! {
                         biased;
                         result = &mut body => Some(result),
-                        _ = tokio::time::sleep(COOPERATIVE_CANCEL_GRACE) => None,
+                        _ = tokio::time::sleep_until(std::cmp::min(
+                            tokio::time::Instant::now() + COOPERATIVE_CANCEL_GRACE,
+                            cancellation.settlement_deadline(),
+                        )) => None,
                     };
                     let mut foreground_reap_proven = true;
+                    // Catch jobs admitted while the cooperative body was still
+                    // polling, before any longer native-reap or storage wait.
+                    signal_processes().await;
                     if result.is_none() && foreground_processes.active_count() > 0 {
                         // Keep the body allocation alive while capture owns the
                         // child. If we dropped it first, the registry token
@@ -233,7 +219,10 @@ impl crate::Agent {
                         tokio::select! {
                             biased;
                             settled = &mut body => result = Some(settled),
-                            reaped = foreground_processes.wait_until_empty(FOREGROUND_REAP_GRACE) => {
+                            reaped = foreground_processes.wait_until_empty(std::cmp::min(
+                                FOREGROUND_REAP_GRACE,
+                                cancellation.settlement_deadline().saturating_duration_since(tokio::time::Instant::now()),
+                            )) => {
                                 foreground_reap_proven = reaped;
                             }
                         }
@@ -243,7 +232,16 @@ impl crate::Agent {
                     // caller's request still owns the result and must roll the
                     // turn back. A normal result that wins the biased outer
                     // branch is not retroactively cancelled.
-                    (result, true, foreground_reap_proven)
+                    (result, true, foreground_reap_proven, false)
+                }
+                _ = async {
+                    let deadline = cancellation.wait_for_settlement_deadline().await;
+                    tokio::time::sleep_until(deadline).await;
+                } => {
+                    cancellation.cancel();
+                    interrupt.store(true, std::sync::atomic::Ordering::Release);
+                    signal_processes().await;
+                    (None, false, foreground_processes.active_count() == 0, true)
                 }
             }
             // `body` drops here, releasing `&mut self`.
@@ -260,118 +258,190 @@ impl crate::Agent {
                 .is_some_and(|error| error.is::<TurnCancellationRequested>())
         });
         let cancellation_cleanup = cancellation_observed || forced_abort || cooperative_cancel;
+        if cancellation_cleanup {
+            // Plan pause persistence can queue behind an accepted slow append.
+            // Signal all turn-owned executions before awaiting that commit.
+            signal_processes().await;
+        }
         let cancellation_abort_reason = cancellation_cleanup.then(|| {
             cancellation
                 .abort_reason()
                 .unwrap_or(hi_agent_lifecycle::TurnAbortReason::Interrupted)
         });
-        let result = if cancellation_cleanup {
-            // Persist the stop latch before rewriting the transcript. If the
-            // process dies between these appends, restart remains safely
-            // paused instead of autonomously re-running abandoned plan work.
-            let restore_plan_pause = requested_drive_kind == crate::DriveKind::Plan
-                || self.pending_plan_interruption_resume
-                || self.turn_consumed_plan_interruption;
-            let pause_result = if restore_plan_pause {
-                self.pause_plan_drive_until_user_input()
-                    .map(|_| ())
-                    .context("persisting plan interruption before cancelled-turn rewind")
-            } else {
-                Ok(())
-            };
-            // This is the sole owner of cancellation rollback. In particular,
-            // it is outside the body future that the cooperative grace may
-            // drop, so an in-progress checkpoint restore can never be detached
-            // and then re-entered by a second cleanup attempt.
-            // A killed child can execute a final write until it is reaped.
-            // Never begin rollback while foreground or auto-backgrounded turn
-            // writers can still race the restoration.
-            let quiescence_result = self.quiesce_abnormal_turn_processes().await;
-            let quiescence_error = if foreground_reap_proven {
-                quiescence_result.err()
-            } else {
-                Some(anyhow::anyhow!(
-                    "timed out waiting for a cancelled foreground process to be reaped"
-                ))
-            };
-            if quiescence_error.is_some() {
-                // The permit's synchronous drop fence records the ambiguity
-                // even if the remaining cleanup is itself cancelled later.
-                let _ = self.workspace_coordination.abandon_active();
-            }
-            let workspace_rolled_back = if quiescence_error.is_none() {
-                match self.rollback_turn_checkpoint(&checkpoint_refs_before).await {
-                    Ok(restored_files) => restored_files > 0,
-                    Err(error) => {
-                        eprintln!(
-                            "hi-agent: couldn't roll back cancelled workspace edits: {error:#}"
-                        );
-                        false
-                    }
+        let result: Result<TurnOutcome> = if settlement_expired {
+            Err(self.fenced_turn_failure(
+                anyhow::anyhow!("turn settlement deadline exceeded after 60s"),
+                vec!["accepted publication remains owned; unresolved workspace effects remain fenced".into()],
+            ).into())
+        } else if cancellation_cleanup {
+            let deadline = cancellation.settlement_deadline();
+            let cleanup = async {
+                // Persist the stop latch before rewriting the transcript. If the
+                // process dies between these appends, restart remains safely
+                // paused instead of autonomously re-running abandoned plan work.
+                let restore_plan_pause = requested_drive_kind == crate::DriveKind::Plan
+                    || self.pending_plan_interruption_resume
+                    || self.turn_consumed_plan_interruption;
+                let pause_result = if restore_plan_pause {
+                    self.pause_plan_drive_until_user_input_async()
+                        .await
+                        .map(|_| ())
+                        .context("persisting plan interruption before cancelled-turn rewind")
+                } else {
+                    Ok(())
+                };
+                // This is the sole owner of cancellation rollback. In particular,
+                // it is outside the body future that the cooperative grace may
+                // drop, so an in-progress checkpoint restore can never be detached
+                // and then re-entered by a second cleanup attempt.
+                // A killed child can execute a final write until it is reaped.
+                // Never begin rollback while foreground or auto-backgrounded turn
+                // writers can still race the restoration.
+                let quiescence_result = self.quiesce_abnormal_turn_processes_before(deadline).await;
+                let quiescence_error = if foreground_reap_proven {
+                    quiescence_result.err()
+                } else {
+                    Some(anyhow::anyhow!(
+                        "timed out waiting for a cancelled foreground process to be reaped"
+                    ))
+                };
+                if quiescence_error.is_some() {
+                    // The permit's synchronous drop fence records the ambiguity
+                    // even if the remaining cleanup is itself cancelled later.
+                    let _ = self.workspace_coordination.abandon_active();
                 }
-            } else {
-                false
-            };
-            let message_start = self
-                .workspace
-                .active_turn_message_start
-                .unwrap_or(message_count_before);
-            if let Err(error) = self.rewind_to_snapshot_durable_with_workspace_rollback(
-                message_start,
-                &state_before,
-                workspace_rolled_back,
-            ) {
-                // Keep the live agent coherent even when its durable sink is
-                // unavailable. This mirrors the interactive interrupt path;
-                // cleanup below still finalizes cancellation and surfaces a
-                // persistence error if its final write also fails.
-                eprintln!("hi-agent: couldn't persist cancelled turn discard: {error:#}");
-                self.truncate_messages(message_start);
-                self.restore_state_snapshot_with_workspace_rollback(
-                    &state_before,
-                    workspace_rolled_back,
-                );
-            }
-            if let Some(error) = quiescence_error {
-                let cleanup = self.cleanup_turn(crate::TurnCleanupKind::Fail).await;
-                cleanup?;
-                pause_result?;
-                Err(error
-                    .context("cancelled turn could not prove all writer processes were reaped"))
-            } else {
-                let cleanup_result = self
-                    .cleanup_turn(crate::TurnCleanupKind::Cancel {
-                        session: crate::SessionRollback::AlreadyApplied,
-                    })
+                // Drain accepted session commands (including their metadata
+                // exports) before rolling workspace bytes back.
+                self.session_barrier()
                     .await
-                    .map(|cleanup| cleanup.outcome);
-                cleanup_result.and_then(|outcome| {
+                    .context("draining session writes before rollback")?;
+                let workspace_rolled_back = if quiescence_error.is_none() {
+                    self.rollback_turn_checkpoint(&checkpoint_refs_before)
+                        .await
+                        .context("rolling back cancelled workspace edits")?
+                        > 0
+                } else {
+                    false
+                };
+                let message_start = self
+                    .workspace
+                    .active_turn_message_start
+                    .unwrap_or(message_count_before);
+                if let Err(error) = self
+                    .rewind_to_snapshot_durable_with_workspace_rollback_async(
+                        message_start,
+                        &state_before,
+                        workspace_rolled_back,
+                    )
+                    .await
+                {
+                    // Keep the live agent coherent even when its durable sink is
+                    // unavailable. This mirrors the interactive interrupt path;
+                    // cleanup below still finalizes cancellation and surfaces a
+                    // persistence error if its final write also fails.
+                    eprintln!("hi-agent: couldn't persist cancelled turn discard: {error:#}");
+                    self.truncate_messages(message_start);
+                    self.restore_state_snapshot_with_workspace_rollback(
+                        &state_before,
+                        workspace_rolled_back,
+                    );
+                    return Err(error.context("persisting cancelled turn discard"));
+                }
+                if let Some(error) = quiescence_error {
                     pause_result?;
-                    Ok(outcome)
-                })
+                    Err(error
+                        .context("cancelled turn could not prove all writer processes were reaped"))
+                } else {
+                    let cleanup_result = self
+                        .cleanup_turn_before(
+                            crate::TurnCleanupKind::Cancel {
+                                session: crate::SessionRollback::AlreadyApplied,
+                            },
+                            deadline,
+                        )
+                        .await
+                        .map(|cleanup| cleanup.outcome);
+                    cleanup_result.and_then(|outcome| {
+                        pause_result?;
+                        Ok(outcome)
+                    })
+                }
+            };
+            match tokio::time::timeout_at(deadline, cleanup).await {
+                Ok(Ok(outcome)) => Ok(outcome),
+                Ok(Err(error)) => Err(self.fenced_turn_failure(error, Vec::new()).into()),
+                Err(_) => Err(self
+                    .fenced_turn_failure(
+                        anyhow::anyhow!("turn cancellation settlement deadline exceeded"),
+                        vec![
+                            "accepted settlement continues; workspace recovery remains fenced"
+                                .into(),
+                        ],
+                    )
+                    .into()),
             }
         } else {
-            body_result.expect("non-cancelled turn body must have a result")
+            match body_result.expect("non-cancelled turn body must have a result") {
+                Ok(outcome) => Ok(outcome),
+                Err(original)
+                    if crate::TurnFailure::from_error(&original)
+                        .is_some_and(crate::TurnFailure::body_settled) =>
+                {
+                    Err(original)
+                }
+                Err(original) => {
+                    let deadline = cancellation.settlement_deadline();
+                    let kind = crate::TurnCleanupKind::for_error(&original);
+                    match tokio::time::timeout_at(deadline, self.cleanup_turn_before(kind, deadline)).await {
+                        Ok(Ok(cleanup)) => Err(crate::TurnFailure::new(original, cleanup.outcome).into()),
+                        Ok(Err(cleanup)) => Err(self.fenced_turn_failure(original, vec![format!("{cleanup:#}")]).into()),
+                        Err(_) => Err(self.fenced_turn_failure(original, vec!["turn settlement deadline exceeded; accepted settlement remains owned".into()]).into()),
+                    }
+                }
+            }
         };
         let drive_must_pause = match &result {
             Err(_) => true,
             Ok(outcome) => crate::plan_drive::outcome_blocks_automatic_drive(outcome),
         };
-        let mut drive_state_result = self
-            .settle_plan_interruption_resume(!drive_must_pause)
-            .context("settling transactional plan interruption resume");
-        if drive_state_result.is_ok()
-            && drive_must_pause
-            && requested_drive_kind == crate::DriveKind::Plan
-        {
-            drive_state_result = self
-                .pause_plan_drive_until_user_input()
-                .map(|_| ())
-                .context("pausing plan drive after unsuccessful synthetic turn");
-        }
+        let drive_state_result =
+            tokio::time::timeout_at(cancellation.settlement_deadline(), async {
+                let mut drive_state_result = self
+                    .settle_plan_interruption_resume_async(!drive_must_pause)
+                    .await
+                    .context("settling transactional plan interruption resume");
+                if drive_state_result.is_ok()
+                    && drive_must_pause
+                    && requested_drive_kind == crate::DriveKind::Plan
+                {
+                    drive_state_result = self
+                        .pause_plan_drive_until_user_input_async()
+                        .await
+                        .map(|_| ())
+                        .context("pausing plan drive after unsuccessful synthetic turn");
+                }
+                drive_state_result
+            })
+            .await
+            .map_err(|_| {
+                self.session_recovery_pending |= self.has_session_io();
+                anyhow::anyhow!("drive-state persistence exceeded the shared settlement deadline")
+            })
+            .and_then(|result| result);
         let result = match drive_state_result {
             Ok(()) => result,
-            Err(error) => Err(error),
+            Err(error) => match result {
+                Ok(outcome) => Err(crate::TurnFailure::new(error, outcome).into()),
+                Err(original) => match original.downcast::<crate::TurnFailure>() {
+                    Ok(mut failure) => {
+                        failure.cleanup_diagnostics.push(format!("{error:#}"));
+                        Err(failure.into())
+                    }
+                    Err(original) => Err(self
+                        .fenced_turn_failure(original, vec![format!("{error:#}")])
+                        .into()),
+                },
+            },
         };
         let abort_reason = cancellation_abort_reason.or_else(|| match &result {
             Ok(outcome) if outcome.status == TurnStatus::Cancelled => cancellation
@@ -383,38 +453,155 @@ impl crate::Agent {
         // future deliberately dropped by the hard cancellation backstop, so it
         // cannot own lifecycle callbacks, Done phase, turn count, or terminal
         // semantic events without skipping them on an uncooperative provider.
-        self.finalize_turn_result(
-            input,
-            ui,
-            &result,
-            abort_reason,
-            forced_abort,
-            &cancellation,
+        let deadline = cancellation.settlement_deadline();
+        let terminal_workspace_baseline = self
+            .report
+            .terminal_input_digest
+            .take()
+            .unwrap_or_else(|| self.runtime.ledger().workspace_revision());
+        let finalized = tokio::time::timeout_at(
+            deadline,
+            self.finalize_turn_result(
+                input,
+                ui,
+                &result,
+                abort_reason,
+                forced_abort,
+                &cancellation,
+            ),
         )
         .await;
-
-        match result {
-            Ok(outcome) => Ok(outcome),
-            Err(error) => {
-                // Kill turn-scoped backgrounds before surfacing the error — a
-                // mid-turn provider/tool failure must not leak delegate/explore
-                // subagents started this turn. Only the background kill runs
-                // here; ledger reconciliation and `last_changed_files` stay
-                // with the caller's own `cleanup_turn(Fail)` /
-                // `finalize_failed_turn` (idempotent via `.take()` on the
-                // baseline), preserving the contract frontends rely on.
-                let _ = self.kill_turn_backgrounds();
-                Err(error)
+        let mut result = if finalized.is_err() {
+            let detail = "terminal turn notices exceeded the shared settlement deadline";
+            match result {
+                Ok(outcome) => {
+                    let mut failure = crate::TurnFailure::new(anyhow::anyhow!(detail), outcome);
+                    let _ = self.workspace_coordination.abandon_active();
+                    let status = self.workspace_controller_status();
+                    failure.settlement_pending = !matches!(
+                        status.state,
+                        hi_workspace::WorkspaceState::Ready
+                            | hi_workspace::WorkspaceState::LocalAuditDegraded
+                    ) || !status.active_jobs.is_empty()
+                        || self.foreground_process_registry().active_count() != 0;
+                    self.foreground_process_registry().kill_current();
+                    Err(failure.into())
+                }
+                Err(error) => match error.downcast::<crate::TurnFailure>() {
+                    Ok(mut failure) => {
+                        failure.cleanup_diagnostics.push(detail.into());
+                        Err(failure.into())
+                    }
+                    Err(error) => Err(self.fenced_turn_failure(error, vec![detail.into()]).into()),
+                },
             }
+        } else {
+            result
+        };
+
+        let final_evidence = tokio::time::timeout_at(
+            deadline,
+            self.reconcile_terminal_workspace(
+                &mut result,
+                &state_before,
+                &terminal_workspace_baseline,
+                ui,
+            ),
+        )
+        .await;
+        let evidence_pending = final_evidence.is_err()
+            || (matches!(&final_evidence, Ok(Err(_)))
+                && !matches!(
+                    self.workspace_controller_status().state,
+                    hi_workspace::WorkspaceState::Ready
+                        | hi_workspace::WorkspaceState::LocalAuditDegraded
+                ));
+        let recovery_credit = match final_evidence {
+            Ok(Ok(credit)) => credit,
+            failed => {
+                let error = match failed {
+                    Ok(Err(error)) => error,
+                    Err(_) => {
+                        self.session_recovery_pending |= self.has_session_io();
+                        let _ = self.workspace_coordination.abandon_active();
+                        anyhow::anyhow!(
+                            "final workspace evidence exceeded the shared settlement deadline"
+                        )
+                    }
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                result = match result {
+                    Ok(outcome) => {
+                        let mut failure = crate::TurnFailure::new(error, outcome);
+                        failure.invalidate_terminal_verification();
+                        failure.settlement_pending |= evidence_pending;
+                        Err(failure.into())
+                    }
+                    Err(original) => {
+                        let mut failure = original
+                            .downcast::<crate::TurnFailure>()
+                            .expect("entry owns a typed failure receipt");
+                        failure.invalidate_terminal_verification();
+                        failure.cleanup_diagnostics.push(format!("{error:#}"));
+                        failure.settlement_pending |= evidence_pending;
+                        Err(failure.into())
+                    }
+                };
+                None
+            }
+        };
+        if result.is_err() {
+            self.emit_deterministic_closeout(ui);
         }
+        let event_turn = if matches!(&result, Ok(outcome) if outcome.stop_reason == TurnStopReason::TurnLimit)
+        {
+            self.turn_count.saturating_add(1)
+        } else {
+            self.turn_count
+        };
+        let result = self
+            .publish_terminal_receipt(result, deadline, recovery_credit)
+            .await;
+        self.report.provisional_goal_baseline = None;
+        self.emit_terminal_result_event(ui, &result, event_turn);
+        result
     }
 
-    async fn run_turn_body(
+    /// Timeout paths never claim successful cleanup. Admitted permits publish
+    /// recovery on drop; shielded settlements retain their existing owner.
+    pub(crate) fn fenced_turn_failure(
         &mut self,
-        input: &str,
-        ui: &mut dyn Ui,
-        engine_lease: hi_engine_host::EngineLease,
-    ) -> Result<TurnOutcome> {
+        original: anyhow::Error,
+        cleanup_diagnostics: Vec<String>,
+    ) -> crate::TurnFailure {
+        self.session_recovery_pending |= self.has_session_io();
+        let tasks = self.bg_tasks.clone();
+        let before = self
+            .workspace
+            .active_turn_task_baseline
+            .clone()
+            .unwrap_or_default();
+        // Retain a cancellation owner even when the caller's budget is already
+        // exhausted. It signals all executions and leaves accepted callbacks
+        // with their existing monitor rather than dropping their publication.
+        tokio::spawn(async move {
+            tasks
+                .kill_started_after_before(&before, tokio::time::Instant::now())
+                .await;
+        });
+        let _ = self.workspace_coordination.abandon_active();
+        self.foreground_process_registry().kill_current();
+        let outcome = self.finalize_failed_turn_snapshot_only();
+        let mut failure = crate::TurnFailure::new(original, outcome);
+        failure.cleanup_diagnostics = cleanup_diagnostics;
+        failure.settlement_pending = true;
+        failure
+    }
+
+    async fn run_turn_body(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
+        // A prior timed-out waiter can leave an accepted append with the owner.
+        // Do not admit a new turn until its durable result has been observed.
+        self.session_barrier().await?;
         ui.semantic_event(RunEvent::new(
             EventKind::RunStarted,
             EventContext::default(),
@@ -497,7 +684,7 @@ impl crate::Agent {
         } else if hooks.join("pre-turn").is_file() {
             ui.status("project hooks skipped: workspace untrusted (run /trust on to enable)");
         }
-        self.run_turn_core(input, ui, engine_lease).await
+        self.run_turn_core(input, ui).await
     }
 
     async fn finalize_turn_result(
@@ -520,12 +707,6 @@ impl crate::Agent {
             self.turn_count = self.turn_count.saturating_add(1);
         }
         self.set_turn_phase(TurnPhase::Done);
-        let event_turn = if turn_limit {
-            self.turn_count.saturating_add(1)
-        } else {
-            self.turn_count
-        };
-
         // Exactly one terminal callback per body start. Cancellation wins over
         // a cleanup error because it, not model failure, ended that turn.
         if !turn_limit && let Some(registry) = &self.extensions {
@@ -567,76 +748,6 @@ impl crate::Agent {
             let _ = tokio::time::timeout(TERMINAL_LIFECYCLE_GRACE, callbacks).await;
         }
 
-        let (event_kind, state, verb) = match result {
-            Ok(outcome) => match outcome.status {
-                TurnStatus::Completed => (
-                    EventKind::RunCompleted,
-                    ActivityState::Succeeded,
-                    ActivityVerb::Complete,
-                ),
-                TurnStatus::Cancelled => (
-                    EventKind::RunCancelled,
-                    ActivityState::Cancelled,
-                    ActivityVerb::Cancel,
-                ),
-                TurnStatus::Failed => (
-                    EventKind::RunFailed,
-                    ActivityState::Failed,
-                    ActivityVerb::Fail,
-                ),
-                TurnStatus::Blocked => (
-                    EventKind::RunCompleted,
-                    ActivityState::Failed,
-                    ActivityVerb::Complete,
-                ),
-            },
-            Err(_) => (
-                EventKind::RunFailed,
-                ActivityState::Failed,
-                ActivityVerb::Fail,
-            ),
-        };
-        let mut run_event = RunEvent::new(
-            event_kind,
-            EventContext::default(),
-            SemanticActivity {
-                verb,
-                object: ActivityObject::Run,
-                state,
-                group_key: format!("run:turn:{event_turn}"),
-                title: if result.is_ok() {
-                    "Run finished"
-                } else {
-                    "Run failed"
-                }
-                .into(),
-                detail: None,
-                refs: Vec::new(),
-                progress: None,
-            },
-        );
-        if let Ok(outcome) = result {
-            run_event = run_event.with_field("status", serde_json::json!(outcome.status));
-            run_event = run_event.with_field("stop_reason", serde_json::json!(outcome.stop_reason));
-            if !outcome.changed_files.is_empty() {
-                ui.semantic_event(hi_events::RunEvent::new(
-                    hi_events::EventKind::GitChanged,
-                    hi_events::EventContext::default(),
-                    hi_events::SemanticActivity {
-                        verb: hi_events::ActivityVerb::Change,
-                        object: hi_events::ActivityObject::Git,
-                        state: hi_events::ActivityState::Succeeded,
-                        group_key: format!("workspace:turn:{event_turn}"),
-                        title: "workspace changed".into(),
-                        detail: Some(format!("{} file(s) changed", outcome.changed_files.len())),
-                        refs: Vec::new(),
-                        progress: None,
-                    },
-                ));
-            }
-        }
-        ui.semantic_event(run_event);
-
         // Hooks have no implicit productive timeout. The hard 750ms turn
         // cancellation backstop drops the hook future, whose process-group
         // guard owns descendant cleanup, so do not start more hooks after the
@@ -672,13 +783,5 @@ impl crate::Agent {
                 Ok(None) => (),
             }
         }
-    }
-}
-
-async fn wait_for_turn_cancellation(cancellation: crate::TurnCancellation) {
-    // Bound wakeups: 5ms is snappy enough for interactive Esc/Ctrl+C without a
-    // Notify-based redesign of TurnCancellation (still an AtomicBool).
-    while !cancellation.is_cancelled() {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::{self, Config, ProfileForm, ProviderName};
 use crate::landing::profile_infos;
-use crate::provider::{agent_provider_route, build_chain};
+use crate::provider::{build_chain, switched_routing};
 
 pub(crate) struct TuiProfileCallbacks {
     pub(crate) profiles: Vec<hi_tui::ProfileInfo>,
@@ -23,20 +23,17 @@ pub(crate) fn callbacks(file: Config, config_path: Option<PathBuf>) -> TuiProfil
     let resolver: hi_tui::ProfileResolver = Box::new({
         let file = Arc::clone(&file);
         move |name: &str| {
-            let settings = {
+            let (settings, fallbacks) = {
                 let file = file.lock().unwrap_or_else(|error| error.into_inner());
-                config::resolve_named_profile(&file, name)?
+                (
+                    config::resolve_named_profile(&file, name)?,
+                    config::resolve_profile_fallbacks(&file, name),
+                )
             };
-            let route = agent_provider_route(&settings);
-            let model = settings.model.clone();
-            let provider = build_chain(&settings, Vec::new());
+            let provider = build_chain(&settings, fallbacks);
             Ok(hi_tui::SwitchedProvider {
                 provider,
-                model,
-                route,
-                max_tokens: settings.max_tokens,
-                max_tokens_explicit: settings.max_tokens_explicit,
-                tool_mode: settings.tool_mode,
+                routing: switched_routing(&settings),
                 local_runtime: None,
             })
         }
@@ -178,8 +175,11 @@ mod tests {
 
         let switched =
             (callbacks.resolver)("pipenetwork").expect("resolve just-saved Pipe profile");
-        assert_eq!(switched.model, "pipe/deepseek-v4-flash-0731");
-        assert_eq!(switched.route.label, "pipenetwork");
+        assert_eq!(switched.routing.model, "pipe/deepseek-v4-flash-0731");
+        assert_eq!(
+            switched.routing.provider_route.as_deref(),
+            Some("pipenetwork")
+        );
         assert!(
             hi_ai::auth_store::load("pipenetwork").is_none(),
             "profile save must not create a provider-wide pairing credential"

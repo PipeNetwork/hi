@@ -54,7 +54,6 @@
 1338 crates/hi-pipefs/src/client.rs
 4533 crates/hi-pipefs/src/workspace.rs
 2115 crates/hi-control/src/lib.rs
-928 crates/hi-engine-host/src/lib.rs
 1905 crates/hi-ai/src/test_support/scripted.rs
 1097 crates/hi-ai/src/types.rs
 1123 crates/hi-cli/src/bench.rs

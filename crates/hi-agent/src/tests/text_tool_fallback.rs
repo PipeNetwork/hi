@@ -20,14 +20,14 @@ impl Provider for ProtocolThenOpenAi {
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> anyhow::Result<Completion> {
         let attempt = self.failures.fetch_add(1, Ordering::SeqCst);
-        if attempt < 5 {
+        if attempt < 3 {
             return Err(ProviderError::new(
                 ProviderErrorKind::ToolProtocol,
                 "scripted structured-call failure",
             )
             .into());
         }
-        if attempt == 5 {
+        if attempt == 3 {
             return self.openai.stream(request, sink).await;
         }
         pop_canned_completion(&self.tail, "ProtocolThenOpenAi")
@@ -140,9 +140,17 @@ async fn fallback_rejects_multiple_calls_before_executing_any_prefix() {
         "<tool_call>write<arg_key>path</arg_key><arg_value>{}</arg_value><arg_key>content</arg_key><arg_value>good</arg_value></tool_call>",
         accepted.display(),
     );
-    let mut steps = (0..5)
-        .map(|_| ProviderStep::Error(ProviderErrorKind::ToolProtocol))
-        .collect::<Vec<_>>();
+    // Enter text fallback through tool argument validation, leaving recovery
+    // allowance to reject a multi-call response and accept one correction.
+    let mut steps = vec![ProviderStep::Completion(completion(
+        vec![Content::ToolCall {
+            id: "invalid-write".into(),
+            name: "write".into(),
+            arguments: "{}".into(),
+        }],
+        1,
+        1,
+    ))];
     steps.extend([
         ProviderStep::Completion(completion(vec![Content::Text(multi)], 1, 1)),
         ProviderStep::Completion(completion(vec![Content::Text(single)], 1, 1)),
@@ -157,7 +165,7 @@ async fn fallback_rejects_multiple_calls_before_executing_any_prefix() {
     ]);
     let mut config = workspace.config();
     config.gates.allow_unverified = true;
-    config.loop_limits.max_repeat_nudges = 1;
+    config.loop_limits.max_repeat_nudges = 0;
     let (mut agent, _) = scripted_agent(steps, config);
     let mut ui = RecUi::default();
 
@@ -172,6 +180,44 @@ async fn fallback_rejects_multiple_calls_before_executing_any_prefix() {
         ui.statuses
             .iter()
             .any(|status| status.contains("multiple calls"))
+    );
+}
+
+#[tokio::test]
+async fn exhausted_physical_allowance_never_executes_a_provisional_fallback_prefix() {
+    let workspace = IsolatedWorkspace::new("text-fallback-physical-exhaustion");
+    let destination = workspace.path("must-not-exist.txt");
+    let call = format!(
+        "<tool_call>write<arg_key>path</arg_key><arg_value>{}</arg_value><arg_key>content</arg_key><arg_value>unsafe prefix</arg_value></tool_call>",
+        destination.display()
+    );
+    let mut responses = (0..3)
+        .map(|_| Response::json(400, r#"{"error":{"message":"invalid tool JSON","code":"tool_protocol_error","retryable":true}}"#))
+        .collect::<Vec<_>>();
+    responses.push(Response::sse(sse_text(&format!("{call}{call}"))));
+    let Some(server) = FakeOpenAiServer::new(responses) else {
+        return;
+    };
+    let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+    let mut config = workspace.config();
+    config.gates.allow_unverified = true;
+    let mut agent = Agent::new(Arc::new(provider), config).unwrap();
+    let result = agent
+        .run_turn("/build the requested file", &mut NullUi)
+        .await;
+    let outcome = match &result {
+        Ok(outcome) => outcome,
+        Err(error) => &crate::TurnFailure::from_error(error).unwrap().outcome,
+    };
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(
+        server.bodies().len(),
+        4,
+        "the default physical budget is exact"
+    );
+    assert!(
+        !destination.exists(),
+        "a rejected response executed a tool prefix"
     );
 }
 

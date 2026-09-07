@@ -589,9 +589,7 @@ impl App {
 fn entry_kind(entry: &TranscriptEntry) -> Option<TranscriptBlockKind> {
     match entry {
         TranscriptEntry::UserPrompt { .. } => Some(TranscriptBlockKind::UserPrompt),
-        TranscriptEntry::Assistant(_) | TranscriptEntry::AssistantMessage { .. } => {
-            Some(TranscriptBlockKind::Assistant)
-        }
+        TranscriptEntry::AssistantMessage { .. } => Some(TranscriptBlockKind::Assistant),
         TranscriptEntry::Reasoning { .. } => Some(TranscriptBlockKind::Reasoning),
         TranscriptEntry::Activity(_) | TranscriptEntry::ToolOutput { .. } => {
             Some(TranscriptBlockKind::Tool)

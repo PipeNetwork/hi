@@ -257,9 +257,9 @@ pub fn fast_check_for(path: &str) -> Option<&'static str> {
 }
 
 /// Run one of [`fast_check_for`]'s checks without interpolating `path` into a
-/// shell command. The boolean is authoritative; the text is bounded diagnostic
-/// context for the model/UI.
-pub async fn run_fast_check_in(root: &Path, check: &str, path: &Path) -> (bool, String) {
+/// shell command. Typed process status distinguishes code failures from an
+/// unavailable checker or deadline; output remains bounded diagnostic context.
+pub async fn run_fast_check_in(root: &Path, check: &str, path: &Path) -> ToolOutcome {
     run_fast_check_in_maybe_timeout(root, check, path, check_timeout()).await
 }
 
@@ -268,7 +268,7 @@ async fn run_fast_check_in_maybe_timeout(
     check: &str,
     path: &Path,
     timeout: Option<Duration>,
-) -> (bool, String) {
+) -> ToolOutcome {
     use std::ffi::OsString;
 
     let path_arg = path.as_os_str().to_os_string();
@@ -293,22 +293,39 @@ async fn run_fast_check_in_maybe_timeout(
         "luac -p" => ("luac", vec![OsString::from("-p"), path_arg]),
         "perl -c" => ("perl", vec![OsString::from("-c"), path_arg]),
         "php -l" => ("php", vec![OsString::from("-l"), path_arg]),
-        _ => return (false, format!("unsupported fast check: {check}")),
+        _ => return unavailable_fast_check(format!("unsupported fast check: {check}")),
     };
     let runner = match ProcessRunner::new(root) {
         Ok(runner) => runner,
-        Err(error) => return (false, format!("fast-check runner failed: {error:#}")),
+        Err(error) => {
+            return unavailable_fast_check(format!("fast-check runner failed: {error:#}"));
+        }
     };
     match runner
         .run_program_maybe_timeout(program, &args, timeout)
         .await
     {
-        Ok(execution) => (
-            fast_check_passed(check, &execution),
-            execution.model_content(),
-        ),
-        Err(error) => (false, format!("fast check failed to start: {error:#}")),
+        Ok(execution) => {
+            let mut output = ToolOutcome::plain(execution.model_content());
+            output.status = if execution.status == crate::ToolStatus::Succeeded
+                && !fast_check_passed(check, &execution)
+            {
+                crate::ToolStatus::Failed
+            } else {
+                execution.status
+            };
+            output.process = Some(execution.model_outcome());
+            output.truncation = execution.truncation;
+            output
+        }
+        Err(error) => unavailable_fast_check(format!("fast check failed to start: {error:#}")),
     }
+}
+
+fn unavailable_fast_check(detail: String) -> ToolOutcome {
+    let mut output = ToolOutcome::plain(detail);
+    output.status = crate::ToolStatus::Failed;
+    output
 }
 
 fn fast_check_passed(check: &str, execution: &crate::ProcessExecution) -> bool {
@@ -1540,19 +1557,35 @@ mod tests {
         let path = dir.join("valid.py");
         std::fs::write(&path, "answer = 42\n").unwrap();
 
-        let (passed, output) =
+        let output =
             run_fast_check_in_maybe_timeout(&dir, "python3 -m py_compile", &path, None).await;
-        assert!(passed, "default-unlimited fast check failed: {output}");
+        assert_eq!(
+            output.status,
+            crate::ToolStatus::Succeeded,
+            "{}",
+            output.content
+        );
+        assert_eq!(
+            output
+                .process
+                .as_ref()
+                .and_then(|process| process.exit_code),
+            Some(0)
+        );
 
-        let (passed, output) = run_fast_check_in_maybe_timeout(
+        let output = run_fast_check_in_maybe_timeout(
             &dir,
             "python3 -m py_compile",
             &path,
             Some(Duration::ZERO),
         )
         .await;
-        assert!(!passed, "an explicit zero-duration deadline must fire");
-        assert!(output.contains("timed out"), "{output}");
+        assert_eq!(
+            output.status,
+            crate::ToolStatus::TimedOut,
+            "an explicit zero-duration deadline must fire"
+        );
+        assert!(output.content.contains("timed out"), "{}", output.content);
         let _ = std::fs::remove_dir_all(dir);
     }
 

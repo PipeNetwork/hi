@@ -312,6 +312,9 @@ pub(crate) enum VerifyEvidence {
     None,
     /// A verification stage ran and failed.
     Failed,
+    /// A pass whose checked inputs changed before settlement. Retain the
+    /// original seal for diagnostics, but never treat it as current evidence.
+    Invalidated { revision: u64, digest: String },
     /// A verification stage ran and passed, bound to the workspace ledger
     /// revision and digest at the moment it passed.
     Passed { revision: u64, digest: String },
@@ -342,6 +345,10 @@ impl VerifyEvidence {
         matches!(self, Self::Failed)
     }
 
+    pub(crate) fn invalidated(&self) -> bool {
+        matches!(self, Self::Invalidated { .. })
+    }
+
     /// Map to the historical `Option<bool>` verdict shape: `Some(true)` for
     /// Passed, `Some(false)` for Failed, `None` for no verification. Preserves
     /// the read semantics of the old `last_verify: Option<bool>` field.
@@ -349,7 +356,7 @@ impl VerifyEvidence {
         match self {
             Self::Passed { .. } => Some(true),
             Self::Failed => Some(false),
-            Self::None => None,
+            Self::None | Self::Invalidated { .. } => None,
         }
     }
 
@@ -385,6 +392,13 @@ pub(crate) struct TurnReportState {
     pub(crate) last_compat_fallbacks: Vec<String>,
     pub(crate) last_turn_telemetry: TurnTelemetry,
     pub(crate) last_turn_outcome: Option<TurnOutcome>,
+    /// Exact canonical input when the body classified its candidate outcome.
+    /// Entry consumes this after late callbacks, including for read-only turns
+    /// which have no Passed seal of their own.
+    pub(crate) terminal_input_digest: Option<String>,
+    /// Goal completion is withheld from metadata until the terminal receipt.
+    /// Outer `None` means ordinary authoritative goal persistence.
+    pub(crate) provisional_goal_baseline: Option<Option<Goal>>,
     pub(crate) turn_phase: TurnPhase,
     pub(crate) last_effective_route: EffectiveModelRoute,
 }
@@ -399,6 +413,8 @@ impl TurnReportState {
             last_compat_fallbacks: Vec::new(),
             last_turn_telemetry: TurnTelemetry::default(),
             last_turn_outcome: None,
+            terminal_input_digest: None,
+            provisional_goal_baseline: None,
             turn_phase: TurnPhase::Setup,
             last_effective_route: route,
         }
@@ -448,6 +464,7 @@ pub(crate) struct WorkspaceTurnState {
     /// Background process ids at turn start so failed/cancelled finalizers can
     /// kill only processes this turn started (mirrors frontend cancel cleanup).
     pub(crate) active_turn_background_baseline: Option<Vec<String>>,
+    pub(crate) active_turn_task_baseline: Option<Vec<String>>,
 }
 
 impl WorkspaceTurnState {
@@ -456,6 +473,7 @@ impl WorkspaceTurnState {
         self.active_turn_ledger_revision = None;
         self.active_turn_message_start = None;
         self.active_turn_background_baseline = None;
+        self.active_turn_task_baseline = None;
     }
 
     /// Install ledger-derived change lists for the last turn.

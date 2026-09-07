@@ -4,8 +4,8 @@
 //! configured pipeline stages in order (cheap compile/typecheck first, then
 //! lint, then tests); the first to fail stops the turn and its output is fed
 //! back to the model for another attempt, up to `max_rounds`. A passing
-//! pipeline ends the turn. The "only verify turns that changed files" gating
-//! lives here too — a turn that edited nothing can't have introduced a failure.
+//! pipeline ends the turn. Ordinary turns verify changes; terminal recovery
+//! can explicitly request evidence for the unchanged current revision.
 //!
 //! **Not** review-answer repair ([`crate::steering::ReviewRepairMode`]) and
 //! **not** RSI attestation ([`hi_verifier::AttestingVerifier`]). See
@@ -23,6 +23,9 @@ use crate::snapshot::{
 };
 use crate::ui::Ui;
 use crate::workspace_coordination::WorkspaceCoordination;
+
+#[path = "verify_cargo_scope.rs"]
+pub(crate) mod cargo_scope;
 
 const VERIFICATION_EXECUTION_LIMIT: usize = 256;
 const VERIFICATION_EXECUTION_HEAD: usize = 32;
@@ -88,6 +91,15 @@ impl VerificationExecution {
 /// The snapshot type the verifier compares against.
 pub(crate) type Snapshot = std::collections::BTreeMap<String, FileFingerprint>;
 
+/// Whether this check follows workspace edits or explicitly needs fresh
+/// evidence for the current bytes after model-request recovery stopped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum VerificationAdmission {
+    #[default]
+    ChangedWorkspace,
+    CurrentRevision,
+}
+
 /// Workspace-local dependencies for one verifier check. Keeping these bound
 /// together makes it difficult to accidentally pair a checkpoint or LSP
 /// manager with a different workspace root.
@@ -102,6 +114,7 @@ pub(crate) struct VerifyWorkspace<'a> {
     lsp: &'a hi_lsp::LspManager,
     known_changed_files: Option<&'a [String]>,
     mutation_seen: bool,
+    admission: VerificationAdmission,
     /// Packages mid-turn `cargo check` already sealed green at the current
     /// ledger revision — skip matching `affected-check:` stages (Phase I).
     skip_affected_checks: Option<&'a std::collections::BTreeSet<String>>,
@@ -133,6 +146,7 @@ impl<'a> VerifyWorkspace<'a> {
             lsp,
             known_changed_files: None,
             mutation_seen: false,
+            admission: VerificationAdmission::ChangedWorkspace,
             skip_affected_checks: None,
             skip_affected_tests: None,
             active_managed_live_writer: false,
@@ -161,6 +175,11 @@ impl<'a> VerifyWorkspace<'a> {
     /// edits restored the original bytes and the net changed-file set is empty.
     pub(crate) fn with_mutation_seen(mut self, mutation_seen: bool) -> Self {
         self.mutation_seen = mutation_seen;
+        self
+    }
+
+    pub(crate) fn with_admission(mut self, admission: VerificationAdmission) -> Self {
+        self.admission = admission;
         self
     }
 
@@ -355,7 +374,9 @@ impl NativeVerifierAdmission {
                 }],
                 execution: execution.clone(),
             };
-            if let Err(stage_error) = durability.stage_workspace_execution(&record) {
+            if let Err(stage_error) =
+                crate::workspace_durability::stage_execution_owned(durability.clone(), record).await
+            {
                 let execution_detail = execution.detail.take();
                 execution.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
                 execution.content_digest = None;
@@ -479,7 +500,7 @@ async fn settle_native_verifier_execution(
 #[derive(Debug)]
 pub(crate) enum VerifyOutcome {
     /// All stages passed — the turn is done.
-    Passed,
+    Passed { revision: u64, digest: String },
     /// No files changed since the turn baseline, so verification was skipped
     /// (a turn that edited nothing can't have introduced a failure). `first`
     /// is true only on the first round, so the caller can surface a one-time
@@ -530,9 +551,9 @@ pub(crate) struct WorkspaceRepairVerifier {
     stages: Vec<VerifyStage>,
     include_affected_packages: bool,
     last_effective_stages: Vec<VerifyStage>,
+    observations: Vec<crate::recovery::ValidationObservation>,
     executions: VerificationExecutionLog,
     successful_test_stage: bool,
-    stage_mutation_counts: std::collections::BTreeMap<String, u32>,
     /// Per-stage failure identity from the previous round — (distinct failure
     /// count, signature) — so repair feedback can say converging vs thrashing.
     previous_failures:
@@ -554,9 +575,9 @@ impl WorkspaceRepairVerifier {
             stages,
             include_affected_packages: false,
             last_effective_stages: Vec::new(),
+            observations: Vec::new(),
             executions: VerificationExecutionLog::default(),
             successful_test_stage: false,
-            stage_mutation_counts: std::collections::BTreeMap::new(),
             previous_failures: std::collections::BTreeMap::new(),
             max_rounds,
             round: 0,
@@ -642,13 +663,17 @@ impl WorkspaceRepairVerifier {
     }
 
     /// Run one verification check against the current workspace snapshot,
-    /// compared to the turn baseline. Gates on file changes: if nothing
-    /// changed, returns [`VerifyOutcome::SkippedNoChanges`] (and does NOT
-    /// consume a round). Otherwise runs the stages in order and returns the
-    /// first failure, or [`VerifyOutcome::Passed`].
+    /// compared to the turn baseline. Ordinary admission skips unchanged
+    /// inputs without consuming a round. Explicit current-revision admission
+    /// runs actual stages even without edits. Both return the first failure
+    /// or [`VerifyOutcome::Passed`] only for the checked input.
     ///
     /// `snapshot_cache` is invalidated-on-mutation cache the verifier reads
     /// through; the caller passes the turn baseline separately.
+    pub(crate) fn take_observations(&mut self) -> Vec<crate::recovery::ValidationObservation> {
+        std::mem::take(&mut self.observations)
+    }
+
     pub(crate) async fn check(
         &mut self,
         workspace: &VerifyWorkspace<'_>,
@@ -657,11 +682,37 @@ impl WorkspaceRepairVerifier {
         ledger: Option<std::sync::Arc<std::sync::Mutex<crate::change_ledger::ChangeLedger>>>,
         ui: &mut dyn Ui,
     ) -> VerifyOutcome {
+        self.observations.clear();
         if (self.stages.is_empty() && !self.include_affected_packages)
             || crate::config::repair_limit_reached(self.max_rounds, self.round)
         {
             return VerifyOutcome::NotRun;
         }
+        // Bind every stage to the input at pipeline admission, before callbacks
+        // or asynchronous stages can mutate the workspace.
+        let (verified_revision, verified_digest) = if let Some(ledger) = &ledger {
+            let mut ledger = ledger.lock().unwrap_or_else(|p| p.into_inner());
+            (ledger.revision(), ledger.workspace_revision())
+        } else {
+            use sha2::Digest;
+            let snapshot = match crate::snapshot::workspace_snapshot(workspace.root).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return VerifyOutcome::InfrastructureError {
+                        stage: VerifyStage::new("snapshot", "workspace input fingerprint"),
+                        output: error.to_string(),
+                        round: self.round,
+                    };
+                }
+            };
+            (
+                0,
+                format!(
+                    "{:x}",
+                    sha2::Sha256::digest(format!("{snapshot:?}").as_bytes())
+                ),
+            )
+        };
         let changed_files = if let Some(changed_files) = workspace.known_changed_files {
             changed_files.to_vec()
         } else {
@@ -686,7 +737,9 @@ impl WorkspaceRepairVerifier {
             };
             changed_files_between(turn_snapshot, &current)
         };
-        if changed_files.is_empty() && !workspace.mutation_seen {
+        let current_revision_required =
+            workspace.admission == VerificationAdmission::CurrentRevision;
+        if changed_files.is_empty() && !workspace.mutation_seen && !current_revision_required {
             let first = self.round == 0;
             return VerifyOutcome::SkippedNoChanges { first };
         }
@@ -695,6 +748,7 @@ impl WorkspaceRepairVerifier {
         // user may have supplied markdownlint, a docs builder, or any other
         // acceptance command, and `--verify` must run exactly as configured.
         if self.include_affected_packages
+            && !current_revision_required
             && changed_files.iter().all(|path| is_prose_only_path(path))
         {
             let first = self.round == 0;
@@ -705,9 +759,15 @@ impl WorkspaceRepairVerifier {
         // Keep that filesystem work off the async/UI executor.
         let discovery_root = workspace.root.to_path_buf();
         let discovery_changed_files = changed_files.clone();
-        let discovery_configured = self.stages.clone();
+        let mut discovery_configured = self.stages.clone();
         let discovery_include_affected = self.include_affected_packages;
         let mut stages = match tokio::task::spawn_blocking(move || {
+            if current_revision_required
+                && discovery_include_affected
+                && discovery_configured.is_empty()
+            {
+                discovery_configured = crate::config::detect_verify_pipeline(&discovery_root);
+            }
             effective_stages(
                 &discovery_root,
                 &discovery_changed_files,
@@ -734,7 +794,11 @@ impl WorkspaceRepairVerifier {
         let skip_checks = workspace.skip_affected_checks.unwrap_or(&empty_set);
         let skip_tests = workspace.skip_affected_tests.unwrap_or(&empty_set);
         let before_filter = stages.len();
-        stages.retain(|stage| !should_skip_affected_stage(stage, skip_checks, skip_tests));
+        // Terminal recovery explicitly requests a physical current-input check;
+        // previously sealed stages do not replace that requested execution.
+        stages.retain(|stage| {
+            current_revision_required || !should_skip_affected_stage(stage, skip_checks, skip_tests)
+        });
         let skipped = before_filter.saturating_sub(stages.len());
         if skipped > 0 {
             ui.status(&format!(
@@ -747,7 +811,10 @@ impl WorkspaceRepairVerifier {
             // filtered at least one stage away, treat as Passed — the work was
             // already proven at this revision. Otherwise nothing to run.
             return if skipped > 0 {
-                VerifyOutcome::Passed
+                VerifyOutcome::Passed {
+                    revision: verified_revision,
+                    digest: verified_digest,
+                }
             } else {
                 VerifyOutcome::NotRun
             };
@@ -1152,27 +1219,11 @@ impl WorkspaceRepairVerifier {
                     round,
                 };
             }
-            if !stage_changes.is_empty() {
+            if !all_stage_changes.is_empty() {
                 snapshot_cache.invalidate();
-                let mutation_count = self
-                    .stage_mutation_counts
-                    .entry(format!("{}\0{}", stage.name, stage.command))
-                    .or_default();
-                *mutation_count = mutation_count.saturating_add(1);
-                if *mutation_count >= 2 {
-                    return VerifyOutcome::Unstable {
-                        stage: stage.clone(),
-                        changed_files: stage_changes,
-                        round,
-                    };
-                }
-                return VerifyOutcome::Failed {
+                return VerifyOutcome::Unstable {
                     stage: stage.clone(),
-                    output: format!(
-                        "Verification stage modified relevant source files, so its result is invalid for a stable revision. Inspect or revert these changes before retrying:\n- {}\n\nStage output:\n{}",
-                        stage_changes.join("\n- "),
-                        execution.model_content(),
-                    ),
+                    changed_files: all_stage_changes,
                     round,
                 };
             }
@@ -1209,6 +1260,34 @@ impl WorkspaceRepairVerifier {
                     round,
                 };
             }
+            if matches!(
+                execution.status,
+                hi_tools::ToolStatus::Cancelled | hi_tools::ToolStatus::Denied
+            ) || (execution.status == hi_tools::ToolStatus::Failed
+                && baseline_failure_is_infrastructure(&execution))
+            {
+                self.record_execution(VerificationExecution::infrastructure_failure(round, stage));
+                return VerifyOutcome::InfrastructureError {
+                    stage: stage.clone(),
+                    output: execution.model_content(),
+                    round,
+                };
+            }
+            let mut observation = crate::recovery::ValidationObservation::command(
+                format!("verify:{}", uuid::Uuid::new_v4()),
+                &stage.command,
+                verified_digest.clone(),
+                if execution.status == hi_tools::ToolStatus::Succeeded {
+                    crate::recovery::ValidationResult::Passed
+                } else {
+                    crate::recovery::ValidationResult::Failed
+                },
+                &execution.model_content(),
+                workspace.root,
+                true,
+            );
+            cargo_scope::canonicalize_command(&mut observation, workspace.root, &stage.command);
+            self.observations.push(observation);
             if execution.status != hi_tools::ToolStatus::Succeeded {
                 let mut output = execution.model_content();
                 // Restructure the raw evidence: distinct root-cause diagnostics
@@ -1311,7 +1390,20 @@ impl WorkspaceRepairVerifier {
             self.previous_failures
                 .remove(&format!("{}\0{}", stage.name, stage.command));
         }
-        VerifyOutcome::Passed
+        if let Some(ledger) = &ledger {
+            let mut ledger = ledger.lock().unwrap_or_else(|p| p.into_inner());
+            if ledger.workspace_revision() != verified_digest {
+                return VerifyOutcome::Unstable {
+                    stage: stages.last().cloned().expect("stages are nonempty"),
+                    changed_files: ledger.touched_paths_since(verified_revision),
+                    round,
+                };
+            }
+        }
+        VerifyOutcome::Passed {
+            revision: verified_revision,
+            digest: verified_digest,
+        }
     }
 }
 
@@ -1699,11 +1791,12 @@ fn bounded_baseline_output(output: &str) -> String {
 }
 
 fn baseline_failure_is_infrastructure(outcome: &hi_tools::ProcessExecution) -> bool {
-    let text = outcome.model_content().to_ascii_lowercase();
-    outcome
-        .outcome
-        .exit_code
-        .is_some_and(|code| matches!(code, 126 | 127))
+    validation_failure_is_infrastructure(outcome.outcome.exit_code, &outcome.model_content())
+}
+
+pub(crate) fn validation_failure_is_infrastructure(code: Option<i32>, output: &str) -> bool {
+    let text = output.to_ascii_lowercase();
+    code.is_some_and(|code| matches!(code, 126 | 127))
         || [
             "operation not permitted",
             "permission denied",
@@ -1797,48 +1890,6 @@ pub(crate) fn is_internal_runtime_artifact_path(path: &str) -> bool {
 }
 
 #[cfg(test)]
-#[test]
-fn only_healthy_active_writer_admission_is_a_verifier_deferral() {
-    let denied = |reason, state| {
-        anyhow::Error::from(hi_workspace::AdmissionDenied {
-            reason,
-            state,
-            detail: "test admission denial".into(),
-        })
-    };
-    assert!(native_verifier_deferred_by_active_writer(&denied(
-        hi_workspace::AdmissionDeniedReason::ActiveWriter,
-        hi_workspace::WorkspaceState::Ready,
-    )));
-    for (reason, state) in [
-        (
-            hi_workspace::AdmissionDeniedReason::NotReady,
-            hi_workspace::WorkspaceState::RecoveryRequired,
-        ),
-        (
-            hi_workspace::AdmissionDeniedReason::NotReady,
-            hi_workspace::WorkspaceState::LeaseLost,
-        ),
-        (
-            hi_workspace::AdmissionDeniedReason::NotReady,
-            hi_workspace::WorkspaceState::Conflict,
-        ),
-        (
-            hi_workspace::AdmissionDeniedReason::Incompatible,
-            hi_workspace::WorkspaceState::Incompatible,
-        ),
-        (
-            hi_workspace::AdmissionDeniedReason::ActiveMutation,
-            hi_workspace::WorkspaceState::Ready,
-        ),
-    ] {
-        assert!(!native_verifier_deferred_by_active_writer(&denied(
-            reason, state
-        )));
-    }
-}
-
-#[cfg(test)]
 #[path = "verify_tests.rs"]
 mod tests;
 
@@ -1853,3 +1904,7 @@ mod verify_test_support;
 #[cfg(test)]
 #[path = "verify_timeout_tests.rs"]
 mod timeout_tests;
+
+#[cfg(test)]
+#[path = "verify_current_revision_tests.rs"]
+mod current_revision_tests;

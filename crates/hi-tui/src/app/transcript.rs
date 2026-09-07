@@ -7,8 +7,8 @@ mod steering;
 
 use run_output::{bash_output_is_idle, bash_process_live, is_missing_background_process_result};
 use steering::{
-    ExploreChrome, absorb_explore_chrome, append_assistant_line, is_steering_assistant_line,
-    is_steering_assistant_text, last_entry_is_blank, normalize_steering_text,
+    ExploreChrome, absorb_explore_chrome, append_assistant_line, is_steering_assistant_text,
+    last_entry_is_blank, normalize_steering_text,
 };
 
 use std::time::Instant;
@@ -386,6 +386,8 @@ impl crate::App {
             // Wire evidence is consumed by the structured event tap before
             // `App::apply`; it must never become transcript or debug content.
             UiEvent::ProviderRequest { .. } => {}
+            UiEvent::ProviderAttempt { event } => self.provider_activity.observe(&event),
+            UiEvent::ProviderProgress => self.provider_activity.progress(),
             UiEvent::Text { text } => {
                 self.event_log
                     .push(format!("assistant_text {} chars", text.len()));
@@ -481,6 +483,7 @@ impl crate::App {
                 self.reasoning_buffer.push_str(&text);
             }
             UiEvent::AssistantEnd => {
+                self.provider_activity = Default::default();
                 self.event_log.push("assistant_end".to_string());
                 self.last_turn_event = Some(TurnEventKind::AssistantEnd);
                 self.turn_rounds = self.turn_rounds.saturating_add(1);
@@ -1066,8 +1069,6 @@ impl crate::App {
                 TranscriptEntry::Activity(block) => {
                     return block.as_verb_group_mut().filter(|group| group.open);
                 }
-                TranscriptEntry::Assistant(line) if is_steering_assistant_line(line) => continue,
-                TranscriptEntry::Assistant(_) => return None,
                 TranscriptEntry::AssistantMessage { text } if is_steering_assistant_text(text) => {
                     continue;
                 }
@@ -1109,13 +1110,10 @@ impl crate::App {
             match &self.transcript[i] {
                 TranscriptEntry::Reasoning { .. } => steal.push(i),
                 TranscriptEntry::Line(_) => continue,
-                TranscriptEntry::Assistant(line) if is_steering_assistant_line(line) => {
-                    steal.push(i);
-                }
                 TranscriptEntry::AssistantMessage { text } if is_steering_assistant_text(text) => {
                     steal.push(i);
                 }
-                TranscriptEntry::Assistant(_) | TranscriptEntry::AssistantMessage { .. } => {
+                TranscriptEntry::AssistantMessage { .. } => {
                     if let Some(&reason_at) = steal
                         .iter()
                         .find(|&&j| matches!(self.transcript[j], TranscriptEntry::Reasoning { .. }))
@@ -1144,12 +1142,6 @@ impl crate::App {
                         chrome.thinking = format!("{text}\n{}", chrome.thinking);
                     }
                     chrome.thinking_elapsed = chrome.thinking_elapsed.saturating_add(elapsed);
-                }
-                TranscriptEntry::Assistant(line) => {
-                    let text = crate::render::line_text(&line);
-                    if !text.trim().is_empty() {
-                        chrome.steering.insert(0, text);
-                    }
                 }
                 TranscriptEntry::AssistantMessage { text } => {
                     for line in text.lines().rev() {
@@ -1268,16 +1260,4 @@ fn is_legacy_subagent_status(text: &str) -> bool {
 }
 
 #[cfg(test)]
-mod generic_completion_negative_control_tests {
-    use super::*;
-
-    #[test]
-    fn feature_controls_only_the_transcript_buffer_guard() {
-        let placeholder = "Completed the requested action.";
-        assert!(could_be_generic_completion_prefix(placeholder));
-        assert_eq!(
-            should_buffer_generic_completion_prefix(placeholder),
-            generic_completion_guards_enabled()
-        );
-    }
-}
+mod generic_completion_negative_control_tests;

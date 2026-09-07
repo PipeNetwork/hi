@@ -27,13 +27,18 @@ impl crate::Agent {
     /// files) and `config.memory.curate_skills`. Like
     /// [`update_memory`](Self::update_memory), it builds a throwaway message vec and
     /// does NOT record into session history.
-    pub(crate) async fn curate_turn_end(&mut self, turn_start: usize, ui: &mut dyn Ui) {
+    /// Returns the exact created path only after workspace publication acknowledges.
+    pub(crate) async fn curate_turn_end(
+        &mut self,
+        turn_start: usize,
+        ui: &mut dyn Ui,
+    ) -> Vec<std::path::PathBuf> {
         // Just this turn's trajectory (user prompt → tool calls → results), with
         // bulky tool outputs elided — the curator needs the shape of what worked,
         // not the verbatim command output.
         let all = self.messages.as_slice();
         if turn_start >= all.len() {
-            return;
+            return Vec::new();
         }
         let mut history: Vec<Message> = all[turn_start..]
             .iter()
@@ -45,7 +50,7 @@ impl crate::Agent {
             history.drain(..window_start);
         }
         if history.is_empty() {
-            return;
+            return Vec::new();
         }
         let len = history.len();
         compaction::elide_tool_outputs(&mut history, len);
@@ -68,6 +73,7 @@ impl crate::Agent {
         let model = self.config.routing.model.clone();
         let request_policy = self.seal_chat_only_auxiliary_request(&model, 512).await;
         let request = ChatRequest {
+            execution: self.request_execution(),
             model,
             request_id: None,
             retry_attempt: 0,
@@ -100,7 +106,7 @@ impl crate::Agent {
             StreamEvent::Status(text) => ui.status(&text),
             StreamEvent::Warning(text) => ui.top_status(&text),
             StreamEvent::Reasoning(_) => {}
-            StreamEvent::WireAudit(_) => {}
+            StreamEvent::WireAudit(_) | StreamEvent::ProviderAttempt(_) => {}
             StreamEvent::ToolCallDelta { .. } => {}
         };
         let timeout = self.side_call_timeout();
@@ -115,17 +121,17 @@ impl crate::Agent {
                     "(skill curation timed out after {:.1}s)",
                     timeout.as_secs_f64()
                 ));
-                return;
+                return Vec::new();
             }
             Ok(Ok(completion)) => completion,
             Ok(Err(err)) => {
                 self.add_side_error_usage(&err);
                 ui.status(&format!("(couldn't curate skill: {err})"));
-                return;
+                return Vec::new();
             }
         };
         self.add_side_usage(completion.usage);
-        let _ = self.persist();
+        let _ = self.persist_async().await;
         if out.trim().is_empty() {
             for c in &completion.content {
                 if let Content::Text(text) = c {
@@ -137,7 +143,7 @@ impl crate::Agent {
         // Silence bias: the model emits nothing (or no valid frontmatter) when
         // there's no general lesson — only persist a well-formed SKILL.md.
         let Some(skill) = parse_skill_markdown(&out) else {
-            return;
+            return Vec::new();
         };
         // Automatic curation is derived from repository-controlled context and
         // model output. Keep it inside this workspace even if that output asks
@@ -162,7 +168,7 @@ impl crate::Agent {
                 "automatic skill curation",
                 &declared_paths,
                 input,
-                || {
+                move || {
                     let written = skills::write_skill(
                         &roots,
                         "project",
@@ -189,9 +195,13 @@ impl crate::Agent {
                 self.subagents.auto_skills_written =
                     self.subagents.auto_skills_written.saturating_add(1);
                 ui.status(&format!("✓ curated skill → {}", path.display()));
+                vec![path]
             }
-            Ok(None) => {} // a skill by this name already exists
-            Err(err) => ui.status(&format!("(skill not saved: {err})")),
+            Ok(None) => Vec::new(), // a skill by this name already exists
+            Err(err) => {
+                ui.status(&format!("(skill not saved: {err})"));
+                Vec::new()
+            }
         }
     }
 }

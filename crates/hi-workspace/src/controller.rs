@@ -139,6 +139,12 @@ pub trait WorkspaceController: Send + Sync {
 
     fn subscribe(&self) -> watch::Receiver<WorkspaceStatus>;
 
+    /// Read the authoritative lifecycle without maintaining an adapter-local
+    /// copy. Backends which do not implement jobs return `None`.
+    fn job_state(&self, _job: &JobId) -> Option<crate::JobState> {
+        None
+    }
+
     async fn begin(&self, intent: MutationIntent) -> Result<MutationPermit, AdmissionDenied>;
 
     async fn settle(&self, permit: MutationPermit, execution: ExecutionReport)

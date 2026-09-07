@@ -125,6 +125,10 @@ pub struct SettingRegistry {
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum SettingError {
+    #[error(
+        "{0} selects the removed experimental engine; remove this setting to use the native turn policy"
+    )]
+    RemovedEngine(String),
     #[error("setting key is empty or invalid: {0:?}")]
     InvalidKey(String),
     #[error("setting {0:?} is already registered")]
@@ -294,6 +298,17 @@ pub fn standard_harness_settings() -> SettingRegistry {
             .secret(),
         )
         .expect("built-in provider credential setting is valid");
+    registry
+        .register(
+            SettingSpec::new(
+                "provider.no_progress_timeout",
+                SettingKind::DurationMillis,
+                Some(SettingValue::DurationMillis(300_000)),
+                "Time without decoded model progress; zero disables the watchdog",
+            )
+            .bounded(0, 24 * 60 * 60_000),
+        )
+        .expect("built-in provider watchdog is valid");
     for (key, millis, description) in [
         (
             "jobs.queue_timeout",
@@ -328,7 +343,24 @@ pub fn standard_harness_settings() -> SettingRegistry {
             )
             .expect("built-in harness duration setting is valid");
     }
+    registry
+        .register(
+            SettingSpec::new(
+                "recovery.max_interventions",
+                SettingKind::Integer,
+                Some(SettingValue::Integer(3)),
+                "Automatic corrections without objective improvement",
+            )
+            .bounded(0, 1_000),
+        )
+        .expect("built-in recovery limit is valid");
     for (key, value, maximum, description) in [
+        (
+            "provider.max_attempts",
+            4,
+            16,
+            "Physical sends per logical model request",
+        ),
         (
             "jobs.max_preparations",
             4,
@@ -373,7 +405,7 @@ pub fn standard_harness_settings() -> SettingRegistry {
         (
             "features.native_director_v2",
             false,
-            "Promote the native director from shadow traces",
+            "Historical setting; NativeDirector was removed",
         ),
         (
             "features.session_projection_v2",

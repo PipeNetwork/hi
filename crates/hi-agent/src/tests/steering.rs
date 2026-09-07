@@ -633,7 +633,7 @@ async fn text_tool_fallback_retries_narration_and_executes_the_next_call() {
 }
 
 #[tokio::test]
-async fn no_progress_implementation_can_finalize_without_a_synthetic_failure() {
+async fn implementation_with_accepted_answer_settles_without_recap_inference() {
     let path = temp_file("implementation-no-finalize");
     let path_string = path.to_string_lossy().to_string();
     let mut cfg = config();
@@ -660,7 +660,7 @@ async fn no_progress_implementation_can_finalize_without_a_synthetic_failure() {
             .unwrap()
             .text()
             .contains("Final recap"),
-        "normal settlement may emit its configured recap"
+        "normal settlement preserves the accepted model answer"
     );
     assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(outcome.stop_reason, TurnStopReason::VerificationUnavailable);
@@ -705,7 +705,7 @@ async fn scaffold_only_implementation_gets_source_edit_nudge() {
             .unwrap()
             .text()
             .contains("Final recap"),
-        "normal settlement may emit its configured recap"
+        "normal settlement preserves the accepted model answer"
     );
     assert!(
         !agent
@@ -1631,7 +1631,7 @@ fn security_preflight_is_code_scoped_and_bounded() {
 }
 
 #[tokio::test]
-async fn read_only_review_no_evidence_repair_settles_with_the_available_answer() {
+async fn read_only_review_no_evidence_exhausts_shared_recovery() {
     let responses = vec![
         completion(
             vec![Content::Text(
@@ -1679,35 +1679,16 @@ async fn read_only_review_no_evidence_repair_settles_with_the_available_answer()
         )
         .await
         .unwrap();
-
-    assert!(
-        ui.assistant
-            .contains("Not enough evidence to review without inspecting files."),
-        "the bounded repair should preserve the available model answer: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("no inspected evidence after repair")),
-        "expected exhausted no-evidence status: {:?}",
-        ui.statuses
-    );
-    let telemetry = agent.last_turn_telemetry();
-    assert_eq!(outcome.status, TurnStatus::Completed);
-    assert_eq!(telemetry.quality_repair_nudges, 4);
-    assert_eq!(telemetry.discovery_depth, "none");
-    assert!(
-        !ui.statuses.iter().any(|status| {
-            status.contains("incomplete") || status.to_ascii_lowercase().contains("stalled")
-        }),
-        "bounded review repair must not manufacture a legacy terminal state: {:?}",
-        ui.statuses
-    );
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
+    assert_eq!(agent.task_recovery().interventions, 3);
+    assert!(agent.task_recovery().exhausted);
+    assert!(ui.assistant.contains("Automatic recovery stopped."));
+    assert_eq!(agent.last_turn_telemetry().discovery_depth, "none");
 }
 
 #[tokio::test]
-async fn listing_only_review_gets_full_budget_after_no_evidence_repair() {
+async fn listing_only_review_retains_shared_recovery_after_no_evidence_repair() {
     let responses = vec![
         completion(
             vec![Content::Text(
@@ -1768,17 +1749,12 @@ async fn listing_only_review_gets_full_budget_after_no_evidence_repair() {
         .run_turn("/status codebase state", &mut ui)
         .await
         .unwrap();
-
-    let telemetry = agent.last_turn_telemetry();
-    assert_eq!(outcome.status, TurnStatus::Completed);
-    assert_eq!(telemetry.quality_repair_nudges, 5);
-    assert_eq!(telemetry.review_repair_counts["review_no_evidence"], 1);
-    assert_eq!(telemetry.review_repair_counts["review_listing_only"], 4);
-    assert_eq!(
-        telemetry.review_repair_exhaustion_reason,
-        "review_listing_only_exhausted"
-    );
-    assert!(ui.assistant.contains("healthy and organized"));
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
+    assert_eq!(agent.task_recovery().interventions, 3);
+    assert!(agent.task_recovery().exhausted);
+    assert!(ui.assistant.contains("Automatic recovery stopped."));
+    assert!(agent.last_turn_telemetry().listing_only);
 }
 
 fn provider_request_text(requests: &[Vec<Message>], index: usize) -> String {
@@ -2314,7 +2290,7 @@ async fn read_only_review_repair_template_final_is_not_accepted() {
 }
 
 #[tokio::test]
-async fn repeated_completion_placeholder_settles_without_a_synthetic_failure() {
+async fn repeated_completion_placeholder_returns_typed_no_progress() {
     let inspected_path = temp_file("repair-exhaustion-evidence");
     std::fs::write(&inspected_path, "pub fn value() -> i32 { 1 }\n").unwrap();
     let inspected = inspected_path.to_string_lossy().to_string();
@@ -2369,22 +2345,11 @@ async fn repeated_completion_placeholder_settles_without_a_synthetic_failure() {
         )
         .await
         .unwrap();
-
-    let telemetry = agent.last_turn_telemetry();
-    assert_eq!(telemetry.quality_repair_nudges, 4);
-    assert_eq!(outcome.status, TurnStatus::Completed);
-    assert!(
-        ui.assistant.contains("Completed the requested action"),
-        "the available user-visible answer should be preserved: {}",
-        ui.assistant
-    );
-    assert!(
-        !ui.statuses.iter().any(|status| {
-            status.contains("incomplete") || status.to_ascii_lowercase().contains("stalled")
-        }),
-        "generic answers must not manufacture a legacy terminal state: {:?}",
-        ui.statuses
-    );
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
+    assert_eq!(agent.task_recovery().interventions, 3);
+    assert!(agent.task_recovery().exhausted);
+    assert!(ui.assistant.contains("Automatic recovery stopped."));
     let _ = std::fs::remove_file(inspected_path);
 }
 
@@ -2488,13 +2453,8 @@ async fn read_only_review_generic_insufficient_after_read_reports_evidence() {
         telemetry.review_repair_counts["review_inspected_disclaimer"],
         4
     );
-    // After disclaimer budget is spent, accept the last model answer instead of stalling.
-    assert!(
-        ui.assistant.contains("Not enough evidence")
-            || ui.assistant.contains("cannot make concrete"),
-        "expected accepted disclaimer text, got: {}",
-        ui.assistant
-    );
+    assert!(ui.assistant.contains("Automatic recovery stopped."));
+    assert!(agent.task_recovery().exhausted);
     let _ = std::fs::remove_file(inspected_path);
 }
 
@@ -2591,7 +2551,7 @@ async fn read_only_review_generic_insufficient_after_read_gets_summary_repair() 
 }
 
 #[tokio::test]
-async fn inspected_disclaimer_chat_attempts_do_not_share_unrelated_repair_budget() {
+async fn inspected_disclaimer_chat_attempts_charge_shared_recovery_once() {
     let inspected_path = temp_file("inspected-disclaimer-independent");
     std::fs::write(&inspected_path, "[workspace]\n").unwrap();
     let inspected = inspected_path.to_string_lossy().to_string();
@@ -2672,13 +2632,13 @@ async fn inspected_disclaimer_chat_attempts_do_not_share_unrelated_repair_budget
             ToolMode::ChatOnly,
             ToolMode::ChatOnly,
         ],
-        "inspected-disclaimer repairs should force independent chat-only answer attempts: {modes:?}"
+        "inspected-disclaimer repairs should request chat-only answers within shared recovery: {modes:?}"
     );
     let _ = std::fs::remove_file(inspected_path);
 }
 
 #[tokio::test]
-async fn read_only_review_repeat_exhaustion_without_an_answer_returns_an_error() {
+async fn read_only_review_repeat_exhaustion_returns_typed_no_progress() {
     let inspected_path = temp_file("repeat-exhaustion-evidence");
     std::fs::write(
         &inspected_path,
@@ -2752,21 +2712,17 @@ async fn read_only_review_repeat_exhaustion_without_an_answer_returns_an_error()
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    let error = agent
+    let outcome = agent
         .run_turn(
             "review for security issues or unsafe unwraps. then disucss only",
             &mut ui,
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert!(
-        error
-            .to_string()
-            .contains("model returned no usable final answer after bounded recovery"),
-        "unexpected bounded-recovery error: {error:#}"
-    );
-    assert!(ui.assistant.is_empty());
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
+    assert!(ui.assistant.contains("Automatic recovery stopped."));
     let _ = std::fs::remove_file(inspected_path);
 }
 
@@ -2847,8 +2803,7 @@ async fn gap_review_search_match_blocks_no_gap_overclaim() {
         ui.statuses
     );
     assert!(
-        ui.assistant
-            .contains("could not complete this request after repeated attempts made no progress"),
+        ui.assistant.contains("Automatic recovery stopped."),
         "contradicted review claims should end with an honest closeout: {}",
         ui.assistant
     );
@@ -3052,7 +3007,7 @@ async fn security_review_overbroad_all_clear_gets_scope_nudge() {
 }
 
 #[tokio::test]
-async fn read_only_review_repeated_search_without_an_answer_returns_an_error() {
+async fn read_only_review_repeated_search_returns_typed_no_progress() {
     let grep_call = || {
         completion(
             vec![Content::ToolCall {
@@ -3075,13 +3030,13 @@ async fn read_only_review_repeated_search_without_an_answer_returns_an_error() {
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    let error = agent
+    let outcome = agent
         .run_turn(
             "review for security issues or unsafe unwraps. then disucss only",
             &mut ui,
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
     assert!(
         ui.statuses
@@ -3090,13 +3045,9 @@ async fn read_only_review_repeated_search_without_an_answer_returns_an_error() {
         "expected read-after-search nudge: {:?}",
         ui.statuses
     );
-    assert!(
-        error
-            .to_string()
-            .contains("model returned no usable final answer after bounded recovery"),
-        "unexpected bounded-recovery error: {error:#}"
-    );
-    assert!(ui.assistant.is_empty());
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
+    assert!(ui.assistant.contains("Automatic recovery stopped."));
 }
 
 #[tokio::test]
@@ -3176,7 +3127,7 @@ async fn read_only_review_search_then_generic_final_requires_file_read() {
 }
 
 #[tokio::test]
-async fn listing_only_review_repair_exhaustion_settles_with_the_available_answer() {
+async fn listing_only_review_repair_exhaustion_preserves_typed_failure() {
     let responses = vec![
         completion(
             vec![Content::ToolCall {
@@ -3231,29 +3182,10 @@ async fn listing_only_review_repair_exhaustion_settles_with_the_available_answer
         .run_turn("/status codebase state", &mut ui)
         .await
         .unwrap();
-
-    assert!(
-        ui.assistant
-            .contains("The repository looks healthy and organized."),
-        "bounded repair should preserve the available model answer: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("only listing evidence after repair")),
-        "expected exhausted repair status: {:?}",
-        ui.statuses
-    );
-    let telemetry = agent.last_turn_telemetry();
-    assert_eq!(outcome.status, TurnStatus::Completed);
-    assert_eq!(telemetry.quality_repair_nudges, 4);
-    assert!(telemetry.listing_only);
-    assert!(
-        !ui.statuses.iter().any(|status| {
-            status.contains("incomplete") || status.to_ascii_lowercase().contains("stalled")
-        }),
-        "bounded review repair must not manufacture a legacy terminal state: {:?}",
-        ui.statuses
-    );
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
+    assert_eq!(agent.task_recovery().interventions, 3);
+    assert!(agent.task_recovery().exhausted);
+    assert!(ui.assistant.contains("Automatic recovery stopped."));
+    assert!(agent.last_turn_telemetry().listing_only);
 }

@@ -21,6 +21,7 @@ use thiserror::Error;
 mod projections;
 mod schema;
 mod workspace_journal;
+mod workspace_journal_writer;
 mod workspace_projection;
 mod workspace_restart;
 

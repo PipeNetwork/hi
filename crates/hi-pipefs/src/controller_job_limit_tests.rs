@@ -65,3 +65,53 @@ async fn preparation_limit_failure_rejects_pipefs_job_admission_without_strandin
         .await
         .expect("failed admission must release its preparation slot");
 }
+
+async fn candidate_trace(
+    controller: &dyn WorkspaceController,
+) -> Vec<(JobSealStatus, Option<JobState>)> {
+    let job = controller
+        .register_job(JobSpec {
+            kind: JobKind::WriteCandidate,
+            effect_scope: EffectScope::CandidateOnly,
+            name: "shared lifecycle".into(),
+            limits: JobLimits::default(),
+            parent_operation: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(controller.job_state(&job.job_id), Some(JobState::Running));
+    let mut trace = Vec::new();
+    for completion in [
+        JobCompletion::Succeeded,
+        JobCompletion::ReadyToMerge,
+        JobCompletion::Merging,
+        JobCompletion::Settling,
+        JobCompletion::Succeeded,
+        JobCompletion::Succeeded,
+    ] {
+        let outcome = controller
+            .seal_job(
+                job.job_id.clone(),
+                JobTerminal {
+                    completion,
+                    detail: None,
+                    artifacts: Vec::new(),
+                },
+            )
+            .await;
+        assert_eq!(controller.job_state(&job.job_id), outcome.state);
+        trace.push((outcome.status, outcome.state));
+    }
+    assert!(controller.status().active_jobs.is_empty());
+    trace
+}
+
+#[tokio::test]
+async fn local_and_pipefs_share_the_candidate_transition_contract() {
+    let (_temporary, remote, _session, _server) = subject(false).await;
+    let local = InMemoryWorkspaceController::new_local("local", "/local", "/state");
+    assert_eq!(
+        candidate_trace(&local).await,
+        candidate_trace(&remote).await
+    );
+}

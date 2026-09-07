@@ -494,6 +494,7 @@ impl crate::Agent {
         let model = self.config.routing.model.clone();
         let request_policy = self.seal_chat_only_auxiliary_request(&model, 1024).await;
         let request = ChatRequest {
+            execution: self.request_execution(),
             model,
             request_id: None,
             retry_attempt: 0,
@@ -528,7 +529,7 @@ impl crate::Agent {
             StreamEvent::Status(text) => ui.status(&text),
             StreamEvent::Warning(text) => ui.top_status(&text),
             StreamEvent::Reasoning(_) => {}
-            StreamEvent::WireAudit(_) => {}
+            StreamEvent::WireAudit(_) | StreamEvent::ProviderAttempt(_) => {}
             StreamEvent::ToolCallDelta { .. } => {}
         };
         let timeout = self.side_call_timeout();
@@ -544,7 +545,7 @@ impl crate::Agent {
                     "compaction summary timed out after {:.1}s; keeping the existing history",
                     timeout.as_secs_f64()
                 ));
-                let _ = self.persist();
+                let _ = self.persist_async().await;
                 return Ok(None);
             }
             Ok(Ok(completion)) => completion,
@@ -555,12 +556,12 @@ impl crate::Agent {
                 self.emit_usage(ui);
                 // Flush any partially-streamed summary text before returning.
                 ui.assistant_end();
-                let _ = self.persist();
+                let _ = self.persist_async().await;
                 return Err(err);
             }
         };
         self.add_side_usage(completion.usage);
-        let _ = self.persist();
+        let _ = self.persist_async().await;
         self.emit_usage(ui);
 
         // Fall back to the final content if the provider didn't stream text.

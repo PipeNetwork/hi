@@ -11,7 +11,7 @@ use hi_agent::Agent;
 use crate::commands::handle_command;
 use crate::config::{self, Settings};
 use crate::goal_drive::pending_drive_prompt;
-use crate::provider::{agent_provider_route, provider_label};
+use crate::provider::provider_label;
 use crate::session;
 use crate::ui::PlainUi;
 
@@ -119,6 +119,12 @@ pub(crate) async fn repl(
                 let input = if let Some(command) =
                     hi_agent::command::parse(&line).map(hi_agent::command::resolve_command)
                 {
+                    if matches!(&command, Command::Model(value) | Command::Provider(value) | Command::Moa(value) if !value.trim().is_empty())
+                        && let Err(error) = agent.ensure_session_reusable()
+                    {
+                        eprintln!("\x1b[33mrouting unchanged: {error:#}\x1b[0m");
+                        continue;
+                    }
                     match command {
                         Command::Quit => break,
                         Command::Pipefs(argument) => {
@@ -681,7 +687,11 @@ pub(crate) async fn repl(
                                     let label = provider_label(new_settings.provider);
                                     let model = new_settings.model.clone();
                                     let provider: std::sync::Arc<dyn hi_ai::Provider> =
-                                        crate::build_chain(&new_settings, Vec::new()).into();
+                                        crate::build_chain(
+                                            &new_settings,
+                                            config::resolve_profile_fallbacks(config, arg),
+                                        )
+                                        .into();
                                     agent.clear_driver_local_server();
                                     apply_resolved_provider(agent, &new_settings, provider, None);
                                     // Track the now-active profile so a later
@@ -861,7 +871,7 @@ pub(crate) async fn repl(
                                     let progress = Arc::new(AtomicBool::new(false));
                                     let mut plain = PlainUi::with_progress(progress.clone());
                                     let cancellation = hi_agent::TurnCancellation::new();
-                                    let (driven, _) = drive_with_spinner(
+                                    let (_driven, _) = drive_with_spinner(
                                         agent.run_turn_cancellable(
                                             &prompt,
                                             &mut plain,
@@ -871,18 +881,6 @@ pub(crate) async fn repl(
                                         Some(cancellation.clone()),
                                     )
                                     .await;
-                                    if let Some(Err(error)) = driven.as_ref()
-                                        && !(cancellation.is_cancelled()
-                                            && agent.last_turn_outcome().is_some_and(|outcome| {
-                                                outcome.status == hi_agent::TurnStatus::Cancelled
-                                            }))
-                                    {
-                                        let _ = agent
-                                            .cleanup_turn(hi_agent::TurnCleanupKind::for_error(
-                                                error,
-                                            ))
-                                            .await;
-                                    }
                                     if let Some(callback) = &after_turn {
                                         callback();
                                     }
@@ -1017,7 +1015,7 @@ pub(crate) async fn repl(
                 let turn_snapshot = agent.state_snapshot();
                 last_turn_snapshot = Some(turn_snapshot.clone());
                 let progress = Arc::new(AtomicBool::new(false));
-                let (driven, interrupt_requested, cancellation_requested) = {
+                let (driven, _interrupt_requested, cancellation_requested) = {
                     let mut plain = PlainUi::with_progress(progress.clone());
                     let cancellation = hi_agent::TurnCancellation::new();
                     let (result, interrupted) = drive_with_spinner(
@@ -1028,14 +1026,14 @@ pub(crate) async fn repl(
                     .await;
                     (result, interrupted, cancellation.is_cancelled())
                 };
-                let cancelled = driven.is_none()
-                    || (interrupt_requested
-                        && driven.as_ref().is_some_and(|result| {
-                            matches!(
-                                result,
-                                Ok(outcome) if outcome.status == hi_agent::TurnStatus::Cancelled
-                            )
-                        }));
+                let settled_outcome = driven.as_ref().and_then(|result| match result {
+                    Ok(outcome) => Some(outcome),
+                    Err(error) => error
+                        .downcast_ref::<hi_agent::TurnFailure>()
+                        .map(|failure| &failure.outcome),
+                });
+                let cancelled = settled_outcome
+                    .is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Cancelled);
                 if cancelled {
                     // `run_turn_cancellable` has already settled tool results,
                     // rewound durable session state, rolled back checkpoints,
@@ -1057,19 +1055,7 @@ pub(crate) async fn repl(
                             "\x1b[33mplan drive interrupted — paused; reply to steer and resume, or use /plan resume\x1b[0m"
                         );
                     }
-                } else if let Some(Err(error)) = driven.as_ref() {
-                    // A configured hard timeout completes Agent-owned Cancel
-                    // cleanup before preserving its deadline error. Avoid
-                    // overwriting that terminal Cancel outcome with Fail.
-                    let already_cancelled = cancellation_requested
-                        && agent.last_turn_outcome().is_some_and(|outcome| {
-                            outcome.status == hi_agent::TurnStatus::Cancelled
-                        });
-                    if !already_cancelled {
-                        let _ = agent
-                            .cleanup_turn(hi_agent::TurnCleanupKind::for_error(error))
-                            .await;
-                    }
+                } else if driven.as_ref().is_some_and(Result::is_err) {
                     if goal_drive_turn {
                         let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Infra);
                     }
@@ -1195,6 +1181,7 @@ async fn switch_to_mlx_profile(
     run: &hi_tools::HfMlxRun,
 ) -> Result<()> {
     let result = async {
+        agent.ensure_session_reusable()?;
         let profile = config::Profile {
             provider: Some(config::ProviderName::Openai),
             model: Some(run.model_id.clone()),
@@ -1215,8 +1202,11 @@ async fn switch_to_mlx_profile(
         };
         config::upsert_profile_project_local(config, &run.profile_name, profile, config_path)?;
         let settings = config::resolve_named_profile(config, &run.profile_name)?;
-        let provider: std::sync::Arc<dyn hi_ai::Provider> =
-            crate::build_chain(&settings, Vec::new()).into();
+        let provider: std::sync::Arc<dyn hi_ai::Provider> = crate::build_chain(
+            &settings,
+            config::resolve_profile_fallbacks(config, &run.profile_name),
+        )
+        .into();
         let mut window: Option<u32> = None;
         apply_resolved_provider(agent, &settings, provider, window);
         agent.register_driver_local_server(
@@ -1245,6 +1235,7 @@ async fn switch_to_managed_local_profile(
     config: &config::Config,
     name: &str,
 ) -> Result<Option<(String, String)>> {
+    agent.ensure_session_reusable()?;
     let settings = config::resolve_named_profile(config, name)?;
     if settings
         .runtime
@@ -1259,7 +1250,7 @@ async fn switch_to_managed_local_profile(
     let label = provider_label(settings.provider).to_string();
     let model = settings.model.clone();
     let provider: std::sync::Arc<dyn hi_ai::Provider> =
-        crate::build_chain(&settings, Vec::new()).into();
+        crate::build_chain(&settings, config::resolve_profile_fallbacks(config, name)).into();
     agent.clear_driver_local_server();
     apply_resolved_provider(agent, &settings, provider, None);
     agent.register_driver_local_server(runtime.base_url, runtime.model_id, runtime.process_id);
@@ -1281,16 +1272,10 @@ fn apply_resolved_provider(
     provider: std::sync::Arc<dyn hi_ai::Provider>,
     context_window: Option<u32>,
 ) {
-    agent.set_provider_with_route(
-        provider,
-        agent_provider_route(settings),
-        settings.model.clone(),
-        context_window,
-        settings.max_tokens,
-        settings.max_tokens_explicit,
-        None,
-    );
-    agent.set_tool_mode(settings.tool_mode);
+    let mut routing = crate::provider::switched_routing(settings);
+    routing.context_window = context_window;
+    routing.temperature = agent.temperature();
+    agent.set_provider_with_routing(provider, routing);
 }
 
 /// Drive a model future (a turn or a compaction) to completion, showing an

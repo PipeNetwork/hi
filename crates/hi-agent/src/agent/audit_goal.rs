@@ -87,6 +87,8 @@ impl crate::Agent {
                 goal.objective_complete = false;
                 let appended = goal.append_missing(&items);
                 if appended > 0 {
+                    self.task_recovery
+                        .request_correction("completion audit missing requested effects");
                     let rounds = goal.audit_rounds;
                     goal.push_event(
                         "audit",
@@ -142,6 +144,7 @@ impl crate::Agent {
         let input = self.audit_input(goal).await;
         let request_policy = self.seal_chat_only_auxiliary_request(&model, 1024).await;
         let request = ChatRequest {
+            execution: self.request_execution(),
             model,
             request_id: None,
             retry_attempt: 0,

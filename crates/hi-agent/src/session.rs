@@ -34,6 +34,11 @@ impl WorkspaceTranscriptExecution {
 
 /// Records conversation messages durably. Implementations do their own IO.
 pub trait SessionSink: Send {
+    /// Runtime ownership seam installed automatically by Agent::set_session.
+    fn io_handle(&self) -> Option<crate::SessionIoHandle> {
+        None
+    }
+
     /// Stable identifier of the durable session this sink writes to — the
     /// transcript file stem for JSONL sessions. `None` for sinks with no
     /// durable identity (tests, ephemeral runs). Findings-ledger records use
@@ -196,6 +201,12 @@ pub trait SessionSink: Send {
         Ok(())
     }
 
+    /// Persist the task-scoped automatic recovery budget. This is independent
+    /// of transcript replacement so cancellation/compaction cannot refill it.
+    fn record_task_recovery(&mut self, _state: &crate::TaskRecoveryState) -> Result<()> {
+        Ok(())
+    }
+
     /// Persist goal-drive stall. Last write wins. Default no-op.
     fn record_goal_drive(&mut self, _stall: u32) -> Result<()> {
         Ok(())
@@ -226,6 +237,29 @@ pub trait SessionSink: Send {
         _outcome: &crate::TurnOutcome,
         _review_unavailable_reason: Option<&str>,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Commit settled goal progress and recovery credit with their final outcome. Durable sinks override
+    /// this with one record. Compatibility sinks write the outcome first, so a
+    /// crash may lose credit but cannot grant it without a settled outcome.
+    fn record_turn_settlement(
+        &mut self,
+        outcome: &crate::TurnOutcome,
+        review_unavailable_reason: Option<&str>,
+        task_recovery: Option<&crate::TaskRecoveryState>,
+        settled_goal: Option<&crate::Goal>,
+    ) -> Result<()> {
+        if let Some(state) = task_recovery {
+            state.validate().map_err(anyhow::Error::msg)?;
+        }
+        self.record_turn_outcome(outcome, review_unavailable_reason)?;
+        if let Some(goal) = settled_goal {
+            self.record_goal(goal)?;
+        }
+        if let Some(state) = task_recovery {
+            self.record_task_recovery(state)?;
+        }
         Ok(())
     }
 }

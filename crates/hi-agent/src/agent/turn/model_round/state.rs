@@ -90,7 +90,7 @@ pub(super) fn collapse_duplicate_inspection_calls(
 
 pub(in crate::agent::turn) enum ModelRoundControl {
     Continue,
-    BreakInner(bool),
+    Finish(crate::agent::turn::ModelLoopDecision),
     RunTools {
         calls: Vec<(String, String, String)>,
         completion_content: Vec<Content>,

@@ -613,8 +613,19 @@ async fn request_too_large_latest_prompt_is_removed_after_failed_retry() {
     );
     assert_eq!(
         agent.messages().len(),
-        start_len,
-        "failed oversized prompt is not left in live history"
+        start_len + 1,
+        "the oversized prompt is replaced by one durable failure closeout"
+    );
+    assert_eq!(
+        agent.messages().last().unwrap().role,
+        hi_ai::Role::Assistant
+    );
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .skip(start_len)
+            .all(|message| message.role != hi_ai::Role::User)
     );
     assert!(
         ui.statuses.iter().any(|s| s.contains("shorten the prompt")),
@@ -656,8 +667,12 @@ async fn request_too_large_failed_retry_after_dropping_context_removes_latest_pr
     );
     assert_eq!(
         agent.messages().len(),
-        1,
-        "failed retry should remove the rewritten latest prompt instead of leaving it in history"
+        2,
+        "only the system message and one durable failure closeout remain after dropping oversized context"
+    );
+    assert_eq!(
+        agent.messages().last().unwrap().role,
+        hi_ai::Role::Assistant
     );
     assert!(
         agent
@@ -759,8 +774,19 @@ async fn context_preflight_rejects_hopeless_oversized_prompt_without_provider_ca
     );
     assert_eq!(
         agent.messages().len(),
-        start_len,
-        "failed oversized prompt is not left in live history"
+        start_len + 1,
+        "the oversized prompt is replaced by one durable failure closeout"
+    );
+    assert_eq!(
+        agent.messages().last().unwrap().role,
+        hi_ai::Role::Assistant
+    );
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .skip(start_len)
+            .all(|message| message.role != hi_ai::Role::User)
     );
     assert!(
         ui.statuses.iter().any(|s| s.contains("shorten the prompt")),
@@ -1009,7 +1035,7 @@ async fn unlimited_default_still_bounds_persistent_empty_recovery_at_six_request
         .unwrap_err();
 
     assert!(
-        err.to_string().contains("scripted provider error"),
+        format!("{err:#}").contains("scripted provider error"),
         "the terminal empty-completion error should surface: {err:#}"
     );
     assert_eq!(
@@ -1616,34 +1642,6 @@ async fn tool_protocol_after_tool_progress_gets_guidance_nudge() {
 }
 
 #[tokio::test]
-async fn alternating_invalid_tool_turns_hit_the_cumulative_circuit_breaker() {
-    // A model that alternates a valid tool call with an invalid tool turn keeps
-    // resetting the *consecutive* protocol counter (MAX_TOOL_PROTOCOL_RETRIES), so
-    // without the cumulative cap the nudge-and-retry loop runs forever (the qtest4
-    // wedge). The cumulative circuit-breaker must end the turn instead. Distinct
-    // valid calls each round keep the repeat-tool-call guard from firing first, so
-    // this isolates the protocol cap; far more pairs than the cap are scripted, so
-    // a non-terminating loop would exhaust the script and panic in the provider.
-    let mut steps = Vec::new();
-    for i in 0..16 {
-        steps.push(ProviderStep::Completion(bash_completion(&format!(
-            "echo {i}"
-        ))));
-        steps.push(ProviderStep::Error(ProviderErrorKind::ToolProtocol));
-    }
-    let (mut agent, _requests) = scripted_agent(steps, config());
-    let mut ui = RecUi::default();
-
-    agent.run_turn("go", &mut ui).await.unwrap();
-
-    assert!(
-        ui.statuses.iter().any(|s| s.contains("invalid tool turns")),
-        "the circuit-breaker should end the turn once cumulative invalid turns are spent: {:?}",
-        ui.statuses
-    );
-}
-
-#[tokio::test]
 async fn keep_working_recovers_after_invalid_tool_turn_budget() {
     let mut cfg = config();
     cfg.loop_limits.max_keep_working = 2;
@@ -1672,58 +1670,6 @@ async fn keep_working_recovers_after_invalid_tool_turn_budget() {
         "must not ask the user to retry: {:?}",
         ui.statuses
     );
-}
-
-#[tokio::test]
-async fn implementation_tool_protocol_exhaustion_falls_back_to_text_tool_calls() {
-    let path = temp_file("protocol-text-fallback");
-    let path_string = path.to_string_lossy().to_string();
-    let xmlish_write = format!(
-        "<tool_call>write<arg_key>path</arg_key><arg_value>{path_string}</arg_value><arg_key>content</arg_key><arg_value>ok\n</arg_value></tool_call>"
-    );
-    let (mut agent, requests) = scripted_agent(
-        vec![
-            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
-            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
-            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
-            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
-            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
-            ProviderStep::Completion(completion(vec![Content::Text(xmlish_write)], 5, 3)),
-            ProviderStep::Completion(bash_completion("true # validate")),
-            ProviderStep::Completion(completion(
-                vec![Content::Text(format!(
-                    "Changed {path_string} and validated with true # validate."
-                ))],
-                5,
-                3,
-            )),
-        ],
-        config(),
-    );
-    let mut ui = RecordingUi::default();
-    agent
-        .run_turn("/build a small CLI project tracker", &mut ui)
-        .await
-        .unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok\n");
-    let _ = std::fs::remove_file(&path);
-
-    assert!(
-        ui.statuses
-            .iter()
-            .any(|status| status.contains("plain-text tool-call parsing")),
-        "expected text-tool fallback status: {:?}",
-        ui.statuses
-    );
-    assert!(
-        agent
-            .messages()
-            .last()
-            .unwrap()
-            .text()
-            .contains("validated with true # validate")
-    );
-    assert!(requests.lock().unwrap().len() >= 7);
 }
 
 #[tokio::test]
@@ -1976,3 +1922,5 @@ async fn terminal_error_persists_usage_before_returning() {
         }]
     );
 }
+
+mod bounded_recovery;

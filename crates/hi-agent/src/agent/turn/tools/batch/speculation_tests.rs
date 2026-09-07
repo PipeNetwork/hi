@@ -108,6 +108,8 @@ async fn execute_program_for_test(
             &specs,
             envelope,
             None,
+            &mut EvidenceTracker::default(),
+            &mut ImplementationTracker::default(),
             &mut progress,
             &mut timeline,
             &mut tool_calls,
@@ -378,6 +380,7 @@ async fn dynamically_built_nested_arguments_obey_the_sealed_byte_limit() {
     let (_, output) = agent
         .authorize_program_call(&call, &program_specs, &envelope, &mut ui)
         .await
+        .expect("authorization persistence succeeds")
         .expect("oversized nested call must be denied before execution");
 
     assert_eq!(output.status, hi_tools::ToolStatus::Denied);
@@ -423,6 +426,7 @@ async fn read_only_programs_cannot_admit_or_execute_mutating_nested_tools() {
     let (_, output) = agent
         .authorize_program_call(&call, &legacy.program_specs(), &legacy, &mut ui)
         .await
+        .expect("authorization persistence succeeds")
         .expect("read-only nested write must be denied");
     assert_eq!(output.status, hi_tools::ToolStatus::Denied);
     assert!(output.content.contains("read-only"));
@@ -594,4 +598,45 @@ fn outer_program_reserves_the_last_sealed_call_slot() {
         r#"tool("read", #{path: "sentinel.txt"})"#,
     );
     assert_eq!(registry.telemetry().launched, 0);
+}
+
+#[tokio::test]
+async fn program_progress_comes_from_real_nested_evidence_only() {
+    let workspace = IsolatedWorkspace::new("program-progress-evidence");
+    std::fs::write(workspace.path("input.txt"), "evidence").unwrap();
+    let mut agent = agent(&workspace, 8);
+    let envelope = envelope(&agent, ToolMode::Auto);
+    let mut ui = RecUi::default();
+    let (empty, _) =
+        execute_program_for_test(&mut agent, &envelope, "let answer = 42;", 0, &mut ui)
+            .await
+            .unwrap();
+    assert!(
+        empty
+            .tool_progress_labels
+            .iter()
+            .all(|label| label.kind != ProgressKind::Meaningful)
+    );
+    let (reads, _) = execute_program_for_test(
+        &mut agent,
+        &envelope,
+        r#"tool("read", #{path: "input.txt"}); tool("read", #{path: "input.txt"});"#,
+        0,
+        &mut ui,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reads
+            .tool_progress_labels
+            .iter()
+            .filter(|label| label.kind == ProgressKind::Meaningful)
+            .count(),
+        1
+    );
+    assert_eq!(
+        reads.tool_progress_labels.len(),
+        3,
+        "two physical reads and one envelope are each observed exactly once"
+    );
 }

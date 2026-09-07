@@ -1324,6 +1324,15 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         let mut restore_model_state: Option<hi_agent::AgentModelState> = None;
         let mut restore_app_model: Option<(String, Option<u32>)> = None;
         let run_line = if let Some(cmd) = command::parse(&line).map(command::resolve_command) {
+            if matches!(&cmd, Command::Model(value) | Command::Provider(value) | Command::Moa(value) if !value.trim().is_empty())
+                && let Err(error) = agent.ensure_session_reusable()
+            {
+                app.push(Line::styled(
+                    format!("routing unchanged: {error:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+                continue;
+            }
             match cmd {
                 Command::Quit => {
                     app.exit_requested = true;
@@ -1509,21 +1518,30 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             }
                         }
                         Ok(hi_tools::HfCommandResult::MlxReady(run)) => {
+                            if let Err(error) = agent.ensure_session_reusable() {
+                                hi_tools::stop_local_server(&run.process_id);
+                                app.push(Line::styled(
+                                    format!("provider unchanged: {error:#}"),
+                                    Style::default().fg(crate::theme::theme().warning),
+                                ));
+                                continue;
+                            }
                             for line in run.message.lines() {
                                 app.push(Line::styled(line.to_string(), dim()));
                             }
                             match (app.mlx_switcher)(&run) {
                                 Ok(switched) => {
-                                    let label = switched.switched.route.label.clone();
-                                    let model = switched.switched.model.clone();
+                                    let label = switched
+                                        .switched
+                                        .routing
+                                        .provider_route
+                                        .clone()
+                                        .unwrap_or_default();
+                                    let model = switched.switched.routing.model.clone();
                                     apply_provider_switch(
                                         agent,
                                         switched.switched.provider.into(),
-                                        switched.switched.route,
-                                        model.clone(),
-                                        switched.switched.max_tokens,
-                                        switched.switched.max_tokens_explicit,
-                                        switched.switched.tool_mode,
+                                        switched.switched.routing,
                                     );
                                     agent.register_driver_local_server(
                                         run.base_url.clone(),
@@ -2025,8 +2043,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     }
                     match (app.resolver)(&arg) {
                         Ok(switched) => {
-                            let label = switched.route.label.clone();
-                            let model = switched.model.clone();
+                            let label = switched.routing.provider_route.clone().unwrap_or_default();
+                            let model = switched.routing.model.clone();
                             let needs_model = model == "__model_not_configured__";
                             // A local driver server is owned by the agent, not
                             // by the profile endpoint. Release it when the
@@ -2036,11 +2054,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             apply_provider_switch(
                                 agent,
                                 switched.provider.into(),
-                                switched.route,
-                                model.clone(),
-                                switched.max_tokens,
-                                switched.max_tokens_explicit,
-                                switched.tool_mode,
+                                switched.routing,
                             );
                             app.provider = label.clone();
                             app.model = model.clone();
@@ -2762,7 +2776,6 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 app.set_working(true);
                                 app.follow();
                                 let checkpoint = agent.messages().len();
-                                let checkpoint_count = agent.checkpoint_count();
                                 app.last_turn_start = checkpoint;
                                 app.last_prompt = Some(run_line.clone());
                                 let turn_snapshot = agent.state_snapshot();
@@ -2806,117 +2819,18 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     )
                                     .await?
                                 };
-                                // A cancel key can race a turn that has already
-                                // committed. `run_turn_cancellable` returns a
-                                // typed Cancelled outcome when cancellation won;
-                                // a Completed value means the body won first and
-                                // must not be rewound by the frontend.
-                                let shared_token_cancelled = turn_cancel.is_cancelled();
-                                let stop_requested = driven.cancelled || shared_token_cancelled;
-                                let settled_status = driven
-                                    .value
-                                    .as_ref()
-                                    .map(|outcome| outcome.status)
-                                    .or_else(|| {
-                                        if shared_token_cancelled {
-                                            agent.last_turn_outcome().map(|outcome| outcome.status)
-                                        } else {
-                                            None
-                                        }
-                                    });
-                                let cancellation = drive::settle_turn_cancellation(
-                                    driven.cancelled,
-                                    shared_token_cancelled,
-                                    settled_status,
-                                );
-                                let cancelled = cancellation.cancelled;
-                                let agent_already_cleaned = cancellation.agent_already_cleaned;
-                                if let Some(outcome) = &driven.value {
+                                let stop_requested = driven.cancelled || turn_cancel.is_cancelled();
+                                let outcome = driven.value.as_ref().or(driven.failure.as_ref());
+                                let cancelled = outcome.is_some_and(|outcome| {
+                                    outcome.status == hi_agent::TurnStatus::Cancelled
+                                });
+                                if let Some(outcome) = outcome {
                                     app.note_turn_outcome(outcome);
-                                } else if agent_already_cleaned {
-                                    if let Some(outcome) = agent.last_turn_outcome() {
-                                        app.note_turn_outcome(outcome);
-                                    }
-                                } else if !cancelled {
-                                    let outcome = agent
-                                        .cleanup_turn(
-                                            driven
-                                                .failure
-                                                .clone()
-                                                .unwrap_or(hi_agent::TurnCleanupKind::Fail),
-                                        )
-                                        .await
-                                        .map(|r| r.outcome)
-                                        .unwrap_or_else(|_| {
-                                            agent.finalize_failed_turn_snapshot_only()
-                                        });
-                                    app.note_turn_outcome(&outcome);
                                 }
                                 app.set_working(false);
                                 app.interrupt = None;
-
                                 if cancelled {
-                                    // Full cancellation cleanup — same as the
-                                    // main turn path: kill bg processes, rewind
-                                    // session state, finalize the cancellation.
-                                    // When cooperative cancel already returned a
-                                    // Cancelled outcome, the agent undid its own
-                                    // checkpoints — skip a second undo.
-                                    if !agent_already_cleaned
-                                        && agent.checkpoint_count() > checkpoint_count
-                                        && let Err(err) = agent.undo().await
-                                    {
-                                        app.push(Line::styled(
-                                            format!("couldn't roll back interrupted workspace edits: {err:#}"),
-                                            Style::default().fg(crate::theme::theme().warning),
-                                        ));
-                                    }
-                                    if !agent_already_cleaned
-                                        && let Err(err) = agent
-                                            .rewind_to_snapshot_durable(checkpoint, &turn_snapshot)
-                                    {
-                                        app.push(Line::styled(
-                                            format!(
-                                                "couldn't persist interrupted turn discard: {err:#}"
-                                            ),
-                                            Style::default().fg(crate::theme::theme().warning),
-                                        ));
-                                        agent.truncate_messages(checkpoint);
-                                        agent.restore_state_snapshot(&turn_snapshot);
-                                    }
-                                    let killed = if agent_already_cleaned {
-                                        0
-                                    } else {
-                                        match agent
-                                            .cleanup_turn(hi_agent::TurnCleanupKind::Cancel {
-                                                session: hi_agent::SessionRollback::AlreadyApplied,
-                                            })
-                                            .await
-                                        {
-                                            Ok(r) => {
-                                                app.note_turn_outcome(&r.outcome);
-                                                r.killed_backgrounds
-                                            }
-                                            Err(err) => {
-                                                app.last_turn_state = TurnState::Cancelled;
-                                                app.status = "cancelled".to_string();
-                                                app.push(Line::styled(
-                                                    format!("couldn't finalize typed cancellation outcome: {err:#}"),
-                                                    Style::default()
-                                                        .fg(crate::theme::theme().warning),
-                                                ));
-                                                0
-                                            }
-                                        }
-                                    };
-                                    let msg = if killed > 0 {
-                                        format!(
-                                            "trio: cancelled; killed {killed} background process(es)"
-                                        )
-                                    } else {
-                                        "trio: cancelled".to_string()
-                                    };
-                                    app.push(Line::styled(msg, dim()));
+                                    app.push(Line::styled("trio: cancelled".to_string(), dim()));
                                     loop_stopped = true;
                                     break;
                                 }

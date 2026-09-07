@@ -11,12 +11,11 @@
 //! Feature-gated behind `AgentConfig::long_horizon` (default off) so the
 //! existing single-turn behavior is unchanged while this stabilizes.
 //!
-//! The state machine is unit-tested here; the deep `run_turn` outer-loop
-//! integration (driving sub-goals across turns, retry-nudging on failure) is
-//! the next step and lives in the agent loop. This module provides the typed
-//! state and the rules.
 
 use serde::{Deserialize, Serialize};
+mod completion;
+
+pub(crate) const GOAL_EXPORT_PATH: &str = ".hi/goal-plan.md";
 
 /// The status of a sub-goal (and the overall goal).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -770,7 +769,7 @@ impl Goal {
     ) -> std::io::Result<std::path::PathBuf> {
         let dir = workspace.join(".hi");
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join("goal-plan.md");
+        let path = workspace.join(GOAL_EXPORT_PATH);
         std::fs::write(&path, self.to_markdown())?;
         Ok(path)
     }

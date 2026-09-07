@@ -118,8 +118,6 @@ hi-test-utils = { version = "0.3.1", path = "crates/hi-test-utils" }
 hi-mcp = { version = "0.3.1", path = "crates/hi-mcp" }
 hi-browser = { version = "0.3.1", path = "crates/hi-browser" }
 hi-workflow = { version = "0.3.1", path = "crates/hi-workflow" }
-hi-engine-api = { version = "0.3.1", path = "crates/hi-engine-api" }
-hi-engine-host = { version = "0.3.1", path = "crates/hi-engine-host" }
 hi-events = { version = "0.3.1", path = "crates/hi-events" }
 hi-policy = { version = "0.3.1", path = "crates/hi-policy" }
 hi-control = { version = "0.3.1", path = "crates/hi-control" }
@@ -176,7 +174,6 @@ rand = "0.8"
 cc = "1"
 ansi-to-tui = "8"
 rhai = { version = "1.25", features = ["serde"] }
-wit-bindgen = "0.51"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 cpal = "0.18"
 whisper-rs = "0.16"

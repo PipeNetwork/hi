@@ -98,18 +98,6 @@ pub(crate) fn recent_split(messages: &[Message], keep_recent: usize) -> Option<u
     (starts.len() > keep_recent).then(|| starts[starts.len() - keep_recent])
 }
 
-/// Whether the slice `[1..split)` contains any tool results. Used by the
-/// elide-then-summarize-tail strategy to decide whether the "old" region is
-/// tool-heavy (elide it, keep the skeleton) or conversational (summarize it).
-#[allow(dead_code)]
-pub(crate) fn has_tool_results(messages: &[Message], split: usize) -> bool {
-    let up_to = split.min(messages.len());
-    messages[1..up_to]
-        .iter()
-        .flat_map(|m| &m.content)
-        .any(|c| matches!(c, Content::ToolResult { .. }))
-}
-
 /// The "old" conversational tail (pure Q&A user turns) that the
 /// elide-then-summarize-tail strategy summarizes. A user turn counts as
 /// conversational iff the assistant reply that follows it made **no tool
@@ -702,14 +690,9 @@ mod tests {
     }
 
     #[test]
-    fn has_tool_results_and_conversational_tail_partition_the_old_region() {
+    fn conversational_tail_excludes_tool_turns() {
         let m = convo(); // system, q1, read call, big result, q2, answer
         let split = recent_split(&m, 1).unwrap(); // q2 onward is recent → split at q2
-        // The old region [1..split) is turn one: q1 + read call + big result.
-        assert!(
-            has_tool_results(&m, split),
-            "old region has the read result"
-        );
         // Turn one's assistant reply made a tool call, so it's NOT part of the
         // conversational tail — the tail is empty for this conversation.
         let tail = conversational_tail(&m, split);

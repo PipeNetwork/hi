@@ -65,6 +65,7 @@ impl crate::Agent {
         };
         let request_policy = self.seal_chat_only_auxiliary_request(&model, 1024).await;
         let request = ChatRequest {
+            execution: self.request_execution(),
             model,
             request_id: None,
             retry_attempt: 0,
@@ -150,6 +151,7 @@ impl crate::Agent {
         let request_policy = self.seal_chat_only_auxiliary_request(&model, 1024).await;
 
         let request = ChatRequest {
+            execution: self.request_execution(),
             model,
             request_id: None,
             retry_attempt: 0,

@@ -1,6 +1,6 @@
 //! Per-turn progress classification and no-progress tracking.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use hi_ai::Content;
 
@@ -31,9 +31,6 @@ pub(super) const AWAITING_BACKGROUND_REASON: &str = "background process is still
 /// a status report. This catches fast completions without allowing unbounded
 /// model-driven polling.
 pub(super) const WAITING_ROUND_BUDGET: u32 = 3;
-pub(super) const REPEATED_VALIDATION_DIAGNOSIS_NUDGE: &str = "The same deterministic validation failure survived another edit-and-test cycle. Stop applying variants of the previous patch. Re-read the failing code and trace the relevant state transition from the assertion backward; if an independent explore tool is available, use it for one focused root-cause diagnosis before editing again. Then make one bounded fix and rerun the narrowest failing validation.";
-const FAILED_VALIDATION_LIMIT: usize = 256;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProgressKind {
     Meaningful,
@@ -56,9 +53,6 @@ pub(super) struct ToolProgressLabel {
     pub(super) kind: ProgressKind,
     pub(super) reason: String,
     pub(super) signature: Option<String>,
-    validation_scope: Option<String>,
-    validation_selector: Option<String>,
-    validation_failure: Option<String>,
 }
 
 impl ToolProgressLabel {
@@ -71,37 +65,8 @@ impl ToolProgressLabel {
             kind,
             reason: reason.into(),
             signature,
-            validation_scope: None,
-            validation_selector: None,
-            validation_failure: None,
         }
     }
-
-    fn validation(
-        kind: ProgressKind,
-        reason: impl Into<String>,
-        coverage: ValidationCoverage,
-        failure: Option<String>,
-    ) -> Self {
-        Self {
-            kind,
-            reason: reason.into(),
-            signature: failure.clone(),
-            validation_scope: Some(coverage.scope),
-            validation_selector: coverage.selector,
-            validation_failure: failure,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ValidationFailureProgress {
-    scope: String,
-    selector: Option<String>,
-    signature: String,
-    repeats: u32,
-    diagnosis_nudged: bool,
-    mutation_epoch: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -133,13 +98,6 @@ pub(super) struct ProgressTracker {
     pub(super) prev_added_no_evidence: bool,
     pub(super) prev_call_sig: Option<Vec<(String, String)>>,
     pub(super) tool_guardrail: ToolLoopGuardrail,
-    /// Failed model-authored validation commands keyed by validator family and
-    /// any narrowing selector. Entries survive unrelated or narrower green
-    /// validators so they cannot erase a still-failing broader trajectory.
-    failed_validations: BTreeMap<String, ValidationFailureProgress>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    failed_validations_dropped: u64,
-    pub(super) mutation_epoch: u32,
     /// Bounded diagnostic trail. Correctness-relevant plan-drive evidence is
     /// pinned separately so middle compaction cannot turn productive work into
     /// a false stall.
@@ -266,7 +224,6 @@ impl ProgressTracker {
     }
 
     pub(super) fn record_round_from_tools(&mut self, labels: &[ToolProgressLabel]) {
-        self.observe_validation_round(labels);
         if let Some(label) = labels
             .iter()
             .find(|label| label.kind == ProgressKind::Meaningful)
@@ -285,105 +242,6 @@ impl ProgressTracker {
                 label.signature.clone(),
             );
         }
-    }
-
-    fn observe_validation_round(&mut self, labels: &[ToolProgressLabel]) {
-        if labels.iter().any(|label| {
-            matches!(
-                label.reason.as_str(),
-                "substantive edit" | "successful mutation" | "successful delegated mutation"
-            )
-        }) {
-            self.mutation_epoch = self.mutation_epoch.saturating_add(1);
-        }
-        for label in labels
-            .iter()
-            .filter(|label| label.reason == "successful validation after mutation")
-        {
-            let Some(scope) = label.validation_scope.as_ref() else {
-                continue;
-            };
-            let selector = label.validation_selector.as_ref();
-            self.failed_validations.retain(|_, progress| {
-                progress.scope != *scope
-                    || selector.is_some_and(|selector| {
-                        progress
-                            .selector
-                            .as_ref()
-                            .is_none_or(|failed| failed != selector)
-                    })
-            });
-        }
-        for label in labels
-            .iter()
-            .filter(|label| label.reason == "validation command failed")
-        {
-            let (Some(scope), Some(signature)) = (
-                label.validation_scope.as_ref(),
-                label.validation_failure.as_ref(),
-            ) else {
-                continue;
-            };
-            let selector = label.validation_selector.clone();
-            let key = validation_failure_key(scope, selector.as_deref());
-            match self.failed_validations.get_mut(&key) {
-                Some(progress) if progress.signature == *signature => {
-                    if progress.mutation_epoch != self.mutation_epoch {
-                        progress.repeats = progress.repeats.saturating_add(1);
-                        progress.mutation_epoch = self.mutation_epoch;
-                    }
-                }
-                Some(progress) => {
-                    *progress = ValidationFailureProgress {
-                        scope: scope.clone(),
-                        selector,
-                        signature: signature.clone(),
-                        repeats: 1,
-                        diagnosis_nudged: false,
-                        mutation_epoch: self.mutation_epoch,
-                    };
-                }
-                None => {
-                    if self.failed_validations.len() >= FAILED_VALIDATION_LIMIT
-                        && let Some(evicted) = self.failed_validations.keys().next().cloned()
-                    {
-                        self.failed_validations.remove(&evicted);
-                        self.failed_validations_dropped =
-                            self.failed_validations_dropped.saturating_add(1);
-                    }
-                    self.failed_validations.insert(
-                        key,
-                        ValidationFailureProgress {
-                            scope: scope.clone(),
-                            selector,
-                            signature: signature.clone(),
-                            repeats: 1,
-                            diagnosis_nudged: false,
-                            mutation_epoch: self.mutation_epoch,
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    pub(super) fn take_repeated_validation_diagnosis(&mut self) -> bool {
-        let Some(progress) = self
-            .failed_validations
-            .values_mut()
-            .find(|progress| progress.repeats >= 2 && !progress.diagnosis_nudged)
-        else {
-            return false;
-        };
-        progress.diagnosis_nudged = true;
-        true
-    }
-
-    pub(super) fn repeated_validation_repair_exhausted(&self) -> Option<String> {
-        self.failed_validations
-            .iter()
-            .find(|(_, progress)| progress.diagnosis_nudged && progress.repeats >= 3)
-            .map(|(scope, progress)| format!("{scope}\u{1f}{}", progress.signature))
     }
 
     pub(super) fn record_final_answer(&mut self) {
@@ -436,245 +294,6 @@ pub(super) fn background_handle_terminal(name: &str, output: &str) -> bool {
     }
 }
 
-/// Coarse validator identity used only for cross-edit convergence. Combined
-/// commands keep every family so an unrelated green command cannot clear it;
-/// narrowing selectors are tracked separately from this family name.
-fn contains_command_phrase(command: &str, phrase: &str) -> bool {
-    command.match_indices(phrase).any(|(start, matched)| {
-        let before = command[..start].chars().next_back();
-        let after = command[start + matched.len()..].chars().next();
-        before.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
-            && after.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
-    })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ValidationCoverage {
-    scope: String,
-    /// A normalized narrowing selector within `scope`. `None` means the
-    /// validator covered the whole family (for example plain `cargo test`).
-    selector: Option<String>,
-}
-
-fn validation_failure_key(scope: &str, selector: Option<&str>) -> String {
-    selector.map_or_else(
-        || scope.to_string(),
-        |selector| format!("{scope}\u{1e}{selector}"),
-    )
-}
-
-/// Return the parts of a `cargo test` invocation that narrow which tests are
-/// covered. Presentation/execution flags such as `--quiet`, `--release`, and
-/// `--nocapture` are deliberately ignored. The result is conservative:
-/// unknown flags count as selectors, because retaining a stale failure is
-/// safer than letting a narrow green command erase a broader red one.
-fn cargo_test_selector(command: &str) -> Option<String> {
-    let lower = command.to_ascii_lowercase();
-    let (start, matched) = lower.match_indices("cargo test").find(|(start, matched)| {
-        let before = lower[..*start].chars().next_back();
-        let after = lower[*start + matched.len()..].chars().next();
-        before.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
-            && after.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
-    })?;
-    let rest = &lower[start + matched.len()..];
-    let end = ["&&", "||", ";", "|", "\n"]
-        .into_iter()
-        .filter_map(|separator| rest.find(separator))
-        .min()
-        .unwrap_or(rest.len());
-    let words = rest[..end]
-        .split_whitespace()
-        .map(|word| {
-            word.trim_matches(|character| matches!(character, '\'' | '"' | '(' | ')' | '[' | ']'))
-        })
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-
-    let mut selectors = Vec::new();
-    let mut index = 0;
-    let mut harness_args = false;
-    while index < words.len() {
-        let word = words[index];
-        if word == "--" {
-            harness_args = true;
-            index += 1;
-            continue;
-        }
-
-        if harness_args {
-            if matches!(word, "--nocapture" | "--show-output") {
-                index += 1;
-                continue;
-            }
-            if matches!(word, "--color" | "--format" | "--test-threads") {
-                index = (index + 2).min(words.len());
-                continue;
-            }
-            if word.starts_with("--color=")
-                || word.starts_with("--format=")
-                || word.starts_with("--test-threads=")
-            {
-                index += 1;
-                continue;
-            }
-            selectors.push(format!("harness:{word}"));
-            index += 1;
-            continue;
-        }
-
-        if matches!(
-            word,
-            "-p" | "--package"
-                | "--exclude"
-                | "--manifest-path"
-                | "--bin"
-                | "--example"
-                | "--test"
-                | "--bench"
-        ) {
-            let value = words.get(index + 1).copied().unwrap_or("<missing>");
-            selectors.push(format!("{word}={value}"));
-            index = (index + 2).min(words.len());
-            continue;
-        }
-        if matches!(
-            word,
-            "--lib" | "--bins" | "--examples" | "--tests" | "--benches" | "--doc"
-        ) || word.starts_with("-p") && word.len() > 2
-            || [
-                "--package=",
-                "--exclude=",
-                "--manifest-path=",
-                "--bin=",
-                "--example=",
-                "--test=",
-                "--bench=",
-            ]
-            .iter()
-            .any(|prefix| word.starts_with(prefix))
-        {
-            selectors.push(word.to_string());
-            index += 1;
-            continue;
-        }
-
-        if matches!(
-            word,
-            "--features"
-                | "--target"
-                | "--target-dir"
-                | "--jobs"
-                | "-j"
-                | "--profile"
-                | "--color"
-                | "--message-format"
-                | "--config"
-                | "-z"
-        ) {
-            index = (index + 2).min(words.len());
-            continue;
-        }
-        if matches!(
-            word,
-            "--quiet"
-                | "-q"
-                | "--verbose"
-                | "-v"
-                | "--workspace"
-                | "--all"
-                | "--all-targets"
-                | "--all-features"
-                | "--no-default-features"
-                | "--release"
-                | "--locked"
-                | "--offline"
-                | "--frozen"
-                | "--keep-going"
-                | "--no-run"
-                | "--future-incompat-report"
-        ) || word.starts_with("--features=")
-            || word.starts_with("--target=")
-            || word.starts_with("--target-dir=")
-            || word.starts_with("--jobs=")
-            || word.starts_with("-j") && word.len() > 2
-            || word.starts_with("--profile=")
-            || word.starts_with("--color=")
-            || word.starts_with("--message-format=")
-            || word.starts_with("--config=")
-            || word.starts_with("-z") && word.len() > 2
-        {
-            index += 1;
-            continue;
-        }
-
-        selectors.push(if word.starts_with('-') {
-            format!("flag:{word}")
-        } else {
-            format!("filter:{word}")
-        });
-        index += 1;
-    }
-
-    (!selectors.is_empty()).then(|| selectors.join(" "))
-}
-
-fn validation_coverage(arguments: &str) -> Option<ValidationCoverage> {
-    let command = crate::steering::bash_command(arguments)?;
-    let compact = command
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut families = Vec::new();
-    for (needle, family) in [
-        ("cargo test", "cargo:test"),
-        ("cargo check", "cargo:check"),
-        ("cargo build", "cargo:build"),
-        ("cargo clippy", "cargo:clippy"),
-        ("npm run test", "npm:test"),
-        ("npm test", "npm:test"),
-        ("npm run build", "npm:build"),
-        ("npm run check", "npm:check"),
-        ("npm run lint", "npm:lint"),
-        ("pnpm test", "pnpm:test"),
-        ("pnpm build", "pnpm:build"),
-        ("pnpm check", "pnpm:check"),
-        ("pnpm lint", "pnpm:lint"),
-        ("yarn test", "yarn:test"),
-        ("yarn build", "yarn:build"),
-        ("bun test", "bun:test"),
-        ("bun run build", "bun:build"),
-        ("pytest", "pytest"),
-        ("go test", "go:test"),
-        ("make test", "make:test"),
-        ("make check", "make:check"),
-        ("make build", "make:build"),
-        ("just test", "just:test"),
-        ("just check", "just:check"),
-        ("just build", "just:build"),
-        ("cargo run", "cargo:run"),
-        ("true # validate", "fixture:validate"),
-    ] {
-        if contains_command_phrase(&compact, needle) && !families.contains(&family) {
-            families.push(family);
-        }
-    }
-    let scope = if families.is_empty() {
-        format!("command:{}", hi_policy::normalize_command(&command))
-    } else {
-        families.join("+")
-    };
-    let selector = (scope == "cargo:test")
-        .then(|| cargo_test_selector(&command))
-        .flatten();
-    Some(ValidationCoverage { scope, selector })
-}
-
-#[cfg(test)]
-fn validation_scope(arguments: &str) -> Option<String> {
-    validation_coverage(arguments).map(|coverage| coverage.scope)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn classify_tool_progress(
     name: &str,
@@ -718,7 +337,6 @@ pub(super) fn classify_tool_progress(
     }
     if error {
         if implementation_tool_call_validates(name, arguments)
-            && let Some(coverage) = validation_coverage(arguments)
             && let Some(digest) = crate::verify_digest::digest_failure(workspace_root, output)
         {
             let signature = digest
@@ -726,10 +344,9 @@ pub(super) fn classify_tool_progress(
                 .into_iter()
                 .collect::<Vec<_>>()
                 .join("\u{1f}");
-            return ToolProgressLabel::validation(
+            return ToolProgressLabel::new(
                 ProgressKind::Weak,
                 "validation command failed",
-                coverage,
                 Some(signature),
             );
         }
@@ -744,12 +361,10 @@ pub(super) fn classify_tool_progress(
     if tracker_before.mutation_seen
         && validation_succeeded
         && implementation_tool_call_validates(name, arguments)
-        && let Some(coverage) = validation_coverage(arguments)
     {
-        return ToolProgressLabel::validation(
+        return ToolProgressLabel::new(
             ProgressKind::Meaningful,
             "successful validation after mutation",
-            coverage,
             None,
         );
     }
@@ -777,71 +392,8 @@ pub(super) fn classify_tool_progress(
 }
 
 #[cfg(test)]
-mod validation_progress_tests {
+mod progress_retention_tests {
     use super::*;
-
-    fn label(kind: ProgressKind, reason: &str, signature: Option<&str>) -> ToolProgressLabel {
-        ToolProgressLabel::new(kind, reason, signature.map(str::to_string))
-    }
-
-    fn failed_validation(scope: &str, signature: &str) -> ToolProgressLabel {
-        failed_validation_with_selector(scope, None, signature)
-    }
-
-    fn failed_validation_with_selector(
-        scope: &str,
-        selector: Option<&str>,
-        signature: &str,
-    ) -> ToolProgressLabel {
-        ToolProgressLabel::validation(
-            ProgressKind::Weak,
-            "validation command failed",
-            ValidationCoverage {
-                scope: scope.to_string(),
-                selector: selector.map(str::to_string),
-            },
-            Some(signature.to_string()),
-        )
-    }
-
-    fn passed_validation(scope: &str) -> ToolProgressLabel {
-        passed_validation_with_selector(scope, None)
-    }
-
-    fn passed_validation_with_selector(scope: &str, selector: Option<&str>) -> ToolProgressLabel {
-        ToolProgressLabel::validation(
-            ProgressKind::Meaningful,
-            "successful validation after mutation",
-            ValidationCoverage {
-                scope: scope.to_string(),
-                selector: selector.map(str::to_string),
-            },
-            None,
-        )
-    }
-
-    #[test]
-    fn validation_scope_separates_check_from_test_and_tracks_test_filters() {
-        assert_eq!(
-            validation_scope(r#"{"command":"cargo test moves::checkmate_detected"}"#).as_deref(),
-            Some("cargo:test")
-        );
-        assert_eq!(
-            validation_scope(r#"{"command":"cargo check --workspace"}"#).as_deref(),
-            Some("cargo:check")
-        );
-        assert_eq!(
-            validation_coverage(r#"{"command":"cargo test --quiet moves::checkmate_detected"}"#)
-                .and_then(|coverage| coverage.selector)
-                .as_deref(),
-            Some("filter:moves::checkmate_detected")
-        );
-        assert_eq!(
-            validation_coverage(r#"{"command":"cargo test --workspace --quiet"}"#)
-                .and_then(|coverage| coverage.selector),
-            None
-        );
-    }
 
     #[test]
     fn plan_drive_progress_is_pinned_across_bounded_middle_compaction() {
@@ -892,146 +444,5 @@ mod validation_progress_tests {
             super::super::retention::PROGRESS_EVENT_LIMIT
         );
         assert_eq!(tracker.drive_evidence_hashes().len(), 400);
-    }
-
-    #[test]
-    fn targeted_validation_pass_does_not_clear_full_suite_failure() {
-        let mut tracker = ProgressTracker::default();
-        tracker.record_round_from_tools(&[failed_validation("cargo:test", "full-suite-red")]);
-
-        tracker.record_round_from_tools(&[passed_validation_with_selector(
-            "cargo:test",
-            Some("filter:round_trip"),
-        )]);
-
-        assert!(tracker.failed_validations.contains_key("cargo:test"));
-    }
-
-    #[test]
-    fn full_suite_pass_clears_targeted_validation_failures() {
-        let mut tracker = ProgressTracker::default();
-        tracker.record_round_from_tools(&[
-            failed_validation_with_selector("cargo:test", Some("filter:first_case"), "first-red"),
-            failed_validation_with_selector("cargo:test", Some("filter:second_case"), "second-red"),
-        ]);
-
-        tracker.record_round_from_tools(&[passed_validation("cargo:test")]);
-
-        assert!(tracker.failed_validations.is_empty());
-    }
-
-    #[test]
-    fn distinct_failed_validation_selectors_have_bounded_repair_memory() {
-        let mut tracker = ProgressTracker::default();
-        for index in 0..300 {
-            tracker.record_round_from_tools(&[failed_validation_with_selector(
-                "cargo:test",
-                Some(&format!("filter:test-{index}")),
-                &format!("failure-{index}"),
-            )]);
-        }
-
-        assert_eq!(tracker.failed_validations.len(), FAILED_VALIDATION_LIMIT);
-        assert_eq!(tracker.failed_validations_dropped, 44);
-        assert!(
-            tracker
-                .failed_validations
-                .contains_key(&validation_failure_key(
-                    "cargo:test",
-                    Some("filter:test-299")
-                )),
-            "new validation evidence must still be tracked after diagnostic eviction"
-        );
-    }
-
-    #[test]
-    fn matching_targeted_pass_clears_only_matching_targeted_failure() {
-        let mut tracker = ProgressTracker::default();
-        tracker.record_round_from_tools(&[
-            failed_validation_with_selector("cargo:test", Some("filter:first_case"), "first-red"),
-            failed_validation_with_selector("cargo:test", Some("filter:second_case"), "second-red"),
-        ]);
-
-        tracker.record_round_from_tools(&[passed_validation_with_selector(
-            "cargo:test",
-            Some("filter:first_case"),
-        )]);
-
-        assert!(
-            !tracker
-                .failed_validations
-                .contains_key(&validation_failure_key(
-                    "cargo:test",
-                    Some("filter:first_case")
-                ))
-        );
-        assert!(
-            tracker
-                .failed_validations
-                .contains_key(&validation_failure_key(
-                    "cargo:test",
-                    Some("filter:second_case")
-                ))
-        );
-    }
-
-    #[test]
-    fn repeated_validation_failure_survives_intervening_edit_and_nudges_once() {
-        let mut tracker = ProgressTracker::default();
-        tracker.record_round_from_tools(&[failed_validation(
-            "cargo:test",
-            "test:moves::checkmate_detected:state-a",
-        )]);
-        assert!(!tracker.take_repeated_validation_diagnosis());
-        tracker.record_round_from_tools(&[passed_validation("cargo:check")]);
-        assert!(tracker.failed_validations.contains_key("cargo:test"));
-        tracker.record_round_from_tools(&[failed_validation(
-            "cargo:test",
-            "test:moves::checkmate_detected:state-a",
-        )]);
-        assert!(
-            !tracker.take_repeated_validation_diagnosis(),
-            "rerunning the same failure without an intervening edit is not a second repair cycle"
-        );
-
-        tracker.record_round_from_tools(&[label(
-            ProgressKind::Meaningful,
-            "successful mutation",
-            None,
-        )]);
-        tracker.record_round_from_tools(&[failed_validation(
-            "cargo:test",
-            "test:moves::checkmate_detected:state-a",
-        )]);
-        assert!(tracker.take_repeated_validation_diagnosis());
-        assert!(!tracker.take_repeated_validation_diagnosis());
-
-        tracker.record_round_from_tools(&[label(
-            ProgressKind::Meaningful,
-            "successful mutation",
-            None,
-        )]);
-        tracker.record_round_from_tools(&[failed_validation(
-            "cargo:test",
-            "test:moves::checkmate_detected:state-a",
-        )]);
-        assert!(tracker.repeated_validation_repair_exhausted().is_some());
-
-        tracker.record_round_from_tools(&[label(
-            ProgressKind::Meaningful,
-            "successful mutation",
-            None,
-        )]);
-        tracker.record_round_from_tools(&[failed_validation(
-            "cargo:test",
-            "test:moves::checkmate_detected:state-b",
-        )]);
-        assert_eq!(tracker.failed_validations["cargo:test"].repeats, 1);
-        assert!(!tracker.take_repeated_validation_diagnosis());
-        assert!(tracker.repeated_validation_repair_exhausted().is_none());
-
-        tracker.record_round_from_tools(&[passed_validation("cargo:test")]);
-        assert!(!tracker.failed_validations.contains_key("cargo:test"));
-        assert!(tracker.repeated_validation_repair_exhausted().is_none());
     }
 }

@@ -1,6 +1,17 @@
 //! Provider capability negotiation at the model-request boundary.
 
 impl crate::Agent {
+    /// A new logical model operation, including all nested transport recovery.
+    pub fn request_execution(&self) -> std::sync::Arc<hi_ai::RequestExecution> {
+        std::sync::Arc::new(hi_ai::RequestExecution::new(
+            hi_ai::RequestExecutionPolicy {
+                max_attempts: self.config.harness.provider.max_attempts,
+                no_progress_timeout: self.config.harness.provider.no_progress_timeout,
+                ..Default::default()
+            },
+        ))
+    }
+
     /// Update a provider while retaining the route identities supplied by an
     /// older frontend. The capability registry is still rotated, so a switch
     /// can never inherit observations from the prior provider instance.
@@ -55,6 +66,18 @@ impl crate::Agent {
         self.config.routing.requested_max_tokens = requested_max_tokens;
         self.config.routing.max_tokens_explicit = max_tokens_explicit;
         self.set_model(model, context_window, max_output_tokens);
+    }
+
+    /// Replace every resolved routing setting together, including compatibility.
+    pub fn set_provider_with_routing(
+        &mut self,
+        provider: std::sync::Arc<dyn hi_ai::Provider>,
+        routing: crate::AgentRouting,
+    ) {
+        self.provider = provider;
+        self.config.routing = routing;
+        self.provider_capability_registry = self.provider_capability_registry.rotated();
+        self.publish_model_context();
     }
 
     /// Replace the default no-I/O registry. Frontends may install an explicitly

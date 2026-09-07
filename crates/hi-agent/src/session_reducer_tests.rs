@@ -25,17 +25,17 @@ fn legacy_json_and_remote_records_reduce_to_the_same_projection() {
     let mut local = SessionReducer::new();
     for line in &records {
         local
-            .apply(SessionEvent::from_legacy_json(line).unwrap())
+            .apply(SessionEvent::decode_legacy_json(line).unwrap().unwrap())
             .unwrap();
     }
 
     let mut remote = SessionReducer::new();
     remote
-        .apply(SessionEvent::from_remote_record("message", &records[0]))
+        .apply(SessionEvent::decode_remote_record("message", &records[0]).unwrap())
         .unwrap();
     for line in &records[1..] {
         remote
-            .apply(SessionEvent::from_remote_record("metadata", line))
+            .apply(SessionEvent::decode_remote_record("metadata", line).unwrap())
             .unwrap();
     }
 
@@ -123,6 +123,8 @@ fn legacy_interruption_pause_is_inferred_then_consumed_by_real_user_turn() {
         .unwrap();
     reducer
         .apply(event(SessionEventKind::TurnOutcome {
+            task_recovery: None,
+            settled_goal: None,
             status: TurnStatus::Cancelled,
             stop_reason: TurnStopReason::Cancelled,
         }))
@@ -145,6 +147,8 @@ fn legacy_interruption_pause_is_inferred_then_consumed_by_real_user_turn() {
         .unwrap();
     let consumed = reducer
         .apply(event(SessionEventKind::TurnOutcome {
+            task_recovery: None,
+            settled_goal: None,
             status: TurnStatus::Completed,
             stop_reason: TurnStopReason::Completed,
         }))
@@ -266,18 +270,20 @@ fn serialized_snapshot_plus_tail_matches_full_replay() {
 
 #[test]
 fn legacy_decoder_preserves_unknown_records_as_boundaries() {
-    assert!(SessionEvent::from_legacy_json(" \n ").is_none());
+    assert!(SessionEvent::decode_legacy_json(" \n ").unwrap().is_none());
     assert!(matches!(
-        SessionEvent::from_legacy_json(r#"{"type":"future_record","x":1}"#)
+        SessionEvent::decode_legacy_json(r#"{"type":"future_record","x":1}"#)
+            .unwrap()
             .unwrap()
             .kind,
         SessionEventKind::OpaqueBoundary
     ));
     assert!(matches!(
-        SessionEvent::from_remote_record(
+        SessionEvent::decode_remote_record(
             "metadata",
             &serde_json::to_string(&Message::user("not a metadata record")).unwrap(),
         )
+        .unwrap()
         .kind,
         SessionEventKind::OpaqueBoundary
     ));
@@ -373,6 +379,8 @@ fn turn_outcome_requires_all_open_transcript_blocks_to_settle() {
 
     assert!(matches!(
         reducer.apply(event(SessionEventKind::TurnOutcome {
+            task_recovery: None,
+            settled_goal: None,
             status: TurnStatus::Completed,
             stop_reason: TurnStopReason::Completed,
         })),
@@ -390,6 +398,8 @@ fn turn_outcome_requires_all_open_transcript_blocks_to_settle() {
         .unwrap();
     reducer
         .apply(event(SessionEventKind::TurnOutcome {
+            task_recovery: None,
+            settled_goal: None,
             status: TurnStatus::Cancelled,
             stop_reason: TurnStopReason::Cancelled,
         }))
@@ -398,17 +408,17 @@ fn turn_outcome_requires_all_open_transcript_blocks_to_settle() {
 
 #[test]
 fn legacy_block_records_decode_aliases_and_old_snapshots_default_empty() {
-    let opened = SessionEvent::from_legacy_json(
+    let opened = SessionEvent::decode_legacy_json(
         r#"{"type":"transcript_block_opened","id":"legacy:block-1","kind":"reasoning","text":"why"}"#,
     )
     .unwrap();
-    let settled = SessionEvent::from_legacy_json(
+    let settled = SessionEvent::decode_legacy_json(
         r#"{"type":"transcript_block_settled","id":"legacy:block-1","terminal":"completed"}"#,
     )
     .unwrap();
     let mut reducer = SessionReducer::new();
-    reducer.apply(opened).unwrap();
-    reducer.apply(settled).unwrap();
+    reducer.apply(opened.unwrap()).unwrap();
+    reducer.apply(settled.unwrap()).unwrap();
     assert_eq!(reducer.state().transcript_blocks[0].content, "why");
 
     let legacy = SessionReducer::new().snapshot();

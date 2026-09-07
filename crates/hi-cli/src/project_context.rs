@@ -147,17 +147,6 @@ pub(crate) fn auto_memory_enabled(no_memory: bool, no_save: bool) -> bool {
     !no_memory && !no_save
 }
 
-/// Build the `# Memory` context section from the saved memory file's contents,
-/// or `None` when it's empty/whitespace (so a blank file adds nothing).
-///
-/// Kept for unit tests / callers that still want a static wrap; production
-/// injection goes through `hi_agent::memory_section_for_task` (task-ranked).
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn memory_context(text: &str) -> Option<String> {
-    let text = text.trim();
-    (!text.is_empty()).then(|| format!("# Memory (from past sessions)\n{text}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

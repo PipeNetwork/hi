@@ -5,6 +5,8 @@
 //! 50 / 75 percent. `/window` and the inject-only `new_context` tool drop
 //! conversation history while keeping session identity and the current task.
 
+mod runtime;
+
 use anyhow::Result;
 
 use crate::Ui;
@@ -214,61 +216,6 @@ impl crate::Agent {
         }
     }
 
-    /// Drop conversation history; keep system identity, goal/decisions/memory,
-    /// and the current user task. No summary call.
-    pub(crate) fn apply_fresh_window(
-        &mut self,
-        ui: &mut dyn Ui,
-        current_task: Option<&str>,
-    ) -> Result<()> {
-        let task = current_task
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_string)
-            .or_else(|| self.current_window_task());
-        self.wipe_conversation_keep_identity()?;
-        if let Some(task) = task {
-            let wrapped = wrap_current_task(self.volatile_context_block().as_deref(), &task);
-            self.messages.push_user(wrapped);
-        }
-        ui.status("fresh context window — conversation dropped, goal/decisions kept");
-        Ok(())
-    }
-
-    /// Start a clean strategy epoch for an automatic plan turn that has
-    /// already produced an evidence-only no-change result. Unlike a user
-    /// `/window`, this deliberately preserves the plan-drive stall and its
-    /// evidence ledger: dropping poisoned conversation must not make old
-    /// inspection look novel or grant another orientation turn.
-    pub(crate) fn apply_plan_recovery_window(&mut self, ui: &mut dyn Ui) -> Result<()> {
-        self.wipe_conversation_keep_identity_inner(false)?;
-        ui.status(
-            "fresh plan-recovery context — prior tool output dropped; plan, decisions, and no-progress evidence kept as fingerprints",
-        );
-        Ok(())
-    }
-
-    fn wipe_conversation_keep_identity_inner(&mut self, reset_drive_state: bool) -> Result<()> {
-        self.token_budget.advance_window();
-        self.replace_history_with_compaction(vec![self.system_message()])?;
-        self.runtime.invalidate_context_after_compaction();
-        self.report.context_used = 0;
-        self.token_budget
-            .begin_turn(0, self.config.routing.context_window);
-        if reset_drive_state {
-            self.reset_goal_drive_stall();
-            self.reset_plan_drive_stall();
-        }
-        Ok(())
-    }
-
-    /// Replace the transcript with the stable system message. Goal, decisions,
-    /// memory, and stall counters live on `Agent` and survive. A new window
-    /// epoch resets drive stalls so a poisoned thread can keep running.
-    fn wipe_conversation_keep_identity(&mut self) -> Result<()> {
-        self.wipe_conversation_keep_identity_inner(true)
-    }
-
     /// If occupancy is past the auto-compact threshold, reclaim room before
     /// this turn's user message. Goal/plan drive uses a no-summary fresh
     /// window (the job already lives outside the transcript). Interactive
@@ -302,7 +249,7 @@ impl crate::Agent {
             // user intent. Preserve semantic no-progress/evidence state so a
             // large read cannot renew an implementation step's one allowed
             // orientation turn. Explicit `/window` still resets it.
-            self.wipe_conversation_keep_identity_inner(false)?;
+            self.wipe_conversation_keep_identity_async(false).await?;
             ui.status(&format!(
                 "context ~{pct}% full — fresh window so the goal can keep running (conversation dropped, goal/decisions kept)"
             ));
@@ -350,11 +297,6 @@ impl crate::Agent {
             .begin_turn(0, self.config.routing.context_window);
         self.reset_goal_drive_stall();
         self.reset_plan_drive_stall();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn compact_fresh_window(&mut self, ui: &mut dyn Ui) -> Result<()> {
-        self.apply_fresh_window(ui, None)
     }
 
     fn current_window_task(&self) -> Option<String> {

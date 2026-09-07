@@ -80,6 +80,7 @@ impl crate::Agent {
         )];
         let stage_error = self
             .stage_active_workspace_execution(&calls, &assistant_content, &results, &execution)
+            .await
             .err();
         if let Some(error) = &stage_error {
             execution.disposition = hi_workspace::ExecutionDisposition::Indeterminate;

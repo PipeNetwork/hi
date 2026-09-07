@@ -1,5 +1,5 @@
 schema_version = 1
-name = "implementation-read-loop-recovers-to-mutation"
+name = "implementation-read-loop-stops-until-explicit-resume"
 tags = ["curated", "pr", "implementation-read-loop-regression"]
 timeout_ms = 45000
 
@@ -16,7 +16,6 @@ args = ["--allow-unverified"]
 title = "Implement the recovered lifecycle marker in recovery-complete.txt"
 status = "pending"
 
-# Turn 1: one novel read is allowed as orientation for an implementation step.
 [[provider.steps]]
 id = "orientation-read"
 [provider.steps.expect]
@@ -54,63 +53,7 @@ kind = "text"
 text = "The first inspection is complete and no plan status or workspace file changed during it."
 
 [[provider.steps]]
-id = "orientation-settle-5"
-[provider.steps.response]
-kind = "text"
-text = "End the orientation pass with the implementation step still pending for the next automatic drive."
-
-# Turn 2: this is genuinely novel evidence, but a second read-only turn on an
-# implementation step must increment the semantic stall instead of resetting it.
-[[provider.steps]]
-id = "later-novel-read"
-[provider.steps.expect]
-body_contains = ["ORIENTATION_POISON_RAW"]
-body_excludes = ["[hi:plan-recovery]"]
-[provider.steps.response]
-kind = "tool_call"
-name = "read"
-arguments = { path = "orientation-02.txt" }
-
-[[provider.steps]]
-id = "later-novel-report"
-[provider.steps.expect]
-body_contains = ["SECOND_POISON_RAW"]
-[provider.steps.response]
-kind = "text"
-text = "SECOND_LOOP_POISON_TEXT: a different file supplied new target evidence, but this drive also made no mutation."
-
-[[provider.steps]]
-id = "later-novel-settle-2"
-[provider.steps.response]
-kind = "text"
-text = "The second distinct source confirms the required marker while the implementation remains unfinished."
-
-[[provider.steps]]
-id = "later-novel-settle-3"
-[provider.steps.response]
-kind = "text"
-text = "Novel offsets and files alone cannot finish this implementation-shaped checklist step."
-
-[[provider.steps]]
-id = "later-novel-settle-4"
-[provider.steps.response]
-kind = "text"
-text = "This second inspection changed neither recovery-complete.txt nor the structured plan."
-
-[[provider.steps]]
-id = "later-novel-settle-5"
-[provider.steps.response]
-kind = "text"
-text = "End the second read-only pass so the next drive can switch to a concrete implementation strategy."
-
-# Turn 3: stall=1 forces a fresh strategy epoch. Both requests in the recovered
-# turn must carry its mutation-oriented instruction, while the strict matchers
-# reject either poisoned raw tool output leaking through the reset transcript.
-[[provider.steps]]
 id = "recovery-write"
-[provider.steps.expect]
-body_contains = ["[hi:plan-recovery]", "make the smallest safe mutation", "Implement the recovered lifecycle marker"]
-body_excludes = ["ORIENTATION_POISON_RAW", "SECOND_POISON_RAW", "FIRST_LOOP_POISON_TEXT", "SECOND_LOOP_POISON_TEXT"]
 [provider.steps.response]
 kind = "tool_call"
 name = "write"
@@ -118,9 +61,6 @@ arguments = { path = "recovery-complete.txt", content = "RECOVERY_MUTATION_OK\n"
 
 [[provider.steps]]
 id = "recovery-complete-plan"
-[provider.steps.expect]
-body_contains = ["[hi:plan-recovery]", "make the smallest safe mutation", "recovery-complete.txt", "RECOVERY_MUTATION_OK"]
-body_excludes = ["ORIENTATION_POISON_RAW", "SECOND_POISON_RAW", "FIRST_LOOP_POISON_TEXT", "SECOND_LOOP_POISON_TEXT"]
 [provider.steps.response]
 kind = "tool_call"
 name = "update_plan"
@@ -128,12 +68,12 @@ arguments = { steps = [{ title = "Implement the recovered lifecycle marker in re
 
 [[actions]]
 kind = "wait_provider_request"
-count = 14
-timeout_ms = 30000
+count = 5
+timeout_ms = 15000
 
 [[actions]]
 kind = "wait_event"
-equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 1, "/data/plan/incomplete" = false, "/data/plan/stall" = 0, "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "none" }
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "failed", "/data/outcome/stop_reason" = "no_progress", "/data/next_drive/action" = "idle" }
 timeout_ms = 10000
 
 [[actions]]
@@ -143,53 +83,45 @@ quiet_ms = 500
 timeout_ms = 3000
 
 [[actions]]
+kind = "send_line"
+text = "/plan resume"
+
+[[actions]]
+kind = "wait_provider_request"
+count = 7
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/plan/incomplete" = false }
+timeout_ms = 10000
+
+[[actions]]
 kind = "quit"
-
-# Typed lifecycle order: orientation succeeds, the second novel inspection
-# increments stall, then the recovered mutation clears the plan and stall.
-[[assertions]]
-kind = "record_sequence"
-source = "events"
-where_equals = { "/event" = "turn_started" }
-pointer = "/data/origin"
-values = ["plan_drive", "plan_drive", "plan_drive"]
-
-[[assertions]]
-kind = "record_sequence"
-source = "events"
-where_equals = { "/event" = "turn_settled" }
-pointer = "/data/plan/stall"
-values = [0, 1, 0]
 
 [[assertions]]
 kind = "records"
 source = "events"
 equals = { "/event" = "turn_started", "/data/origin" = "plan_drive" }
-exact = 3
+exact = 2
 
 [[assertions]]
 kind = "records"
 source = "events"
-equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 0, "/data/plan/incomplete" = true, "/data/plan/stall" = 0, "/data/next_drive/action" = "enqueue", "/data/next_drive/kind" = "plan_drive" }
+equals = { "/event" = "turn_settled", "/data/outcome/stop_reason" = "no_progress" }
 exact = 1
 
 [[assertions]]
 kind = "records"
-source = "events"
-equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 0, "/data/plan/incomplete" = true, "/data/plan/stall" = 1, "/data/next_drive/action" = "enqueue", "/data/next_drive/kind" = "plan_drive" }
-exact = 1
-
-[[assertions]]
-kind = "records"
-source = "events"
-equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed", "/data/outcome/changed_file_count" = 1, "/data/plan/incomplete" = false, "/data/plan/stall" = 0, "/data/next_drive/action" = "idle", "/data/next_drive/reason" = "none" }
-exact = 1
+source = "provider_requests"
+equals = { "/method" = "POST" }
+exact = 7
 
 [[assertions]]
 kind = "records"
 source = "events"
 equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "read" }
-exact = 2
+exact = 1
 
 [[assertions]]
 kind = "records"
@@ -198,37 +130,10 @@ equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "wr
 exact = 1
 
 [[assertions]]
-kind = "records"
-source = "events"
-equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "update_plan" }
-exact = 1
-
-[[assertions]]
-kind = "records"
-source = "events"
-equals = { "/event" = "drive_parked", "/data/kind" = "plan_drive" }
-exact = 0
-
-# Script order is strict in ScriptedOpenAiServer; exact count prevents an
-# unbounded retry or an extra autonomous drive from hiding behind it.
-[[assertions]]
-kind = "records"
-source = "provider_requests"
-equals = { "/method" = "POST" }
-exact = 14
-
-[[assertions]]
-kind = "records"
-source = "provider_requests"
-contains = { "/body" = "[hi:plan-recovery]" }
-exact = 2
-
-[[assertions]]
-kind = "record_sequence"
-source = "session"
-where_equals = { "/type" = "plan_drive" }
-pointer = "/stall"
-values = [0, 1, 0]
+kind = "file"
+path = "recovery-complete.txt"
+exists = true
+equals = "RECOVERY_MUTATION_OK\n"
 
 [[assertions]]
 kind = "records"
@@ -241,12 +146,6 @@ kind = "records"
 source = "events"
 equals = { "/event" = "session_ended", "/data/queue_depth" = 0, "/data/plan/incomplete" = false, "/data/plan/stall" = 0 }
 exact = 1
-
-[[assertions]]
-kind = "file"
-path = "recovery-complete.txt"
-exists = true
-equals = "RECOVERY_MUTATION_OK\n"
 
 [[assertions]]
 kind = "workspace_patch"

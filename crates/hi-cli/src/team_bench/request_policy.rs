@@ -12,6 +12,7 @@ pub(super) async fn build(provider: &OpenAiProvider, model: &str, prompt: &str) 
     )
     .await;
     ChatRequest {
+        execution: Default::default(),
         model: model.to_string(),
         request_id: None,
         retry_attempt: 0,

@@ -89,6 +89,10 @@ impl TurnStopReason {
     /// infrastructure outage. All other escaped errors retain the historical
     /// infrastructure classification.
     pub fn for_error(err: &anyhow::Error) -> Self {
+        if let Some(failure) = crate::TurnFailure::from_error(err) {
+            return failure.outcome.stop_reason;
+        }
+
         let Some(denied) = err.downcast_ref::<hi_workspace::AdmissionDenied>() else {
             return Self::InfrastructureFailure;
         };

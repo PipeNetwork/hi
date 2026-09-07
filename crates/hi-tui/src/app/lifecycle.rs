@@ -228,6 +228,7 @@ impl crate::App {
             turn_rounds: 0,
             run_streamed_this_call: false,
             waiting_for: None,
+            provider_activity: Default::default(),
             last_turn_state: TurnState::Idle,
             last_error: None,
             event_log: Vec::new(),
@@ -371,6 +372,7 @@ impl crate::App {
             self.turn_steering_seen.clear();
             self.turn_status_seen.clear();
             self.waiting_for = Some(Duration::ZERO);
+            self.provider_activity = Default::default();
             self.last_turn_state = TurnState::Running;
             // Ghost-text suggestions are for the idle composer only.
             self.suggested_prompt = None;

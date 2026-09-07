@@ -1178,7 +1178,7 @@ fn no_index_tool_call_index(
 }
 
 pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
-    if let Some(provider) = err.downcast_ref::<ProviderError>() {
+    if let Some(provider) = crate::provider::provider_error_details(&err) {
         return provider.clone();
     }
     let text = err.to_string();
@@ -1536,6 +1536,7 @@ mod tests {
             model: "test".into(),
             request_id: None,
             retry_attempt: 0,
+            execution: Default::default(),
             user_turn: true,
             canonical_objective: None,
             messages: messages.clone(),

@@ -21,8 +21,8 @@ fn agent_with_chat_only_observation(workspace: &IsolatedWorkspace) -> ChatOnlyOb
     let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
     let answer = || completion(vec![Content::Text("read-only answer".into())], 1, 1);
     let provider = std::sync::Arc::new(RecordRequests {
-        // A ChatOnly explorer can spend its bounded no-evidence repair budget
-        // before accepting text. Keep this fixture focused on registry reuse.
+        // A ChatOnly explorer exhausts bounded no-evidence repair. Registry
+        // inheritance still has to hold for every attempted child request.
         responses: Mutex::new(std::iter::repeat_with(answer).take(12).collect()),
         tool_names: tool_names.clone(),
         modes: modes.clone(),
@@ -143,8 +143,8 @@ async fn background_explore_inherits_the_parent_capability_registry() {
 
     assert_eq!(
         terminal.state,
-        hi_tools::BackgroundTaskState::Completed,
-        "{}",
+        hi_tools::BackgroundTaskState::Failed,
+        "a catalog-only explorer cannot complete an evidence-required task: {}",
         terminal.output
     );
     assert!(

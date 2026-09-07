@@ -10,9 +10,13 @@ impl crate::Agent {
     /// After a turn that passed verification and changed files, extract durable
     /// coding facts (verify command, package ownership, stack, test gate) into
     /// the session decision log and project memory. Best-effort, no model call.
-    pub(crate) async fn record_coding_facts_turn_end(&mut self, ui: &mut dyn Ui) {
+    /// Returns only metadata targets whose workspace publication acknowledged.
+    pub(crate) async fn record_coding_facts_turn_end(
+        &mut self,
+        ui: &mut dyn Ui,
+    ) -> Vec<std::path::PathBuf> {
         if !self.report.verify.passed() || self.workspace.last_changed_files.is_empty() {
-            return;
+            return Vec::new();
         }
 
         let wants_tests = self
@@ -27,18 +31,20 @@ impl crate::Agent {
             workspace_root: self.runtime.root(),
         });
         if facts.is_empty() {
-            return;
+            return Vec::new();
         }
 
         let mut next = self.decisions.clone();
         for fact in &facts {
             next.record(fact.clone());
         }
-        if let Some(session) = self.session.as_mut()
-            && let Err(err) = session.record_decisions(&next)
+        let record = next.clone();
+        if let Err(err) = self
+            .write_session(move |sink| sink.record_decisions(&record))
+            .await
         {
             ui.status(&format!("(couldn't persist coding facts: {err})"));
-            return;
+            return Vec::new();
         }
         self.decisions = next;
         self.subagents.coding_facts_written = self
@@ -59,7 +65,7 @@ impl crate::Agent {
                 "record verifier-backed coding memory",
                 &declared_paths,
                 serde_json::json!({ "fact_count": fact_count }),
-                || {
+                move || {
                     let added = merge_facts_into_workspace_memory(
                         &workspace_root,
                         &state_root,
@@ -76,23 +82,24 @@ impl crate::Agent {
                 },
             )
             .await;
+        let published = write.is_ok();
         match write {
             Ok(0) => {
                 ui.status(&format!(
                     "coding memory · {} decision(s) (memory already current)",
-                    facts.len()
+                    fact_count
                 ));
             }
             Ok(n) => {
                 ui.status(&format!(
                     "coding memory · {} decision(s), {n} new memory bullet(s)",
-                    facts.len()
+                    fact_count
                 ));
             }
             Err(err) => {
                 ui.status(&format!(
                     "coding memory · {} decision(s); memory write skipped: {err}",
-                    facts.len()
+                    fact_count
                 ));
             }
         }
@@ -101,5 +108,10 @@ impl crate::Agent {
         let task = self.task.last_task_prompt.clone().unwrap_or_default();
         self.refresh_memory_context(&task);
         self.refresh_system_message();
+        if published {
+            declared_paths
+        } else {
+            Vec::new()
+        }
     }
 }

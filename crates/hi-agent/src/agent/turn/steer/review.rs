@@ -105,7 +105,9 @@ impl crate::Agent {
             progress_tracker.last_no_progress_reason.clear();
             progress_tracker.record(ProgressKind::Weak, AWAITING_BACKGROUND_REASON, None);
             ui.status("background work continues; ending the turn with the status report");
-            return Ok(RoundControl::BreakInner(false));
+            return Ok(RoundControl::Finish(
+                crate::agent::turn::ModelLoopDecision::Verify,
+            ));
         }
         if read_only_intent.is_some()
             && plan_incomplete
@@ -257,8 +259,11 @@ impl crate::Agent {
                     // its bounded repair budget is spent. Review text is
                     // buffered for read-only turns, so replacing it here keeps
                     // the user-visible answer honest and single-owned.
-                    self.emit_deterministic_closeout(ui);
-                    return Ok(RoundControl::BreakInner(false));
+                    self.task_recovery
+                        .stop("answer repair exhausted without supporting evidence");
+                    return Ok(RoundControl::Finish(
+                        crate::agent::turn::ModelLoopDecision::Verify,
+                    ));
                 }
                 // Repair exhaustion is advisory. Preserve and return the
                 // model's answer instead of manufacturing a failed turn.
@@ -302,7 +307,9 @@ impl crate::Agent {
                     None,
                 );
                 ui.status("no file changes were made; ending the turn without another retry");
-                return Ok(RoundControl::BreakInner(false));
+                return Ok(RoundControl::Finish(
+                    crate::agent::turn::ModelLoopDecision::Verify,
+                ));
             }
             const MAX_GENERIC_COMPLETION_RETRIES: u32 = 1;
             if *generic_completion_retries < MAX_GENERIC_COMPLETION_RETRIES {
@@ -348,7 +355,9 @@ impl crate::Agent {
                     ui.status(
                         "model summary was unusable; keeping the completed work and continuing the plan",
                     );
-                    return Ok(RoundControl::BreakInner(false));
+                    return Ok(RoundControl::Finish(
+                        crate::agent::turn::ModelLoopDecision::Verify,
+                    ));
                 }
                 // A repeated canned completion is not a usable result for an
                 // unchanged unfinished checklist. Accepting it as a successful
@@ -368,7 +377,9 @@ impl crate::Agent {
                 )]);
                 ui.nudge("model repeated a generic completion response without advancing the plan");
                 ui.status("model did not produce a usable plan result after bounded recovery");
-                return Ok(RoundControl::BreakInner(false));
+                return Ok(RoundControl::Finish(
+                    crate::agent::turn::ModelLoopDecision::Verify,
+                ));
             }
             progress_tracker.record(ProgressKind::None, "generic_completion_placeholder", None);
             ui.nudge("model repeated a generic completion response; returning the available text");
@@ -423,6 +434,8 @@ impl crate::Agent {
             progress_tracker.last_no_progress_reason.clear();
             progress_tracker.record_final_answer();
         }
-        Ok(RoundControl::BreakInner(false))
+        Ok(RoundControl::Finish(
+            crate::agent::turn::ModelLoopDecision::Verify,
+        ))
     }
 }

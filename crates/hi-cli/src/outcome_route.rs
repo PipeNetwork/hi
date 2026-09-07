@@ -417,16 +417,19 @@ impl OutcomeRouteProvider {
                 OutcomeClient::pick_offer(&quotes, self.offer).map(|offer| offer.route.clone())
             });
         sink(StreamEvent::Status("Outcome: creating task".into()));
-        let created = self
-            .client
-            .create_task(&TaskCreateRequest::code_change(
-                prompt,
-                repository_id,
-                self.verifiers(&contract, has_cargo),
-                self.cost_usd(),
-                self.deadline_secs(),
-            ))
-            .await?;
+        let submission = self.client.task_submission(&TaskCreateRequest::code_change(
+            prompt,
+            repository_id,
+            self.verifiers(&contract, has_cargo),
+            self.cost_usd(),
+            self.deadline_secs(),
+        ));
+        let response = request
+            .execution
+            .dispatch_once(submission, "outcome_task", &request.model, sink)
+            .await
+            .map_err(|error| OutcomeError::hard(error.to_string()))?;
+        let created: hi_outcome::TaskView = OutcomeClient::decode_response(response).await?;
         self.persist_last(&LastTask {
             id: created.id.clone(),
             status: created.status.as_str().into(),

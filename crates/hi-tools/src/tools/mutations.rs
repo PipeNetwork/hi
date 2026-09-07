@@ -13,6 +13,10 @@ use crate::{ToolEffects, ToolOutcome, format_lsp_error_feedback};
 
 use super::parse;
 
+#[cfg(test)]
+#[path = "mutation_noop_tests.rs"]
+mod noop_tests;
+
 /// A completely parsed and materialized file-tool invocation.
 ///
 /// The contained [`MutationPlan`] owns the exact postimages shown by

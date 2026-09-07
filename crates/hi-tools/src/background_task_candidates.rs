@@ -158,6 +158,13 @@ impl CandidateQueue {
             .collect()
     }
 
+    pub(super) fn contains(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id)
+    }
+
     pub(super) fn is_ready(&self, id: &str) -> bool {
         self.inner
             .lock()
@@ -223,7 +230,7 @@ impl CandidateQueue {
         }
     }
 
-    fn cancel_requested(&self, id: &str) -> bool {
+    pub(super) fn cancel_requested(&self, id: &str) -> bool {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -383,26 +390,75 @@ impl CandidateQueue {
     }
 }
 
+pub(super) enum KillRequest {
+    Immediate(BackgroundTaskOutcome),
+    Pending {
+        description: String,
+        subagent_type: String,
+        settlement: tokio::task::JoinHandle<BackgroundTaskOutcome>,
+    },
+}
+
 impl BackgroundTaskRegistry {
     pub async fn kill(&self, id: &str) -> Option<BackgroundTaskOutcome> {
+        let request = self.request_kill(id).await?;
+        Some(
+            self.finish_kill(
+                id,
+                request,
+                tokio::time::Instant::now() + super::WORKER_HANDLE_ACK_TIMEOUT,
+            )
+            .await,
+        )
+    }
+
+    pub(super) async fn request_kill(&self, id: &str) -> Option<KillRequest> {
         let (description, subagent_type, settlement) = {
             let mut tasks = self.tasks.lock().await;
             let entry = tasks.get_mut(id)?;
             if let Some(outcome) = entry.final_outcome.clone() {
                 entry.observed = true;
-                return Some(outcome);
+                return Some(KillRequest::Immediate(outcome));
+            }
+            // The worker publishes this cell before waking the registry poller.
+            // A late cancellation must see that acknowledgement even when the
+            // poller has not yet copied it into the entry cache.
+            let published = entry
+                .terminal_outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(outcome) = published {
+                let outcome =
+                    outcome.with_registry_identity(id, &entry.description, &entry.subagent_type);
+                entry.final_outcome = Some(outcome.clone());
+                entry.observed = true;
+                return Some(KillRequest::Immediate(outcome));
             }
             if entry.cancel_requested {
                 let mut outcome =
                     BackgroundTaskOutcome::running(id, &entry.description, &entry.subagent_type);
                 outcome.output = "Task cancellation is still settling.".into();
-                return Some(outcome);
+                return Some(KillRequest::Immediate(outcome));
+            }
+            if (*entry.execution_done.borrow()
+                || entry
+                    .abort_handle
+                    .as_ref()
+                    .is_some_and(tokio::task::AbortHandle::is_finished))
+                && !self.candidates.contains(id)
+            {
+                let mut outcome =
+                    BackgroundTaskOutcome::running(id, &entry.description, &entry.subagent_type);
+                outcome.output =
+                    "Task execution finished; its publication is still settling.".into();
+                return Some(KillRequest::Immediate(outcome));
             }
             if !self.candidates.reserve_cancel(id) {
                 let mut outcome =
                     BackgroundTaskOutcome::running(id, &entry.description, &entry.subagent_type);
                 outcome.output = "Task merge has started and can no longer be cancelled.".into();
-                return Some(outcome);
+                return Some(KillRequest::Immediate(outcome));
             }
             let indexed_handle = self
                 .abort_handles
@@ -411,6 +467,7 @@ impl BackgroundTaskRegistry {
                 .remove(id);
             let abort_handle = entry.abort_handle.take().or(indexed_handle)?;
             entry.cancel_requested = true;
+            abort_handle.abort();
             let outcome = BackgroundTaskOutcome {
                 id: id.to_string(),
                 description: entry.description.clone(),
@@ -425,6 +482,7 @@ impl BackgroundTaskRegistry {
                 entry.subagent_type.clone(),
                 super::lifecycle::CancelSettlement {
                     abort_handle,
+                    execution_done: entry.execution_done.clone(),
                     managed_job: entry.managed_job.clone(),
                     lifecycle_gate: entry.lifecycle_gate.clone(),
                     outcome,
@@ -438,13 +496,36 @@ impl BackgroundTaskRegistry {
             )
         };
 
-        let mut settlement = tokio::spawn(settlement.run());
-        match tokio::time::timeout(super::WORKER_HANDLE_ACK_TIMEOUT, &mut settlement).await {
-            Ok(Ok(outcome)) => Some(
+        Some(KillRequest::Pending {
+            description,
+            subagent_type,
+            settlement: tokio::spawn(settlement.run()),
+        })
+    }
+
+    pub(super) async fn finish_kill(
+        &self,
+        id: &str,
+        request: KillRequest,
+        deadline: tokio::time::Instant,
+    ) -> BackgroundTaskOutcome {
+        let KillRequest::Pending {
+            description,
+            subagent_type,
+            mut settlement,
+        } = request
+        else {
+            let KillRequest::Immediate(outcome) = request else {
+                unreachable!()
+            };
+            return outcome;
+        };
+        match tokio::time::timeout_at(deadline, &mut settlement).await {
+            Ok(Ok(outcome)) => {
                 self.commit_worker_terminal(id, &description, &subagent_type, outcome, true)
-                    .await,
-            ),
-            Ok(Err(error)) => Some(BackgroundTaskOutcome {
+                    .await
+            }
+            Ok(Err(error)) => BackgroundTaskOutcome {
                 id: id.to_string(),
                 description,
                 subagent_type,
@@ -452,11 +533,11 @@ impl BackgroundTaskRegistry {
                 output: format!("Task cancellation monitor failed: {error}"),
                 applied: false,
                 changed_files: Vec::new(),
-            }),
+            },
             Err(_) => {
                 let mut outcome = BackgroundTaskOutcome::running(id, &description, &subagent_type);
                 outcome.output = "Task cancellation was requested and is still settling.".into();
-                Some(outcome)
+                outcome
             }
         }
     }

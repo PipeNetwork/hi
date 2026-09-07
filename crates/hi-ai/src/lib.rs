@@ -24,6 +24,11 @@ pub mod pipenetwork_auth;
 pub mod provider;
 pub mod provider_capabilities;
 mod request_envelope;
+mod request_execution;
+pub use request_execution::{
+    PhysicalAttemptEvidence, ProviderAttemptEvent, ProviderAttemptState, RequestExecution,
+    RequestExecutionPolicy, RequestFailureEvidence, RequestFailureReason, RequestProgress,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 mod text_tool_fallback;
@@ -51,8 +56,8 @@ pub use huggingface::{
 pub use auth_store::StoredToken;
 pub use http::{
     HttpRetryEvent, HttpRetryObserver, agent_http_client, agent_http_client_quick, cache_key,
-    credential_redirect_policy, load_cache, save_cache, set_http_retry_observer,
-    timed_http_client_fallback,
+    credential_redirect_policy, inference_http_client_for_socket, load_cache, save_cache,
+    set_http_retry_observer, timed_http_client_fallback,
 };
 pub use mcp::{
     McpDiscoveryProvider, McpTool, PIPE_MCP_DEFAULT_URL, PipeMcpClient, PipeMcpModelHealth,
@@ -67,7 +72,7 @@ pub use provider::{
     CODING_AGENT_MIN_OUTPUT_TOKENS, KeyCheck, OutputCapError, Provider, ProviderCapabilities,
     ProviderError, ProviderErrorKind, ProviderRequestContext, ServedModel,
     effective_coding_agent_max_tokens, is_billing_or_quota_text, is_http_auth_rejection,
-    is_pipenetwork_coding_route, provider_error_affects_health,
+    is_pipenetwork_coding_route, provider_error_affects_health, provider_error_details,
     provider_error_is_fallback_eligible, provider_error_is_temporary_overload, provider_error_kind,
     provider_error_retryable, provider_error_usage, provider_output_cap_error,
     provider_retry_after_seconds, provider_route_error_is_retryable,

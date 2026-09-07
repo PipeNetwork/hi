@@ -12,6 +12,7 @@ fn request() -> ChatRequest {
         model: "claude-test".into(),
         request_id: None,
         retry_attempt: 0,
+        execution: Default::default(),
         user_turn: false,
         canonical_objective: None,
         messages: vec![Message::user("Update the source")].into(),

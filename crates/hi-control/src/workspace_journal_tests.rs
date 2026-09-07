@@ -783,3 +783,6 @@ impl ProjectionStateName for WorkspaceBindingRecord {
         }
     }
 }
+
+#[path = "workspace_journal_ack_tests.rs"]
+mod acknowledgement;

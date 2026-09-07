@@ -13,7 +13,7 @@ use crate::ui::Ui;
 use super::super::phase::TurnPhase;
 use super::super::progress::{
     AWAITING_BACKGROUND_REASON, NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker,
-    REPEATED_VALIDATION_DIAGNOSIS_NUDGE, WAITING_ROUND_BUDGET, no_progress_signature_for_calls,
+    WAITING_ROUND_BUDGET, no_progress_signature_for_calls,
 };
 use super::super::tools::{ToolBatchOutcome, ToolProtocolFailureKind};
 use super::RoundControl;
@@ -146,7 +146,7 @@ impl crate::Agent {
                 ui.status(&format!(
                     "the workspace kept changing while tool requests were in flight ({validation_summary})"
                 ));
-                return RoundControl::BreakInner(false);
+                return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
             }
             let unavailable_tools = protocol_validation_errors
                 .iter()
@@ -194,13 +194,13 @@ impl crate::Agent {
                     ui.status(
                         "the model kept selecting unavailable inspection tools after mutation-only recovery; no file changes were made",
                     );
-                    return RoundControl::BreakInner(false);
+                    return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
                 }
                 ui.status(&format!(
                     "the model kept calling tools outside the sealed envelope ({validation_summary})"
                 ));
                 *provider_exhausted = true;
-                return RoundControl::BreakInner(false);
+                return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
             }
             if *repeat_nudges < self.config.loop_limits.max_repeat_nudges {
                 if !*deepseek_strict_fallback_used
@@ -261,7 +261,7 @@ impl crate::Agent {
             ui.status(&format!(
                 "tool arguments kept failing validation ({validation_summary})"
             ));
-            return RoundControl::BreakInner(false);
+            return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
         }
 
         // A final, successful bookkeeping-only batch is itself a terminal
@@ -291,7 +291,7 @@ impl crate::Agent {
             progress_tracker.last_no_progress_reason.clear();
             progress_tracker.record_final_answer();
             ui.status("plan completed; settling from successful tool evidence");
-            return RoundControl::BreakInner(false);
+            return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
         }
         match self.handle_mutation_recovery(
             mutation_recovery,
@@ -314,7 +314,7 @@ impl crate::Agent {
                 ui.nudge(
                     "implementation discovery budget was exhausted; settling with current evidence",
                 );
-                return RoundControl::BreakInner(false);
+                return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
             }
         }
         // Waiting-round detection keys on the process *lifecycle*, not output
@@ -488,7 +488,7 @@ impl crate::Agent {
                 progress_tracker.record(ProgressKind::None, "repeat_same_inspection_output", None);
                 ui.nudge("review kept getting the same inspection output");
                 let _ = intent;
-                return RoundControl::BreakInner(false);
+                return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
             }
             if (implementation_intent.is_some() || expected_mutation)
                 && !implementation_tracker.mutation_seen
@@ -519,7 +519,7 @@ impl crate::Agent {
                 progress_tracker.record(ProgressKind::None, "implementation_repeat_no_edit", None);
                 implementation_tracker.no_mutation_exhausted = true;
                 ui.nudge("implementation repeated equivalent inspection output without editing");
-                return RoundControl::BreakInner(false);
+                return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
             }
             // A prior mutation must not grant an unlimited exemption from
             // convergence. It does mean there is useful work to summarize, so
@@ -552,34 +552,9 @@ impl crate::Agent {
             } else {
                 "tool results kept repeating without new workspace effects"
             });
-            return RoundControl::BreakInner(false);
+            return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
         } else if !tool_progress_labels.is_empty() {
             progress_tracker.record_round_from_tools(tool_progress_labels);
-            if implementation_tracker.mutation_seen
-                && progress_tracker.take_repeated_validation_diagnosis()
-            {
-                *force_tools_next = true;
-                progress_tracker.force_no_progress_final_answer_next = false;
-                ui.nudge(
-                    "the same validation failure survived two repair cycles — requesting a focused root-cause diagnosis",
-                );
-                self.messages
-                    .push_nudge(NudgeKind::Continue, REPEATED_VALIDATION_DIAGNOSIS_NUDGE);
-                return RoundControl::Continue;
-            }
-            if implementation_tracker.mutation_seen
-                && let Some(failure_signature) =
-                    progress_tracker.repeated_validation_repair_exhausted()
-            {
-                *force_tools_next = false;
-                progress_tracker.record(
-                    ProgressKind::None,
-                    "same validation failure survived focused repair",
-                    Some(failure_signature),
-                );
-                ui.status("the same validation failure persisted after focused repair");
-                return RoundControl::BreakInner(false);
-            }
         }
 
         RoundControl::Continue

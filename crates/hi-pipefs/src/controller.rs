@@ -591,6 +591,14 @@ impl WorkspaceController for PipeFsWorkspaceController {
         }
     }
 
+    fn job_state(&self, job: &JobId) -> Option<JobState> {
+        self.inner
+            .jobs
+            .status(&self.inner.jobs.fence(), job)
+            .ok()
+            .map(|job| job.state)
+    }
+
     async fn register_job(&self, spec: JobSpec) -> Result<JobPermit, AdmissionDenied> {
         let state = lock(&self.inner.state);
         if spec.effect_scope == hi_workspace::EffectScope::LiveWriter {
@@ -622,39 +630,18 @@ impl WorkspaceController for PipeFsWorkspaceController {
         }
         drop(state);
         let fence = self.inner.jobs.fence();
-        let permit = self.inner.jobs.register(&fence, spec).map_err(|error| {
-            denied(
-                &lock(&self.inner.state),
-                AdmissionDeniedReason::ActiveWriter,
-                error.to_string(),
-            )
-        })?;
-        for (expected, next) in [
-            (JobState::Queued, JobState::Starting),
-            (JobState::Starting, JobState::Running),
-        ] {
-            if let Err(error) =
-                self.inner
-                    .jobs
-                    .transition(&fence, &permit.job_id, expected, next, None, Vec::new())
-            {
-                let _ = self.inner.jobs.seal(
-                    &fence,
-                    &permit.job_id,
-                    JobTerminal {
-                        completion: hi_workspace::JobCompletion::Failed,
-                        detail: Some(format!("job admission failed before execution: {error}")),
-                        artifacts: Vec::new(),
-                    },
-                );
+        let permit = self
+            .inner
+            .jobs
+            .register_running(&fence, spec)
+            .map_err(|error| {
                 sync_jobs(&self.inner);
-                return Err(denied(
+                denied(
                     &lock(&self.inner.state),
                     AdmissionDeniedReason::ActiveWriter,
                     error.to_string(),
-                ));
-            }
-        }
+                )
+            })?;
         sync_jobs(&self.inner);
         Ok(permit)
     }

@@ -67,24 +67,17 @@ impl JournaledWorkspaceController {
         let binding = self.inner.binding();
         let proof_error = validate_exact_settlement_proof(&permit, &outcome, &binding).err();
 
+        // The binding and terminal operation become visible in one required
+        // transaction. A crash can no longer expose just one side of success.
         if proof_error.is_none()
             && self.journal_is_healthy()
-            && let Err(error) = self.journal.record_binding(
+            && let Err(error) = self.journal.record_settlement_with_binding(
                 &binding,
                 &self.inner.status(),
                 &self.inner.capabilities(),
+                &permit,
+                &outcome,
             )
-        {
-            self.note_journal_failure(&error);
-        }
-        // The operation transition is deliberately the final normal-path
-        // write. Any earlier failure leaves the admitted/executing row
-        // discoverable after restart instead of persisting a false success.
-        if proof_error.is_none()
-            && self.journal_is_healthy()
-            && let Err(error) = self
-                .journal
-                .record_operation_settled(&binding, &permit, &outcome)
         {
             self.note_journal_failure(&error);
         }

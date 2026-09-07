@@ -382,7 +382,6 @@ impl crate::App {
             match entry {
                 crate::TranscriptEntry::Line(_)
                 | crate::TranscriptEntry::UserPrompt { .. }
-                | crate::TranscriptEntry::Assistant(_)
                 | crate::TranscriptEntry::AssistantMessage { .. }
                 | crate::TranscriptEntry::Btw { .. }
                 | crate::TranscriptEntry::Workflow { .. }
@@ -687,9 +686,7 @@ impl crate::App {
             // export. Code-block recovery needs the raw rendered line so it can
             // still distinguish markdown's `▏ ` guide from ordinary text.
             let text = match entry {
-                crate::TranscriptEntry::Line(line) | crate::TranscriptEntry::Assistant(line) => {
-                    crate::render::line_text(line)
-                }
+                crate::TranscriptEntry::Line(line) => crate::render::line_text(line),
                 crate::TranscriptEntry::AssistantMessage { text } => {
                     if let Some(block) = Self::last_fenced_block(text) {
                         return Some(block);
@@ -843,26 +840,28 @@ impl crate::App {
                 let was_review = agent
                     .structured_goal()
                     .is_some_and(|g| g.pause_reason == hi_agent::GoalPauseReason::Review);
-                let (msg, style) =
-                    match agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::None) {
-                        Ok(true) => {
-                            agent.reset_goal_drive_stall();
-                            let text = if was_review || arg == "accept" {
-                                "✓ plan accepted — goal driving turns again"
-                            } else {
-                                "✓ goal resumed — steering turns again"
-                            };
-                            (
-                                text.to_string(),
-                                Style::default().fg(crate::theme::theme().accent_success),
-                            )
-                        }
-                        Ok(false) => ("no goal to resume".into(), dim()),
-                        Err(err) => (
-                            format!("goal resume failed: {err:#}"),
-                            Style::default().fg(crate::theme::theme().warning),
-                        ),
-                    };
+                let (msg, style) = match agent
+                    .restart_task_recovery()
+                    .and_then(|()| agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::None))
+                {
+                    Ok(true) => {
+                        agent.reset_goal_drive_stall();
+                        let text = if was_review || arg == "accept" {
+                            "✓ plan accepted — goal driving turns again"
+                        } else {
+                            "✓ goal resumed — steering turns again"
+                        };
+                        (
+                            text.to_string(),
+                            Style::default().fg(crate::theme::theme().accent_success),
+                        )
+                    }
+                    Ok(false) => ("no goal to resume".into(), dim()),
+                    Err(err) => (
+                        format!("goal resume failed: {err:#}"),
+                        Style::default().fg(crate::theme::theme().warning),
+                    ),
+                };
                 self.refresh_goal(agent);
                 self.push(Line::styled(msg, style));
                 if let Some(g) = agent.structured_goal() {

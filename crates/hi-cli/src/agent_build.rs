@@ -13,7 +13,7 @@ use crate::landing::LoadedAgentSession;
 use crate::project_context::{
     load_candidate_project_context_from, load_standing_rules, load_trust_aware_project_context_from,
 };
-use crate::provider::{LiveModelMetadata, agent_provider_route};
+use crate::provider::{LiveModelMetadata, agent_provider_route, resolved_agent_routing};
 
 pub(crate) struct BuiltAgent {
     pub agent: Agent,
@@ -56,23 +56,12 @@ pub(crate) fn build_agent(
             workspace_root: workspace_root.clone(),
             state_root: state_root.clone(),
         },
-        routing: hi_agent::AgentRouting {
-            model: settings.model.clone(),
-            provider_route: Some(provider_route.label),
-            capability_route: Some(provider_route.capability_identity),
-            requested_max_tokens: settings.max_tokens,
+        routing: resolved_agent_routing(
+            settings,
+            live_metadata.context_window,
             max_tokens,
-            max_tokens_explicit: settings.max_tokens_explicit,
-            temperature: cli.temperature,
-            top_p: settings.top_p,
-            output_token_parameter: settings.output_token_parameter,
-            thinking_budget: settings.thinking_budget,
-            reasoning_effort: settings.reasoning_effort,
-            tool_mode: settings.tool_mode,
-            compat: settings.compat,
-            deepseek_compat: settings.deepseek_compat,
-            context_window: live_metadata.context_window,
-        },
+            cli.temperature,
+        ),
         gates: hi_agent::AgentGates {
             verification: quality.verification.clone(),
             max_verify_repairs: quality.max_verify_repairs,
@@ -203,6 +192,7 @@ pub(crate) fn build_agent(
     let restored_goal_drive = loaded
         .as_ref()
         .map(|l| (l.goal_drive_stall, l.goal_drive_evidence.clone()));
+    let restored_task_recovery = loaded.as_ref().map(|l| l.task_recovery.clone());
     let declared_provider_capabilities = provider.capabilities();
     let agent_result = match loaded {
         Some(loaded) => Agent::resume(
@@ -245,6 +235,10 @@ pub(crate) fn build_agent(
     }
     if let Some((stall, evidence)) = restored_goal_drive {
         agent.restore_goal_drive(stall, evidence);
+    }
+
+    if let Some(recovery) = restored_task_recovery {
+        agent.restore_task_recovery(recovery);
     }
 
     Ok(BuiltAgent {

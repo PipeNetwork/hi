@@ -22,6 +22,7 @@ mod daemon;
 mod lease_confirmation;
 mod lease_signal;
 mod pipefs_causal;
+mod session_sink;
 mod transport_ack;
 mod workspace_execution;
 pub use config::{HeartbeatTelemetry, SyncConfig, validate_session_id};
@@ -39,6 +40,7 @@ const RECORD_TYPE_LOCAL_WORKSPACE_STAGE: &str = "workspace_execution_staged";
 const RECORD_TYPE_LOCAL_WORKSPACE_SETTLEMENT: &str = "workspace_execution_settled";
 const RECORD_TYPE_CHECKPOINTS: &str = "checkpoints";
 const RECORD_TYPE_HARNESS_SETTINGS: &str = crate::session_harness::RECORD_TYPE;
+#[cfg(test)]
 const RECORD_TYPE_STATE_REPLACEMENT: &str = "state_replacement";
 const RECORD_TYPE_PLAN_DRIVE: &str = "plan_drive";
 const RECORD_TYPE_PLAN_APPROVAL: &str = "plan_approval";
@@ -522,14 +524,9 @@ impl RemoteSessionSink {
     pub fn seed_snapshot(&self, loaded: &crate::session::LoadedSession) -> Result<()> {
         self.set_title(loaded.name.clone());
         self.observe_messages(&loaded.messages);
-        let payload = serde_json::to_string(&serde_json::json!({
-            "type": "state_replacement",
-            "messages": loaded.messages,
-            "goal": loaded.goal,
-            "decisions": loaded.decisions.entries(),
-            "plan": loaded.plan,
-        }))?;
-        self.push(RECORD_TYPE_STATE_REPLACEMENT, &payload);
+        for (record_type, payload) in loaded.replacement_records()? {
+            self.push(record_type, &payload);
+        }
         if !loaded.usage.is_zero() {
             self.push(
                 RECORD_TYPE_USAGE,
@@ -1371,180 +1368,6 @@ impl SyncSession {
     }
 }
 
-impl SessionSink for SyncSession {
-    fn id(&self) -> Option<String> {
-        self.local.id()
-    }
-
-    fn requires_local_workspace_execution_stage(&self) -> bool {
-        true
-    }
-
-    fn record(&mut self, messages: &[Message], usage: Usage) -> Result<()> {
-        self.local.record(messages, usage)?;
-        self.remote.observe_messages(messages);
-        self.remote.observe_context_used(usage.context_occupancy);
-        self.remote.reconcile_message_prefix(self.local.path())
-    }
-
-    fn stage_workspace_execution(
-        &mut self,
-        record: &hi_agent::WorkspaceTranscriptExecution,
-    ) -> Result<()> {
-        self.remote.stage_workspace_execution(record)
-    }
-
-    fn stage_local_workspace_execution(
-        &mut self,
-        record: &hi_agent::WorkspaceTranscriptExecution,
-        visible_on_resume: bool,
-    ) -> Result<()> {
-        self.local
-            .stage_local_workspace_execution(record, visible_on_resume)
-    }
-
-    fn settle_local_workspace_execution(
-        &mut self,
-        operation_id: &hi_workspace::OperationId,
-    ) -> Result<()> {
-        self.local.settle_local_workspace_execution(operation_id)
-    }
-
-    fn record_model_context(&mut self, model: &str, context_window: Option<u32>) {
-        self.remote.set_model_context(model, context_window);
-    }
-
-    fn record_compaction(&mut self, messages: &[Message]) -> Result<()> {
-        self.local.record_compaction(messages)?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn record_state_replacement(
-        &mut self,
-        messages: &[Message],
-        goal: Option<&hi_agent::Goal>,
-        decisions: &hi_agent::DecisionLog,
-        plan: &[hi_agent::PlanStep],
-    ) -> Result<()> {
-        self.local
-            .record_state_replacement(messages, goal, decisions, plan)?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
-        self.local.record_checkpoints(refs)?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn record_pipefs_mode(&mut self, enabled: bool) -> Result<()> {
-        self.local.record_pipefs_mode(enabled)?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn record_goal(&mut self, goal: &hi_agent::Goal) -> Result<()> {
-        self.local.record_goal(goal)?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn clear_goal(&mut self) -> Result<()> {
-        self.local.clear_goal()?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn record_plan(&mut self, plan: &[hi_agent::PlanStep]) -> Result<()> {
-        self.local.record_plan(plan)?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn clear_plan(&mut self) -> Result<()> {
-        self.local.clear_plan()?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn record_plan_drive(&mut self, paused: bool, stall: u32) -> Result<()> {
-        self.record_plan_drive_state(paused, stall, false, &[])
-    }
-
-    fn record_plan_drive_state(
-        &mut self,
-        paused: bool,
-        stall: u32,
-        evidence_reset: bool,
-        evidence_add: &[String],
-    ) -> Result<()> {
-        self.local
-            .record_plan_drive_state(paused, stall, evidence_reset, evidence_add)?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn record_plan_drive_state_with_policy(
-        &mut self,
-        paused: bool,
-        stall: u32,
-        resume_on_user_input: bool,
-        evidence_reset: bool,
-        evidence_add: &[String],
-    ) -> Result<()> {
-        self.local.record_plan_drive_state_with_policy(
-            paused,
-            stall,
-            resume_on_user_input,
-            evidence_reset,
-            evidence_add,
-        )?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn record_plan_approval_parked(&mut self, parked: bool) -> Result<()> {
-        self.local.record_plan_approval_parked(parked)?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn record_goal_drive(&mut self, stall: u32) -> Result<()> {
-        self.record_goal_drive_state(stall, false, &[])
-    }
-
-    fn record_goal_drive_state(
-        &mut self,
-        stall: u32,
-        evidence_reset: bool,
-        evidence_add: &[String],
-    ) -> Result<()> {
-        self.local
-            .record_goal_drive_state(stall, evidence_reset, evidence_add)?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn record_decisions(&mut self, decisions: &hi_agent::DecisionLog) -> Result<()> {
-        self.local.record_decisions(decisions)?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-
-    fn record_turn_outcome(
-        &mut self,
-        outcome: &hi_agent::TurnOutcome,
-        review_unavailable_reason: Option<&str>,
-    ) -> Result<()> {
-        self.local
-            .record_turn_outcome(outcome, review_unavailable_reason)?;
-        self.reconcile_best_effort();
-        Ok(())
-    }
-}
-
 // ─── Live event streaming (Phase 2) ─────────────────────────────────────────
 
 /// A [`hi_agent::Ui`] that serializes each callback as a [`hi_tui::event::UiEvent`]
@@ -2218,13 +2041,6 @@ pub async fn run_daemon_loop(
                 let (kind, guidance) = hi_agent::classify_error(err);
                 eprintln!("\x1b[31m{kind}: {err:#} — {guidance}\x1b[0m");
             }
-            if result.is_err()
-                && !agent
-                    .last_turn_outcome()
-                    .is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Cancelled)
-            {
-                let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
-            }
 
             // Flush sync records + live events to ipop.
             if let Some(handle) = &sync_handle
@@ -2737,6 +2553,7 @@ fn render_live_event(event: &hi_tui::event::UiEvent, live_status: &mut Option<St
     }
 
     match event {
+        UiEvent::ProviderAttempt { .. } | UiEvent::ProviderProgress => {}
         UiEvent::Text { text } => {
             print!("{text}");
             use std::io::Write;
@@ -3317,13 +3134,6 @@ pub async fn run_resume_local(
         if let Err(err) = &result {
             let (kind, guidance) = hi_agent::classify_error(err);
             eprintln!("\x1b[31m{kind}: {err:#} — {guidance}\x1b[0m");
-        }
-        if result.is_err()
-            && !agent
-                .last_turn_outcome()
-                .is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Cancelled)
-        {
-            let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
         }
         agent.settle_workspace_for_exit().await?;
         if let Err(err) = sync_handle.flush().await {

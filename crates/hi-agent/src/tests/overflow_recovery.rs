@@ -236,7 +236,11 @@ async fn failed_preflight_after_context_drop_removes_oversized_request() {
     assert!(requests.lock().unwrap().is_empty());
     assert_eq!(
         agent.messages().len(),
-        1,
-        "failed preflight retained its oversized rewritten request after the history boundary moved"
+        2,
+        "only the system message and durable failure closeout remain after context moves"
     );
+    assert_eq!(agent.messages().last().unwrap().role, Role::Assistant);
+    assert!(agent.messages().iter().all(|message| {
+        message.role != Role::User && !message.text().contains("oversized current request")
+    }));
 }

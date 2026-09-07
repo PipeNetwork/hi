@@ -31,6 +31,7 @@ impl Provider for ToolCapableProvider {
 
 fn sealed_request(route: &str) -> ChatRequest {
     ChatRequest {
+        execution: Default::default(),
         model: "configured-model".into(),
         request_id: None,
         retry_attempt: 0,

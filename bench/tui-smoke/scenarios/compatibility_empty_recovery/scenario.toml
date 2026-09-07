@@ -10,7 +10,7 @@ json_equals = { "/max_tokens" = 8192 }
 [provider.steps.response]
 kind = "http_error"
 status = 400
-body = '{"error":{"message":"parameter max_tokens is not supported; use max_completion_tokens","code":"bad_request","retryable":false}}'
+body = '{"error":{"message":"parameter max_tokens is not supported; use max_completion_tokens","code":"bad_request"}}'
 
 [[provider.steps]]
 id = "fallback-empty"
@@ -55,12 +55,18 @@ exact = 3
 kind = "records"
 source = "provider_requests"
 equals = { "/method" = "POST", "/headers/x-request-attempt" = "0" }
-exact = 2
+exact = 3
 
 [[assertions]]
 kind = "records"
 source = "provider_requests"
 equals = { "/method" = "POST", "/headers/x-request-attempt" = "1" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "provider_attempt", "/data/attempt/physical_attempt" = 3, "/data/attempt/state/started/replay_attempt" = 0 }
 exact = 1
 
 [[assertions]]

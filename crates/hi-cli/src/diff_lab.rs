@@ -282,6 +282,7 @@ async fn run_one_api_case(
         providers.push((api_targets.last().cloned().unwrap(), provider));
     }
     let request = ChatRequest {
+        execution: Default::default(),
         model: api_targets
             .first()
             .map(|target| target.model.clone())

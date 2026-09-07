@@ -701,6 +701,7 @@ impl crate::Agent {
         let results = [(call_id, result)];
         let stage_error = self
             .stage_active_workspace_execution(&calls, &assistant_content, &results, &execution)
+            .await
             .err();
         if let Some(error) = &stage_error {
             execution.disposition = ExecutionDisposition::Indeterminate;

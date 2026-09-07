@@ -187,8 +187,10 @@ impl crate::Agent {
                 if next.len() > crate::MAX_CHECKPOINTS {
                     next.drain(0..next.len() - crate::MAX_CHECKPOINTS);
                 }
-                if let Some(session) = self.session.as_mut()
-                    && let Err(err) = session.record_checkpoints(&next)
+                let durable_next = next.clone();
+                if let Err(err) = self
+                    .write_session(move |session| session.record_checkpoints(&durable_next))
+                    .await
                 {
                     format!(
                         "checkpoint was created but its reference could not be persisted: {err:#}"
@@ -231,9 +233,9 @@ impl crate::Agent {
                 if let Some(last) = self.workspace.checkpoints.last_mut() {
                     *last = sealed;
                 }
-                if let Some(session) = self.session.as_mut() {
-                    session.record_checkpoints(&self.workspace.checkpoints)?;
-                }
+                let checkpoints = self.workspace.checkpoints.clone();
+                self.write_session(move |session| session.record_checkpoints(&checkpoints))
+                    .await?;
                 Ok(true)
             }
             hi_tools::checkpoint::CreateResult::Unavailable(reason)
@@ -242,9 +244,9 @@ impl crate::Agent {
                 // this turn, so always drop it. Strict mode fails the operation;
                 // YOLO continues silently and exposes the loss in telemetry.
                 self.workspace.checkpoints.pop();
-                if let Some(session) = self.session.as_mut() {
-                    session.record_checkpoints(&self.workspace.checkpoints)?;
-                }
+                let checkpoints = self.workspace.checkpoints.clone();
+                self.write_session(move |session| session.record_checkpoints(&checkpoints))
+                    .await?;
                 if !self.config.gates.allow_no_checkpoint {
                     ui.checkpoint_warning(&format!(
                         "⚠ could not seal this turn's undo record: {reason}"

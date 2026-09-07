@@ -145,8 +145,9 @@ pub(super) async fn publish_after_settlement(
     };
     let mut execution = workspace_execution_report(intent, batch_entries, calls.len());
     merge_reconciled_changes(&mut execution, feedback_changes);
-    if let Err(stage_error) =
-        agent.stage_visible_workspace_execution(calls, completion_content, results, &execution)
+    if let Err(stage_error) = agent
+        .stage_visible_workspace_execution(calls, completion_content, results, &execution)
+        .await
     {
         let mut indeterminate = execution;
         indeterminate.disposition = hi_workspace::ExecutionDisposition::Indeterminate;

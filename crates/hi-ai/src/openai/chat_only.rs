@@ -10,6 +10,7 @@ fn chat_only_request(model: &str, deepseek_compat: DeepSeekCompat) -> crate::typ
         model: model.into(),
         request_id: None,
         retry_attempt: 0,
+        execution: Default::default(),
         user_turn: false,
         canonical_objective: None,
         messages: vec![Message::user("hi")].into(),

@@ -258,8 +258,8 @@ pub trait EventSink: Send + Sync {
 }
 
 /// A durable event sink that can replay canonical events in stream order.
-/// Live subscription remains an implementation concern (the CLI uses a
-/// broadcast channel), while this contract is sufficient for restart-safe
+/// Live subscription remains an implementation concern, while this contract
+/// is sufficient for restart-safe
 /// workflow dispatchers and remote observation adapters.
 pub trait EventBus: EventSink {
     fn replay_since(&self, sequence: u64) -> Result<Vec<RunEvent>, EventError>;

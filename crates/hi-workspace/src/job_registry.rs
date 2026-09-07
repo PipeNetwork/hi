@@ -1,4 +1,8 @@
 use std::collections::BTreeMap;
+#[path = "job_registry_transition.rs"]
+mod transition;
+use transition::{completion_state, transition_allowed};
+
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -329,6 +333,36 @@ impl WorkspaceJobRegistry {
         };
         state.jobs.insert(permit.job_id.clone(), snapshot);
         publish(&self.inner, &mut state);
+        Ok(permit)
+    }
+
+    /// Admission shared by local and remote controllers. A preparation which
+    /// cannot acquire its slot is terminalized before returning the denial.
+    pub fn register_running(
+        &self,
+        fence: &JobFence,
+        spec: JobSpec,
+    ) -> Result<JobPermit, JobRegistryError> {
+        let permit = self.register(fence, spec)?;
+        for (expected, next) in [
+            (JobState::Queued, JobState::Starting),
+            (JobState::Starting, JobState::Running),
+        ] {
+            if let Err(error) =
+                self.transition(fence, &permit.job_id, expected, next, None, Vec::new())
+            {
+                self.seal(
+                    fence,
+                    &permit.job_id,
+                    JobTerminal {
+                        completion: JobCompletion::Failed,
+                        detail: Some(format!("job admission failed before execution: {error}")),
+                        artifacts: Vec::new(),
+                    },
+                );
+                return Err(error);
+            }
+        }
         Ok(permit)
     }
 
@@ -705,41 +739,6 @@ fn ensure_job_fence(job: &WorkspaceJobSnapshot, fence: &JobFence) -> Result<(), 
         Ok(())
     } else {
         Err(JobRegistryError::StaleFence)
-    }
-}
-
-fn transition_allowed(job: &WorkspaceJobSnapshot, next: JobState) -> bool {
-    if !job.state.can_transition_to(next) {
-        return false;
-    }
-    if is_candidate(&job.permit.spec) {
-        if job.state == JobState::Running && next == JobState::Succeeded {
-            return false;
-        }
-        if next == JobState::Succeeded && job.state != JobState::Settling {
-            return false;
-        }
-    } else if matches!(job.permit.spec.effect_scope, EffectScope::LiveWriter)
-        && next == JobState::Succeeded
-        && job.state != JobState::Settling
-    {
-        return false;
-    }
-    true
-}
-
-fn completion_state(completion: JobCompletion) -> JobState {
-    match completion {
-        JobCompletion::Succeeded => JobState::Succeeded,
-        JobCompletion::ReadyToMerge => JobState::ReadyToMerge,
-        JobCompletion::Merging => JobState::Merging,
-        JobCompletion::Settling => JobState::Settling,
-        JobCompletion::Failed => JobState::Failed,
-        JobCompletion::Cancelled => JobState::Cancelled,
-        JobCompletion::DurabilityPending => JobState::DurabilityPending,
-        JobCompletion::RecoveryRequired => JobState::RecoveryRequired,
-        JobCompletion::Orphaned => JobState::Orphaned,
-        JobCompletion::Stale => JobState::Stale,
     }
 }
 

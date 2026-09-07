@@ -89,6 +89,7 @@ pub(super) fn build_reference_request(
         model: reference_model,
         request_id: request.request_id.clone(),
         retry_attempt: request.retry_attempt,
+        execution: request.execution.clone(),
         user_turn: false,
         canonical_objective: None,
         messages: Arc::new(super::reference_messages(

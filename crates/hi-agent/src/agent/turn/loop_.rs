@@ -45,7 +45,6 @@ impl crate::Agent {
         &mut self,
         input: &str,
         ui: &mut dyn Ui,
-        engine_lease: hi_engine_host::EngineLease,
     ) -> Result<TurnOutcome> {
         self.set_turn_phase(TurnPhase::Setup);
         // Immediate `/btw` launcher — TUI fires asides without waiting for a
@@ -80,13 +79,18 @@ impl crate::Agent {
             self.runtime.clear_repo_map_cache();
         }
         let turn_ledger_revision = self.runtime.ledger().begin_turn_retention_window();
-        let turn_background_baseline = self.runtime.background().ids();
+        let turn_background_baseline = self
+            .workspace
+            .active_turn_background_baseline
+            .clone()
+            .unwrap_or_else(|| self.runtime.background().ids());
         // Ledger + bg baselines + per-turn caches (cancel-safe finalizers).
         self.workspace
             .begin_turn(turn_ledger_revision, turn_background_baseline.clone());
         let expanded_input =
             command::expand_prompt_macro(input).unwrap_or_else(|| input.to_string());
-        self.begin_drive_turn(crate::DriveKind::from_prompt(&expanded_input))?;
+        let drive_kind = crate::DriveKind::from_prompt(&expanded_input);
+        self.begin_drive_turn_async(drive_kind).await?;
         // Synthetic goal-drive text is only transport. Contracts, context
         // ranking, review, and implementation guards need the real objective
         // and active milestone—especially explicit paths such as plan.md.
@@ -103,6 +107,16 @@ impl crate::Agent {
         let context_task = goal_context
             .or(plan_context)
             .unwrap_or_else(|| expanded_input.clone());
+        // A stale/missing drive context is still synthetic transport. It must
+        // not create another allowance. Only old sessions with no recovery
+        // state yet need an initial budget on their first synthetic drive.
+        if drive_kind == crate::DriveKind::User
+            || self.task_recovery == crate::TaskRecoveryState::default()
+        {
+            self.start_task_recovery_async(context_task.clone()).await?;
+        }
+        self.persist_task_recovery_async().await?;
+        self.answer_state = crate::recovery::AnswerState::Missing;
         let tool_free_response =
             crate::task_contract::prompt_requests_tool_free_response(&context_task);
         // Plan mode is a distinct planning-only scope, not a code-review turn
@@ -218,13 +232,6 @@ impl crate::Agent {
         // the per-round refresh no longer rewrites any message.
         self.refresh_memory_context(&context_task);
         self.refresh_system_message();
-        self.initialize_wasm_turn(
-            &engine_lease,
-            &expanded_input,
-            context_generation_seen,
-            turn_ledger_revision,
-            ui,
-        )?;
         // A turn is *expected* to mutate only for an explicit mutation request
         // ("fix the login bug"), a structured implementation task, or a
         // synthetic goal/plan drive turn. The mutation-capable intent that ambiguous wording
@@ -317,14 +324,12 @@ impl crate::Agent {
             };
             let preserve_plan = self.goals.plan_incomplete();
             if self.goals.clear_plan_unless(preserve_plan) {
-                if let Some(session) = self.session.as_mut() {
-                    session.clear_plan()?;
-                }
+                self.write_session(|sink| sink.clear_plan()).await?;
                 ui.plan(&[]);
             }
             self.messages.strip_trailing_nudges();
             self.persisted = self.persisted.min(self.messages.len());
-            self.persist()?;
+            self.persist_async().await?;
             ui.turn_error(
                 "tools",
                 &format!(
@@ -360,7 +365,7 @@ impl crate::Agent {
         if plan_recovery_window {
             let recovery_instruction =
                 crate::plan_drive::plan_recovery_instruction(self.next_plan_step_title());
-            self.apply_plan_recovery_window(ui)?;
+            self.apply_plan_recovery_window_async(ui).await?;
             model_turn_input.push_str("\n\n[hi:plan-recovery]\n");
             model_turn_input.push_str(recovery_instruction);
             model_turn_input.push_str("\n[/hi:plan-recovery]");
@@ -415,7 +420,7 @@ impl crate::Agent {
         }
         let turn_start = self.messages.len().saturating_sub(1);
         self.workspace.set_message_start(turn_start);
-        self.persist_durable_boundary("prompt")?;
+        self.persist_durable_boundary_async("prompt").await?;
         self.report.verify = VerifyEvidence::none();
         self.workspace.last_changed_files.clear();
         self.workspace.last_file_changes.clear();
@@ -430,9 +435,7 @@ impl crate::Agent {
         // can replace stale steps instead of inheriting PLAN_CONTINUE_NUDGE.
         let preserve_plan = self.goals.plan_incomplete();
         if self.goals.clear_plan_unless(preserve_plan) {
-            if let Some(session) = self.session.as_mut() {
-                session.clear_plan()?;
-            }
+            self.write_session(|sink| sink.clear_plan()).await?;
             ui.plan(&[]);
         }
         let plan_drive_turn =
@@ -614,7 +617,8 @@ impl crate::Agent {
             empty_tui_needs_project = implementation_intent.is_some_and(|intent| intent.tui)
                 && implementation_tracker.preferred_validation.is_none();
         }
-        let retry_state = TurnRetryState::default();
+        let mut retry_state = TurnRetryState::default();
+        retry_state.execution = self.request_execution();
         let request_max_tokens_override: Option<u32> = None;
         // After a bookkeeping-repost nudge, withhold the bookkeeping tools
         // (`update_plan`, `record_decision`) from the next request's tool
@@ -642,7 +646,9 @@ impl crate::Agent {
         // avoid a second full tree walk when verify already took one.
 
         // Owned per-turn bag — Model/Tools/Steer/Verify project from this.
+        self.messages.take_recovery_request();
         let mut turn = super::state::TurnState {
+            enrichment_attempted: false,
             phase_latencies: crate::TurnPhaseLatencies::default(),
             user_prompt_tokens,
             turn_ledger_revision,
@@ -658,19 +664,6 @@ impl crate::Agent {
             expected_mutation,
             requested_validation,
             turn_input: input.to_string(),
-            native_director: self.initialize_native_director_v2(
-                &turn_input,
-                context_generation_seen,
-                turn_ledger_revision,
-                super::native_director::DirectorTurnRequirements {
-                    plan: planning_turn || plan_drive_turn,
-                    goal: goal_drive_turn,
-                    reminder: self.goals.plan_incomplete(),
-                    forced_tool: flags.force_tools_next,
-                    verify_before_yield: (expected_mutation || requested_validation)
-                        && verifier.is_on(),
-                },
-            ),
             turn_checkpoint_allowed,
             turn_checkpoint_created,
             verifier,
@@ -711,6 +704,7 @@ impl crate::Agent {
             deepseek_strict_fallback_active: false,
             deepseek_strict_fallback_used: false,
             retry_state,
+            pending_provider_error: None,
             request_max_tokens_override,
             compat_fallbacks,
             effective_fallback_route,
@@ -744,6 +738,7 @@ impl crate::Agent {
             .map(|budget| std::time::Instant::now() + budget);
         let deadline_expired =
             || turn_deadline_at.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        let settlement_result: Result<TurnOutcome> = async {
         'turn: loop {
             // Stop *starting* new work once the budget is spent; work already
             // in flight is never interrupted. Falling through to Settle means
@@ -768,7 +763,7 @@ impl crate::Agent {
             }
             // Inner loop: Model → Tools → Steer until tools stop or an explicit
             // model/tool cap fires.
-            let hit_cap = loop {
+            let loop_decision = loop {
                 // Checked per round, not just per outer iteration: a model that
                 // keeps calling tools never returns to the outer loop, so an
                 // outer-only check let a turn run to the external kill without
@@ -791,7 +786,7 @@ impl crate::Agent {
                     if turn.steps == 0 {
                         break 'turn;
                     }
-                    break false;
+                    break super::ModelLoopDecision::Verify;
                 }
                 if self
                     .turn_cancellation
@@ -818,14 +813,17 @@ impl crate::Agent {
                 // `run_model_round`. Keep cancellation cleanup on the same
                 // boundary instead of letting it truncate with a stale index.
                 self.workspace.set_message_start(turn.turn_start);
-                match model_result? {
+                let model_control = match model_result {
+                    Err(error) if turn.flags.made_tool_call
+                        && hi_ai::provider_error_details(&error).is_some() => {
+                        self.retain_terminal_provider_error(error, &mut turn, ui).await?;
+                        break super::ModelLoopDecision::VerifyAfterRecoveryExhaustion;
+                    }
+                    result => result?,
+                };
+                match model_control {
                     super::model_round::ModelRoundControl::Continue => continue,
-                    super::model_round::ModelRoundControl::BreakInner(hit) => {
-                        if !turn.implementation_tracker.no_mutation_exhausted
-                            && self.native_director_candidate_yield(&mut turn, hit)
-                        {
-                            continue;
-                        }
+                    super::model_round::ModelRoundControl::Finish(hit) => {
                         break hit;
                     }
                     super::model_round::ModelRoundControl::RunTools {
@@ -873,7 +871,14 @@ impl crate::Agent {
                             .tool_batch_ms
                             .saturating_add(tool_started.elapsed().as_millis() as u64);
                         let batch = batch_result?;
-                        self.persist_durable_boundary("tool")?;
+                        if turn.expected_mutation
+                            && turn.implementation_tracker.substantive_edit_seen
+                        {
+                            self.task_recovery.observe_requested_mutation();
+                        }
+                        self.persist_task_recovery_async().await?;
+
+                        self.persist_durable_boundary_async("tool").await?;
                         if batch.program_fallback_exhausted {
                             return Err(anyhow::anyhow!(
                                 "run_program failed after its bounded ordinary-tool fallback"
@@ -901,24 +906,33 @@ impl crate::Agent {
                         );
                         if self.token_budget.take_pending_fresh_window() {
                             let task = self.task.last_task_prompt.clone();
-                            self.apply_fresh_window(ui, task.as_deref())?;
+                            self.apply_fresh_window_async(ui, task.as_deref()).await?;
                             turn.turn_start = self.messages.len().saturating_sub(1);
                             self.workspace.set_message_start(turn.turn_start);
                         }
                         match steer {
                             super::steer::RoundControl::Continue => {}
-                            super::steer::RoundControl::BreakInner(hit) => {
-                                if !turn.implementation_tracker.no_mutation_exhausted
-                                    && self.native_director_candidate_yield(&mut turn, hit)
-                                {
-                                    continue;
-                                }
+                            super::steer::RoundControl::Finish(hit) => {
                                 break hit;
                             }
                         }
                     }
                 }
             };
+            if let super::ModelLoopDecision::Settle(reason) = loop_decision {
+                if reason == crate::TurnStopReason::NoProgress {
+                    self.task_recovery.stop("automatic recovery exhausted");
+                }
+                break 'turn;
+            }
+            if loop_decision == super::ModelLoopDecision::VerifyAfterRecoveryExhaustion {
+                self.reconcile_workspace_changes().await?;
+                if !self.terminal_verification_required(&turn) {
+                    break 'turn;
+                }
+                ui.status("checking retained edits before closing automatic recovery");
+            }
+            let hit_cap = loop_decision == super::ModelLoopDecision::VerifyAtLimit;
             if hit_cap {
                 let limit = match turn.flags.cap_kind {
                     Some(crate::domain::TurnCapKind::Tool) => "tool-call limit",
@@ -936,160 +950,225 @@ impl crate::Agent {
             // from task polling or the child's completion callback.
             self.settle_ready_candidates_at_boundary().await?;
 
-            // TurnPhase::WorkspaceRepair — compile/lint/test stages; not review repair.
-            // The state machine lives in WorkspaceRepairVerifier; this loop reacts.
-            self.set_turn_phase(TurnPhase::WorkspaceRepair);
-            ui.semantic_event(hi_events::RunEvent::new(
-                hi_events::EventKind::VerificationStarted,
-                hi_events::EventContext::default(),
-                hi_events::SemanticActivity {
-                    verb: hi_events::ActivityVerb::Verify,
-                    object: hi_events::ActivityObject::Verification,
-                    state: hi_events::ActivityState::Running,
-                    group_key: format!("verification:turn:{}", self.turn_count),
-                    title: "verification started".into(),
-                    detail: None,
-                    refs: Vec::new(),
-                    progress: None,
-                },
-            ));
-            let verify_started = std::time::Instant::now();
-            let outcome_result = self
-                .run_workspace_repair_verification(
-                    &mut turn.verifier,
-                    &turn.turn_background_baseline,
-                    &mut turn.turn_snapshot,
-                    turn.turn_checkpoint_created,
-                    turn.turn_ledger_revision,
-                    &turn.fast_feedback,
-                    ui,
-                )
-                .await;
-            turn.phase_latencies.verify_ms = turn
-                .phase_latencies
-                .verify_ms
-                .saturating_add(verify_started.elapsed().as_millis() as u64);
-            let outcome = outcome_result?;
-            let (verification_state, verification_verb) = match &outcome {
-                crate::verify::VerifyOutcome::Passed
-                | crate::verify::VerifyOutcome::SkippedNoChanges { .. }
-                | crate::verify::VerifyOutcome::SkippedProseOnly { .. } => (
-                    hi_events::ActivityState::Succeeded,
-                    hi_events::ActivityVerb::Complete,
-                ),
-                crate::verify::VerifyOutcome::Failed { .. }
-                | crate::verify::VerifyOutcome::InfrastructureError { .. } => (
-                    hi_events::ActivityState::Failed,
-                    hi_events::ActivityVerb::Fail,
-                ),
-                crate::verify::VerifyOutcome::Unstable { .. } => (
-                    hi_events::ActivityState::Waiting,
-                    hi_events::ActivityVerb::Wait,
-                ),
-                crate::verify::VerifyOutcome::DeferredActiveWriter { .. }
-                | crate::verify::VerifyOutcome::NotRun => (
-                    hi_events::ActivityState::Waiting,
-                    hi_events::ActivityVerb::Wait,
-                ),
-            };
-            ui.semantic_event(hi_events::RunEvent::new(
-                hi_events::EventKind::VerificationCompleted,
-                hi_events::EventContext::default(),
-                hi_events::SemanticActivity {
-                    verb: verification_verb,
-                    object: hi_events::ActivityObject::Verification,
-                    state: verification_state,
-                    group_key: format!("verification:turn:{}", self.turn_count),
-                    title: "verification finished".into(),
-                    detail: None,
-                    refs: Vec::new(),
-                    progress: None,
-                },
-            ));
-            // Retain turn evidence immediately, not only in the common finalizer:
-            // reconciliation or persistence can still fail after a successful
-            // check, and reports for those error turns need the stages that
-            // actually ran.
-            self.report
-                .last_turn_telemetry
-                .replace_verification_diagnostics(
-                    turn.verifier.executions(),
-                    turn.verifier.executions_dropped(),
-                    turn.verifier.execution_count(),
-                    turn.verifier.successful_test_stage(),
-                );
-            match self
-                .handle_workspace_repair_outcome(
-                    outcome,
-                    &mut turn.verifier,
-                    turn.turn_ledger_revision,
-                    turn.expected_mutation,
-                    &turn.context_task,
-                    turn.repository_context_enabled,
-                    &mut super::verify_outcome::VerifyOutcomeState {
-                        obligation_nudge_fired: &mut turn.flags.obligation_nudge_fired,
-                        force_tools_next: &mut turn.flags.force_tools_next,
-                        independent_review_status: &mut turn.independent_review_status,
-                        independent_review_repairs: &mut turn.independent_review_repairs,
-                        last_hygiene_repair_revision: &mut turn.last_hygiene_repair_revision,
-                        last_completion_review_repair_revision: &mut turn
-                            .last_completion_review_repair_revision,
-                        last_verify_failure_repair: &mut turn.last_verify_failure_repair,
-                        review_unavailable_reason: &mut turn.review_unavailable_reason,
-                        verification_infrastructure_error: &mut turn
-                            .verification_infrastructure_error,
-                        verification_deferred_active_writer: &mut turn
-                            .verification_deferred_active_writer,
-                        verification_unstable: &mut turn.verification_unstable,
-                        last_verify_attributions: &mut turn.last_verify_attributions,
-                        validation_after_last_mutation: turn
-                            .implementation_tracker
-                            .validation_after_last_mutation,
-                        ranked_context_paths: &mut turn.ranked_context_paths,
-                        context_generation_seen: &mut turn.context_generation_seen,
-                        indexed_ledger_revision: &mut turn.indexed_ledger_revision,
+            let mut revalidating_enrichment = false;
+            let mut preserved_review_at = None;
+            loop {
+                // TurnPhase::WorkspaceRepair — compile/lint/test stages; not review repair.
+                // The state machine lives in WorkspaceRepairVerifier; this loop reacts.
+                self.set_turn_phase(TurnPhase::WorkspaceRepair);
+                ui.semantic_event(hi_events::RunEvent::new(
+                    hi_events::EventKind::VerificationStarted,
+                    hi_events::EventContext::default(),
+                    hi_events::SemanticActivity {
+                        verb: hi_events::ActivityVerb::Verify,
+                        object: hi_events::ActivityObject::Verification,
+                        state: hi_events::ActivityState::Running,
+                        group_key: format!("verification:turn:{}", self.turn_count),
+                        title: "verification started".into(),
+                        detail: None,
+                        refs: Vec::new(),
+                        progress: None,
                     },
-                    ui,
-                )
-                .await?
-            {
-                super::verify_outcome::VerifyOutcomeControl::BreakTurn => break 'turn,
-                // The repair loop is the classic budget sink: a check that
-                // keeps failing re-enters the model until something external
-                // kills the process. Honor the deadline here too, so a turn
-                // that ran out of time still settles on its own terms.
-                super::verify_outcome::VerifyOutcomeControl::ReenterModel => {
-                    if turn.flags.provider_exhausted {
-                        ui.status(
+                ));
+                let verify_started = std::time::Instant::now();
+                let outcome_result = self
+                    .run_workspace_repair_verification(
+                        &mut turn.verifier,
+                        &turn.turn_background_baseline,
+                        &mut turn.turn_snapshot,
+                        turn.turn_checkpoint_created,
+                        turn.turn_ledger_revision,
+                        &turn.fast_feedback,
+                        if self.task_recovery.exhausted
+                            && (turn.implementation_tracker.validation_seen
+                                || turn.pending_provider_error.is_some())
+                        {
+                            crate::verify::VerificationAdmission::CurrentRevision
+                        } else {
+                            crate::verify::VerificationAdmission::ChangedWorkspace
+                        },
+                        ui,
+                    )
+                    .await;
+                turn.phase_latencies.verify_ms = turn
+                    .phase_latencies
+                    .verify_ms
+                    .saturating_add(verify_started.elapsed().as_millis() as u64);
+                let outcome = outcome_result?;
+                if let Some(reviewed_input) = &preserved_review_at
+                    && &self.runtime.ledger().workspace_revision() != reviewed_input
+                {
+                    turn.independent_review_status = ReviewStatus::Unavailable;
+                    turn.review_unavailable_reason = Some(
+                        "workspace inputs changed after task-review preservation and before final verification".into(),
+                    );
+                }
+                let (verification_state, verification_verb) = match &outcome {
+                    crate::verify::VerifyOutcome::Passed { .. }
+                    | crate::verify::VerifyOutcome::SkippedNoChanges { .. }
+                    | crate::verify::VerifyOutcome::SkippedProseOnly { .. } => (
+                        hi_events::ActivityState::Succeeded,
+                        hi_events::ActivityVerb::Complete,
+                    ),
+                    crate::verify::VerifyOutcome::Failed { .. }
+                    | crate::verify::VerifyOutcome::InfrastructureError { .. } => (
+                        hi_events::ActivityState::Failed,
+                        hi_events::ActivityVerb::Fail,
+                    ),
+                    crate::verify::VerifyOutcome::Unstable { .. } => (
+                        hi_events::ActivityState::Waiting,
+                        hi_events::ActivityVerb::Wait,
+                    ),
+                    crate::verify::VerifyOutcome::DeferredActiveWriter { .. }
+                    | crate::verify::VerifyOutcome::NotRun => (
+                        hi_events::ActivityState::Waiting,
+                        hi_events::ActivityVerb::Wait,
+                    ),
+                };
+                ui.semantic_event(hi_events::RunEvent::new(
+                    hi_events::EventKind::VerificationCompleted,
+                    hi_events::EventContext::default(),
+                    hi_events::SemanticActivity {
+                        verb: verification_verb,
+                        object: hi_events::ActivityObject::Verification,
+                        state: verification_state,
+                        group_key: format!("verification:turn:{}", self.turn_count),
+                        title: "verification finished".into(),
+                        detail: None,
+                        refs: Vec::new(),
+                        progress: None,
+                    },
+                ));
+                // Retain turn evidence immediately, not only in the common finalizer:
+                // reconciliation or persistence can still fail after a successful
+                // check, and reports for those error turns need the stages that
+                // actually ran.
+                self.report
+                    .last_turn_telemetry
+                    .replace_verification_diagnostics(
+                        turn.verifier.executions(),
+                        turn.verifier.executions_dropped(),
+                        turn.verifier.execution_count(),
+                        turn.verifier.successful_test_stage(),
+                    );
+                if self.task_recovery.exhausted {
+                    self.record_terminal_verification(outcome, &mut turn, ui);
+                    self.persist_task_recovery_async().await?;
+                    break 'turn;
+                }
+                // Review task changes before automatic maintenance adds its
+                // own artifacts. Revalidation after that maintenance proves the
+                // final inputs without reopening model-directed review.
+                if revalidating_enrichment
+                    && let crate::verify::VerifyOutcome::Passed { revision, digest } = &outcome
+                {
+                    self.report.verify = VerifyEvidence::pass(*revision, digest.clone());
+                    self.runtime
+                        .ledger()
+                        .retain_verification_baseline(*revision);
+                    ui.status("✓ verification passed for the final workspace revision");
+                    break 'turn;
+                }
+                let enrichment_check_incomplete = revalidating_enrichment;
+                match self
+                    .handle_workspace_repair_outcome(
+                        outcome,
+                        &mut turn.verifier,
+                        turn.turn_ledger_revision,
+                        turn.expected_mutation,
+                        &turn.context_task,
+                        turn.repository_context_enabled,
+                        &mut super::verify_outcome::VerifyOutcomeState {
+                            obligation_nudge_fired: &mut turn.flags.obligation_nudge_fired,
+                            force_tools_next: &mut turn.flags.force_tools_next,
+                            independent_review_status: &mut turn.independent_review_status,
+                            independent_review_repairs: &mut turn.independent_review_repairs,
+                            last_hygiene_repair_revision: &mut turn.last_hygiene_repair_revision,
+                            last_completion_review_repair_revision: &mut turn
+                                .last_completion_review_repair_revision,
+                            last_verify_failure_repair: &mut turn.last_verify_failure_repair,
+                            review_unavailable_reason: &mut turn.review_unavailable_reason,
+                            verification_infrastructure_error: &mut turn
+                                .verification_infrastructure_error,
+                            verification_deferred_active_writer: &mut turn
+                                .verification_deferred_active_writer,
+                            verification_unstable: &mut turn.verification_unstable,
+                            last_verify_attributions: &mut turn.last_verify_attributions,
+                            validation_after_last_mutation: turn
+                                .implementation_tracker
+                                .validation_after_last_mutation,
+                            ranked_context_paths: &mut turn.ranked_context_paths,
+                            context_generation_seen: &mut turn.context_generation_seen,
+                            indexed_ledger_revision: &mut turn.indexed_ledger_revision,
+                        },
+                        ui,
+                    )
+                    .await?
+                {
+                    super::verify_outcome::VerifyOutcomeControl::BreakTurn => {
+                        if !turn.enrichment_attempted
+                            && let Some((revision, digest)) =
+                                self.report.verify.bound_revision_digest()
+                        {
+                            turn.enrichment_attempted = true;
+                            let enrichment = self
+                                .enrich_verified_turn(&mut turn, revision, digest, ui)
+                                .await?;
+                            preserved_review_at = enrichment.preserved_review_at;
+                            if enrichment.inputs_changed {
+                                revalidating_enrichment = true;
+                                continue;
+                            }
+                        }
+                        break 'turn;
+                    }
+                    // The repair loop is the classic budget sink: a check that
+                    // keeps failing re-enters the model until something external
+                    // kills the process. Honor the deadline here too, so a turn
+                    // that ran out of time still settles on its own terms.
+                    super::verify_outcome::VerifyOutcomeControl::ReenterModel => {
+                        if enrichment_check_incomplete {
+                            ui.status("post-enrichment verification did not settle; finishing without another model request");
+                            break 'turn;
+                        }
+                        if turn.flags.provider_exhausted {
+                            ui.status(
                             "provider protocol recovery budget exhausted; settling without another model request",
                         );
-                        break 'turn;
-                    }
-                    if turn.flags.ended_at_cap {
-                        let limit = match turn.flags.cap_kind {
-                            Some(crate::domain::TurnCapKind::Tool) => "tool-call limit",
-                            Some(crate::domain::TurnCapKind::Both) => "step and tool-call limits",
-                            _ => "step limit",
-                        };
-                        ui.status(&format!(
+                            break 'turn;
+                        }
+                        if turn.flags.ended_at_cap {
+                            let limit = match turn.flags.cap_kind {
+                                Some(crate::domain::TurnCapKind::Tool) => "tool-call limit",
+                                Some(crate::domain::TurnCapKind::Both) => {
+                                    "step and tool-call limits"
+                                }
+                                _ => "step limit",
+                            };
+                            ui.status(&format!(
                             "verification still needs repair, but the {limit} is spent; settling the current workspace"
                         ));
-                        break 'turn;
-                    }
-                    if deadline_expired() {
-                        ui.status(
+                            break 'turn;
+                        }
+                        if deadline_expired() {
+                            ui.status(
                             "wall-clock budget spent during repair; finishing with the current state",
                         );
-                        turn.flags.ended_at_deadline = true;
-                        break 'turn;
+                            turn.flags.ended_at_deadline = true;
+                            break 'turn;
+                        }
+                        continue 'turn;
                     }
-                    continue 'turn;
                 }
             }
         }
 
         // TurnPhase::Settle — seal checkpoint, then keep/wipe green verify.
         self.set_turn_phase(TurnPhase::Settle);
+        if let Some(cancellation) = self.turn_cancellation.as_ref() {
+            cancellation.begin_settlement();
+        }
+
         // Seal first: checkpoint creation may take long enough for an owned
         // process or editor to move the tree. The authoritative reconciliation
         // below therefore happens after this final asynchronous safety step.
@@ -1108,29 +1187,19 @@ impl crate::Agent {
         // shell/delegate/background changes that did not flow through a file
         // mutation tool. Its revision is content-based and workspace-local.
         self.reconcile_workspace_changes().await?;
-        let (final_ledger_revision, final_workspace_revision, ledger_changes) = {
+        let (final_workspace_revision, ledger_changes) = {
             let mut ledger = self.runtime.ledger();
             (
-                ledger.revision(),
                 ledger.workspace_revision(),
                 ledger.changes_since(turn.turn_ledger_revision),
             )
         };
         {
-            let delta = {
-                let ledger = self.runtime.ledger();
-                match self.report.verify.bound_revision_digest() {
-                    Some((revision, _)) => ledger.changes_since(revision),
-                    None => ledger_changes.clone(),
-                }
-            };
             let review_was_passed = turn.independent_review_status == ReviewStatus::Passed;
             super::settlement::reconcile_verified_revision(
                 &mut self.report.verify,
                 &mut turn.independent_review_status,
-                final_ledger_revision,
                 final_workspace_revision.clone(),
-                &delta,
                 ui,
             );
             if review_was_passed && turn.independent_review_status == ReviewStatus::Unavailable {
@@ -1223,23 +1292,6 @@ impl crate::Agent {
             turn.advertised_tool_names.iter().cloned().collect();
         self.report.last_turn_telemetry.tool_schema_tokens = turn.tool_schema_tokens;
 
-        // Verifier-gated skill auto-curation: after a turn that PASSED verification
-        // and actually changed files, optionally distill a reusable technique into a
-        // learned skill. The ground-truth turn.verifier is the gate (safe with weak local
-        // models); opt-in via `curate_skills`.
-        if self.config.memory.curate_skills
-            && self.report.verify.passed()
-            && !self.workspace.last_changed_files.is_empty()
-        {
-            self.curate_turn_end(turn.turn_start, ui).await;
-        }
-
-        // Phase K: always-on (cheap, no model call) coding-fact extraction into
-        // the decision log + project memory after a green file-changing turn.
-        if self.report.verify.passed() && !self.workspace.last_changed_files.is_empty() {
-            self.record_coding_facts_turn_end(ui).await;
-        }
-
         // Surface the files this turn changed, so the user sees what was touched
         // without needing /diff. Skipped for read-only/Q&A turns (empty list).
         // Emitted BEFORE the finalize recap so the recap is the last text the
@@ -1248,93 +1300,26 @@ impl crate::Agent {
             ui.changed_files(&self.workspace.last_changed_files);
         }
 
-        // TurnPhase::Finalize — only generate a recap when the turn did not
-        // already produce a visible assistant answer. A recap after every
-        // mutating turn is an unnecessary second provider request; it can
-        // consume the next scripted/provider response, add latency after the
-        // real work is finished, and make a completed turn look unfinished.
+        self.disarm_btw_dispatcher();
         self.set_turn_phase(TurnPhase::Finalize);
-        let finalize_started = std::time::Instant::now();
-        let no_mutation_exhausted = turn.implementation_tracker.no_mutation_exhausted;
-        // Interim diagnosis/narration is not a successful closeout when an
-        // explicit mutation obligation exhausted without an edit. Force the
-        // deterministic terminal explanation even if earlier assistant prose
-        // is present in the transcript.
-        let needs_closeout = no_mutation_exhausted
-            || !super::finalize::turn_has_visible_assistant_text(
-                self.messages.as_slice(),
-                turn.turn_start,
-            );
-        let bounded_plan_answer_recovery_exhausted =
-            turn.progress_tracker.bounded_plan_answer_recovery_exhausted;
-        let mut closeout_generated = false;
-        let optional_finalize_requested = self.config.memory.finalize
-            && turn.flags.made_tool_call
-            && !turn.flags.ended_at_deadline
-            && !no_mutation_exhausted
-            && needs_closeout;
-        if optional_finalize_requested || bounded_plan_answer_recovery_exhausted {
-            // Side questions may still be streaming — wait so their UI/usage land
-            // before we close the turn, then disarm so idle `/btw` can't fire.
-            self.join_btw_jobs(ui).await;
-            self.disarm_btw_dispatcher();
-        }
-        if optional_finalize_requested && !bounded_plan_answer_recovery_exhausted {
-            closeout_generated = self.finalize_turn(turn.turn_start, ui).await;
-            // finalize_turn appended a [user: finalize-nudge][assistant: recap]
-            // pair. Strip it from the persisted transcript so the FINALIZE_PROMPT
-            // ("don't take any further action") doesn't bleed into the next turn
-            // and make the model emit summary text instead of executing the new
-            // prompt. The recap was already shown to the user via the UI.
-            self.messages.strip_finalize_pair();
-        }
-        if needs_closeout && !closeout_generated {
-            // A provider recap is optional; a user-facing terminal state is not.
-            // Private answer-repair markers must never suppress this fallback
-            // and leave the frontend looking stuck.
-            self.emit_deterministic_closeout(ui);
-        }
-        // A circuit-breaker closeout with no landed workspace progress is a
-        // typed no-progress failure, not a successful answer. This is keyed on
-        // the semantic tracker and the absence of a model/user-visible answer;
-        // lexical guesses about the requested task do not manufacture it.
-        let no_progress_exhausted = no_mutation_exhausted
-            || bounded_plan_answer_recovery_exhausted
-            || (needs_closeout
-                && !closeout_generated
-                && turn.progress_tracker.no_progress_streak > 0);
-        turn.phase_latencies.finalize_ms = turn
-            .phase_latencies
-            .finalize_ms
-            .saturating_add(finalize_started.elapsed().as_millis() as u64);
 
         // Tool-free curation/finalization calls and external editors can take
         // time after the first final reconciliation. Reconcile once more before
         // any long-horizon progress or typed outcome is committed.
         self.reconcile_workspace_changes().await?;
-        let (settled_revision, settled_digest, settled_changes) = {
+        let (settled_digest, settled_changes) = {
             let mut ledger = self.runtime.ledger();
             (
-                ledger.revision(),
                 ledger.workspace_revision(),
                 ledger.changes_since(turn.turn_ledger_revision),
             )
         };
         {
-            let delta = {
-                let ledger = self.runtime.ledger();
-                match self.report.verify.bound_revision_digest() {
-                    Some((revision, _)) => ledger.changes_since(revision),
-                    None => settled_changes.clone(),
-                }
-            };
             let review_was_passed = turn.independent_review_status == ReviewStatus::Passed;
             super::settlement::reconcile_verified_revision(
                 &mut self.report.verify,
                 &mut turn.independent_review_status,
-                settled_revision,
                 settled_digest.clone(),
-                &delta,
                 ui,
             );
             if review_was_passed && turn.independent_review_status == ReviewStatus::Unavailable {
@@ -1351,12 +1336,26 @@ impl crate::Agent {
             .collect();
         self.workspace.last_file_changes = settled_changes;
 
+        // A pass in another scope cannot advance a goal past an unresolved
+        // failure. Changed input makes that obligation unverified, not resolved.
+        if let Some(problem) = self
+            .task_recovery
+            .unresolved_validation_status(&settled_digest)
+        {
+            self.report.verify = if problem == crate::recovery::ValidationResult::Failed {
+                crate::domain::VerifyEvidence::fail()
+            } else {
+                crate::domain::VerifyEvidence::none()
+            };
+        }
+
         // Long-horizon progress happens only after the final settled revision
         // still matches deterministic verification.
         // Keep the pre-turn goal until every user/session callback has
         // finished. A late workspace mutation must also roll back progress
         // that this hook tentatively advances.
         let goal_before_final_settlement = turn.goal_before.clone();
+        self.report.provisional_goal_baseline = Some(turn.goal_before.clone());
         let goal_invalidated_verification = self
             .goal_turn_end(
                 super::super::goal_turn::GoalTurnState {
@@ -1420,7 +1419,7 @@ impl crate::Agent {
                  {report}\n`/goal budget <n>` to reset it, or `/goal budget off` to remove it; then `/goal resume`."
             ));
             self.refresh_system_message();
-            self.persist_goal(ui);
+            self.persist_goal_async(ui).await;
         }
 
         // Report the user-prompt estimate and all turn-local model output; full request
@@ -1432,7 +1431,7 @@ impl crate::Agent {
         // can leave a nudge as the last entry; removing it here gives the next
         // turn a clean transcript.
         self.messages.strip_trailing_nudges();
-        self.persist()?;
+        self.persist_async().await?;
 
         // `goal_turn_end`, `Ui::turn_end`, and a session sink are extension
         // points outside the turn.verifier. Reconcile after all of them and before
@@ -1440,33 +1439,19 @@ impl crate::Agent {
         // revision pass. There are deliberately no callbacks after this
         // settlement point.
         self.reconcile_workspace_changes().await?;
-        let (outcome_revision, outcome_digest) = {
-            let mut ledger = self.runtime.ledger();
-            (ledger.revision(), ledger.workspace_revision())
-        };
+        let outcome_digest = self.runtime.ledger().workspace_revision();
         let changed_after_final_hooks = self.report.verify.passed()
             && self
                 .report
                 .verify
                 .bound_revision_digest()
-                .is_none_or(|(revision, digest)| {
-                    revision != outcome_revision || digest != outcome_digest
-                });
+                .is_none_or(|(_, digest)| digest != outcome_digest);
         if changed_after_final_hooks {
-            let delta = {
-                let ledger = self.runtime.ledger();
-                match self.report.verify.bound_revision_digest() {
-                    Some((revision, _)) => ledger.changes_since(revision),
-                    None => ledger.changes_since(turn.turn_ledger_revision),
-                }
-            };
             let review_was_passed = turn.independent_review_status == ReviewStatus::Passed;
             let wiped = super::settlement::reconcile_verified_revision_with_message(
                 &mut self.report.verify,
                 &mut turn.independent_review_status,
-                outcome_revision,
                 outcome_digest.clone(),
-                &delta,
                 ui,
                 "workspace changed during turn finalization; the previous pass and goal progress were invalidated",
             );
@@ -1486,10 +1471,9 @@ impl crate::Agent {
                     // The earlier persist may contain tentatively advanced goal
                     // state. Rewrite the goal record itself (message persistence
                     // does not include side-channel goal state) before returning.
-                    if let Some(session) = self.session.as_mut()
-                        && let Some(goal) = self.goals.structured.as_ref()
-                    {
-                        session.record_goal(goal)?;
+                    if let Some(goal) = self.goals.structured.clone() {
+                        self.write_session(move |sink| sink.record_goal(&goal))
+                            .await?;
                     }
                 }
                 // Capture any additional effects of the invalidation notification
@@ -1573,11 +1557,11 @@ impl crate::Agent {
             && !turn_had_mutation;
         let classification_ended_at_cap =
             turn.flags.ended_at_cap && !accepted_read_only_cap_wrap_up;
-        let (mut status, verification, review, mut classified_stop_reason) =
+        let (mut status, mut verification, review, mut classified_stop_reason) =
             super::finalize::classify_turn_outcome(
                 turn.verification_infrastructure_error,
                 turn.verification_unstable,
-                self.report.verify.as_bool(),
+                &self.report.verify,
                 &self.workspace.last_changed_files,
                 turn_had_mutation,
                 no_applicable_check,
@@ -1587,6 +1571,25 @@ impl crate::Agent {
                 turn.flags.ended_at_deadline,
                 self.config.gates.allow_unverified,
             );
+        if let Some(problem) = self
+            .task_recovery
+            .unresolved_validation_status(&self.runtime.ledger().workspace_revision())
+        {
+            status = TurnStatus::Failed;
+            if problem == crate::recovery::ValidationResult::Failed {
+                verification = VerificationStatus::Failed;
+                classified_stop_reason = TurnStopReason::VerificationFailed;
+                self.report.verify = crate::domain::VerifyEvidence::fail();
+            } else {
+                verification = VerificationStatus::Unverified;
+                classified_stop_reason = TurnStopReason::VerificationUnavailable;
+                self.report.verify = crate::domain::VerifyEvidence::none();
+            }
+        }
+        let no_progress_exhausted = self.task_recovery.exhausted
+            || turn.implementation_tracker.no_mutation_exhausted
+            || turn.progress_tracker.bounded_plan_answer_recovery_exhausted
+            || (!self.answer_state.is_terminal() && turn.progress_tracker.no_progress_streak > 0);
         if turn.flags.provider_exhausted {
             // Tool results and workspace reconciliation remain valid, but an
             // exhausted provider recovery budget is an infrastructure failure,
@@ -1595,14 +1598,7 @@ impl crate::Agent {
             // the same unavailable provider indefinitely.
             status = TurnStatus::Failed;
             classified_stop_reason = TurnStopReason::InfrastructureFailure;
-        } else if no_progress_exhausted
-            && self.workspace.last_changed_files.is_empty()
-            && status == TurnStatus::Completed
-            && matches!(
-                classified_stop_reason,
-                TurnStopReason::Completed | TurnStopReason::NoApplicableVerification
-            )
-        {
+        } else if no_progress_exhausted {
             status = TurnStatus::Failed;
             classified_stop_reason = TurnStopReason::NoProgress;
         }
@@ -1643,11 +1639,18 @@ impl crate::Agent {
             plan_leftover: self.goals.plan_leftover_work(),
         };
         self.report.set_outcome(outcome.clone());
+        self.report.terminal_input_digest = Some(self.runtime.ledger().workspace_revision());
+        self.persist_task_recovery_async().await?;
+        if !self.answer_state.is_terminal() || outcome.status != TurnStatus::Completed {
+            self.emit_deterministic_closeout(ui);
+        }
+
         // Claude-style suggested next prompt: cheap ChatOnly side call after
         // settlement. Never mutates history/workspace; frontends show ghost text.
         if self.should_suggest_next_prompt(&outcome) {
             self.suggest_next_prompt(turn.turn_start, ui).await;
         }
+        self.maybe_requeue_goal_second_pass_async().await?;
         // Cancellation can arrive during late settlement (for example while a
         // best-effort suggestion call is in flight). Do not clear the rollback
         // baselines and return a normal outcome merely because the main
@@ -1660,20 +1663,9 @@ impl crate::Agent {
         {
             return Err(TurnCancellationRequested.into());
         }
-        // The cancellation check above is the commit boundary for diagnostics:
-        // do not durably publish a normal outcome (or synchronize it remotely)
-        // while a cancellable late suggestion is still in flight. Everything
-        // below is synchronous, so the body returns without another await and
-        // a later cancellation belongs to the next outer scheduling point.
-        if let Some(session) = self.session.as_mut() {
-            let _ = session.record_turn_outcome(
-                &outcome,
-                self.report
-                    .last_turn_telemetry
-                    .review_unavailable_reason
-                    .as_deref(),
-            );
-        }
+        // The final cancellation check commits the body's outcome. Entry owns
+        // the awaitable diagnostic append after this future returns, so a
+        // cancellation during publication cannot append a conflicting receipt.
         // Automatic post-mortem intake: bad outcomes become findings-ledger
         // records so `hi metrics` surfaces failure patterns without anyone
         // spelunking raw transcripts. Best-effort by design.
@@ -1682,37 +1674,42 @@ impl crate::Agent {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            crate::learning::append_finding(
-                self.runtime.state_root(),
-                &crate::learning::Finding {
-                    ts,
-                    session_id: self.session.as_deref().and_then(crate::SessionSink::id),
-                    turn: Some(self.turn_count),
-                    status: outcome.status,
-                    stop_reason: outcome.stop_reason,
-                    verification: outcome.verification,
-                    review: outcome.review,
-                    review_unavailable_reason: self
-                        .report
-                        .last_turn_telemetry
-                        .review_unavailable_reason
-                        .clone(),
-                    last_no_progress_reason: self
-                        .report
-                        .last_turn_telemetry
-                        .last_no_progress_reason
-                        .clone(),
-                    changed_files: outcome.changed_files.len(),
-                    model: outcome.effective_route.model.clone(),
-                    hint_active: self.task.active_hint_shape.clone(),
-                    failure_shape: crate::learning::tool_failure_shape(
-                        &self.report.last_turn_telemetry.tool_timeline,
-                    ),
-                },
-            );
+            let state_root = self.runtime.state_root().to_path_buf();
+            let finding = crate::learning::Finding {
+                ts,
+                session_id: self.session.as_deref().and_then(crate::SessionSink::id),
+                turn: Some(self.turn_count),
+                status: outcome.status,
+                stop_reason: outcome.stop_reason,
+                verification: outcome.verification,
+                review: outcome.review,
+                review_unavailable_reason: self
+                    .report
+                    .last_turn_telemetry
+                    .review_unavailable_reason
+                    .clone(),
+                last_no_progress_reason: self
+                    .report
+                    .last_turn_telemetry
+                    .last_no_progress_reason
+                    .clone(),
+                changed_files: outcome.changed_files.len(),
+                model: outcome.effective_route.model.clone(),
+                hint_active: self.task.active_hint_shape.clone(),
+                failure_shape: crate::learning::tool_failure_shape(
+                    &self.report.last_turn_telemetry.tool_timeline,
+                ),
+            };
+            tokio::task::spawn_blocking(move || {
+                crate::learning::append_finding(&state_root, &finding);
+            });
         }
         self.workspace.clear_active_baselines();
-        let _ = self.maybe_requeue_goal_second_pass();
         Ok(outcome)
+        }.await;
+        super::terminal_verification::finish_provider_settlement(
+            settlement_result,
+            turn.pending_provider_error.take(),
+        )
     }
 }

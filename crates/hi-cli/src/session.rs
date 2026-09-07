@@ -2,7 +2,6 @@
 //!
 //! Sessions live under `$XDG_DATA_HOME/hi/sessions` (or `~/.local/share/...`).
 //! Resuming loads every line back as conversation history.
-use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -15,15 +14,10 @@ use serde::{Deserialize, Serialize};
 
 #[path = "session_scan.rs"]
 mod session_scan;
-#[path = "session_shadow.rs"]
-pub(crate) mod session_shadow;
 #[path = "session_workspace_execution.rs"]
 mod session_workspace_execution;
-#[path = "session_workspace_replay.rs"]
-mod session_workspace_replay;
 use session_scan::session_line_count;
 pub(crate) use session_scan::{resume_summary, session_snapshot_reader};
-use session_workspace_replay::WorkspaceExecutionReplay;
 
 #[cfg(test)]
 #[path = "session_append_tests.rs"]
@@ -32,6 +26,11 @@ mod append_tests;
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SessionMeta {
+    /// Explicit cache boundary carrying pending operation evidence and reducer
+    /// compatibility state. Ordinary JSONL appends retain their legacy format.
+    ReducerSnapshot {
+        snapshot: hi_agent::SessionReducerSnapshot,
+    },
     /// Canonical IPOP identity for a locally cached continuation of a remote
     /// session. The local filename remains an implementation detail; all
     /// future sync and PipeFS operations must keep using this identifier.
@@ -87,6 +86,9 @@ enum SessionMeta {
     },
     /// The long-horizon goal was explicitly cleared. Last write wins.
     GoalCleared,
+    TaskRecovery {
+        state: hi_agent::TaskRecoveryState,
+    },
     /// The intra-session decision log. Last write wins.
     Decisions {
         decisions: Vec<hi_agent::Decision>,
@@ -149,6 +151,12 @@ enum SessionMeta {
         /// `default` keeps older JSONL lines loadable.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         review_same_model: bool,
+        /// Goal completion credit and its receipt form one replay event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_recovery: Option<hi_agent::TaskRecoveryState>,
+        /// The final verified goal state replaces conservative turn snapshots.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settled_goal: Option<Box<hi_agent::Goal>>,
     },
     /// An explicit replacement of all retry-relevant state. This keeps
     /// transcript, structured goal, and decisions in sync when a turn is
@@ -313,6 +321,19 @@ impl SessionSink for JsonlSession {
         outcome: &hi_agent::TurnOutcome,
         review_unavailable_reason: Option<&str>,
     ) -> Result<()> {
+        self.record_turn_settlement(outcome, review_unavailable_reason, None, None)
+    }
+
+    fn record_turn_settlement(
+        &mut self,
+        outcome: &hi_agent::TurnOutcome,
+        review_unavailable_reason: Option<&str>,
+        task_recovery: Option<&hi_agent::TaskRecoveryState>,
+        settled_goal: Option<&hi_agent::Goal>,
+    ) -> Result<()> {
+        if let Some(state) = task_recovery {
+            state.validate().map_err(anyhow::Error::msg)?;
+        }
         self.append_meta(&SessionMeta::TurnOutcome {
             ts: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -324,6 +345,8 @@ impl SessionSink for JsonlSession {
             stop_reason: outcome.stop_reason,
             review_unavailable_reason: review_unavailable_reason.map(str::to_string),
             review_same_model: outcome.review_same_model,
+            task_recovery: task_recovery.cloned(),
+            settled_goal: settled_goal.map(|goal| Box::new(goal.clone())),
         })
     }
 
@@ -366,6 +389,15 @@ impl SessionSink for JsonlSession {
         self.append_meta(&SessionMeta::PlanApproval { parked })
     }
 
+    fn record_task_recovery(&mut self, state: &hi_agent::TaskRecoveryState) -> Result<()> {
+        state.validate().map_err(anyhow::Error::msg)?;
+        let mut line = serde_json::to_string(&SessionMeta::TaskRecovery {
+            state: state.clone(),
+        })?;
+        line.push('\n');
+        append_session_records_inner(&self.path, &line, true)
+    }
+
     fn record_goal_drive(&mut self, stall: u32) -> Result<()> {
         self.record_goal_drive_state(stall, false, &[])
     }
@@ -400,6 +432,9 @@ impl SessionSink for JsonlSession {
 }
 #[allow(dead_code)]
 pub struct LoadedSession {
+    /// Only present while a workspace effect lacks a settlement acknowledgement.
+    /// Preserve this source snapshot when moving the session to another cache.
+    pub pending_execution_snapshot: Option<hi_agent::SessionReducerSnapshot>,
     pub messages: Vec<Message>,
     pub(crate) workspace_execution_recovered: bool,
     pub usage: Usage,
@@ -434,6 +469,35 @@ pub struct LoadedSession {
     pub plan_drive_evidence: Vec<String>,
     /// SHA-256 evidence identities already credited in the current goal scope.
     pub goal_drive_evidence: Vec<String>,
+    pub task_recovery: hi_agent::TaskRecoveryState,
+}
+
+impl LoadedSession {
+    /// Both local caches and remote adoption preserve the same pending outbox.
+    pub(crate) fn replacement_records(&self) -> Result<[(&'static str, String); 2]> {
+        self.task_recovery.validate().map_err(anyhow::Error::msg)?;
+        let (record_type, payload) = if let Some(snapshot) = &self.pending_execution_snapshot {
+            (
+                "reducer_snapshot",
+                serde_json::json!({"type":"reducer_snapshot", "snapshot":snapshot}),
+            )
+        } else {
+            (
+                "state_replacement",
+                serde_json::json!({
+                    "type":"state_replacement", "messages":self.messages,
+                    "goal":self.goal, "decisions":self.decisions.entries(), "plan":self.plan,
+                }),
+            )
+        };
+        let recovery = serde_json::to_string(&SessionMeta::TaskRecovery {
+            state: self.task_recovery.clone(),
+        })?;
+        Ok([
+            (record_type, serde_json::to_string(&payload)?),
+            ("task_recovery", recovery),
+        ])
+    }
 }
 
 pub(crate) use crate::session_harness::apply_loaded_session;
@@ -450,12 +514,10 @@ pub fn cache_loaded_session(path: &Path, loaded: &LoadedSession) -> Result<()> {
     let temp = path.with_extension(format!("restoring-{}-{restore_id}", std::process::id()));
     let result = (|| {
         let mut session = JsonlSession::new(temp.clone());
-        session.record_state_replacement(
-            &loaded.messages,
-            loaded.goal.as_ref(),
-            &loaded.decisions,
-            &loaded.plan,
-        )?;
+        for (_, mut payload) in loaded.replacement_records()? {
+            payload.push('\n');
+            session.append(&payload)?;
+        }
         session.record(&[], loaded.usage)?;
         session.record_checkpoints(&loaded.checkpoint_refs)?;
         crate::session_harness::append(&temp, &loaded.harness_settings)?;
@@ -798,6 +860,12 @@ enum GoalSummaryRecord {
         #[serde(default)]
         goal: Option<hi_agent::Goal>,
     },
+    TurnOutcome {
+        #[serde(default)]
+        settled_goal: Option<Box<hi_agent::Goal>>,
+        #[serde(default)]
+        task_recovery: Option<hi_agent::TaskRecoveryState>,
+    },
     #[serde(other)]
     Other,
 }
@@ -829,6 +897,18 @@ pub fn session_goal_summary(path: &Path) -> Option<SessionGoalSummary> {
             Ok(GoalSummaryRecord::Goal { goal: next }) => goal = Some(next),
             Ok(GoalSummaryRecord::GoalCleared) => goal = None,
             Ok(GoalSummaryRecord::StateReplacement { goal: next }) => goal = next,
+            Ok(GoalSummaryRecord::TurnOutcome {
+                settled_goal,
+                task_recovery,
+            }) => {
+                if task_recovery
+                    .as_ref()
+                    .is_none_or(|state| state.validate().is_ok())
+                    && let Some(next) = settled_goal
+                {
+                    goal = Some(*next);
+                }
+            }
             Ok(GoalSummaryRecord::Other) | Err(_) => {}
         }
     }
@@ -998,144 +1078,12 @@ pub fn latest_session() -> Option<PathBuf> {
         })
 }
 
-fn apply_drive_evidence_delta(evidence: &mut BTreeSet<String>, reset: bool, added: Vec<String>) {
-    if reset {
-        evidence.clear();
-    }
-    evidence.extend(added.into_iter().filter(|hash| {
-        hash.len() == 64
-            && hash
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }));
-}
-
-/// Recover the meaning of pre-policy `plan_drive` pause records without
-/// treating every old manual `/plan pause` as interruption-resumable.
-///
-/// Old cancellation cleanup first replaced the transcript with a shorter
-/// snapshot that discarded a synthetic plan-drive prompt, then wrote one or
-/// more paused drive records (usage/checkpoint records could sit between).
-/// That rollback signature is specific enough to migrate the interruption;
-/// an otherwise bare legacy pause retains the historical manual semantics.
-#[derive(Default)]
-struct LegacyPlanPauseMigration {
-    cancellation_candidate: bool,
-    inferred_interruption_chain: bool,
-    /// A missing-policy pause was identified as an interruption latch. Keep
-    /// this separate from `inferred_interruption_chain`: ordinary turn records
-    /// end the adjacent pause-record chain but must not forget that a later
-    /// legacy user turn can consume the inferred latch.
-    inferred_pause_active: bool,
-    /// Whether the first turn-starting user message after the inferred pause
-    /// was real user work rather than a synthetic plan/goal continuation.
-    /// Later user-role nudge messages in the same turn must not overwrite it.
-    pending_real_user_turn: Option<bool>,
-}
-
-impl LegacyPlanPauseMigration {
-    fn note_state_replacement(&mut self, before: &[Message], replacement: &[Message]) {
-        self.cancellation_candidate = replacement.len() < before.len()
-            && before[replacement.len()..].iter().any(|message| {
-                message.role == Role::User && message.text().contains(hi_agent::PLAN_DRIVE_PROMPT)
-            });
-        self.inferred_interruption_chain = false;
-        // A replacement abandons the attempted turn. A subsequent successful
-        // user turn may still consume the older inferred interruption latch.
-        self.pending_real_user_turn = None;
-    }
-
-    fn clear_boundary(&mut self) {
-        self.cancellation_candidate = false;
-        self.inferred_interruption_chain = false;
-    }
-
-    fn invalidate(&mut self) {
-        self.clear_boundary();
-        self.inferred_pause_active = false;
-        self.pending_real_user_turn = None;
-    }
-
-    fn resolve(&mut self, paused: bool, explicit: Option<bool>) -> bool {
-        let inferred = explicit.is_none()
-            && paused
-            && (self.cancellation_candidate || self.inferred_interruption_chain);
-        let resume_on_user_input = explicit.unwrap_or(inferred);
-        self.cancellation_candidate = false;
-        self.inferred_interruption_chain = paused && resume_on_user_input;
-        // Every drive-state record is authoritative. Only an adjacent legacy
-        // chain remains eligible for completed-user-turn migration; an
-        // explicit-policy record or a later unrelated record supersedes it.
-        self.inferred_pause_active = inferred;
-        self.pending_real_user_turn = None;
-        resume_on_user_input
-    }
-
-    fn note_message(&mut self, message: &Message) {
-        self.clear_boundary();
-        if self.inferred_pause_active
-            && self.pending_real_user_turn.is_none()
-            && message.role == Role::User
-        {
-            let text = message.text();
-            // Persisted prompts may have session-context wrappers prepended,
-            // so exact `DriveKind::from_prompt` classification is too narrow
-            // for legacy logs. The synthetic sentinels themselves are unique.
-            let synthetic = text.contains(hi_agent::PLAN_DRIVE_PROMPT)
-                || text.contains(hi_agent::GOAL_CONTINUE_PROMPT);
-            self.pending_real_user_turn = Some(!synthetic);
-        }
-    }
-
-    fn completed_user_turn_consumes_pause(
-        &mut self,
-        status: hi_agent::TurnStatus,
-        stop_reason: hi_agent::TurnStopReason,
-    ) -> bool {
-        let successful = status == hi_agent::TurnStatus::Completed
-            && !matches!(
-                stop_reason,
-                hi_agent::TurnStopReason::Cancelled
-                    | hi_agent::TurnStopReason::TurnLimit
-                    | hi_agent::TurnStopReason::InfrastructureFailure
-                    | hi_agent::TurnStopReason::NoProgress
-            );
-        let consume =
-            self.inferred_pause_active && self.pending_real_user_turn == Some(true) && successful;
-        self.pending_real_user_turn = None;
-        if consume {
-            self.inferred_pause_active = false;
-            self.inferred_interruption_chain = false;
-            self.cancellation_candidate = false;
-        }
-        consume
-    }
-}
-
 /// Load a session's messages back into conversation history.
 pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let mut reader = session_snapshot_reader(path)
         .with_context(|| format!("opening session {}", path.display()))?;
-    let mut reducer_shadow = session_shadow::SessionReducerShadow::new();
-    let mut messages = Vec::new();
-    let mut usage = Usage::default();
-    let mut checkpoint_refs = Vec::new();
+    let mut reducer = hi_agent::SessionReducer::new();
     let mut harness_settings = crate::session_harness::empty_layer();
-    let mut remote_session_id = None;
-    let mut pipefs_enabled = None;
-    let mut loaded_goal: Option<hi_agent::Goal> = None;
-    let mut loaded_decisions = hi_agent::DecisionLog::default();
-    let mut loaded_plan = Vec::new();
-    let mut loaded_name = None;
-    let mut loaded_plan_drive_paused = false;
-    let mut loaded_plan_drive_resume_on_user_input = false;
-    let mut legacy_plan_pause = LegacyPlanPauseMigration::default();
-    let mut loaded_plan_approval_parked = false;
-    let mut loaded_plan_drive_stall = 0;
-    let mut loaded_goal_drive_stall = 0;
-    let mut loaded_plan_drive_evidence = BTreeSet::new();
-    let mut loaded_goal_drive_evidence = BTreeSet::new();
-    let mut workspace_replay = WorkspaceExecutionReplay::default();
     let mut record = Vec::new();
     loop {
         record.clear();
@@ -1146,216 +1094,97 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         {
             break;
         }
-        if record.last() == Some(&b'\n') {
-            record.pop();
-        }
-        if record.last() == Some(&b'\r') {
-            record.pop();
-        }
         let Ok(line) = std::str::from_utf8(&record) else {
-            reducer_shadow.observe_opaque_boundary();
-            legacy_plan_pause.invalidate();
+            reducer.apply_event(hi_agent::SessionEvent::opaque_boundary())?;
             continue;
         };
-        if line.trim().is_empty() {
-            continue;
-        }
-        reducer_shadow.observe_legacy_json(line);
-        if let Some(layer) = crate::session_harness::parse_record(line)? {
-            legacy_plan_pause.clear_boundary();
-            harness_settings = layer;
-            continue;
-        }
-        if let Ok(meta) = serde_json::from_str::<SessionMeta>(line) {
-            match meta {
-                SessionMeta::RemoteSessionIdentity { session_id } => {
-                    crate::sync::validate_session_id(&session_id).with_context(|| {
-                        format!("invalid remote session identity in {}", path.display())
-                    })?;
-                    remote_session_id = Some(session_id);
-                }
-                SessionMeta::PipeFsMode { enabled } => {
-                    pipefs_enabled = Some(enabled);
-                }
-                SessionMeta::Name { name } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_name = (!name.trim().is_empty()).then(|| name.trim().to_string());
-                }
-                SessionMeta::Usage {
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_creation_tokens,
-                    estimated,
-                } => {
-                    usage = Usage {
-                        input_tokens,
-                        output_tokens,
-                        cache_read_tokens,
-                        cache_creation_tokens,
-                        input_includes_cache: false,
-                        context_occupancy: input_tokens,
-                        rate_limits: None,
-                        estimated,
-                    };
-                }
-                SessionMeta::WorkspaceExecutionStaged {
-                    visible_on_resume,
-                    execution,
-                } => workspace_replay.stage(execution, visible_on_resume, messages.len())?,
-                SessionMeta::WorkspaceExecutionSettled { operation_id } => {
-                    workspace_replay.settle(operation_id);
-                }
-                SessionMeta::Checkpoints { refs } => {
-                    checkpoint_refs = refs;
-                }
-                SessionMeta::Compaction {
-                    messages: compacted,
-                } => {
-                    workspace_replay.retire_settled();
-                    legacy_plan_pause.clear_boundary();
-                    // Replace all prior messages with the compacted set.
-                    messages = compacted;
-                }
-                SessionMeta::Goal { goal } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_goal = Some(goal);
-                }
-                SessionMeta::GoalCleared => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_goal = None;
-                    loaded_goal_drive_evidence.clear();
-                }
-                SessionMeta::Decisions { decisions } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
-                }
-                SessionMeta::Plan { steps } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_plan = steps;
-                }
-                SessionMeta::PlanCleared => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_plan.clear();
-                    loaded_plan_drive_evidence.clear();
-                }
-                SessionMeta::PlanDrive {
-                    paused,
-                    resume_on_user_input,
-                    stall,
-                    evidence_reset,
-                    evidence_add,
-                } => {
-                    loaded_plan_drive_paused = paused;
-                    loaded_plan_drive_resume_on_user_input =
-                        legacy_plan_pause.resolve(paused, resume_on_user_input);
-                    loaded_plan_drive_stall = stall;
-                    apply_drive_evidence_delta(
-                        &mut loaded_plan_drive_evidence,
-                        evidence_reset,
-                        evidence_add,
-                    );
-                }
-                SessionMeta::PlanApproval { parked } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_plan_approval_parked = parked;
-                }
-                SessionMeta::GoalDrive {
-                    stall,
-                    evidence_reset,
-                    evidence_add,
-                } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_goal_drive_stall = stall;
-                    apply_drive_evidence_delta(
-                        &mut loaded_goal_drive_evidence,
-                        evidence_reset,
-                        evidence_add,
-                    );
-                }
-                // Cancellation outcomes may be written between rollback and
-                // the legacy pause record. Other settlements break the
-                // cancellation signature.
-                SessionMeta::TurnOutcome {
-                    status,
-                    stop_reason,
-                    ..
-                } => {
-                    if status != hi_agent::TurnStatus::Cancelled
-                        && !matches!(
-                            stop_reason,
-                            hi_agent::TurnStopReason::Cancelled
-                                | hi_agent::TurnStopReason::TurnLimit
-                        )
-                    {
-                        legacy_plan_pause.clear_boundary();
-                    }
-                    if legacy_plan_pause.completed_user_turn_consumes_pause(status, stop_reason) {
-                        loaded_plan_drive_paused = false;
-                        loaded_plan_drive_resume_on_user_input = false;
-                        loaded_plan_drive_stall = 0;
-                        loaded_plan_drive_evidence.clear();
-                    }
-                }
-                SessionMeta::StateReplacement {
-                    messages: replacement,
-                    goal,
-                    decisions,
-                    plan,
-                } => {
-                    workspace_replay.retire_settled();
-                    legacy_plan_pause.note_state_replacement(&messages, &replacement);
-                    messages = replacement;
-                    loaded_goal = goal;
-                    loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
-                    loaded_plan = plan;
-                    // A durable rewind replaces conversational/goal state, but
-                    // it does not start a new drive-evidence scope in the live
-                    // Agent. Preserve the ledger too so restart matches the
-                    // uninterrupted process. Explicit evidence reset deltas
-                    // remain the sole scope boundary.
-                }
-            }
-            continue;
-        }
-        let message: Message = match serde_json::from_str(line) {
-            Ok(m) => m,
-            Err(_) => {
-                legacy_plan_pause.invalidate();
-                continue;
-            }
-        };
-        legacy_plan_pause.note_message(&message);
-        messages.push(message);
+        reduce_session_record(&mut reducer, &mut harness_settings, None, line)
+            .with_context(|| format!("restoring session {}", path.display()))?;
     }
-    let workspace_execution_recovered = workspace_replay.finish(&mut messages);
-    if loaded_plan
-        .iter()
-        .all(|step| step.status == hi_agent::PlanStatus::Done)
+    Ok(loaded_from_reducer(reducer, harness_settings))
+}
+
+/// Translators own wire/storage details; all logical replay runs in hi-agent.
+fn reduce_session_record(
+    reducer: &mut hi_agent::SessionReducer,
+    harness_settings: &mut hi_workspace::SettingLayer,
+    record_type: Option<&str>,
+    payload: &str,
+) -> Result<()> {
+    #[derive(Deserialize)]
+    struct RecordHeader<'a> {
+        #[serde(default, rename = "type", borrow)]
+        record_type: Option<&'a str>,
+    }
+    let payload_type = serde_json::from_str::<RecordHeader<'_>>(payload)
+        .ok()
+        .and_then(|header| header.record_type);
+    if record_type != Some("message")
+        && (payload_type == Some("reducer_snapshot") || record_type == Some("reducer_snapshot"))
     {
-        loaded_plan.clear();
+        let SessionMeta::ReducerSnapshot { snapshot } =
+            serde_json::from_str(payload).context("parsing persisted session reducer snapshot")?
+        else {
+            anyhow::bail!("remote reducer_snapshot record omitted its type tag");
+        };
+        *reducer = hi_agent::SessionReducer::from_snapshot(snapshot)?;
+        return Ok(());
     }
-    let loaded = LoadedSession {
-        messages,
-        workspace_execution_recovered,
-        usage,
-        checkpoint_refs,
-        harness_settings,
-        remote_session_id,
-        pipefs_enabled,
-        name: loaded_name,
-        goal: loaded_goal,
-        decisions: loaded_decisions,
-        plan: loaded_plan,
-        plan_drive_paused: loaded_plan_drive_paused,
-        plan_drive_resume_on_user_input: loaded_plan_drive_resume_on_user_input,
-        plan_approval_parked: loaded_plan_approval_parked,
-        plan_drive_stall: loaded_plan_drive_stall,
-        goal_drive_stall: loaded_goal_drive_stall,
-        plan_drive_evidence: loaded_plan_drive_evidence.into_iter().collect(),
-        goal_drive_evidence: loaded_goal_drive_evidence.into_iter().collect(),
+    if record_type != Some("message") {
+        if payload_type == Some(crate::session_harness::RECORD_TYPE) {
+            let layer = crate::session_harness::parse_record(payload)?
+                .context("harness settings record omitted its type tag")?;
+            *harness_settings = layer;
+            reducer.apply_event(hi_agent::SessionEvent::new(
+                hi_agent::SessionEventKind::ExtensionBoundary,
+            ))?;
+            return Ok(());
+        }
+        if record_type == Some(crate::session_harness::RECORD_TYPE) {
+            anyhow::bail!("remote harness_settings record omitted its type tag");
+        }
+    }
+    let event = match record_type {
+        Some(record_type) => Some(hi_agent::SessionEvent::decode_remote_record(
+            record_type,
+            payload,
+        )?),
+        None => hi_agent::SessionEvent::decode_legacy_json(payload)?,
     };
-    reducer_shadow.finish(loaded, "local_jsonl")
+    if let Some(event) = event {
+        reducer.apply_event(event)?;
+    }
+    Ok(())
+}
+
+fn loaded_from_reducer(
+    reducer: hi_agent::SessionReducer,
+    harness_settings: hi_workspace::SettingLayer,
+) -> LoadedSession {
+    let pending_execution_snapshot = reducer.pending_execution_snapshot();
+    let (state, workspace_execution_recovered) = reducer.into_restored_state();
+    LoadedSession {
+        pending_execution_snapshot,
+        messages: state.messages,
+        workspace_execution_recovered,
+        usage: state.usage,
+        checkpoint_refs: state.checkpoint_refs,
+        harness_settings,
+        remote_session_id: state.remote_session_id,
+        pipefs_enabled: state.pipefs_enabled,
+        name: state.name,
+        goal: state.goal,
+        decisions: hi_agent::DecisionLog::from_entries(state.decisions),
+        plan: state.plan,
+        plan_drive_paused: state.plan_drive_paused,
+        plan_drive_resume_on_user_input: state.plan_drive_resume_on_user_input,
+        plan_approval_parked: state.plan_approval_parked,
+        plan_drive_stall: state.plan_drive_stall,
+        goal_drive_stall: state.goal_drive_stall,
+        plan_drive_evidence: state.plan_drive_evidence.into_iter().collect(),
+        goal_drive_evidence: state.goal_drive_evidence.into_iter().collect(),
+        task_recovery: state.task_recovery,
+    }
 }
 
 /// A remote session record: `(record_type, payload_json)`, as fetched from
@@ -1373,226 +1202,19 @@ pub struct RemoteRecord {
 /// This lets `hi --attach --resume-local` boot a local agent from the remote
 /// session history when the daemon is down.
 pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSession> {
-    let mut reducer_shadow = session_shadow::SessionReducerShadow::new();
-    let mut messages = Vec::new();
-    let mut usage = Usage::default();
-    let mut checkpoint_refs = Vec::new();
+    let mut reducer = hi_agent::SessionReducer::new();
     let mut harness_settings = crate::session_harness::empty_layer();
-    let mut remote_session_id = None;
-    let mut pipefs_enabled = None;
-    let mut loaded_goal: Option<hi_agent::Goal> = None;
-    let mut loaded_decisions = hi_agent::DecisionLog::default();
-    let mut loaded_plan = Vec::new();
-    let mut loaded_name = None;
-    let mut loaded_plan_drive_paused = false;
-    let mut loaded_plan_drive_resume_on_user_input = false;
-    let mut legacy_plan_pause = LegacyPlanPauseMigration::default();
-    let mut loaded_plan_approval_parked = false;
-    let mut loaded_plan_drive_stall = 0;
-    let mut loaded_goal_drive_stall = 0;
-    let mut loaded_plan_drive_evidence = BTreeSet::new();
-    let mut loaded_goal_drive_evidence = BTreeSet::new();
-    let mut workspace_replay = WorkspaceExecutionReplay::default();
-
     for record in records {
-        reducer_shadow.observe_remote(&record.record_type, &record.payload_json);
-        if record.record_type == crate::session_harness::RECORD_TYPE {
-            harness_settings = crate::session_harness::parse_record(&record.payload_json)?
-                .context("remote harness_settings record omitted its type tag")?;
-            legacy_plan_pause.clear_boundary();
-            continue;
-        }
-        if record.record_type == "message" {
-            if let Ok(message) = serde_json::from_str::<Message>(&record.payload_json) {
-                legacy_plan_pause.note_message(&message);
-                messages.push(message);
-            } else {
-                legacy_plan_pause.invalidate();
-            }
-            continue;
-        }
-        if let Ok(meta) = serde_json::from_str::<SessionMeta>(&record.payload_json) {
-            match meta {
-                SessionMeta::RemoteSessionIdentity { session_id } => {
-                    crate::sync::validate_session_id(&session_id)
-                        .context("invalid canonical identity in remote session records")?;
-                    remote_session_id = Some(session_id);
-                }
-                SessionMeta::PipeFsMode { enabled } => {
-                    pipefs_enabled = Some(enabled);
-                }
-                SessionMeta::Name { name } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_name = (!name.trim().is_empty()).then(|| name.trim().to_string());
-                }
-                SessionMeta::Usage {
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_creation_tokens,
-                    estimated,
-                } => {
-                    usage = Usage {
-                        input_tokens,
-                        output_tokens,
-                        cache_read_tokens,
-                        cache_creation_tokens,
-                        input_includes_cache: false,
-                        context_occupancy: input_tokens,
-                        rate_limits: None,
-                        estimated,
-                    };
-                }
-                SessionMeta::WorkspaceExecutionStaged {
-                    visible_on_resume,
-                    execution,
-                } => workspace_replay.stage(execution, visible_on_resume, messages.len())?,
-                SessionMeta::WorkspaceExecutionSettled { operation_id } => {
-                    workspace_replay.settle(operation_id);
-                }
-                SessionMeta::Checkpoints { refs } => {
-                    checkpoint_refs = refs;
-                }
-                SessionMeta::Compaction {
-                    messages: compacted,
-                } => {
-                    workspace_replay.retire_settled();
-                    legacy_plan_pause.clear_boundary();
-                    messages = compacted;
-                }
-                SessionMeta::Goal { goal } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_goal = Some(goal);
-                }
-                SessionMeta::GoalCleared => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_goal = None;
-                    loaded_goal_drive_evidence.clear();
-                }
-                SessionMeta::Decisions { decisions } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
-                }
-                SessionMeta::Plan { steps } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_plan = steps;
-                }
-                SessionMeta::PlanCleared => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_plan.clear();
-                    loaded_plan_drive_evidence.clear();
-                }
-                SessionMeta::PlanDrive {
-                    paused,
-                    resume_on_user_input,
-                    stall,
-                    evidence_reset,
-                    evidence_add,
-                } => {
-                    loaded_plan_drive_paused = paused;
-                    loaded_plan_drive_resume_on_user_input =
-                        legacy_plan_pause.resolve(paused, resume_on_user_input);
-                    loaded_plan_drive_stall = stall;
-                    apply_drive_evidence_delta(
-                        &mut loaded_plan_drive_evidence,
-                        evidence_reset,
-                        evidence_add,
-                    );
-                }
-                SessionMeta::PlanApproval { parked } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_plan_approval_parked = parked;
-                }
-                SessionMeta::GoalDrive {
-                    stall,
-                    evidence_reset,
-                    evidence_add,
-                } => {
-                    legacy_plan_pause.clear_boundary();
-                    loaded_goal_drive_stall = stall;
-                    apply_drive_evidence_delta(
-                        &mut loaded_goal_drive_evidence,
-                        evidence_reset,
-                        evidence_add,
-                    );
-                }
-                // Cancellation outcomes may be written between rollback and
-                // the legacy pause record. Other settlements break the
-                // cancellation signature.
-                SessionMeta::TurnOutcome {
-                    status,
-                    stop_reason,
-                    ..
-                } => {
-                    if status != hi_agent::TurnStatus::Cancelled
-                        && !matches!(
-                            stop_reason,
-                            hi_agent::TurnStopReason::Cancelled
-                                | hi_agent::TurnStopReason::TurnLimit
-                        )
-                    {
-                        legacy_plan_pause.clear_boundary();
-                    }
-                    if legacy_plan_pause.completed_user_turn_consumes_pause(status, stop_reason) {
-                        loaded_plan_drive_paused = false;
-                        loaded_plan_drive_resume_on_user_input = false;
-                        loaded_plan_drive_stall = 0;
-                        loaded_plan_drive_evidence.clear();
-                    }
-                }
-                SessionMeta::StateReplacement {
-                    messages: replacement,
-                    goal,
-                    decisions,
-                    plan,
-                } => {
-                    workspace_replay.retire_settled();
-                    legacy_plan_pause.note_state_replacement(&messages, &replacement);
-                    messages = replacement;
-                    loaded_goal = goal;
-                    loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
-                    loaded_plan = plan;
-                    // Keep parity with the local JSONL loader above: state
-                    // replacement is not itself an evidence-scope reset.
-                }
-            }
-        } else {
-            legacy_plan_pause.invalidate();
-        }
+        reduce_session_record(
+            &mut reducer,
+            &mut harness_settings,
+            Some(&record.record_type),
+            &record.payload_json,
+        )?;
     }
-
-    let workspace_execution_recovered = workspace_replay.finish(&mut messages);
-    if loaded_plan
-        .iter()
-        .all(|step| step.status == hi_agent::PlanStatus::Done)
-    {
-        loaded_plan.clear();
-    }
-    let loaded = LoadedSession {
-        messages,
-        workspace_execution_recovered,
-        usage,
-        checkpoint_refs,
-        harness_settings,
-        remote_session_id,
-        pipefs_enabled,
-        name: loaded_name,
-        goal: loaded_goal,
-        decisions: loaded_decisions,
-        plan: loaded_plan,
-        plan_drive_paused: loaded_plan_drive_paused,
-        plan_drive_resume_on_user_input: loaded_plan_drive_resume_on_user_input,
-        plan_approval_parked: loaded_plan_approval_parked,
-        plan_drive_stall: loaded_plan_drive_stall,
-        goal_drive_stall: loaded_goal_drive_stall,
-        plan_drive_evidence: loaded_plan_drive_evidence.into_iter().collect(),
-        goal_drive_evidence: loaded_goal_drive_evidence.into_iter().collect(),
-    };
-    reducer_shadow.finish(loaded, "remote_records")
+    Ok(loaded_from_reducer(reducer, harness_settings))
 }
-/// Walks every project bucket under the data root (sessions are namespaced
-/// per-directory) and lists them newest-first, annotating each with a short
-/// project-digest prefix so you can tell which directory a session belongs to.
+
 pub fn list_sessions() -> Result<()> {
     let Some(root) = data_root() else {
         println!("no session directory");
@@ -1860,9 +1482,14 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let mut recovery = hi_agent::TaskRecoveryState::new("persisted objective".into(), 3);
+        recovery.remaining = 1;
+        recovery.interventions = 2;
         let expected = LoadedSession {
+            pending_execution_snapshot: None,
             messages: vec![Message::user("restored prompt")],
             workspace_execution_recovered: false,
+            task_recovery: recovery,
             usage: Usage {
                 input_tokens: 12,
                 output_tokens: 4,
@@ -1903,6 +1530,7 @@ mod tests {
         assert_eq!(loaded.remote_session_id, expected.remote_session_id);
         assert_eq!(loaded.pipefs_enabled, expected.pipefs_enabled);
         assert_eq!(loaded.name, expected.name);
+        assert_eq!(loaded.task_recovery, expected.task_recovery);
         assert_eq!(loaded.plan_drive_evidence, expected.plan_drive_evidence);
         assert_eq!(loaded.goal_drive_evidence, expected.goal_drive_evidence);
         let _ = std::fs::remove_file(path);
@@ -1936,8 +1564,10 @@ mod tests {
         agent.restore_goal_drive(8, vec!["d".repeat(64)]);
 
         let loaded = |paused, resume_on_user_input, plan_stall, goal_stall| LoadedSession {
+            pending_execution_snapshot: None,
             messages: vec![Message::system("restored")],
             workspace_execution_recovered: false,
+            task_recovery: hi_agent::TaskRecoveryState::default(),
             usage: Usage::default(),
             checkpoint_refs: Vec::new(),
             harness_settings: crate::session_harness::empty_layer(),
@@ -1965,7 +1595,11 @@ mod tests {
         assert!(!agent.plan_approval_parked());
         assert_eq!(agent.goal_drive_stall(), 0);
 
-        apply_loaded_session(&mut agent, loaded(true, true, 2, 3)).unwrap();
+        let mut continued = loaded(true, true, 2, 3);
+        continued.task_recovery.remaining = 1;
+        continued.task_recovery.interventions = 2;
+        apply_loaded_session(&mut agent, continued).unwrap();
+        assert_eq!(agent.task_recovery().remaining, 1);
         assert!(agent.plan_drive_paused());
         assert_eq!(agent.plan_drive_stall(), 2);
         assert_eq!(agent.goal_drive_stall(), 3);
@@ -2553,6 +2187,8 @@ fix the parser";
                 stop_reason,
                 review_unavailable_reason: None,
                 review_same_model: false,
+                task_recovery: None,
+                settled_goal: None,
             })
             .unwrap(),
         }

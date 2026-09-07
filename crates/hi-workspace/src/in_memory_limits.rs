@@ -27,12 +27,12 @@ impl InMemoryWorkspaceController {
             let (status_tx, _) = watch::channel(status.clone());
             Inner {
                 state: Mutex::new(State {
+                    jobs: crate::WorkspaceJobRegistry::with_limits(binding.clone(), job_limits)
+                        .expect("validated job limits"),
                     binding,
                     capabilities: WorkspaceCapabilities::in_memory(),
                     status,
                     active_operation: None,
-                    job_limits,
-                    jobs: BTreeMap::new(),
                     recoveries: BTreeMap::new(),
                 }),
                 status_tx,
@@ -74,12 +74,12 @@ impl InMemoryWorkspaceController {
             let (status_tx, _) = watch::channel(status.clone());
             Inner {
                 state: Mutex::new(State {
+                    jobs: crate::WorkspaceJobRegistry::with_limits(binding.clone(), job_limits)
+                        .expect("validated job limits"),
                     binding,
                     capabilities: WorkspaceCapabilities::pipefs(causal_commit),
                     status,
                     active_operation: None,
-                    job_limits,
-                    jobs: BTreeMap::new(),
                     recoveries: BTreeMap::new(),
                 }),
                 status_tx,

@@ -233,6 +233,7 @@ mod tests {
             },
         );
         ChatRequest {
+            execution: Default::default(),
             model: model.into(),
             request_id: None,
             retry_attempt: 0,

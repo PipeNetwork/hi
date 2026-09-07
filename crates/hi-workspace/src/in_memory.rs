@@ -8,13 +8,16 @@ use tokio::sync::watch;
 
 use crate::{
     AdmissionDenied, AdmissionDeniedReason, BarrierKind, BarrierReceipt, BarrierStatus, BindingId,
-    ExecutionDisposition, ExecutionReport, JobCompletion, JobId, JobPermit, JobRegistryLimits,
-    JobSealOutcome, JobSealStatus, JobSpec, JobState, JobTerminal, MutationIntent, MutationPermit,
+    ExecutionDisposition, ExecutionReport, JobId, JobPermit, JobRegistryLimits, JobSealOutcome,
+    JobSealStatus, JobSpec, JobState, JobTerminal, MutationIntent, MutationPermit,
     MutationPermitRecord, OperationId, PermitAbandonment, PermitIssuer, RecoveryId, RecoveryKind,
     RecoveryOutcome, RecoveryRecord, RecoveryStatus, SettlementOutcome, SettlementReceipt,
     SettlementStatus, WORKSPACE_CONTRACT_SCHEMA_VERSION, WorkspaceAuthority, WorkspaceBinding,
     WorkspaceCapabilities, WorkspaceController, WorkspaceId, WorkspaceState, WorkspaceStatus,
 };
+
+#[cfg(test)]
+use crate::JobCompletion;
 
 #[path = "in_memory_limits.rs"]
 mod limits;
@@ -35,15 +38,8 @@ struct State {
     capabilities: WorkspaceCapabilities,
     status: WorkspaceStatus,
     active_operation: Option<MutationPermitRecord>,
-    job_limits: JobRegistryLimits,
-    jobs: BTreeMap<JobId, JobRecord>,
+    jobs: crate::WorkspaceJobRegistry,
     recoveries: BTreeMap<RecoveryId, RecoveryRecord>,
-}
-
-struct JobRecord {
-    permit: JobPermit,
-    state: JobState,
-    recovery_id: Option<RecoveryId>,
 }
 
 struct AbandonmentHandler {
@@ -184,6 +180,11 @@ impl InMemoryWorkspaceController {
             generation: 0,
             content_digest: None,
         };
+        state.jobs = crate::WorkspaceJobRegistry::with_limits(
+            state.binding.clone(),
+            state.jobs.snapshot().limits,
+        )
+        .expect("validated job limits");
         state.status.binding_id = state.binding.binding_id.clone();
         state.status.epoch = state.binding.epoch;
         state.status.state = WorkspaceState::Ready;
@@ -228,10 +229,12 @@ impl InMemoryWorkspaceController {
     }
 
     pub fn job_state(&self, job_id: &JobId) -> Option<JobState> {
-        lock(&self.inner.state)
+        let state = lock(&self.inner.state);
+        state
             .jobs
-            .get(job_id)
-            .map(|record| record.state)
+            .status(&state.jobs.fence(), job_id)
+            .ok()
+            .map(|job| job.state)
     }
 }
 
@@ -253,6 +256,10 @@ impl WorkspaceController for InMemoryWorkspaceController {
         self.inner.status_tx.subscribe()
     }
 
+    fn job_state(&self, job: &JobId) -> Option<JobState> {
+        InMemoryWorkspaceController::job_state(self, job)
+    }
+
     async fn begin(&self, intent: MutationIntent) -> Result<MutationPermit, AdmissionDenied> {
         let mut state = lock(&self.inner.state);
         if !state.status.state.admits_mutation() {
@@ -270,7 +277,9 @@ impl WorkspaceController for InMemoryWorkspaceController {
         }
         let live_writer_states = state
             .jobs
-            .values()
+            .snapshot()
+            .jobs
+            .into_iter()
             .filter(|job| {
                 !job.state.is_terminal()
                     && matches!(job.permit.spec.effect_scope, crate::EffectScope::LiveWriter)
@@ -429,76 +438,32 @@ impl WorkspaceController for InMemoryWorkspaceController {
             spec.parent_operation.as_ref() == Some(&operation.operation_id)
         });
         if !state.status.state.admits_mutation() && !belongs_to_active {
-            let detail = state
-                .status
-                .admission_block_detail("workspace is not ready for job admission");
-            return Err(denied(&state, AdmissionDeniedReason::NotReady, detail));
+            return Err(denied(
+                &state,
+                AdmissionDeniedReason::NotReady,
+                state
+                    .status
+                    .admission_block_detail("workspace is not ready for job admission"),
+            ));
         }
         if matches!(spec.effect_scope, crate::EffectScope::LiveWriter)
-            && ((state.active_operation.is_some() && !belongs_to_active)
-                || state.jobs.values().any(|job| {
-                    !job.state.is_terminal()
-                        && matches!(job.permit.spec.effect_scope, crate::EffectScope::LiveWriter)
-                        && !(is_local_live_process(&state.binding, &spec)
-                            && is_local_live_process(&state.binding, &job.permit.spec))
-                }))
-        {
-            let detail = state
-                .status
-                .admission_block_detail("another live writer blocks job admission");
-            return Err(denied(&state, AdmissionDeniedReason::ActiveWriter, detail));
-        }
-        let active_jobs = state
-            .jobs
-            .values()
-            .filter(|job| !job.state.is_terminal())
-            .count();
-        if active_jobs >= state.job_limits.max_active_jobs {
-            return Err(denied(
-                &state,
-                AdmissionDeniedReason::ActiveWriter,
-                format!(
-                    "active job limit reached ({})",
-                    state.job_limits.max_active_jobs
-                ),
-            ));
-        }
-        if is_candidate_spec(&spec)
-            && state
-                .jobs
-                .values()
-                .filter(|job| is_candidate_spec(&job.permit.spec))
-                .filter(|job| matches!(job.state, JobState::Starting | JobState::Running))
-                .count()
-                >= state.job_limits.max_preparations
+            && state.active_operation.is_some()
+            && !belongs_to_active
         {
             return Err(denied(
                 &state,
                 AdmissionDeniedReason::ActiveWriter,
-                format!(
-                    "candidate preparation limit reached ({})",
-                    state.job_limits.max_preparations
-                ),
+                "another live writer blocks job admission",
             ));
         }
-
-        let permit = JobPermit {
-            schema_version: WORKSPACE_CONTRACT_SCHEMA_VERSION,
-            controller_id: state.binding.controller_id.clone(),
-            job_id: JobId::new(uuid::Uuid::new_v4().to_string()),
-            binding_id: state.binding.binding_id.clone(),
-            epoch: state.binding.epoch,
-            spec,
-            issued_at_ms: now_ms(),
-        };
-        state.jobs.insert(
-            permit.job_id.clone(),
-            JobRecord {
-                permit: permit.clone(),
-                state: JobState::Running,
-                recovery_id: None,
-            },
-        );
+        let fence = state.jobs.fence();
+        let permit = state.jobs.register_running(&fence, spec).map_err(|error| {
+            denied(
+                &state,
+                AdmissionDeniedReason::ActiveWriter,
+                error.to_string(),
+            )
+        })?;
         state.status.active_jobs = nonterminal_job_ids(&state.jobs);
         publish(&self.inner, &mut state);
         Ok(permit)
@@ -506,79 +471,34 @@ impl WorkspaceController for InMemoryWorkspaceController {
 
     async fn seal_job(&self, job: JobId, terminal: JobTerminal) -> JobSealOutcome {
         let mut state = lock(&self.inner.state);
-        let Some((current, job_recovery_id)) = state
-            .jobs
-            .get(&job)
-            .map(|record| (record.state, record.recovery_id.clone()))
-        else {
-            return JobSealOutcome {
-                job_id: job,
-                status: JobSealStatus::NotFound,
-                state: None,
-                recovery_id: None,
-                detail: Some("job was not registered".to_owned()),
-            };
-        };
-        if current.is_terminal() {
-            return JobSealOutcome {
-                job_id: job,
-                status: JobSealStatus::AlreadySealed,
-                state: Some(current),
-                recovery_id: job_recovery_id,
-                detail: terminal.detail,
-            };
-        }
-        let next = completion_state(terminal.completion);
-        let transition_allowed = state
-            .jobs
-            .get(&job)
-            .is_some_and(|record| job_transition_allowed(record, next));
-        if !transition_allowed {
-            return JobSealOutcome {
-                job_id: job,
-                status: JobSealStatus::Rejected,
-                state: Some(current),
-                recovery_id: state.status.recovery_id.clone(),
-                detail: Some(format!("illegal job transition {current:?} -> {next:?}")),
-            };
-        }
-
-        state.jobs.get_mut(&job).expect("job was just found").state = next;
-        let recovery = if matches!(next, JobState::RecoveryRequired) {
-            let recovery = make_recovery(
-                &state.binding,
-                RecoveryKind::CrashedWriterJob,
-                None,
-                Some(job.clone()),
-                terminal
+        let outcome = state.jobs.seal(&state.jobs.fence(), &job, terminal);
+        if outcome.status == JobSealStatus::Sealed
+            && let Some(recovery_id) = &outcome.recovery_id
+            && outcome.state == Some(JobState::RecoveryRequired)
+        {
+            let record = RecoveryRecord {
+                schema_version: WORKSPACE_CONTRACT_SCHEMA_VERSION,
+                recovery_id: recovery_id.clone(),
+                kind: RecoveryKind::CrashedWriterJob,
+                binding_id: state.binding.binding_id.clone(),
+                epoch: state.binding.epoch,
+                operation_id: None,
+                job_id: Some(job),
+                detail: outcome
                     .detail
-                    .as_deref()
-                    .unwrap_or("job requires workspace recovery"),
-            );
+                    .clone()
+                    .unwrap_or_else(|| "job requires workspace recovery".into()),
+                created_at_ms: now_ms(),
+                resolved: false,
+            };
             state.status.state = WorkspaceState::RecoveryRequired;
-            state.status.recovery_id = Some(recovery.recovery_id.clone());
-            state.status.detail = Some(recovery.detail.clone());
-            state
-                .recoveries
-                .insert(recovery.recovery_id.clone(), recovery.clone());
-            state
-                .jobs
-                .get_mut(&job)
-                .expect("job was just found")
-                .recovery_id = Some(recovery.recovery_id.clone());
-            Some(recovery.recovery_id)
-        } else {
-            None
-        };
+            state.status.recovery_id = Some(recovery_id.clone());
+            state.status.detail = Some(record.detail.clone());
+            state.recoveries.insert(recovery_id.clone(), record);
+        }
         state.status.active_jobs = nonterminal_job_ids(&state.jobs);
         publish(&self.inner, &mut state);
-        JobSealOutcome {
-            job_id: job,
-            status: JobSealStatus::Sealed,
-            state: Some(next),
-            recovery_id: recovery,
-            detail: terminal.detail,
-        }
+        outcome
     }
 
     async fn barrier(&self, reason: BarrierKind, deadline: Instant) -> BarrierReceipt {
@@ -628,11 +548,10 @@ impl WorkspaceController for InMemoryWorkspaceController {
         }
         record.resolved = true;
         let recovered_job = record.job_id.clone();
-        if let Some(job_id) = recovered_job
-            && let Some(job) = state.jobs.get_mut(&job_id)
-            && job.state == JobState::RecoveryRequired
-        {
-            job.state = JobState::Failed;
+        if recovered_job.is_some() {
+            let _ = state
+                .jobs
+                .reconcile_recovery(&state.jobs.fence(), &recovery, None);
         }
         state.status.active_jobs = nonterminal_job_ids(&state.jobs);
         if state.status.recovery_id.as_ref() == Some(&recovery) {
@@ -665,41 +584,10 @@ impl WorkspaceController for InMemoryWorkspaceController {
     }
 }
 
-fn completion_state(completion: JobCompletion) -> JobState {
-    match completion {
-        JobCompletion::Succeeded => JobState::Succeeded,
-        JobCompletion::ReadyToMerge => JobState::ReadyToMerge,
-        JobCompletion::Merging => JobState::Merging,
-        JobCompletion::Settling => JobState::Settling,
-        JobCompletion::Failed => JobState::Failed,
-        JobCompletion::Cancelled => JobState::Cancelled,
-        JobCompletion::DurabilityPending => JobState::DurabilityPending,
-        JobCompletion::RecoveryRequired => JobState::RecoveryRequired,
-        JobCompletion::Orphaned => JobState::Orphaned,
-        JobCompletion::Stale => JobState::Stale,
-    }
-}
-
 fn is_local_live_process(binding: &WorkspaceBinding, spec: &JobSpec) -> bool {
     matches!(&binding.authority, WorkspaceAuthority::Local)
         && spec.kind == crate::JobKind::Process
         && spec.effect_scope == crate::EffectScope::LiveWriter
-}
-
-/// Keep the always-present local controller on the same publication fence as
-/// [`WorkspaceJobRegistry`]. Read-only work may finish directly from Running,
-/// but a candidate or live writer must first enter Settling so a lifecycle
-/// adapter cannot publish success before the workspace receipt exists.
-fn job_transition_allowed(record: &JobRecord, next: JobState) -> bool {
-    if !record.state.can_transition_to(next) {
-        return false;
-    }
-    let write_job = record.permit.spec.kind == crate::JobKind::WriteCandidate
-        || !matches!(
-            record.permit.spec.effect_scope,
-            crate::EffectScope::ReadOnly
-        );
-    !write_job || next != JobState::Succeeded || record.state == JobState::Settling
 }
 
 fn make_recovery(
@@ -723,16 +611,13 @@ fn make_recovery(
     }
 }
 
-fn nonterminal_job_ids(jobs: &BTreeMap<JobId, JobRecord>) -> Vec<JobId> {
-    jobs.iter()
-        .filter(|(_, record)| !record.state.is_terminal())
-        .map(|(id, _)| id.clone())
+fn nonterminal_job_ids(jobs: &crate::WorkspaceJobRegistry) -> Vec<JobId> {
+    jobs.snapshot()
+        .jobs
+        .into_iter()
+        .filter(|record| !record.state.is_terminal())
+        .map(|record| record.permit.job_id)
         .collect()
-}
-
-fn is_candidate_spec(spec: &JobSpec) -> bool {
-    spec.kind == crate::JobKind::WriteCandidate
-        || matches!(spec.effect_scope, crate::EffectScope::CandidateOnly)
 }
 
 fn denied(

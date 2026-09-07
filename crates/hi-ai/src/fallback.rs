@@ -83,17 +83,15 @@ impl Provider for FallbackProvider {
             .unwrap_or_default()
     }
 
-    fn capability_candidates(
-        &self,
-        _route: &str,
-        _model: &str,
-    ) -> Vec<ProviderCapabilityCandidate> {
+    fn capability_candidates(&self, _route: &str, model: &str) -> Vec<ProviderCapabilityCandidate> {
         self.chain
             .iter()
-            .flat_map(|backend| {
-                backend
-                    .provider
-                    .capability_candidates(&backend.capability_route, &backend.model)
+            .enumerate()
+            .flat_map(|(index, backend)| {
+                backend.provider.capability_candidates(
+                    &backend.capability_route,
+                    if index == 0 { model } else { &backend.model },
+                )
             })
             .collect()
     }
@@ -101,15 +99,16 @@ impl Provider for FallbackProvider {
     fn capability_candidates_for_request(
         &self,
         _route: &str,
-        _model: &str,
+        model: &str,
         context: crate::ProviderRequestContext<'_>,
     ) -> Vec<ProviderCapabilityCandidate> {
         self.chain
             .iter()
-            .flat_map(|backend| {
+            .enumerate()
+            .flat_map(|(index, backend)| {
                 backend.provider.capability_candidates_for_request(
                     &backend.capability_route,
-                    &backend.model,
+                    if index == 0 { model } else { &backend.model },
                     context,
                 )
             })
@@ -129,7 +128,12 @@ impl Provider for FallbackProvider {
             // Check the circuit breaker — skip this backend if it's open.
             if let Err(reason) = self.breakers[i].check() {
                 if is_last {
-                    return Err(anyhow::anyhow!("{reason}"));
+                    return Err(ProviderError::new(
+                        crate::ProviderErrorKind::Outage,
+                        reason.to_string(),
+                    )
+                    .with_usage(prior_usage)
+                    .into());
                 }
                 let next = &self.chain[i + 1];
                 sink(StreamEvent::Status(format!(
@@ -140,10 +144,21 @@ impl Provider for FallbackProvider {
             }
 
             let mut req = request.clone();
-            req.model = backend.model.clone();
+            if i > 0 {
+                req.model = backend.model.clone();
+            }
+            if let Err(error) = req.execution.ensure_available() {
+                prior_usage.add(error.usage);
+                return Err(error.with_usage(prior_usage).into());
+            }
 
             match backend.provider.stream(req, sink).await {
-                Ok(mut completion) if !completion.content.is_empty() || is_last => {
+                Ok(mut completion)
+                    if !completion.content.is_empty()
+                        || completion.refusal.is_some()
+                        || completion.stop_reason.as_deref() == Some("refusal")
+                        || is_last =>
+                {
                     self.breakers[i].record(Outcome::Success);
                     if !prior_usage.is_zero() {
                         // Fold the failed/empty earlier attempts' token counts
@@ -223,7 +238,7 @@ impl Provider for FallbackProvider {
 }
 
 fn error_with_usage(err: &anyhow::Error, usage: Usage) -> ProviderError {
-    err.downcast_ref::<ProviderError>()
+    crate::provider::provider_error_details(err)
         .cloned()
         .unwrap_or_else(|| {
             ProviderError::new(
@@ -330,7 +345,7 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(
             candidates[0].target,
-            crate::CapabilityRoute::new("openai@endpoint:blake3:opaque-a", "model-a")
+            crate::CapabilityRoute::new("openai@endpoint:blake3:opaque-a", "requested")
         );
         assert_eq!(
             candidates[1].target,
@@ -345,6 +360,7 @@ mod tests {
             model: "primary".into(),
             request_id: None,
             retry_attempt: 0,
+            execution: Default::default(),
             user_turn: false,
             canonical_objective: None,
             messages: vec![].into(),

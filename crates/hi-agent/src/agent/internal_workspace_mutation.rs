@@ -14,17 +14,43 @@ impl crate::Agent {
     /// Run a write which is deliberately host-local, never part of the
     /// authoritative workspace. Refuse an override that points into the
     /// workspace rather than silently bypassing controller admission.
-    pub(crate) fn run_host_local_file_mutation<T, F>(
-        &self,
+    pub(crate) async fn run_host_local_file_mutation<T, F>(
+        &mut self,
         description: &str,
         paths: &[PathBuf],
         mutation: F,
     ) -> Result<T>
     where
-        F: FnOnce() -> Result<T>,
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
     {
         ensure_host_local_paths(self.workspace_root(), paths, description)?;
-        mutation()
+        self.run_owned_maintenance(mutation).await
+    }
+
+    /// Reuse the session metadata owner for blocking maintenance. The owned
+    /// command remains behind the session barrier if its caller is cancelled;
+    /// an unobserved failure is also retained by that owner for the barrier.
+    async fn run_owned_maintenance<T, F>(&mut self, mutation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let acknowledged = self
+            .write_session_metadata(move |_| {
+                let result = mutation();
+                let failure = result.as_ref().err().map(|error| format!("{error:#}"));
+                let _ = send.send(result);
+                failure.map_or(Ok(()), |error| Err(anyhow!(error)))
+            })
+            .await;
+        match receive.await {
+            Ok(result) => result,
+            Err(_) => Err(acknowledged
+                .err()
+                .unwrap_or_else(|| anyhow!("maintenance owner lost its result"))),
+        }
     }
 
     pub(crate) async fn run_internal_file_mutation<T, F>(
@@ -36,7 +62,8 @@ impl crate::Agent {
         mutation: F,
     ) -> Result<T>
     where
-        F: FnOnce() -> Result<(T, String)>,
+        T: Send + 'static,
+        F: FnOnce() -> Result<(T, String)> + Send + 'static,
     {
         // Legacy PipeFS can CAS workspace bytes but has no durable operation
         // slot for this synthetic transcript. Optional maintenance must stay
@@ -58,7 +85,8 @@ impl crate::Agent {
             .with_context(|| format!("workspace controller refused {description}"))?;
 
         let ledger_revision = self.runtime.ledger().revision();
-        let (value, result_text, mutation_error) = match mutation() {
+        let (value, result_text, mutation_error) = match self.run_owned_maintenance(mutation).await
+        {
             Ok((value, result)) => (Some(value), result, None),
             Err(error) => {
                 let result = format!("{description} failed: {error:#}");
@@ -130,6 +158,7 @@ impl crate::Agent {
         let results = [(call_id, result_text)];
         let stage_error = self
             .stage_active_workspace_execution(&calls, &assistant_content, &results, &execution)
+            .await
             .err();
         if let Some(error) = &stage_error {
             execution.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
@@ -317,6 +346,66 @@ fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_blocking_maintenance_stays_owned_and_preserves_late_failure() {
+        for fail in [false, true] {
+            let workspace = crate::tests::common::IsolatedWorkspace::new("owned-maintenance");
+            let mut subject = crate::tests::common::agent(Vec::new(), workspace.config());
+            let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+            let started = entered.clone();
+            let (release, held) = std::sync::mpsc::channel();
+            let target = workspace.path("memory.md");
+            let written = target.clone();
+            let paths = vec![target.clone()];
+            let mut mutation = Box::pin(subject.run_internal_file_mutation(
+                "held_maintenance",
+                "held maintenance",
+                &paths,
+                serde_json::json!({}),
+                move || {
+                    started.notify_one();
+                    held.recv_timeout(std::time::Duration::from_secs(2))
+                        .context("test maintenance release did not arrive")?;
+                    std::fs::write(written, "retained after caller cancellation")?;
+                    if fail {
+                        anyhow::bail!("late original maintenance failure");
+                    }
+                    Ok(((), "written".to_owned()))
+                },
+            ));
+            tokio::select! {
+                result = mutation.as_mut() => panic!("maintenance returned before release: {result:?}"),
+                _ = entered.notified() => {},
+            }
+            let start = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            assert!(start.elapsed() < std::time::Duration::from_millis(200));
+            drop(mutation);
+            let mut barrier = Box::pin(subject.session_barrier());
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), barrier.as_mut())
+                    .await
+                    .is_err()
+            );
+            release.send(()).unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), barrier)
+                .await
+                .unwrap();
+            if fail {
+                assert!(
+                    format!("{:#}", result.unwrap_err())
+                        .contains("late original maintenance failure")
+                );
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                std::fs::read_to_string(target).unwrap(),
+                "retained after caller cancellation"
+            );
+        }
+    }
 
     #[test]
     fn path_classification_separates_workspace_and_host_local_targets() {

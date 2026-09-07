@@ -134,17 +134,19 @@ fn resume_restores_decision_log_and_rebuilds_system_prompt() {
     );
 }
 
-#[test]
-fn record_decision_persists_log_before_updating_visible_prompt() {
+#[tokio::test]
+async fn record_decision_persists_log_before_updating_visible_prompt() {
     let records = Arc::new(Mutex::new(Vec::new()));
     let mut agent = agent(vec![], config());
     agent.set_session(Box::new(DecisionRecordingSession {
         records: records.clone(),
     }));
 
-    let result = agent.handle_record_decision(
-        r#"{"summary":"use BTreeMap","rationale":"ordered iteration","files":["src/m.rs"]}"#,
-    );
+    let result = agent
+        .handle_record_decision(
+            r#"{"summary":"use BTreeMap","rationale":"ordered iteration","files":["src/m.rs"]}"#,
+        )
+        .await;
 
     assert_eq!(result.status, hi_tools::ToolStatus::Succeeded);
     assert!(
@@ -164,14 +166,16 @@ fn record_decision_persists_log_before_updating_visible_prompt() {
     );
 }
 
-#[test]
-fn record_decision_keeps_visible_prompt_unchanged_when_persistence_fails() {
+#[tokio::test]
+async fn record_decision_keeps_visible_prompt_unchanged_when_persistence_fails() {
     let mut agent = agent(vec![], config());
     agent.set_session(Box::new(FailingDecisionSession));
 
-    let result = agent.handle_record_decision(
-        r#"{"summary":"use BTreeMap","rationale":"ordered iteration","files":["src/m.rs"]}"#,
-    );
+    let result = agent
+        .handle_record_decision(
+            r#"{"summary":"use BTreeMap","rationale":"ordered iteration","files":["src/m.rs"]}"#,
+        )
+        .await;
 
     assert!(
         result.content.contains("couldn't persist decision"),

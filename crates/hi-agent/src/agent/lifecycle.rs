@@ -7,8 +7,10 @@ mod commit;
 mod drive;
 mod goals;
 mod mcp;
+mod rewind;
 mod routes;
 mod rsi;
+mod session_io;
 mod workspace;
 mod workspace_failure;
 mod workspace_shutdown;
@@ -117,7 +119,7 @@ impl crate::Agent {
 
     fn with_messages(
         provider: Arc<dyn Provider>,
-        mut config: AgentConfig,
+        config: AgentConfig,
         messages: Vec<Message>,
         persisted: usize,
         scan: Option<crate::change_ledger::BackgroundScan>,
@@ -135,6 +137,25 @@ impl crate::Agent {
         // incremental session recorder doesn't slice past the end.
         let persisted = persisted.min(messages.len());
         config.gates.verification.validate()?;
+        if std::env::var("HI_ENGINE_MODE").ok().is_some_and(|mode| {
+            !matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "" | "native" | "rust" | "off"
+            )
+        }) {
+            anyhow::bail!(
+                "The experimental WASM engine has been removed; unset HI_ENGINE_MODE to use the native turn policy"
+            );
+        }
+        if ["HI_ENGINE_MODULE", "HI_ENGINE_WATCH"].iter().any(|key| {
+            std::env::var(key).ok().is_some_and(|value| {
+                !value.trim().is_empty() && !matches!(value.as_str(), "0" | "false" | "off")
+            })
+        }) {
+            anyhow::bail!(
+                "Experimental engine modules and watchers were removed; unset HI_ENGINE_MODULE and HI_ENGINE_WATCH"
+            );
+        }
         let sandbox_policy = config.sandbox_policy;
         let sandbox_config = config.sandbox_config.clone();
         let initial_lsp_mode = if config.defer_initial_lsp {
@@ -160,42 +181,6 @@ impl crate::Agent {
         // endpoint (e.g. a local hi-local server) when configured. Shared with
         // the runtime `/config skeptic-local` toggle so their wiring can't drift.
         let skeptic_provider = crate::local_skeptic::build_skeptic_provider(&config);
-        let engine_runtime =
-            hi_engine_host::EngineRuntime::new(hi_engine_host::ModuleValidationPolicy {
-                allow_unsigned: config.engine.allow_unsigned,
-                trusted_keys: hi_engine_host::parse_trusted_keys(&config.engine.trusted_key_hex)?,
-                max_guest_fuel: config.engine.max_guest_fuel,
-                max_guest_memory_bytes: config.engine.max_guest_memory_bytes,
-                max_guest_step_ms: config.engine.max_guest_step_ms,
-                ..hi_engine_host::ModuleValidationPolicy::default()
-            })?;
-        if config.engine.mode == hi_engine_api::EngineMode::Wasm {
-            if let Some(module_path) =
-                hi_engine_host::discover_module_path(config.engine.module_path.as_deref())
-            {
-                match engine_runtime.reload(&module_path) {
-                    Ok(_) => {
-                        config.engine.module_path = Some(module_path.clone());
-                        if config.engine.watch
-                            && let Err(error) = engine_runtime.start_watch(module_path)
-                        {
-                            tracing::warn!(%error, "WASM engine watch could not start");
-                        }
-                    }
-                    Err(error) => {
-                        // The optional logic module must not make ordinary
-                        // native turns unusable. The rejection is retained in
-                        // logs and the config surface still makes the selected
-                        // mode/path visible.
-                        tracing::warn!(%error, "WASM engine module rejected; using native engine");
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    "WASM engine selected but no module was found; using native engine until a validated module is loaded"
-                );
-            }
-        }
         let btw_jobs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let btw_dispatch = crate::agent::turn::btw::BtwDispatcher::new(btw_jobs.clone());
         let workspace_coordination =
@@ -220,7 +205,8 @@ impl crate::Agent {
             team_local_servers: Vec::new(),
             driver_local_server: None,
             config,
-            engine_runtime,
+            task_recovery: crate::TaskRecoveryState::default(),
+            answer_state: Default::default(),
             side_call_timeout: crate::agent::turn::DEFAULT_SIDE_CALL_TIMEOUT,
             runtime,
             workspace_coordination,
@@ -229,6 +215,8 @@ impl crate::Agent {
             messages,
             tools,
             session: None,
+            session_metadata_io: None,
+            session_recovery_pending: false,
             persisted,
             totals: Usage::default(),
             pending_prompt: None,
@@ -349,7 +337,9 @@ impl crate::Agent {
         let transcript = [hi_ai::Content::Text(
             "Workspace undo operation completed.".into(),
         )];
-        if let Err(error) = self.stage_active_workspace_execution(&[], &transcript, &[], &execution)
+        if let Err(error) = self
+            .stage_active_workspace_execution(&[], &transcript, &[], &execution)
+            .await
         {
             execution.disposition = hi_workspace::ExecutionDisposition::Indeterminate;
             execution.content_digest = None;
@@ -430,11 +420,10 @@ impl crate::Agent {
         };
         let mut next = self.workspace.checkpoints.clone();
         next.pop();
+        let durable_next = next.clone();
         let persist_result = self
-            .session
-            .as_mut()
-            .map(|session| session.record_checkpoints(&next))
-            .unwrap_or(Ok(()));
+            .write_session(move |session| session.record_checkpoints(&durable_next))
+            .await;
         if let Err(persist_error) = persist_result {
             let rollback = hi_tools::checkpoint::restore_sealed_with_state(
                 self.runtime.root(),
@@ -491,7 +480,11 @@ impl crate::Agent {
 
     /// Attach a session sink that records messages produced from here on.
     pub fn set_session(&mut self, session: Box<dyn SessionSink>) {
-        self.session = Some(session);
+        self.session = Some(if session.io_handle().is_some() {
+            session
+        } else {
+            Box::new(crate::session_io::OwnedSessionSink::new(session))
+        });
         self.publish_model_context();
         if let Err(error) = self.persist_pending_legacy_goal_budget_migration() {
             // `set_session` predates fallible attachment. Keep the migration
@@ -521,7 +514,7 @@ impl crate::Agent {
 
     /// Tell the session sink which model this agent runs, so a remote viewer
     /// sees the truth even across `/provider` switches.
-    fn publish_model_context(&mut self) {
+    pub(super) fn publish_model_context(&mut self) {
         let model = self.config.routing.model.clone();
         let window = self.config.routing.context_window;
         if let Some(session) = self.session.as_mut() {
@@ -835,76 +828,12 @@ impl crate::Agent {
         snapshot: &crate::AgentStateSnapshot,
         workspace_rolled_back: bool,
     ) -> Result<()> {
-        let len = len.min(self.messages.len());
-        let mut next = self.messages.as_slice()[..len].to_vec();
-        let structured_goal = self
-            .config
-            .subagents
-            .long_horizon
-            .then_some(snapshot.structured_goal.clone())
-            .flatten();
-        let plan = if workspace_rolled_back {
-            crate::domain::GoalState::prefer_plan_progress_after_workspace_rollback(
-                &snapshot.last_plan,
-                self.goals.plan(),
-            )
-        } else {
-            crate::domain::GoalState::prefer_plan_progress(&snapshot.last_plan, self.goals.plan())
-        };
-        let plan_drive_scope_changed = crate::heuristics::next_plan_step_title(&snapshot.last_plan)
-            != crate::heuristics::next_plan_step_title(&plan);
-        // Durable session: keep unfinished progress; drop a fully-done checklist
-        // so resume does not resurrect it (live UI still shows finished below).
-        let session_plan: &[hi_tools::PlanStep] =
-            if crate::heuristics::plan_has_pending_steps(&plan) {
-                plan.as_slice()
-            } else {
-                &[]
-            };
-        // The stable system message carries no goal/decision state — the
-        // restored snapshot state below reaches the model via the next
-        // turn's volatile context block.
-        let system = self.system_message_for();
-        if let Some(first) = next.first_mut() {
-            *first = system;
-        } else {
-            next.push(system);
-        }
-
-        // Session rewinds must serialize the durable latch, not the effective
-        // UI state. During a transactional user resume the badge is hidden,
-        // but a crash before successful settlement must still restore paused.
-        let plan_drive_paused = self.durable_plan_drive_paused();
-        let plan_drive_resume_on_user_input = self.plan_drive_resumes_on_user_input();
+        self.ensure_session_reusable()?;
+        let prepared = self.prepare_snapshot_rewind(len, snapshot, workspace_rolled_back);
         if let Some(session) = self.session.as_mut() {
-            if plan_drive_scope_changed {
-                // Reset the old scope first. A crash/failure between these two
-                // append-only records then leaves the old plan with a clean
-                // ledger, never the new next step with inherited stall/evidence.
-                session.record_plan_drive_state_with_policy(
-                    plan_drive_paused,
-                    0,
-                    plan_drive_resume_on_user_input,
-                    true,
-                    &[],
-                )?;
-            }
-            session.record_state_replacement(
-                &next,
-                structured_goal.as_ref(),
-                &snapshot.decisions,
-                session_plan,
-            )?;
+            prepared.record(session.as_mut())?;
         }
-        self.messages.replace_all(next);
-        self.persisted = self.messages.len();
-        self.goals
-            .restore_triple(snapshot.goal.clone(), structured_goal, plan);
-        if plan_drive_scope_changed {
-            self.plan_drive_stall = 0;
-            self.plan_drive_evidence.clear();
-        }
-        self.decisions = snapshot.decisions.clone();
+        prepared.apply(self);
         Ok(())
     }
 
@@ -1704,119 +1633,28 @@ impl crate::Agent {
                 Ok(_) => "on".into(),
                 Err(_) => "auto".into(),
             },
-            engine_mode: c.engine.mode.as_str().to_string(),
-            engine_module: c
-                .engine
-                .module_path
-                .as_deref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<none>".into()),
         }
     }
 
-    /// Inspect or reload the optional decision engine without touching the
-    /// active turn. Reloads are generation-pinned by `EngineRuntime` and are
-    /// therefore safe to request while a provider stream is still running.
-    pub fn engine_command(&mut self, argument: &str) -> String {
-        let mut parts = argument.split_whitespace();
-        let action = parts.next().unwrap_or("status").to_ascii_lowercase();
-        match action.as_str() {
-            "status" | "show" => {
-                let status = hi_engine_host::status(&self.engine_runtime);
-                let current = status.current.map_or_else(
-                    || "none".to_string(),
-                    |module| {
-                        format!(
-                            "v{} (generation {}, {})",
-                            module.guest_version,
-                            module.generation,
-                            &module.module_sha256[..12]
-                        )
-                    },
-                );
-                let pending = status.pending.map_or_else(
-                    || "none".to_string(),
-                    |module| {
-                        format!(
-                            "v{} (generation {})",
-                            module.guest_version, module.generation
-                        )
-                    },
-                );
-                format!(
-                    "engine: {}\n  module: {}\n  current: {current}\n  pending: {pending}\n  watch: {}",
-                    self.config.engine.mode.as_str(),
-                    self.config
-                        .engine
-                        .module_path
-                        .as_deref()
-                        .map_or("<auto>", |path| path.to_str().unwrap_or("<non-utf8>")),
-                    if self.engine_runtime.is_watching() {
-                        "on"
-                    } else {
-                        "off"
-                    },
-                )
-            }
-            "native" | "rust" | "off" => {
-                self.config.engine.mode = hi_engine_api::EngineMode::Native;
-                self.engine_runtime.stop_watch();
-                "engine mode: native (WASM remains loaded but is not selected)".into()
-            }
-            "wasm" | "component" => {
-                self.config.engine.mode = hi_engine_api::EngineMode::Wasm;
-                if let Some(path) = parts.next().map(std::path::PathBuf::from) {
-                    self.config.engine.module_path = Some(path);
-                }
-                self.reload_engine_module()
-            }
-            "reload" => self.reload_engine_module(),
-            "watch" => match parts.next().unwrap_or("on") {
-                "off" | "disable" => {
-                    self.config.engine.watch = false;
-                    self.engine_runtime.stop_watch();
-                    "engine module watch: off".into()
-                }
-                "on" | "enable" => {
-                    let Some(path) = self.engine_module_path() else {
-                        return "engine watch unavailable: set HI_ENGINE_MODULE or provide /engine wasm <path>".into();
-                    };
-                    match self.engine_runtime.start_watch(path) {
-                        Ok(()) => {
-                            self.config.engine.watch = true;
-                            "engine module watch: on (reloads become active next turn)".into()
-                        }
-                        Err(error) => format!("engine watch failed: {error:#}"),
-                    }
-                }
-                other => format!("usage: /engine watch [on|off] — got {other:?}"),
-            },
-            other => format!(
-                "usage: /engine [status|native|wasm [path]|reload|watch on|off] — got {other:?}"
-            ),
-        }
+    /// Compatibility diagnostic for removed experimental engine commands.
+    pub fn engine_command(&mut self, _argument: &str) -> String {
+        "The experimental WASM engine and NativeDirector have been removed. hi now uses one native turn policy; remove /engine or /config engine from your commands.".into()
     }
 
-    fn engine_module_path(&self) -> Option<std::path::PathBuf> {
-        hi_engine_host::discover_module_path(self.config.engine.module_path.as_deref())
+    pub(crate) fn persist_task_recovery(&mut self) -> anyhow::Result<()> {
+        if let Some(session) = self.session.as_mut() {
+            session.record_task_recovery(&self.task_recovery)?;
+        }
+        Ok(())
     }
 
-    fn reload_engine_module(&mut self) -> String {
-        let Some(path) = self.engine_module_path() else {
-            return "engine reload unavailable: set HI_ENGINE_MODULE or place engine.wasm beside hi".into();
-        };
-        match self.engine_runtime.reload(&path) {
-            Ok(info) => {
-                self.config.engine.module_path = Some(path.clone());
-                format!(
-                    "engine candidate loaded: v{} generation {} — active next turn ({})",
-                    info.guest_version,
-                    info.generation,
-                    path.display()
-                )
-            }
-            Err(error) => format!("engine reload rejected: {error:#}"),
-        }
+    pub fn task_recovery(&self) -> &crate::TaskRecoveryState {
+        &self.task_recovery
+    }
+
+    pub fn restore_task_recovery(&mut self, mut state: crate::TaskRecoveryState) {
+        state.migrate();
+        self.task_recovery = state;
     }
 
     /// Whether any verification stage is configured.
@@ -1996,71 +1834,6 @@ impl crate::Agent {
             self.persisted = self.messages.len();
         }
         Ok(())
-    }
-
-    /// Persist the current transcript at a safe execution boundary. Durable
-    /// mode deliberately fails the turn when its checkpoint cannot be written:
-    /// continuing after a lost checkpoint would make the advertised recovery
-    /// guarantee false.
-    pub(crate) fn persist_durable_boundary(&mut self, boundary: &str) -> Result<()> {
-        // Exact workspace transcript staging is only recoverable when its
-        // conversational prefix is already in the same durable sink. The
-        // interactive CLI otherwise runs in Ephemeral mode, so a stage fsync
-        // could outrun the user prompt (or a preceding read-only/tool batch)
-        // and restart would have no exact place to publish the result.
-        let requires_workspace_transcript_anchor = self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.requires_local_workspace_execution_stage());
-        if self.config.execution.is_durable() || requires_workspace_transcript_anchor {
-            self.persist().with_context(|| {
-                format!("durable execution checkpoint failed at {boundary} boundary")
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Persist the current structured goal (if any) so a `/resume` picks it up
-    /// at its active sub-goal. Best-effort: a failure is logged to the UI but
-    /// doesn't fail the turn (the goal still lives in-memory for this session).
-    pub(crate) fn persist_goal(&mut self, ui: &mut dyn Ui) {
-        if let Some(session) = self.session.as_mut()
-            && let Some(goal) = &self.goals.structured
-            && let Err(err) = session.record_goal(goal)
-        {
-            ui.status(&format!("(couldn't persist goal: {err})"));
-        }
-        // Refresh the human-readable export alongside the durable record.
-        // It used to be written only on an explicit `/goal export`, so the file
-        // people actually open to check on a long run could sit hours stale
-        // while the goal moved underneath it — a supervision surface that
-        // silently disagrees with reality is worse than none. Best-effort: a
-        // write failure must not disturb a turn that already persisted.
-        //
-        // Skip when the workspace root is the process cwd: that is the bare
-        // default in canned-provider tests (which run with the crate dir as the
-        // root), and exporting there leaks a stub `.hi/goal-plan.md` into the
-        // package source tree on every test run. Real sessions and
-        // IsolatedWorkspace tests set an explicit root, so they still export.
-        let root = self.runtime.root().to_path_buf();
-        let is_cwd_default = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| cwd.canonicalize().ok())
-            .and_then(|cwd| {
-                root.canonicalize()
-                    .ok()
-                    .map(|canonical_root| canonical_root == cwd)
-            })
-            .unwrap_or(false);
-        // Goal snapshots are UI/runtime state, not user workspace content.
-        // They cannot use the asynchronous PipeFS durability fence from this
-        // synchronous state update, so never emit them into a portable root.
-        if !self.pipefs_workspace_active()
-            && !is_cwd_default
-            && let Some(goal) = &self.goals.structured
-        {
-            let _ = goal.export_markdown_to(&root);
-        }
     }
 
     /// Test-only direct access to the backing message vec, so tests can set up

@@ -77,7 +77,7 @@ impl OpenAiProvider {
     /// refresh-and-retry instead of failing the turn.
     pub fn with_token_source(base_url: String, auth: Arc<dyn TokenSource>) -> Self {
         Self {
-            http: crate::http::agent_http_client(),
+            http: crate::http::inference_http_client_for_socket(None),
             base_url: base_url.trim_end_matches('/').to_string(),
             auth,
             pipe_metadata: false,
@@ -110,7 +110,7 @@ impl OpenAiProvider {
 
     pub fn new_unix(base_url: String, api_key: String, socket: &std::path::Path) -> Self {
         Self {
-            http: crate::http::agent_http_client_for_socket(Some(socket)),
+            http: crate::http::inference_http_client_for_socket(Some(socket)),
             base_url: base_url.trim_end_matches('/').to_string(),
             auth: Arc::new(StaticToken(api_key)),
             pipe_metadata: false,
@@ -175,6 +175,22 @@ impl Provider for OpenAiProvider {
         mut request: ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
+        let execution = request.execution.clone();
+        let progress = execution.progress();
+        let mut physical_attempt = None;
+        let estimated_input = estimate_request_input_tokens(&request.messages, &request.tools);
+        let mut prior_usage = Usage::default();
+        let mut observed_sink = |event| {
+            if let StreamEvent::ProviderAttempt(attempt) = &event
+                && matches!(attempt.state, crate::ProviderAttemptState::Started { .. })
+            {
+                physical_attempt = Some(attempt.physical_attempt);
+            }
+            progress.observe(&event);
+            sink(event);
+        };
+        let sink: &mut (dyn FnMut(StreamEvent) + Send) = &mut observed_sink;
+        progress.watch(async {
         if responses::supports_model(&request.model) {
             return self.stream_responses(request, sink).await;
         }
@@ -234,7 +250,6 @@ impl Provider for OpenAiProvider {
             );
         }
         let mut last_error: Option<ProviderError> = None;
-        let mut prior_usage = Usage::default();
         let mut idx = 0;
         let mut auth_refreshed = false;
         let correlation_id = canonical_request_id(request.request_id.as_deref());
@@ -256,14 +271,12 @@ impl Provider for OpenAiProvider {
             } else {
                 format!("{correlation_id}-wire{}", idx + 1)
             };
-            let idempotency_key = request_idempotency_key(&wire_request_id, &body);
             let response = match self
                 .dispatch_chat(
                     &url,
                     &body,
                     &wire_request_id,
-                    request.retry_attempt,
-                    &idempotency_key,
+                    &request.execution,
                     sink,
                 )
                 .await
@@ -444,6 +457,10 @@ impl Provider for OpenAiProvider {
             }
             let parsed = request::parse_api_error(Some(status), &text);
             let kind = parsed.kind;
+            if parsed.explicit_retryable == Some(false) {
+                last_error = Some(parsed.into_provider_error(Some(status)));
+                break;
+            }
             // An expiring credential (OAuth) can die mid-session. Re-mint it and
             // replay the same attempt once. Guarded by `auth_refreshed` so a
             // source that refreshes to an equally-rejected token can't loop, and
@@ -515,6 +532,10 @@ impl Provider for OpenAiProvider {
             ProviderError::new(ProviderErrorKind::Other, "request failed before streaming")
         });
         Err(retry_usage::error_with_previous(error, prior_usage).into())
+        }).await.map_err(|error| {
+            execution.record_provider_failure(physical_attempt, &error);
+            crate::request_execution::include_stalled_usage(error, estimated_input, prior_usage)
+        })
     }
 
     async fn list_models(&self) -> Result<Vec<crate::provider::ServedModel>> {
@@ -558,30 +579,35 @@ impl OpenAiProvider {
         url: &str,
         body: &Value,
         wire_request_id: &str,
-        retry_attempt: u32,
-        idempotency_key: &str,
         token: &str,
         payment_signature: Option<&str>,
+        execution: &crate::RequestExecution,
+        sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<reqwest::Response, ProviderError> {
         let mut builder = self
             .http
             .post(url)
             .header("x-request-id", wire_request_id)
-            .header("x-request-attempt", retry_attempt.to_string())
-            .header("idempotency-key", idempotency_key)
             .json(body);
         if let Some(signature) = payment_signature {
             builder = builder.header(x402::X402_PAYMENT_SIGNATURE_HEADER, signature);
         } else {
             builder = with_optional_bearer(builder, token);
         }
-        crate::http::send_with_retry(builder).await.map_err(|_| {
-            ProviderError::new(
-                ProviderErrorKind::Outage,
-                "request to model endpoint failed",
+        execution
+            .dispatch(
+                builder,
+                if self.pipe_metadata {
+                    "pipenetwork"
+                } else {
+                    "openai"
+                },
+                body.get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                sink,
             )
-            .with_api_contract(None, Some(true), None)
-        })
+            .await
     }
 
     async fn dispatch_chat(
@@ -589,21 +615,12 @@ impl OpenAiProvider {
         url: &str,
         body: &Value,
         wire_request_id: &str,
-        retry_attempt: u32,
-        idempotency_key: &str,
+        execution: &crate::RequestExecution,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<reqwest::Response, ProviderError> {
         let token = self.auth.token().await;
         let response = self
-            .post_chat(
-                url,
-                body,
-                wire_request_id,
-                retry_attempt,
-                idempotency_key,
-                &token,
-                None,
-            )
+            .post_chat(url, body, wire_request_id, &token, None, execution, sink)
             .await?;
         if response.status() != StatusCode::PAYMENT_REQUIRED {
             return Ok(response);
@@ -633,7 +650,10 @@ impl OpenAiProvider {
             "x402 quote ${:.6} — paying USDC on Solana",
             summary.usd
         )));
-        let signature = session.settler.settle(&accepted).await.map_err(|error| {
+        execution.note_state(crate::ProviderAttemptState::WaitingForApproval, sink);
+        let signature_result = session.settler.settle(&accepted).await;
+        execution.note_state(crate::ProviderAttemptState::ApprovalCompleted, sink);
+        let signature = signature_result.map_err(|error| {
             ProviderError::new(
                 ProviderErrorKind::PaymentRequired,
                 format!("x402 settlement failed: {error:#}"),
@@ -663,10 +683,10 @@ impl OpenAiProvider {
                     url,
                     body,
                     wire_request_id,
-                    retry_attempt,
-                    idempotency_key,
                     "",
                     Some(&encoded),
+                    execution,
+                    sink,
                 )
                 .await?;
             if paid.status().is_success() || paid.status() != StatusCode::CONFLICT {
@@ -682,7 +702,14 @@ impl OpenAiProvider {
             sink(StreamEvent::Status(
                 "waiting for Solana confirmation — retrying the same signature".to_string(),
             ));
-            tokio::time::sleep(delay).await;
+            execution.backoff(delay).await.map_err(|error| {
+                error.downcast::<ProviderError>().unwrap_or_else(|_| {
+                    ProviderError::new(
+                        ProviderErrorKind::PaymentRequired,
+                        "payment retry wait exhausted",
+                    )
+                })
+            })?;
             delay = (delay * 2).min(Duration::from_secs(4));
         }
     }
@@ -700,12 +727,6 @@ fn canonical_request_id(request_id: Option<&str>) -> String {
     } else {
         format!("hi_{}", uuid::Uuid::new_v4().simple())
     }
-}
-
-fn request_idempotency_key(correlation_id: &str, body: &Value) -> String {
-    let encoded = serde_json::to_vec(body).unwrap_or_default();
-    let digest = blake3::hash(&encoded).to_hex();
-    format!("{correlation_id}:{}", &digest[..24])
 }
 
 fn retry_after_header_seconds(response: &reqwest::Response) -> Option<u64> {
@@ -760,6 +781,10 @@ fn header_number(headers: &header::HeaderMap, name: &str) -> u64 {
         .filter(|value| value.is_finite() && *value >= 0.0)
         .map(|value| value as u64)
         .unwrap_or(0)
+}
+
+pub(crate) fn explicit_retryable(text: &str) -> Option<bool> {
+    request::parse_api_error(None, text).explicit_retryable
 }
 
 #[cfg(test)]
@@ -895,8 +920,8 @@ mod tests {
         );
         assert_eq!(
             server.request_attempts(),
-            vec![Some("2".to_string()), Some("2".to_string())],
-            "wire-shape fallback stays on the same logical recovery attempt"
+            vec![Some("0".to_string()), Some("0".to_string())],
+            "each distinct payload starts its own exact-replay ordinal"
         );
         assert_eq!(audits[1].response_status, Some(200));
         assert!(
@@ -1095,7 +1120,7 @@ mod tests {
         provider.stream(req, &mut |_| {}).await.unwrap();
 
         assert_eq!(server.request_ids(), vec![Some("hi_turn_123".to_string())]);
-        assert_eq!(server.request_attempts(), vec![Some("1".to_string())]);
+        assert_eq!(server.request_attempts(), vec![Some("0".to_string())]);
         let keys = server.idempotency_keys();
         assert!(
             keys[0]
@@ -1880,6 +1905,7 @@ mod tests {
             model: "m".into(),
             request_id: None,
             retry_attempt: 0,
+            execution: Default::default(),
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),

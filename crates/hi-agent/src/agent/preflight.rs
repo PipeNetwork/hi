@@ -682,8 +682,9 @@ impl crate::Agent {
             arguments: arguments.clone(),
         }];
         let results = vec![(id.clone(), output.content.clone())];
-        if let Err(stage_error) =
-            self.stage_active_workspace_execution(&calls, &assistant_content, &results, &execution)
+        if let Err(stage_error) = self
+            .stage_active_workspace_execution(&calls, &assistant_content, &results, &execution)
+            .await
         {
             let mut indeterminate = execution;
             indeterminate.disposition = hi_workspace::ExecutionDisposition::Indeterminate;

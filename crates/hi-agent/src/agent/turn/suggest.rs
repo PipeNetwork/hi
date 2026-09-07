@@ -26,6 +26,9 @@ const MAX_SUGGESTION_CHARS: usize = 160;
 impl crate::Agent {
     /// Whether this settled turn should attempt a next-prompt suggestion.
     pub(super) fn should_suggest_next_prompt(&self, outcome: &crate::TurnOutcome) -> bool {
+        if self.answer_state != crate::recovery::AnswerState::Accepted {
+            return false;
+        }
         if !self.config.memory.suggest_next_prompt {
             return false;
         }
@@ -86,6 +89,7 @@ impl crate::Agent {
         let model = self.config.routing.model.clone();
         let request_policy = self.seal_chat_only_auxiliary_request(&model, 64).await;
         let request = ChatRequest {
+            execution: self.request_execution(),
             model,
             request_id: None,
             retry_attempt: 0,
@@ -118,6 +122,7 @@ impl crate::Agent {
             | StreamEvent::Warning(_)
             | StreamEvent::Reasoning(_)
             | StreamEvent::WireAudit(_)
+            | StreamEvent::ProviderAttempt(_)
             | StreamEvent::ToolCallDelta { .. } => {}
         };
         let timeout = self.side_call_timeout();
