@@ -1,16 +1,8 @@
-//! Text-answer Steer path: unfinished continues, **answer-repair** quality
-//! nudges, and implementation completeness gates.
-//!
-//! Answer repair (`ReviewRepairMode` / `ReviewRepairBudgets`) is distinct from
-//! post-mutation **completion review** (`ReviewPolicy` → `ReviewStatus`) and
-//! the long-horizon **goal skeptic**.
+//! Text-answer steering: unfinished work and implementation completeness.
 
 use hi_ai::Content;
 
-use crate::steering::{
-    EvidenceTracker, ImplementationIntent, ImplementationTracker, ReviewIntent,
-    repair_nudge_with_required_next,
-};
+use crate::steering::{EvidenceTracker, ImplementationIntent, ImplementationTracker, ReviewIntent};
 use crate::transcript::NudgeKind;
 use crate::{GOAL_CONTINUE_NUDGE, PLAN_CONTINUE_NUDGE, Ui};
 
@@ -32,7 +24,7 @@ impl crate::Agent {
         requested_validation: bool,
         implementation_tracker: &mut ImplementationTracker,
         evidence: &mut EvidenceTracker,
-        review_repair: &mut ReviewRepairState,
+        _review_repair: &mut ReviewRepairState,
         progress_tracker: &mut ProgressTracker,
         silent_continues: &mut u32,
         generic_completion_retries: &mut u32,
@@ -46,7 +38,6 @@ impl crate::Agent {
         ui: &mut dyn Ui,
     ) -> anyhow::Result<RoundControl> {
         self.set_turn_phase(TurnPhase::Steer);
-        let budgets = self.config.loop_limits.review_repair.clone();
         // Text but no tool call (the content-less case was handled
         // above). Silently re-prompt the model to continue — no
         // status line, no steer counter, no visible nudge.
@@ -207,69 +198,9 @@ impl crate::Agent {
                 None => {}
             }
         }
-        // Table-driven review quality cascade (order = REVIEW_QUALITY_CASCADE).
-        match super::cascade::select_review_quality_repair(
-            read_only_intent,
-            evidence,
-            assistant_text,
-            review_repair,
-            &budgets,
-        ) {
-            Some(super::cascade::QualityCascadeAction::Repair {
-                mode,
-                status,
-                nudge_body,
-                force_tools,
-                force_text,
-            }) => {
-                assert!(
-                    review_repair.spend(mode, evidence, &budgets),
-                    "answer-repair spend must succeed after cascade has_budget for {}",
-                    mode.key()
-                );
-                *force_tools_next = force_tools;
-                *force_text_answer_next = force_text;
-                ui.nudge(&status);
-                // Some modes use ui.status historically; keep nudge for all for visibility.
-                self.messages.push_assistant_repair_note(mode);
-                self.messages.push_nudge(
-                    NudgeKind::Continue,
-                    repair_nudge_with_required_next(mode, nudge_body),
-                );
-                return Ok(RoundControl::Continue);
-            }
-            Some(super::cascade::QualityCascadeAction::Exhausted { mode, status }) => {
-                if self.try_no_progress_recovery(
-                    progress_tracker,
-                    force_tools_next,
-                    Some(continue_total_nudges),
-                    ui,
-                ) {
-                    self.messages
-                        .push_assistant(std::mem::take(completion_content));
-                    return Ok(RoundControl::Continue);
-                }
-                let reason = review_repair.exhausted(mode);
-                progress_tracker.record(ProgressKind::None, reason, None);
-                ui.nudge(&status);
-                if matches!(mode, crate::steering::AnswerRepairMode::GapSearchOverclaim) {
-                    // A contradiction between search evidence and the model's
-                    // final claim is different from a merely format-weak
-                    // answer. Never surface the overclaim as the result after
-                    // its bounded repair budget is spent. Review text is
-                    // buffered for read-only turns, so replacing it here keeps
-                    // the user-visible answer honest and single-owned.
-                    self.task_recovery
-                        .stop("answer repair exhausted without supporting evidence");
-                    return Ok(RoundControl::Finish(
-                        crate::agent::turn::ModelLoopDecision::Verify,
-                    ));
-                }
-                // Repair exhaustion is advisory. Preserve and return the
-                // model's answer instead of manufacturing a failed turn.
-            }
-            None => {}
-        }
+        // A review answer is model-authored content. Do not reject or rewrite
+        // it based on evidence counts, disclaimer phrases, or required headings.
+        // Execution and verification outcomes remain independently enforced.
         // A syntactically valid but content-free completion claim is never a
         // user answer. Give ordinary Q&A and already-satisfied implementation
         // turns one compact retry. If the provider repeats the same canned

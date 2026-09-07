@@ -432,10 +432,6 @@ impl EvidenceTracker {
         self.saw_listing && !self.saw_search && !self.saw_read
     }
 
-    pub(crate) fn has_discovery(&self) -> bool {
-        self.saw_listing || self.saw_search || self.saw_read
-    }
-
     pub(crate) fn discovery_depth(&self) -> &'static str {
         let kinds = usize::from(self.saw_listing)
             + usize::from(self.saw_search)
@@ -453,10 +449,6 @@ impl EvidenceTracker {
         self.first_tool_kind
             .map(EvidenceKind::as_str)
             .unwrap_or("none")
-    }
-
-    pub(crate) fn security_search_complete(&self) -> bool {
-        self.security_unsafe_search && self.security_execution_search && self.security_secret_search
     }
 
     pub(crate) fn record_search_hit_snippets(&mut self, output: &str) {

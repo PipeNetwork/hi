@@ -186,6 +186,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_edit_implementation_survives_intermediate_cargo_failures() {
+        use crate::tests::common::{RecordingUi, completion};
+        use hi_ai::Content;
+
+        let workspace = IsolatedWorkspace::new("chat-multi-edit-checks");
+        let root = workspace.path("");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"multi_edit_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let mut source = "pub fn answer() -> u32 { 0 }\n".to_owned();
+        std::fs::write(root.join("src/lib.rs"), &source).unwrap();
+        let preparation = tokio::process::Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(&root)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            preparation.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preparation.stderr)
+        );
+        let mut responses = vec![completion(
+            vec![Content::ToolCall {
+                id: "read-source".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"src/lib.rs"}"#.into(),
+            }],
+            1,
+            1,
+        )];
+        // Five successful edits whose automatic checks fail exceeds the old
+        // task recovery allowance. Only the final edit completes the feature.
+        for index in 0..6 {
+            let next = if index == 5 {
+                "pub fn answer() -> u32 { 42 }\n".to_owned()
+            } else {
+                format!("pub fn answer() -> u32 {{ pending_{index}() }}\n")
+            };
+            responses.push(completion(vec![Content::ToolCall {
+                id: format!("edit-{index}"), name: "edit".into(),
+                arguments: serde_json::json!({"path":"src/lib.rs", "old_string":source, "new_string":next}).to_string(),
+            }], 1, 1));
+            source = next;
+        }
+        responses.push(completion(
+            vec![Content::Text(
+                "Implemented answer in src/lib.rs; cargo check passed.".into(),
+            )],
+            1,
+            1,
+        ));
+        let mut cfg = workspace.config();
+        cfg.gates.lsp_mode = crate::LspMode::Off;
+        cfg.gates.verification =
+            crate::VerificationMode::Explicit(vec![crate::config::VerifyStage::new(
+                "check",
+                "cargo check --quiet",
+            )]);
+        let mut agent = crate::Agent::new(Arc::new(Canned(Mutex::new(responses))), cfg).unwrap();
+        let mut ui = RecordingUi::default();
+        let outcome = agent
+            .run_turn("Implement the answer function in src/lib.rs", &mut ui)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::TurnStatus::Completed,
+            "{outcome:?}: {:?}",
+            ui.statuses
+        );
+        assert_eq!(outcome.verification, crate::VerificationStatus::Passed);
+        assert!(!agent.task_recovery.exhausted);
+        assert_eq!(agent.task_recovery.interventions, 0);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            source
+        );
+        assert!(
+            ui.statuses
+                .iter()
+                .filter(|status| status.contains("cannot find function `pending_"))
+                .count()
+                >= 5,
+            "{:?}",
+            ui.statuses
+        );
+    }
+
+    #[tokio::test]
     async fn actual_final_cargo_check_clears_repaired_fast_check_failure() {
         use crate::config::VerifyStage;
         use crate::verify::{VerifyOutcome, VerifyWorkspace, WorkspaceRepairVerifier};
@@ -243,7 +336,7 @@ mod tests {
         package_outcome(&agent.runtime, &mut observations, failed, input).await;
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].status, ValidationResult::Failed);
-        agent.task_recovery.observe(&observations[0]);
+        agent.task_recovery.observe_feedback(&observations[0]);
         let baseline = crate::snapshot::workspace_snapshot(&root).await.unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
         let revision = input_revision(&agent.runtime).await.unwrap();

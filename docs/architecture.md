@@ -15,7 +15,7 @@ hi-cli → hi-agent → hi-ai (providers)
 |--------|---------------|------|
 | Turn loop | `hi-agent` (`run_turn` / `TurnPhase`) | Setup → (Model → Tools → Steer)* → WorkspaceRepair → Settle → Finalize → Done |
 | Workspace repair | `hi_agent::verify::WorkspaceRepairVerifier` | compile/lint/test stages; failures feed the model |
-| Review repair | `hi_agent::steering::ReviewRepairMode` | answer-quality nudges in Steer (not shell stages) |
+| Answer handling | `hi-agent` Steer | preserves model answers; no evidence-count, disclaimer, or heading-based review repair |
 | Session memory | `hi_agent::memory` | markdown bullets (`.hi/memory.md`, user global) |
 | Runtime | process-local `WorkspaceRuntime` | tools, ledger, LSP, checkpoints |
 | Shell sandbox | `hi_tools::sandbox` (`HI_SANDBOX`) | default workspace write confine (`off` to disable); see [sandbox.md](sandbox.md) |
@@ -23,6 +23,13 @@ hi-cli → hi-agent → hi-ai (providers)
 This path is what developers run day to day. Verification here is a **workspace
 repair gate**, not a cryptographic attestation. CLI RSI hooks stay thin
 (`hi-cli` `rsi_bootstrap`) — descriptors, budgets, trace observation only.
+
+Automatic post-edit checks report intermediate failures without consuming the
+task's repair allowance. Their unresolved failures remain persisted verification
+obligations. Explicit checks and final verification still enforce failure and
+repeat limits. The no-change implementation challenge permits either an edit or
+an explanation; it does not force a tool protocol fallback for a text answer.
+Historical review-repair keys remain readable in older session telemetry.
 
 Built-in tools stay a thin remote control over human developer surfaces (files,
 shell, real CLIs). Adding to the catalog follows

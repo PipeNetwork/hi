@@ -126,7 +126,11 @@ fn evaluate_gate(
     let used = gate.counter(tracker);
     if used < gate.budget() {
         let next = used + 1;
-        let use_text_fallback = next >= gate.budget();
+        // The no-change challenge explicitly permits an explanation that the
+        // work is already satisfied. Requiring a tool (or calling valid prose
+        // a protocol failure and forcing XML) makes that answer impossible.
+        let allows_explanation = gate == ImplementationGate::NoChanges;
+        let use_text_fallback = !allows_explanation && next >= gate.budget();
         let (status, body) = match gate {
             ImplementationGate::NoChanges => (
                 "implementation answer had no file changes; nudging the model to edit or scaffold",
@@ -154,7 +158,7 @@ fn evaluate_gate(
             gate,
             status,
             nudge_body,
-            force_tools: !use_text_fallback,
+            force_tools: !allows_explanation && !use_text_fallback,
             text_tool_fallback: use_text_fallback,
         })
     } else {
@@ -187,6 +191,25 @@ pub(super) fn spend_implementation_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_change_challenge_allows_an_answer_without_protocol_fallback() {
+        for no_change_nudges in 0..2 {
+            let tracker = ImplementationTracker {
+                no_change_nudges,
+                ..ImplementationTracker::default()
+            };
+            assert!(matches!(
+                select_implementation_completeness(None, true, false, true, &tracker),
+                Some(ImplementationCascadeAction::Repair {
+                    gate: ImplementationGate::NoChanges,
+                    force_tools: false,
+                    text_tool_fallback: false,
+                    ..
+                })
+            ));
+        }
+    }
 
     #[test]
     fn cascade_order_is_no_change_scaffold_validation() {

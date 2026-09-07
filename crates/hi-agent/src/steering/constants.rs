@@ -65,9 +65,6 @@ pub(crate) const BOOKKEEPING_REPOST_NUDGE: &str = "You repeated a bookkeeping ca
 are saved; bookkeeping tools are unavailable for your next action. Do the actual work now: \
 inspect files with read/list/grep, run a command with bash, or make an edit.";
 
-pub(crate) const NO_EVIDENCE_REVIEW_NUDGE: &str = "This read-only review has no inspected evidence yet. \
-Do not finalize. Use read-only inspection tools first, then answer from the inspected evidence. \
-If inspection is impossible, explain which inspection failed and what remains unknown.";
 /// In-turn elision occupancy for classified read-only reviews. 12k fired as
 /// soon as the system prompt + skill pack landed, stubbing every tool result
 /// and sending the model hunting for evidence it no longer had (live: 45+
@@ -83,30 +80,6 @@ pub(crate) const READ_ONLY_PREFLIGHT_GREP_MAX_LINES: usize = 32;
 pub(crate) const READ_ONLY_PREFLIGHT_DIFF_MAX_LINES: usize = 160;
 pub(crate) const SECURITY_PREFLIGHT_EXTRA_READ_LIMIT: u32 = 90;
 pub(crate) const DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT: u32 = 120;
-pub(crate) const NO_EVIDENCE_SECURITY_NUDGE: &str = "This security review has no inspected evidence yet. \
-Do not finalize. Search for unsafe, unwrap, expect, panic!, command execution, filesystem/env \
-access, and secret/token/auth patterns, then read the most relevant matching files before answering.";
-pub(crate) const NO_EVIDENCE_STATUS_NUDGE: &str = "This status review has no inspected evidence yet. \
-Do not finalize. Inspect git status or diff summary, workspace manifests, README/docs if present, \
-main crate or module entrypoints, and tests before making status claims.";
-pub(crate) const NO_EVIDENCE_GAP_NUDGE: &str = "This gap or roadmap review has no inspected evidence yet. \
-Do not finalize. Inspect manifests, owning modules, tests, and TODO/FIXME or missing-coverage \
-search results before naming gaps or build-next work.";
-pub(crate) const REVIEW_DEEPEN_NUDGE: &str = "This read-only review only has a directory listing so far. \
-Do not finalize yet. Use a targeted search or read relevant files, then answer from the inspected \
-evidence. If deeper inspection is impossible, explain which files or searches could not be checked.";
-pub(crate) const SECURITY_DEEPEN_NUDGE: &str = "This security review only has a directory listing so far. \
-Do not finalize yet. Search for unsafe, unwrap, expect, panic!, command execution, filesystem/env \
-access, and secret/token/auth patterns, then read the most relevant matching files before answering.";
-pub(crate) const STATUS_DEEPEN_NUDGE: &str = "This status review only has a directory listing so far. Do \
-not finalize yet. Inspect git status or diff summary, workspace manifests, README/docs if present, \
-main crate or module entrypoints, and tests before making status claims.";
-pub(crate) const GAP_DEEPEN_NUDGE: &str = "This gap or roadmap review only has a directory listing so far. \
-Do not finalize yet. Inspect manifests, owning modules, tests, and TODO/FIXME or missing-coverage \
-search results before naming gaps or build-next work.";
-pub(crate) const CONCRETE_REVIEW_NUDGE: &str = "Your read-only review answer did not cite concrete files or \
-modules from the inspected evidence. Do not use mutating tools. Answer again with bounded findings \
-tied to inspected paths and a brief Limits section naming what remains unknown.";
 pub(crate) const READ_AFTER_SEARCH_NUDGE: &str = "The targeted search result is already in the transcript. \
 Do not rerun the same search and do not use mutating tools. Read the most relevant matching file, \
 then answer from that inspected file. If you cannot pick a file to read, explain that limitation \
@@ -150,19 +123,6 @@ pub(crate) const BACKGROUND_WAIT_FINAL_NUDGE: &str = "The background process is 
 were already asked to stop polling it. Give your final status answer now: state that the work remains \
 in progress, what has been completed so far, and what remains. Do not call any tools and do not claim \
 completion or failure.";
-pub(crate) const SECURITY_BROAD_SEARCH_NUDGE: &str = "This security review searched and read some evidence, \
-but it has not covered all required pattern families yet. Do not use mutating tools. Search for \
-unsafe/unwrap/expect/panic, command execution/filesystem/env access, and secret/token/auth \
-patterns, then answer only from concrete inspected evidence with a Limits section for unsearched \
-areas.";
-pub(crate) const SECURITY_SCOPE_NUDGE: &str = "The security answer made repo-wide all-clear claims that are \
-broader than the inspected files and search results support. Do not use mutating tools. Answer \
-again with findings explicitly bounded to the searched patterns and inspected files, and name any \
-broader security claims that remain unverified.";
-pub(crate) const GAP_SEARCH_OVERCLAIM_NUDGE: &str = "The gap or roadmap answer claimed there were no \
-TODO/FIXME/missing gaps even though the targeted search returned matches. Do not use mutating \
-tools. Answer again from the inspected files and search matches, with Limits for broader roadmap \
-claims.";
 pub(crate) const SECURITY_PREFLIGHT_PATTERN: &str = "unsafe|unwrap\\(|expect\\(|panic!|std::process|process::Command|Command::new|spawn\\(|std::fs|fs::|read_to_string|std::env|env::|secret|token|auth|api_key|apikey|password|credential|bearer";
 pub(crate) const GAP_PREFLIGHT_PATTERN: &str =
     "TODO|FIXME|todo!|unimplemented!|missing|gap|needs coverage|not implemented";

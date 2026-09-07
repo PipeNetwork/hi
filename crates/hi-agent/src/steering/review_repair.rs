@@ -1,23 +1,8 @@
-//! Centralized **answer-repair** mode metadata (Steer phase).
+//! Historical answer-repair telemetry keys, retained to read older sessions.
 //!
-//! # Three "review" systems (do not conflate)
-//!
-//! | System | Types | Phase |
-//! |---|---|---|
-//! | **Answer repair** | [`ReviewRepairMode`] / [`AnswerRepairMode`], [`crate::ReviewRepairBudgets`] | Steer |
-//! | **Completion review** | [`crate::ReviewPolicy`] / [`crate::CompletionReviewPolicy`], [`crate::SkepticVerdict`] → [`crate::ReviewStatus`] | after WorkspaceRepair |
-//! | **Goal skeptic** | `skeptic_gate` → [`crate::ReviewStatus`] | goal advance |
-//!
-//! These modes nudge the model when a read-only **answer** is weak (no
-//! evidence, generic template, …). They never run shell stages.
-//!
-//! Contrast with [`crate::verify::WorkspaceRepairVerifier`] (WorkspaceRepair
-//! phase), which runs compile/lint/test and feeds failures back into the loop.
+//! The evidence/format repair cascade has been removed. Only repeated-tool
+//! recovery still uses SprawlForceAnswer to request an answer from existing results.
 
-/// Local **answer-repair** modes for read-only turns (answer quality, not tests).
-///
-/// Prefer the alias [`AnswerRepairMode`] in new code. The string keys are
-/// report/telemetry wire values — keep them stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ReviewRepairMode {
     NoEvidence,
@@ -31,13 +16,8 @@ pub(crate) enum ReviewRepairMode {
     SecurityScope,
     GapSearchOverclaim,
     /// Force a bounded chat answer after inspection-sprawl already fired.
-    /// Not part of [`REVIEW_QUALITY_CASCADE`]; budgeted separately so cascade
-    /// spends cannot starve the force-answer path.
     SprawlForceAnswer,
 }
-
-/// Alias for [`ReviewRepairMode`] — Steer answer quality only.
-pub(crate) type AnswerRepairMode = ReviewRepairMode;
 
 impl ReviewRepairMode {
     pub(crate) const ALL: &'static [Self] = &[
@@ -70,6 +50,7 @@ impl ReviewRepairMode {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn exhaustion_key(self) -> &'static str {
         match self {
             Self::NoEvidence => "review_no_evidence_exhausted",
@@ -161,6 +142,7 @@ impl ReviewRepairMode {
     }
 
     /// Budget for this mode from operator-tunable loop limits.
+    #[cfg(test)]
     pub(crate) fn limit_with(self, budgets: &crate::config::ReviewRepairBudgets) -> u32 {
         budgets.limit_for_key(self.key())
     }
@@ -205,83 +187,4 @@ pub(crate) fn compact_review_repair_label(label: &str) -> String {
         other => other,
     }
     .to_string()
-}
-
-/// Preface modes evaluated **before** [`REVIEW_QUALITY_CASCADE`].
-///
-/// Today this is only SecurityBroad when a Security intent answers with an
-/// insufficient-evidence disclaimer after a partial security search — historical
-/// priority over the disclaimer branch. Kept as an explicit list so order tests
-/// cover the real selector priority, not only the table walk.
-pub(crate) const REVIEW_QUALITY_PREFACE: &[ReviewRepairMode] =
-    &[ReviewRepairMode::SecurityBroadSearch];
-
-/// Text-only Steer quality-repair cascade order (after unfinished/plan,
-/// implementation-completeness, and [`REVIEW_QUALITY_PREFACE`]). Walked by
-/// [`crate::agent::turn::steer::cascade::select_review_quality_repair`] — tests
-/// freeze the order so a casual reorder fails loudly.
-///
-/// [`ReviewRepairMode::SprawlForceAnswer`] is intentionally absent: it is a
-/// dedicated force-answer budget outside the quality cascade.
-pub(crate) const REVIEW_QUALITY_CASCADE: &[ReviewRepairMode] = &[
-    ReviewRepairMode::NoEvidence,
-    ReviewRepairMode::InspectedDisclaimer,
-    ReviewRepairMode::InspectedDisclaimerChatAttempt,
-    ReviewRepairMode::GenericTemplate,
-    ReviewRepairMode::ListingOnly,
-    ReviewRepairMode::ReadAfterSearch,
-    ReviewRepairMode::SecurityBroadSearch,
-    ReviewRepairMode::SecurityScope,
-    ReviewRepairMode::GapSearchOverclaim,
-    ReviewRepairMode::ConcreteAnswer,
-];
-
-#[cfg(test)]
-mod cascade_tests {
-    use super::*;
-
-    #[test]
-    fn quality_cascade_is_unique_and_covers_known_modes() {
-        let mut seen = std::collections::BTreeSet::new();
-        for mode in REVIEW_QUALITY_CASCADE {
-            assert!(
-                seen.insert(mode.key()),
-                "duplicate cascade entry {}",
-                mode.key()
-            );
-            assert!(
-                ReviewRepairMode::ALL.contains(mode),
-                "{} missing from ReviewRepairMode::ALL",
-                mode.key()
-            );
-        }
-        for mode in REVIEW_QUALITY_PREFACE {
-            assert!(
-                ReviewRepairMode::ALL.contains(mode),
-                "preface mode {} missing from ALL",
-                mode.key()
-            );
-        }
-        // Disclaimer family shares exhaustion key but remains distinct cascade steps.
-        assert!(REVIEW_QUALITY_CASCADE.contains(&ReviewRepairMode::InspectedDisclaimer));
-        assert!(REVIEW_QUALITY_CASCADE.contains(&ReviewRepairMode::InspectedDisclaimerChatAttempt));
-        // Sprawl force-answer is budgeted outside the quality cascade.
-        assert!(!REVIEW_QUALITY_CASCADE.contains(&ReviewRepairMode::SprawlForceAnswer));
-        assert!(!REVIEW_QUALITY_PREFACE.contains(&ReviewRepairMode::SprawlForceAnswer));
-    }
-
-    #[test]
-    fn cascade_runs_no_evidence_before_concrete_and_security_before_gap() {
-        let idx = |m: ReviewRepairMode| {
-            REVIEW_QUALITY_CASCADE
-                .iter()
-                .position(|x| *x == m)
-                .expect("mode in cascade")
-        };
-        assert!(idx(ReviewRepairMode::NoEvidence) < idx(ReviewRepairMode::ConcreteAnswer));
-        assert!(idx(ReviewRepairMode::ReadAfterSearch) < idx(ReviewRepairMode::ConcreteAnswer));
-        assert!(idx(ReviewRepairMode::SecurityBroadSearch) < idx(ReviewRepairMode::SecurityScope));
-        assert!(idx(ReviewRepairMode::SecurityScope) < idx(ReviewRepairMode::GapSearchOverclaim));
-        assert!(idx(ReviewRepairMode::ListingOnly) < idx(ReviewRepairMode::ConcreteAnswer));
-    }
 }

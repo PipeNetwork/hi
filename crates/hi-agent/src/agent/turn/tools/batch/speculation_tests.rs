@@ -296,6 +296,11 @@ async fn terminal_nested_poll_observes_and_settles_its_live_writer_job() {
                 .await
                 .iter()
                 .any(|job| job.handle == handle)
+                // The durable observation becomes pending before the driver
+                // publishes its terminal process snapshot. This test exercises
+                // a terminal poll, not a poll racing that publication.
+                && agent.runtime.background().outcome(&handle).unwrap().state
+                    != hi_tools::BackgroundState::Running
             {
                 break;
             }

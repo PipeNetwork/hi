@@ -143,8 +143,8 @@ async fn background_explore_inherits_the_parent_capability_registry() {
 
     assert_eq!(
         terminal.state,
-        hi_tools::BackgroundTaskState::Failed,
-        "a catalog-only explorer cannot complete an evidence-required task: {}",
+        hi_tools::BackgroundTaskState::Completed,
+        "the child answer should settle without evidence-count repair: {}",
         terminal.output
     );
     assert!(

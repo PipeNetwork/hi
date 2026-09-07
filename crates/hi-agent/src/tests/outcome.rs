@@ -665,6 +665,40 @@ async fn tool_using_turn_with_explicit_noop_answer_completes_after_challenge() {
 }
 
 #[tokio::test]
+async fn build_followup_accepts_past_tense_no_further_changes_after_inspection() {
+    let workspace = IsolatedWorkspace::new("chat-already-built");
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    std::fs::write(
+        workspace.path("src/protocol.rs"),
+        "enum Command { Kicked }\n",
+    )
+    .unwrap();
+    let answer = "The Kicked variant is implemented in src/protocol.rs. No further file changes were needed — the build request was already satisfied by the prior turn's work.";
+    let mut agent = agent(
+        vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "inspect-protocol".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"src/protocol.rs"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            completion(vec![Content::Text(answer.into())], 1, 1),
+            completion(vec![Content::Text(answer.into())], 1, 1),
+        ],
+        workspace.config(),
+    );
+    let mut ui = RecordingUi::default();
+    let outcome = agent.run_turn("build all of that", &mut ui).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(agent.last_turn_telemetry().continue_nudges, 1);
+    assert!(!agent.task_recovery.exhausted);
+    assert!(agent.messages().last().unwrap().text().contains(answer));
+}
+
+#[tokio::test]
 async fn no_change_challenge_accepts_explicit_decline() {
     // The no-change nudge offers an escape hatch: edit now, or state plainly
     // that no file changes are needed. A challenged model that explicitly

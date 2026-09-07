@@ -326,6 +326,17 @@ impl TaskRecoveryState {
     }
 
     pub(crate) fn observe(&mut self, observation: &ValidationObservation) {
+        self.observe_with_recovery(observation, true);
+    }
+
+    /// Automatic post-edit checks describe an intermediate workspace. Keep
+    /// their failures as verification obligations, but do not spend repair
+    /// attempts or detect repair cycles before the model finishes its edits.
+    pub(crate) fn observe_feedback(&mut self, observation: &ValidationObservation) {
+        self.observe_with_recovery(observation, false);
+    }
+
+    fn observe_with_recovery(&mut self, observation: &ValidationObservation, repair: bool) {
         self.migrate();
         if self.observed_executions.contains(&observation.execution_id) {
             return;
@@ -339,6 +350,16 @@ impl TaskRecoveryState {
             observation.status,
             ValidationResult::Infrastructure | ValidationResult::Deferred
         ) {
+            return;
+        }
+        if !repair && observation.status == ValidationResult::Failed {
+            self.validations
+                .entry(observation.scope.clone())
+                .or_default()
+                .current_failure = Some(CurrentValidationFailure {
+                input_revision: observation.input_revision.clone(),
+                diagnostics: observation.diagnostics.clone(),
+            });
             return;
         }
         let improved = self.observe_validation(
@@ -556,6 +577,14 @@ impl crate::Agent {
         self.task_recovery.observe(&observation);
         self.persist_task_recovery_async().await
     }
+
+    pub(crate) async fn observe_validation_feedback(
+        &mut self,
+        observation: ValidationObservation,
+    ) -> anyhow::Result<()> {
+        self.task_recovery.observe_feedback(&observation);
+        self.persist_task_recovery_async().await
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +593,94 @@ mod tests {
 
     fn failures(names: &[&str]) -> Option<BTreeSet<String>> {
         Some(names.iter().map(|name| (*name).to_owned()).collect())
+    }
+
+    #[test]
+    fn intermediate_compile_failures_do_not_spend_or_exhaust_recovery() {
+        let mut state = TaskRecoveryState::default();
+        // Adding an enum variant, its parser, and handlers can report the
+        // same missing arm several times, including across a resumed turn.
+        for (index, diagnostic) in [
+            "missing arm",
+            "missing arm",
+            "missing method",
+            "missing arm",
+            "missing arm",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let observation = ValidationObservation {
+                execution_id: format!("edit-{index}"),
+                scope: "cargo check".into(),
+                input_revision: format!("rev-{index}"),
+                status: ValidationResult::Failed,
+                diagnostics: failures(&[diagnostic]),
+                required_stage: false,
+                equivalent_scopes: Vec::new(),
+            };
+            state.observe_feedback(&observation);
+            assert!(!state.exhausted);
+            assert!(!state.pending_validation_correction);
+            assert_eq!(state.remaining, state.limit);
+            assert_eq!(
+                state.unresolved_validation_status(&observation.input_revision),
+                Some(ValidationResult::Failed)
+            );
+            state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        }
+        let final_check = ValidationObservation::command(
+            "final-check".into(),
+            "cargo check",
+            "finished".into(),
+            ValidationResult::Passed,
+            "",
+            std::path::Path::new("."),
+            true,
+        );
+        state.observe(&final_check);
+        assert_eq!(state.unresolved_validation_status("finished"), None);
+    }
+
+    #[test]
+    fn feedback_does_not_hide_failures_or_cancel_an_existing_repair() {
+        let mut state = TaskRecoveryState::default();
+        state.request_correction("required test failed");
+        let failure = ValidationObservation::command(
+            "fast-check".into(),
+            "cargo check",
+            "rev".into(),
+            ValidationResult::Failed,
+            "error[E0382]: partial move\n --> src/server.rs:482:4",
+            std::path::Path::new("."),
+            false,
+        );
+        state.observe_feedback(&failure);
+        assert!(state.pending_validation_correction);
+        assert_eq!(
+            state.unresolved_validation_status("rev"),
+            Some(ValidationResult::Failed)
+        );
+        assert_eq!(
+            state.unresolved_validation_status("changed"),
+            Some(ValidationResult::Deferred)
+        );
+        let mut final_failure = failure.clone();
+        final_failure.execution_id = "final-check".into();
+        final_failure.required_stage = true;
+        state.observe(&final_failure);
+        assert!(
+            !state.exhausted,
+            "the first final check is not a feedback cycle"
+        );
+        assert!(state.pending_validation_correction);
+        assert!(state.intervene("fix check"));
+        final_failure.execution_id = "repeated-final-check".into();
+        state.observe(&final_failure);
+        assert!(
+            state.exhausted,
+            "explicit failed verification loops remain bounded"
+        );
     }
 
     #[test]

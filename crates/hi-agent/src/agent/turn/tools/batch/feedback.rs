@@ -62,7 +62,7 @@ pub(super) async fn append_fast_feedback(
                 agent.runtime.root(),
             );
             let status = observation.status;
-            agent.observe_validation(observation).await?;
+            agent.observe_validation_feedback(observation).await?;
             if status == ValidationResult::Passed {
                 proactive_passes.push(format!("✓ fast check passed for {path} ({check})"));
             } else {
@@ -107,7 +107,7 @@ pub(super) async fn append_fast_feedback(
                 fast_failures.push(text);
             }
             for observation in report.observations {
-                agent.observe_validation(observation).await?;
+                agent.observe_validation_feedback(observation).await?;
             }
         }
         // Edits that landed on a definition line get a reverse-reference

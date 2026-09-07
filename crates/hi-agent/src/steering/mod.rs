@@ -2,8 +2,8 @@
 //!
 //! This module is the Steer-phase half of "review": intent classification,
 //! evidence/implementation trackers, preflight call planning, and **answer-repair**
-//! modes ([`ReviewRepairMode`] / [`AnswerRepairMode`]) when the model's answer
-//! lacks inspected evidence, concrete file citations, or post-edit validation.
+//! metadata for older sessions. Model answers are not rewritten or rejected
+//! based on evidence counts, disclaimer phrases, or heading templates.
 //!
 //! It does **not** own post-mutation **completion review** (`ReviewPolicy` →
 //! `ReviewStatus`) or the long-horizon **goal skeptic** — those live in

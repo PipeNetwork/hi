@@ -469,9 +469,12 @@ async fn bare_review_codebase_first_request_advertises_inspection_tools() {
 
     let outcome = agent.run_turn("review codebase", &mut ui).await.unwrap();
 
-    assert_eq!(outcome.status, TurnStatus::Failed);
-    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
-    assert!(agent.task_recovery().exhausted);
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
+    assert!(!agent.task_recovery().exhausted);
     let requests = tool_names.lock().unwrap();
     let modes = modes.lock().unwrap();
     assert!(
@@ -604,7 +607,7 @@ async fn bare_review_codebase_keeps_tools_after_two_distinct_inspection_rounds()
 }
 
 #[tokio::test]
-async fn bare_review_citation_repair_keeps_inspection_tools_without_a_hidden_wrap_up() {
+async fn bare_review_answer_keeps_inspection_tools_without_citation_repair() {
     let workspace = IsolatedWorkspace::new("bare-review-citation-repair-keeps-tools");
     std::fs::write(
         workspace.path("Cargo.toml"),
@@ -637,7 +640,7 @@ async fn bare_review_citation_repair_keeps_inspection_tools_without_a_hidden_wra
                 1,
                 1,
             ),
-            // Answer with no citation of inspected paths → ConcreteAnswer repair.
+            // A prose answer need not match a citation or heading template.
             completion(
                 vec![Content::Text(
                     "The codebase looks generally healthy with no obvious issues.".into(),
@@ -671,22 +674,12 @@ async fn bare_review_citation_repair_keeps_inspection_tools_without_a_hidden_wra
     let requests = tool_names.lock().unwrap();
     let modes = modes.lock().unwrap();
     assert!(
-        requests.len() >= 4,
-        "inspection, answer, and citation-repair: {requests:?}"
+        requests.len() == 3,
+        "two inspections and one answer, without citation-repair: {requests:?}"
     );
     assert_ne!(
         modes.get(2).copied(),
         Some(ToolMode::ChatOnly),
         "ordinary answer request must retain tools: {modes:?}"
-    );
-    let repair = requests.get(3).expect("citation-repair request");
-    assert!(
-        !repair.is_empty(),
-        "citation-repair must keep inspection tools: requests={requests:?} modes={modes:?}"
-    );
-    assert_ne!(
-        modes.get(3).copied(),
-        Some(ToolMode::ChatOnly),
-        "citation-repair must not be pinned chat-only: {modes:?}"
     );
 }
