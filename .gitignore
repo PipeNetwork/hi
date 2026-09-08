@@ -13,6 +13,7 @@
 /crates/*/.hi/transactions/
 /crates/*/.hi/history
 /crates/*/.hi/goal-plan.md
+/crates/*/.hi/events.sqlite3
 
 # Test artifacts: temp files created by hi-agent tests that leaked into the
 # workspace. visible_temp_file uses hi-test-* names in the workspace root (not
