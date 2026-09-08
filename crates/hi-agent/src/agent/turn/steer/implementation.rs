@@ -1,8 +1,9 @@
 //! Post-tool Steer: mutation recovery, repeat/no-progress, implementation stalls.
 
 use crate::steering::{
-    EvidenceTracker, IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker,
-    REREAD_NUDGE, WAIT_POLL_STATIC_NUDGE, bash_call_waits, implementation_text_tool_nudge,
+    BACKGROUND_WAIT_FINAL_NUDGE, BACKGROUND_WAIT_STATUS_NUDGE, EvidenceTracker,
+    IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker, REREAD_NUDGE,
+    WAIT_POLL_STATIC_NUDGE, bash_call_waits, implementation_text_tool_nudge,
     implementation_tool_call_validates, tool_validation_retry_nudge, unavailable_tool_retry_nudge,
 };
 use crate::transcript::NudgeKind;
@@ -11,7 +12,7 @@ use crate::ui::Ui;
 use super::super::phase::TurnPhase;
 use super::super::progress::{
     AWAITING_BACKGROUND_REASON, NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker,
-    no_progress_signature_for_calls,
+    WAITING_ROUND_BUDGET, no_progress_signature_for_calls,
 };
 use super::super::tools::{ToolBatchOutcome, ToolProtocolFailureKind};
 use super::RoundControl;
@@ -290,22 +291,47 @@ impl crate::Agent {
             ui.status("plan completed; settling from successful tool evidence");
             return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
         }
-        // A live command is still doing work. Poll counts say nothing about
-        // whether it is stuck, and must not remove the tools needed to finish.
-        // Failure diagnostics still fall through so the model can act on them.
+        // Waiting keys on lifecycle, not output novelty: a progress bar makes
+        // every poll look new. Latch wrap-up only after consecutive waiting
+        // rounds so one poll plus a status line cannot end the turn, and live
+        // polls cannot burn unbounded model rounds. Failure diagnostics still
+        // fall through so the model can act on them.
         let waiting_round = running_background_poll_results > 0
             && wait_flavored_results == calls.len()
             && actionable_poll_results == 0;
-        progress_tracker.awaiting_background = waiting_round;
+        if waiting_round {
+            progress_tracker.waiting_rounds = progress_tracker.waiting_rounds.saturating_add(1);
+        } else {
+            progress_tracker.waiting_rounds = 0;
+            progress_tracker.awaiting_background = false;
+        }
         if waiting_round {
             *repeat_nudges = 0;
-            *force_tools_next = false;
             progress_tracker.force_no_progress_final_answer_next = false;
             progress_tracker.record(
                 ProgressKind::Weak,
                 AWAITING_BACKGROUND_REASON,
                 no_progress_signature_for_calls(calls),
             );
+            if progress_tracker.waiting_rounds >= WAITING_ROUND_BUDGET {
+                let first_request = !progress_tracker.awaiting_background;
+                progress_tracker.awaiting_background = true;
+                *force_tools_next = false;
+                if first_request {
+                    ui.nudge(
+                        "the background process is still running; asking the model to wait once with wait_secs or wrap up with a status report",
+                    );
+                    self.messages
+                        .push_nudge(NudgeKind::Continue, BACKGROUND_WAIT_STATUS_NUDGE);
+                } else {
+                    progress_tracker.force_no_progress_final_answer_next = true;
+                    ui.nudge(
+                        "still polling after the wrap-up request — forcing a final status answer",
+                    );
+                    self.messages
+                        .push_nudge(NudgeKind::Continue, BACKGROUND_WAIT_FINAL_NUDGE);
+                }
+            }
             return RoundControl::Continue;
         }
         // A handle the model named that the registry has never seen. The

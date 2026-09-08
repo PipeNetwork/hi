@@ -35,22 +35,31 @@ impl crate::Agent {
         // Reaps only auto-backgrounded foreground overruns. Deliberate
         // `run_in_background` jobs (downloads, servers) survive the turn —
         // killing them here once cost two ~800 GB downloads at turn end.
+        // Wait even when verification is off so overrun bytes settle; the wait
+        // is bounded so a hung compile cannot park WorkspaceRepair forever.
         let finished_backgrounds = if self.task_recovery.exhausted {
             self.runtime
                 .background()
                 .kill_started_after_and_reap(turn_background_baseline)
                 .await?
         } else {
+            let deadline = tokio::time::Instant::now()
+                + self
+                    .config
+                    .verification_timeout
+                    .or_else(hi_tools::check_timeout)
+                    .filter(|timeout| !timeout.is_zero())
+                    .unwrap_or(self.config.harness.jobs.verifier_timeout);
             self.runtime
                 .background()
-                .wait_started_after_and_reap(turn_background_baseline)
-                .await
+                .wait_started_after_and_reap_before(turn_background_baseline, deadline)
+                .await?
         };
         if finished_backgrounds > 0 {
             ui.status(if self.task_recovery.exhausted {
                 "stopped auto-backgrounded commands after recovery ended"
             } else {
-                "foreground commands finished; continuing final verification"
+                "foreground commands settled; continuing final verification"
             });
             self.invalidate_snapshot();
             self.reconcile_workspace_changes().await?;

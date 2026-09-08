@@ -26,6 +26,10 @@ pub(super) const TOOL_LIMIT_WRAP_UP_NUDGE: &str = "You have reached this turn's 
 /// final-answer acceptance paths: it marks the turn as blocked only on live
 /// background work, so a status answer is a valid terminal outcome.
 pub(super) const AWAITING_BACKGROUND_REASON: &str = "background process is still running";
+/// Consecutive waiting rounds tolerated before the turn is steered to end with
+/// a status report. This catches fast completions without allowing unbounded
+/// model-driven polling.
+pub(super) const WAITING_ROUND_BUDGET: u32 = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProgressKind {
     Meaningful,
@@ -71,7 +75,9 @@ pub(super) struct ProgressTracker {
     pub(super) forced_final_answer_attempts: u32,
     pub(super) last_progress_reason: String,
     pub(super) last_no_progress_reason: String,
-    /// The latest tool round only watched still-running background work.
+    /// Consecutive tool rounds that only watched still-running background work.
+    pub(super) waiting_rounds: u32,
+    /// Sticky once the waiting budget is spent, until a round does real work.
     pub(super) awaiting_background: bool,
     /// Extra recoveries after a no-progress budget was spent (`max_keep_working`).
     pub(super) keep_working_rounds: u32,

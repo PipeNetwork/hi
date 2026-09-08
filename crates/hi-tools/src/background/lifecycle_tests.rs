@@ -388,3 +388,56 @@ async fn background_cancellation_keeps_unterminated_diagnostics() {
         crate::BackgroundState::Killed
     );
 }
+
+#[tokio::test]
+async fn overrun_wait_kills_hung_auto_backgrounded_processes() {
+    let _guard = TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join(".hi");
+    std::fs::create_dir(&state).unwrap();
+    let runner =
+        crate::ProcessRunner::new_with_policy(directory.path(), crate::sandbox::SandboxPolicy::Off)
+            .unwrap();
+    let registry = BackgroundRegistry::default();
+    let before = registry.ids();
+    let download = registry.spawn(&runner, "sleep 600").unwrap();
+    let snapshot = crate::effects::workspace_snapshot(directory.path(), &state)
+        .await
+        .unwrap();
+    let command = "sleep 600";
+    let mut child = runner.spawn_shell(command).unwrap();
+    let pgid = child.id().map(|p| p as i32);
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let adopted = registry
+        .adopt(
+            command,
+            child,
+            stdout,
+            stderr,
+            pgid,
+            String::new(),
+            (directory.path().into(), state, snapshot),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        registry.wait_started_after_and_reap_before(
+            &before,
+            tokio::time::Instant::now() + Duration::from_millis(80),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        registry.outcome(&adopted).unwrap().state,
+        crate::BackgroundState::Killed
+    );
+    assert_eq!(
+        registry.outcome(&download).unwrap().state,
+        crate::BackgroundState::Running
+    );
+    registry.kill_and_reap(&download).await.unwrap();
+}

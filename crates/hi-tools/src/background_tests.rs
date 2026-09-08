@@ -806,6 +806,7 @@ async fn normal_completion_wait_is_cancellation_safe_and_spares_deliberate_jobs(
         registry.wait_started_after_and_reap(&before),
     )
     .await
+    .unwrap()
     .unwrap();
     assert_eq!(
         std::fs::read_to_string(directory.path().join("completed")).unwrap(),

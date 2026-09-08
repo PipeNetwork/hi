@@ -105,6 +105,22 @@ re-run the same poll. Check the underlying process directly (bash_output on its 
 to block for new output instead of re-polling — its log file, or the process list), fix what is stuck if \
 you can, or if the wait is genuinely still in progress use a much longer interval. If you cannot make \
 progress now, stop and report the current state and what remains.";
+/// Sent when the turn has spent its waiting budget: several consecutive tool
+/// rounds did nothing but watch still-running background work. Babysitting a
+/// long process one model round at a time is the most expensive failure mode
+/// observed in real transcripts.
+pub(crate) const BACKGROUND_WAIT_STATUS_NUDGE: &str = "The background process is still running. Stop \
+polling it round after round. If it should produce output or finish within a few minutes, make ONE \
+bash_output call with wait_secs (up to 600) to block until then. Otherwise stop now and give a concise \
+final status: the work remains in progress, what has been completed so far, and what remains once it \
+finishes. Do not claim completion or failure, and do not keep watching a process that will run for a \
+long time.";
+/// Sent when the model keeps polling after [`BACKGROUND_WAIT_STATUS_NUDGE`] —
+/// the next round is forced tool-free so the status answer actually lands.
+pub(crate) const BACKGROUND_WAIT_FINAL_NUDGE: &str = "The background process is still running and you \
+were already asked to stop polling it. Give your final status answer now: state that the work remains \
+in progress, what has been completed so far, and what remains. Do not call any tools and do not claim \
+completion or failure.";
 pub(crate) const SECURITY_PREFLIGHT_PATTERN: &str = "unsafe|unwrap\\(|expect\\(|panic!|std::process|process::Command|Command::new|spawn\\(|std::fs|fs::|read_to_string|std::env|env::|secret|token|auth|api_key|apikey|password|credential|bearer";
 pub(crate) const GAP_PREFLIGHT_PATTERN: &str =
     "TODO|FIXME|todo!|unimplemented!|missing|gap|needs coverage|not implemented";

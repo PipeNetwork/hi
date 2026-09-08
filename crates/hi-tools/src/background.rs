@@ -42,6 +42,9 @@ const MAX_BG_PROCS: usize = 64;
 /// Workspace teardown must not race a killed process that still owns open
 /// descriptors or can execute a final filesystem write while being reaped.
 const QUIESCENT_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bound for waiting on auto-backgrounded foreground overruns before
+/// verification. Matches the default `jobs.verifier_timeout` (two minutes).
+const OVERRUN_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2 * 60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BgState {
@@ -1085,7 +1088,22 @@ impl BackgroundRegistry {
     /// Wait for foreground commands that exceeded the initial tool wait window.
     /// Deliberate background jobs survive turn boundaries. Dropping this future
     /// leaves process ownership with the registry for cancellation cleanup.
-    pub async fn wait_started_after_and_reap(&self, before: &[String]) -> usize {
+    /// Remaining live overruns are killed after [`OVERRUN_WAIT_TIMEOUT`].
+    pub async fn wait_started_after_and_reap(&self, before: &[String]) -> Result<usize> {
+        self.wait_started_after_and_reap_before(
+            before,
+            tokio::time::Instant::now() + OVERRUN_WAIT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Wait for auto-backgrounded overruns until `deadline`. Remaining live
+    /// processes are then killed and reaped so WorkspaceRepair cannot stall.
+    pub async fn wait_started_after_and_reap_before(
+        &self,
+        before: &[String],
+        deadline: tokio::time::Instant,
+    ) -> Result<usize> {
         let targets = {
             let processes = self.processes.lock().unwrap();
             processes
@@ -1098,19 +1116,33 @@ impl BackgroundRegistry {
                 .map(|(_, process)| Arc::clone(process))
                 .collect::<Vec<_>>()
         };
-        futures_util::future::join_all(targets.iter().map(|process| async move {
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        let timed_out = futures_util::future::join_all(targets.iter().map(|process| async move {
             loop {
                 let notified = process.reaped.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 if process.inner.lock().unwrap().reaped {
-                    break;
+                    return false;
                 }
-                notified.await;
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    return true;
+                }
             }
         }))
-        .await;
-        targets.len()
+        .await
+        .into_iter()
+        .any(|timed_out| timed_out);
+        if timed_out {
+            self.kill_started_after_and_reap_before(
+                before,
+                tokio::time::Instant::now() + QUIESCENT_REAP_TIMEOUT,
+            )
+            .await?;
+        }
+        Ok(targets.len())
     }
 
     pub async fn kill_started_after_and_reap_before(

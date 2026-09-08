@@ -2364,8 +2364,8 @@ async fn idle_background_poll_budget_exhaustion_reports_progress_without_stallin
     assert!(
         ui.statuses
             .iter()
-            .any(|status| status.contains("background work continues")),
-        "expected voluntary status reporting: {:?}",
+            .any(|status| status.contains("background process is still running")),
+        "expected immediate progress-report recovery: {:?}",
         ui.statuses
     );
 }
@@ -2424,9 +2424,6 @@ async fn waiting_on_live_background_with_fresh_output_ends_with_status_report() 
         ),
         bash_output(&id),
         bash_output(&id),
-        bash_output(&id),
-        bash_output(&id),
-        bash_output(&id),
         completion(
             vec![Content::Text(
                 "Work remains in progress: the download is still running; conversion has not started.".into(),
@@ -2451,9 +2448,11 @@ async fn waiting_on_live_background_with_fresh_output_ends_with_status_report() 
         agent.last_turn_telemetry()
     );
     assert!(
-        !ui.statuses
+        ui.statuses
             .iter()
-            .any(|s| s.contains("wrap-up request") || s.contains("forcing a final status"))
+            .any(|s| s.contains("wait once with wait_secs or wrap up")),
+        "the waiting budget should trigger the wrap-up request despite fresh output: {:?}",
+        ui.statuses
     );
     assert!(
         ui.statuses

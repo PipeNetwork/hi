@@ -128,6 +128,82 @@ async fn verification_waits_for_auto_background_reap_and_settlement() {
     );
 }
 
+#[tokio::test]
+async fn verification_stops_hung_overrun_after_wait_budget() {
+    if std::env::var("HI_TEST_VERIFY_REAP_CHILD").as_deref() != Ok("1") {
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent::turn::verify_run::tests::verification_stops_hung_overrun_after_wait_budget",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("HI_TEST_VERIFY_REAP_CHILD", "1")
+            .env("HI_BASH_AUTO_BACKGROUND", "1")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut cfg = config();
+    cfg.verification_timeout = Some(Duration::from_millis(80));
+    let mut subject = agent(vec![], cfg);
+    let background = subject.runtime.background_arc();
+    background.set_foreground_handoff_budget(Some(Duration::from_millis(25)));
+    let output = hi_tools::execute_in_runtime_shared_with_runner(
+        subject.runtime.process_runner(),
+        subject.runtime.root(),
+        subject.runtime.state_root(),
+        &subject.runtime.lsp(),
+        &background,
+        subject.runtime.read_cache(),
+        &subject.runtime.repo_map_arc(),
+        None,
+        None,
+        "bash",
+        r#"{"command":"sleep 600"}"#,
+    )
+    .await;
+    let id = output
+        .background
+        .expect("foreground overrun must be adopted")
+        .id;
+    subject.set_turn_phase(TurnPhase::Model);
+    subject.set_turn_phase(TurnPhase::WorkspaceRepair);
+    let mut verifier = WorkspaceRepairVerifier::new(Vec::new(), 0);
+    let mut snapshot = None;
+    let fast_feedback = crate::agent::turn::fast_feedback::FastFeedbackState::default();
+    let mut ui = crate::tests::common::NullUi;
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        subject.run_workspace_repair_verification(
+            &mut verifier,
+            &[],
+            &mut snapshot,
+            false,
+            0,
+            &fast_feedback,
+            VerificationAdmission::ChangedWorkspace,
+            &mut ui,
+        ),
+    )
+    .await
+    .expect("hung overrun must not block WorkspaceRepair")
+    .unwrap();
+    assert!(matches!(outcome, VerifyOutcome::NotRun));
+    assert_eq!(
+        background.outcome(&id).unwrap().state,
+        hi_tools::BackgroundState::Killed
+    );
+    background.kill_and_reap(&id).await.unwrap();
+}
+
 async fn local_service_verification_case() -> (crate::TurnOutcome, Vec<String>) {
     let mut cfg = config();
     cfg.gates.review = crate::ReviewPolicy::Off;

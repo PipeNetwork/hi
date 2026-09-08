@@ -4,6 +4,7 @@ pub(crate) use hi_ai::{Completion, Content, ProviderErrorKind, Role, Usage};
 pub(crate) use std::sync::Mutex;
 
 mod background_task;
+mod background_wait;
 mod cancellation_settlement;
 mod candidate_publication;
 mod coding_memory;
