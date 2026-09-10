@@ -141,6 +141,13 @@ impl App {
             }
             Action::ToggleReasoning => {
                 self.show_reasoning = !self.show_reasoning;
+                if !self.show_reasoning {
+                    for entry in &mut self.transcript {
+                        if let crate::TranscriptEntry::Reasoning { expanded, .. } = entry {
+                            *expanded = false;
+                        }
+                    }
+                }
                 self.bump_transcript();
             }
             Action::ToggleToolOutput => {

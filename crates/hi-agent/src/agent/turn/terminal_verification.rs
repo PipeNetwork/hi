@@ -13,12 +13,24 @@ pub(super) fn protocol_format_exhausted(recovery: &crate::recovery::TaskRecovery
         .is_some_and(|reason| reason.contains("invalid tool turns exhausted"))
 }
 
+pub(super) fn request_limit_recovery_exhausted(
+    recovery: &crate::recovery::TaskRecoveryState,
+) -> bool {
+    recovery
+        .last_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("request limit exhausted"))
+}
+
 pub(super) fn productive_stall_is_leftover(
     recovery: &crate::recovery::TaskRecoveryState,
     turn_had_mutation: bool,
     stationarity_ended: bool,
 ) -> bool {
-    turn_had_mutation && (protocol_format_exhausted(recovery) || stationarity_ended)
+    turn_had_mutation
+        && (protocol_format_exhausted(recovery)
+            || request_limit_recovery_exhausted(recovery)
+            || stationarity_ended)
 }
 
 /// Invalid tool JSON is a model-format failure, not a down provider.
@@ -40,6 +52,22 @@ pub(super) fn tool_protocol_allowance_exhausted(error: &anyhow::Error) -> bool {
                 .and_then(|attempt| attempt.failure_kind.as_deref())
                 == Some("tool_protocol")
     })
+}
+
+/// Local send/wait budget, or a capacity refusal after those retries, is not
+/// a down provider. Grok-build keeps the retained workspace and starts a new
+/// request; wrapping this as `infrastructure_failure` fights the leftover
+/// closeout the TUI already printed.
+pub(super) fn request_limit_exhausted(error: &anyhow::Error) -> bool {
+    let Some(details) = hi_ai::provider_error_details(error) else {
+        return false;
+    };
+    details.request_failure.is_some()
+        || details.kind == hi_ai::ProviderErrorKind::CapacityUnavailable
+}
+
+pub(super) fn leftover_allowance_exhausted(error: &anyhow::Error) -> bool {
+    tool_protocol_allowance_exhausted(error) || request_limit_exhausted(error)
 }
 
 impl crate::Agent {
@@ -69,8 +97,8 @@ impl crate::Agent {
         Ok(())
     }
 
-    /// Protocol retries ran out. Settle as no-progress when nothing was
-    /// edited; verify retained mutations without branding a provider outage.
+    /// Protocol or request-limit retries ran out. Settle as no-progress when
+    /// nothing was edited; verify retained mutations without a provider outage.
     pub(super) async fn settle_invalid_tool_budget(
         &mut self,
         error: anyhow::Error,
@@ -86,12 +114,21 @@ impl crate::Agent {
                     "kind": "request_failure", "request_failure": evidence,
                 }));
         }
-        self.task_recovery
-            .stop(format!("invalid tool turns exhausted: {error}"));
+        let protocol = tool_protocol_allowance_exhausted(&error);
+        let (stop, status) = if protocol {
+            (
+                format!("invalid tool turns exhausted: {error}"),
+                "invalid tool turns exhausted; settling without treating it as a provider outage",
+            )
+        } else {
+            (
+                format!("request limit exhausted: {error}"),
+                "request limit exhausted; settling retained work without treating it as a provider outage",
+            )
+        };
+        self.task_recovery.stop(stop);
         self.persist_task_recovery_async().await?;
-        ui.status(
-            "invalid tool turns exhausted; settling without treating it as a provider outage",
-        );
+        ui.status(status);
         if self
             .runtime
             .ledger()
@@ -240,18 +277,45 @@ mod tests {
         recovery = crate::recovery::TaskRecoveryState::new("task".into(), 3);
         recovery.stop("automatic recovery exhausted");
         assert!(!super::protocol_format_exhausted(&recovery));
+        recovery = crate::recovery::TaskRecoveryState::new("task".into(), 3);
+        recovery.stop("request limit exhausted: 4/4 sends; last attempt: capacity");
+        assert!(super::request_limit_recovery_exhausted(&recovery));
+        assert!(super::productive_stall_is_leftover(&recovery, true, false));
+        assert!(!super::productive_stall_is_leftover(
+            &recovery, false, false
+        ));
     }
 
     #[test]
-    fn tool_protocol_budget_is_not_a_provider_outage() {
+    fn leftover_budgets_are_not_a_provider_outage() {
         let protocol: anyhow::Error =
             hi_ai::ProviderError::new(hi_ai::ProviderErrorKind::ToolProtocol, "invalid tool JSON")
                 .into();
         assert!(super::tool_protocol_allowance_exhausted(&protocol));
+        assert!(super::leftover_allowance_exhausted(&protocol));
+        let capacity: anyhow::Error = hi_ai::ProviderError::new(
+            hi_ai::ProviderErrorKind::CapacityUnavailable,
+            "capacity temporarily unavailable",
+        )
+        .into();
+        assert!(super::request_limit_exhausted(&capacity));
+        assert!(super::leftover_allowance_exhausted(&capacity));
+        let local = hi_ai::RequestExecution::new(hi_ai::RequestExecutionPolicy {
+            max_attempts: 0,
+            max_backoff: std::time::Duration::ZERO,
+            ..Default::default()
+        })
+        .ensure_available()
+        .unwrap_err();
+        let local: anyhow::Error = local.into();
+        assert!(super::request_limit_exhausted(&local));
+        assert!(super::leftover_allowance_exhausted(&local));
         let outage: anyhow::Error =
             hi_ai::ProviderError::new(hi_ai::ProviderErrorKind::Outage, "upstream unavailable")
                 .into();
         assert!(!super::tool_protocol_allowance_exhausted(&outage));
+        assert!(!super::request_limit_exhausted(&outage));
+        assert!(!super::leftover_allowance_exhausted(&outage));
     }
 
     #[test]

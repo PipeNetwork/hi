@@ -22,17 +22,35 @@ impl SessionSink for ReceiptSink {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TerminalProviderFailure {
+    Protocol,
+    Capacity,
+    Outage,
+}
+
+impl TerminalProviderFailure {
+    fn leftover(self) -> bool {
+        !matches!(self, Self::Outage)
+    }
+}
+
 #[tokio::test]
 async fn physical_provider_exhaustion_after_tool_work_settles_actual_verification_once() {
-    assert_provider_failure_settlement(true).await;
+    assert_provider_failure_settlement(TerminalProviderFailure::Protocol).await;
+}
+
+#[tokio::test]
+async fn physical_capacity_exhaustion_after_tool_work_settles_as_leftover() {
+    assert_provider_failure_settlement(TerminalProviderFailure::Capacity).await;
 }
 
 #[tokio::test]
 async fn terminal_retryable_outage_after_tool_work_settles_without_extra_requests() {
-    assert_provider_failure_settlement(false).await;
+    assert_provider_failure_settlement(TerminalProviderFailure::Outage).await;
 }
 
-async fn assert_provider_failure_settlement(physical_limit: bool) {
+async fn assert_provider_failure_settlement(kind: TerminalProviderFailure) {
     for check_passes in [true, false] {
         let workspace = IsolatedWorkspace::new("provider-terminal-verification");
         let checks = tempfile::NamedTempFile::new().unwrap();
@@ -48,13 +66,21 @@ async fn assert_provider_failure_settlement(physical_limit: bool) {
             }
         }]},"finish_reason":"tool_calls"}]});
         let mut responses = vec![Response::sse(format!("data: {tool}\n\ndata: [DONE]\n\n"))];
-        let expected_failed_sends = if physical_limit { 4 } else { 2 };
-        responses.extend((0..expected_failed_sends).map(|_| {
-            if physical_limit {
-                Response::json(400, r#"{"error":{"message":"invalid tool JSON","code":"tool_protocol_error","retryable":true}}"#)
-            } else {
-                Response::json(503, r#"{"error":{"message":"upstream unavailable","code":"service_unavailable","retryable":true}}"#)
-            }
+        let leftover = kind.leftover();
+        let expected_failed_sends = if leftover { 4 } else { 2 };
+        responses.extend((0..expected_failed_sends).map(|_| match kind {
+            TerminalProviderFailure::Protocol => Response::json(
+                400,
+                r#"{"error":{"message":"invalid tool JSON","code":"tool_protocol_error","retryable":true}}"#,
+            ),
+            TerminalProviderFailure::Capacity => Response::json(
+                429,
+                r#"{"error":{"message":"capacity temporarily unavailable","code":"capacity_unavailable","retryable":true,"retry_after_seconds":0}}"#,
+            ),
+            TerminalProviderFailure::Outage => Response::json(
+                503,
+                r#"{"error":{"message":"upstream unavailable","code":"service_unavailable","retryable":true}}"#,
+            ),
         }));
         let Some(server) = FakeOpenAiServer::new(responses) else {
             return;
@@ -63,7 +89,7 @@ async fn assert_provider_failure_settlement(physical_limit: bool) {
         cfg.loop_limits.max_recovery_interventions = 16;
         // Protocol retries must not request a 5th HTTP send. keep-working
         // is covered by the review-and-fix protocol-storm test.
-        cfg.loop_limits.max_keep_working = if physical_limit { 0 } else { 2 };
+        cfg.loop_limits.max_keep_working = if leftover { 0 } else { 2 };
         cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new(
             "retained source",
             "python3 validate.py",
@@ -81,11 +107,11 @@ async fn assert_provider_failure_settlement(physical_limit: bool) {
         let receipts = Arc::new(Mutex::new(Vec::new()));
         subject.set_session(Box::new(ReceiptSink(receipts.clone())));
         let mut ui = RecUi::default();
-        let (status, stop_reason, verification) = if physical_limit {
+        let (status, stop_reason, verification) = if leftover {
             let outcome = subject
                 .run_turn("build all of the requested implementation", &mut ui)
                 .await
-                .expect("invalid tools are not a provider outage");
+                .expect("protocol and request-limit budgets are not a provider outage");
             (outcome.status, outcome.stop_reason, outcome.verification)
         } else {
             let error = subject
@@ -112,14 +138,14 @@ async fn assert_provider_failure_settlement(physical_limit: bool) {
                 failure.outcome.verification,
             )
         };
-        if physical_limit && check_passes {
+        if leftover && check_passes {
             assert_eq!(status, TurnStatus::Completed);
             assert_eq!(stop_reason, TurnStopReason::Completed);
         } else {
             assert_eq!(status, TurnStatus::Failed);
             assert_eq!(
                 stop_reason,
-                if physical_limit {
+                if leftover {
                     TurnStopReason::VerificationFailed
                 } else {
                     TurnStopReason::InfrastructureFailure
@@ -168,29 +194,51 @@ async fn assert_provider_failure_settlement(physical_limit: bool) {
             "passing tests cannot complete unfinished plan work"
         );
         assert!(ui.turn_end.is_some(), "normal body settlement must run");
-        if physical_limit {
-            assert!(
-                subject
-                    .messages()
-                    .iter()
-                    .any(|message| message.text().contains("[hi:nudge:protocol]")),
-                "HTTP 400 tool_protocol retries must use the protocol nudge"
-            );
+        if leftover {
             assert_eq!(
                 subject.task_recovery().interventions,
                 0,
-                "malformed tool JSON must not spend recovery interventions: {:?}",
+                "leftover budgets must not spend recovery interventions: {:?}",
                 subject.task_recovery().last_reason
             );
-            assert!(
-                subject
-                    .task_recovery()
-                    .last_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("invalid tool turns exhausted")),
-                "{:?}",
-                subject.task_recovery().last_reason
-            );
+            let reason = subject.task_recovery().last_reason.as_deref().unwrap_or("");
+            match kind {
+                TerminalProviderFailure::Protocol => {
+                    assert!(
+                        ui.statuses.iter().any(|status| {
+                            status.contains("invalid tool turn")
+                                && status.contains("tool-format guidance")
+                        }),
+                        "HTTP 400 tool_protocol retries must use the protocol path: {:?}",
+                        ui.statuses
+                    );
+                    assert!(
+                        reason.contains("invalid tool turns exhausted"),
+                        "{reason:?}"
+                    );
+                }
+                TerminalProviderFailure::Capacity => {
+                    assert!(reason.contains("request limit exhausted"), "{reason:?}");
+                    assert!(
+                        ui.statuses.iter().any(|status| {
+                            status.contains("request limit exhausted")
+                                && status.contains("without treating it as a provider outage")
+                        }),
+                        "{:?}",
+                        ui.statuses
+                    );
+                    assert!(
+                        !ui.statuses.iter().any(|status| {
+                            status.contains("infrastructure")
+                                || status.contains("provider requests stopped")
+                        }),
+                        "{:?}",
+                        ui.statuses
+                    );
+                    assert_ne!(stop_reason, TurnStopReason::InfrastructureFailure);
+                }
+                TerminalProviderFailure::Outage => {}
+            }
         }
     }
 }

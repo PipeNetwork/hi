@@ -303,6 +303,7 @@ fn internal_statuses_are_hidden_or_humanized() {
     assert!(user_facing_status("verification started").is_none());
     assert!(user_facing_status("verification finished").is_none());
     assert!(user_facing_status("verification skipped — no files changed this turn").is_none());
+    assert!(user_facing_status("Run started").is_none());
     let leftover = user_facing_status("3/9 remaining — wire the scheduler").unwrap();
     assert_eq!(leftover, "3/9 remaining — wire the scheduler");
     assert_eq!(

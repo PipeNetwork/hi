@@ -9,6 +9,7 @@ mod diff_color;
 mod goal;
 mod review_pane;
 mod send_now;
+mod thinking;
 
 pub(crate) fn dump(term: &Terminal<TestBackend>) -> String {
     let buf = term.backend().buffer();
@@ -3560,6 +3561,7 @@ fn session_render_snapshots_cover_responsive_chrome() {
         app.transcript.push(TranscriptEntry::Reasoning {
             text: "Check spacing and preserve the active input.".into(),
             elapsed: Duration::from_secs(3),
+            expanded: false,
         });
         app.transcript.push(TranscriptEntry::ToolOutput {
             body: (1..=17)
@@ -3678,7 +3680,7 @@ fn transcript_roles_get_display_gutters_without_polluting_copy_text() {
     let thought =
         crate::render::line_text(&reasoning.flatten(true, false, Density::Comfortable)[0]);
     assert!(
-        thought.contains("thought") || thought.contains("Thinking"),
+        thought.contains("Thought") || thought.contains("Thinking"),
         "{thought}"
     );
 
@@ -4376,7 +4378,7 @@ fn explore_tools_collapse_header_and_line_count_into_one_line() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("Read src/main.rs · 3 lines")),
+            .any(|l| l.contains("Read src/main.rs") && !l.contains("·")),
         "collapsed read line: {lines:?}"
     );
     assert_eq!(
@@ -4704,7 +4706,7 @@ fn consecutive_same_tool_explore_results_merge_into_one_line() {
         "run broken by edit: {lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("Read d.rs · 2 lines")),
+        lines.iter().any(|l| l.contains("Read d.rs")),
         "fresh read after break: {lines:?}"
     );
 }
@@ -4768,22 +4770,6 @@ fn explore_tools_group_across_assistant_narration() {
     );
 }
 
-#[test]
-fn collapsed_zero_second_thought_is_hidden() {
-    let entry = TranscriptEntry::Reasoning {
-        text: "instant".into(),
-        elapsed: Duration::from_secs(0),
-    };
-    assert!(
-        entry.flatten(false, false, Density::Comfortable).is_empty(),
-        "collapsed 0s thought must not take a row"
-    );
-    assert!(
-        !entry.flatten(true, false, Density::Comfortable).is_empty(),
-        "Ctrl-T still reveals 0s thought"
-    );
-}
-
 fn flatten_texts(app: &crate::App, show_reasoning: bool, show_tool: bool) -> Vec<String> {
     app.transcript
         .iter()
@@ -4843,7 +4829,7 @@ fn explore_burst_absorbs_thinking_and_steering() {
     assert!(
         !collapsed
             .iter()
-            .any(|l| l.contains("thought for") || l.contains("Let me read")),
+            .any(|l| l.contains("Thought") || l.contains("Let me read")),
         "thinking and steering stay folded: {collapsed:?}"
     );
 
@@ -4857,7 +4843,9 @@ fn explore_burst_absorbs_thinking_and_steering() {
 
     let with_t = flatten_texts(&app, true, false);
     assert!(
-        with_t.iter().any(|l| l.contains("thought for")),
+        with_t
+            .iter()
+            .any(|l| l.contains("Thought") || l.contains("Thinking")),
         "Ctrl-T shows thinking in the group: {with_t:?}"
     );
     assert!(
@@ -6135,7 +6123,7 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
         result: output,
     });
 
-    // Collapsed (default): Run header + first 2 / last 3, not the full dump.
+    // Collapsed (default): grok execute header only, not the dump.
     let collapsed: Vec<String> = app
         .transcript
         .iter()
@@ -6147,12 +6135,12 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
         "collapsed run header: {collapsed:?}"
     );
     assert!(
-        collapsed.iter().any(|l| l.contains("… +")),
-        "middle stdout is folded: {collapsed:?}"
+        !collapsed.iter().any(|l| l.contains("line 0")),
+        "finished run stdout stays behind the header: {collapsed:?}"
     );
     assert!(
         !collapsed.iter().any(|l| l.contains("line 20")),
-        "the middle is folded away when collapsed: {collapsed:?}"
+        "the body is folded away when collapsed: {collapsed:?}"
     );
 
     // Expanded (Ctrl-O / show_tool_output): the full body, no footer.

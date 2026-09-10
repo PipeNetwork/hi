@@ -32,6 +32,20 @@ fn numbered_read_pages_use_the_read_budget() {
     let page = "   1\t# Solana P2P Marketplace spec\n   2\t## Phase 1\n";
     assert!(looks_like_numbered_read(page));
     assert_eq!(result_char_budget(page), read_output_budget());
+    let mut multi = String::from("──── src/state.rs ────\n");
+    for i in 1..=400 {
+        multi.push_str(&format!("  {i:3}\tline {i} of state.rs\n"));
+    }
+    assert!(super::looks_like_multi_file_read(&multi));
+    assert!(multi.chars().count() > *crate::condense::MAX_OUTPUT_CHARS);
+    assert_eq!(result_char_budget(&multi), read_output_budget());
+    let (bounded, state) = crate::bound_tool_content(multi.clone());
+    assert!(
+        bounded.chars().count() > *crate::condense::MAX_OUTPUT_CHARS,
+        "multi-file reads must not be reclipped at 5k: {} chars",
+        bounded.chars().count()
+    );
+    assert_eq!(state, crate::TruncationState::Complete);
     assert_eq!(
         result_char_budget("explore dump\n".repeat(20).as_str()),
         *crate::condense::MAX_OUTPUT_CHARS

@@ -1999,6 +1999,9 @@ impl crate::App {
                 block_line_ranges.push((start, lines.len(), o));
             }
         }
+        let committed_entries = self.transcript.len();
+        let committed_flat_lines = lines.len();
+        lines.extend(self.live_thinking_lines());
         if let Some((style, markdown, text)) = &self.pending {
             let mut line = if *markdown {
                 markdown_line(text, &mut self.code_lang.clone())
@@ -2017,14 +2020,6 @@ impl crate::App {
             cum = cum.saturating_add(wrapped_line_height(line, inner_w) as u32);
             prefix.push(cum);
         }
-
-        let committed_entries = self.transcript.len();
-        // When pending is present it's the last line; committed flat count excludes it.
-        let committed_flat_lines = if self.pending.is_some() {
-            lines.len().saturating_sub(1)
-        } else {
-            lines.len()
-        };
         self.view_cache = crate::view_cache::TranscriptViewCache {
             generation: self.transcript_gen,
             theme_revision,
@@ -2135,6 +2130,13 @@ impl crate::App {
         }
         let committed_entries = self.transcript.len();
         let committed_flat_lines = lines.len();
+
+        for line in self.live_thinking_lines() {
+            let h = wrapped_line_height(&line, inner_w) as u32;
+            let cum = prefix.last().copied().unwrap_or(0).saturating_add(h);
+            prefix.push(cum);
+            lines.push(line);
+        }
 
         // Re-add pending.
         if let Some((style, markdown, text)) = &self.pending {

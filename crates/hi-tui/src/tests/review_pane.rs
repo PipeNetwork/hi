@@ -178,6 +178,57 @@ fn send_attaches_hunk_quote_when_chip_remains() {
     );
 }
 
+#[test]
+fn transcript_hides_hunk_quote_until_thinking_expands() {
+    let mut app = test_app("openai", "gpt-4o");
+    open_docked(&mut app);
+    app.review.focused = true;
+    app.dispatch_key(&key(KeyCode::Char('n')));
+    if app.review.selected_hunk == Some(0) {
+        app.dispatch_key(&key(KeyCode::Char('n')));
+    }
+    let line = app.edit_key(&key(KeyCode::Enter)).expect("submit");
+    app.push_user_prompt(ratatui::text::Line::raw(format!("❯ {line}")));
+
+    let texts = |show_reasoning: bool| -> Vec<String> {
+        app.transcript
+            .iter()
+            .flat_map(|entry| entry.flatten(show_reasoning, false, crate::Density::Comfortable))
+            .map(|row| crate::render::line_text(&row))
+            .collect()
+    };
+
+    let collapsed = texts(false);
+    assert!(
+        collapsed
+            .iter()
+            .any(|row| row.contains("❯") && prompt_still_mentions_a_file(row)),
+        "question stays visible: {collapsed:?}"
+    );
+    assert!(
+        !collapsed
+            .iter()
+            .any(|row| row.contains("new a") || row.contains("new b")),
+        "hunk is hidden until thinking expands: {collapsed:?}"
+    );
+    assert!(
+        !collapsed.iter().any(|row| row.contains("<review hunk>")),
+        "markup must not leak: {collapsed:?}"
+    );
+
+    let expanded = texts(true);
+    assert!(
+        expanded
+            .iter()
+            .any(|row| row.contains("new a") || row.contains("new b")),
+        "Ctrl-E thinking shows the hunk: {expanded:?}"
+    );
+    assert!(
+        expanded.iter().any(|row| row.contains("review hunk")),
+        "expanded thinking labels the hunk: {expanded:?}"
+    );
+}
+
 fn prompt_still_mentions_a_file(line: &str) -> bool {
     line.contains("@a.rs") || line.contains("@b.rs")
 }
@@ -352,4 +403,124 @@ fn space_while_following_types_a_space() {
     ));
     assert_eq!(app.edit_key(&key(KeyCode::Char(' '))), None);
     assert_eq!(app.input.text(), " ");
+}
+
+#[test]
+fn parse_two_file_unified_diff() {
+    let hunks = crate::review::parse_review_hunks(TWO_FILE);
+    assert_eq!(hunks.len(), 2, "{hunks:?}");
+    assert_eq!(hunks[0].path, "a.rs");
+    assert_eq!(hunks[0].start, Some(1));
+    assert_eq!(hunks[1].path, "b.rs");
+    assert_eq!(hunks[1].start, Some(10));
+    assert_eq!(hunks[1].end, Some(12));
+    assert!(hunks[1].painted_start > hunks[0].painted_start);
+}
+
+#[test]
+fn deleted_file_uses_old_path() {
+    let diff = "\
+--- a/gone.rs
++++ /dev/null
+@@ -1,1 +0,0 @@
+-bye
+";
+    let hunks = crate::review::parse_review_hunks(diff);
+    assert_eq!(hunks[0].path, "gone.rs");
+}
+
+#[test]
+fn chip_replaces_previous_review_mention() {
+    let next = crate::review::replace_or_prepend_chip("@a.rs:1-2 please undo", "@b.rs:10-12");
+    assert_eq!(next, "@b.rs:10-12 please undo");
+    assert_eq!(
+        crate::review::replace_or_prepend_chip("", "@a.rs:1"),
+        "@a.rs:1 "
+    );
+    assert_eq!(
+        crate::review::replace_or_prepend_chip("hello", "@a.rs:1"),
+        "@a.rs:1 hello"
+    );
+}
+
+#[test]
+fn echo_strips_the_hunk_from_the_visible_prompt() {
+    let hunks = crate::review::parse_review_hunks(TWO_FILE);
+    let h = &hunks[1];
+    let mention = h.mention().unwrap();
+    let quoted = crate::review::attach_hunk_quote(&format!("{mention} why?"), h, TWO_FILE);
+    let (visible, body) = crate::review::split_review_hunk_echo(&quoted);
+    assert_eq!(visible, format!("{mention} why?"));
+    let body = body.expect("hunk body");
+    assert!(body.contains("new b"), "{body}");
+    assert!(!body.contains("<review hunk>"), "{body}");
+    assert_eq!(
+        crate::review::split_review_hunk_echo("plain question"),
+        ("plain question", None)
+    );
+}
+
+#[test]
+fn quote_requires_mention_and_is_capped() {
+    let hunks = crate::review::parse_review_hunks(TWO_FILE);
+    let h = &hunks[1];
+    let mention = h.mention().unwrap();
+    let quoted = crate::review::attach_hunk_quote(&format!("{mention} why?"), h, TWO_FILE);
+    assert!(quoted.contains("<review hunk>"), "{quoted}");
+    assert!(quoted.contains("b.rs:10-12"), "{quoted}");
+    assert!(quoted.contains("new b"), "{quoted}");
+    let dropped = crate::review::attach_hunk_quote("no chip here", h, TWO_FILE);
+    assert_eq!(dropped, "no chip here");
+}
+
+#[test]
+fn dock_only_on_wide_layout() {
+    assert!(!crate::review::can_dock(80));
+    assert!(!crate::review::can_dock(99));
+    assert!(crate::review::can_dock(100));
+    assert!(crate::review::can_dock(120));
+}
+
+#[test]
+fn split_body_honors_width_and_clamps() {
+    let area = ratatui::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 20,
+    };
+    let (left, Some((gap, right))) = crate::review::split_body(area, true, Some(40)) else {
+        panic!("expected docked split");
+    };
+    assert_eq!(right.width, 40);
+    assert_eq!(gap.width, 1);
+    assert_eq!(left.width + gap.width + right.width, 100);
+
+    let (_, Some((_, narrow))) = crate::review::split_body(area, true, Some(10)) else {
+        panic!("clamp min");
+    };
+    assert_eq!(narrow.width, 36);
+
+    let (_, Some((_, wide))) = crate::review::split_body(area, true, Some(90)) else {
+        panic!("clamp max");
+    };
+    assert_eq!(wide.width, 100 - 24 - 1);
+}
+
+#[test]
+fn docked_hints_depend_on_focus() {
+    let idle = crate::review::docked_session_hints(false);
+    assert!(
+        idle.iter()
+            .any(|h| h.key == "tab" && h.label == "focus diff")
+    );
+    assert!(idle.iter().any(|h| h.key == "ctrl+g" && h.label == "close"));
+    let focused = crate::review::docked_session_hints(true);
+    assert!(focused.iter().any(|h| h.key == "n/p" && h.label == "hunk"));
+    assert!(
+        focused
+            .iter()
+            .any(|h| h.key == "esc" && h.label == "unfocus")
+    );
+    assert!(!focused.iter().any(|h| h.key == "tab"));
 }

@@ -1973,3 +1973,4 @@ async fn terminal_error_persists_usage_before_returning() {
 }
 
 mod bounded_recovery;
+mod protocol_nudge;

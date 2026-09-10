@@ -99,12 +99,30 @@ impl crate::Agent {
             false
         };
         let mut review_after_reconciliation = turn.independent_review_status;
-        let changed = super::settlement::reconcile_verified_revision(
-            &mut self.report.verify,
-            &mut review_after_reconciliation,
-            current_digest.clone(),
-            ui,
+        let recheck = enrichment_requires_revalidation(
+            changed_by_writers.iter().map(|change| change.path.as_str()),
+            &self
+                .config
+                .gates
+                .verification
+                .resolved_stages(self.runtime.root()),
         );
+        let changed = if !recheck && only_owned_metadata {
+            // Skill/memory prose is not checked input for cargo test. Rebind
+            // the seal instead of a second suite run the model cannot repair.
+            let revision = self.runtime.ledger().revision();
+            self.report.verify = VerifyEvidence::pass(revision, current_digest.clone());
+            self.runtime.ledger().retain_verification_baseline(revision);
+            ui.status("workspace learning did not change checked verification inputs");
+            false
+        } else {
+            super::settlement::reconcile_verified_revision(
+                &mut self.report.verify,
+                &mut review_after_reconciliation,
+                current_digest.clone(),
+                ui,
+            )
+        };
         if !preserve_review {
             turn.independent_review_status = review_after_reconciliation;
         }
@@ -117,5 +135,51 @@ impl crate::Agent {
             inputs_changed: changed,
             preserved_review_at: (changed && preserve_review).then_some(current_digest),
         })
+    }
+}
+
+fn enrichment_requires_revalidation<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    stages: &[crate::config::VerifyStage],
+) -> bool {
+    let paths: Vec<String> = paths
+        .into_iter()
+        .map(|path| path.replace('\\', "/"))
+        .collect();
+    if paths.is_empty() {
+        return false;
+    }
+    if paths.iter().any(|path| {
+        !crate::verify::is_prose_only_path(path)
+            && !crate::verify::is_internal_runtime_artifact_path(path)
+    }) {
+        return true;
+    }
+    stages.iter().any(|stage| {
+        paths
+            .iter()
+            .any(|path| stage.command.contains(path.as_str()))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enrichment_requires_revalidation;
+    use crate::config::VerifyStage;
+
+    #[test]
+    fn cargo_stages_ignore_prose_memory_writes() {
+        let stages = [VerifyStage::new("test", "cargo test --quiet")];
+        assert!(!enrichment_requires_revalidation(
+            [".hi/memory.md"],
+            &stages
+        ));
+        assert!(enrichment_requires_revalidation(["src/ws.rs"], &stages));
+    }
+
+    #[test]
+    fn explicit_memory_checks_still_revalidate() {
+        let stages = [VerifyStage::new("check", "test ! -e .hi/memory.md")];
+        assert!(enrichment_requires_revalidation([".hi/memory.md"], &stages));
     }
 }

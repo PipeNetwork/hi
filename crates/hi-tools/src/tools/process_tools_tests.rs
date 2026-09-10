@@ -106,6 +106,17 @@ fn file_dump_commands_map_to_read_arguments() {
     );
     assert!(parsed("cat SPEC.md && rm SPEC.md").is_none());
     assert!(parsed("rm SPEC.md && cat SPEC.md").is_none());
+    assert_eq!(
+        parsed(r#"grep -n "" src/ws.rs"#),
+        Some(serde_json::json!({"path":"src/ws.rs"}))
+    );
+    assert_eq!(
+        parsed("grep -n '^' src/ws.rs | sed -n '206,300p'"),
+        Some(serde_json::json!({"path":"src/ws.rs","offset":206,"limit":95}))
+    );
+    assert!(parsed(r#"grep -n TODO src/ws.rs"#).is_none());
+    assert!(parsed(r#"grep -n "" src/ws.rs | wc -l"#).is_none());
+    assert!(parsed("cat SPEC.md | wc -l").is_none());
 }
 
 #[test]

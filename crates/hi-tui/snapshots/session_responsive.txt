@@ -4,9 +4,9 @@
 
   ❯ review the responsive layout
   The layout is stable.
-    thought for 3s
-    Check spacing and preserve the active input.
+  ◆ Thought for 3.0s
   ┃ … +17 more lines · Ctrl-O to expand
+
 
 
 
@@ -25,9 +25,9 @@
 
 --- 64x14 ---
   /workspace                  reasoning: off │ sandbox │ undo
+  ❯ review the responsive layout
   The layout is stable.
-    thought for 3s
-    Check spacing and preserve the active input.
+  ◆ Thought for 3.0s
   ┃ … +17 more lines · Ctrl-O to expand
   ⠋ Working… 0s                                        [stop]
 

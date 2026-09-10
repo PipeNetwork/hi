@@ -240,6 +240,31 @@ fn fold_user_text(message: &mut Message, text: &str) {
     }
 }
 
+fn strip_trailing_nudge_segments(text: &str) -> String {
+    let mut parts: Vec<&str> = text.split(USER_FOLD_SEPARATOR).collect();
+    while parts.last().is_some_and(|part| is_nudge_text(part)) {
+        parts.pop();
+    }
+    parts.join(USER_FOLD_SEPARATOR)
+}
+
+fn replace_trailing_synthetic_with(message: &mut Message, tagged: &str) {
+    if contains_only_synthetic_nudges(message) {
+        message.content = vec![Content::Text(tagged.to_string())];
+        return;
+    }
+    if let Some(Content::Text(tail)) = message.content.last_mut() {
+        let kept = strip_trailing_nudge_segments(tail);
+        if kept.is_empty() {
+            *tail = tagged.to_string();
+        } else {
+            *tail = format!("{kept}{USER_FOLD_SEPARATOR}{tagged}");
+        }
+        return;
+    }
+    message.content.push(Content::Text(tagged.to_string()));
+}
+
 fn contains_only_synthetic_nudges(message: &Message) -> bool {
     message.role == Role::User
         && !message.content.is_empty()
@@ -973,9 +998,19 @@ impl Transcript {
         if let Some(last) = msgs.last_mut()
             && last.role == Role::User
         {
-            if !matches!(kind, NudgeKind::Interjection | NudgeKind::Btw)
-                && matches!(last.content.as_slice(), [Content::Text(t)]
-                    if t.starts_with(marker) && !t.contains(USER_FOLD_SEPARATOR))
+            if matches!(kind, NudgeKind::Interjection | NudgeKind::Btw) {
+                fold_user_text(last, &tagged);
+                return;
+            }
+            // Grok-build keeps one format/stationarity reminder. Folding each
+            // retry onto the user prompt (or merging consecutive users) stacked
+            // six copies of the same protocol text in live ~/chat sessions.
+            if matches!(kind, NudgeKind::Protocol | NudgeKind::Repeat) {
+                replace_trailing_synthetic_with(last, &tagged);
+                return;
+            }
+            if matches!(last.content.as_slice(), [Content::Text(t)]
+                if t.starts_with(marker) && !t.contains(USER_FOLD_SEPARATOR))
             {
                 last.content = vec![Content::Text(tagged)];
                 return;
@@ -2338,6 +2373,45 @@ Read-only review guard: use only the currently advertised read-only inspection t
         let text = t.as_slice().last().unwrap().text();
         assert!(text.contains("second"));
         assert!(!text.contains("first"));
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn protocol_retries_replace_a_synthetic_nudge_stack() {
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
+        t.push_nudge(NudgeKind::Protocol, "retry with valid tool JSON");
+        t.push_nudge_or_fold(NudgeKind::Continue, "keep going");
+        t.push_nudge_or_fold(NudgeKind::Protocol, "retry again with valid tool JSON");
+
+        assert_eq!(t.as_slice().len(), 3);
+        let text = t.as_slice().last().unwrap().text();
+        assert_eq!(
+            text.matches(nudge_marker(NudgeKind::Protocol)).count(),
+            1,
+            "protocol retries must not stack copies: {text}"
+        );
+        assert!(text.contains("retry again with valid tool JSON"));
+        assert!(!text.contains("keep going"));
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn protocol_retries_do_not_stack_on_the_user_prompt() {
+        let mut t = Transcript::new(vec![user("review and fix")]);
+        t.push_nudge_or_fold(NudgeKind::Protocol, "retry 1");
+        t.push_nudge_or_fold(NudgeKind::Protocol, "retry 2");
+        t.push_nudge_or_fold(NudgeKind::Protocol, "retry 3");
+
+        assert_eq!(t.len(), 1);
+        let text = t.last().unwrap().text();
+        assert!(text.starts_with("review and fix"));
+        assert_eq!(
+            text.matches(nudge_marker(NudgeKind::Protocol)).count(),
+            1,
+            "protocol retries must not stack on the user prompt: {text}"
+        );
+        assert!(text.contains("retry 3"));
+        assert!(!text.contains("retry 1"));
         t.validate_for_provider().unwrap();
     }
 

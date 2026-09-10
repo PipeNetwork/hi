@@ -67,10 +67,10 @@ impl crate::App {
         if self.following {
             self.page_flip_on_send = true;
         }
-        self.transcript.push(TranscriptEntry::UserPrompt {
+        self.transcript.push(crate::review::user_prompt_entry(
             line,
-            at: std::time::SystemTime::now(),
-        });
+            std::time::SystemTime::now(),
+        ));
         self.bump_transcript();
         self.cap_transcript();
     }
@@ -331,11 +331,32 @@ impl crate::App {
             .map(|t| t.elapsed())
             .unwrap_or_default();
         let text = std::mem::take(&mut self.reasoning_buffer);
-        self.transcript
-            .push(TranscriptEntry::Reasoning { text, elapsed });
+        self.transcript.push(TranscriptEntry::Reasoning {
+            text,
+            elapsed,
+            expanded: false,
+        });
         self.bump_transcript();
         self.reasoning_started = None;
         self.cap_transcript();
+    }
+
+    /// In-flight thinking row (grok-build "Thinking…") while chunks are still
+    /// arriving and have not been committed as a `Reasoning` entry.
+    pub(crate) fn live_thinking_lines(&self) -> Vec<ratatui::text::Line<'static>> {
+        if self.reasoning_buffer.trim().is_empty() {
+            return Vec::new();
+        }
+        let elapsed = self
+            .reasoning_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        crate::thinking::thinking_block_lines(
+            &self.reasoning_buffer,
+            elapsed,
+            self.show_reasoning,
+            true,
+        )
     }
 
     /// Append streamed text under `style`, committing complete lines. When
@@ -481,6 +502,7 @@ impl crate::App {
                     return;
                 }
                 self.reasoning_buffer.push_str(&text);
+                self.bump_transcript();
             }
             UiEvent::AssistantEnd => {
                 self.provider_activity = Default::default();
@@ -1135,7 +1157,7 @@ impl crate::App {
         let mut chrome = ExploreChrome::default();
         for i in steal.into_iter().rev() {
             match self.transcript.remove(i) {
-                TranscriptEntry::Reasoning { text, elapsed } => {
+                TranscriptEntry::Reasoning { text, elapsed, .. } => {
                     if chrome.thinking.is_empty() {
                         chrome.thinking = text;
                     } else {

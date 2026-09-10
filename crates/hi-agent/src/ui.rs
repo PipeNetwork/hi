@@ -570,6 +570,8 @@ pub fn user_facing_status(text: &str) -> Option<String> {
         || candidate == "verification started"
         || candidate == "verification finished"
         || candidate == "verification skipped — no files changed this turn"
+        || candidate == "Run started"
+        || candidate == "Run finished"
     {
         return None;
     }

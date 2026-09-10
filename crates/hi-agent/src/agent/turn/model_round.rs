@@ -987,7 +987,7 @@ impl crate::Agent {
                         SKIPPED_PLAN_REPOST_RESULT
                     } else if hi_tools::is_coordination(name) {
                         SKIPPED_BOOKKEEPING_REPOST_RESULT
-                    } else if name == "read" && evidence.rereads_only_completed_files(&calls) {
+                    } else if evidence.rereads_only_completed_files(&calls) {
                         SKIPPED_COMPLETED_FILE_REREAD_RESULT
                     } else {
                         SKIPPED_REPEATED_CALL_RESULT

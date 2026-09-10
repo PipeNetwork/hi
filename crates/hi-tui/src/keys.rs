@@ -260,7 +260,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::Navigation,
         keys: "Ctrl-B",
-        help: "block nav: fold/unfold one tool-output block",
+        help: "block nav: fold/unfold one tool, thinking, or btw block",
         in_help: true,
         action: Some(Action::ToggleBlockNav),
         matches: &[KeyMatch::ctrl(KeyCode::Char('b'))],

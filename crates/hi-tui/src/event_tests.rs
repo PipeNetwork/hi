@@ -60,6 +60,7 @@ fn capability_and_verification_lifecycle_is_not_a_status_line() {
         .is_none()
     );
     assert!(canonical_to_ui_event(&event(EventKind::RunCompleted, "Run finished")).is_none());
+    assert!(canonical_to_ui_event(&event(EventKind::RunStarted, "Run started")).is_none());
 }
 
 #[test]

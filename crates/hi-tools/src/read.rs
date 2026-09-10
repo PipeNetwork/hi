@@ -72,12 +72,27 @@ pub(crate) fn looks_like_numbered_read(content: &str) -> bool {
     })
 }
 
+/// Multi-path `read` pages are headed `──── path ────`, then numbered lines.
+/// The first line is therefore not numbered, so [`looks_like_numbered_read`]
+/// misses them — live ~/chat then clipped a 2-file batch at 5k, marked it
+/// complete (no paging footer survived), and the model spawned explore
+/// children to dump the rest of files it already had.
+pub(crate) fn looks_like_multi_file_read(content: &str) -> bool {
+    content.lines().next().is_some_and(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with('─') && trimmed.ends_with('─') && trimmed.len() >= 5
+    })
+}
+
 /// Character budget for a model-facing tool result.
 ///
 /// Numbered `read` pages (and pages that invite further paging) keep the
 /// dedicated read budget. Everything else uses the shared ~5k cap.
 pub(crate) fn result_char_budget(content: &str) -> usize {
-    if read_output_invites_paging(content) || looks_like_numbered_read(content) {
+    if read_output_invites_paging(content)
+        || looks_like_numbered_read(content)
+        || looks_like_multi_file_read(content)
+    {
         read_output_budget()
     } else {
         *crate::condense::MAX_OUTPUT_CHARS

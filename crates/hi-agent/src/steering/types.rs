@@ -250,19 +250,17 @@ impl EvidenceTracker {
             }
             EvidenceKind::FileRead => {
                 self.saw_read = true;
-                self.file_reads = self.file_reads.saturating_add(1);
-                if let Some(path) = hi_tools::target_path(name, arguments)
-                    && !path.is_empty()
-                {
-                    if !self
-                        .inspected_paths
-                        .iter()
-                        .any(|existing| existing == &path)
-                    {
+                let paths = hi_tools::target_paths(name, arguments);
+                self.file_reads = self.file_reads.saturating_add(paths.len().max(1) as u32);
+                for path in &paths {
+                    if path.is_empty() {
+                        continue;
+                    }
+                    if !self.inspected_paths.iter().any(|existing| existing == path) {
                         Self::push_path(&mut self.inspected_paths, path.clone());
                     }
-                    self.record_read_page(&path, output);
                 }
+                self.record_read_pages(&paths, output);
             }
         }
         // Record the inspection signature so the no-new-evidence guard can
@@ -297,14 +295,27 @@ impl EvidenceTracker {
                     {
                         continue;
                     }
-                    if let Some(path) = hi_tools::target_path(name, args)
-                        && self.path_already_inspected(&path)
-                    {
-                        if !self.path_read_is_complete(&path) && self.path_read_is_truncated(&path)
-                        {
+                    let paths = hi_tools::target_paths(name, args);
+                    if !paths.is_empty() {
+                        let mut any_new_page = false;
+                        let mut all_inspected = true;
+                        for path in &paths {
+                            if self.path_already_inspected(path) {
+                                if !self.path_read_is_complete(path)
+                                    && self.path_read_is_truncated(path)
+                                {
+                                    any_new_page = true;
+                                }
+                            } else {
+                                all_inspected = false;
+                            }
+                        }
+                        if any_new_page {
                             return true;
                         }
-                        continue;
+                        if all_inspected {
+                            continue;
+                        }
                     }
                     match inspection_signature(name, args) {
                         Some(sig) if self.has_seen_signature(&sig) => {}
@@ -326,6 +337,12 @@ impl EvidenceTracker {
                 }
                 "list" | "grep" | "glob" | "bash_output" | "bash_kill" => {
                     if name == "grep" && self.has_seen_signature("grep:error:unavailable") {
+                        continue;
+                    }
+                    if name == "grep"
+                        && let Some(path) = grep_full_file_dump_path(args)
+                        && self.path_read_is_complete(&path)
+                    {
                         continue;
                     }
                     match inspection_signature(name, args) {
@@ -374,11 +391,31 @@ impl EvidenceTracker {
     /// consecutive no-new-evidence hit.
     pub(crate) fn rereads_only_completed_files(&self, calls: &[(String, String, String)]) -> bool {
         !calls.is_empty()
-            && calls.iter().all(|(_, name, args)| {
-                name == "read"
-                    && hi_tools::target_path(name, args)
-                        .is_some_and(|path| self.path_read_is_complete(&path))
+            && calls.iter().all(|(_, name, args)| match name.as_str() {
+                "read" => {
+                    let paths = hi_tools::target_paths(name, args);
+                    !paths.is_empty() && paths.iter().all(|path| self.path_read_is_complete(path))
+                }
+                "grep" => grep_full_file_dump_path(args)
+                    .is_some_and(|path| self.path_read_is_complete(&path)),
+                "bash" => {
+                    let paths = bash_inspection_paths(args);
+                    !paths.is_empty() && paths.iter().all(|path| self.path_read_is_complete(path))
+                }
+                _ => false,
             })
+    }
+
+    fn record_read_pages(&mut self, paths: &[String], output: &str) {
+        match paths {
+            [] => {}
+            [path] => self.record_read_page(path, output),
+            paths => {
+                for path in paths {
+                    self.record_read_page(path, read_section_for_path(output, path));
+                }
+            }
+        }
     }
 
     fn record_read_page(&mut self, path: &str, output: &str) {
@@ -408,9 +445,11 @@ impl EvidenceTracker {
                     arguments,
                 } = block
                     && name == "read"
-                    && let Some(path) = hi_tools::target_path(name, arguments)
                 {
-                    ids.insert(id.clone(), path);
+                    let paths = hi_tools::target_paths(name, arguments);
+                    if !paths.is_empty() {
+                        ids.insert(id.clone(), paths);
+                    }
                 }
             }
         }
@@ -418,12 +457,14 @@ impl EvidenceTracker {
             for block in &message.content {
                 if let Content::ToolResult { call_id, output } = block
                     && output.starts_with("[elided")
-                    && let Some(path) = ids.get(call_id)
+                    && let Some(paths) = ids.get(call_id)
                 {
-                    self.completed_read_paths
-                        .retain(|seen| !paths_refer_to_same_file(seen, path));
-                    if !self.path_read_is_truncated(path) {
-                        Self::push_path(&mut self.truncated_read_paths, path.clone());
+                    for path in paths {
+                        self.completed_read_paths
+                            .retain(|seen| !paths_refer_to_same_file(seen, path));
+                        if !self.path_read_is_truncated(path) {
+                            Self::push_path(&mut self.truncated_read_paths, path.clone());
+                        }
                     }
                 }
             }
@@ -518,6 +559,22 @@ impl PreflightCall {
 /// relative forms (`crates/foo.rs` vs `/Users/me/proj/crates/foo.rs`).
 /// Bare filenames (`lib.rs`) only match exactly, so they cannot collide with
 /// every `**/lib.rs` in the tree.
+/// `grep` with `^` / `.` / `.*` on a single file is a full-file dump — the
+/// live ~/chat session used it after a completed `read` skip.
+fn grep_full_file_dump_path(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let pattern = value.get("pattern")?.as_str()?.trim();
+    if !matches!(pattern, "^" | "." | ".*" | "^.*$") {
+        return None;
+    }
+    value
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+}
+
 fn paths_refer_to_same_file(a: &str, b: &str) -> bool {
     let a = a.replace('\\', "/").trim_end_matches('/').to_string();
     let b = b.replace('\\', "/").trim_end_matches('/').to_string();
@@ -530,6 +587,21 @@ fn paths_refer_to_same_file(a: &str, b: &str) -> bool {
         b.ends_with(&format!("/{a}"))
     } else {
         false
+    }
+}
+
+/// Body of one file in a multi-path `read` result (`──── path ────` sections).
+/// Falls back to the whole output when the header is missing so paging footers
+/// still mark every path truncated rather than complete.
+fn read_section_for_path<'a>(output: &'a str, path: &str) -> &'a str {
+    let header = format!("──── {path} ────");
+    let Some(start) = output.find(&header) else {
+        return output;
+    };
+    let rest = &output[start + header.len()..];
+    match rest.find("\n──── ") {
+        Some(end) => &rest[..end],
+        None => rest,
     }
 }
 
@@ -548,10 +620,13 @@ pub(crate) fn inspection_signature(name: &str, arguments: &str) -> Option<String
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
     match name {
         "read" => {
-            let path = value.get("path")?.as_str()?;
-            if path.is_empty() {
+            let mut paths = hi_tools::target_paths("read", arguments);
+            if paths.is_empty() {
                 return None;
             }
+            paths.sort_unstable();
+            paths.dedup();
+            let path = paths.join("\u{1f}");
             const DEFAULT_READ_LIMIT: u64 = 2000;
             let offset = optional_u64_field(&value, "offset")?.unwrap_or(1).max(1);
             let limit = optional_u64_field(&value, "limit")?

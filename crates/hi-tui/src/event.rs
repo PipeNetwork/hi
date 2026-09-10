@@ -312,13 +312,15 @@ impl ChannelUi {
 pub(crate) fn canonical_to_ui_event(event: &hi_events::RunEvent) -> Option<UiEvent> {
     let text = event.activity.title.clone();
     match event.kind {
+        // Grok-build's feed is Read / Edit / Run rows. Turn bookkeeping
+        // ("Run started") is not a verb the user needs in scrollback.
         hi_events::EventKind::RunStarted
         | hi_events::EventKind::AttemptClaimed
         | hi_events::EventKind::AttemptRenewed
         | hi_events::EventKind::AttemptLeaseLost
         | hi_events::EventKind::AttemptCompleted
-        | hi_events::EventKind::AttemptFailed
-        | hi_events::EventKind::RunWaiting
+        | hi_events::EventKind::AttemptFailed => None,
+        hi_events::EventKind::RunWaiting
         | hi_events::EventKind::RunResumed
         | hi_events::EventKind::ApprovalDecided
         | hi_events::EventKind::ApprovalConsumed

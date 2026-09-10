@@ -70,8 +70,37 @@ fn collect_dump_paths(segment: &str, paths: &mut Vec<String>) {
                 paths.push(word.clone());
             }
         }
+        "grep" | "egrep" | "ggrep" => {
+            if let Some(path) = grep_full_file_dump_operand(&words) {
+                paths.push(path);
+            }
+        }
         _ => {}
     }
+}
+
+fn grep_full_file_dump_operand(words: &[String]) -> Option<String> {
+    let mut pattern: Option<&str> = None;
+    let mut path: Option<&str> = None;
+    for word in words.iter().skip(1) {
+        if word == "--" || matches!(word.as_str(), "-n" | "--line-number") {
+            continue;
+        }
+        if word.starts_with('-') {
+            return None;
+        }
+        if pattern.is_none() {
+            pattern = Some(word);
+        } else if path.is_none() {
+            path = Some(word);
+        } else {
+            return None;
+        }
+    }
+    if !matches!(pattern?, "" | "^" | "." | ".*" | "^.*$") {
+        return None;
+    }
+    Some(path?.to_string())
 }
 
 fn looks_like_source_path(word: &str) -> bool {
@@ -329,6 +358,15 @@ mod tests {
         assert_eq!(
             bash_inspection_paths(&serde_json::json!({"command": paged}).to_string()),
             vec!["src/server.rs".to_string()]
+        );
+        let grep_page = r#"grep -n "" src/ws.rs | sed -n '206,300p'"#;
+        assert_eq!(
+            classify_bash_command(grep_page),
+            BashCommandKind::Inspection
+        );
+        assert_eq!(
+            bash_inspection_paths(&serde_json::json!({"command": grep_page}).to_string()),
+            vec!["src/ws.rs".to_string()]
         );
     }
 

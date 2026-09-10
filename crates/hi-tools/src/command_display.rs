@@ -29,6 +29,43 @@ pub fn peel_cd_for_title(command: &str) -> &str {
     peel_cd_prefix(inner, None).unwrap_or(trimmed)
 }
 
+/// Unwrap `bash -c '…'` / `sh -lc "…"` so activity titles show the inner
+/// command (`git status`) instead of `Run bash`.
+pub fn peel_shell_c_wrapper(command: &str) -> &str {
+    let trimmed = command.trim_start();
+    let Some((prog, after_prog)) = take_shell_word(trimmed) else {
+        return command;
+    };
+    let base = Path::new(prog)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(prog);
+    if !matches!(base, "bash" | "sh" | "zsh" | "dash" | "ksh") {
+        return command;
+    }
+    let mut rest = after_prog.trim_start();
+    let mut saw_c = false;
+    while let Some((tok, after)) = take_shell_word(rest) {
+        if !tok.starts_with('-') || tok == "-" || tok.starts_with("--") {
+            break;
+        }
+        if tok.contains('c') {
+            saw_c = true;
+        }
+        rest = after.trim_start();
+        if saw_c {
+            break;
+        }
+    }
+    if !saw_c || rest.is_empty() {
+        return command;
+    }
+    unquote_path_token(rest)
+        .map(str::trim)
+        .filter(|script| !script.is_empty())
+        .unwrap_or(command)
+}
+
 fn paths_equal_for_display(a: &Path, b: &Path) -> bool {
     let a_str = a.to_string_lossy();
     let b_str = b.to_string_lossy();
@@ -354,6 +391,16 @@ mod tests {
         assert_eq!(
             peel_cd_for_title("cd /repo && cargo test | head"),
             "cargo test | head"
+        );
+        assert_eq!(
+            peel_shell_c_wrapper(r#"bash -lc "git status && git diff --stat""#),
+            "git status && git diff --stat"
+        );
+        assert_eq!(peel_shell_c_wrapper("bash -c 'wc -l src/*'"), "wc -l src/*");
+        assert_eq!(peel_shell_c_wrapper("git status"), "git status");
+        assert_eq!(
+            crate::background::shell_title(r#"bash -lc "git status && git diff --stat""#),
+            "git status"
         );
     }
 }

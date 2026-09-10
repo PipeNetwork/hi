@@ -822,7 +822,7 @@ impl crate::Agent {
                         if turn.flags.made_tool_call
                             && hi_ai::provider_error_details(&error).is_some() =>
                     {
-                        if super::terminal_verification::tool_protocol_allowance_exhausted(&error) {
+                        if super::terminal_verification::leftover_allowance_exhausted(&error) {
                             break self
                                 .settle_invalid_tool_budget(error, &mut turn, ui)
                                 .await?;

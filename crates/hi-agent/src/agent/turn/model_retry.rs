@@ -491,7 +491,7 @@ impl crate::Agent {
                     "⚠ the model emitted an invalid tool turn — retrying with tool-format guidance ({protocol_retries}/{MAX_TOOL_PROTOCOL_RETRIES})"
                 ));
                 self.messages
-                    .push_nudge(NudgeKind::Protocol, &protocol_retry_nudge);
+                    .push_nudge_or_fold(NudgeKind::Protocol, &protocol_retry_nudge);
                 Ok(ProviderStreamResult::Continue)
             }
             Err(err)

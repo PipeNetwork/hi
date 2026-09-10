@@ -2,7 +2,8 @@
 //!
 //! Wide terminals dock a right-hand pane so the composer stays usable. Narrow
 //! terminals keep the exclusive full-screen overlay. Selecting a hunk (click or
-//! `n/p` while focused) writes an `@path:N-M` chip; send attaches a hunk quote.
+//! `n/p` while focused) writes an `@path:N-M` chip; send attaches a hunk quote
+//! for the model. The transcript hides that quote until thinking is expanded.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -255,6 +256,67 @@ fn is_review_chip_token(token: &str) -> bool {
 
 pub(crate) fn prompt_still_has_mention(prompt: &str, mention: &str) -> bool {
     prompt.split_whitespace().any(|tok| tok == mention)
+}
+
+/// Split a submitted review prompt into the visible question and the attached
+/// hunk. The agent still receives the full quote; the transcript hides the
+/// code until thinking is expanded (Ctrl-E / Ctrl-T).
+pub(crate) fn split_review_hunk_echo(prompt: &str) -> (&str, Option<&str>) {
+    const OPEN: &str = "<review hunk>";
+    const CLOSE: &str = "</review hunk>";
+    let Some(open_at) = prompt.find(OPEN) else {
+        return (prompt, None);
+    };
+    let visible = prompt[..open_at].trim_end();
+    let mut body = &prompt[open_at + OPEN.len()..];
+    if let Some(stripped) = body.strip_prefix('\n') {
+        body = stripped;
+    }
+    if let Some(close_at) = body.find(CLOSE) {
+        body = body[..close_at].trim_end();
+    } else {
+        body = body.trim_end();
+    }
+    (visible, (!body.is_empty()).then_some(body))
+}
+
+pub(crate) fn review_hunk_thinking_lines(hunk: Option<&str>) -> Vec<Line<'static>> {
+    let Some(hunk) = hunk.filter(|h| !h.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let th = theme();
+    std::iter::once(Line::styled(
+        "  review hunk",
+        Style::default().fg(th.accent_thinking),
+    ))
+    .chain(
+        hunk.lines()
+            .map(|raw| Line::styled(format!("  {raw}"), Style::default().fg(th.gray_dim))),
+    )
+    .collect()
+}
+
+pub(crate) fn user_prompt_entry(
+    line: Line<'static>,
+    at: std::time::SystemTime,
+) -> crate::TranscriptEntry {
+    let text = line_text(&line);
+    let (visible, hunk) = split_review_hunk_echo(&text);
+    let line = if hunk.is_some() && visible != text {
+        let style = line
+            .spans
+            .first()
+            .map(|span| span.style)
+            .unwrap_or(line.style);
+        Line::styled(visible.to_string(), style)
+    } else {
+        line
+    };
+    crate::TranscriptEntry::UserPrompt {
+        line,
+        at,
+        review_hunk: hunk.map(str::to_string),
+    }
 }
 
 pub(crate) fn attach_hunk_quote(prompt: &str, hunk: &ReviewHunk, diff: &str) -> String {
@@ -662,123 +724,5 @@ impl crate::App {
             .border_style(border)
             .title(title);
         frame.render_widget(Paragraph::new(body).block(block), area);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TWO_FILE: &str = "\
-diff --git a/a.rs b/a.rs
---- a/a.rs
-+++ b/a.rs
-@@ -1,1 +1,1 @@
--old a
-+new a
-diff --git a/b.rs b/b.rs
---- a/b.rs
-+++ b/b.rs
-@@ -10,2 +10,3 @@
- ctx
--old b
-+new b
-";
-
-    #[test]
-    fn parse_two_file_unified_diff() {
-        let hunks = parse_review_hunks(TWO_FILE);
-        assert_eq!(hunks.len(), 2, "{hunks:?}");
-        assert_eq!(hunks[0].path, "a.rs");
-        assert_eq!(hunks[0].start, Some(1));
-        assert_eq!(hunks[1].path, "b.rs");
-        assert_eq!(hunks[1].start, Some(10));
-        assert_eq!(hunks[1].end, Some(12));
-        assert!(hunks[1].painted_start > hunks[0].painted_start);
-    }
-
-    #[test]
-    fn deleted_file_uses_old_path() {
-        let diff = "\
---- a/gone.rs
-+++ /dev/null
-@@ -1,1 +0,0 @@
--bye
-";
-        let hunks = parse_review_hunks(diff);
-        assert_eq!(hunks[0].path, "gone.rs");
-    }
-
-    #[test]
-    fn chip_replaces_previous_review_mention() {
-        let next = replace_or_prepend_chip("@a.rs:1-2 please undo", "@b.rs:10-12");
-        assert_eq!(next, "@b.rs:10-12 please undo");
-        assert_eq!(replace_or_prepend_chip("", "@a.rs:1"), "@a.rs:1 ");
-        assert_eq!(replace_or_prepend_chip("hello", "@a.rs:1"), "@a.rs:1 hello");
-    }
-
-    #[test]
-    fn quote_requires_mention_and_is_capped() {
-        let hunks = parse_review_hunks(TWO_FILE);
-        let h = &hunks[1];
-        let mention = h.mention().unwrap();
-        let quoted = attach_hunk_quote(&format!("{mention} why?"), h, TWO_FILE);
-        assert!(quoted.contains("<review hunk>"), "{quoted}");
-        assert!(quoted.contains("b.rs:10-12"), "{quoted}");
-        assert!(quoted.contains("new b"), "{quoted}");
-        let dropped = attach_hunk_quote("no chip here", h, TWO_FILE);
-        assert_eq!(dropped, "no chip here");
-    }
-
-    #[test]
-    fn dock_only_on_wide_layout() {
-        assert!(!can_dock(80));
-        assert!(!can_dock(99));
-        assert!(can_dock(100));
-        assert!(can_dock(120));
-    }
-
-    #[test]
-    fn split_body_honors_width_and_clamps() {
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 100,
-            height: 20,
-        };
-        let (left, Some((gap, right))) = split_body(area, true, Some(40)) else {
-            panic!("expected docked split");
-        };
-        assert_eq!(right.width, 40);
-        assert_eq!(gap.width, 1);
-        assert_eq!(left.width + gap.width + right.width, 100);
-
-        let (_, Some((_, narrow))) = split_body(area, true, Some(10)) else {
-            panic!("clamp min");
-        };
-        assert_eq!(narrow.width, 36);
-
-        let (_, Some((_, wide))) = split_body(area, true, Some(90)) else {
-            panic!("clamp max");
-        };
-        assert_eq!(wide.width, 100 - 24 - 1);
-    }
-
-    #[test]
-    fn docked_hints_depend_on_focus() {
-        let idle = docked_session_hints(false);
-        assert!(
-            idle.iter()
-                .any(|h| h.key == "tab" && h.label == "focus diff")
-        );
-        assert!(idle.iter().any(|h| h.key == "ctrl+g" && h.label == "close"));
-        let focused = docked_session_hints(true);
-        assert!(focused.iter().any(|h| h.key == "n/p" && h.label == "hunk"));
-        assert!(
-            focused
-                .iter()
-                .any(|h| h.key == "esc" && h.label == "unfocus")
-        );
-        assert!(!focused.iter().any(|h| h.key == "tab"));
     }
 }

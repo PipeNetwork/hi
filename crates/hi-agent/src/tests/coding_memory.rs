@@ -113,14 +113,10 @@ async fn enrichment_revalidation_respects_the_explicit_verification_ceiling() {
     let (subject, outcome, _) = run_enrichment_turn(&workspace, "true", 0, false).await;
 
     assert!(workspace.path(".hi/memory.md").exists());
-    assert_eq!(outcome.verification, VerificationStatus::Unverified);
-    assert_ne!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert_eq!(subject.last_turn_telemetry().verify_rounds, 1);
     assert_eq!(subject.last_turn_telemetry().model_requests, 2);
-    assert!(matches!(
-        subject.report.verify,
-        crate::domain::VerifyEvidence::Invalidated { .. }
-    ));
 }
 
 #[tokio::test]
@@ -137,7 +133,7 @@ async fn curated_skill_and_coding_memory_share_one_revalidation() {
             .exists()
     );
     assert!(workspace.path(".hi/memory.md").exists());
-    assert_eq!(subject.last_turn_telemetry().verify_rounds, 2);
+    assert_eq!(subject.last_turn_telemetry().verify_rounds, 1);
     assert_eq!(subject.last_turn_telemetry().model_requests, 2);
     assert_eq!(
         outcome.verified_workspace_revision,
@@ -207,7 +203,7 @@ async fn green_turn_records_coding_facts_into_decisions() {
     assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert_eq!(agent.last_verify(), Some(true));
-    assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 1);
     assert_eq!(agent.last_turn_telemetry().model_requests, 2);
     assert_eq!(
         outcome.verified_workspace_revision,

@@ -463,10 +463,10 @@ impl App {
         let content = block.content;
         match block.kind {
             TranscriptBlockKind::UserPrompt => {
-                self.transcript.push(TranscriptEntry::UserPrompt {
-                    line: Line::raw(format!("❯ {content}")),
-                    at: SystemTime::now(),
-                });
+                self.transcript.push(crate::review::user_prompt_entry(
+                    Line::raw(format!("❯ {content}")),
+                    SystemTime::now(),
+                ));
             }
             TranscriptBlockKind::Assistant => self
                 .transcript
@@ -474,6 +474,7 @@ impl App {
             TranscriptBlockKind::Reasoning => self.transcript.push(TranscriptEntry::Reasoning {
                 text: content,
                 elapsed: Duration::ZERO,
+                expanded: false,
             }),
             TranscriptBlockKind::Tool => {
                 let text = tool_payload(&content);
@@ -518,10 +519,10 @@ impl App {
                         });
                     }
                     if !text.trim().is_empty() {
-                        self.transcript.push(TranscriptEntry::UserPrompt {
-                            line: Line::raw(format!("❯ {text}")),
-                            at: SystemTime::now(),
-                        });
+                        self.transcript.push(crate::review::user_prompt_entry(
+                            Line::raw(format!("❯ {text}")),
+                            SystemTime::now(),
+                        ));
                         self.bump_transcript();
                     }
                 }

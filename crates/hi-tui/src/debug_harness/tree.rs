@@ -149,9 +149,9 @@ fn transcript_kind(entry: &TranscriptEntry) -> &'static str {
 
 fn entry_expanded(entry: &TranscriptEntry) -> Option<bool> {
     match entry {
-        TranscriptEntry::Btw { expanded, .. } | TranscriptEntry::ToolOutput { expanded, .. } => {
-            Some(*expanded)
-        }
+        TranscriptEntry::Btw { expanded, .. }
+        | TranscriptEntry::ToolOutput { expanded, .. }
+        | TranscriptEntry::Reasoning { expanded, .. } => Some(*expanded),
         TranscriptEntry::Activity(block) if block.is_foldable() => Some(block.expanded),
         _ => None,
     }

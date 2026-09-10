@@ -198,13 +198,8 @@ impl VerbGroup {
         } else {
             parts.join(", ")
         };
-        if self.total() == 1 {
-            if self.all_empty {
-                label.push_str(" · (no output)");
-            } else if self.lines > 0 {
-                let s = if self.lines == 1 { "" } else { "s" };
-                label.push_str(&format!(" · {} line{s}", self.lines));
-            }
+        if self.total() == 1 && self.all_empty {
+            label.push_str(" · (no output)");
         }
         label
     }
@@ -287,7 +282,12 @@ impl ActivityBlock {
             ActivityKind::VerbGroup(g) => {
                 let mut lines = vec![header];
                 if show_reasoning && !g.thinking.trim().is_empty() {
-                    lines.extend(thinking_block_lines(&g.thinking, g.thinking_elapsed, true));
+                    lines.extend(crate::thinking::thinking_block_lines(
+                        &g.thinking,
+                        g.thinking_elapsed,
+                        true,
+                        false,
+                    ));
                 }
                 // Ctrl-O / verbose expand Edit/Run bodies, not every explore path.
                 if self.expanded {
@@ -309,13 +309,11 @@ impl ActivityBlock {
                 let show_full = density.show_tool_output(show_tool_output) || self.expanded;
                 if show_full {
                     lines.extend(output_body_lines(body));
-                } else if density == Density::Compact {
-                    return lines;
-                } else if *idle {
+                } else if *idle && density != Density::Compact {
+                    // Grok Truncated-while-running: keep a live tail.
                     lines.extend(live_run_tail_lines(body));
-                } else {
-                    lines.extend(finished_run_preview_lines(body));
                 }
+                // Grok Collapsed: finished execute is header-only.
                 lines
             }
             ActivityKind::Edit { diff, .. } => {
@@ -515,74 +513,6 @@ fn split_label_detail(label: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Grok-build thinking block: muted header + optional preview, wrap at 120.
-pub(crate) const THINKING_WRAP_COLS: usize = 120;
-const THINKING_PREVIEW_LINES: usize = 3;
-
-pub(crate) fn thinking_block_lines(
-    text: &str,
-    elapsed: std::time::Duration,
-    expanded: bool,
-) -> Vec<Line<'static>> {
-    let th = theme();
-    let secs = elapsed.as_secs();
-    let header = if secs == 0 && !expanded {
-        "Thinking…".to_string()
-    } else {
-        let label = if secs >= 60 {
-            format!("{}m {:02}s", secs / 60, secs % 60)
-        } else {
-            format!("{secs}s")
-        };
-        format!("thought for {label}")
-    };
-    let mut lines = vec![Line::styled(
-        format!("  {header}"),
-        Style::default().fg(th.accent_thinking),
-    )];
-    if text.trim().is_empty() {
-        return lines;
-    }
-    let wrapped = wrap_text_cols(text, THINKING_WRAP_COLS);
-    let take = if expanded {
-        wrapped.len()
-    } else {
-        wrapped.len().min(THINKING_PREVIEW_LINES)
-    };
-    for line in wrapped.into_iter().take(take) {
-        lines.push(Line::styled(
-            format!("  {line}"),
-            Style::default().fg(th.gray_dim),
-        ));
-    }
-    lines
-}
-
-fn wrap_text_cols(text: &str, max_cols: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for raw in text.lines() {
-        if raw.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut current = String::new();
-        let mut width = 0usize;
-        for ch in raw.chars() {
-            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            if width + w > max_cols && !current.is_empty() {
-                out.push(std::mem::take(&mut current));
-                width = 0;
-            }
-            current.push(ch);
-            width = width.saturating_add(w);
-        }
-        if !current.is_empty() {
-            out.push(current);
-        }
-    }
-    out
-}
-
 pub(crate) fn edit_body_lines(diff: &str) -> Vec<Line<'static>> {
     let plain = strip_ansi(diff);
     if plain.trim().is_empty() {
@@ -642,24 +572,6 @@ const LIVE_RUN_TAIL_LINES: usize = 12;
 /// Keep the default edit row informative without turning every mutation into
 /// a full-screen diff. Ctrl-O or verbose density still shows every hunk.
 const EDIT_PREVIEW_LINES: usize = 6;
-/// Grok-build execute block: first 2 + last 3 when collapsed.
-const FINISHED_RUN_HEAD: usize = 2;
-const FINISHED_RUN_TAIL: usize = 3;
-
-fn finished_run_preview_lines(body: &str) -> Vec<Line<'static>> {
-    let all = output_body_lines(body);
-    if all.len() <= FINISHED_RUN_HEAD + FINISHED_RUN_TAIL {
-        return all;
-    }
-    let hidden = all.len() - FINISHED_RUN_HEAD - FINISHED_RUN_TAIL;
-    let mut lines = all[..FINISHED_RUN_HEAD].to_vec();
-    lines.push(Line::styled(
-        format!("  … +{hidden} lines"),
-        Style::default().fg(theme().gray_dim),
-    ));
-    lines.extend(all[all.len() - FINISHED_RUN_TAIL..].iter().cloned());
-    lines
-}
 
 fn live_run_tail_lines(body: &str) -> Vec<Line<'static>> {
     let mut all = output_body_lines(body);
@@ -1060,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn finished_run_shows_head_and_tail() {
+    fn finished_run_is_header_only() {
         let body = (1..=10)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
@@ -1080,12 +992,10 @@ mod tests {
             .map(crate::render::line_text)
             .collect();
         let joined = lines.join("\n");
-        assert!(joined.contains("line 1"), "{joined}");
-        assert!(joined.contains("line 2"), "{joined}");
-        assert!(joined.contains("… +5 lines"), "{joined}");
-        assert!(joined.contains("line 8"), "{joined}");
-        assert!(joined.contains("line 10"), "{joined}");
-        assert!(!joined.contains("line 5"), "{joined}");
+        assert!(joined.contains("Run echo"), "{joined}");
+        assert!(joined.contains('›'), "{joined}");
+        assert!(!joined.contains("line 1"), "{joined}");
+        assert!(!joined.contains("… +"), "{joined}");
     }
 
     #[test]
@@ -1094,7 +1004,7 @@ mod tests {
         g.add(ExploreVerb::Read, Some("src/main.rs".into()));
         g.lines = 3;
         g.live = false;
-        assert_eq!(g.label(), "Read src/main.rs · 3 lines");
+        assert_eq!(g.label(), "Read src/main.rs");
     }
 
     #[test]

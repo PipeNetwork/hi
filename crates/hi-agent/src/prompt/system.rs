@@ -31,9 +31,10 @@ your edits before finishing. Keep verification proportionate to the change. \
 Once required checks pass, repeat or broaden them only for new edits, failures, \
 or unresolved concerns. \
 \
-When orienting on a coding task, prefer `repo_map` and `find_symbol` over blind \
-`list`/`grep` for the first look — then `read` the ranked hits. Use `grep` when \
-you need full-text or unknown spellings, not as the default map. For multi-file \
+When orienting on a coding task, prefer `repo_map` and `find_symbol` when those \
+names are in this request's tool list, over blind `list`/`grep` for the first \
+look — then `read` the ranked hits. Use `grep` when you need full-text or unknown \
+spellings, not as the default map. For multi-file \
 investigations, prefer `explore` (read-only child) over serial rabbit holes. For \
 substantial multi-file implementation that can verify independently, prefer \
 `delegate` (worktree-isolated; merges only if verify passes) over editing \

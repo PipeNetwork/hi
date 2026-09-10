@@ -55,6 +55,7 @@ mod session_pickers;
 mod subagent_overlay;
 mod sync_tui;
 mod theme;
+mod thinking;
 mod timeline;
 mod tui_event_trace;
 mod turn_status;
@@ -737,19 +738,24 @@ pub(crate) enum TranscriptEntry {
     /// transcript is scrolled past a prompt, that prompt pins to the top so the
     /// visible output always shows which request it belongs to. `at` is the
     /// wall-clock stamp grok-build right-aligns on the first prompt row.
+    /// `review_hunk` is the attached Ctrl-G quote; hidden unless thinking
+    /// (Ctrl-E / Ctrl-T) is expanded.
     UserPrompt {
         line: Line<'static>,
         at: SystemTime,
+        review_hunk: Option<String>,
     },
     /// One grok-build assistant reply (markdown source), flattened as a block.
     AssistantMessage {
         text: String,
     },
     /// Assistant reasoning/thinking, buffered until the reasoning phase ends.
-    /// Shown collapsed ("thought for Ns") unless `show_reasoning` is on.
+    /// Collapsed is grok-build's header-only row ("Thought for Xs"). Ctrl-E /
+    /// Ctrl-T expands every thought; click / block-nav toggles one (`expanded`).
     Reasoning {
         text: String,
         elapsed: Duration,
+        expanded: bool,
     },
     /// Persisted `/btw` aside after the overlay is dismissed. Collapsed shows
     /// the golden `/btw <question>` header (grok-build); expand to read the
@@ -823,12 +829,20 @@ impl TranscriptEntry {
         let preview_n = density.tool_preview_lines();
         match self {
             TranscriptEntry::Line(line) => vec![line.clone()],
-            TranscriptEntry::UserPrompt { line, .. } => {
+            TranscriptEntry::UserPrompt {
+                line, review_hunk, ..
+            } => {
                 let mut prompt = style_user_prompt(line);
                 if th.paints_backgrounds() {
                     prompt.style = prompt.style.bg(th.bg_highlight);
                 }
-                vec![prompt]
+                let mut lines = vec![prompt];
+                if show_reasoning {
+                    lines.extend(crate::review::review_hunk_thinking_lines(
+                        review_hunk.as_deref(),
+                    ));
+                }
+                lines
             }
             TranscriptEntry::AssistantMessage { text } => {
                 let mut lines = Vec::new();
@@ -858,15 +872,16 @@ impl TranscriptEntry {
             }
             TranscriptEntry::Workflow { snapshot } => workflow_snapshot_lines(snapshot),
             TranscriptEntry::Activity(block) => block.flatten(show_tool, show_reasoning, density),
-            TranscriptEntry::Reasoning { text, elapsed } => {
-                let secs = elapsed.as_secs();
-                // Instant CoT is noise in the collapsed feed — grok-build
-                // folds it into the tool row. Keep it for Ctrl-T / Ctrl-E.
-                if !show_reasoning && secs == 0 {
-                    return Vec::new();
-                }
-                crate::activity_feed::thinking_block_lines(text, *elapsed, show_reasoning)
-            }
+            TranscriptEntry::Reasoning {
+                text,
+                elapsed,
+                expanded,
+            } => crate::thinking::thinking_block_lines(
+                text,
+                *elapsed,
+                show_reasoning || *expanded,
+                false,
+            ),
             TranscriptEntry::ToolOutput { body, expanded } => {
                 // The visible body lines sit in a sunken panel (a `panel` base
                 // background) on truecolor themes, tagging them so the render
@@ -945,7 +960,7 @@ impl TranscriptEntry {
     /// Foldable blocks that block-nav / click-to-expand step over.
     pub(crate) fn is_foldable(&self) -> bool {
         match self {
-            Self::ToolOutput { .. } | Self::Btw { .. } => true,
+            Self::ToolOutput { .. } | Self::Btw { .. } | Self::Reasoning { .. } => true,
             Self::Activity(block) => block.is_foldable() || block.subagent_id().is_some(),
             _ => false,
         }
@@ -954,7 +969,9 @@ impl TranscriptEntry {
     /// Per-block expand flag, when this entry is foldable.
     pub(crate) fn expanded_mut(&mut self) -> Option<&mut bool> {
         match self {
-            Self::ToolOutput { expanded, .. } | Self::Btw { expanded, .. } => Some(expanded),
+            Self::ToolOutput { expanded, .. }
+            | Self::Btw { expanded, .. }
+            | Self::Reasoning { expanded, .. } => Some(expanded),
             Self::Activity(block) if block.is_foldable() => Some(&mut block.expanded),
             _ => None,
         }
@@ -1135,11 +1152,11 @@ pub(crate) struct App {
     /// reasoning phase ends, then committed as a single collapsible
     /// `TranscriptEntry::Reasoning` so it doesn't flood the transcript inline.
     pub(crate) reasoning_buffer: String,
-    /// When the current reasoning phase started (for the "thought for Ns" label).
+    /// When the current reasoning phase started (for the "Thought for Xs" label).
     pub(crate) reasoning_started: Option<Instant>,
     /// Whether reasoning (CoT) blocks are expanded inline. Off by default —
-    /// reasoning is collapsed to a one-line "thought for Ns" summary; Ctrl-T /
-    /// Ctrl-E toggles this to show/hide the full thinking text.
+    /// reasoning is collapsed to grok-build's header-only "Thought for Xs"
+    /// row; Ctrl-T / Ctrl-E toggles this to show/hide the full thinking text.
     pub(crate) show_reasoning: bool,
     /// Whether long tool-output blocks are expanded in full. Off by default —
     /// output beyond [`TOOL_OUTPUT_PREVIEW_LINES`] folds to a preview; Ctrl-O

@@ -233,9 +233,9 @@ impl crate::App {
             KeyCode::Char('?') if ctrl => {
                 self.show_debug = !self.show_debug;
             }
-            // Toggle reasoning (CoT) expansion: collapsed "thought for Ns"
-            // summaries vs. the full thinking text. Off by default so reasoning
-            // doesn't flood the transcript; Ctrl-T / Ctrl-E show/hide all blocks.
+            // Toggle reasoning (CoT) expansion: grok-build header-only
+            // "Thought for Xs" vs. the full thinking text. Off by default so
+            // reasoning doesn't flood the transcript; Ctrl-T / Ctrl-E show/hide.
             KeyCode::Char('t') if ctrl => {
                 self.apply_action(Action::ToggleReasoning);
             }
