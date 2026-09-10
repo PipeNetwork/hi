@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub(crate) const SCENARIO_SCHEMA_VERSION: u16 = 1;
-pub(crate) const MAX_SCENARIO_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
+pub(crate) const MAX_SCENARIO_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

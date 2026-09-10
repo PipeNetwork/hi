@@ -6,6 +6,7 @@ use crate::edit::sh_quote;
 use crate::paths::{FileVersion, ReadCache, cache_key};
 use crate::{ProcessRunner, ToolOutcome, ToolStatus};
 
+mod cursor_rules;
 mod discovery;
 mod formatting;
 mod grep_fallback;
@@ -142,8 +143,17 @@ pub(crate) async fn run_read_with_mcp(
                 limit,
                 ..
             } = read;
+            let cursor_path = match &source {
+                resource::RoutedReadSource::WorkspacePath(path) => {
+                    Some(std::path::PathBuf::from(path))
+                }
+                resource::RoutedReadSource::ResourceBody(_) => None,
+            };
             let content = source.read(cache).await?;
-            let rendered = format_read_for_output(&content, offset, limit);
+            let mut rendered = format_read_for_output(&content, offset, limit);
+            if let Some(path) = cursor_path {
+                cursor_rules::append_cursor_rules_for_read(root, &path, &mut rendered.content);
+            }
             Ok(crate::ToolOutcome::plain_read(
                 rendered.content,
                 content.len() as u64,

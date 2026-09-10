@@ -118,6 +118,7 @@ impl crate::App {
         &mut self,
         help_h: usize,
         inner_w: usize,
+        menu_h: usize,
     ) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if let Some(search) = self.mode.history_search() {
@@ -223,7 +224,9 @@ impl crate::App {
                 ),
             ]));
             let sel = palette.selected;
-            for (i, item) in palette.items.iter().take(12).enumerate() {
+            let (start, end) = crate::completion::visible_range(sel, palette.items.len(), menu_h);
+            for (i, item) in palette.items[start..end].iter().enumerate() {
+                let i = start + i;
                 if i == sel {
                     lines.push(Line::from(vec![
                         Span::styled(
@@ -241,10 +244,15 @@ impl crate::App {
                     ]));
                 }
             }
-            lines.push(Line::styled(
-                "  ↑↓ move · Enter run · Esc close · type to filter",
-                dim(),
-            ));
+            let mut hint = "  ↑↓ move · Enter run · Esc close · type to filter".to_string();
+            if palette.items.len() > end.saturating_sub(start) {
+                hint = format!(
+                    "  ↑↓  {}/{}  · Enter run · Esc close · type to filter",
+                    sel + 1,
+                    palette.items.len()
+                );
+            }
+            lines.push(Line::styled(hint, dim()));
         }
         let items = self.completion_items();
         let selected = self.completion.as_ref().map(|c| c.selected).unwrap_or(0);
@@ -255,7 +263,9 @@ impl crate::App {
             Some(crate::completion::CompletionContext::Arg { prefix, .. }) => prefix.as_str(),
             None => "",
         };
-        for (i, item) in items.iter().enumerate() {
+        let (start, end) = crate::completion::visible_range(selected, items.len(), menu_h);
+        for (i, item) in items[start..end].iter().enumerate() {
+            let i = start + i;
             let label = format!("{:<width$}", item.label, width = label_w);
             let mark = if i == selected { "▶ " } else { "  " };
             let mut row = vec![Span::raw(mark.to_string())];
@@ -268,6 +278,12 @@ impl crate::App {
                 row.push(Span::styled(format!("  {}", item.help), dim()));
             }
             lines.push(Line::from(row));
+        }
+        if items.len() > end.saturating_sub(start) {
+            lines.push(Line::styled(
+                format!("  ↑↓  {}/{}", selected + 1, items.len()),
+                dim(),
+            ));
         }
         lines
             .into_iter()

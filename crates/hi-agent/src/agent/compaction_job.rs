@@ -86,7 +86,19 @@ impl crate::Agent {
 
     /// Reclaim context using a specific strategy (e.g. `/compact <kind>`).
     pub async fn compact_with(&mut self, kind: CompactionKind, ui: &mut dyn Ui) -> Result<()> {
-        self.compact_with_control(kind, ui, None).await
+        self.compact_with_instructions(kind, None, ui).await
+    }
+
+    /// `/compact [kind] extra instructions` — extra text is appended to the
+    /// summarizer prompt so the user can keep named facts.
+    pub async fn compact_with_instructions(
+        &mut self,
+        kind: CompactionKind,
+        extra_instructions: Option<&str>,
+        ui: &mut dyn Ui,
+    ) -> Result<()> {
+        self.compact_with_control(kind, extra_instructions, ui, None)
+            .await
     }
 
     /// Compact with a frontend cancellation signal whose terminal job seal is
@@ -97,13 +109,25 @@ impl crate::Agent {
         ui: &mut dyn Ui,
         cancellation: crate::TurnCancellation,
     ) -> Result<()> {
-        self.compact_with_control(kind, ui, Some(cancellation))
+        self.compact_with_cancellable_instructions(kind, None, ui, cancellation)
+            .await
+    }
+
+    pub async fn compact_with_cancellable_instructions(
+        &mut self,
+        kind: CompactionKind,
+        extra_instructions: Option<&str>,
+        ui: &mut dyn Ui,
+        cancellation: crate::TurnCancellation,
+    ) -> Result<()> {
+        self.compact_with_control(kind, extra_instructions, ui, Some(cancellation))
             .await
     }
 
     async fn compact_with_control(
         &mut self,
         kind: CompactionKind,
+        extra_instructions: Option<&str>,
         ui: &mut dyn Ui,
         cancellation: Option<crate::TurnCancellation>,
     ) -> Result<()> {
@@ -140,7 +164,7 @@ impl crate::Agent {
         let prepared = {
             let preparation = tokio::time::timeout(
                 execution_limit,
-                self.prepare_compaction(kind, &source_messages, ui),
+                self.prepare_compaction(kind, extra_instructions, &source_messages, ui),
             );
             tokio::pin!(preparation);
             if let Some(signal) = cancellation.clone() {
@@ -249,19 +273,23 @@ impl crate::Agent {
     async fn prepare_compaction(
         &mut self,
         kind: CompactionKind,
+        extra_instructions: Option<&str>,
         source: &[Message],
         ui: &mut dyn Ui,
     ) -> Result<PreparedCompaction> {
         match kind {
-            CompactionKind::Summarize => self.prepare_summarize(source, ui).await,
+            CompactionKind::Summarize => {
+                self.prepare_summarize(source, extra_instructions, ui).await
+            }
             CompactionKind::Hybrid { keep_recent } => {
-                self.prepare_hybrid(source, keep_recent, ui).await
+                self.prepare_hybrid(source, keep_recent, extra_instructions, ui)
+                    .await
             }
             CompactionKind::ElideToolOutput { keep_recent } => {
                 Ok(prepare_elide(source, keep_recent))
             }
             CompactionKind::ElideThenSummarizeTail { keep_recent } => {
-                self.prepare_elide_then_summarize_tail(source, keep_recent, ui)
+                self.prepare_elide_then_summarize_tail(source, keep_recent, extra_instructions, ui)
                     .await
             }
             CompactionKind::FreshWindow => Ok(PreparedCompaction::Replace {
@@ -275,12 +303,13 @@ impl crate::Agent {
     async fn prepare_summarize(
         &mut self,
         source: &[Message],
+        extra_instructions: Option<&str>,
         ui: &mut dyn Ui,
     ) -> Result<PreparedCompaction> {
         if source.len() <= 1 {
             return Ok(PreparedCompaction::NoChange("nothing to compact yet"));
         }
-        let Some(summary) = self.summarize(&source[1..], ui).await? else {
+        let Some(summary) = self.summarize(&source[1..], extra_instructions, ui).await? else {
             return Ok(PreparedCompaction::NoChange(
                 "compaction produced no summary; keeping history",
             ));
@@ -299,15 +328,19 @@ impl crate::Agent {
         &mut self,
         source: &[Message],
         keep_recent: usize,
+        extra_instructions: Option<&str>,
         ui: &mut dyn Ui,
     ) -> Result<PreparedCompaction> {
         if keep_recent == 0 {
-            return self.prepare_summarize(source, ui).await;
+            return self.prepare_summarize(source, extra_instructions, ui).await;
         }
         let Some(split) = compaction::recent_split(source, keep_recent) else {
-            return self.prepare_summarize(source, ui).await;
+            return self.prepare_summarize(source, extra_instructions, ui).await;
         };
-        let Some(summary) = self.summarize(&source[1..split], ui).await? else {
+        let Some(summary) = self
+            .summarize(&source[1..split], extra_instructions, ui)
+            .await?
+        else {
             return Ok(PreparedCompaction::NoChange(
                 "compaction produced no summary; keeping history",
             ));
@@ -328,13 +361,14 @@ impl crate::Agent {
         &mut self,
         source: &[Message],
         keep_recent: usize,
+        extra_instructions: Option<&str>,
         ui: &mut dyn Ui,
     ) -> Result<PreparedCompaction> {
         if keep_recent == 0 {
-            return self.prepare_summarize(source, ui).await;
+            return self.prepare_summarize(source, extra_instructions, ui).await;
         }
         let Some(split) = compaction::recent_split(source, keep_recent) else {
-            return self.prepare_summarize(source, ui).await;
+            return self.prepare_summarize(source, extra_instructions, ui).await;
         };
         let mut working = source.to_vec();
         compaction::elide_tool_outputs(&mut working, split);
@@ -342,7 +376,7 @@ impl crate::Agent {
         let summary = if convo.is_empty() {
             None
         } else {
-            self.summarize(&convo, ui).await?
+            self.summarize(&convo, extra_instructions, ui).await?
         };
         let old = compaction::tool_bearing_turns(&working, split);
         let mut recent = working[split..].to_vec();

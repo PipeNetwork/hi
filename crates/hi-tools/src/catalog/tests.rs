@@ -108,6 +108,8 @@ fn metadata_catalog_covers_every_schema_once() {
     assert!(is_known_tool("research_read"));
     assert!(is_known_tool("browser_exec"));
     assert!(is_known_tool("run_program"));
+    assert!(is_known_tool("send_subagent_message"));
+    assert!(is_known_tool("monitor"));
     assert!(!is_known_tool("hallucinated_tool"));
 }
 
@@ -534,6 +536,8 @@ fn capability_matrix_known_tool_side_effects() {
         ("get_task_output", "process"),
         ("wait_tasks", "process"),
         ("kill_task", "process"),
+        ("send_subagent_message", "process"),
+        ("monitor", "process"),
         ("web_search", "network"),
         ("web_fetch", "network"),
         ("research", "network"),

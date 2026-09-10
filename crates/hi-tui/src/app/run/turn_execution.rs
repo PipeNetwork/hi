@@ -183,8 +183,8 @@ pub(super) async fn run_agent_turn(
         // panel (verify rounds, recovery retries, nudges, stalls).
         app.last_telemetry = Some(agent.last_turn_telemetry().clone());
         app.last_turn_phase = Some(agent.turn_phase().label());
-        // A new turn's edits supersede any open diff panel's snapshot.
-        app.diff_text = None;
+        // A new turn's edits supersede a closed pane; an open pane refreshes.
+        app.refresh_review_if_open();
     }
     if stop_requested && !cancelled {
         // The body either committed or returned its original error just
@@ -324,6 +324,9 @@ pub(super) async fn run_agent_turn(
         app.finish_plan_draft(started_in_plan_mode, driven.value.as_ref());
         app.push_session_face(agent);
         app.maybe_queue_drive(agent, driven.value.as_ref());
+        if let Some(prompt) = agent.take_monitor_wake_prompt() {
+            let _ = app.enqueue_prompt(prompt);
+        }
     }
     app.trace_turn_settled(agent, outcome)?;
     if cancelled && !app.exit_requested {

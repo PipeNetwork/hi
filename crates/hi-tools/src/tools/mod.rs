@@ -32,9 +32,10 @@ pub use crate::catalog::{
     delegate_tool_spec, explore_tool_spec, get_task_output_tool_spec, is_coordination,
     is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec,
     memory_forget_tool_spec, memory_get_tool_spec, memory_search_tool_spec,
-    memory_update_tool_spec, new_context_tool_spec, research_read_tool_spec, research_tool_spec,
-    run_program_tool_spec, search_tool_tool_spec, skill_tool_spec, speculation_class, target_path,
-    target_paths, task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
+    memory_update_tool_spec, monitor_tool_spec, new_context_tool_spec, research_read_tool_spec,
+    research_tool_spec, run_program_tool_spec, search_tool_tool_spec,
+    send_subagent_message_tool_spec, skill_tool_spec, speculation_class, target_path, target_paths,
+    task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
 };
 
 use mutations::run_prepared_mutation;
@@ -1130,6 +1131,7 @@ async fn run(
         "web_download" => {
             crate::web::run_web_download_in(root, resources.background, arguments).await
         }
+        "monitor" => process_tools::run_monitor_tool(root, state_root, &resources, arguments).await,
         "search_tool" => external::run_search_tool(resources.mcp, arguments).await,
         "use_tool" => external::run_use_tool(resources.mcp, arguments).await,
         "browser_exec" => run_browser_exec(arguments).await,
@@ -2040,7 +2042,7 @@ mod tests {
     fn bash_foreground_attachment_is_bounded_when_process_lifetime_is_unlimited() {
         assert_eq!(
             resolve_foreground_budget_from_values(None, None),
-            Duration::from_secs(30)
+            Duration::from_secs(15)
         );
         assert_eq!(
             resolve_foreground_budget_from_values(None, Some("7")),
@@ -2052,7 +2054,7 @@ mod tests {
         );
         assert_eq!(
             resolve_foreground_budget_from_values(None, Some("invalid")),
-            Duration::from_secs(30)
+            Duration::from_secs(15)
         );
     }
 

@@ -31,6 +31,61 @@ pub(crate) fn bash_inspection_signature(arguments: &str) -> Option<String> {
         .then(|| normalize_inspection_command(&command))
 }
 
+/// Source-file operands of a read-only dump (`cat`/`sed`/`head`/`tail`/`nl`).
+/// Used so `cd dir && cat src/foo.rs` cannot count as new evidence after the
+/// `read` tool already returned that file.
+pub(crate) fn bash_inspection_paths(arguments: &str) -> Vec<String> {
+    let Some(command) = bash_command(arguments) else {
+        return Vec::new();
+    };
+    if classify_bash_command(&command) != BashCommandKind::Inspection {
+        return Vec::new();
+    }
+    let segments = read_only_shell_segments(&command).unwrap_or_else(|| vec![command.clone()]);
+    let mut paths = Vec::new();
+    for segment in segments {
+        collect_dump_paths(&segment, &mut paths);
+    }
+    paths
+}
+
+fn collect_dump_paths(segment: &str, paths: &mut Vec<String>) {
+    let Some(words) = simple_shell_words(segment) else {
+        return;
+    };
+    let Some(cmd) = words.first() else {
+        return;
+    };
+    let cmd = cmd.rsplit('/').next().unwrap_or(cmd);
+    match cmd {
+        "cat" | "nl" => {
+            for word in words.iter().skip(1) {
+                if looks_like_source_path(word) {
+                    paths.push(word.clone());
+                }
+            }
+        }
+        "sed" | "head" | "tail" => {
+            if let Some(word) = words.iter().rev().find(|word| looks_like_source_path(word)) {
+                paths.push(word.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn looks_like_source_path(word: &str) -> bool {
+    if word.starts_with('-') || word.is_empty() {
+        return false;
+    }
+    word.contains('/')
+        || word.ends_with(".rs")
+        || word.ends_with(".toml")
+        || word.ends_with(".md")
+        || word.ends_with(".json")
+        || word.ends_with(".lock")
+}
+
 /// Identify a bounded foreground execution probe such as
 /// `timeout 10 ./target/debug/app | head`. Callers must separately prove that
 /// the command caused no workspace mutation before using the signature.
@@ -193,6 +248,11 @@ fn shell_segment_is_read_only(segment: &str) -> bool {
         return simple_shell_words(segment)
             .is_some_and(|words| git_subcommand_is_read_only(&words[1..]));
     }
+    // `cd dir && cat file` is how models re-dump files after the read tool
+    // refuses a reread. Changing directory is not a workspace mutation.
+    if command == "cd" {
+        return true;
+    }
     matches!(
         command,
         "pwd"
@@ -253,6 +313,23 @@ mod tests {
             Some("./target/debug/app")
         );
         assert!(bash_bounded_execution_probe(r#"{"command":"cargo test"}"#).is_none());
+    }
+
+    #[test]
+    fn cd_and_cat_is_inspection_of_the_dumped_path() {
+        let command = "cd /Users/david/chat && cat src/state.rs";
+        assert_eq!(classify_bash_command(command), BashCommandKind::Inspection);
+        let arguments = serde_json::json!({"command": command}).to_string();
+        assert_eq!(
+            bash_inspection_paths(&arguments),
+            vec!["src/state.rs".to_string()]
+        );
+        let paged = "cd /Users/david/chat && sed -n '120,420p' src/server.rs";
+        assert_eq!(classify_bash_command(paged), BashCommandKind::Inspection);
+        assert_eq!(
+            bash_inspection_paths(&serde_json::json!({"command": paged}).to_string()),
+            vec!["src/server.rs".to_string()]
+        );
     }
 
     #[test]

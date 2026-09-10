@@ -1,9 +1,14 @@
 //! Goal decomposition: one auxiliary planner-model call that turns a `/goal`
-//! objective into an ordered list of sub-tasks for the long-horizon engine to
-//! drive. A strong planner (e.g. glm-5.2) plans once; the session model executes
-//! each sub-goal turn-by-turn. Modeled on the other auxiliary side-calls
-//! ([`Agent::update_memory_at`], MoA's `reference_guidance`): a throwaway
-//! chat-only request through `self.provider`, usage booked, no history recorded.
+//! objective into a grok-style plan (kind, acceptance, verification, checklist)
+//! for the long-horizon engine to drive. A strong planner (e.g. glm-5.2) plans
+//! once; the session model executes each sub-goal turn-by-turn. Modeled on the
+//! other auxiliary side-calls ([`Agent::update_memory_at`], MoA's
+//! `reference_guidance`): a throwaway chat-only request through
+//! `self.provider`, usage booked, no history recorded.
+
+mod parse;
+
+pub(crate) use parse::parse_planner_output;
 
 use std::io::Read;
 use std::path::{Component, Path};
@@ -48,23 +53,36 @@ or stand-in in another language does not complete it. Include testing/integratio
 establish \
 the whole objective, not just a first slice — but do NOT add a standalone final validation or \
 'run all tests' milestone: validation lives inside each milestone, and the system runs its own \
-completion audit when the goal finishes. Each line must be a real, checkable step, not \
-busywork. Output one imperative milestone per line — no numbering, no bullet characters, no prose, \
-no preamble, no blank lines.";
+completion audit when the goal finishes. Each checklist line must be a real, checkable step, not \
+busywork. Output Markdown with these sections in order and nothing else (no preamble, no closing \
+prose):\n\
+\n\
+## Goal kind\n\
+<code-change | analysis | research>\n\
+\n\
+## Acceptance criteria\n\
+1. <gating, outcome-based criterion; 3-5 items; atomic; do not invent scope>\n\
+\n\
+## Verification plan\n\
+1. <action plus the observations that MUST hold to pass; cover every criterion>\n\
+\n\
+## Task checklist\n\
+<one imperative milestone per line — no numbering, no bullet characters, no checkboxes>";
 
 impl crate::Agent {
-    /// Decompose `objective` into ordered sub-task descriptions via one auxiliary
-    /// call to the configured `planner_model`. Returns the parsed list; errors if
-    /// no planner is configured, the call fails, or nothing usable comes back — the
-    /// caller then falls back to a single sub-goal equal to the objective. Books the
-    /// call's token usage; records nothing into the session history.
+    /// Decompose `objective` into a structured plan via one auxiliary call to
+    /// the configured `planner_model`. Returns kind / acceptance / verification
+    /// plus the drive checklist; errors if no planner is configured, the call
+    /// fails, or nothing usable comes back — the caller then falls back to a
+    /// single sub-goal equal to the objective. Books the call's token usage;
+    /// records nothing into the session history.
     ///
     /// Decomposition quality is guarded deterministically: read-only "review the
     /// documents" milestones are dropped, and when workspace documents were inlined
     /// the milestones must share vocabulary with them ([`decomposition_grounded`]) —
     /// one retry with a sterner prompt, then an error (the callers' single-sub-goal
     /// fallback beats driving a plan that ignored the requirements).
-    pub async fn decompose_goal(&mut self, objective: &str) -> Result<Vec<String>> {
+    pub async fn decompose_goal(&mut self, objective: &str) -> Result<crate::GoalPlan> {
         // Referenced documents can be large (up to the bounded 256 KiB planner
         // context). Do not perform their canonicalization and reads on the
         // async drive task before the planner request starts.
@@ -77,12 +95,12 @@ impl crate::Agent {
         let text = self
             .planner_call(PLANNER_PROMPT.to_string(), &input.text, execution.clone())
             .await?;
-        let steps = drop_meta_milestones(parse_sub_goals(&text));
-        if steps.is_empty() {
+        let plan = plan_from_planner_text(&text);
+        if plan.milestones.is_empty() {
             return Err(anyhow!("planner returned no sub-tasks"));
         }
-        let unmatched = match decomposition_grounded(&steps, &input.docs) {
-            Ok(()) => return Ok(steps),
+        let unmatched = match decomposition_grounded(&plan.milestones, &input.docs) {
+            Ok(()) => return Ok(plan),
             Err(unmatched) => unmatched,
         };
 
@@ -97,20 +115,21 @@ impl crate::Agent {
         let sterner = format!(
             "{PLANNER_PROMPT}\n\nYour previous decomposition did not correspond to the \
 referenced workspace documents: milestones such as {examples} share no vocabulary with them. \
-Decompose again strictly from the documents' actual contents; every milestone must name \
-concrete components, files, or requirements that appear in the documents."
+Decompose again strictly from the documents' actual contents; every Task checklist milestone \
+must name concrete components, files, or requirements that appear in the documents. Keep the \
+Markdown sections (Goal kind, Acceptance criteria, Verification plan, Task checklist)."
         );
         let text = self.planner_call(sterner, &input.text, execution).await?;
-        let steps = drop_meta_milestones(parse_sub_goals(&text));
-        if steps.is_empty() {
+        let plan = plan_from_planner_text(&text);
+        if plan.milestones.is_empty() {
             return Err(anyhow!("planner returned no sub-tasks on retry"));
         }
-        if decomposition_grounded(&steps, &input.docs).is_err() {
+        if decomposition_grounded(&plan.milestones, &input.docs).is_err() {
             return Err(anyhow!(
                 "planner decomposition did not match the referenced documents after a retry"
             ));
         }
-        Ok(steps)
+        Ok(plan)
     }
 
     /// One bounded, chat-only planner-model call: send `system_prompt` + `input`,
@@ -632,9 +651,15 @@ pub(crate) fn decomposition_grounded(
     }
 }
 
+fn plan_from_planner_text(text: &str) -> crate::GoalPlan {
+    let mut plan = parse_planner_output(text);
+    plan.milestones = drop_meta_milestones(plan.milestones);
+    plan
+}
+
 /// Strip a leading list marker — `- ` / `* ` / `• ` or a `12.` / `12)` number —
 /// that a model tends to add despite being told not to.
-fn strip_list_marker(line: &str) -> String {
+pub(super) fn strip_list_marker(line: &str) -> String {
     let s = line.trim();
     // Bullet forms.
     if let Some(rest) = s.strip_prefix(['-', '*', '•']) {

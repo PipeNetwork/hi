@@ -120,7 +120,7 @@ impl CandidateChildPaths {
     }
 
     pub(crate) fn delegate_environment(&self, api_key: &str) -> Vec<(OsString, OsString)> {
-        vec![
+        let mut environment = vec![
             ("HI_FORCE_API_KEY".into(), api_key.into()),
             ("HI_API_KEY".into(), api_key.into()),
             ("CARGO_TARGET_DIR".into(), self.build_cache("cargo-target")),
@@ -128,13 +128,27 @@ impl CandidateChildPaths {
             ("SCCACHE_DIR".into(), self.build_cache("sccache")),
             // Enforce normal folder trust; never inherit an operator override.
             ("HI_FOLDER_TRUST".into(), "on".into()),
-        ]
+        ];
+        inherit_bash_handoff_env(&mut environment);
+        environment
     }
 
     pub(crate) fn retain(&self, report: &Path, events: Option<&Path>) {
         let _ = copy_regular_no_follow(&self.report(), report);
         if let Some(events) = events {
             let _ = copy_regular_no_follow(&self.events(), events);
+        }
+    }
+}
+
+fn inherit_bash_handoff_env(environment: &mut Vec<(OsString, OsString)>) {
+    for key in [
+        "HI_BASH_TIMEOUT_SECS",
+        "HI_BASH_AUTO_BACKGROUND",
+        "HI_BASH_FOREGROUND_BUDGET_SECS",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            environment.push((OsString::from(key), value));
         }
     }
 }

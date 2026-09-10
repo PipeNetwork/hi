@@ -52,25 +52,18 @@ pub enum Command {
     Doctor,
     /// Enter/exit plan mode, pause leftover-work drive, or show the current plan.
     /// Arg: empty/on, `off`, `show`, `pause`, `resume`, `clear`, `replace`, or a request.
+    /// `/view-plan` parses as `Plan("show")`.
     Plan(String),
-    /// Show the current plan checklist (`update_plan` / plan mode).
-    ViewPlan,
     /// Fork a peer session; optional `--worktree` / `--no-worktree` and directive.
     Fork(String),
     /// Rewind conversation to before a user turn. Empty opens the picker; `<n>` rewinds.
     Rewind(String),
     /// Permission ladder: empty/status, `ask`, `auto`, `always` (yolo).
+    /// `/always-approve` / `/yolo` / `/auto` parse into this.
     Permissions(String),
-    /// Alias for `/permissions always` when empty; otherwise same as Permissions.
-    AlwaysApprove(String),
-    /// Alias for `/permissions auto` when empty.
-    Auto(String),
     /// Show queued prompts / background work. Frontend fills live queue details.
+    /// `/tasks` parses as `Queue("tasks")`.
     Queue(String),
-    /// Show tasks (loops, background processes, delegates). Alias surface for `/queue tasks`.
-    Tasks(String),
-    /// List skills + `.hi/hooks` inventory (lightweight plugins/hooks view).
-    Plugins(String),
     /// Append a durable memory note. Optional `--global` / `global`.
     Remember(String),
     /// Restore the previous markdown memory file after a remember/update/forget.
@@ -88,10 +81,10 @@ pub enum Command {
     /// Search conversation messages for text.
     Find(String),
     /// Jump to a user turn. Empty opens the picker; `<n>` scrolls to that prompt.
+    /// `/history` parses as this.
     Jump(String),
-    /// List recent user prompts (history).
-    History(String),
     /// Execute/list lifecycle hooks under `.hi/hooks`.
+    /// `/plugins` parses as this.
     Hooks(String),
     /// Query/grant/revoke trust for repository-local executable config.
     Trust(String),
@@ -103,12 +96,6 @@ pub enum Command {
     Inspect(String),
     /// Manage named agent/persona definitions under `.hi/agents`.
     Agents(String),
-    /// Share/export the current session for review.
-    Share(String),
-    /// MCP administration beyond inspect (list/add/remove/doctor guidance).
-    McpAdmin(String),
-    /// Rewind picker/list UX (alias of `/rewind`, TUI may open a picker).
-    RewindPicker,
     /// Switch between fullscreen and terminal-scrollback-oriented minimal mode.
     ScreenMode(String),
     /// Toggle vim-style composer mode.
@@ -121,10 +108,6 @@ pub enum Command {
     Timestamps(String),
     /// Change/list dashboard workspace directory.
     Cd(String),
-    /// Primary session rename surface.
-    Rename(String),
-    /// Primary session resume surface.
-    Resume(String),
     /// Toggle or query the LSP subsystem. Arg: `on`, `off`, or empty (status).
     Lsp(String),
     /// Toggle or query the write-capable `delegate` subagent. Arg: `on`, `off`,
@@ -181,7 +164,7 @@ pub enum Command {
     Commit,
     /// Print the version and exit.
     Version,
-    /// Export the conversation to a file.
+    /// Export the conversation to a file. `/share` parses as `Export("--share")`.
     Export(String),
     /// Workspace MCP status, `/mcp pipe` for provider mcp_url, or reconnect/enable.
     Mcp(String),
@@ -190,7 +173,8 @@ pub enum Command {
     /// Open the fleet dashboard: dispatch, monitor, and steer multiple
     /// concurrent agent sessions from one screen (TUI only). Arg: empty opens
     /// the dashboard; `status` lists this project's resumable fleet sessions.
-    Dashboard(String),
+    /// `/dashboard` is a parse alias of `/fleet`.
+    Fleet(String),
     /// Run or manage a scripted workflow: `/workflow <name> [args...]` launches
     /// a multi-phase, multi-agent plan from a Rhai script (built-in or
     /// `~/.hi/workflows/<name>.rhai`). Subcommands: `list` lists available
@@ -211,20 +195,10 @@ pub enum Command {
     /// Parked confirms waiting on a human (`allow`/`deny` by id). `/digest` is
     /// what changed; inbox is blocked-on-you.
     Inbox(String),
-    /// Toggle or query session sync to ipop. Arg: `on`, `off`, `status`, or
-    /// empty (status). When on, session records + live events are pushed to
-    /// the ipop API for cross-machine resume.
-    Sync(String),
     /// List or manage sessions. Args: `switch <id>`, `rename <id> <name>`, or
-    /// empty (list).
+    /// empty (list). `/sync`, `/attach`, `/daemon`, `/rename`, and `/resume`
+    /// parse into this.
     Sessions(String),
-    /// Attach to a running session as a viewer + input sender. Arg: session id
-    /// (or empty to pick from a list). This opens its live event stream.
-    Attach(String),
-    /// Start this session as a persistent daemon: hold the agent resident and
-    /// accept input from remote clients via ipop. Arg: empty (use current
-    /// session) or a session id to resume.
-    Daemon(String),
     /// Switch the TUI color theme (TUI only). Default is `groknight`. Arg:
     /// `groknight`/`dark`, `grokday`/`light`, `tokyonight`, `oscura`,
     /// `rosepine`, `ansi`, `auto` (follow OS), or empty to cycle to the next.
@@ -293,15 +267,17 @@ pub fn parse(line: &str) -> Option<Command> {
         "turns" | "turn-limit" | "max-turns" => Command::Turns(arg),
         "doctor" => Command::Doctor,
         "plan" => Command::Plan(arg),
-        "view-plan" | "viewplan" | "show-plan" | "showplan" => Command::ViewPlan,
+        "view-plan" | "viewplan" | "show-plan" | "showplan" => Command::Plan("show".into()),
         "fork" => Command::Fork(arg),
-        "rewind" => Command::Rewind(arg),
+        "rewind" | "rewind-picker" | "rewind-pick" => Command::Rewind(arg),
         "permissions" | "permission" | "perms" => Command::Permissions(arg),
-        "always-approve" | "alwaysapprove" | "yolo" => Command::AlwaysApprove(arg),
-        "auto" => Command::Auto(arg),
+        "always-approve" | "alwaysapprove" | "yolo" => {
+            Command::Permissions(permission_alias(&arg, "always"))
+        }
+        "auto" => Command::Permissions(permission_alias(&arg, "auto")),
         "queue" => Command::Queue(arg),
-        "tasks" | "task" => Command::Tasks(arg),
-        "plugins" | "plugin" => Command::Plugins(arg),
+        "tasks" | "task" => Command::Queue(prefixed("tasks", &arg)),
+        "plugins" | "plugin" => Command::Hooks(arg),
         "remember" | "mem" => Command::Remember(arg),
         "undo-memory" | "undomemory" => Command::UndoMemory,
         "memory" => Command::Memory,
@@ -310,17 +286,15 @@ pub fn parse(line: &str) -> Option<Command> {
         "metrics" => Command::Metrics,
         "synth-evals" | "synth" => Command::SynthEvals,
         "find" | "search" => Command::Find(arg),
-        "jump" => Command::Jump(arg),
-        "history" | "hist" => Command::History(arg),
+        "jump" | "history" | "hist" => Command::Jump(arg),
         "hooks" | "hook" => Command::Hooks(arg),
         "trust" => Command::Trust(arg),
         "marketplace" | "market" => Command::Marketplace(arg),
         "worktree" | "worktrees" | "wt" => Command::Worktree(arg),
         "inspect" => Command::Inspect(arg),
         "agents" | "personas" | "persona" => Command::Agents(arg),
-        "share" => Command::Share(arg),
-        "mcp-admin" | "mcps" => Command::McpAdmin(arg),
-        "rewind-picker" | "rewind-pick" => Command::RewindPicker,
+        "share" => Command::Export(prefixed("--share", &arg)),
+        "mcp-admin" | "mcps" => Command::Mcp(arg),
         "minimal" => Command::ScreenMode(if arg.is_empty() {
             "minimal".into()
         } else {
@@ -337,8 +311,8 @@ pub fn parse(line: &str) -> Option<Command> {
         "timeline" => Command::Timeline(arg),
         "timestamps" | "timestamp" => Command::Timestamps(arg),
         "cd" | "cwd" => Command::Cd(arg),
-        "rename" => Command::Rename(arg),
-        "resume" => Command::Resume(arg),
+        "rename" => Command::Sessions(prefixed("rename-current", &arg)),
+        "resume" => Command::Sessions(prefixed("switch", &arg)),
         "log" | "debug" => Command::Log,
         "verify" | "test" => Command::Verify(arg),
         "diff" | "changes" => Command::Diff,
@@ -363,7 +337,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "hf" | "hd" | "huggingface" => Command::Hf(arg),
         "lsp" => Command::Lsp(arg),
         "delegate" | "delegates" => Command::Delegate(arg),
-        "dashboard" | "fleet" => Command::Dashboard(arg),
+        "dashboard" | "fleet" => Command::Fleet(arg),
         // `fleet` is the public name; `dashboard` remains a parse alias.
         "workflow" | "workflows" => Command::Workflow(arg),
         "deep-research" | "deepresearch" => Command::Workflow(if arg.is_empty() {
@@ -382,25 +356,54 @@ pub fn parse(line: &str) -> Option<Command> {
         "btw" | "bytheway" | "question" => Command::Btw(arg),
         // Compatibility aliases remain accepted, but the public command
         // surface is consolidated under `/sessions`.
-        "sync" => Command::Sessions(if arg.is_empty() {
-            "sync".to_string()
-        } else {
-            format!("sync {arg}")
-        }),
+        "sync" => Command::Sessions(prefixed("sync", &arg)),
         "sessions" => Command::Sessions(arg),
-        "attach" => Command::Sessions(if arg.is_empty() {
-            "attach".to_string()
-        } else {
-            format!("attach {arg}")
-        }),
-        "daemon" => Command::Sessions(if arg.is_empty() {
-            "host".to_string()
-        } else {
-            format!("host {arg}")
-        }),
+        "attach" => Command::Sessions(prefixed("attach", &arg)),
+        "daemon" => Command::Sessions(prefixed("host", &arg)),
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
+}
+
+fn prefixed(head: &str, arg: &str) -> String {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head} {arg}")
+    }
+}
+
+/// `/always-approve` / `/auto` empty or `on` select the mode; `off` returns to ask.
+fn permission_alias(arg: &str, on: &str) -> String {
+    let a = arg.trim();
+    if a.is_empty() || a.eq_ignore_ascii_case("on") {
+        on.to_string()
+    } else if a.eq_ignore_ascii_case("off") {
+        "ask".to_string()
+    } else {
+        a.to_string()
+    }
+}
+
+/// `/share` parses as [`Command::Export`] with a `--share` prefix.
+pub fn is_share_export(arg: &str) -> bool {
+    let a = arg.trim();
+    a == "--share" || a == "share" || a.starts_with("--share ")
+}
+
+/// Remainder after `/share` / `export --share` (json flag, etc.).
+pub fn share_export_arg(arg: &str) -> &str {
+    let a = arg.trim();
+    a.strip_prefix("--share")
+        .or_else(|| a.strip_prefix("share"))
+        .unwrap_or(a)
+        .trim()
+}
+
+/// `/plan show` (and `/view-plan`) — print or unpark the checklist, don't enter plan mode.
+pub fn plan_is_view(arg: &str) -> bool {
+    matches!(arg.trim(), "show" | "view" | "list" | "status")
 }
 
 /// True when the submitted line must not land in ↑ / Ctrl-R history (`/auth …`).
@@ -1562,8 +1565,9 @@ impl CommandSpec {
     }
 }
 
-/// Every slash command, in display order. Each `name` must be parseable by
-/// [`parse`] (guarded by a test).
+/// Slash commands listed in `/help` and the `/` menu, in display order. Each
+/// `name` must be parseable by [`parse`] (guarded by a test). Short names that
+/// still parse but are not catalog rows live in [`COMMAND_ALIASES`].
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "help",
@@ -1575,12 +1579,6 @@ pub const COMMANDS: &[CommandSpec] = &[
             ("platform", "rsi, mcp, traces, and other power commands"),
             ("all", "every command, grouped"),
         ],
-    },
-    CommandSpec {
-        name: "model",
-        args: "[id]",
-        help: "show or set the model (alias of /config model)",
-        arg_values: &[],
     },
     CommandSpec {
         name: "config",
@@ -1689,12 +1687,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
-        name: "provider",
-        args: "[name|add|edit|remove]",
-        help: "profiles (alias of /config provider)",
-        arg_values: &[],
-    },
-    CommandSpec {
         name: "local",
         args: "[model|path|cancel|retry|fallback]",
         help: "choose, start, or cancel a local MLX model",
@@ -1702,29 +1694,6 @@ pub const COMMANDS: &[CommandSpec] = &[
             ("cancel", "cancel an in-flight local model setup"),
             ("retry", "retry persisted local MLX startup"),
             ("fallback", "continue with the configured fallback provider"),
-        ],
-    },
-    CommandSpec {
-        name: "login",
-        args: "<provider>",
-        help: "subscription sign-in (alias of /config auth login)",
-        arg_values: &[
-            (
-                "xai",
-                "Grok via a grok.com SuperGrok or X Premium subscription",
-            ),
-            ("pipenetwork", "Pipe Network via a browser pairing flow"),
-            ("x402", "Pipe Network via a local Solana USDC payment"),
-        ],
-    },
-    CommandSpec {
-        name: "logout",
-        args: "<provider>",
-        help: "discard subscription login (alias of /config auth logout)",
-        arg_values: &[
-            ("xai", "forget the stored grok.com credential"),
-            ("pipenetwork", "forget the stored Pipe Network credential"),
-            ("x402", "forget stored x402 credit token; keep keypair file"),
         ],
     },
     CommandSpec {
@@ -1754,12 +1723,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "security",
         args: "[topic]",
         help: "run a read-only security review with targeted search",
-        arg_values: &[],
-    },
-    CommandSpec {
-        name: "audit",
-        args: "[topic]",
-        help: "run a read-only security audit with targeted search",
         arg_values: &[],
     },
     CommandSpec {
@@ -1911,8 +1874,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "compact",
-        args: "[kind]",
-        help: "reclaim context (kind: hybrid, full, or elide)",
+        args: "[kind] [instructions]",
+        help: "reclaim context (kind: hybrid, full, or elide; extra text is summarizer instructions)",
         arg_values: &[
             (
                 "hybrid",
@@ -2000,42 +1963,9 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
-        name: "lsp",
-        args: "[on|off|status]",
-        help: "LSP toggle (alias of /config lsp)",
-        arg_values: &[
-            ("on", "enable LSP"),
-            ("off", "disable LSP"),
-            ("status", "show per-language server state"),
-        ],
-    },
-    CommandSpec {
-        name: "delegate",
-        args: "[on|off|risk|status]",
-        help: "delegate policy (alias of /config delegate)",
-        arg_values: &[
-            ("on", "offer delegate on every mutation turn"),
-            ("off", "never offer delegate"),
-            ("risk", "only multi-file / isolation-shaped tasks (default)"),
-            ("status", "show off|risk|on"),
-        ],
-    },
-    CommandSpec {
         name: "fleet",
         args: "[status|resume <id>]",
         help: "dispatch, monitor, and steer multiple isolated agents (TUI)",
-        arg_values: &[
-            ("status", "list this project's resumable fleet sessions"),
-            (
-                "resume",
-                "re-adopt a fleet session as a live row (most recent if no id)",
-            ),
-        ],
-    },
-    CommandSpec {
-        name: "dashboard",
-        args: "[status|resume <id>]",
-        help: "alias of /fleet",
         arg_values: &[
             ("status", "list this project's resumable fleet sessions"),
             (
@@ -2060,12 +1990,6 @@ pub const COMMANDS: &[CommandSpec] = &[
                 "build a plan.md of objectives with the workflow engine",
             ),
         ],
-    },
-    CommandSpec {
-        name: "deep-research",
-        args: "<query>",
-        help: "research with independent claim verification and cited findings (alias of /workflow deep-research)",
-        arg_values: &[],
     },
     CommandSpec {
         name: "loop",
@@ -2102,54 +2026,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
-        name: "theme",
-        args: "[groknight|grokday|tokyonight|oscura|rosepine|ansi|auto]",
-        help: "TUI theme (alias of /config ui theme)",
-        arg_values: &[
-            (
-                "groknight",
-                "default — grok-build dark: near-black gray, magenta accents",
-            ),
-            ("grokday", "grok-build light counterpart"),
-            ("tokyonight", "blue-tinted Storm palette"),
-            ("oscura", "deep purple-tinted midnight"),
-            ("rosepine", "rose pine moon"),
-            ("dark", "alias of groknight"),
-            ("light", "alias of grokday"),
-            ("ansi", "terminal-native 16-color palette"),
-            ("auto", "follow the OS light/dark appearance"),
-        ],
-    },
-    CommandSpec {
-        name: "density",
-        args: "[compact|comfortable|verbose]",
-        help: "transcript density (alias of /config ui density)",
-        arg_values: &[
-            ("compact", "headers only for long tool output"),
-            ("comfortable", "default preview fold"),
-            ("verbose", "expand all tool output"),
-        ],
-    },
-    CommandSpec {
         name: "voice",
         args: "[language|quality]",
         help: "dictation language or quality for Ctrl+Space (Whisper)",
         arg_values: VOICE_ARGS,
-    },
-    CommandSpec {
-        name: "mouse",
-        args: "[on|off]",
-        help: "mouse capture (alias of /config ui mouse)",
-        arg_values: &[
-            (
-                "on",
-                "app handles the mouse: scroll wheel, click-fold, drag-copy",
-            ),
-            (
-                "off",
-                "release the mouse to the terminal's native text selection",
-            ),
-        ],
     },
     CommandSpec {
         name: "sessions",
@@ -2203,12 +2083,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
-        name: "view-plan",
-        args: "",
-        help: "show the current plan checklist",
-        arg_values: &[],
-    },
-    CommandSpec {
         name: "fork",
         args: "[--worktree|--no-worktree] [directive]",
         help: "fork a peer session, optionally in an isolated git worktree",
@@ -2234,34 +2108,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
-        name: "always-approve",
-        args: "",
-        help: "set permissions to always (yolo); alias of /permissions always",
-        arg_values: &[],
-    },
-    CommandSpec {
-        name: "auto",
-        args: "",
-        help: "set permissions to auto; alias of /permissions auto",
-        arg_values: &[],
-    },
-    CommandSpec {
         name: "queue",
         args: "[tasks|resume]",
         help: "show queued work, or resume work parked by stop",
         arg_values: &[("tasks", "show details"), ("resume", "resume parked work")],
-    },
-    CommandSpec {
-        name: "tasks",
-        args: "",
-        help: "show background tasks, processes, and session work",
-        arg_values: &[],
-    },
-    CommandSpec {
-        name: "plugins",
-        args: "",
-        help: "list skills and .hi/hooks (hooks/plugins inventory)",
-        arg_values: &[],
     },
     CommandSpec {
         name: "remember",
@@ -2382,23 +2232,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[("--json", "machine-readable result")],
     },
     CommandSpec {
-        name: "mcp-admin",
-        args: "[list|doctor|add|remove]",
-        help: "inspect/manage provider MCP configuration",
-        arg_values: &[
-            ("list", "show MCP setup"),
-            ("doctor", "run MCP health guidance"),
-            ("add", "add endpoint guidance"),
-            ("remove", "remove endpoint guidance"),
-        ],
-    },
-    CommandSpec {
-        name: "rewind-picker",
-        args: "",
-        help: "open the rewind picker (same as /rewind)",
-        arg_values: &[],
-    },
-    CommandSpec {
         name: "screen-mode",
         args: "[minimal|fullscreen]",
         help: "switch transcript screen style",
@@ -2438,18 +2271,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[],
     },
     CommandSpec {
-        name: "rename",
-        args: "<name>",
-        help: "rename the active session (frontends route via /sessions)",
-        arg_values: &[],
-    },
-    CommandSpec {
-        name: "resume",
-        args: "[id]",
-        help: "resume/switch sessions (frontends route via /sessions)",
-        arg_values: &[],
-    },
-    CommandSpec {
         name: "log",
         args: "",
         help: "write a local debug log for this session",
@@ -2469,6 +2290,120 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
 ];
 
+/// Parseable short names omitted from `/help` and the `/` menu. Argument
+/// completion still uses these so `/model `, `/provider `, `/login `, and the
+/// other `/config` shortcuts keep working. Canonical homes are `/config …`.
+pub const COMMAND_ALIASES: &[CommandSpec] = &[
+    CommandSpec {
+        name: "model",
+        args: "[id]",
+        help: "show or set the model (alias of /config model)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "provider",
+        args: "[name|add|edit|remove]",
+        help: "profiles (alias of /config provider)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "login",
+        args: "<provider>",
+        help: "subscription sign-in (alias of /config auth login)",
+        arg_values: &[
+            (
+                "xai",
+                "Grok via a grok.com SuperGrok or X Premium subscription",
+            ),
+            ("pipenetwork", "Pipe Network via a browser pairing flow"),
+            ("x402", "Pipe Network via a local Solana USDC payment"),
+        ],
+    },
+    CommandSpec {
+        name: "logout",
+        args: "<provider>",
+        help: "discard subscription login (alias of /config auth logout)",
+        arg_values: &[
+            ("xai", "forget the stored grok.com credential"),
+            ("pipenetwork", "forget the stored Pipe Network credential"),
+            ("x402", "forget stored x402 credit token; keep keypair file"),
+        ],
+    },
+    CommandSpec {
+        name: "lsp",
+        args: "[on|off|status]",
+        help: "LSP toggle (alias of /config lsp)",
+        arg_values: &[
+            ("on", "enable LSP"),
+            ("off", "disable LSP"),
+            ("status", "show per-language server state"),
+        ],
+    },
+    CommandSpec {
+        name: "delegate",
+        args: "[on|off|risk|status]",
+        help: "delegate policy (alias of /config delegate)",
+        arg_values: &[
+            ("on", "offer delegate on every mutation turn"),
+            ("off", "never offer delegate"),
+            ("risk", "only multi-file / isolation-shaped tasks (default)"),
+            ("status", "show off|risk|on"),
+        ],
+    },
+    CommandSpec {
+        name: "theme",
+        args: "[groknight|grokday|tokyonight|oscura|rosepine|ansi|auto]",
+        help: "TUI theme (alias of /config ui theme)",
+        arg_values: &[
+            (
+                "groknight",
+                "default — grok-build dark: near-black gray, magenta accents",
+            ),
+            ("grokday", "grok-build light counterpart"),
+            ("tokyonight", "blue-tinted Storm palette"),
+            ("oscura", "deep purple-tinted midnight"),
+            ("rosepine", "rose pine moon"),
+            ("dark", "alias of groknight"),
+            ("light", "alias of grokday"),
+            ("ansi", "terminal-native 16-color palette"),
+            ("auto", "follow the OS light/dark appearance"),
+        ],
+    },
+    CommandSpec {
+        name: "density",
+        args: "[compact|comfortable|verbose]",
+        help: "transcript density (alias of /config ui density)",
+        arg_values: &[
+            ("compact", "headers only for long tool output"),
+            ("comfortable", "default preview fold"),
+            ("verbose", "expand all tool output"),
+        ],
+    },
+    CommandSpec {
+        name: "mouse",
+        args: "[on|off]",
+        help: "mouse capture (alias of /config ui mouse)",
+        arg_values: &[
+            (
+                "on",
+                "app handles the mouse: scroll wheel, click-fold, drag-copy",
+            ),
+            (
+                "off",
+                "release the mouse to the terminal's native text selection",
+            ),
+        ],
+    },
+];
+
+/// Look up a command spec by name, including unlisted aliases.
+pub fn spec_by_name(name: &str) -> Option<&'static CommandSpec> {
+    COMMANDS
+        .iter()
+        .chain(COMMAND_ALIASES)
+        .find(|c| c.name.eq_ignore_ascii_case(name))
+}
+
 /// The message `/init` runs as a turn: explore the project and write a concise
 /// `HI.md` guide that future sessions load as context.
 pub const INIT_PROMPT: &str = "Explore this project (use the list and read tools) and write a \
@@ -2479,12 +2414,21 @@ factual and tight — this file is loaded as context for future sessions. Create
 write tool, then end with a one-line summary of what you captured.";
 
 /// Commands whose canonical name starts with `prefix` (case-insensitive), in
-/// display order — drives the `/`-completion menu. An empty prefix lists all.
+/// display order — drives the `/`-completion menu. An empty prefix lists the
+/// catalog only; a non-empty prefix also matches unlisted aliases so `/mod`
+/// still completes to `/model`.
 pub fn matching(prefix: &str) -> Vec<&'static CommandSpec> {
     let needle = prefix.to_lowercase();
-    COMMANDS
-        .iter()
-        .filter(|c| c.name.starts_with(&needle))
+    let listed = COMMANDS.iter().filter(|c| c.name.starts_with(&needle));
+    if needle.is_empty() {
+        return listed.collect();
+    }
+    listed
+        .chain(
+            COMMAND_ALIASES
+                .iter()
+                .filter(|c| c.name.starts_with(&needle)),
+        )
         .collect()
 }
 
@@ -2494,9 +2438,7 @@ pub fn matching(prefix: &str) -> Vec<&'static CommandSpec> {
 /// unknown, takes a freeform argument, or nothing matches.
 pub fn arg_matching(name: &str, prefix: &str) -> Vec<(&'static str, &'static str)> {
     let needle = prefix.to_lowercase();
-    COMMANDS
-        .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(name))
+    spec_by_name(name)
         .map(|c| {
             c.arg_values
                 .iter()
@@ -2512,17 +2454,17 @@ pub use crate::help::{help_text, help_text_for};
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, Command, GoalBudgetArg, GoalEditArg, GoalLimitArg, GoalObjectiveFlags,
-        GoalTeamArg, GoalUnattendedArg, LoopArg, TurnsArg, expand_prompt_macro,
+        COMMAND_ALIASES, COMMANDS, Command, GoalBudgetArg, GoalEditArg, GoalLimitArg,
+        GoalObjectiveFlags, GoalTeamArg, GoalUnattendedArg, LoopArg, TurnsArg, expand_prompt_macro,
         goal_arg_is_objective, help_text, hides_from_history, mask_secret_input, matching, parse,
         parse_goal_budget, parse_goal_edit, parse_goal_limit, parse_goal_objective_flags,
-        parse_goal_team, parse_goal_unattended, parse_loop_arg, parse_turns_arg,
+        parse_goal_team, parse_goal_unattended, parse_loop_arg, parse_turns_arg, spec_by_name,
     };
 
     #[test]
     fn every_listed_command_parses_to_a_real_command() {
         // Guards against the menu/help listing a command no frontend can run.
-        for spec in COMMANDS {
+        for spec in COMMANDS.iter().chain(COMMAND_ALIASES) {
             let line = format!("/{}", spec.name);
             match parse(&line) {
                 Some(Command::Unknown(_)) | None => {
@@ -2536,7 +2478,7 @@ mod tests {
     #[test]
     fn command_registry_metadata_is_unique_and_complete() {
         let mut names = std::collections::BTreeSet::new();
-        for spec in COMMANDS {
+        for spec in COMMANDS.iter().chain(COMMAND_ALIASES) {
             assert!(!spec.name.trim().is_empty(), "empty command name");
             assert!(
                 spec.name
@@ -2582,6 +2524,55 @@ mod tests {
             Some(Command::Sessions("attach abc".into()))
         );
         assert_eq!(parse("/daemon"), Some(Command::Sessions("host".into())));
+    }
+
+    #[test]
+    fn catalog_omits_duplicate_surfaces() {
+        let names: std::collections::BTreeSet<_> = COMMANDS.iter().map(|c| c.name).collect();
+        let aliases: std::collections::BTreeSet<_> =
+            COMMAND_ALIASES.iter().map(|c| c.name).collect();
+        for name in [
+            "dashboard",
+            "audit",
+            "deep-research",
+            "rewind-picker",
+            "always-approve",
+            "auto",
+            "mcp-admin",
+            "plugins",
+            "rename",
+            "resume",
+            "tasks",
+            "view-plan",
+            "model",
+            "provider",
+            "login",
+            "logout",
+            "lsp",
+            "delegate",
+        ] {
+            assert!(
+                !names.contains(name),
+                "{name} must not be a /help or / menu row"
+            );
+            let line = format!("/{name}");
+            match parse(&line) {
+                Some(Command::Unknown(_)) | None => panic!("{line} must still parse"),
+                Some(_) => {}
+            }
+        }
+        for name in [
+            "model", "provider", "login", "logout", "lsp", "delegate", "theme", "density", "mouse",
+        ] {
+            assert!(aliases.contains(name), "{name} stays as an unlisted alias");
+            assert!(spec_by_name(name).is_some());
+            assert!(!names.contains(name), "{name} must not be a catalog row");
+        }
+        assert!(matching("").iter().all(|c| c.name != "model"));
+        assert!(
+            matching("delegate").iter().any(|c| c.name == "delegate"),
+            "typing a prefix still completes unlisted aliases"
+        );
     }
 
     #[test]
@@ -2728,7 +2719,7 @@ mod tests {
             parse("/plan fix auth"),
             Some(Command::Plan("fix auth".into()))
         );
-        assert_eq!(parse("/view-plan"), Some(Command::ViewPlan));
+        assert_eq!(parse("/view-plan"), Some(Command::Plan("show".into())));
         assert_eq!(
             parse("/fork --worktree try x"),
             Some(Command::Fork("--worktree try x".into()))
@@ -2740,12 +2731,16 @@ mod tests {
         );
         assert_eq!(
             parse("/always-approve"),
-            Some(Command::AlwaysApprove(String::new()))
+            Some(Command::Permissions("always".into()))
         );
-        assert_eq!(parse("/auto"), Some(Command::Auto(String::new())));
+        assert_eq!(parse("/auto"), Some(Command::Permissions("auto".into())));
+        assert_eq!(
+            parse("/always-approve off"),
+            Some(Command::Permissions("ask".into()))
+        );
         assert_eq!(parse("/queue"), Some(Command::Queue(String::new())));
-        assert_eq!(parse("/tasks"), Some(Command::Tasks(String::new())));
-        assert_eq!(parse("/plugins"), Some(Command::Plugins(String::new())));
+        assert_eq!(parse("/tasks"), Some(Command::Queue("tasks".into())));
+        assert_eq!(parse("/plugins"), Some(Command::Hooks(String::new())));
         assert_eq!(parse("/hooks"), Some(Command::Hooks(String::new())));
         assert_eq!(
             parse("/hooks pre-turn hello"),
@@ -2762,7 +2757,7 @@ mod tests {
             Some(Command::Inspect("--json".into()))
         );
         assert_eq!(parse("/agents list"), Some(Command::Agents("list".into())));
-        assert_eq!(parse("/share"), Some(Command::Share(String::new())));
+        assert_eq!(parse("/share"), Some(Command::Export("--share".into())));
         assert_eq!(parse("/mcp"), Some(Command::Mcp(String::new())));
         assert_eq!(parse("/mcp pipe"), Some(Command::Mcp("pipe".into())));
         assert_eq!(
@@ -2775,7 +2770,10 @@ mod tests {
                 "add docs --http https://example.test/mcp".into()
             ))
         );
-        assert_eq!(parse("/rewind-picker"), Some(Command::RewindPicker));
+        assert_eq!(
+            parse("/rewind-picker"),
+            Some(Command::Rewind(String::new()))
+        );
         assert_eq!(
             parse("/minimal"),
             Some(Command::ScreenMode("minimal".into()))
@@ -2797,9 +2795,12 @@ mod tests {
         assert_eq!(parse("/cd ../repo"), Some(Command::Cd("../repo".into())));
         assert_eq!(
             parse("/rename release work"),
-            Some(Command::Rename("release work".into()))
+            Some(Command::Sessions("rename-current release work".into()))
         );
-        assert_eq!(parse("/resume abc"), Some(Command::Resume("abc".into())));
+        assert_eq!(
+            parse("/resume abc"),
+            Some(Command::Sessions("switch abc".into()))
+        );
         assert_eq!(
             parse("/remember use pnpm"),
             Some(Command::Remember("use pnpm".into()))
@@ -2813,7 +2814,7 @@ mod tests {
         assert_eq!(parse("/recap"), Some(Command::Recap));
         assert_eq!(parse("/find token"), Some(Command::Find("token".into())));
         assert_eq!(parse("/jump"), Some(Command::Jump(String::new())));
-        assert_eq!(parse("/history"), Some(Command::History(String::new())));
+        assert_eq!(parse("/history"), Some(Command::Jump(String::new())));
         assert!(matches!(
             parse("/status codebase state"),
             Some(Command::Prompt(_))
@@ -2897,11 +2898,11 @@ mod tests {
         assert_eq!(parse("/lsp on"), Some(Command::Lsp("on".into())));
         assert_eq!(parse("/lsp off"), Some(Command::Lsp("off".into())));
         // `/delegate` toggles the write subagent.
-        assert_eq!(parse("/dashboard"), Some(Command::Dashboard(String::new())));
-        assert_eq!(parse("/fleet"), Some(Command::Dashboard(String::new())));
+        assert_eq!(parse("/dashboard"), Some(Command::Fleet(String::new())));
+        assert_eq!(parse("/fleet"), Some(Command::Fleet(String::new())));
         assert_eq!(
             parse("/fleet status"),
-            Some(Command::Dashboard("status".into()))
+            Some(Command::Fleet("status".into()))
         );
         assert_eq!(parse("/delegate"), Some(Command::Delegate(String::new())));
         assert_eq!(parse("/delegate on"), Some(Command::Delegate("on".into())));

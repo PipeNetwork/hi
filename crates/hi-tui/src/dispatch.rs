@@ -3,7 +3,7 @@
 //! Keeps `run.rs` thin: resolve → apply, with specialized fallthrough for
 //! text editing and normal-mode search.
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::App;
 use crate::action::{self, Action, KeySurface};
@@ -29,7 +29,13 @@ impl App {
 
     /// Current key surface for action resolution.
     pub(crate) fn key_surface(&self) -> KeySurface {
-        KeySurface::from_app(&self.mode, self.has_hard_overlay())
+        if self.has_hard_overlay() {
+            return KeySurface::Overlay;
+        }
+        if self.review_is_overlay() || (self.review.open && self.review.focused) {
+            return KeySurface::Review;
+        }
+        KeySurface::from_app(&self.mode, false)
     }
 
     /// Resolve and apply a key. Returns [`DispatchResult::Fallthrough`] when the
@@ -41,6 +47,39 @@ impl App {
         // ever reach dispatch while one is up, swallow — never fall through to
         // edit_key (would type into the composer under a modal).
         if surface == KeySurface::Overlay {
+            return DispatchResult::Handled;
+        }
+
+        // Space returns to the prompt when the composer is not the key owner
+        // (scrollback, review, block-nav) or when the transcript is scrolled
+        // away. Ctrl+Space stays dictation; a following insert still types.
+        if key.code == KeyCode::Char(' ')
+            && key.modifiers.is_empty()
+            && surface != KeySurface::HistorySearch
+        {
+            let jump = match surface {
+                KeySurface::Insert => !self.following,
+                KeySurface::Normal | KeySurface::BlockNav | KeySurface::Review => true,
+                KeySurface::Overlay | KeySurface::HistorySearch => false,
+            };
+            if jump {
+                self.focus_prompt();
+                return DispatchResult::Handled;
+            }
+        }
+
+        // Tab focuses the docked review pane unless completion or ghost-text
+        // already claimed it. Overlay review swallows Tab via the Review surface.
+        if key.code == KeyCode::Tab
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+            && self.review.open
+            && self.can_dock_review()
+            && self.completion.is_none()
+        {
+            if !self.review.focused && self.ghost_suffix().is_some() {
+                return DispatchResult::Fallthrough;
+            }
+            self.toggle_review_focus();
             return DispatchResult::Handled;
         }
 
@@ -98,11 +137,7 @@ impl App {
                 self.show_debug = !self.show_debug;
             }
             Action::ToggleDiff | Action::ToggleReview => {
-                if self.mode.is_review() {
-                    self.mode.to_insert();
-                } else {
-                    self.open_review(None);
-                }
+                self.toggle_review();
             }
             Action::ToggleReasoning => {
                 self.show_reasoning = !self.show_reasoning;
@@ -129,6 +164,7 @@ impl App {
             Action::ExitToInsert => {
                 self.mode.to_insert();
             }
+            Action::FocusPrompt => self.focus_prompt(),
             Action::CopyLastCode => {
                 self.copy_last_code_block();
             }
@@ -157,30 +193,16 @@ impl App {
             }
             Action::QueueMoveSelected { delta } => self.queue_move_selected(delta),
             Action::ReviewClose => {
-                self.mode.to_insert();
+                self.close_review();
+            }
+            Action::ReviewUnfocus => {
+                self.unfocus_or_close_review();
             }
             Action::ReviewScroll { delta } => {
-                if delta == Action::REVIEW_SCROLL_END {
-                    let total = self
-                        .diff_text
-                        .as_deref()
-                        .map(|t| t.lines().count())
-                        .unwrap_or(0);
-                    self.review_scroll = total;
-                } else if delta > 0 {
-                    self.review_scroll = self.review_scroll.saturating_add(delta as usize);
-                } else {
-                    self.review_scroll = self
-                        .review_scroll
-                        .saturating_sub(delta.unsigned_abs() as usize);
-                }
+                self.review_scroll_by(delta);
             }
             Action::ReviewHunk { dir } => {
-                self.review_scroll = crate::app::review_next_hunk(
-                    self.diff_text.as_deref(),
-                    self.review_scroll,
-                    dir,
-                );
+                self.review_jump_hunk(dir);
             }
             Action::BlockNavUp => {
                 self.block_cursor = self.selected_block_ord().saturating_sub(1);
@@ -206,6 +228,19 @@ impl App {
                 self.plan_pane_expanded = !self.plan_pane_expanded;
             }
         }
+    }
+
+    /// Grok-style: leave transcript/review/block-nav and land on the composer.
+    pub(crate) fn focus_prompt(&mut self) {
+        if self.review.open {
+            if self.can_dock_review() {
+                self.review.focused = false;
+            } else {
+                self.close_review();
+            }
+        }
+        self.mode.to_insert();
+        self.follow();
     }
 
     /// Jump the transcript scroll to the next/prev marker of `kind`.

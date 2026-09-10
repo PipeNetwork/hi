@@ -1339,9 +1339,8 @@ async fn plan_settles_after_max_consecutive_text_only_responses() {
 
 #[tokio::test]
 async fn keep_working_finishes_plan_after_silent_continue_budget() {
-    // After the silent-continue budget is spent, production keeps working
-    // in-turn instead of asking the user to retry. The model then acts and
-    // finishes the plan.
+    // After the TodoGate cap is spent, leftover plan steps stay leftover
+    // for the next user/drive turn instead of stacking keep-working.
     let mut cfg = config();
     cfg.loop_limits.max_silent_continues = 1;
     cfg.loop_limits.max_keep_working = 2;
@@ -1384,19 +1383,22 @@ async fn keep_working_finishes_plan_after_silent_continue_budget() {
     let mut ui = RecUi::default();
     agent.run_turn("do it", &mut ui).await.unwrap();
     assert!(
-        ui.statuses.iter().any(|s| s.contains("still working")),
-        "keep-working recovery should fire after silent-continue budget: {:?}",
-        ui.statuses
+        agent
+            .messages()
+            .iter()
+            .any(|message| message.text().contains("[hi:nudge:todogate]")
+                || message.text().contains("outstanding todos")),
+        "TodoGate should continue leftover plan steps: {:?}",
+        agent
+            .messages()
+            .iter()
+            .map(|m| m.text())
+            .collect::<Vec<_>>()
     );
     assert!(
         !ui.statuses.iter().any(|s| s.contains("/retry")),
         "must not ask the user to retry: {:?}",
         ui.statuses
-    );
-    let last_text = agent.messages().last().unwrap().text();
-    assert!(
-        last_text.contains("All steps complete"),
-        "turn should finish the plan, got: {last_text}"
     );
 }
 

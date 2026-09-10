@@ -550,7 +550,12 @@ impl crate::Agent {
                 None
             }
         };
-        if result.is_err() {
+        let already_closed = result
+            .as_ref()
+            .err()
+            .and_then(crate::TurnFailure::from_error)
+            .is_some_and(crate::TurnFailure::body_settled);
+        if result.is_err() && !already_closed {
             self.emit_deterministic_closeout(ui);
         }
         let event_turn = if matches!(&result, Ok(outcome) if outcome.stop_reason == TurnStopReason::TurnLimit)
@@ -602,9 +607,16 @@ impl crate::Agent {
         // A prior timed-out waiter can leave an accepted append with the owner.
         // Do not admit a new turn until its durable result has been observed.
         self.session_barrier().await?;
+        self.turn_attempt_id = uuid::Uuid::new_v4().to_string();
+        self.runtime
+            .background()
+            .set_current_turn(u64::from(self.turn_count.saturating_add(1)));
         ui.semantic_event(RunEvent::new(
             EventKind::RunStarted,
-            EventContext::default(),
+            EventContext {
+                attempt_id: Some(self.turn_attempt_id.clone()),
+                ..EventContext::default()
+            },
             SemanticActivity {
                 verb: ActivityVerb::Start,
                 object: ActivityObject::Run,

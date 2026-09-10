@@ -130,7 +130,7 @@ OpenAI-compatible endpoints vary in how much of Chat Completions they implement.
 | `HI_VERIFY_TIMEOUT_SECS` | Optional positive verification process timeout; unset or `0` allows continual execution | off |
 | `HI_BASH_TIMEOUT_SECS` | Optional hard shell-command timeout; setting it keeps the command foreground until completion or timeout | off |
 | `HI_BASH_AUTO_BACKGROUND` | Hand a shell command that outlives its foreground attachment budget to the managed background registry; set `0` to opt out | on |
-| `HI_BASH_FOREGROUND_BUDGET_SECS` | Time a shell command may remain attached to the active turn before managed handoff | 30s |
+| `HI_BASH_FOREGROUND_BUDGET_SECS` | Time a shell command may remain attached to the active turn before managed handoff | 15s |
 | `HI_MCP_CONNECT_TIMEOUT_SECS` | Optional positive lazy MCP handshake timeout; unset or `0` waits until connection, failure, or turn cancellation | off |
 | `HI_MCP_TOOL_TIMEOUT_SECS` | Optional positive MCP `tools/call` timeout; unset or `0` allows continual execution until completion or turn cancellation | off |
 | `HI_MODEL_REQUEST_TIMEOUT_SECS` | Optional positive absolute deadline for one model HTTP request (including bounded retries/backoffs); unset or `0` allows continual execution | off |
@@ -421,7 +421,7 @@ Slash commands (TUI or plain REPL):
 | `/fleet` (`/dashboard`) | control a fleet, not an agent: dispatch, monitor, and steer multiple concurrent sessions — each in its own git worktree with verified diffs auto-merging back; `/fleet status` lists this project's resumable fleet sessions ([docs](fleet-dashboard.md)) |
 | `/delegate [on\|off\|risk]` | write-capable delegate subagent: worktree-isolated child; changes land only if they verify. Default **risk** (multi-file / isolation-shaped tasks); `on` = every mutation; `off` = never. Read-only `explore` is on by default for repo tasks |
 | `/init` | scan the repo and write an `HI.md` project guide (loaded as context in future sessions) |
-| `/compact [kind]` | reclaim context — `hybrid` (summarize old turns, keep recent), `full` (summarize everything), or `elide` (drop old tool output, no model call) |
+| `/compact [kind] [instructions]` | reclaim context — `hybrid` (summarize old turns, keep recent), `full` (summarize everything), or `elide` (drop old tool output, no model call). Trailing text is extra summarizer instructions. |
 | `/context` (`/context-doctor`) | occupancy breakdown plus a fresh-session **injection census** (system, guides, skills, tool schemas, volatile memory) |
 | `/retry` | re-run your last message (drops the previous attempt — pairs with `/model`) |
 | `/undo` | revert the file changes the last turn made (restores its git checkpoint) |

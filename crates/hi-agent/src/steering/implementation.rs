@@ -5,7 +5,7 @@ mod shell_inspection;
 
 use super::intent::contains_any;
 pub(crate) use shell_inspection::{
-    bash_bounded_execution_probe, bash_command, bash_inspection_signature,
+    bash_bounded_execution_probe, bash_command, bash_inspection_paths, bash_inspection_signature,
     bash_no_progress_signature,
 };
 
@@ -54,6 +54,11 @@ pub(crate) fn classify_bash_command(command: &str) -> BashCommandKind {
         return BashCommandKind::NoProgress;
     }
     let Some(words) = simple_shell_words(command) else {
+        // `cd /repo && cargo test | tail` is untokenizable (`&`/`|`), but
+        // grok-build still classifies the validator in the chain.
+        if shell_command_likely_validates(command) {
+            return BashCommandKind::Validation;
+        }
         return if shell_inspection::compound_shell_is_read_only_inspection(command) {
             BashCommandKind::Inspection
         } else {
@@ -104,7 +109,7 @@ pub(crate) fn classify_bash_command(command: &str) -> BashCommandKind {
 /// inspection; ambiguous ones (`branch`, `tag`, `remote`, `config`) fall
 /// through to `Unknown` so the caller's conservative path (serial run with
 /// snapshot/checkpoint) applies.
-fn git_subcommand_is_read_only(words: &[String]) -> bool {
+pub(crate) fn git_subcommand_is_read_only(words: &[String]) -> bool {
     // Skip leading global flags. `-C <dir>` consumes its argument; other
     // global flags (`--git-dir=...`, `-c key=val`) carry `=` and are skipped
     // by the `contains('=')` check.
@@ -140,6 +145,61 @@ fn git_subcommand_is_read_only(words: &[String]) -> bool {
     }
     // Bare `git` (or only flags) prints help — read-only.
     true
+}
+
+pub(crate) fn skip_git_globals(words: &[String]) -> &[String] {
+    let mut i = 0;
+    while i < words.len() {
+        let word = &words[i];
+        if matches!(
+            word.as_str(),
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+        ) {
+            i = i.saturating_add(2);
+            continue;
+        }
+        if word.starts_with('-') || word.contains('=') {
+            i += 1;
+            continue;
+        }
+        return &words[i..];
+    }
+    &[]
+}
+
+/// `git checkout --`, `git restore`, `git reset --hard/--merge/--keep`, and
+/// `git clean -f` discard worktree bytes. Auto mode must never run these
+/// without a confirm; Always/yolo still may.
+pub fn is_destructive_git_restore(command: &str) -> bool {
+    let Some(words) = simple_shell_words(command) else {
+        return false;
+    };
+    let Some(cmd) = words.first().map(String::as_str) else {
+        return false;
+    };
+    if cmd != "git" && !cmd.ends_with("/git") {
+        return false;
+    }
+    let after = skip_git_globals(&words[1..]);
+    let Some(sub) = after.first().map(String::as_str) else {
+        return false;
+    };
+    match sub {
+        "checkout" => after
+            .iter()
+            .any(|word| matches!(word.as_str(), "--" | "-f" | "--force")),
+        "restore" => true,
+        "reset" => after
+            .iter()
+            .any(|word| matches!(word.as_str(), "--hard" | "--merge" | "--keep")),
+        "clean" => after.iter().any(|word| {
+            word == "--force"
+                || word
+                    .strip_prefix('-')
+                    .is_some_and(|flags| !flags.starts_with('-') && flags.contains('f'))
+        }),
+        _ => false,
+    }
 }
 
 /// Some commands have an inspection-shaped verb but can still write files.
@@ -239,7 +299,7 @@ pub(crate) fn implementation_tool_call_validates(name: &str, arguments: &str) ->
     shell_command_likely_validates(&command)
 }
 
-fn simple_shell_words(command: &str) -> Option<Vec<String>> {
+pub(crate) fn simple_shell_words(command: &str) -> Option<Vec<String>> {
     let mut chars = command.trim().chars().peekable();
     let mut words = Vec::new();
     let mut current = String::new();
@@ -590,7 +650,13 @@ mod tests {
         );
         assert_eq!(
             classify_bash_command("echo stop && cargo test"),
-            BashCommandKind::Unknown
+            BashCommandKind::Validation
+        );
+        assert_eq!(
+            classify_bash_command(
+                "cd /Users/david/chat && cargo clippy --all-targets 2>&1 | grep warning"
+            ),
+            BashCommandKind::Validation
         );
         assert_eq!(
             classify_bash_command("echo stop > marker.txt"),
@@ -681,6 +747,37 @@ mod tests {
             classify_bash_command("git config --list"),
             BashCommandKind::Mutation
         );
+    }
+
+    #[test]
+    fn destructive_git_restore_is_explicit() {
+        for command in [
+            "git checkout -- src/lib.rs",
+            "git checkout -f main",
+            "git restore src/lib.rs",
+            "git reset --hard HEAD",
+            "git reset --merge",
+            "git clean -fd",
+            "git clean -f",
+            "git -C /tmp clean -fx",
+        ] {
+            assert!(
+                is_destructive_git_restore(command),
+                "{command:?} must be classified as destructive git restore"
+            );
+        }
+        for command in [
+            "git status",
+            "git checkout main",
+            "git reset --soft HEAD~1",
+            "git clean -n",
+            "echo git reset --hard",
+        ] {
+            assert!(
+                !is_destructive_git_restore(command),
+                "{command:?} must not be treated as destructive git restore"
+            );
+        }
     }
 
     #[test]

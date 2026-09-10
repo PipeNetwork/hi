@@ -30,6 +30,9 @@ mod names;
 #[cfg(test)]
 #[path = "background/lifecycle_tests.rs"]
 mod lifecycle_tests;
+#[cfg(test)]
+#[path = "background/wait_abort_tests.rs"]
+mod wait_abort_tests;
 use names::handle_id;
 pub use names::shell_title;
 
@@ -96,6 +99,14 @@ struct BgProc {
     /// Woken on every output append and lifecycle transition, so a blocking
     /// [`BackgroundRegistry::poll_wait`] sleeps instead of spinning.
     changed: Notify,
+    /// Turn that spawned this process (`0` = unset).
+    owner_turn: AtomicU64,
+    /// True when spawned via the `monitor` tool.
+    monitor: std::sync::atomic::AtomicBool,
+    /// Unix-ms deadline for non-persistent monitors (`0` = none).
+    timeout_deadline_ms: AtomicU64,
+    /// Output end already reported as an idle wake.
+    wake_seen_end: AtomicU64,
 }
 
 /// A handle the model named that this registry has never seen. The registry
@@ -151,6 +162,30 @@ pub struct BackgroundRegistry {
     /// global environment state.
     foreground_handoff_budget_ms: AtomicU64,
     lifecycle: crate::job_lifecycle::BackgroundJobLifecycleSlot,
+    /// Turn currently executing in the owning agent (`0` = none).
+    current_turn: AtomicU64,
+    /// When set, [`poll_wait`] returns early so a user follow-up can drain.
+    wait_abort: Mutex<Option<WaitAbort>>,
+}
+
+#[derive(Clone)]
+struct WaitAbort {
+    notify: Arc<Notify>,
+    pending: Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+async fn abort_notified(abort: Option<&Notify>) {
+    match abort {
+        Some(notify) => notify.notified().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Cap on remembered unknown handles. Bounded so a guessing loop cannot grow
@@ -170,6 +205,8 @@ impl Default for BackgroundRegistry {
             poll_wait_base_secs: AtomicU64::new(POLL_WAIT_USE_ENV),
             foreground_handoff_budget_ms: AtomicU64::new(FOREGROUND_HANDOFF_USE_ENV),
             lifecycle: crate::job_lifecycle::BackgroundJobLifecycleSlot::default(),
+            current_turn: AtomicU64::new(0),
+            wait_abort: Mutex::new(None),
         }
     }
 }
@@ -244,6 +281,40 @@ impl BgProc {
             crate::tools::kill_group(pgid);
         }
     }
+}
+
+#[cfg(test)]
+fn registry_with_retained_output(output: String) -> (BackgroundRegistry, String) {
+    let registry = BackgroundRegistry::default();
+    let id = "overflow-test_1".to_string();
+    registry
+        .processes
+        .lock()
+        .unwrap()
+        .insert(id.clone(), test_proc("overflow-test", output));
+    (registry, id)
+}
+
+#[cfg(test)]
+fn test_proc(command: &str, output: String) -> Arc<BgProc> {
+    Arc::new(BgProc {
+        command: command.to_string(),
+        title: command.to_string(),
+        pgid: None,
+        origin: BgOrigin::Requested,
+        managed_effect: None,
+        effect_baseline: None,
+        managed_job: None,
+        ownership_released: std::sync::atomic::AtomicBool::new(false),
+        inner: Mutex::new(BgInner::running(output)),
+        terminal_publication: tokio::sync::Mutex::new(()),
+        reaped: Notify::new(),
+        changed: Notify::new(),
+        owner_turn: AtomicU64::new(0),
+        monitor: std::sync::atomic::AtomicBool::new(false),
+        timeout_deadline_ms: AtomicU64::new(0),
+        wake_seen_end: AtomicU64::new(0),
+    })
 }
 
 impl Drop for BgProc {
@@ -504,6 +575,10 @@ impl BackgroundRegistry {
             terminal_publication: tokio::sync::Mutex::new(()),
             reaped: Notify::new(),
             changed: Notify::new(),
+            owner_turn: AtomicU64::new(self.current_turn.load(Ordering::Acquire)),
+            monitor: std::sync::atomic::AtomicBool::new(false),
+            timeout_deadline_ms: AtomicU64::new(0),
+            wake_seen_end: AtomicU64::new(0),
         });
         {
             let mut reg = self.processes.lock().unwrap();
@@ -559,6 +634,10 @@ impl BackgroundRegistry {
             terminal_publication: tokio::sync::Mutex::new(()),
             reaped: Notify::new(),
             changed: Notify::new(),
+            owner_turn: AtomicU64::new(self.current_turn.load(Ordering::Acquire)),
+            monitor: std::sync::atomic::AtomicBool::new(false),
+            timeout_deadline_ms: AtomicU64::new(0),
+            wake_seen_end: AtomicU64::new(0),
         });
 
         {
@@ -667,6 +746,10 @@ impl BackgroundRegistry {
             terminal_publication: tokio::sync::Mutex::new(()),
             reaped: Notify::new(),
             changed: Notify::new(),
+            owner_turn: AtomicU64::new(self.current_turn.load(Ordering::Acquire)),
+            monitor: std::sync::atomic::AtomicBool::new(false),
+            timeout_deadline_ms: AtomicU64::new(0),
+            wake_seen_end: AtomicU64::new(0),
         });
         self.processes
             .lock()
@@ -766,6 +849,120 @@ impl BackgroundRegistry {
     /// [`poll_wait`](Self::poll_wait) that also forwards newly buffered output
     /// through `on_line` as it arrives, so a UI can paint a live tail during a
     /// multi-minute wait instead of staying blank until the poll returns.
+    pub fn set_wait_abort(
+        &self,
+        notify: Option<Arc<Notify>>,
+        pending: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        if let Ok(mut slot) = self.wait_abort.lock() {
+            *slot = notify.map(|notify| WaitAbort {
+                notify,
+                pending: pending
+                    .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            });
+        }
+    }
+
+    pub fn set_current_turn(&self, turn: u64) {
+        self.current_turn.store(turn, Ordering::Release);
+    }
+
+    pub fn mark_monitor(&self, id: &str) {
+        self.arm_monitor(id, None, true);
+    }
+
+    pub fn arm_monitor(&self, id: &str, timeout_ms: Option<u64>, persistent: bool) {
+        if let Ok(reg) = self.processes.lock()
+            && let Some(proc) = reg.get(id)
+        {
+            proc.monitor.store(true, Ordering::Release);
+            if persistent {
+                proc.timeout_deadline_ms.store(0, Ordering::Release);
+            } else {
+                let ms = timeout_ms.unwrap_or(36_000_000).min(36_000_000);
+                proc.timeout_deadline_ms
+                    .store(unix_now_ms().saturating_add(ms), Ordering::Release);
+            }
+        }
+    }
+
+    fn expire_monitors(&self) {
+        let now = unix_now_ms();
+        let expired: Vec<String> = {
+            let Ok(reg) = self.processes.lock() else {
+                return;
+            };
+            reg.iter()
+                .filter(|(_, proc)| {
+                    proc.monitor.load(Ordering::Acquire)
+                        && {
+                            let deadline = proc.timeout_deadline_ms.load(Ordering::Acquire);
+                            deadline != 0 && now >= deadline
+                        }
+                        && proc
+                            .inner
+                            .lock()
+                            .map(|inner| inner.native_running())
+                            .unwrap_or(false)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in expired {
+            let _ = self.kill(&id);
+        }
+    }
+
+    /// Idle auto-wake: prior-turn monitors with new output. Own-turn events stay
+    /// in the running turn (explicit poll / wait).
+    pub fn take_monitor_wake_ids(&self, _current_turn: u64) -> Vec<String> {
+        self.expire_monitors();
+        let Ok(reg) = self.processes.lock() else {
+            return Vec::new();
+        };
+        let mut ids = Vec::new();
+        for (id, proc) in reg.iter() {
+            if !proc.monitor.load(Ordering::Acquire) {
+                continue;
+            }
+            let Ok(inner) = proc.inner.lock() else {
+                continue;
+            };
+            let end = output_end(&inner);
+            let seen = proc
+                .wake_seen_end
+                .load(Ordering::Acquire)
+                .max(inner.read_position);
+            if end > seen {
+                proc.wake_seen_end.store(end, Ordering::Release);
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    pub fn monitor_should_wake_turn(&self, id: &str, turn: u64) -> bool {
+        let Ok(reg) = self.processes.lock() else {
+            return false;
+        };
+        let Some(proc) = reg.get(id) else {
+            return false;
+        };
+        if !proc.monitor.load(Ordering::Acquire) {
+            return false;
+        }
+        let owner = proc.owner_turn.load(Ordering::Acquire);
+        owner != 0 && owner != turn
+    }
+
+    fn wait_abort_handle(&self) -> Option<WaitAbort> {
+        self.wait_abort.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn wait_abort_is_pending(abort: Option<&WaitAbort>) -> bool {
+        abort.is_some_and(|abort| abort.pending.load(Ordering::Acquire))
+    }
+
     pub async fn poll_wait_streaming(
         &self,
         id: &str,
@@ -777,11 +974,18 @@ impl BackgroundRegistry {
             let inner = proc.inner.lock().unwrap();
             inner.read_position
         };
+        self.expire_monitors();
         let deadline = tokio::time::Instant::now() + wait;
+        let abort = self.wait_abort_handle();
         loop {
+            if Self::wait_abort_is_pending(abort.as_ref()) {
+                break;
+            }
             let notified = proc.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            let abort_fut = abort_notified(abort.as_ref().map(|abort| abort.notify.as_ref()));
+            tokio::pin!(abort_fut);
             let (omitted, fresh, end, done) = {
                 let inner = proc.inner.lock().unwrap();
                 let (omitted, fresh, end) = output_since(&inner, streamed);
@@ -803,6 +1007,11 @@ impl BackgroundRegistry {
             }
             tokio::select! {
                 () = &mut notified => {}
+                () = &mut abort_fut => {
+                    if Self::wait_abort_is_pending(abort.as_ref()) {
+                        break;
+                    }
+                }
                 () = tokio::time::sleep_until(deadline) => break,
             }
         }
@@ -1048,6 +1257,7 @@ impl BackgroundRegistry {
     /// is for read-only inspection (e.g. a session snapshot shown to the model).
     /// Status is a short label: `running`, `exited <code>`, `killed`, or `failed`.
     pub fn snapshot(&self) -> Vec<(String, String, String)> {
+        self.expire_monitors();
         self.processes
             .lock()
             .unwrap()

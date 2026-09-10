@@ -179,6 +179,64 @@ pub fn wait_tasks_tool_spec() -> ToolSpec {
     }
 }
 
+/// Follow-up to an owned subagent. Inject-only (ADR 002: structure — a typed
+/// coordinator wake beats ad-hoc `task` respawns). Not in `TOOL_SPECS`.
+pub fn send_subagent_message_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "send_subagent_message".into(),
+        description: "Send a follow-up message to a subagent owned by this session. An inactive subagent resumes with the same identity and receives the message as its next turn. For an active subagent, the default steers the current turn at its next safe point; set queue to true to wait for a later turn.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "subagent_id": {
+                    "type": "string",
+                    "description": "ID of the owned subagent that should receive the message (task_… or explore-…)."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text to send to the subagent."
+                },
+                "queue": {
+                    "type": "boolean",
+                    "description": "Queue for a later turn instead of steering the active turn. Default false."
+                }
+            },
+            "required": ["subagent_id", "text"]
+        }),
+    }
+}
+
+/// Model-owned long-running watch. Inject-only (ADR 002: structure — wake
+/// events need a stable handle, not free-form bash). Not in `TOOL_SPECS`.
+pub fn monitor_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "monitor".into(),
+        description: "Start a background monitor that streams events from a long-running script. Each stdout line is an event — you can keep working and poll with bash_output. Exit ends the watch. Print only DONE/FAILED/CANCELLED on the watched command; no progress lines. Use grep --line-buffered in pipes. Set persistent true for session-length watches (PR monitoring, log tails); otherwise it is a managed background job you can bash_kill.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command whose stdout lines are monitor events."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Short human-readable description of what you are monitoring."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Optional idle/lifetime hint in milliseconds. Default 10 hours. Use bash_kill to stop sooner."
+                },
+                "persistent": {
+                    "type": "boolean",
+                    "description": "Keep the monitor for the session lifetime (true) instead of a bounded watch."
+                }
+            },
+            "required": ["command", "description"]
+        }),
+    }
+}
+
 /// `kill_task` — cancel a running background subagent task.
 pub fn kill_task_tool_spec() -> ToolSpec {
     ToolSpec {

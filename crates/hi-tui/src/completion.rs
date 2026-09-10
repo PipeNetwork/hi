@@ -51,6 +51,21 @@ pub(crate) struct CompletionItem {
 pub(crate) const MODEL_CMD: &str = "model";
 /// Cap on inline `/model` id completions, so a large catalog can't flood the menu.
 pub(crate) const MODEL_COMPLETION_MAX: usize = 8;
+/// Visible rows in the `/` menu and Ctrl-K palette. Extra matches stay
+/// reachable by moving the highlight — same compact window grok uses.
+pub(crate) const COMPLETION_VISIBLE_ROWS: usize = 8;
+
+/// Inclusive-start, exclusive-end window that keeps `selected` in view.
+pub(crate) fn visible_range(selected: usize, len: usize, max_rows: usize) -> (usize, usize) {
+    if len == 0 || max_rows == 0 {
+        return (0, 0);
+    }
+    let window = max_rows.min(len);
+    let selected = selected.min(len - 1);
+    let start = selected.saturating_sub(window.saturating_sub(1));
+    (start, start + window)
+}
+
 /// The command whose argument values are profile names, hosted provider
 /// presets, and the `add`/`edit`/`remove` subcommands.
 pub(crate) const PROVIDER_CMD: &str = "provider";
@@ -77,9 +92,7 @@ pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
         None => Some(CompletionContext::Command(rest.to_lowercase())),
         // Past the name, on the first argument token.
         Some((name, arg)) => {
-            let spec = command::COMMANDS
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(name))?;
+            let spec = command::spec_by_name(name)?;
             if spec.name == SESSIONS_CMD
                 && let Some((action, remainder)) = arg.split_once(char::is_whitespace)
             {
@@ -302,8 +315,19 @@ pub(crate) fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionIte
 mod tests {
     use super::{
         CompletionContext::{Arg, Command, Path},
-        completion_context, highlight_label,
+        completion_context, highlight_label, visible_range,
     };
+
+    #[test]
+    fn visible_range_keeps_the_highlight_in_a_small_window() {
+        assert_eq!(visible_range(0, 0, 8), (0, 0));
+        assert_eq!(visible_range(0, 3, 8), (0, 3));
+        assert_eq!(visible_range(0, 20, 8), (0, 8));
+        assert_eq!(visible_range(7, 20, 8), (0, 8));
+        assert_eq!(visible_range(8, 20, 8), (1, 9));
+        assert_eq!(visible_range(19, 20, 8), (12, 20));
+        assert_eq!(visible_range(99, 20, 8), (12, 20));
+    }
 
     #[test]
     fn completion_context_tracks_name_then_argument() {

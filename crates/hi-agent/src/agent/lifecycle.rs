@@ -197,6 +197,12 @@ impl crate::Agent {
             },
         ));
         workspace_coordination.bind_background_registries(runtime.background(), &bg_tasks);
+        let interjections = crate::InterjectionInbox::default();
+        runtime.background().set_wait_abort(
+            Some(interjections.notify_handle()),
+            Some(interjections.abort_pending_flag()),
+        );
+        hi_ai::warmup_agent_http_clients();
         Ok(Self {
             provider,
             provider_capability_registry: hi_ai::ProviderCapabilityRegistry::default(),
@@ -236,7 +242,7 @@ impl crate::Agent {
             snapshot_cache: SnapshotCache::default(),
             prefix_stability: crate::prefix_stability::PrefixStability::default(),
             token_budget: crate::token_budget::TokenBudgetState::default(),
-            interjections: crate::InterjectionInbox::default(),
+            interjections,
             btw_jobs,
             btw_dispatch,
             btw_git_facts_cache: std::sync::Mutex::new(None),
@@ -264,6 +270,8 @@ impl crate::Agent {
             extensions: None,
             mcp: None,
             memory: None,
+            subagent_mailbox: crate::agent::subagent_mailbox::SubagentMailbox::default(),
+            turn_attempt_id: String::new(),
         })
     }
 
@@ -292,6 +300,28 @@ impl crate::Agent {
     /// them as genuine user messages (mid-turn steering).
     pub fn interjection_inbox(&self) -> crate::InterjectionInbox {
         self.interjections.clone()
+    }
+
+    pub(crate) fn event_context(&self) -> hi_events::EventContext {
+        hi_events::EventContext {
+            attempt_id: (!self.turn_attempt_id.is_empty()).then(|| self.turn_attempt_id.clone()),
+            ..hi_events::EventContext::default()
+        }
+    }
+
+    /// Idle follow-up when a monitor from a prior turn has new output.
+    pub fn take_monitor_wake_prompt(&self) -> Option<String> {
+        let ids = self
+            .runtime
+            .background()
+            .take_monitor_wake_ids(u64::from(self.turn_count));
+        if ids.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Monitor event(s) from {}: read with bash_output and act if needed.",
+            ids.join(", ")
+        ))
     }
 
     /// Revert the file changes the most recent turn made, restoring its git
@@ -731,13 +761,14 @@ impl crate::Agent {
     /// The text of the last assistant message, or `None`. Used to capture a
     /// read-only `explore` subagent's final answer after its turn completes.
     pub(crate) fn last_assistant_text(&self) -> Option<String> {
-        self.messages
-            .as_slice()
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::Assistant)
-            .map(|m| m.text())
-            .filter(|t| !t.trim().is_empty())
+        self.messages.as_slice().iter().rev().find_map(|message| {
+            if message.role != Role::Assistant {
+                return None;
+            }
+            let text = message.text();
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then_some(text)
+        })
     }
 
     /// Discard messages back to `len` — used to drop an interrupted turn so the
@@ -1225,6 +1256,45 @@ impl crate::Agent {
     /// reads on an edit-heavy session). Mid-turn staleness is fine: each
     /// source only changes through the model's own actions (its edits, its
     /// `update_plan`/`record_decision` calls), which it already sees.
+    fn live_work_section(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        let jobs = self.runtime.background().snapshot();
+        if !jobs.is_empty() {
+            let mut block = String::from("[Live background jobs]\n");
+            for (id, command, status) in jobs {
+                let cmd = crate::clip_subagent_description(&command);
+                block.push_str(&format!("- {id}: {status} — {cmd}\n"));
+            }
+            parts.push(block.trim_end().to_string());
+        }
+        let tasks = self.bg_tasks.list_now();
+        if !tasks.is_empty() {
+            let mut block = String::from("[Live subagent tasks]\n");
+            for id in tasks {
+                block.push_str(&format!("- {id}\n"));
+            }
+            parts.push(block.trim_end().to_string());
+        }
+        let mailbox = self.subagent_mailbox.snapshot_lines();
+        if !mailbox.is_empty() {
+            let mut block = String::from("[Owned subagents]\n");
+            for line in mailbox {
+                block.push_str(&line);
+                block.push('\n');
+            }
+            if let Some(digest) = self.subagent_mailbox.wake_digest() {
+                block.push('\n');
+                block.push_str(&digest);
+            }
+            parts.push(block.trim_end().to_string());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
+    }
+
     pub(crate) fn volatile_context_block(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
         if let Some(mem) = self.task.memory_context.as_deref() {
@@ -1302,6 +1372,9 @@ impl crate::Agent {
         }
         if let Some(budget) = self.token_budget.fragment() {
             parts.push(budget.to_string());
+        }
+        if let Some(live) = self.live_work_section() {
+            parts.push(live);
         }
         // This block carries canonical task/goal requirements as well as
         // summaries. Keep it intact here; `ensure_request_fits_context` owns

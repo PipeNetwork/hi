@@ -462,6 +462,7 @@ impl crate::Agent {
                     result_chars: 0,
                     truncated: false,
                     kind: String::new(),
+                    model: String::new(),
                 }
                 .with_tape(&result.call.arguments, &result.output.content),
             );
@@ -562,6 +563,7 @@ impl crate::Agent {
                     result_chars: 0,
                     truncated: false,
                     kind: String::new(),
+                    model: String::new(),
                 }
                 .with_tape(&result.call.arguments, &result.output.content),
             );
@@ -747,6 +749,7 @@ impl crate::Agent {
                 result_chars: 0,
                 truncated: false,
                 kind: String::new(),
+                model: String::new(),
             }
             .with_tape(&arguments, &output.content),
         );

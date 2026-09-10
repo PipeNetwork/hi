@@ -3,6 +3,7 @@
 /// Short auto-name for a shell command (UI / status lines). Never includes
 /// the complete JSON arguments or command text.
 pub fn shell_title(command: &str) -> String {
+    let command = crate::command_display::peel_cd_for_title(command);
     let tokens: Vec<&str> = command.split_whitespace().collect();
     if tokens.is_empty() {
         return "shell".into();

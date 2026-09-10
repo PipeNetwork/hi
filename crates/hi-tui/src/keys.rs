@@ -177,7 +177,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::Input,
         keys: "Ctrl-A/E/U/K",
-        help: "line start/end / kill to start / kill to end",
+        help: "line start/end / kill to start / kill to end (empty Ctrl-E expands thinking)",
         in_help: true,
         action: None,
         matches: &[],
@@ -235,7 +235,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::Navigation,
         keys: "PgUp/PgDn",
-        help: "scroll the transcript",
+        help: "scroll the transcript · Space returns to the prompt",
         in_help: true,
         action: None,
         matches: &[],
@@ -318,7 +318,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::ReviewTools,
         keys: "Ctrl-D",
-        help: "full-screen diff review (same as Ctrl-G)",
+        help: "diff review, split when wide (same as Ctrl-G)",
         in_help: true,
         action: Some(Action::ToggleDiff),
         matches: &[KeyMatch::ctrl(KeyCode::Char('d'))],
@@ -334,7 +334,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::ReviewTools,
         keys: "Ctrl-G",
-        help: "full-screen diff review (scrollable, n/p hunks)",
+        help: "diff review (split when wide; overlay when narrow)",
         in_help: true,
         action: Some(Action::ToggleReview),
         matches: &[KeyMatch::ctrl(KeyCode::Char('g'))],
@@ -357,11 +357,16 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         context: BindContext::ReviewTools,
-        keys: "Ctrl-T",
-        help: "toggle reasoning (thinking) display",
+        keys: "Ctrl-T / Ctrl-E",
+        help: "expand/collapse thinking (Ctrl-E also works on an empty prompt)",
         in_help: true,
         action: Some(Action::ToggleReasoning),
-        matches: &[KeyMatch::ctrl(KeyCode::Char('t'))],
+        matches: &[
+            KeyMatch::ctrl(KeyCode::Char('t')),
+            // Scrollback/normal: grok-build Ctrl+E. Insert keeps emacs
+            // end-of-line unless the prompt is empty (see `edit_key`).
+            KeyMatch::ctrl(KeyCode::Char('e')).on_surface(KeySurface::Normal),
+        ],
     },
     KeyBinding {
         context: BindContext::ReviewTools,
@@ -514,14 +519,15 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         context: BindContext::Normal,
-        keys: "i/q/Esc",
-        help: "return to insert mode",
+        keys: "i/q/Esc/Space",
+        help: "return to the prompt",
         in_help: true,
         action: Some(Action::ExitToInsert),
         matches: &[
             KeyMatch::plain(KeyCode::Char('i')),
             KeyMatch::plain(KeyCode::Char('q')),
             KeyMatch::plain(KeyCode::Esc),
+            KeyMatch::plain(KeyCode::Char(' ')),
         ],
     },
     // --- Block nav ---
@@ -537,8 +543,15 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
             KeyMatch::plain(KeyCode::Down),
             KeyMatch::plain(KeyCode::Char('j')),
             KeyMatch::plain(KeyCode::Enter),
-            KeyMatch::plain(KeyCode::Char(' ')),
         ],
+    },
+    KeyBinding {
+        context: BindContext::BlockNav,
+        keys: "Space",
+        help: "return to the prompt",
+        in_help: true,
+        action: Some(Action::FocusPrompt),
+        matches: &[KeyMatch::plain(KeyCode::Char(' '))],
     },
     KeyBinding {
         context: BindContext::BlockNav,
@@ -559,7 +572,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
         action: Some(Action::OpenBlockViewer),
         matches: &[KeyMatch::ctrl(KeyCode::Char('f'))],
     },
-    // --- Diff review (full-screen) ---
+    // --- Diff review (docked pane or full-screen overlay) ---
     KeyBinding {
         context: BindContext::Review,
         keys: "j/k · PgUp/PgDn",
@@ -579,7 +592,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::Review,
         keys: "n/p",
-        help: "next / previous hunk",
+        help: "next / previous hunk (selects it for comment)",
         in_help: true,
         action: Some(Action::ReviewHunk { dir: 1 }),
         matches: &[
@@ -589,13 +602,28 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         context: BindContext::Review,
-        keys: "q · Esc · Ctrl-G",
+        keys: "Space",
+        help: "return to the prompt",
+        in_help: true,
+        action: Some(Action::FocusPrompt),
+        matches: &[KeyMatch::plain(KeyCode::Char(' '))],
+    },
+    KeyBinding {
+        context: BindContext::Review,
+        keys: "Esc",
+        help: "unfocus split pane, or close overlay",
+        in_help: true,
+        action: Some(Action::ReviewUnfocus),
+        matches: &[KeyMatch::plain(KeyCode::Esc)],
+    },
+    KeyBinding {
+        context: BindContext::Review,
+        keys: "q · Ctrl-G",
         help: "close review",
         in_help: true,
         action: Some(Action::ReviewClose),
         matches: &[
             KeyMatch::plain(KeyCode::Char('q')),
-            KeyMatch::plain(KeyCode::Esc),
             KeyMatch::ctrl(KeyCode::Char('g')),
         ],
     },
@@ -760,7 +788,7 @@ fn refine_action(base: Action, m: &KeyMatch, key: &KeyEvent) -> Action {
             Action::QueueMoveSelected { delta }
         }
         Action::BlockNavUp | Action::BlockNavDown | Action::BlockNavToggle => match key.code {
-            KeyCode::Enter | KeyCode::Char(' ') => Action::BlockNavToggle,
+            KeyCode::Enter => Action::BlockNavToggle,
             KeyCode::Down | KeyCode::Char('j') => Action::BlockNavDown,
             _ => Action::BlockNavUp,
         },
@@ -897,7 +925,7 @@ mod tests {
     fn table_resolves_review_and_block_nav() {
         assert_eq!(
             resolve_from_table(KeySurface::Review, &key(KeyCode::Esc, KeyModifiers::NONE)),
-            Action::ReviewClose
+            Action::ReviewUnfocus
         );
         assert_eq!(
             resolve_from_table(

@@ -2,7 +2,12 @@
 
 use hi_ai::Content;
 
-use crate::steering::{EvidenceTracker, ImplementationIntent, ImplementationTracker, ReviewIntent};
+use crate::steering::{
+    BAIL_CONTINUE_NUDGE, EvidenceTracker, GoalKind, ImplementationIntent, ImplementationTracker,
+    LazinessCategory, LazinessConfig, LazinessDecision, NoNudgeReason, ReviewIntent,
+    TodoGateDecision, build_laziness_nudge, claim_evidence_category, evaluate_laziness,
+    evaluate_todo_gate, matched_bail_out, todo_gate_input_from_plan,
+};
 use crate::transcript::NudgeKind;
 use crate::{GOAL_CONTINUE_NUDGE, PLAN_CONTINUE_NUDGE, Ui};
 
@@ -20,6 +25,7 @@ impl crate::Agent {
         read_only_intent: Option<ReviewIntent>,
         implementation_intent: Option<ImplementationIntent>,
         expected_mutation: bool,
+        goal_kind: GoalKind,
         requested_validation: bool,
         implementation_tracker: &mut ImplementationTracker,
         evidence: &mut EvidenceTracker,
@@ -61,14 +67,33 @@ impl crate::Agent {
         // impossible instruction cycle ("do the work" while mutating tools are
         // unavailable) and invites the model to self-certify every step as
         // done just to escape the loop.
-        let plan_incomplete = !self.plan_mode && (self.goals.plan_incomplete() || leftover_goal);
+        //
+        // Grok-build kind lens: analysis/research judge the written
+        // deliverable. A leftover implementer checklist from a prior
+        // code-change must not keep this turn alive. Structured goal
+        // auto-drive still continues.
+        let checklist_incomplete = !self.plan_mode && self.goals.plan_incomplete();
+        let plan_incomplete = leftover_goal
+            || (checklist_incomplete
+                && (goal_kind.requires_workspace_evidence() || progress_tracker.plan_updated));
         // Prefer a goal-aware continue when leftover Goal work is why the
         // turn is unfinished — the model's `update_plan` checklist may already
-        // look complete.
-        let continue_nudge = if leftover_goal {
-            GOAL_CONTINUE_NUDGE
-        } else {
-            PLAN_CONTINUE_NUDGE
+        // look complete. A last-paragraph bail-out gets grok-build's preface.
+        let continue_nudge = {
+            let body = if leftover_goal {
+                self.goals
+                    .structured
+                    .as_ref()
+                    .map(crate::goal::continuation::mid_turn_continue_nudge)
+                    .unwrap_or_else(|| GOAL_CONTINUE_NUDGE.to_string())
+            } else {
+                PLAN_CONTINUE_NUDGE.to_string()
+            };
+            if plan_incomplete && matched_bail_out(assistant_text).is_some() {
+                format!("{BAIL_CONTINUE_NUDGE}\n\n{body}")
+            } else {
+                body
+            }
         };
         // A plan can be structurally incomplete while every remaining step is
         // blocked on a live background process. A status answer is then the
@@ -102,20 +127,47 @@ impl crate::Agent {
             && plan_incomplete
             && *silent_continues < self.config.loop_limits.max_silent_continues
         {
-            self.messages
-                .push_assistant(std::mem::take(completion_content));
-            *silent_continues += 1;
-            *continue_total_nudges += 1;
-            *force_tools_next = true;
-            self.messages
-                .push_nudge(NudgeKind::Continue, continue_nudge);
-            return Ok(RoundControl::Continue);
+            return self.fire_todo_gate(
+                completion_content,
+                assistant_text,
+                progress_tracker,
+                silent_continues,
+                continue_total_nudges,
+                force_tools_next,
+                leftover_goal,
+                &continue_nudge,
+                ui,
+            );
         }
         // Table-driven implementation completeness (order = IMPLEMENTATION_COMPLETENESS_CASCADE).
         // Ordinary expected_mutation turns get the no-change gate for finished
         // answers, including after read/fetch/wait tools. Unfinished narration
         // and incomplete plans take the existing continuation paths below.
         let finished_text_answer = !plan_incomplete;
+        if finished_text_answer
+            && self.laziness_should_nudge(
+                assistant_text,
+                goal_kind,
+                implementation_tracker.tests_seen,
+                false,
+                progress_tracker.awaiting_background,
+                progress_tracker.laziness_nudges,
+            )
+        {
+            self.messages
+                .push_assistant(std::mem::take(completion_content));
+            self.maybe_fire_laziness(
+                assistant_text,
+                goal_kind,
+                implementation_tracker.tests_seen,
+                false,
+                progress_tracker.awaiting_background,
+                progress_tracker,
+                force_tools_next,
+                ui,
+            );
+            return Ok(RoundControl::Continue);
+        }
         // Escape hatch: the no-change nudge asks the model to either edit or
         // state plainly that no file changes are needed. A challenged model
         // that explicitly declines mutation has answered the challenge —
@@ -330,40 +382,42 @@ impl crate::Agent {
         self.messages
             .push_assistant(std::mem::take(completion_content));
         if plan_incomplete && *silent_continues < self.config.loop_limits.max_silent_continues {
-            // A real final answer after a forced no-progress recovery resolves
-            // pending unfinished state from the preceding tool round.
-            progress_tracker.no_progress_streak = 0;
-            progress_tracker.last_no_progress_reason.clear();
-            *silent_continues += 1;
-            *continue_total_nudges += 1;
-            // Force the next round to actually call a tool, so the
-            // nudge can't be answered with yet another narration or an
-            // empty completion.
-            *force_tools_next = true;
-            // Use a goal-aware or plan-aware nudge so the model knows to
-            // continue leftover drive work rather than recap and stop.
-            self.messages
-                .push_nudge(NudgeKind::Continue, continue_nudge);
-            return Ok(RoundControl::Continue);
-        }
-        // Once the plan-continuation budget is spent, try one different action.
-        // If that is also spent, settle and leave the remaining plan durable for
-        // the next drive turn.
-        if plan_incomplete {
-            if self.try_no_progress_recovery(
+            return self.fire_todo_gate_after_assistant(
+                assistant_text,
                 progress_tracker,
+                silent_continues,
+                continue_total_nudges,
                 force_tools_next,
-                Some(continue_total_nudges),
+                leftover_goal,
+                &continue_nudge,
                 ui,
-            ) {
-                return Ok(RoundControl::Continue);
-            }
+            );
+        }
+        if plan_incomplete {
             progress_tracker.record(
                 ProgressKind::Weak,
                 "structured plan has remaining steps",
                 None,
             );
-        } else if !implementation_tracker.no_mutation_exhausted {
+            progress_tracker.record_final_answer();
+            ui.status("todo gate spent; leaving remaining plan steps for the next turn");
+            return Ok(RoundControl::Finish(
+                crate::agent::turn::ModelLoopDecision::Verify,
+            ));
+        }
+        if self.maybe_fire_laziness(
+            assistant_text,
+            goal_kind,
+            implementation_tracker.tests_seen,
+            false,
+            progress_tracker.awaiting_background,
+            progress_tracker,
+            force_tools_next,
+            ui,
+        ) {
+            return Ok(RoundControl::Continue);
+        }
+        if !implementation_tracker.no_mutation_exhausted {
             progress_tracker.no_progress_streak = 0;
             progress_tracker.last_no_progress_reason.clear();
             progress_tracker.record_final_answer();
@@ -371,5 +425,171 @@ impl crate::Agent {
         Ok(RoundControl::Finish(
             crate::agent::turn::ModelLoopDecision::Verify,
         ))
+    }
+
+    fn fire_todo_gate(
+        &mut self,
+        completion_content: &mut Vec<Content>,
+        assistant_text: &str,
+        progress_tracker: &mut ProgressTracker,
+        silent_continues: &mut u32,
+        continue_total_nudges: &mut u32,
+        force_tools_next: &mut bool,
+        leftover_goal: bool,
+        continue_nudge: &str,
+        ui: &mut dyn Ui,
+    ) -> anyhow::Result<RoundControl> {
+        self.messages
+            .push_assistant(std::mem::take(completion_content));
+        self.fire_todo_gate_after_assistant(
+            assistant_text,
+            progress_tracker,
+            silent_continues,
+            continue_total_nudges,
+            force_tools_next,
+            leftover_goal,
+            continue_nudge,
+            ui,
+        )
+    }
+
+    fn fire_todo_gate_after_assistant(
+        &mut self,
+        assistant_text: &str,
+        progress_tracker: &mut ProgressTracker,
+        silent_continues: &mut u32,
+        continue_total_nudges: &mut u32,
+        force_tools_next: &mut bool,
+        leftover_goal: bool,
+        continue_nudge: &str,
+        ui: &mut dyn Ui,
+    ) -> anyhow::Result<RoundControl> {
+        let input =
+            todo_gate_input_from_plan(&self.goals.last_plan, progress_tracker.awaiting_background);
+        let decision = if leftover_goal {
+            TodoGateDecision::Nudge {
+                reminder: continue_nudge.to_string(),
+                reason: crate::steering::TodoGateReason::InFlight,
+            }
+        } else {
+            evaluate_todo_gate(&input)
+        };
+        match decision {
+            TodoGateDecision::Nudge { reminder, .. } => {
+                progress_tracker.no_progress_streak = 0;
+                progress_tracker.last_no_progress_reason.clear();
+                *silent_continues += 1;
+                *continue_total_nudges += 1;
+                // Analysis/research leftover work is a write-up, not a mutation.
+                // Forcing a tool call after a cited recap only pads the turn.
+                *force_tools_next = !leftover_goal
+                    || self
+                        .goals
+                        .structured
+                        .as_ref()
+                        .is_some_and(|goal| goal.kind.requires_workspace_evidence());
+                ui.status("outstanding todos remain; continuing this turn");
+                let reminder = if matched_bail_out(assistant_text).is_some() {
+                    format!("{BAIL_CONTINUE_NUDGE}\n\n{reminder}")
+                } else {
+                    reminder
+                };
+                self.messages.push_nudge(NudgeKind::TodoGate, reminder);
+                Ok(RoundControl::Continue)
+            }
+            TodoGateDecision::Continue => {
+                let _ = assistant_text;
+                Ok(RoundControl::Finish(
+                    crate::agent::turn::ModelLoopDecision::Verify,
+                ))
+            }
+        }
+    }
+
+    fn laziness_should_nudge(
+        &self,
+        assistant_text: &str,
+        goal_kind: GoalKind,
+        tests_seen: bool,
+        plan_incomplete: bool,
+        awaiting_background: bool,
+        laziness_nudges: u32,
+    ) -> bool {
+        matches!(
+            self.laziness_decision(
+                assistant_text,
+                goal_kind,
+                tests_seen,
+                plan_incomplete,
+                awaiting_background,
+                laziness_nudges,
+            ),
+            LazinessDecision::Nudge { .. }
+        )
+    }
+
+    fn laziness_decision(
+        &self,
+        assistant_text: &str,
+        goal_kind: GoalKind,
+        tests_seen: bool,
+        plan_incomplete: bool,
+        awaiting_background: bool,
+        laziness_nudges: u32,
+    ) -> LazinessDecision {
+        if !goal_kind.requires_workspace_evidence() {
+            return LazinessDecision::NoNudge {
+                category: LazinessCategory::NotStalledComplete,
+                confidence: 1.0,
+                reason: NoNudgeReason::NotStalled,
+            };
+        }
+        let category = claim_evidence_category(
+            assistant_text,
+            goal_kind,
+            tests_seen,
+            plan_incomplete,
+            awaiting_background,
+        );
+        let parsed = crate::steering::ClassifierOutput {
+            category,
+            confidence: 1.0,
+            evidence: "turn-end claim vs tool evidence".into(),
+        };
+        evaluate_laziness(&parsed, &LazinessConfig::default(), laziness_nudges, 0.7)
+    }
+
+    fn maybe_fire_laziness(
+        &mut self,
+        assistant_text: &str,
+        goal_kind: GoalKind,
+        tests_seen: bool,
+        plan_incomplete: bool,
+        awaiting_background: bool,
+        progress_tracker: &mut ProgressTracker,
+        force_tools_next: &mut bool,
+        ui: &mut dyn Ui,
+    ) -> bool {
+        let LazinessDecision::Nudge {
+            category, evidence, ..
+        } = self.laziness_decision(
+            assistant_text,
+            goal_kind,
+            tests_seen,
+            plan_incomplete,
+            awaiting_background,
+            progress_tracker.laziness_nudges,
+        )
+        else {
+            return false;
+        };
+        progress_tracker.laziness_nudges = progress_tracker.laziness_nudges.saturating_add(1);
+        *force_tools_next = true;
+        ui.status("idle-stall detector: continuing without branding no-progress");
+        self.messages.push_nudge(
+            NudgeKind::Laziness,
+            build_laziness_nudge(category, &evidence),
+        );
+        true
     }
 }

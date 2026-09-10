@@ -143,97 +143,23 @@ fn inline_code_style(_content: &str) -> Style {
 /// a `---`/`+++` file-header pair) — so we can colorize plain `git diff` /
 /// `diff -u` output the model runs via the shell.
 pub(crate) fn looks_like_diff(s: &str) -> bool {
-    let (mut minus, mut plus) = (false, false);
+    let (mut minus, mut plus, mut change) = (false, false, false);
     for line in s.lines() {
         if line.starts_with("@@") || line.starts_with("diff --git ") {
             return true;
         }
         minus |= line.starts_with("--- ");
         plus |= line.starts_with("+++ ");
+        // Compact `edit` previews also emit `--- path` / `+++ path` around
+        // numbered `   1 + line` rows. Those are not unified diffs: require a
+        // real `+`/`-` change line so the compact painter can color them.
+        change |= (line.starts_with('+') && !line.starts_with("+++"))
+            || (line.starts_with('-') && !line.starts_with("---"));
     }
-    minus && plus
+    minus && plus && change
 }
 
-/// Role of one painted diff row (insert/delete get background bands).
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum DiffBand {
-    Add,
-    Del,
-    Context,
-    Meta,
-}
-
-/// One diff row: optional line-number gutter, role color, and insert/delete
-/// background bands on truecolor themes (grok-build's glanceable hunk look).
-pub(crate) fn banded_diff_line(
-    band: DiffBand,
-    gutter: impl Into<String>,
-    content: impl Into<String>,
-) -> Line<'static> {
-    let th = theme();
-    let (fg, bg, extra) = match band {
-        DiffBand::Add => (th.diff_add, Some(th.diff_add_bg), Modifier::empty()),
-        DiffBand::Del => (th.diff_del, Some(th.diff_del_bg), Modifier::empty()),
-        DiffBand::Context => (th.diff_context, None, Modifier::empty()),
-        DiffBand::Meta => (th.diff_hunk, None, Modifier::BOLD),
-    };
-    let bg = bg.filter(|_| th.paints_backgrounds());
-    let mut style = Style::default().fg(fg).add_modifier(extra);
-    let mut gutter_style = dim();
-    if let Some(bg) = bg {
-        style = style.bg(bg);
-        gutter_style = gutter_style.bg(bg);
-    }
-    let mut line = Line::from(vec![
-        Span::styled(gutter.into(), gutter_style),
-        Span::styled(content.into(), style),
-    ]);
-    if let Some(bg) = bg {
-        line.style = line.style.bg(bg);
-    }
-    line
-}
-
-/// Render a unified diff with coloring and a new-file line-number gutter:
-/// additions green, removals red, hunk headers cyan, file headers bold, context
-/// muted. Insert/delete rows get a background band on truecolor themes. The
-/// line number (tracked from each `@@` header) is shown for context and added
-/// lines; removed lines and headers get a blank gutter.
-pub(crate) fn diff_lines(body: &str) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    let mut new_line: Option<u32> = None;
-    for line in body.lines() {
-        let (band, gutter, advance) = if line.starts_with("+++") || line.starts_with("---") {
-            (DiffBand::Meta, None, false)
-        } else if line.starts_with("@@") {
-            new_line = parse_hunk_new_start(line);
-            (DiffBand::Meta, None, false)
-        } else if line.starts_with('+') {
-            (DiffBand::Add, new_line, true)
-        } else if line.starts_with('-') {
-            (DiffBand::Del, None, false)
-        } else {
-            (DiffBand::Context, new_line, true)
-        };
-        let num = match gutter {
-            Some(n) => format!("{n:>4} "),
-            None => "     ".to_string(),
-        };
-        out.push(banded_diff_line(band, num, line.to_string()));
-        if advance && let Some(n) = new_line.as_mut() {
-            *n += 1;
-        }
-    }
-    out
-}
-
-/// Parse the new-file start line from a unified-diff hunk header
-/// `@@ -old,n +new,m @@` → `new`.
-fn parse_hunk_new_start(header: &str) -> Option<u32> {
-    let plus = header.split('+').nth(1)?;
-    let num: String = plus.chars().take_while(|c| c.is_ascii_digit()).collect();
-    num.parse().ok()
-}
+pub(crate) use crate::inline_diff::{diff_lines, hunk_start_indices};
 
 /// The broad language family a fence belongs to, for keyword/type tables and
 /// comment syntax. `Other` gets string+number+comment highlighting but no
@@ -1241,11 +1167,15 @@ mod tests {
     #[test]
     fn looks_like_diff_detects_unified_and_ignores_lists() {
         assert!(looks_like_diff("@@ -1,2 +1,2 @@\n-a\n+b"));
-        assert!(looks_like_diff("--- a/x\n+++ b/x\n context"));
+        assert!(looks_like_diff("--- a/x\n+++ b/x\n-old\n+new"));
         assert!(looks_like_diff("diff --git a/x b/x\n..."));
         // A bullet list or a flag line must not be mistaken for a diff.
         assert!(!looks_like_diff("- one\n- two\n+ three"));
         assert!(!looks_like_diff("plain output\nno diff here"));
+        // Compact hi edit previews: numbered `   1 + line` under file headers.
+        assert!(!looks_like_diff(
+            "--- src/x.rs\n+++ src/x.rs\n   1 - old\n   2 + new"
+        ));
     }
 
     #[test]
@@ -1253,26 +1183,29 @@ mod tests {
         let body = "--- a/x\n+++ b/x\n@@ -10,3 +10,4 @@\n ctx\n-old\n+new\n+more\n";
         let lines = diff_lines(body);
         let text: Vec<String> = lines.iter().map(line_text).collect();
-        // Context line is numbered from the hunk's new-file start (10).
         assert!(
             text.iter().any(|t| t.contains("10") && t.contains("ctx")),
             "{text:?}"
         );
-        // Additions continue the new-file numbering (11, 12); removals don't advance it.
         assert!(
-            text.iter().any(|t| t.contains("11") && t.contains("+new")),
+            text.iter()
+                .any(|t| t.contains("11") && t.contains("new") && !t.contains('+')),
             "{text:?}"
         );
         assert!(
-            text.iter().any(|t| t.contains("12") && t.contains("+more")),
+            text.iter()
+                .any(|t| t.contains("12") && t.contains("more") && !t.contains('+')),
             "{text:?}"
         );
-        // The removed line carries no number (blank gutter before the '-').
-        let removed = text.iter().find(|t| t.contains("-old")).unwrap();
+        let removed = text
+            .iter()
+            .find(|t| t.contains("old") && !t.contains("new"))
+            .unwrap();
         assert!(
-            !removed.chars().any(|c| c.is_ascii_digit()),
-            "removed line has no number: {removed:?}"
+            removed.contains("10") || removed.contains("11"),
+            "removed line keeps its old-file number: {removed:?}"
         );
+        assert!(!removed.contains("-old"), "{removed:?}");
     }
 
     #[test]

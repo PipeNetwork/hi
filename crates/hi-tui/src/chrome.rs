@@ -12,9 +12,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
 
-/// Horizontal inset for the session stack, matching grok-build's
-/// `outer_hpad_left/right = 2`.
+/// Horizontal inset for the session stack. Left matches grok-build's
+/// `outer_hpad_left = 2`; right is one column wider so content and the
+/// prompt keep a one-cell canvas gutter against the terminal edge.
 pub(crate) const TRANSCRIPT_HPAD: u16 = 2;
+pub(crate) const TRANSCRIPT_HPAD_RIGHT: u16 = 3;
 
 /// Vertical inset (top and bottom), matching grok-build's `outer_vpad = 1`.
 pub(crate) const OUTER_VPAD: u16 = 1;
@@ -47,25 +49,27 @@ pub(crate) fn fill_background(frame: &mut ratatui::Frame, area: Rect, theme: &Th
     );
 }
 
-/// Effective outer padding for `area`: 2 columns on each side, plus a blank
-/// row above and below on a tall terminal. Auto-compact (height ≤ 20) drops
-/// the vertical pad so a short session never starves the prompt.
-pub(crate) fn outer_pad(area: Rect) -> (u16, u16, u16) {
+/// Effective outer padding for `area`: 2 columns on the left, 3 on the right,
+/// plus a blank row above and below on a tall terminal. Auto-compact
+/// (height ≤ 20) drops the vertical pad so a short session never starves the
+/// prompt.
+pub(crate) fn outer_pad(area: Rect) -> (u16, u16, u16, u16) {
     let compact = area.height > 0 && area.height <= AUTO_COMPACT_MAX_ROWS;
     let vpad = if compact { 0 } else { OUTER_VPAD };
-    (TRANSCRIPT_HPAD, vpad, vpad)
+    (TRANSCRIPT_HPAD, TRANSCRIPT_HPAD_RIGHT, vpad, vpad)
 }
 
 /// Inset `area` on all four sides so chrome floats on the canvas instead of
-/// flushing to the terminal edge.
-pub(crate) fn inset(area: Rect, hpad: u16, top: u16, bottom: u16) -> Rect {
-    let hpad = hpad.min(area.width / 2);
+/// flushing to the terminal edge. Right pad may be one column wider than left.
+pub(crate) fn inset(area: Rect, left: u16, right: u16, top: u16, bottom: u16) -> Rect {
+    let left = left.min(area.width);
+    let right = right.min(area.width.saturating_sub(left));
     let top = top.min(area.height);
     let bottom = bottom.min(area.height.saturating_sub(top));
     Rect {
-        x: area.x + hpad,
+        x: area.x + left,
         y: area.y + top,
-        width: area.width.saturating_sub(hpad.saturating_mul(2)),
+        width: area.width.saturating_sub(left).saturating_sub(right),
         height: area.height.saturating_sub(top).saturating_sub(bottom),
     }
 }
@@ -448,19 +452,24 @@ mod tests {
             width: 80,
             height: 24,
         };
-        assert_eq!(outer_pad(tall), (2, 1, 1));
+        assert_eq!(outer_pad(tall), (2, 3, 1, 1));
         let compact = Rect {
             x: 0,
             y: 0,
             width: 80,
             height: 20,
         };
-        assert_eq!(outer_pad(compact), (2, 0, 0));
-        let inset_tall = inset(tall, 2, 1, 1);
+        assert_eq!(outer_pad(compact), (2, 3, 0, 0));
+        let inset_tall = inset(tall, 2, 3, 1, 1);
         assert_eq!(inset_tall.x, 2);
         assert_eq!(inset_tall.y, 1);
-        assert_eq!(inset_tall.width, 76);
+        assert_eq!(inset_tall.width, 75);
         assert_eq!(inset_tall.height, 22);
+        assert_eq!(
+            tall.width - (inset_tall.x + inset_tall.width),
+            3,
+            "one extra canvas column on the right"
+        );
     }
 
     #[test]

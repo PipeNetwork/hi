@@ -31,6 +31,8 @@ pub(crate) enum Action {
     /// Esc on empty idle input — applied by `run.rs`, not the table matcher.
     EnterNormal,
     ExitToInsert,
+    /// Grok-style: leave scrollback/review/block-nav and land on the composer.
+    FocusPrompt,
     CopyLastCode,
     ExternalEdit,
     /// Cycled via `/density` (table lists it for help; applicator supports it).
@@ -51,6 +53,8 @@ pub(crate) enum Action {
         delta: i32,
     },
     ReviewClose,
+    /// Esc in review: unfocus a docked pane, or close the overlay.
+    ReviewUnfocus,
     ReviewScroll {
         delta: i32,
     },
@@ -136,13 +140,46 @@ mod tests {
             ),
             Action::ToggleReview
         );
+        assert_eq!(
+            resolve_key(
+                KeySurface::Insert,
+                &key(KeyCode::Char('t'), KeyModifiers::CONTROL)
+            ),
+            Action::ToggleReasoning
+        );
+        assert_eq!(
+            resolve_key(
+                KeySurface::Insert,
+                &key(KeyCode::Char('e'), KeyModifiers::CONTROL)
+            ),
+            Action::None,
+            "insert Ctrl+E stays emacs end-of-line unless the prompt is empty"
+        );
+    }
+
+    #[test]
+    fn normal_ctrl_e_expands_thinking() {
+        assert_eq!(
+            resolve_key(
+                KeySurface::Normal,
+                &key(KeyCode::Char('e'), KeyModifiers::CONTROL)
+            ),
+            Action::ToggleReasoning
+        );
+        assert_eq!(
+            resolve_key(
+                KeySurface::Normal,
+                &key(KeyCode::Char('t'), KeyModifiers::CONTROL)
+            ),
+            Action::ToggleReasoning
+        );
     }
 
     #[test]
     fn review_keys_resolve() {
         assert_eq!(
             resolve_key(KeySurface::Review, &key(KeyCode::Esc, KeyModifiers::NONE)),
-            Action::ReviewClose
+            Action::ReviewUnfocus
         );
         assert_eq!(
             resolve_key(

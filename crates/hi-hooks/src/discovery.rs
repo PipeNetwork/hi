@@ -85,6 +85,29 @@ fn load_hooks_from_dir(dir: &Path) -> (Vec<HookSpec>, Vec<String>) {
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                errors.push(format!("reading {}: {e}", path.display()));
+                continue;
+            }
+        };
+        if !meta.is_file() {
+            errors.push(format!(
+                "skipping {}: hook settings must be files, not directories",
+                path.display()
+            ));
+            continue;
+        }
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let canonical_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        if !canonical.starts_with(&canonical_dir) {
+            errors.push(format!(
+                "skipping {}: hook path escapes trusted hook directory",
+                path.display()
+            ));
+            continue;
+        }
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -175,5 +198,17 @@ matcher = "bash*"
         let (registry, errors) = discover_hooks(Some(Path::new("/nonexistent/hi/hooks")), None);
         assert!(registry.is_empty());
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn refuses_directory_typed_hook_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("nested.toml")).unwrap();
+        let (registry, errors) = discover_hooks(None, Some(dir.path()));
+        assert!(registry.is_empty());
+        assert!(
+            errors.iter().any(|e| e.contains("not directories")),
+            "{errors:?}"
+        );
     }
 }

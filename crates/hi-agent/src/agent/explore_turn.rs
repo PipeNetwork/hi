@@ -56,6 +56,7 @@ pub(crate) struct ExploreJob {
     pub(crate) provider: std::sync::Arc<dyn hi_ai::Provider>,
     pub(crate) capability_registry: hi_ai::ProviderCapabilityRegistry,
     pub(crate) child_config: AgentConfig,
+    pub(crate) mailbox: crate::agent::subagent_mailbox::SubagentMailbox,
 }
 
 /// The result of running an explore job — the tool outcome plus the child's
@@ -65,6 +66,7 @@ pub(crate) struct ExploreResult {
     pub(crate) slot: u32,
     pub(crate) outcome: hi_tools::ToolOutcome,
     pub(crate) usage: hi_ai::Usage,
+    pub(crate) last_prompt: String,
 }
 impl crate::Agent {
     /// Prepare an explore subagent job: reserve accounting, build the child config,
@@ -154,6 +156,7 @@ impl crate::Agent {
             provider: self.explore_child_provider(),
             capability_registry: self.provider_capability_registry.clone(),
             child_config,
+            mailbox: self.subagent_mailbox.clone(),
         })
     }
 
@@ -274,6 +277,12 @@ impl crate::Agent {
         let status = crate::subagent_finish_status(result.outcome.status);
         let finish_summary: String = result.outcome.content.chars().take(120).collect();
         ui.subagent_finished(&id, status, elapsed_ms, &finish_summary);
+        self.subagent_mailbox.mark_finished(
+            &id,
+            "explore".into(),
+            task,
+            result.outcome.content.clone(),
+        );
         result.outcome
     }
 
@@ -281,6 +290,12 @@ impl crate::Agent {
     /// Called after parallel explores complete in the batch scheduler.
     pub(crate) fn finish_explore(&mut self, result: ExploreResult) -> hi_tools::ToolOutcome {
         self.add_side_usage(result.usage);
+        self.subagent_mailbox.mark_finished(
+            &format!("explore-{}", result.slot),
+            "explore".into(),
+            result.last_prompt,
+            result.outcome.content.clone(),
+        );
         result.outcome
     }
 }
@@ -295,7 +310,10 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
         provider,
         capability_registry,
         child_config,
+        mailbox,
     } = job;
+    let last_prompt = task.clone();
+    let id = format!("explore-{slot}");
 
     let mut child = match crate::Agent::new(provider, child_config) {
         Ok(child) => child,
@@ -307,10 +325,12 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
                     hi_tools::ToolStatus::Failed,
                 ),
                 usage: hi_ai::Usage::default(),
+                last_prompt,
             };
         }
     };
     child.set_provider_capability_registry(capability_registry);
+    mailbox.register_running(&id, child.interjection_inbox());
     let mut child = super::child_process_teardown::ReapingChild::new(child, None);
     // `Box::pin` breaks the async-recursion cycle (`run_turn` → `handle_explore`
     // → child `run_turn`) that would otherwise make the future infinitely sized.
@@ -348,6 +368,7 @@ pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut dyn Ui) -> Explore
         slot,
         outcome,
         usage,
+        last_prompt,
     }
 }
 

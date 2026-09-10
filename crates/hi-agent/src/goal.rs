@@ -14,8 +14,16 @@
 
 use serde::{Deserialize, Serialize};
 mod completion;
+pub(crate) mod continuation;
+pub(crate) mod kind_lens;
+pub(crate) mod plan_file;
+pub(crate) mod scratch;
 
 pub(crate) const GOAL_EXPORT_PATH: &str = ".hi/goal-plan.md";
+
+fn default_persisted_goal_kind() -> crate::GoalKind {
+    crate::GoalKind::CodeChange
+}
 
 /// The status of a sub-goal (and the overall goal).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +192,21 @@ pub struct SubGoal {
     pub requeued: bool,
 }
 
+/// Structured `/goal` planner output: kind, gating criteria, verification
+/// steps, and the drive checklist. One-line-per-milestone replies populate
+/// only [`Self::milestones`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GoalPlan {
+    /// Planner `## Goal kind` / `KIND:` when present.
+    pub kind: Option<crate::GoalKind>,
+    /// Ordered drive checklist (task-checklist items, or the line-list fallback).
+    pub milestones: Vec<String>,
+    /// Gating acceptance criteria. Capped when stored on [`Goal`].
+    pub acceptance: Vec<String>,
+    /// Shared verification steps. Capped when stored on [`Goal`].
+    pub verification: Vec<String>,
+}
+
 /// A structured, multi-step objective that persists across turns and sessions.
 /// Distinct from the transient `Agent.goal` string (which is just a prompt
 /// injection): a `Goal` is decomposed, tracked, and resumed.
@@ -191,6 +214,18 @@ pub struct SubGoal {
 pub struct Goal {
     /// The high-level objective, as the user stated it.
     pub objective: String,
+    /// Frozen grok-build `## Goal kind`. Drive turns use this instead of
+    /// re-deriving from the synthetic continue prompt. Older sessions without
+    /// the field load as code-change (hi goals were coding work).
+    #[serde(default = "default_persisted_goal_kind")]
+    pub kind: crate::GoalKind,
+    /// Planner `## Acceptance criteria`, capped. Empty on goals created without
+    /// a structured plan (tests, ingest, legacy sessions).
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    /// Planner `## Verification plan`, capped. Empty when the planner omitted it.
+    #[serde(default)]
+    pub verification: Vec<String>,
     /// The ordered sub-goals the agent decomposed the objective into.
     pub sub_goals: Vec<SubGoal>,
     /// The overall status — `Done` when all sub-goals are done, `Failed` if a
@@ -284,6 +319,24 @@ pub struct Goal {
     /// `/goal unattended on` or `/goal --unattended`. `#[serde(default)]`.
     #[serde(default)]
     pub unattended: bool,
+    /// Last majority-panel gaps, inlined into the next drive continuation.
+    #[serde(default)]
+    pub last_gaps: String,
+    /// Fail-open strategist note after repeated review objections.
+    #[serde(default)]
+    pub strategy_note: String,
+    /// `skeptic_objections` when the strategist last ran.
+    #[serde(default)]
+    pub strategy_at: u32,
+    /// Closing recap from the fail-open summarizer.
+    #[serde(default)]
+    pub closing_summary: String,
+    /// Fingerprint of [`Self::last_gaps`] so identical refutes can stall.
+    #[serde(default)]
+    pub last_gap_fingerprint: u64,
+    /// Consecutive identical panel-gap fingerprints (grok stall threshold 2).
+    #[serde(default)]
+    pub consecutive_same_gaps: u32,
 }
 
 /// Unlimited sentinel for ordinary per-sub-goal retries.
@@ -416,6 +469,8 @@ impl Goal {
     /// (one model call, done by the agent loop); this constructor takes the
     /// already-decomposed list.
     pub fn new(objective: impl Into<String>, sub_goal_descriptions: Vec<String>) -> Self {
+        let objective = objective.into();
+        let kind = crate::GoalKind::for_objective(&objective);
         let mut sub_goals = Vec::new();
         let mut known_descriptions = std::collections::HashSet::new();
         for description in sub_goal_descriptions {
@@ -445,7 +500,10 @@ impl Goal {
             });
         }
         let mut g = Self {
-            objective: objective.into(),
+            objective,
+            kind,
+            acceptance: Vec::new(),
+            verification: Vec::new(),
             sub_goals,
             status: GoalStatus::Active,
             paused: false,
@@ -464,9 +522,68 @@ impl Goal {
             last_skeptic_status: None,
             audit_rounds: 0,
             unattended: false,
+            last_gaps: String::new(),
+            strategy_note: String::new(),
+            strategy_at: 0,
+            closing_summary: String::new(),
+            last_gap_fingerprint: 0,
+            consecutive_same_gaps: 0,
         };
         g.push_event("set", "goal created");
         g
+    }
+
+    /// Install a planner-produced contract: sub-goals from the checklist, plus
+    /// frozen kind / acceptance / verification. Missing kind falls back to
+    /// [`crate::GoalKind::for_objective`] via [`Self::new`].
+    pub fn from_goal_plan(objective: impl Into<String>, plan: GoalPlan) -> Self {
+        let GoalPlan {
+            kind,
+            milestones,
+            acceptance,
+            verification,
+        } = plan;
+        let mut goal = Self::new(objective, milestones);
+        if let Some(kind) = kind {
+            goal.kind = kind;
+        }
+        goal.acceptance = clip_plan_items(acceptance);
+        goal.verification = clip_plan_items(verification);
+        goal
+    }
+
+    /// Record this turn's panel gaps and return true when the same fingerprint
+    /// has now appeared twice in a row (grok no-progress stall).
+    pub(crate) fn record_repeated_gaps(&mut self) -> bool {
+        let fingerprint = gap_fingerprint(&self.last_gaps);
+        if fingerprint != 0 && fingerprint == self.last_gap_fingerprint {
+            self.consecutive_same_gaps = self.consecutive_same_gaps.saturating_add(1);
+        } else {
+            self.consecutive_same_gaps = 1;
+            self.last_gap_fingerprint = fingerprint;
+        }
+        self.consecutive_same_gaps >= 2
+    }
+
+    pub(crate) fn clear_repeated_gaps(&mut self) {
+        self.last_gaps.clear();
+        self.consecutive_same_gaps = 0;
+        self.last_gap_fingerprint = 0;
+    }
+
+    /// Compact kind + first criterion + first verify step for prompts.
+    pub(crate) fn contract_prompt_lines(&self) -> String {
+        let mut out = format!("Kind: {}\n", self.kind.as_str());
+        if let Some(criterion) = self.acceptance.first() {
+            out.push_str(&format!(
+                "Acceptance: {}\n",
+                clip_chars(criterion, MAX_STEP_CHARS)
+            ));
+        }
+        if let Some(step) = self.verification.first() {
+            out.push_str(&format!("Verify: {}\n", clip_chars(step, MAX_STEP_CHARS)));
+        }
+        out
     }
 
     /// Remove a generated turn ceiling written by an older hi version. A
@@ -627,6 +744,10 @@ impl Goal {
             .unwrap_or_else(|| "none".into());
         let mut out = String::new();
         out.push_str(&format!("goal: {}\n", self.objective));
+        out.push_str(&format!("  kind: {}\n", self.kind.as_str()));
+        if let Some(criterion) = self.acceptance.first() {
+            out.push_str(&format!("  acceptance: {criterion}\n"));
+        }
         out.push_str(&format!(
             "  state: {:?} · drive: {pause} · steps: {done}/{total} done · limit: {limit}\n",
             self.status
@@ -703,7 +824,25 @@ impl Goal {
 
     /// Markdown snapshot for human review (export-only; struct remains SoT).
     pub fn to_markdown(&self) -> String {
-        let mut out = format!("# Goal\n\n**Objective:** {}\n\n", self.objective);
+        let mut out = format!(
+            "# Goal\n\n**Objective:** {}\n\n**Kind:** {}\n\n",
+            self.objective,
+            self.kind.as_str()
+        );
+        if !self.acceptance.is_empty() {
+            out.push_str("## Acceptance criteria\n\n");
+            for (i, criterion) in self.acceptance.iter().enumerate() {
+                out.push_str(&format!("{}. {}\n", i + 1, criterion));
+            }
+            out.push('\n');
+        }
+        if !self.verification.is_empty() {
+            out.push_str("## Verification plan\n\n");
+            for (i, step) in self.verification.iter().enumerate() {
+                out.push_str(&format!("{}. {}\n", i + 1, step));
+            }
+            out.push('\n');
+        }
         let done = self.completed_count();
         let failed = self
             .sub_goals
@@ -730,16 +869,15 @@ impl Goal {
                 self.consecutive_skips
             ));
         }
-        out.push_str("\n## Checklist\n\n");
-        for (i, sg) in self.sub_goals.iter().enumerate() {
+        out.push_str("\n## Task checklist\n\n");
+        for sg in &self.sub_goals {
             let box_ = match sg.status {
                 GoalStatus::Done => "[x]",
-                GoalStatus::Active => "[>]",
                 GoalStatus::Failed => "[!]",
                 GoalStatus::Blocked => "[-]",
-                GoalStatus::Pending => "[ ]",
+                GoalStatus::Active | GoalStatus::Pending => "[ ]",
             };
-            out.push_str(&format!("{}. {} {}\n", i + 1, box_, sg.description));
+            out.push_str(&format!("- {box_} {}\n", sg.description));
             if sg.attempts > 0 {
                 out.push_str(&format!("   - attempts: {}\n", sg.attempts));
             }
@@ -1365,13 +1503,13 @@ impl Goal {
         if self.sub_goals.is_empty() || self.is_paused() {
             return None;
         }
-        let mut out = String::from(
-            "\n\n[Long-horizon goal — work the active step, then advance only after validation]\n",
-        );
+        let mut out = String::from(kind_lens::prompt_banner(self.kind));
         out.push_str(&format!(
             "Objective: {}\n",
             clip_chars(&self.objective, MAX_OBJECTIVE_CHARS)
         ));
+        out.push_str(&self.contract_prompt_lines());
+        out.push_str(kind_lens::prompt_rules(self.kind));
         // The full checklist rides in the system prompt every turn; on a long
         // goal (the planner may produce 120 milestones) re-rendering every line
         // is the dominant per-turn token cost — and it busts provider prefix
@@ -1490,6 +1628,33 @@ fn push_clipped_note(sub_goal: &mut SubGoal, note: &str) {
 
 const MAX_OBJECTIVE_CHARS: usize = 500;
 const MAX_STEP_CHARS: usize = 200;
+const MAX_PLAN_ITEMS: usize = 8;
+
+fn gap_fingerprint(gaps: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut lines: Vec<String> = gaps
+        .lines()
+        .map(|line| line.trim().to_ascii_lowercase())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return 0;
+    }
+    lines.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lines.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn clip_plan_items(items: Vec<String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|item| clip_chars(&item, MAX_STEP_CHARS))
+        .filter(|item| !item.is_empty())
+        .take(MAX_PLAN_ITEMS)
+        .collect()
+}
+
 pub(crate) const MAX_NOTE_CHARS: usize = 240;
 const MAX_NOTES_PER_STEP: usize = 6;
 pub(crate) const MAX_NOTES_IN_PROMPT: usize = 4;
@@ -1515,6 +1680,9 @@ fn parse_status(raw: &str) -> GoalStatus {
 }
 
 #[cfg(test)]
+mod contract_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1527,185 +1695,6 @@ mod tests {
                 "update callers".into(),
             ],
         )
-    }
-
-    #[test]
-    fn a_goal_saved_before_these_fields_existed_still_loads() {
-        // Sessions on disk predate every counter added here. If any of them
-        // failed to default, resuming an existing long-horizon goal would error
-        // instead of picking up where it left off — losing exactly the progress
-        // record these changes exist to protect.
-        let legacy = r#"{
-            "objective": "review plan.md and fully build this",
-            "sub_goals": [
-                {"description": "step one", "status": "Done", "attempts": 0, "notes": []},
-                {"description": "step two", "status": "Active", "attempts": 2, "notes": ["a note"]}
-            ],
-            "status": "Active",
-            "paused": true,
-            "team": true
-        }"#;
-        let goal: Goal = serde_json::from_str(legacy).expect("legacy goal must deserialize");
-
-        assert_eq!(goal.sub_goals.len(), 2);
-        assert_eq!(goal.completed_count(), 1);
-        assert!(goal.is_paused());
-        // Every field added across these changes defaults sanely.
-        assert_eq!(goal.consecutive_skips, 0);
-        assert_eq!(goal.turn_budget, None);
-        assert_eq!(goal.turns_spent, 0);
-        assert_eq!(goal.sub_goals[1].unjudged_turns, 0);
-        assert_eq!(goal.sub_goals[1].productive_turns, 0);
-        assert_eq!(goal.sub_goals[1].cap_continuations, 0);
-        // And the pre-existing state survives untouched.
-        assert_eq!(goal.sub_goals[1].attempts, 2);
-        assert!(!goal.is_thrashing(), "a legacy goal must not read as stuck");
-    }
-
-    #[test]
-    fn fresh_goals_have_no_default_turn_budget() {
-        let g = goal();
-        assert_eq!(g.turn_budget, None);
-        assert!(!g.budget_auto);
-        assert!(!g.budget_exhausted());
-    }
-
-    #[test]
-    fn plan_growth_does_not_install_a_default_turn_budget() {
-        let mut g = Goal::new("ship it", vec!["one".into()]);
-        let grown: Vec<String> = (0..80).map(|i| format!("step {i}")).collect();
-        g.append_missing(&grown);
-        assert_eq!(g.turn_budget, None);
-        assert!(!g.budget_auto);
-    }
-
-    #[test]
-    fn a_legacy_automatic_budget_is_removed_and_reopened() {
-        let mut g = Goal::new("ship it", vec!["one".into()]);
-        g.turn_budget = Some(25);
-        g.budget_auto = true;
-        g.pause(GoalPauseReason::Budget);
-
-        assert!(g.clear_legacy_automatic_budget());
-        assert_eq!(g.turn_budget, None);
-        assert!(!g.budget_auto);
-        assert!(!g.is_paused());
-        assert_eq!(g.pause_reason, GoalPauseReason::None);
-        assert!(!g.clear_legacy_automatic_budget());
-    }
-
-    #[test]
-    fn an_explicit_budget_stops_the_rescaling() {
-        let mut g = Goal::new("ship it", vec!["one".into()]);
-        g.turn_budget = Some(7);
-        g.budget_auto = false; // as `/goal budget 7` does
-        let grown: Vec<String> = (0..40).map(|i| format!("step {i}")).collect();
-        g.append_missing(&grown);
-        assert_eq!(
-            g.turn_budget,
-            Some(7),
-            "a number the user chose must not move under them"
-        );
-    }
-
-    #[test]
-    fn compatibility_auto_budget_helper_is_unlimited() {
-        assert_eq!(auto_budget_for(0), u32::MAX);
-        assert_eq!(auto_budget_for(1), u32::MAX);
-        assert_eq!(auto_budget_for(100_000), u32::MAX);
-    }
-
-    #[test]
-    fn a_turn_budget_bounds_an_open_ended_objective() {
-        // "fully build this" against a multi-phase plan has no reachable end
-        // state, so without a ceiling it simply runs until someone notices.
-        let mut g = goal();
-        // `/goal budget off` — the explicit opt-out.
-        g.turn_budget = None;
-        g.budget_auto = false;
-        assert!(!g.budget_exhausted(), "no budget set = runs until done");
-        assert_eq!(g.turns_remaining(), None);
-        assert!(!g.spend_turn(), "spending against no budget never exhausts");
-
-        g.turn_budget = Some(2);
-        g.turns_spent = 0;
-        assert!(!g.spend_turn(), "one of two");
-        assert_eq!(g.turns_remaining(), Some(1));
-        assert!(g.spend_turn(), "the second turn exhausts it");
-        assert!(g.budget_exhausted());
-        assert_eq!(g.turns_remaining(), Some(0));
-    }
-
-    #[test]
-    fn the_progress_report_accounts_for_every_step() {
-        // A goal that stops without saying what it finished, what it couldn't
-        // reach, and what's left is no more useful than one that ran forever.
-        let mut g = Goal::new(
-            "ship it",
-            vec!["one".into(), "two".into(), "three".into(), "four".into()],
-        );
-        g.advance(); // one: done
-        g.block_active("a running PostgreSQL"); // two: blocked
-        g.record_failure("verification failed", 0); // three: failed
-        g.turns_spent = 7;
-
-        let report = g.progress_report();
-        assert!(report.contains("1 done"), "{report}");
-        assert!(report.contains("1 failed"), "{report}");
-        assert!(report.contains("1 blocked"), "{report}");
-        assert!(report.contains("across 7 turn(s)"), "{report}");
-        assert!(
-            report.contains("a running PostgreSQL"),
-            "the actionable prerequisite must appear: {report}"
-        );
-        assert!(
-            report.contains("Next up: 4."),
-            "the user needs to know where it would resume: {report}"
-        );
-    }
-
-    #[test]
-    fn blocking_a_step_costs_no_retry_budget_and_is_not_a_failure() {
-        // A missing prerequisite is not a rejected attempt. Marking it `Failed`
-        // tells the user their work was judged and found wanting, and hides the
-        // one thing they can act on.
-        let mut g = goal();
-        assert!(g.block_active("a running PostgreSQL reachable via DATABASE_URL"));
-
-        assert_eq!(g.sub_goals[0].status, GoalStatus::Blocked);
-        assert_ne!(g.sub_goals[0].status, GoalStatus::Failed);
-        assert_eq!(g.sub_goals[0].attempts, 0, "no retry budget spent");
-        assert_eq!(g.active_index(), Some(1), "the drive moves on");
-        assert_eq!(g.status, GoalStatus::Active);
-
-        let blocked = g.blocked_steps();
-        assert_eq!(blocked.len(), 1);
-        assert!(
-            blocked[0].1.notes.iter().any(|n| n.contains("PostgreSQL")),
-            "the prerequisite must be recorded verbatim: {:?}",
-            blocked[0].1.notes
-        );
-    }
-
-    #[test]
-    fn a_wholly_blocked_plan_reports_blocked_not_failed() {
-        let mut g = goal();
-        g.block_active("no database");
-        g.block_active("no database");
-        assert!(!g.block_active("no database"), "nothing left to drive");
-        assert_eq!(
-            g.status,
-            GoalStatus::Blocked,
-            "the goal is waiting on prerequisites, not broken"
-        );
-
-        // A genuine failure alongside blocks dominates — claiming merely
-        // "blocked" would overstate how recoverable the run is.
-        let mut mixed = goal();
-        mixed.block_active("no database");
-        mixed.record_failure("verification failed", 0);
-        mixed.block_active("no tofu");
-        assert_eq!(mixed.status, GoalStatus::Failed);
     }
 
     #[test]
@@ -1838,6 +1827,8 @@ mod tests {
         assert!(md.contains("progress: 0 done · 0 failed · 3 total"), "{md}");
         assert!(md.contains("attempts: 1"), "{md}");
         assert!(md.contains("unjudged turns"), "{md}");
+        assert!(md.contains("## Task checklist"), "{md}");
+        assert!(md.contains("- [ ] write tests"), "{md}");
 
         let mut skipped = goal();
         skipped.skip_active("blocked");

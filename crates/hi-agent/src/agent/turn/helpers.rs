@@ -91,6 +91,7 @@ pub(super) fn build_turn_telemetry(
         wire_audit: Vec::new(),
         requests: Vec::new(),
         compaction: Vec::new(),
+        model: String::new(),
         diagnostic_retention: crate::TurnDiagnosticRetention {
             progress_events_dropped: progress.retained_events_dropped(),
             tool_timeline_dropped: tool_timeline.dropped(),
@@ -223,6 +224,7 @@ pub(super) fn tool_entry_with_args(
         result_chars: output.content.chars().count() as u64,
         truncated,
         kind,
+        model: String::new(),
     }
 }
 

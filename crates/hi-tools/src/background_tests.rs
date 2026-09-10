@@ -200,6 +200,17 @@ fn handle_ids_name_the_job_and_order_by_suffix() {
         "cargo-test_3"
     );
     assert_eq!(
+        shell_title("cd /Users/david/chat && cargo clippy --all-targets 2>&1 | grep warning"),
+        "cargo clippy"
+    );
+    assert_eq!(
+        handle_id(
+            "cd /Users/david/chat && cargo test --quiet 2>&1 | tail -40",
+            1
+        ),
+        "cargo-test_1"
+    );
+    assert_eq!(
         handle_id("RUST_LOG=debug git push origin main", 7),
         "git-push_7"
     );
@@ -652,27 +663,6 @@ fn char_boundary_helper_lands_on_boundaries() {
     assert_eq!(char_boundary_at_or_after(s, 2), 5);
     assert_eq!(char_boundary_at_or_after(s, 1), 1);
     assert_eq!(char_boundary_at_or_after(s, 99), s.len());
-}
-
-fn registry_with_retained_output(output: String) -> (BackgroundRegistry, String) {
-    let registry = BackgroundRegistry::default();
-    let id = "overflow-test_1".to_string();
-    let proc = Arc::new(BgProc {
-        command: "overflow-test".to_string(),
-        title: "overflow-test".to_string(),
-        pgid: None,
-        origin: BgOrigin::Requested,
-        managed_effect: None,
-        effect_baseline: None,
-        managed_job: None,
-        ownership_released: std::sync::atomic::AtomicBool::new(false),
-        inner: Mutex::new(BgInner::running(output)),
-        terminal_publication: tokio::sync::Mutex::new(()),
-        reaped: Notify::new(),
-        changed: Notify::new(),
-    });
-    registry.processes.lock().unwrap().insert(id.clone(), proc);
-    (registry, id)
 }
 
 #[test]

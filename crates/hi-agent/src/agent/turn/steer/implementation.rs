@@ -3,7 +3,7 @@
 use crate::steering::{
     BACKGROUND_WAIT_FINAL_NUDGE, BACKGROUND_WAIT_STATUS_NUDGE, EvidenceTracker,
     IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker, REREAD_NUDGE,
-    WAIT_POLL_STATIC_NUDGE, bash_call_waits, implementation_text_tool_nudge,
+    STATIONARITY_NUDGE, WAIT_POLL_STATIC_NUDGE, bash_call_waits, implementation_text_tool_nudge,
     implementation_tool_call_validates, tool_validation_retry_nudge, unavailable_tool_retry_nudge,
 };
 use crate::transcript::NudgeKind;
@@ -90,6 +90,24 @@ impl crate::Agent {
         let read_only_intent = batch.read_only_intent;
         // Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
         self.set_turn_phase(TurnPhase::Steer);
+        if !calls.is_empty() {
+            progress_tracker.stationarity.observe_calls(calls);
+            if progress_tracker.stationarity.hard_stop() {
+                progress_tracker.stationarity_ended = true;
+                ui.nudge("identical tool calls reached the stationarity hard stop");
+                if implementation_tracker.mutation_seen {
+                    progress_tracker.record_final_answer();
+                    return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
+                }
+            } else if progress_tracker.stationarity.take_nudge() {
+                ui.nudge("identical tool calls repeating — nudging a different next action");
+                self.messages
+                    .push_nudge(NudgeKind::Repeat, STATIONARITY_NUDGE);
+                return RoundControl::Continue;
+            } else if progress_tracker.stationarity.nudged && implementation_tracker.mutation_seen {
+                return RoundControl::Continue;
+            }
+        }
         if interrupted_calls > 0 {
             let coordination_only = interrupted_calls == interrupted_coordination_calls;
             *force_tools_next = true;

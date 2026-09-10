@@ -427,6 +427,8 @@ pub(crate) fn config() -> AgentConfig {
             // canned tool lists stay predictable.
             explore_subagents: false,
             write_subagents: crate::WriteSubagentPolicy::Off,
+            // Existing skeptic tests script one reviewer completion.
+            skeptic_count: 1,
             ..crate::AgentSubagents::default()
         },
         ..AgentConfig::default()

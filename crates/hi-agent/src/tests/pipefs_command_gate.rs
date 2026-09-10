@@ -85,7 +85,7 @@ fn pipefs_controller_blocks_sync_mutation_without_legacy_durability() {
             Some(workspace.path(".hi/agents/reviewer.md")),
         ),
         (
-            crate::Command::Share(String::new()),
+            crate::Command::Export("--share".into()),
             Some(workspace.path(".hi/shares")),
         ),
         (crate::Command::Trust("off".into()), None),

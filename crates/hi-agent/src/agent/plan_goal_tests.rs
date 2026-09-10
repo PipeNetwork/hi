@@ -54,6 +54,20 @@ fn empty_output_yields_nothing() {
 }
 
 #[test]
+fn planner_output_falls_back_to_line_list_and_drops_kind_prefix() {
+    let plan = parse_planner_output(
+        "KIND: code-change\n\
+         Add the parser module\n\
+         Wire it into main\n",
+    );
+    assert_eq!(plan.kind, Some(crate::GoalKind::CodeChange));
+    assert_eq!(
+        plan.milestones,
+        vec!["Add the parser module", "Wire it into main"]
+    );
+}
+
+#[test]
 fn planner_preserves_objective_tail_past_the_old_boundary() {
     let root = temp_root("huge-objective");
     const OLD_OBJECTIVE_LIMIT: usize = 32 * 1024;

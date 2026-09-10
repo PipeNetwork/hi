@@ -76,6 +76,8 @@ impl ConfirmationRequest {
                 let destructive = diff.lines().filter(|line| line.starts_with('-')).count() > 80;
                 !secretish && !destructive && diff.len() <= 32 * 1024
             }
+            // Shell mutations — including destructive git checkout/restore/reset/clean —
+            // are never auto-safe. Always/yolo still confirm via the usual ladder.
             Self::ShellMutation { .. }
             | Self::DelegateApply { .. }
             | Self::AskUser { .. }
@@ -86,9 +88,14 @@ impl ConfirmationRequest {
     pub fn details(&self) -> String {
         match self {
             Self::FileEdit { path, diff } => format!("file: {path}\n\n{diff}"),
-            Self::ShellMutation { command, cwd } => format!(
-                "working directory: {cwd}\nwarning: this command is likely to mutate the workspace\n\n$ {command}"
-            ),
+            Self::ShellMutation { command, cwd } => {
+                let warning = if crate::steering::is_destructive_git_restore(command) {
+                    "warning: this git command discards worktree files (checkout -- / restore / reset --hard / clean -f). Auto mode will not run it."
+                } else {
+                    "warning: this command is likely to mutate the workspace"
+                };
+                format!("working directory: {cwd}\n{warning}\n\n$ {command}")
+            }
             Self::DelegateApply { summary, diff } => format!("{summary}\n\n{diff}"),
             Self::AskUser { question, options } => {
                 if options.is_empty() {

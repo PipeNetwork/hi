@@ -25,12 +25,8 @@ impl App {
             crate::block_viewer::render(frame, area, self);
             return true;
         }
-        if let Some(picker) = &self.jump_picker {
-            crate::session_pickers::render_jump(frame, area, picker);
-            return true;
-        }
-        if let Some(picker) = &self.rewind_picker {
-            crate::session_pickers::render_rewind(frame, area, picker);
+        if let Some(picker) = &self.turn_picker {
+            crate::session_pickers::render_turn_picker(frame, area, picker);
             return true;
         }
         if let Some(browser) = &self.memory_browser {
@@ -45,11 +41,10 @@ impl App {
             overlay.render(frame, area);
             return true;
         }
-        // Full-screen diff review overlay (Ctrl-G): takes over the whole screen
-        // with a scrollable, syntax-colored diff and hunk navigation. Rendered
-        // before the normal layout and returned early so it's truly modal.
-        if self.mode.is_review() {
-            self.render_review(frame, area);
+        // Exclusive overlay (narrow terminals). Wide terminals dock a pane in
+        // the main layout instead so the composer stays usable.
+        if self.review_is_overlay() {
+            self.render_review_overlay(frame, area);
             return true;
         }
         false

@@ -51,25 +51,34 @@ async fn exhausted_edit_case(
     cfg.memory.suggest_next_prompt = true;
     cfg.memory.finalize = true;
     let current_check_failed = verification_cap_spent && final_state == "still-broken";
+    // Invalid tool JSON is format steering: consecutive retries, then a
+    // reserved Auto implementation text-tool fallback, then settlement.
+    // One error used to end the turn because it shared the recovery budget.
+    let protocol_exhaustion = || {
+        (0..crate::MAX_TOOL_PROTOCOL_RETRIES)
+            .map(|_| ProviderStep::Error(ProviderErrorKind::ToolProtocol))
+    };
     let steps = if verification_cap_spent {
-        vec![
+        let mut steps = vec![
             ProviderStep::Completion(edit_state("baseline", "broken")),
             ProviderStep::Completion(bash_completion("python3 -c 'assert 2 + 2 == 4'")),
             ProviderStep::Completion(completion(vec![Content::Text("Updated state.rs with the requested implementation and checked the edited source. The source is ready for the configured verification stage.".into())], 1, 1)),
             ProviderStep::Completion(edit_state("broken", final_state)),
-            if current_check_failed {
-                ProviderStep::Completion(bash_completion(command))
-            } else {
-                ProviderStep::Error(ProviderErrorKind::ToolProtocol)
-            },
-        ]
+        ];
+        if current_check_failed {
+            steps.push(ProviderStep::Completion(bash_completion(command)));
+        } else {
+            steps.extend(protocol_exhaustion());
+        }
+        steps
     } else {
-        vec![
+        let mut steps = vec![
             ProviderStep::Completion(edit_state("baseline", "broken")),
             ProviderStep::Completion(bash_completion(command)),
             ProviderStep::Completion(edit_state("broken", final_state)),
-            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
-        ]
+        ];
+        steps.extend(protocol_exhaustion());
+        steps
     };
     let (mut subject, requests) = scripted_agent(steps, cfg);
     let mut ui = RecUi::default();
@@ -80,10 +89,17 @@ async fn exhausted_edit_case(
         )
         .await
         .unwrap();
+    let protocol_sends = crate::MAX_TOOL_PROTOCOL_RETRIES as usize;
     assert_eq!(
         requests.lock().unwrap().len(),
-        if verification_cap_spent { 5 } else { 4 },
-        "no model request after exhaustion"
+        if current_check_failed {
+            5
+        } else if verification_cap_spent {
+            4 + protocol_sends
+        } else {
+            3 + protocol_sends
+        },
+        "no model request after protocol and recovery exhaustion"
     );
     assert_eq!(
         std::fs::read_to_string(workspace.path("state.rs"))
@@ -94,12 +110,26 @@ async fn exhausted_edit_case(
     assert!(subject.task_recovery().exhausted);
     assert_eq!(subject.task_recovery().remaining, 0);
     assert_eq!(subject.task_recovery().interventions, 1);
-    assert_eq!(
-        outcome.status,
-        TurnStatus::Failed,
-        "a passing check alone does not complete the request"
-    );
-    assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
+    if current_check_failed {
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
+    } else if verification_enabled && !verification_cap_spent && final_state == "fixed" {
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        assert_ne!(
+            outcome.stop_reason,
+            TurnStopReason::NoProgress,
+            "protocol after retained edits is leftover, not a failed stall"
+        );
+    } else if verification_enabled && final_state == "still-broken" {
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        assert_eq!(outcome.stop_reason, TurnStopReason::VerificationFailed);
+    } else {
+        assert_ne!(
+            outcome.stop_reason,
+            TurnStopReason::NoProgress,
+            "protocol after mutations must not be no_progress: {outcome:?}"
+        );
+    }
     assert_eq!(
         subject.last_turn_telemetry().verify_rounds,
         u32::from(verification_enabled)
@@ -118,7 +148,16 @@ async fn exhausted_edit_case(
                 outcome.verified_workspace_revision.as_deref(),
                 Some(subject.runtime.ledger().workspace_revision().as_str())
             );
-            assert!(ui.assistant.contains("Final verification passed"));
+            assert!(
+                ui.assistant.contains("Final verification passed")
+                    || ui
+                        .statuses
+                        .iter()
+                        .any(|status| status.to_ascii_lowercase().contains("verification passed")),
+                "terminal check must still run: assistant={} statuses={:?}",
+                ui.assistant,
+                ui.statuses
+            );
             assert!(!ui.assistant.contains("current::broken"));
         }
         (_, "still-broken") => {

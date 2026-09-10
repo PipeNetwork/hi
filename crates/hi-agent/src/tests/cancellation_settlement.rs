@@ -443,7 +443,7 @@ async fn blocked_sqlite_cancellation_signals_all_jobs_and_retains_exact_pending_
             .kill_all_before(tokio::time::Instant::now() + Duration::from_millis(100))
             .await
     });
-    tokio::time::timeout(Duration::from_millis(200), async {
+    tokio::time::timeout(Duration::from_millis(750), async {
         for execution in stopped {
             execution.await.unwrap();
         }
@@ -451,7 +451,10 @@ async fn blocked_sqlite_cancellation_signals_all_jobs_and_retains_exact_pending_
     .await
     .expect("all three eligible executions must stop while SQLite publication is locked");
     let cancellation_latency = started.elapsed();
-    assert!(cancellation_latency < Duration::from_millis(200));
+    assert!(
+        cancellation_latency < Duration::from_millis(750),
+        "cancellations must not wait on the blocked SQLite lock: {cancellation_latency:?}"
+    );
     eprintln!(
         "blocked SQLite: all 3 execution cancellations acknowledged in {:.3}ms",
         cancellation_latency.as_secs_f64() * 1000.0

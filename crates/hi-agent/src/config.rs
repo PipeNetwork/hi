@@ -786,6 +786,8 @@ pub struct AgentSubagents {
     pub planner_model: Option<String>,
     /// Model id used by the `/goal team` skeptic gate.
     pub skeptic_model: Option<String>,
+    /// Independent reviewers in the `/goal team` panel (grok N=3). Clamped 1..=5.
+    pub skeptic_count: u8,
     /// Optional OpenAI-compatible base URL for the skeptic review call only.
     pub skeptic_endpoint: Option<String>,
     /// API key sent to `skeptic_endpoint`.
@@ -828,6 +830,7 @@ impl Default for AgentSubagents {
             long_horizon: false,
             planner_model: None,
             skeptic_model: None,
+            skeptic_count: 3,
             skeptic_endpoint: None,
             skeptic_endpoint_key: None,
             delegate_model: None,

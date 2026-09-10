@@ -4,6 +4,45 @@
 
 use super::intent::contains_any;
 use super::types::{EvidenceTracker, ReviewIntent};
+/// After repeated inspection, tell the model to execute the *actual* next
+/// plan step. Grok-build's TodoGate names the remaining work; it does not
+/// demand `apply_patch` while the active step is still "orient / read".
+pub(crate) fn reread_action_nudge(paths: &str, plan_step: Option<&str>) -> String {
+    let Some(step) = plan_step else {
+        return format!(
+            "You already inspected these files: {paths}. Their contents are in the conversation above — do not re-read them. \
+You have enough context to make progress. Edit one of the inspected files now with write/edit/multi_edit/apply_patch. \
+If the task is already complete, stop and give your final recap."
+        );
+    };
+    if plan_step_is_inspection(step) {
+        format!(
+            "You already inspected these files: {paths}. Their contents are in the conversation above — do not re-read them. \
+Your plan's next step is: \"{step}\". Mark that step done in update_plan and continue with the next remaining step. \
+If the next step is a code change, edit with write/edit/multi_edit/apply_patch. Do not re-read these files."
+        )
+    } else {
+        format!(
+            "You already inspected these files: {paths}. Their contents are in the conversation above — do not re-read them. \
+Your plan's next step is: \"{step}\". Execute it now with write/edit/multi_edit/apply_patch. \
+Do not read more files first — you have enough context. Act on the next plan step immediately."
+        )
+    }
+}
+
+fn plan_step_is_inspection(step: &str) -> bool {
+    let lower = step.to_ascii_lowercase();
+    let inspection = [
+        "orient", "read ", "inspect", "identify", "survey", "look at", "explore",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    let mutation = ["fix", "edit", "implement", "write", "patch", "change"]
+        .iter()
+        .any(|cue| lower.contains(cue));
+    inspection && !mutation
+}
+
 pub(crate) fn implementation_text_tool_nudge(reason: &str) -> String {
     format!(
         "{reason}\n\nThe next request will describe the plain-text call format from its sealed tool envelope."
@@ -195,5 +234,17 @@ mod tests {
         ] {
             assert!(!answer_declines_mutation(unsupported), "{unsupported:?}");
         }
+    }
+
+    #[test]
+    fn reread_nudge_does_not_demand_a_patch_during_orientation() {
+        let orient = reread_action_nudge("src/a.rs", Some("Orient and read core source files"));
+        assert!(orient.contains("Mark that step done"), "{orient}");
+        assert!(
+            !orient.contains("Execute it now with write/edit"),
+            "{orient}"
+        );
+        let fix = reread_action_nudge("src/a.rs", Some("Fix identified issues"));
+        assert!(fix.contains("Execute it now with write/edit"), "{fix}");
     }
 }

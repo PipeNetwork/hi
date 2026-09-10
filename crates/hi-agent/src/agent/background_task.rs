@@ -220,6 +220,7 @@ impl crate::Agent {
         // The future factory is `Send` (a closure), but the future it produces
         // does NOT need to be `Send` — it runs on a worker thread's `LocalSet`.
         let prompt_for_factory = prompt.clone();
+        let mailbox = self.subagent_mailbox.clone();
         let factory: Box<dyn FnOnce() -> hi_tools::BgFuture + Send + 'static> =
             Box::new(move || {
                 Box::pin(async move {
@@ -232,6 +233,7 @@ impl crate::Agent {
                     if let Some(s) = &sink {
                         s.progress(&id, "running", None);
                     }
+                    let prompt_for_mailbox = prompt_for_factory.clone();
                     let result = match candidate_run {
                         Some(plan) => {
                             plan.run(
@@ -239,6 +241,7 @@ impl crate::Agent {
                                 prompt_for_factory,
                                 candidate_registry,
                                 child_teardown,
+                                mailbox.clone(),
                                 &mut child_ui,
                             )
                             .await
@@ -253,11 +256,19 @@ impl crate::Agent {
                                 kind,
                                 prompt_for_factory,
                                 child_teardown,
+                                mailbox.clone(),
+                                id.clone(),
                                 &mut child_ui,
                             )
                             .await
                         }
                     };
+                    mailbox.mark_finished(
+                        &id,
+                        kind.as_str().to_string(),
+                        prompt_for_mailbox,
+                        result.output.clone(),
+                    );
                     if let Some(s) = &sink {
                         let status = match result.state {
                             hi_tools::BackgroundTaskState::Completed => "completed",
@@ -415,11 +426,26 @@ impl crate::Agent {
             .unwrap_or(30_000);
         let timeout = Duration::from_millis(timeout_ms).min(hi_tools::MAX_WAIT_TIMEOUT);
 
-        let results = if mode == "wait_any" {
-            self.bg_tasks.wait_any(&ids, timeout).await
-        } else {
-            self.bg_tasks.wait_all(&ids, timeout).await
+        if self.interjections.has_pending() {
+            let results = self.bg_tasks.poll_many(&ids, Duration::ZERO).await;
+            return interrupted_wait_outcome(&results);
+        }
+        let wait = async {
+            if mode == "wait_any" {
+                self.bg_tasks.wait_any(&ids, timeout).await
+            } else {
+                self.bg_tasks.wait_all(&ids, timeout).await
+            }
         };
+        let results = tokio::select! {
+            results = wait => results,
+            _ = self.interjections.wait_pending() => {
+                self.bg_tasks.poll_many(&ids, Duration::ZERO).await
+            }
+        };
+        if self.interjections.has_pending() {
+            return interrupted_wait_outcome(&results);
+        }
 
         for result in &results {
             self.register_job_resource(result);
@@ -563,6 +589,14 @@ impl crate::Agent {
 }
 
 /// Format task results for the model-facing tool output.
+fn interrupted_wait_outcome(results: &[hi_tools::BackgroundTaskOutcome]) -> hi_tools::ToolOutcome {
+    let mut content = String::from(
+        "wait_tasks interrupted: a user follow-up arrived. Remaining tasks are still running.\n",
+    );
+    content.push_str(&format_task_results(results));
+    bg_tool_outcome(content, hi_tools::ToolStatus::Succeeded)
+}
+
 fn format_task_results(results: &[hi_tools::BackgroundTaskOutcome]) -> String {
     if results.is_empty() {
         return "No tasks found.".to_string();
@@ -621,6 +655,8 @@ async fn run_bg_readonly(
     kind: BgTaskKind,
     prompt: String,
     teardown: hi_tools::BackgroundTaskTeardown,
+    mailbox: crate::agent::subagent_mailbox::SubagentMailbox,
+    task_id: String,
     ui: &mut dyn Ui,
 ) -> hi_tools::BackgroundTaskOutcome {
     let kind_label = kind.as_str();
@@ -641,6 +677,7 @@ async fn run_bg_readonly(
         }
     };
     child.set_provider_capability_registry(capability_registry);
+    mailbox.register_running(&task_id, child.interjection_inbox());
 
     let mut child = super::child_process_teardown::ReapingChild::new(child, Some(teardown));
     let result = child.child_mut().run_turn(&child_prompt, ui).await;

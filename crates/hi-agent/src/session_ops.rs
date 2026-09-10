@@ -264,7 +264,6 @@ fn handle_session_command_inner(
         });
     }
     let message = match command {
-        Command::ViewPlan => format_plan(agent.current_plan()),
         Command::Plan(arg) => {
             let arg = arg.trim();
             match arg {
@@ -434,27 +433,7 @@ fn handle_session_command_inner(
             }
         }
         Command::Permissions(arg) => apply_permissions(agent, arg),
-        Command::AlwaysApprove(arg) => {
-            let a = arg.trim();
-            if a.is_empty() || a == "on" {
-                apply_permissions(agent, "always")
-            } else if a == "off" {
-                apply_permissions(agent, "ask")
-            } else {
-                apply_permissions(agent, a)
-            }
-        }
-        Command::Auto(arg) => {
-            let a = arg.trim();
-            if a.is_empty() || a == "on" {
-                apply_permissions(agent, "auto")
-            } else if a == "off" {
-                apply_permissions(agent, "ask")
-            } else {
-                apply_permissions(agent, a)
-            }
-        }
-        Command::Queue(_) | Command::Tasks(_) => {
+        Command::Queue(_) => {
             let extras: Vec<String> = frontend_queue
                 .iter()
                 .map(|s| collapse_preview(s, 80))
@@ -468,7 +447,6 @@ fn handle_session_command_inner(
                 &extras,
             )
         }
-        Command::Plugins(_) => plugins_and_hooks_report(agent.workspace_root()),
         Command::Remember(arg) => {
             let (global, text) = parse_remember_args(arg);
             match remember_note(agent.workspace_root(), &text, global) {
@@ -510,9 +488,9 @@ fn handle_session_command_inner(
         }
         Command::Engine(arg) => agent.engine_command(arg),
         Command::Agents(arg) => agents_report(agent.workspace_root(), arg),
-        Command::Share(arg) => share_report(agent, arg),
-        Command::McpAdmin(arg) => mcp_admin_report(arg),
-        Command::RewindPicker => format_user_turns(&list_user_turns(agent.messages()), 60),
+        Command::Export(arg) if crate::command::is_share_export(arg) => {
+            share_report(agent, crate::command::share_export_arg(arg))
+        }
         Command::Cd(arg) => {
             let arg = arg.trim();
             if arg.is_empty() {
@@ -544,22 +522,6 @@ fn handle_session_command_inner(
                 }
             }
         }
-        Command::Rename(arg) => format!(
-            "session rename requested: {}\n(use /sessions rename <id> <name> in the current frontend)",
-            if arg.trim().is_empty() {
-                "<name>"
-            } else {
-                arg.trim()
-            }
-        ),
-        Command::Resume(arg) => format!(
-            "resume requested: {}\n(use /sessions switch <id> or `hi --resume <id>`)",
-            if arg.trim().is_empty() {
-                "list sessions with /sessions"
-            } else {
-                arg.trim()
-            }
-        ),
         Command::ScreenMode(_)
         | Command::VimMode(_)
         | Command::Multiline(_)
@@ -584,7 +546,7 @@ fn handle_session_command_inner(
             };
         }
         Command::Find(arg) => search_messages(agent.messages(), arg),
-        Command::Jump(arg) | Command::History(arg) => {
+        Command::Jump(arg) => {
             let arg = arg.trim();
             if arg.is_empty() {
                 format_user_turns(&list_user_turns(agent.messages()), 40)
@@ -639,7 +601,7 @@ fn session_command_mutates_workspace(command: &Command) -> bool {
         }
         // `/share` always materializes a local bundle before optionally
         // printing a portal URL.
-        Command::Share(_) => true,
+        Command::Export(arg) if crate::command::is_share_export(arg) => true,
         // `/cd` saves a dashboard cwd hint below `.hi/`.
         Command::Cd(arg) => !arg.trim().is_empty(),
         // A portable restore starts untrusted.  Do not let a command grant a
@@ -709,7 +671,7 @@ fn session_command_execution_disposition(
         Command::Agents(arg) if arg.trim_start().starts_with("remove ") => {
             message.starts_with("removed ")
         }
-        Command::Share(_) => {
+        Command::Export(arg) if crate::command::is_share_export(arg) => {
             message.starts_with("share bundle:") || message.starts_with("{\"path\":")
         }
         Command::Cd(_) => message.starts_with("dashboard workspace "),
@@ -737,7 +699,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Worktree(_) => "worktree",
         Command::Inspect(_) => "inspect bundle",
         Command::Agents(_) => "agents",
-        Command::Share(_) => "share",
+        Command::Export(_) => "share",
         Command::Cd(_) => "cd",
         Command::Trust(_) => "trust",
         _ => "command",
@@ -1528,17 +1490,6 @@ pub fn share_report(agent: &crate::Agent, arg: &str) -> String {
         serde_json::json!({"path": path, "portal_base": portal}).to_string()
     } else {
         out
-    }
-}
-
-pub fn mcp_admin_report(arg: &str) -> String {
-    match arg.trim() {
-        "" | "list" | "status" => "MCP admin:\n  workspace servers: /mcp\n  provider mcp_url: /mcp pipe\n  /mcp add <name> --stdio … | --http <url>\n  /mcp <name> allow|deny <tool>\n  /doctor probes provider MCP\n  import gating: [mcp_import] in hi.toml\n  per-server lists: [mcp.servers.<name>] in hi.toml or only/exclude in .hi/mcp/<name>.json\n".into(),
-        "doctor" => "use /doctor (includes MCP connectivity/tools probe)".into(),
-        other if other.starts_with("add ") || other.starts_with("remove ") => {
-            "use /mcp add <name> --stdio … | --http <url> (writes .hi/mcp/<name>.json)".into()
-        }
-        _ => "usage: /mcp-admin [list|doctor|add|remove]".into(),
     }
 }
 

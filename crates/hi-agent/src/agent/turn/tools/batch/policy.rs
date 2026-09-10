@@ -611,6 +611,7 @@ mod workspace_policy_tests {
             result_chars: 0,
             truncated: false,
             kind: "process".into(),
+            model: String::new(),
         }
     }
 

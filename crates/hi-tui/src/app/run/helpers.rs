@@ -70,6 +70,7 @@ pub(crate) fn handle_normal_mode(app: &mut App, key: &KeyEvent) {
         KeyCode::Char('i') | KeyCode::Char('q') | KeyCode::Esc => {
             app.mode.to_insert();
         }
+        KeyCode::Char(' ') => app.focus_prompt(),
         // Scroll one line.
         KeyCode::Char('j') | KeyCode::Down => app.scroll_down(1),
         KeyCode::Char('k') | KeyCode::Up => app.scroll_up(1),
@@ -178,22 +179,20 @@ pub(super) fn run_chord_pipeline(app: &mut App, key: &KeyEvent) -> Option<ChordP
             }
         });
     }
-    if app.jump_picker.is_some() {
-        crate::session_pickers::handle_jump_key(app, key);
-        return Some(ChordPipeline::Continue);
-    }
-    if app.rewind_picker.is_some() {
-        return Some(match crate::session_pickers::handle_rewind_key(app, key) {
-            crate::session_pickers::PickerOutcome::Continue => ChordPipeline::Continue,
-            crate::session_pickers::PickerOutcome::Close => {
-                app.rewind_picker = None;
-                ChordPipeline::Continue
-            }
-            crate::session_pickers::PickerOutcome::Rewind(n) => {
-                app.rewind_picker = None;
-                ChordPipeline::PaletteAccept(format!("/rewind {n}"))
-            }
-        });
+    if app.turn_picker.is_some() {
+        return Some(
+            match crate::session_pickers::handle_turn_picker_key(app, key) {
+                crate::session_pickers::PickerOutcome::Continue => ChordPipeline::Continue,
+                crate::session_pickers::PickerOutcome::Close => {
+                    app.turn_picker = None;
+                    ChordPipeline::Continue
+                }
+                crate::session_pickers::PickerOutcome::Rewind(n) => {
+                    app.turn_picker = None;
+                    ChordPipeline::PaletteAccept(format!("/rewind {n}"))
+                }
+            },
+        );
     }
     if app.memory_browser.is_some() {
         crate::memory_browser::handle_key(app, key);
@@ -293,26 +292,32 @@ pub(crate) fn search_transcript(app: &mut App, query: &str, dir: i32) {
     }
 }
 
-/// Find the line index of the next (dir=1) or previous (dir=-1) `@@` hunk
-/// header in `diff`, starting the search from `from`. Used by the full-screen
-/// diff review overlay's n/p navigation. Clamps to the diff bounds; returns
-/// `from` unchanged if there's no hunk in the requested direction.
+/// Find the painted line index of the next (dir=1) or previous (dir=-1) hunk
+/// in `diff`. Hunks are grok-build inline rows separated by `…` gaps, not raw
+/// `@@` headers. Clamps to the painted bounds; returns `from` unchanged if
+/// there's no hunk in the requested direction.
 pub(crate) fn review_next_hunk(diff: Option<&str>, from: usize, dir: i32) -> usize {
     let Some(diff) = diff else { return from };
-    let lines: Vec<&str> = diff.lines().collect();
+    let lines = crate::render::diff_lines(diff);
     if lines.is_empty() {
         return from;
     }
+    let starts = crate::render::hunk_start_indices(&lines);
+    if starts.is_empty() {
+        return from.min(lines.len().saturating_sub(1));
+    }
     if dir > 0 {
-        // Next hunk: first `@@` line strictly after `from`.
-        (from + 1..lines.len())
-            .find(|&i| lines[i].starts_with("@@"))
+        starts
+            .iter()
+            .copied()
+            .find(|&i| i > from)
             .unwrap_or(lines.len().saturating_sub(1))
     } else {
-        // Previous hunk: last `@@` line strictly before `from`.
-        (0..from.min(lines.len()))
+        starts
+            .iter()
+            .copied()
             .rev()
-            .find(|&i| lines[i].starts_with("@@"))
+            .find(|&i| i < from)
             .unwrap_or(0)
     }
 }

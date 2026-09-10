@@ -13,19 +13,43 @@
 //! touches `Agent` state directly — so it lives outside the main `lib.rs`.
 
 mod constants;
+mod goal_kind;
 mod implementation;
 mod intent;
+mod laziness;
 mod nudges;
 mod preflight;
 mod review_repair;
+mod routine_git;
+mod settlement;
+mod stationarity;
+mod stop_detector;
+mod todo_gate;
 mod tool_guardrail;
 mod types;
 
 pub(crate) use constants::*;
+pub use goal_kind::GoalKind;
+pub use implementation::is_destructive_git_restore;
 pub(crate) use implementation::*;
 pub(crate) use intent::*;
+pub(crate) use laziness::{
+    ClassifierOutput, LazinessCategory, LazinessConfig, LazinessDecision, NoNudgeReason,
+    build_laziness_nudge, claim_evidence_category, evaluate_laziness,
+};
 pub(crate) use nudges::*;
 pub(crate) use preflight::*;
 pub(crate) use review_repair::*;
+pub use routine_git::{git_command_is_routine, git_command_is_routine_in};
+#[cfg(test)]
+pub(crate) use settlement::forced_final_answer_is_unusable;
+pub(crate) use settlement::no_progress_forced_final_is_unusable;
+pub(crate) use stationarity::{
+    IdenticalToolCallRun, MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS, STATIONARITY_NUDGE,
+};
+pub(crate) use stop_detector::{BAIL_CONTINUE_NUDGE, matched_bail_out};
+pub(crate) use todo_gate::{
+    TodoGateDecision, TodoGateReason, evaluate_todo_gate, todo_gate_input_from_plan,
+};
 pub(crate) use tool_guardrail::*;
 pub(crate) use types::*;

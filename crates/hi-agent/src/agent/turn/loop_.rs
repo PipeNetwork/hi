@@ -18,10 +18,10 @@ use crate::domain::TurnControlFlags;
 use crate::domain::VerifyEvidence;
 use crate::heuristics::{looks_like_continue, looks_like_new_task, tool_mode_label};
 use crate::steering::{
-    EvidenceTracker, IMPLEMENTATION_EMPTY_TUI_NUDGE, ImplementationIntent, ImplementationTracker,
-    classify_implementation_intent, classify_read_only_intent, implementation_mentions_tui,
-    implementation_turn_prompt, implicit_read_only_review_intent, is_bounded_file_review,
-    preflight_is_redundant_for_prompt, read_only_turn_prompt,
+    EvidenceTracker, GoalKind, IMPLEMENTATION_EMPTY_TUI_NUDGE, ImplementationIntent,
+    ImplementationTracker, classify_implementation_intent, classify_read_only_intent,
+    implementation_mentions_tui, implementation_turn_prompt, implicit_read_only_review_intent,
+    is_bounded_file_review, preflight_is_redundant_for_prompt, read_only_turn_prompt,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::{Snapshot, WorkspaceRepairVerifier, is_internal_runtime_artifact_path};
@@ -252,6 +252,15 @@ impl crate::Agent {
             && !tool_free_response
             && read_only_intent.is_none()
             && task_contract.wants_tests;
+        let goal_kind = if goal_drive_turn {
+            self.goals
+                .structured
+                .as_ref()
+                .map(|goal| goal.kind)
+                .unwrap_or_else(|| GoalKind::derive(&context_task, expected_mutation))
+        } else {
+            GoalKind::derive(&context_task, expected_mutation)
+        };
         let turn_input = if planning_turn {
             crate::plan_mode_prompt(&context_task)
         } else if let Some(intent) = read_only_intent {
@@ -658,6 +667,7 @@ impl crate::Agent {
             read_only_intent,
             implementation_intent,
             expected_mutation,
+            goal_kind,
             requested_validation,
             turn_input: input.to_string(),
             turn_checkpoint_allowed,
@@ -808,9 +818,17 @@ impl crate::Agent {
                 // boundary instead of letting it truncate with a stale index.
                 self.workspace.set_message_start(turn.turn_start);
                 let model_control = match model_result {
-                    Err(error) if turn.flags.made_tool_call
-                        && hi_ai::provider_error_details(&error).is_some() => {
-                        self.retain_terminal_provider_error(error, &mut turn, ui).await?;
+                    Err(error)
+                        if turn.flags.made_tool_call
+                            && hi_ai::provider_error_details(&error).is_some() =>
+                    {
+                        if super::terminal_verification::tool_protocol_allowance_exhausted(&error) {
+                            break self
+                                .settle_invalid_tool_budget(error, &mut turn, ui)
+                                .await?;
+                        }
+                        self.retain_terminal_provider_error(error, &mut turn, ui)
+                            .await?;
                         break super::ModelLoopDecision::VerifyAfterRecoveryExhaustion;
                     }
                     result => result?,
@@ -951,7 +969,7 @@ impl crate::Agent {
                 self.set_turn_phase(TurnPhase::WorkspaceRepair);
                 ui.semantic_event(hi_events::RunEvent::new(
                     hi_events::EventKind::VerificationStarted,
-                    hi_events::EventContext::default(),
+                    self.event_context(),
                     hi_events::SemanticActivity {
                         verb: hi_events::ActivityVerb::Verify,
                         object: hi_events::ActivityObject::Verification,
@@ -1020,7 +1038,7 @@ impl crate::Agent {
                 };
                 ui.semantic_event(hi_events::RunEvent::new(
                     hi_events::EventKind::VerificationCompleted,
-                    hi_events::EventContext::default(),
+                    self.event_context(),
                     hi_events::SemanticActivity {
                         verb: verification_verb,
                         object: hi_events::ActivityObject::Verification,
@@ -1248,6 +1266,7 @@ impl crate::Agent {
             &turn.evidence,
             &self.prefix_stability,
         );
+        self.report.last_turn_telemetry.attach_model(&self.config.routing.model);
         self.report.last_turn_telemetry.model_requests = model_telemetry.model_requests;
         self.report.last_turn_telemetry.accepted_completions = model_telemetry.accepted_completions;
         self.report.last_turn_telemetry.last_stop_reason = model_telemetry.last_stop_reason;
@@ -1599,9 +1618,19 @@ impl crate::Agent {
             // the same unavailable provider indefinitely.
             status = TurnStatus::Failed;
             classified_stop_reason = TurnStopReason::InfrastructureFailure;
+        } else if no_progress_exhausted
+            && super::terminal_verification::productive_stall_is_leftover(
+                &self.task_recovery,
+                turn_had_mutation,
+                turn.progress_tracker.stationarity_ended,
+            )
+        {
+            self.answer_state = crate::recovery::AnswerState::Deterministic;
         } else if no_progress_exhausted {
             status = TurnStatus::Failed;
             classified_stop_reason = TurnStopReason::NoProgress;
+            // Absorb so a later user/drive turn cannot reopen this stall.
+            self.task_recovery.stop("automatic recovery exhausted");
         }
         let cap_stop_reason = if turn.flags.cap_kind == Some(crate::domain::TurnCapKind::Tool) {
             TurnStopReason::ToolLimit

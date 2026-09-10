@@ -80,7 +80,7 @@ async fn real_user_turn_starts_a_new_allowance_after_exhaustion() {
 }
 
 #[tokio::test]
-async fn alternating_invalid_tool_turns_share_the_task_recovery_allowance() {
+async fn alternating_invalid_tool_turns_hit_the_cumulative_protocol_cap() {
     // A model that alternates a valid tool call with an invalid tool turn keeps
     // resetting the *consecutive* protocol counter (MAX_TOOL_PROTOCOL_RETRIES), so
     // without the cumulative cap the nudge-and-retry loop runs forever (the qtest4
@@ -88,8 +88,10 @@ async fn alternating_invalid_tool_turns_share_the_task_recovery_allowance() {
     // valid calls each round keep the repeat-tool-call guard from firing first, so
     // this isolates the protocol cap; far more pairs than the cap are scripted, so
     // a non-terminating loop would exhaust the script and panic in the provider.
+    // Protocol retries are format steering, not the 3-slot task_recovery budget.
+    let cap = crate::MAX_TOOL_PROTOCOL_FAILURES as usize;
     let mut steps = Vec::new();
-    for i in 0..16 {
+    for i in 0..(cap + 8) {
         steps.push(ProviderStep::Completion(bash_completion(&format!(
             "echo {i}"
         ))));
@@ -101,18 +103,39 @@ async fn alternating_invalid_tool_turns_share_the_task_recovery_allowance() {
     let outcome = agent.run_turn("go", &mut ui).await.unwrap();
     assert_eq!(outcome.status, TurnStatus::Failed);
     assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
-    assert!(agent.task_recovery().exhausted);
+    assert_eq!(
+        agent.task_recovery().interventions,
+        0,
+        "malformed tool JSON must not spend recovery interventions: {:?}",
+        agent.task_recovery().last_reason
+    );
+    let sent = requests.lock().unwrap().len();
+    // The retry branch Continues while `protocol_failures_total < cap`, so the
+    // cap-th invalid turn still retries. The next pair trips settlement.
     assert!(
-        requests.lock().unwrap().len() < 16,
-        "alternating successes must not buy unlimited corrections"
+        sent <= 2 * (cap + 2),
+        "alternating successes must not buy unlimited corrections: {sent} sends"
+    );
+    assert!(
+        sent >= 2 * cap,
+        "the cumulative cap should be spent before ending: {sent} sends"
     );
 
     assert!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("automatic recovery exhausted")),
-        "the shared allowance should end alternating invalid turns: {:?}",
+            .any(|s| s.contains("invalid tool turns exhausted")),
+        "the cumulative protocol cap should end alternating invalid turns: {:?}",
         ui.statuses
+    );
+    assert!(
+        agent
+            .task_recovery()
+            .last_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("invalid tool turns exhausted")),
+        "{:?}",
+        agent.task_recovery().last_reason
     );
 }
 

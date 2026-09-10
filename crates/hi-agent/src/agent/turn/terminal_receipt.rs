@@ -3,8 +3,7 @@
 use crate::{TurnFailure, TurnOutcome, TurnStatus, TurnStopReason};
 use anyhow::Result;
 use hi_events::{
-    ActivityObject, ActivityState, ActivityVerb, EventContext, EventKind, RunEvent,
-    SemanticActivity,
+    ActivityObject, ActivityState, ActivityVerb, EventKind, RunEvent, SemanticActivity,
 };
 
 impl crate::Agent {
@@ -161,7 +160,7 @@ impl crate::Agent {
         };
         let mut run_event = RunEvent::new(
             event_kind,
-            EventContext::default(),
+            self.event_context(),
             SemanticActivity {
                 verb,
                 object: ActivityObject::Run,
@@ -179,7 +178,7 @@ impl crate::Agent {
             if !outcome.changed_files.is_empty() {
                 ui.semantic_event(hi_events::RunEvent::new(
                     hi_events::EventKind::GitChanged,
-                    hi_events::EventContext::default(),
+                    self.event_context(),
                     hi_events::SemanticActivity {
                         verb: hi_events::ActivityVerb::Change,
                         object: hi_events::ActivityObject::Git,

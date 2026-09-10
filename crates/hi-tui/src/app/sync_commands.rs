@@ -386,11 +386,28 @@ impl crate::App {
                 self.steering_remote_session = None;
                 self.switch_session(agent, session_id).await;
             }
+            value if value == "rename-current" || value.starts_with("rename-current ") => {
+                let name = value.strip_prefix("rename-current").unwrap_or("").trim();
+                if name.is_empty() {
+                    self.push(Line::styled("usage: /rename <name>", dim()));
+                    self.follow();
+                    return;
+                }
+                let Some(session_id) = self.sync_session_id.clone() else {
+                    self.push(Line::styled(
+                        "no current session id — /sessions rename <id> <name>",
+                        dim(),
+                    ));
+                    self.follow();
+                    return;
+                };
+                self.rename_session(&session_id, name).await;
+            }
             value if value == "rename" || value.starts_with("rename ") => {
                 let rest = value.strip_prefix("rename").unwrap_or("").trim();
                 let Some((session_id, name)) = rest.split_once(char::is_whitespace) else {
                     self.push(Line::styled(
-                        "usage: /sessions rename <session-id> <name>",
+                        "usage: /sessions rename <session-id> <name> (or /rename <name>)",
                         dim(),
                     ));
                     self.follow();

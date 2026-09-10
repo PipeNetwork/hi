@@ -118,16 +118,11 @@ pub(crate) fn handle_command(
         // `/doctor` needs async settings/MCP probes; handled inline by REPL/TUI.
         Command::Doctor => {}
         Command::Plan(_)
-        | Command::ViewPlan
         | Command::Memory
         | Command::Fork(_)
         | Command::Rewind(_)
         | Command::Permissions(_)
-        | Command::AlwaysApprove(_)
-        | Command::Auto(_)
         | Command::Queue(_)
-        | Command::Tasks(_)
-        | Command::Plugins(_)
         | Command::Remember(_)
         | Command::UndoMemory
         | Command::ImportClaude(_)
@@ -136,16 +131,12 @@ pub(crate) fn handle_command(
         | Command::SynthEvals
         | Command::Find(_)
         | Command::Jump(_)
-        | Command::History(_)
         | Command::Hooks(_)
         | Command::Trust(_)
         | Command::Marketplace(_)
         | Command::Worktree(_)
         | Command::Inspect(_)
         | Command::Agents(_)
-        | Command::Share(_)
-        | Command::McpAdmin(_)
-        | Command::RewindPicker
         | Command::ScreenMode(_)
         | Command::VimMode(_)
         | Command::Multiline(_)
@@ -162,30 +153,6 @@ pub(crate) fn handle_command(
                         "\x1b[2m(the follow-up turn runs automatically in the REPL/TUI; paste the request as a normal message here if needed)\x1b[0m"
                     );
                 }
-            }
-        }
-        Command::Rename(arg) => {
-            let id = crate::session::local_sessions()
-                .into_iter()
-                .next()
-                .map(|s| s.id);
-            match id {
-                Some(id) if !arg.trim().is_empty() => {
-                    match crate::session::rename_session(&id, &arg) {
-                        Ok(name) => println!("\x1b[32m✓ session {id} renamed to {name}\x1b[0m"),
-                        Err(error) => eprintln!("\x1b[33mrename failed: {error:#}\x1b[0m"),
-                    }
-                }
-                _ => println!(
-                    "\x1b[2musage: /rename <name> (or /sessions rename <id> <name>)\x1b[0m"
-                ),
-            }
-        }
-        Command::Resume(arg) => {
-            if arg.trim().is_empty() {
-                println!("\x1b[2muse /sessions to choose a session, or /resume <id>\x1b[0m");
-            } else {
-                println!("\x1b[2mresume with: hi --resume {}\x1b[0m", arg.trim());
             }
         }
         Command::Log => {
@@ -759,6 +726,14 @@ pub(crate) fn handle_command(
         Command::Version => {
             println!("hi {}", hi_agent::VERSION);
         }
+        Command::Export(ref arg) if hi_agent::command::is_share_export(arg) => {
+            if let Some(effect) = hi_agent::handle_session_command(agent, &command, &[]) {
+                print!("{}", effect.message);
+                if !effect.message.ends_with('\n') {
+                    println!();
+                }
+            }
+        }
         Command::Export(arg) => {
             if agent.pipefs_workspace_active() {
                 eprintln!(
@@ -784,14 +759,6 @@ pub(crate) fn handle_command(
                 Err(err) => eprintln!("\x1b[33mexport failed: {err}\x1b[0m"),
             }
         }
-        Command::Sync(arg) => match arg.trim() {
-            "status" | "" => {
-                println!("\x1b[2muse /sync in the TUI, or `hi --sync` on the CLI\x1b[0m");
-            }
-            _ => {
-                println!("\x1b[33m/sync is only available in the full-screen TUI\x1b[0m");
-            }
-        },
         Command::Sessions(arg) => match arg.trim() {
             "" => {
                 let sessions = crate::session::local_sessions();
@@ -813,22 +780,51 @@ pub(crate) fn handle_command(
             value if value == "host" || value.starts_with("host ") => {
                 println!("\x1b[33mhosting requires the TUI or `hi --daemon --sync`\x1b[0m");
             }
+            value if value == "switch" || value.starts_with("switch ") => {
+                let id = value.strip_prefix("switch").unwrap_or("").trim();
+                if id.is_empty() {
+                    println!("\x1b[2muse /sessions to choose a session, or /resume <id>\x1b[0m");
+                } else {
+                    println!("\x1b[2mresume with: hi --resume {id}\x1b[0m");
+                }
+            }
+            value if value == "rename-current" || value.starts_with("rename-current ") => {
+                let name = value.strip_prefix("rename-current").unwrap_or("").trim();
+                let id = crate::session::local_sessions()
+                    .into_iter()
+                    .next()
+                    .map(|s| s.id);
+                match id {
+                    Some(id) if !name.is_empty() => {
+                        match crate::session::rename_session(&id, name) {
+                            Ok(name) => println!("\x1b[32m✓ session {id} renamed to {name}\x1b[0m"),
+                            Err(error) => eprintln!("\x1b[33mrename failed: {error:#}\x1b[0m"),
+                        }
+                    }
+                    _ => println!(
+                        "\x1b[2musage: /rename <name> (or /sessions rename <id> <name>)\x1b[0m"
+                    ),
+                }
+            }
+            value if value == "rename" || value.starts_with("rename ") => {
+                let rest = value.strip_prefix("rename").unwrap_or("").trim();
+                let Some((id, name)) = rest.split_once(char::is_whitespace) else {
+                    println!(
+                        "\x1b[2musage: /sessions rename <id> <name> (or /rename <name>)\x1b[0m"
+                    );
+                    return false;
+                };
+                match crate::session::rename_session(id, name.trim()) {
+                    Ok(name) => println!("\x1b[32m✓ session {id} renamed to {name}\x1b[0m"),
+                    Err(error) => eprintln!("\x1b[33mrename failed: {error:#}\x1b[0m"),
+                }
+            }
             _ => {
                 println!(
                     "\x1b[33msession switching and renaming require the TUI (run hi without --plain)\x1b[0m"
                 );
             }
         },
-        Command::Attach(_) => {
-            println!(
-                "\x1b[33m/attach is only available in the full-screen TUI; or run `hi --attach <id>`\x1b[0m"
-            );
-        }
-        Command::Daemon(_) => {
-            println!(
-                "\x1b[33m/daemon is only available in the full-screen TUI; or run `hi --daemon --sync`\x1b[0m"
-            );
-        }
         Command::Unknown(name) => {
             eprintln!("\x1b[33munknown command /{name}; try /help\x1b[0m");
         }
@@ -905,7 +901,7 @@ pub(crate) fn handle_command(
             );
         }
         Command::Inbox(arg) => handle_inbox(agent, approval_store, &arg),
-        Command::Dashboard(arg) => match arg.trim() {
+        Command::Fleet(arg) => match arg.trim() {
             "status" | "sessions" | "ls" => {
                 let sessions = crate::session::fleet_sessions();
                 if sessions.is_empty() {
@@ -1218,35 +1214,24 @@ pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: 
     } else {
         flags.text.as_str()
     };
-    let sub_goals = if let Some(goal) = agent.try_ingest_goal(objective) {
-        match agent.set_structured_goal(Some(goal)) {
-            Ok(true) => {
-                echo_planned_goal(agent, flags.review, flags.unattended);
-                return;
-            }
-            Ok(false) => {
-                echo_transient_goal(agent, objective);
-                return;
-            }
-            Err(err) => {
-                eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m");
-                return;
-            }
-        }
+    let goal = if let Some(ingested) = agent.try_ingest_goal(objective) {
+        ingested
     } else {
         println!("\x1b[2mplanning goal with the planner model…\x1b[0m");
         match agent.decompose_goal(objective).await {
-            Ok(steps) if !steps.is_empty() => steps,
-            Ok(_) => vec![objective.to_string()],
+            Ok(plan) if !plan.milestones.is_empty() => {
+                hi_agent::Goal::from_goal_plan(objective.to_string(), plan)
+            }
+            Ok(_) => hi_agent::Goal::new(objective.to_string(), vec![objective.to_string()]),
             Err(err) => {
                 println!(
                     "\x1b[2mplanner unavailable ({err:#}); using the objective as one step\x1b[0m"
                 );
-                vec![objective.to_string()]
+                hi_agent::Goal::new(objective.to_string(), vec![objective.to_string()])
             }
         }
     };
-    match agent.set_structured_goal(Some(hi_agent::Goal::new(objective.to_string(), sub_goals))) {
+    match agent.set_structured_goal(Some(goal)) {
         Ok(true) => echo_planned_goal(agent, flags.review, flags.unattended),
         Ok(false) => echo_transient_goal(agent, objective),
         Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),

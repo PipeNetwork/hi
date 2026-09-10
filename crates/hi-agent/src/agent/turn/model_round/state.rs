@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashSet};
 use hi_ai::Content;
 
 use crate::steering::{
-    EvidenceTracker, ImplementationIntent, ImplementationTracker, ReviewIntent,
+    EvidenceTracker, GoalKind, ImplementationIntent, ImplementationTracker, ReviewIntent,
     is_read_only_inspection_tool,
 };
 use crate::verify::WorkspaceRepairVerifier;
@@ -148,6 +148,7 @@ pub(in crate::agent::turn) struct ModelRoundState<'a> {
     pub read_only_intent: Option<ReviewIntent>,
     pub implementation_intent: Option<ImplementationIntent>,
     pub expected_mutation: bool,
+    pub goal_kind: GoalKind,
     pub requested_validation: bool,
     pub input: &'a str,
     pub user_prompt_tokens: u64,

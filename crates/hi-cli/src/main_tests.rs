@@ -485,6 +485,7 @@ fn report_tool_records_preserve_typed_evidence() {
         result_chars: 0,
         truncated: true,
         kind: "shell".into(),
+        model: String::new(),
     };
 
     let records = report_tool_records(&[entry]);

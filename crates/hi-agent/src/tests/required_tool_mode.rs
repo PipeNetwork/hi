@@ -103,7 +103,7 @@ async fn unsupported_explicit_required_mode_fails_before_provider_send() {
 #[tokio::test]
 async fn required_mode_rejects_narration_without_weakening_the_request() {
     let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let responses = (0..=MAX_TOOL_PROTOCOL_RETRIES)
+    let responses = (0..MAX_TOOL_PROTOCOL_RETRIES)
         .map(|_| {
             completion(
                 vec![Content::Text("Let me call the tool next.".into())],
@@ -131,14 +131,18 @@ async fn required_mode_rejects_narration_without_weakening_the_request() {
         Some(ProviderErrorKind::ToolProtocol)
     );
     let modes = modes.lock().unwrap();
-    assert_eq!(modes.len(), MAX_TOOL_PROTOCOL_RETRIES as usize + 1);
+    assert_eq!(
+        modes.len(),
+        MAX_TOOL_PROTOCOL_RETRIES as usize,
+        "the consecutive protocol budget is {MAX_TOOL_PROTOCOL_RETRIES} sends, not one extra after exhaustion"
+    );
     assert_eq!(
         agent.last_turn_usage().input_tokens,
-        u64::from(MAX_TOOL_PROTOCOL_RETRIES) + 1
+        u64::from(MAX_TOOL_PROTOCOL_RETRIES)
     );
     assert_eq!(
         agent.last_turn_usage().output_tokens,
-        u64::from(MAX_TOOL_PROTOCOL_RETRIES) + 1
+        u64::from(MAX_TOOL_PROTOCOL_RETRIES)
     );
     assert_eq!(
         agent.last_turn_telemetry().accepted_completions,

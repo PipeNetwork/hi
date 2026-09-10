@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
+mod test_credit;
 mod validation;
+pub(crate) use test_credit::tool_result_shows_passing_tests;
 pub(crate) use validation::{command_runs_tests, is_validation_command};
 
 use validation::bash_validation_scope;

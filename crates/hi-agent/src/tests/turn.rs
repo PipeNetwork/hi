@@ -3220,6 +3220,8 @@ async fn implementation_repeat_exhaustion_repairs_to_edit_instead_of_forced_fina
         read(),
         read(),
         read(),
+        read(),
+        read(),
         write_completion(&write_path_string),
         completion(vec![Content::Text("Implemented it.".into())], 1, 1),
         bash_completion("python3 -c 'assert 2 + 2 == 4'"),
@@ -4073,7 +4075,10 @@ async fn step_cap_folds_wrap_up_nudge_after_recovery_nudge() {
     }]);
     let mut ui = RecUi::default();
 
-    agent.run_turn("continue", &mut ui).await.unwrap();
+    agent
+        .run_turn("implement the remaining plan step", &mut ui)
+        .await
+        .unwrap();
 
     agent.messages.validate_for_provider().unwrap();
     assert!(

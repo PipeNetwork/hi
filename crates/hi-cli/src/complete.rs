@@ -16,8 +16,6 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Helper, Result};
 
-use hi_agent::command::CommandSpec;
-
 /// The concrete editor type used throughout the REPL (helper + default
 /// history). Provider add/edit prompts take `&mut` on this so they reuse the
 /// same terminal state — constructing a second editor was why paste broke in
@@ -32,15 +30,13 @@ pub type ProfileNames = Rc<RefCell<Vec<String>>>;
 /// Rustyline helper: command + profile-name completion, bracket matching,
 /// and history-based hints.
 pub struct ReplHelper {
-    commands: &'static [CommandSpec],
     profiles: ProfileNames,
     brackets: MatchingBracketHighlighter,
 }
 
 impl ReplHelper {
-    pub fn new(commands: &'static [CommandSpec], profiles: ProfileNames) -> Self {
+    pub fn new(profiles: ProfileNames) -> Self {
         Self {
-            commands,
             profiles,
             brackets: MatchingBracketHighlighter::new(),
         }
@@ -69,13 +65,11 @@ impl Completer for ReplHelper {
             return Ok((0, Vec::new()));
         }
 
-        // Completing the command name itself.
-        let cands: Vec<String> = self
-            .commands
-            .iter()
-            .map(|c| c.name)
-            .filter(|name| name.starts_with(rest))
-            .map(|name| format!("/{name}"))
+        // Completing the command name itself. Empty prefix is the catalog;
+        // a typed prefix also matches unlisted `/config` aliases.
+        let cands: Vec<String> = hi_agent::command::matching(rest)
+            .into_iter()
+            .map(|c| format!("/{}", c.name))
             .collect();
         Ok((0, cands))
     }
@@ -110,8 +104,8 @@ impl Hinter for ReplHelper {
         if line.starts_with('/') && pos == line.len() {
             let rest = &line[1..];
             if !rest.contains(' ') {
-                for c in self.commands {
-                    if c.name.starts_with(rest) && c.name.len() > rest.len() {
+                for c in hi_agent::command::matching(rest) {
+                    if c.name.len() > rest.len() {
                         return Some(c.name[rest.len()..].to_string());
                     }
                 }

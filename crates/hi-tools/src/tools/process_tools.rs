@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 use std::{fs::File, io::Read};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::{ProcessExecution, ProcessRunner, ToolOutcome};
@@ -96,7 +96,7 @@ pub(super) fn resolve_foreground_budget_from_values(
         .filter(|seconds| *seconds > 0)
     {
         Some(secs) => Duration::from_secs(secs),
-        None => Duration::from_secs(30),
+        None => Duration::from_secs(15),
     }
 }
 
@@ -954,6 +954,81 @@ fn workspace_file_fits_read(root: &Path, rel: &str) -> bool {
         return false;
     };
     meta.is_file() && meta.len() <= crate::read::MAX_READ_FILE_BYTES
+}
+
+/// Model-owned background watch. Reuses the bash `run_in_background` registry
+/// so `bash_output` / `bash_kill` work on the returned id.
+pub(super) async fn run_monitor_tool(
+    root: &Path,
+    state_root: &Path,
+    resources: &RuntimeResources<'_>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    #[derive(Deserialize)]
+    struct Args {
+        command: String,
+        description: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        #[serde(default)]
+        persistent: bool,
+    }
+    let args: Args = serde_json::from_str(arguments).context("invalid tool arguments")?;
+    if args.command.trim().is_empty() {
+        return Ok(ToolOutcome::failed(
+            "monitor error: missing required \"command\" argument".into(),
+        ));
+    }
+    if args.description.trim().is_empty() {
+        return Ok(ToolOutcome::failed(
+            "monitor error: missing required \"description\" argument".into(),
+        ));
+    }
+    let Some(runner) = resources.process_runner else {
+        return Ok(ToolOutcome::failed(
+            "monitor error: no process runner in this runtime".into(),
+        ));
+    };
+    let baseline = match crate::effects::workspace_snapshot(root, state_root).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let mut outcome = ToolOutcome::failed("Monitor was not started.".into());
+            mark_effect_inspection_failed(&mut outcome, &error, false);
+            return Ok(outcome);
+        }
+    };
+    let id = resources
+        .background
+        .spawn_tracked(runner, &args.command, root, state_root, baseline)
+        .await?;
+    resources
+        .background
+        .arm_monitor(&id, args.timeout_ms, args.persistent);
+    if let Ok(mut cache) = resources.read_cache.lock() {
+        cache.clear();
+    }
+    let title = crate::background::shell_title(&args.command);
+    let lifetime = if args.persistent {
+        "persistent until bash_kill or session end".to_string()
+    } else {
+        let ms = args.timeout_ms.unwrap_or(36_000_000);
+        format!("timeout hint {ms}ms; stop with bash_kill")
+    };
+    let mut outcome = background_tool_outcome(
+        format!(
+            "Started monitor {title} ({id}) — {}.\n{}\n\
+Each stdout line is an event. Print only DONE/FAILED/CANCELLED from the watched command.\n\
+Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
+            lifetime, args.description
+        ),
+        crate::BackgroundOutcome {
+            id,
+            state: crate::BackgroundState::Started,
+            exit_code: None,
+        },
+    );
+    outcome.effects.mutation_attempted = true;
+    Ok(outcome)
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! `/jump` and `/rewind` pickers over user turns.
+//! One turn picker for `/jump` and `/rewind`.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use hi_agent::UserTurn;
@@ -11,16 +11,25 @@ use crate::render::dim;
 use crate::theme::theme;
 use crate::{App, TranscriptEntry};
 
-pub(crate) struct JumpPicker {
-    pub previews: Vec<String>,
-    pub selected: usize,
-    pub restore_scroll: u16,
-    pub restore_following: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnPickerMode {
+    /// Live-scroll; Enter keeps the new position.
+    Jump,
+    /// Truncate conversation; Enter confirms.
+    Rewind,
 }
 
-pub(crate) struct RewindPicker {
-    pub turns: Vec<UserTurn>,
+pub(crate) struct TurnRow {
+    pub n: usize,
+    pub preview: String,
+}
+
+pub(crate) struct TurnPicker {
+    pub rows: Vec<TurnRow>,
     pub selected: usize,
+    pub mode: TurnPickerMode,
+    pub restore_scroll: u16,
+    pub restore_following: bool,
     pub confirm: bool,
 }
 
@@ -31,113 +40,120 @@ pub(crate) enum PickerOutcome {
     Rewind(usize),
 }
 
-impl JumpPicker {
-    pub(crate) fn from_app(app: &App) -> Option<Self> {
-        let previews = user_prompt_previews(app);
-        if previews.is_empty() {
+impl TurnPicker {
+    fn jump_from_app(app: &App) -> Option<Self> {
+        let rows = user_prompt_rows(app);
+        if rows.is_empty() {
             return None;
         }
-        let selected = previews.len().saturating_sub(1);
+        let selected = rows.len().saturating_sub(1);
         Some(Self {
-            previews,
+            rows,
             selected,
+            mode: TurnPickerMode::Jump,
             restore_scroll: app.scroll,
             restore_following: app.following,
+            confirm: false,
         })
     }
-}
 
-impl RewindPicker {
-    pub(crate) fn new(turns: Vec<UserTurn>) -> Option<Self> {
+    pub(crate) fn rewind(turns: Vec<UserTurn>) -> Option<Self> {
         if turns.is_empty() {
             return None;
         }
         let selected = turns.len().saturating_sub(1);
         Some(Self {
-            turns,
+            rows: turns
+                .into_iter()
+                .map(|t| TurnRow {
+                    n: t.n,
+                    preview: t.preview,
+                })
+                .collect(),
             selected,
+            mode: TurnPickerMode::Rewind,
+            restore_scroll: 0,
+            restore_following: true,
             confirm: false,
         })
     }
 
     fn current_n(&self) -> Option<usize> {
-        self.turns.get(self.selected).map(|t| t.n)
+        self.rows.get(self.selected).map(|t| t.n)
     }
 }
 
-pub(crate) fn handle_jump_key(app: &mut App, key: &KeyEvent) -> PickerOutcome {
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            if let Some(picker) = app.jump_picker.take() {
-                app.scroll = picker.restore_scroll;
-                app.following = picker.restore_following;
-            }
-            PickerOutcome::Close
-        }
-        KeyCode::Enter => {
-            app.jump_picker = None;
-            PickerOutcome::Close
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            let sel = app.jump_picker.as_mut().map(|p| {
-                p.selected = p.selected.saturating_sub(1);
-                p.selected
-            });
-            if let Some(sel) = sel {
-                app.scroll_to_user_prompt(sel);
-            }
-            PickerOutcome::Continue
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            let sel = app.jump_picker.as_mut().map(|p| {
-                let len = p.previews.len();
-                if len > 0 {
-                    p.selected = (p.selected + 1).min(len - 1);
-                }
-                p.selected
-            });
-            if let Some(sel) = sel {
-                app.scroll_to_user_prompt(sel);
-            }
-            PickerOutcome::Continue
-        }
-        _ => PickerOutcome::Continue,
-    }
-}
-
-pub(crate) fn handle_rewind_key(app: &mut App, key: &KeyEvent) -> PickerOutcome {
-    let Some(picker) = app.rewind_picker.as_mut() else {
-        return PickerOutcome::Close;
+pub(crate) fn handle_turn_picker_key(app: &mut App, key: &KeyEvent) -> PickerOutcome {
+    let mode = match app.turn_picker.as_ref() {
+        Some(p) => p.mode,
+        None => return PickerOutcome::Close,
     };
-    let len = picker.turns.len();
+    let confirming = app
+        .turn_picker
+        .as_ref()
+        .is_some_and(|p| p.confirm && p.mode == TurnPickerMode::Rewind);
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
-            if picker.confirm {
-                picker.confirm = false;
+            if confirming {
+                if let Some(picker) = app.turn_picker.as_mut() {
+                    picker.confirm = false;
+                }
                 PickerOutcome::Continue
+            } else if mode == TurnPickerMode::Jump {
+                if let Some(picker) = app.turn_picker.take() {
+                    app.scroll = picker.restore_scroll;
+                    app.following = picker.restore_following;
+                }
+                PickerOutcome::Close
             } else {
+                app.turn_picker = None;
                 PickerOutcome::Close
             }
         }
-        KeyCode::Enter => {
-            if picker.confirm {
-                if let Some(n) = picker.current_n() {
+        KeyCode::Enter => match mode {
+            TurnPickerMode::Jump => {
+                app.turn_picker = None;
+                PickerOutcome::Close
+            }
+            TurnPickerMode::Rewind if confirming => {
+                let n = app.turn_picker.as_ref().and_then(TurnPicker::current_n);
+                if let Some(n) = n {
                     PickerOutcome::Rewind(n)
                 } else {
                     PickerOutcome::Close
                 }
-            } else {
-                picker.confirm = true;
+            }
+            TurnPickerMode::Rewind => {
+                if let Some(picker) = app.turn_picker.as_mut() {
+                    picker.confirm = true;
+                }
                 PickerOutcome::Continue
             }
-        }
-        KeyCode::Up | KeyCode::Char('k') if !picker.confirm => {
-            picker.selected = picker.selected.saturating_sub(1);
+        },
+        KeyCode::Up | KeyCode::Char('k') if !confirming => {
+            if let Some(picker) = app.turn_picker.as_mut() {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            let sel = app.turn_picker.as_ref().map(|p| p.selected);
+            if mode == TurnPickerMode::Jump
+                && let Some(sel) = sel
+            {
+                app.scroll_to_user_prompt(sel);
+            }
             PickerOutcome::Continue
         }
-        KeyCode::Down | KeyCode::Char('j') if !picker.confirm => {
-            if len > 0 {
-                picker.selected = (picker.selected + 1).min(len - 1);
+        KeyCode::Down | KeyCode::Char('j') if !confirming => {
+            if let Some(picker) = app.turn_picker.as_mut() {
+                let len = picker.rows.len();
+                if len > 0 {
+                    picker.selected = (picker.selected + 1).min(len - 1);
+                }
+            }
+            let sel = app.turn_picker.as_ref().map(|p| p.selected);
+            if mode == TurnPickerMode::Jump
+                && let Some(sel) = sel
+            {
+                app.scroll_to_user_prompt(sel);
             }
             PickerOutcome::Continue
         }
@@ -145,43 +161,42 @@ pub(crate) fn handle_rewind_key(app: &mut App, key: &KeyEvent) -> PickerOutcome 
     }
 }
 
-pub(crate) fn render_jump(frame: &mut ratatui::Frame, area: Rect, picker: &JumpPicker) {
-    render_list(
-        frame,
-        area,
-        " jump · live-scroll · Enter stay · Esc restore ",
-        &picker
-            .previews
-            .iter()
-            .enumerate()
-            .map(|(i, p)| format!("{:>3}. {p}", i + 1))
-            .collect::<Vec<_>>(),
-        picker.selected,
-        None,
-    );
-}
-
-pub(crate) fn render_rewind(frame: &mut ratatui::Frame, area: Rect, picker: &RewindPicker) {
+pub(crate) fn render_turn_picker(frame: &mut ratatui::Frame, area: Rect, picker: &TurnPicker) {
     let rows: Vec<String> = picker
-        .turns
+        .rows
         .iter()
         .map(|t| format!("{:>3}. {}", t.n, t.preview))
         .collect();
-    let footer = if picker.confirm {
-        picker
-            .current_n()
-            .map(|n| format!("rewind conversation before turn {n}? Enter confirm · Esc cancel"))
-    } else {
-        Some("Enter confirm · j/k move · Esc close — files unchanged, /undo reverts edits".into())
-    };
-    render_list(
-        frame,
-        area,
-        " rewind · truncate conversation before this turn ",
-        &rows,
-        picker.selected,
-        footer.as_deref(),
-    );
+    match picker.mode {
+        TurnPickerMode::Jump => render_list(
+            frame,
+            area,
+            " jump · live-scroll · Enter stay · Esc restore ",
+            &rows,
+            picker.selected,
+            None,
+        ),
+        TurnPickerMode::Rewind => {
+            let footer = if picker.confirm {
+                picker.current_n().map(|n| {
+                    format!("rewind conversation before turn {n}? Enter confirm · Esc cancel")
+                })
+            } else {
+                Some(
+                    "Enter confirm · j/k move · Esc close — files unchanged, /undo reverts edits"
+                        .into(),
+                )
+            };
+            render_list(
+                frame,
+                area,
+                " rewind · truncate conversation before this turn ",
+                &rows,
+                picker.selected,
+                footer.as_deref(),
+            );
+        }
+    }
 }
 
 fn render_list(
@@ -224,27 +239,28 @@ fn render_list(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn user_prompt_previews(app: &App) -> Vec<String> {
+fn user_prompt_rows(app: &App) -> Vec<TurnRow> {
     app.transcript
         .iter()
         .filter_map(|e| match e {
             TranscriptEntry::UserPrompt { line, .. } => {
                 let t = crate::render::line_text(line);
                 let t = t.trim().trim_start_matches('❯').trim();
-                Some(t.chars().take(72).collect())
+                Some(t.chars().take(72).collect::<String>())
             }
             _ => None,
         })
+        .enumerate()
+        .map(|(i, preview)| TurnRow { n: i + 1, preview })
         .collect()
 }
 
 impl App {
     pub(crate) fn open_jump_picker(&mut self) {
-        self.rewind_picker = None;
-        match JumpPicker::from_app(self) {
+        match TurnPicker::jump_from_app(self) {
             Some(picker) => {
                 let sel = picker.selected;
-                self.jump_picker = Some(picker);
+                self.turn_picker = Some(picker);
                 let _ = self.scroll_to_user_prompt(sel);
             }
             None => self.status = "no user prompts to jump to".into(),
@@ -252,10 +268,9 @@ impl App {
     }
 
     pub(crate) fn open_rewind_picker(&mut self, agent: &hi_agent::Agent) {
-        self.jump_picker = None;
         let turns = hi_agent::list_user_turns(agent.messages());
-        match RewindPicker::new(turns) {
-            Some(picker) => self.rewind_picker = Some(picker),
+        match TurnPicker::rewind(turns) {
+            Some(picker) => self.turn_picker = Some(picker),
             None => self.status = "no user turns yet".into(),
         }
     }

@@ -16,7 +16,7 @@ mod transcript;
 pub(crate) mod voice;
 
 pub use run::run;
-#[cfg(test)]
-pub(crate) use run::search_transcript;
 pub(crate) use run::{handle_normal_mode, review_next_hunk};
+#[cfg(test)]
+pub(crate) use run::{search_transcript, send_now_queued_follow_up};
 pub(crate) use sync_commands::SteeringRemote;

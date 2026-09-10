@@ -358,11 +358,6 @@ fn marketplace_installs_skill_file() {
 }
 
 #[test]
-fn mcp_admin_has_doctor_route() {
-    assert!(mcp_admin_report("doctor").contains("/doctor"));
-}
-
-#[test]
 fn remember_note_stamps_bullet_id_and_mentions_undo() {
     let root = std::env::temp_dir().join(format!(
         "hi-remember-{}-{}",

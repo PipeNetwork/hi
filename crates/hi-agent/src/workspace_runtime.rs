@@ -178,6 +178,7 @@ pub struct WorkspaceRuntime {
     // trusted hook snapshot without rebuilding the agent and losing its
     // resumed task/checkpoint state.
     hooks: std::sync::RwLock<Option<Arc<hi_hooks::HookRegistry>>>,
+    file_ops: hi_tools::FileOperationLockManager,
 }
 
 impl WorkspaceRuntime {
@@ -315,6 +316,7 @@ impl WorkspaceRuntime {
             ledger: Arc::new(Mutex::new(ledger)),
             context_generation: std::sync::atomic::AtomicU64::new(0),
             hooks: std::sync::RwLock::new(hooks),
+            file_ops: hi_tools::FileOperationLockManager::new(),
         })
     }
 
@@ -379,6 +381,10 @@ impl WorkspaceRuntime {
 
     pub fn background(&self) -> &hi_tools::BackgroundRegistry {
         &self.background
+    }
+
+    pub fn file_ops(&self) -> &hi_tools::FileOperationLockManager {
+        &self.file_ops
     }
 
     /// Cloneable handle for concurrent side loops (`/btw`).

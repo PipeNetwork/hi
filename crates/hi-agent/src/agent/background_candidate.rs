@@ -162,6 +162,7 @@ impl BackgroundCandidatePlan {
         prompt: String,
         registry: Arc<hi_tools::BackgroundTaskRegistry>,
         teardown: hi_tools::BackgroundTaskTeardown,
+        mailbox: crate::agent::subagent_mailbox::SubagentMailbox,
         ui: &mut dyn Ui,
     ) -> hi_tools::BackgroundTaskOutcome {
         let Some(workspace_job_id) = registry.candidate_workspace_job_id(task_id).await else {
@@ -212,6 +213,7 @@ impl BackgroundCandidatePlan {
             Ok(child) => child,
             Err(error) => return failed(format!("candidate child creation failed: {error:#}")),
         };
+        mailbox.register_running(task_id, child.interjection_inbox());
         let mut child = super::child_process_teardown::ReapingChild::new(child, Some(teardown));
         child
             .child_mut()

@@ -82,14 +82,8 @@ impl crate::Agent {
                     // snapshot withholds Done until the terminal receipt; this
                     // export happens first so the final input guard can see it.
                     if let Some(root) = root {
-                        let is_cwd_default = std::env::current_dir()
-                            .ok()
-                            .and_then(|cwd| cwd.canonicalize().ok())
-                            .and_then(|cwd| root.canonicalize().ok().map(|root| root == cwd))
-                            .unwrap_or(false);
-                        if !is_cwd_default {
-                            let _ = goal.export_markdown_to(&root);
-                        }
+                        let _ = goal.export_markdown_to(&root);
+                        let _ = crate::goal::scratch::ensure(&root);
                     }
                     Ok(())
                 })

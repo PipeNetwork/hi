@@ -10,7 +10,9 @@ use crate::agent::turn::progress::ProgressTracker;
 use crate::agent::turn::retry::TurnRetryState;
 use crate::agent::turn::speculation::SpeculationRegistry;
 use crate::domain::TurnControlFlags;
-use crate::steering::{EvidenceTracker, ImplementationIntent, ImplementationTracker, ReviewIntent};
+use crate::steering::{
+    EvidenceTracker, GoalKind, ImplementationIntent, ImplementationTracker, ReviewIntent,
+};
 use crate::verify::{Snapshot, WorkspaceRepairVerifier};
 use crate::{ReviewStatus, TaskContract, TurnPhaseLatencies};
 
@@ -31,6 +33,9 @@ pub(super) struct TurnState {
     pub read_only_intent: Option<ReviewIntent>,
     pub implementation_intent: Option<ImplementationIntent>,
     pub expected_mutation: bool,
+    /// Grok-build `## Goal kind`: analysis/research accept prose; code-change
+    /// requires workspace evidence.
+    pub goal_kind: GoalKind,
     pub requested_validation: bool,
     pub turn_input: String,
 
@@ -181,6 +186,7 @@ impl TurnState {
             read_only_intent: self.read_only_intent,
             implementation_intent: self.implementation_intent,
             expected_mutation: self.expected_mutation,
+            goal_kind: self.goal_kind,
             requested_validation: self.requested_validation,
             input: &self.turn_input,
             user_prompt_tokens: self.user_prompt_tokens,

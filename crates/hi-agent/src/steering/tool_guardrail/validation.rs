@@ -1,5 +1,7 @@
 const VALIDATION_FAMILIES: &[(&str, &str)] = &[
+    ("cargo nextest", "cargo:test"),
     ("cargo test", "cargo:test"),
+    ("cargo t", "cargo:test"),
     ("cargo check", "cargo:check"),
     ("cargo build", "cargo:build"),
     ("cargo clippy", "cargo:clippy"),
@@ -102,7 +104,7 @@ fn validation_match(command: &str) -> Option<(usize, usize, &'static str)> {
         .min_by_key(|(start, _, _)| *start)
 }
 
-fn validation_matches(command: &str) -> Vec<(usize, usize, &'static str)> {
+pub(super) fn validation_matches(command: &str) -> Vec<(usize, usize, &'static str)> {
     let lower = command.to_ascii_lowercase();
     VALIDATION_FAMILIES
         .iter()
@@ -183,7 +185,7 @@ fn quoted_executable_delimiter(command: &str, start: usize) -> Option<u8> {
     Some(delimiter)
 }
 
-fn first_shell_boundary(source: &str) -> usize {
+pub(super) fn first_shell_boundary(source: &str) -> usize {
     let mut single_quoted = false;
     let mut double_quoted = false;
     let mut escaped = false;
@@ -212,7 +214,7 @@ fn first_shell_boundary(source: &str) -> usize {
     source.len()
 }
 
-fn validation_requests_metadata(family: &str, suffix: &str) -> bool {
+pub(super) fn validation_requests_metadata(family: &str, suffix: &str) -> bool {
     suffix[..first_shell_boundary(suffix)]
         .split_whitespace()
         .map(shell_word_before_redirection)
@@ -595,7 +597,8 @@ pub(crate) fn command_runs_tests(arguments: &str) -> bool {
     let Some(command) = super::super::implementation::bash_command(arguments) else {
         return false;
     };
-    validation_matches(&command)
+    let command = strip_process_wrappers(&command);
+    validation_matches(command)
         .into_iter()
         .any(|(_, end, family)| {
             let suffix = &command[end..];
@@ -611,20 +614,63 @@ pub(crate) fn command_runs_tests(arguments: &str) -> bool {
             {
                 return false;
             }
-            matches!(
-                family,
-                "cargo:test"
-                    | "npm:test"
-                    | "pnpm:test"
-                    | "yarn:test"
-                    | "bun:test"
-                    | "pytest"
-                    | "unittest"
-                    | "go:test"
-                    | "make:test"
-                    | "just:test"
-            )
+            is_test_family(family)
         })
+}
+
+pub(super) fn is_test_family(family: &str) -> bool {
+    matches!(
+        family,
+        "cargo:test"
+            | "npm:test"
+            | "pnpm:test"
+            | "yarn:test"
+            | "bun:test"
+            | "pytest"
+            | "unittest"
+            | "go:test"
+            | "make:test"
+            | "just:test"
+    )
+}
+
+pub(super) fn strip_process_wrappers(command: &str) -> &str {
+    let mut rest = command.trim_start();
+    for _ in 0..4 {
+        let Some(first) = rest.split_whitespace().next() else {
+            return rest;
+        };
+        let name = first.trim_matches(['\'', '"']);
+        let after = rest[first.len()..].trim_start();
+        rest = match name.to_ascii_lowercase().as_str() {
+            "nice" | "nohup" | "command" | "time" => after,
+            "timeout" | "gtimeout" => skip_timeout_args(after),
+            _ => return rest,
+        };
+    }
+    rest
+}
+
+fn skip_timeout_args(mut rest: &str) -> &str {
+    loop {
+        let Some(word) = rest.split_whitespace().next() else {
+            return rest;
+        };
+        if word.starts_with('-') {
+            rest = rest[word.len()..].trim_start();
+            if matches!(word, "-k" | "--kill-after" | "-s" | "--signal") {
+                if let Some(arg) = rest.split_whitespace().next() {
+                    rest = rest[arg.len()..].trim_start();
+                }
+            }
+            continue;
+        }
+        let duration = word.trim_end_matches(['s', 'm', 'h', 'd', 'S', 'M', 'H']);
+        if !duration.is_empty() && duration.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return rest[word.len()..].trim_start();
+        }
+        return rest;
+    }
 }
 
 #[cfg(test)]

@@ -5,22 +5,20 @@
 use hi_ai::ToolSpec;
 use serde_json::json;
 use std::sync::LazyLock;
-
 mod optional_specs;
 mod policy;
-
 pub use optional_specs::{
     ask_user_tool_spec, browser_exec_tool_spec, delegate_tool_spec, explore_tool_spec,
     get_task_output_tool_spec, kill_task_tool_spec, memory_forget_tool_spec, memory_get_tool_spec,
-    memory_search_tool_spec, memory_update_tool_spec, new_context_tool_spec,
+    memory_search_tool_spec, memory_update_tool_spec, monitor_tool_spec, new_context_tool_spec,
     research_read_tool_spec, research_tool_spec, run_program_tool_spec, search_tool_tool_spec,
-    skill_tool_spec, task_tool_spec, use_tool_tool_spec, wait_tasks_tool_spec,
+    send_subagent_message_tool_spec, skill_tool_spec, task_tool_spec, use_tool_tool_spec,
+    wait_tasks_tool_spec,
 };
 pub use policy::*;
 
 /// Whether a tool is safe to pre-launch while a program is still streaming.
-/// This is deliberately separate from `read_only`: a read-only operation can
-/// still be nondeterministic, expensive, private, or externally observable.
+/// Separate from `read_only`: a read-only op can still be expensive or observable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpeculationClass {
     Never,
@@ -837,6 +835,24 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         false,
         Safety,
         "OS kill without task registry"
+    ),
+    tool_metadata!(
+        "send_subagent_message",
+        Subagent,
+        false,
+        false,
+        false,
+        Structure,
+        "new task follow-up"
+    ),
+    tool_metadata!(
+        "monitor",
+        Background,
+        false,
+        false,
+        false,
+        Structure,
+        "bash run_in_background"
     ),
     tool_metadata!(
         "use_tool",

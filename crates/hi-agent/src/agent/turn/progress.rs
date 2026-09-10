@@ -2,10 +2,9 @@
 
 use std::collections::HashSet;
 
-use hi_ai::Content;
-
 use crate::ProgressEvent;
-use crate::heuristics::{looks_like_unfinished_step, parse_text_tool_calls};
+#[cfg(test)]
+use crate::steering::GoalKind;
 use crate::steering::{
     EvidenceTracker, ImplementationTracker, ToolLoopGuardrail, bash_no_progress_signature,
     classify_bash_command, evidence_kind_for_tool, implementation_tool_call_validates,
@@ -85,6 +84,10 @@ pub(super) struct ProgressTracker {
     pub(super) keep_working_blocked_signature: Option<String>,
     /// Whether a tool ran since the last keep-working recovery.
     pub(super) saw_tool_since_keep_working: bool,
+    /// `update_plan` (or equivalent) changed checklist state this turn.
+    /// Grok-build's TodoGate: a live in-turn checklist continues even on
+    /// analysis. An inherited stale plan does not.
+    pub(super) plan_updated: bool,
     /// Cross-round repeat-loop state lives here so the newer owned turn bag can
     /// retain its construction shape while preserving the established guards.
     pub(super) repeat_sampling_rounds: u32,
@@ -94,6 +97,9 @@ pub(super) struct ProgressTracker {
     /// Settlement owns this as a typed no-progress outcome; it is not a
     /// provider transport or verification-infrastructure failure.
     pub(super) bounded_plan_answer_recovery_exhausted: bool,
+    pub(super) stationarity: crate::steering::IdenticalToolCallRun,
+    pub(super) stationarity_ended: bool,
+    pub(super) laziness_nudges: u32,
     /// Revision shared by the pre-call signature and post-call result guards.
     inspection_revision: Option<u64>,
     pub(super) prev_added_no_evidence: bool,
@@ -150,6 +156,9 @@ impl ProgressTracker {
             reason: reason.into(),
             signature,
         };
+        if event.reason == "changed plan state" {
+            self.plan_updated = true;
+        }
         if self.plan_drive_progress_event.is_none()
             && crate::plan_drive::progress_event_counts_as_plan_drive(&event)
         {
@@ -302,14 +311,13 @@ pub(super) fn no_progress_signature_for_calls(
     })
 }
 
-pub(super) fn forced_final_answer_is_unusable(text: &str, plan_incomplete: bool) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || plan_incomplete || looks_like_unfinished_step(trimmed) {
-        return true;
-    }
-    parse_text_tool_calls(trimmed, 0)
-        .iter()
-        .any(|content| matches!(content, Content::ToolCall { .. }))
+#[cfg(test)]
+pub(super) fn forced_final_answer_is_unusable(
+    text: &str,
+    plan_incomplete: bool,
+    kind: GoalKind,
+) -> bool {
+    crate::steering::forced_final_answer_is_unusable(text, plan_incomplete, kind)
 }
 
 pub(super) fn signature_seen(evidence: &EvidenceTracker, signature: &Option<String>) -> bool {
@@ -466,6 +474,46 @@ mod progress_retention_tests {
         assert!(!evidence.round_adds_evidence(&calls));
         assert!(tracker.observe_workspace_revision(&mut evidence, 8, true));
         assert!(evidence.round_adds_evidence(&calls));
+    }
+
+    #[test]
+    fn analysis_review_is_usable_even_if_it_offers_to_implement() {
+        let review = "I have all the source in context now. Here's my review.\n\n\
+## Major issues found\n\n\
+1. PRIVMSG leaks whether a username exists.\n\
+2. NICK rename leaks rate-limiter entries.\n\
+3. KICK broadcasts KICKED to every subscriber.\n\n\
+Those are the highest-value fixes.\n\n\
+Let me implement fixes for #1, #2, and #3.";
+        assert!(
+            !forced_final_answer_is_unusable(review, false, GoalKind::Analysis),
+            "grok-build analysis: the written review is the deliverable"
+        );
+        assert!(!forced_final_answer_is_unusable(
+            "Let me implement the parser.",
+            false,
+            GoalKind::Analysis
+        ));
+        assert!(forced_final_answer_is_unusable(
+            "",
+            false,
+            GoalKind::Analysis
+        ));
+        assert!(forced_final_answer_is_unusable(
+            "The parser is fixed.",
+            true,
+            GoalKind::CodeChange
+        ));
+        assert!(!forced_final_answer_is_unusable(
+            "The parser is fixed.",
+            false,
+            GoalKind::CodeChange
+        ));
+        assert!(forced_final_answer_is_unusable(
+            "I can't proceed.",
+            false,
+            GoalKind::CodeChange
+        ));
     }
 
     #[test]

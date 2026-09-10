@@ -61,6 +61,10 @@ pub const NESTED_SANDBOX_ENV: &str = "HI_SANDBOXED";
 /// mount namespaces.
 pub(crate) const PRIVATE_DENY_READ_MASK_DIR: &str = ".deny-read-directory";
 
+#[path = "sandbox_deny.rs"]
+mod sandbox_deny;
+pub use sandbox_deny::{chmod_000, path_is_mode_000, permission_denied_is_mode_000};
+
 /// How much of the filesystem a shell command may modify.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SandboxPolicy {
@@ -690,16 +694,7 @@ fn push_flag_path(args: &mut Vec<OsString>, flag: &str, source: &Path, target: &
 
 #[cfg(any(test, target_os = "linux"))]
 fn deny_read_overlay_source(config: &SandboxConfig, target: &Path) -> PathBuf {
-    if target.is_dir()
-        && let Some(mask) = config
-            .private_temp
-            .as_deref()
-            .map(|temp| temp.join(PRIVATE_DENY_READ_MASK_DIR))
-            .filter(|mask| mask.is_dir())
-    {
-        return mask;
-    }
-    PathBuf::from("/dev/null")
+    sandbox_deny::deny_read_overlay_source(config.private_temp.as_deref(), target)
 }
 
 #[cfg(any(test, target_os = "linux"))]

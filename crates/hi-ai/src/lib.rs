@@ -55,9 +55,10 @@ pub use huggingface::{
 // metadata at startup (instant) and save fresh results from the background fetch.
 pub use auth_store::StoredToken;
 pub use http::{
-    HttpRetryEvent, HttpRetryObserver, agent_http_client, agent_http_client_quick, cache_key,
-    credential_redirect_policy, inference_http_client_for_socket, load_cache, save_cache,
-    set_http_retry_observer, timed_http_client_fallback,
+    HttpRetryEvent, HttpRetryObserver, agent_http_client, agent_http_client_for_socket,
+    agent_http_client_quick, cache_key, credential_redirect_policy,
+    inference_http_client_for_socket, load_cache, save_cache, set_http_retry_observer,
+    timed_http_client_fallback, warmup_agent_http_clients,
 };
 pub use mcp::{
     McpDiscoveryProvider, McpTool, PIPE_MCP_DEFAULT_URL, PipeMcpClient, PipeMcpModelHealth,

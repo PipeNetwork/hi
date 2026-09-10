@@ -314,8 +314,8 @@ where
 mod clients;
 pub(crate) use clients::agent_http_client_bounded;
 pub use clients::{
-    agent_http_client, agent_http_client_quick, inference_http_client_for_socket,
-    timed_http_client_fallback,
+    agent_http_client, agent_http_client_for_socket, agent_http_client_quick,
+    inference_http_client_for_socket, timed_http_client_fallback, warmup_agent_http_clients,
 };
 
 /// Redirect policy for HTTP clients that attach credentials (`Authorization`,

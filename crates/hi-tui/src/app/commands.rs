@@ -10,9 +10,10 @@ use std::time::Instant;
 use super::command_helpers::{
     on_off, parse_race_arg, race_setup_lines, toggle_arg, tui_mcp_agent_check,
 };
+use crate::TurnState;
+use crate::action::Action;
 use crate::render::dim;
 use crate::util::{copy_to_clipboard, goal_feedback};
-use crate::{TurnState, diff_for_files_sync, working_tree_diff_sync};
 
 impl crate::App {
     /// Apply a pure editing/navigation key to the input line, shared by the
@@ -142,7 +143,8 @@ impl crate::App {
                         self.block_cursor = (self.selected_block_ord() + 1).min(n - 1);
                     }
                 }
-                KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_block(),
+                KeyCode::Enter => self.toggle_selected_block(),
+                KeyCode::Char(' ') => self.focus_prompt(),
                 _ => {}
             }
             return None;
@@ -184,7 +186,7 @@ impl crate::App {
                 let line = self.input.submit();
                 if !line.trim().is_empty() {
                     self.input.save_history_file(&self.input_history_path);
-                    return Some(line);
+                    return Some(self.attach_review_quote(line));
                 }
                 if let Some(hint) = self
                     .suggested_prompt
@@ -201,31 +203,28 @@ impl crate::App {
             }
             KeyCode::Char('u') if ctrl => self.input.kill_to_start(),
             KeyCode::Char('a') if ctrl => self.input.home(),
-            KeyCode::Char('e') if ctrl => self.input.end(),
+            // Grok-build Ctrl+E expands/collapses thinking. On a non-empty
+            // prompt keep emacs end-of-line so editing is not stolen.
+            KeyCode::Char('e') if ctrl => {
+                if self.input.is_empty() {
+                    self.apply_action(Action::ToggleReasoning);
+                } else {
+                    self.input.end();
+                }
+            }
             // Readline word motions: Alt-B/F move by word, Ctrl-W deletes the
             // word before the cursor, Ctrl-K kills to end of line.
             KeyCode::Char('b') if alt => self.input.word_left(),
             KeyCode::Char('f') if alt => self.input.word_right(),
             KeyCode::Char('w') if ctrl => self.input.delete_word_back(),
             KeyCode::Char('k') if ctrl => self.input.kill_to_end(),
-            // Full-screen diff review (Ctrl-D aliases Ctrl-G).
+            // Diff review (Ctrl-D aliases Ctrl-G): docked pane when wide,
+            // exclusive overlay when narrow.
             KeyCode::Char('d') if ctrl => {
-                if self.mode.is_review() {
-                    self.mode.to_insert();
-                } else {
-                    self.open_review(None);
-                }
+                self.toggle_review();
             }
-            // Full-screen diff review overlay (Ctrl-G): a scrollable,
-            // syntax-colored view of the entire working-tree diff with
-            // hunk-to-hunk navigation (n/p). Takes over the screen until
-            // closed with q/Esc/Ctrl-G.
             KeyCode::Char('g') if ctrl => {
-                if self.mode.is_review() {
-                    self.mode.to_insert();
-                } else {
-                    self.open_review(None);
-                }
+                self.toggle_review();
             }
             // Toggle the agent-observability panel (Ctrl-? = Ctrl-Shift-/).
             // Shows the last turn's trajectory telemetry, tool-call count, and
@@ -236,10 +235,9 @@ impl crate::App {
             }
             // Toggle reasoning (CoT) expansion: collapsed "thought for Ns"
             // summaries vs. the full thinking text. Off by default so reasoning
-            // doesn't flood the transcript; Ctrl-T shows/hides all blocks.
+            // doesn't flood the transcript; Ctrl-T / Ctrl-E show/hide all blocks.
             KeyCode::Char('t') if ctrl => {
-                self.show_reasoning = !self.show_reasoning;
-                self.bump_transcript();
+                self.apply_action(Action::ToggleReasoning);
             }
             // Toggle full tool-output expansion: long blocks fold to a preview
             // by default; Ctrl-O reveals every block's full body (and back).
@@ -585,21 +583,6 @@ impl crate::App {
         // Clean up the temp file.
         let _ = std::fs::remove_file(&tmp_path);
         self.follow();
-    }
-
-    /// Open the full-screen diff review overlay (Ctrl-G / bare `/review`).
-    /// When `files` is `None`, shows the entire working-tree diff; when `Some`,
-    /// shows only those paths — used by the deep-link from a `✎ files changed`
-    /// transcript line (click). `/review <topic>` is the read-only review macro,
-    /// not a path filter.
-    pub(crate) fn open_review(&mut self, files: Option<&[String]>) {
-        let diff = match files {
-            None => working_tree_diff_sync(&self.workspace_root),
-            Some(paths) => diff_for_files_sync(&self.workspace_root, paths),
-        };
-        self.diff_text = Some(diff);
-        self.review_scroll = 0;
-        self.mode = crate::mode::UiMode::Review;
     }
 
     /// Accumulate `last_changed_files` into `session_changed_files` (the
@@ -1406,13 +1389,13 @@ impl crate::App {
         self.follow();
     }
 
-    /// Install a goal whose sub-goals a planner already decomposed (from the run
+    /// Install a goal whose plan a planner already decomposed (from the run
     /// loop, after [`Agent::decompose_goal`]), then echo the resulting checklist.
     pub(crate) fn set_planned_goal(
         &mut self,
         agent: &mut Agent,
         objective: &str,
-        sub_goals: Vec<String>,
+        plan: hi_agent::GoalPlan,
     ) {
         let flags = command::parse_goal_objective_flags(objective);
         let objective = if flags.text.is_empty() {
@@ -1420,7 +1403,11 @@ impl crate::App {
         } else {
             flags.text.as_str()
         };
-        let error = Self::apply_goal(agent, objective, sub_goals);
+        let error = Self::apply_installed_goal(
+            agent,
+            objective,
+            hi_agent::Goal::from_goal_plan(objective.to_string(), plan),
+        );
         self.finish_goal_install(agent, objective, flags.review, flags.unattended, error);
         self.echo_installed_goal(agent);
         self.follow();
@@ -1795,7 +1782,7 @@ impl crate::App {
                 }
             }
             // Handled inline by the run loop (needs terminal/input/ticker).
-            Command::Dashboard(_) => {}
+            Command::Fleet(_) => {}
             // Handled inline by the run loop (workflow runs render in the
             // dashboard; list/show/validate print to the transcript).
             Command::Workflow(_) => {}
@@ -1865,13 +1852,6 @@ impl crate::App {
             Command::Turns(arg) => {
                 self.handle_turns(agent, hi_agent::command::parse_turns_arg(&arg));
             }
-            Command::Tasks(_) => {
-                crate::subagent_overlay::open_tasks(
-                    self,
-                    &agent.background_process_ids(),
-                    &agent.background_task_ids(),
-                );
-            }
             Command::Jump(arg) => {
                 let arg = arg.trim();
                 if arg.is_empty() {
@@ -1895,7 +1875,6 @@ impl crate::App {
                     }
                 }
             }
-            Command::RewindPicker => self.open_rewind_picker(agent),
             Command::Rewind(arg) => {
                 let trimmed = arg.trim();
                 if trimmed.is_empty() || trimmed == "list" || trimmed == "ls" {
@@ -1915,7 +1894,7 @@ impl crate::App {
                         }
                         if !failed {
                             self.rewind_transcript_to_user_turn(n);
-                            self.rewind_picker = None;
+                            self.turn_picker = None;
                         }
                         self.refresh_goal(agent);
                     }
@@ -1945,7 +1924,7 @@ impl crate::App {
                 ));
                 self.follow();
             }
-            Command::ViewPlan => {
+            Command::Plan(ref arg) if hi_agent::command::plan_is_view(arg) => {
                 if self.plan_approval.is_some() {
                     if self.unpark_plan_approval() {
                         self.push_session_face(agent);
@@ -1972,10 +1951,7 @@ impl crate::App {
             Command::Plan(_)
             | Command::Fork(_)
             | Command::Permissions(_)
-            | Command::AlwaysApprove(_)
-            | Command::Auto(_)
             | Command::Queue(_)
-            | Command::Plugins(_)
             | Command::Remember(_)
             | Command::UndoMemory
             | Command::ImportClaude(_)
@@ -1983,18 +1959,13 @@ impl crate::App {
             | Command::Metrics
             | Command::SynthEvals
             | Command::Find(_)
-            | Command::History(_)
             | Command::Hooks(_)
             | Command::Trust(_)
             | Command::Marketplace(_)
             | Command::Worktree(_)
             | Command::Inspect(_)
             | Command::Agents(_)
-            | Command::Share(_)
-            | Command::McpAdmin(_)
-            | Command::Cd(_)
-            | Command::Rename(_)
-            | Command::Resume(_) => {
+            | Command::Cd(_) => {
                 let queued: Vec<String> = self.queue.iter().cloned().collect();
                 if let Some(effect) =
                     hi_agent::handle_session_command_coordinated(agent, &command, &queued).await
@@ -2594,9 +2565,9 @@ impl crate::App {
             }
             Command::Files => self.show_session_files(),
             Command::Review(_arg) => {
-                // `/review` opens the full-screen diff review overlay (like
-                // Ctrl-G). File-filtered review is via clicking a `✎ files
-                // changed` transcript line.
+                // `/review` toggles the same surface as Ctrl-G (docked pane
+                // when wide, overlay when narrow). File-filtered review is
+                // via clicking the changed-files chrome row.
                 self.open_review(None);
             }
             Command::Commit => {
@@ -2781,6 +2752,16 @@ impl crate::App {
                 };
                 self.push(Line::styled(msg, dim()));
             }
+            Command::Export(ref arg) if hi_agent::command::is_share_export(arg) => {
+                let queued: Vec<String> = self.queue.iter().cloned().collect();
+                if let Some(effect) =
+                    hi_agent::handle_session_command_coordinated(agent, &command, &queued).await
+                {
+                    for line in effect.message.lines() {
+                        self.push(Line::styled(line.to_string(), dim()));
+                    }
+                }
+            }
             Command::Export(arg) => {
                 if agent.pipefs_workspace_active() {
                     self.push(Line::styled(
@@ -2811,10 +2792,7 @@ impl crate::App {
                     )),
                 }
             }
-            Command::Sync(arg) => self.handle_sync_command(agent, &arg).await,
             Command::Sessions(arg) => self.handle_sessions_command(agent, &arg).await,
-            Command::Attach(arg) => self.handle_attach_command(agent, &arg).await,
-            Command::Daemon(arg) => self.handle_daemon_command(&arg).await,
             Command::Unknown(name) => {
                 self.push(Line::styled(
                     format!("unknown command /{name}; try /help"),

@@ -25,8 +25,10 @@
 use std::sync::Arc;
 
 use crate::domain::VerifyEvidence;
+#[cfg(test)]
+use crate::goal::kind_lens::CODE_CHANGE_SKEPTIC as SKEPTIC_PROMPT;
 
-use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent};
+use hi_ai::{ChatRequest, Content, Message, RequestProfile};
 
 /// How much of the turn diff to show the **goal** skeptic, counted in **Unicode
 /// chars** (not bytes). Intentionally smaller than completion-review's
@@ -44,38 +46,6 @@ const MAX_SKEPTIC_PATH_CHARS: usize = 200;
 /// green WorkspaceRepair). Kept here next to the goal budget so the asymmetry
 /// is obvious; applied in `verify_outcome`.
 pub(crate) const COMPLETION_REVIEW_DIFF_BUDGET: usize = 50_000;
-
-const SKEPTIC_PROMPT: &str = "You are a code reviewer acting as a merge gate for a coding agent. \
-You see the objective, the active sub-goal, prior review notes on this step, the agent's verify \
-result, and the diff it just \
-produced. Your ONLY job is to block a change that fails to accomplish the active sub-goal — not to \
-improve it or hold it to a higher standard. Judge the sub-goal's OUTCOME: do not object because \
-the implementation's internal structure, naming, or approach differs from what you would have \
-chosen — the how is the implementer's choice unless the sub-goal itself mandates it. Bias \
-strongly toward APPROVE. Reply APPROVE on the \
-first line if the diff plausibly accomplishes the sub-goal, even if it is imperfect, could be more \
-robust, lacks tests, or you cannot fully confirm it from the diff alone. Reply OBJECT on the first \
-line ONLY when the diff has a concrete, specific defect that means the sub-goal is genuinely NOT \
-accomplished: a real bug, a removed or broken safeguard, a case the sub-goal explicitly requires \
-left unhandled, a change that does the opposite of the sub-goal, stub code standing in for \
-behavior the sub-goal requires — todo!()/unimplemented!()/raise NotImplementedError or placeholder \
-bodies where the sub-goal demands the real implementation; listed stub markers in the changed \
-files are concrete evidence, not speculation — or the wrong artifact: when the sub-goal names a \
-specific technology or file kind (a CUDA kernel, a Metal shader, a SQL schema) and the diff \
-delivers a simulation or substitute in another language instead, the sub-goal is NOT \
-accomplished. \
-On a re-review (prior review notes are present), your PRIMARY job is to confirm the previously \
-noted defects are addressed — the bar does NOT rise between rounds: a concern that earlier \
-rounds accepted, or that you did not raise when you first saw this work, is not grounds to \
-object now. Reply ESCALATE on the first line — instead of OBJECT — when retrying cannot fix the \
-problem: the sub-goal contradicts the objective or the work already done, or completing/verifying \
-it needs information or a decision only the user can provide. Escalation is rare; a fixable \
-defect is an OBJECT. Do NOT object over style or naming. Missing tests ARE grounds \
-to OBJECT when the sub-goal or task contract demands them; otherwise do not object over \
-missing tests, speculative edge cases, or anything you merely cannot verify from the diff. \
-When uncertain, APPROVE — a wrong objection wastes a real retry. After OBJECT or ESCALATE, \
-put one concrete reason per line. The very first \
-non-empty line of your reply must be the single word APPROVE, OBJECT, or ESCALATE — no preamble.";
 
 const INDEPENDENT_REVIEW_PROMPT: &str = "You are the independent completion reviewer for a coding \
 agent. Review the task contract, scoped repository instructions, complete bounded diff, relevant \
@@ -166,7 +136,92 @@ impl crate::Agent {
             return SkepticVerdict::Object(vec![reason]);
         }
         let context = self.skeptic_context(objective, sub_goal, prior_notes).await;
-        self.skeptic_review(&context).await
+        self.skeptic_panel(&context).await
+    }
+
+    async fn skeptic_panel(&mut self, context: &str) -> SkepticVerdict {
+        let count =
+            crate::agent::skeptic_panel::clamp_skeptic_count(self.config.subagents.skeptic_count);
+        if count == 1 {
+            return self.skeptic_review(context).await;
+        }
+        let model = self.effective_skeptic_model().to_string();
+        let kind = self
+            .goals
+            .structured
+            .as_ref()
+            .map(|goal| goal.kind)
+            .unwrap_or(crate::GoalKind::CodeChange);
+        let base = crate::goal::kind_lens::skeptic_prompt(kind);
+        let system = if kind.requires_workspace_evidence() {
+            crate::skills::gated_review_system_prompt(base, true)
+        } else {
+            format!("{base}\n\nLine 1 remains exactly APPROVE, OBJECT, or ESCALATE.")
+        };
+        let request = self.build_review_request(context, &system, model).await;
+        let provider = if self.skeptic_route_is_dead() {
+            self.provider.clone()
+        } else {
+            self.skeptic_provider
+                .clone()
+                .unwrap_or_else(|| self.provider.clone())
+        };
+        let timeout = self.side_call_timeout();
+        let mut futs = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            futs.push(crate::agent::skeptic_panel::run_review_attempt(
+                provider.clone(),
+                request.clone(),
+                timeout,
+            ));
+        }
+        let attempts = futures_util::future::join_all(futs).await;
+        let mut verdicts = Vec::with_capacity(attempts.len());
+        for attempt in attempts {
+            if let Some(usage) = attempt.usage {
+                self.add_side_usage(usage);
+            }
+            if let Some(err) = attempt.error {
+                self.add_side_error_usage(&err);
+            }
+            verdicts.push(attempt.verdict);
+        }
+        crate::agent::skeptic_panel::aggregate_panel(verdicts)
+    }
+
+    async fn build_review_request(
+        &mut self,
+        context: &str,
+        system_prompt: &str,
+        model: String,
+    ) -> ChatRequest {
+        let request_policy = self.seal_chat_only_auxiliary_request(&model, 1024).await;
+        ChatRequest {
+            execution: self.request_execution(),
+            model,
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: false,
+            canonical_objective: None,
+            messages: Arc::new(vec![Message::system(system_prompt), Message::user(context)]),
+            tools: request_policy.tools,
+            tool_envelope: Some(request_policy.envelope),
+            max_tokens: request_policy.max_tokens,
+            temperature: Some(0.0),
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: RequestProfile {
+                compat: self.config.routing.compat,
+                tool_mode: request_policy.tool_mode,
+                stream_usage: None,
+                deepseek_compat: self.config.routing.deepseek_compat,
+                deepseek_strict: None,
+                deepseek_thinking: None,
+                output_token_parameter: self.config.routing.output_token_parameter,
+            },
+        }
     }
 
     /// Review an arbitrary `(objective, sub_goal, diff)` with the real skeptic —
@@ -266,14 +321,53 @@ impl crate::Agent {
             diff = diff.chars().take(SKEPTIC_DIFF_BUDGET).collect();
             diff.push_str("\n… (diff truncated)");
         }
-        let acceptance = self
-            .task
-            .last_task_contract
+        let kind = self
+            .goals
+            .structured
             .as_ref()
-            .and_then(|c| c.acceptance_section())
+            .map(|goal| goal.kind)
+            .unwrap_or(crate::GoalKind::CodeChange);
+        let planner_acceptance = self.goals.structured.as_ref().and_then(|goal| {
+            if goal.acceptance.is_empty() {
+                None
+            } else {
+                Some(
+                    goal.acceptance
+                        .iter()
+                        .map(|item| format!("- {item}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+        });
+        let acceptance = planner_acceptance.unwrap_or_else(|| {
+            self.task
+                .last_task_contract
+                .as_ref()
+                .and_then(|c| c.acceptance_section())
+                .unwrap_or_else(|| "(none named)".into())
+        });
+        let write_up = self
+            .last_assistant_text()
+            .map(|text| crate::goal::clip_chars(&text, MAX_SKEPTIC_SIDE_CHARS))
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "(none)".into());
+        let verification = self
+            .goals
+            .structured
+            .as_ref()
+            .filter(|goal| !goal.verification.is_empty())
+            .map(|goal| {
+                goal.verification
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
             .unwrap_or_else(|| "(none named)".into());
         format!(
             "Objective: {}\n\n\
+             Kind: {}\n\n\
              Active sub-goal (the one about to be marked done): {}\n\n\
              Prior review notes on this step (re-review: confirm these are addressed; \
              the bar does not rise): {notes}\n\n\
@@ -281,8 +375,11 @@ impl crate::Agent {
              Files changed this turn: {files}\n\
              Stub markers present in files changed this turn: {stubs}\n\n\
              Acceptance criteria:\n{acceptance}\n\n\
+             Verification plan:\n{verification}\n\n\
+             Write-up this turn:\n{write_up}\n\n\
              Diff of this turn's changes:\n{diff}",
             crate::goal::clip_chars(objective, MAX_SKEPTIC_SIDE_CHARS),
+            kind.as_str(),
             crate::goal::clip_chars(sub_goal, MAX_SKEPTIC_SIDE_CHARS),
         )
     }
@@ -290,6 +387,14 @@ impl crate::Agent {
     /// Deterministic OBJECT when the contract/sub-goal is test-gated but this
     /// turn added no test files and ran no test verification stage.
     fn missing_required_tests_objection(&self, sub_goal: &str) -> Option<String> {
+        if self
+            .goals
+            .structured
+            .as_ref()
+            .is_some_and(|goal| !goal.kind.requires_workspace_evidence())
+        {
+            return None;
+        }
         let wants = self
             .task
             .last_task_contract
@@ -330,7 +435,18 @@ impl crate::Agent {
     /// review as diagnostics without confusing it with an objection.
     async fn skeptic_review(&mut self, context: &str) -> SkepticVerdict {
         let model = self.effective_skeptic_model().to_string();
-        let system = crate::skills::gated_review_system_prompt(SKEPTIC_PROMPT, true);
+        let kind = self
+            .goals
+            .structured
+            .as_ref()
+            .map(|goal| goal.kind)
+            .unwrap_or(crate::GoalKind::CodeChange);
+        let base = crate::goal::kind_lens::skeptic_prompt(kind);
+        let system = if kind.requires_workspace_evidence() {
+            crate::skills::gated_review_system_prompt(base, true)
+        } else {
+            format!("{base}\n\nLine 1 remains exactly APPROVE, OBJECT, or ESCALATE.")
+        };
         self.review_with_prompt(context, &system, model).await
     }
 
@@ -340,49 +456,9 @@ impl crate::Agent {
         system_prompt: &str,
         model: String,
     ) -> SkepticVerdict {
-        let request_policy = self.seal_chat_only_auxiliary_request(&model, 1024).await;
-        let request = ChatRequest {
-            execution: self.request_execution(),
-            model,
-            request_id: None,
-            retry_attempt: 0,
-            user_turn: false,
-            canonical_objective: None,
-            messages: Arc::new(vec![Message::system(system_prompt), Message::user(context)]),
-            tools: request_policy.tools,
-            tool_envelope: Some(request_policy.envelope),
-            max_tokens: request_policy.max_tokens,
-            // Deterministic structured verdict — do not inherit the coding turn's
-            // sampling (higher temp makes first-line APPROVE/OBJECT less reliable
-            // on non-GLM hosts such as xAI).
-            temperature: Some(0.0),
-            top_p: None,
-            frequency_penalty: None,
-            thinking_budget: None,
-            reasoning_effort: None,
-            profile: RequestProfile {
-                compat: self.config.routing.compat,
-                tool_mode: request_policy.tool_mode,
-                stream_usage: None,
-                deepseek_compat: self.config.routing.deepseek_compat,
-                deepseek_strict: None,
-                deepseek_thinking: None,
-                output_token_parameter: self.config.routing.output_token_parameter,
-            },
-        };
-
-        // One bounded retry on a transient transport error (rate limit, brief
-        // capacity/outage blip). A review that a single 429 could permanently
-        // downgrade to "unavailable" is noise at the end of an otherwise-good
-        // turn; anything persistent still reports unavailable after the retry.
-        // Route to the opt-in skeptic endpoint (a local model) when configured,
-        // otherwise the session provider — cloned so the borrow doesn't overlap
-        // the `&mut self` usage-accounting calls below.
-        // A managed local team server can die after the route was installed
-        // (OOM, bad weights, or an external kill). Executor routing already
-        // falls back to the driver in that case; keep the goal skeptic
-        // consistent so a dead sidecar does not fail-closed and park every
-        // goal. Explicit external endpoints are not classified as dead.
+        let request = self
+            .build_review_request(context, system_prompt, model)
+            .await;
         let provider = if self.skeptic_route_is_dead() {
             self.provider.clone()
         } else {
@@ -390,47 +466,19 @@ impl crate::Agent {
                 .clone()
                 .unwrap_or_else(|| self.provider.clone())
         };
-        let mut attempts_left = 2u32;
-        loop {
-            attempts_left -= 1;
-            let mut text = String::new();
-            let mut sink = |event: StreamEvent| {
-                if let StreamEvent::Text(t) = event {
-                    text.push_str(&t);
-                }
-            };
-            let timeout = self.side_call_timeout();
-            let completion = match crate::agent::turn::await_side_call(
-                timeout,
-                provider.stream(request.clone(), &mut sink),
-            )
-            .await
-            {
-                Err(timeout) => {
-                    return SkepticVerdict::Unavailable(format!(
-                        "provider timed out after {:.1}s",
-                        timeout.as_secs_f64()
-                    ));
-                }
-                Ok(Ok(completion)) => completion,
-                Ok(Err(err)) => {
-                    self.add_side_error_usage(&err);
-                    if attempts_left > 0 && review_error_is_transient(&err) {
-                        let delay = hi_ai::provider_retry_after_seconds(&err)
-                            .unwrap_or(2)
-                            .min(10);
-                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                        continue;
-                    }
-                    return SkepticVerdict::Unavailable(format!("provider error: {err:#}"));
-                }
-            };
-            self.add_side_usage(completion.usage);
-            if text.trim().is_empty() {
-                text = content_text(&completion.content);
-            }
-            return parse_verdict(&text);
+        let attempt = crate::agent::skeptic_panel::run_review_attempt(
+            provider,
+            request,
+            self.side_call_timeout(),
+        )
+        .await;
+        if let Some(usage) = attempt.usage {
+            self.add_side_usage(usage);
         }
+        if let Some(err) = attempt.error {
+            self.add_side_error_usage(&err);
+        }
+        attempt.verdict
     }
 
     /// A best-effort unified diff of this turn's changes (against the turn's
@@ -486,7 +534,7 @@ impl crate::Agent {
 }
 
 /// Collect the text blocks of a completion (the no-stream fallback).
-fn content_text(content: &[Content]) -> String {
+pub(super) fn content_text(content: &[Content]) -> String {
     content
         .iter()
         .filter_map(|block| match block {
@@ -500,7 +548,7 @@ fn content_text(content: &[Content]) -> String {
 /// Transient transport errors worth one bounded retry before reporting the
 /// review unavailable. Anything auth- or request-shape-related fails fast —
 /// retrying cannot change those.
-fn review_error_is_transient(err: &anyhow::Error) -> bool {
+pub(super) fn review_error_is_transient(err: &anyhow::Error) -> bool {
     use hi_ai::ProviderErrorKind as K;
     matches!(
         hi_ai::provider_error_kind(err),
@@ -633,7 +681,7 @@ fn review_diff_context(objective: &str, sub_goal: &str, diff: &str) -> String {
     )
 }
 
-fn parse_verdict(text: &str) -> SkepticVerdict {
+pub(super) fn parse_verdict(text: &str) -> SkepticVerdict {
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim)

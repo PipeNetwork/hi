@@ -5,6 +5,7 @@ mod census;
 mod change_ledger;
 mod coding_memory;
 pub mod command;
+mod compact_arg;
 pub mod compaction;
 mod config;
 mod context_index;
@@ -22,6 +23,7 @@ mod heuristics;
 mod hygiene;
 mod inbox;
 mod injection_census;
+mod interjection;
 pub mod learning;
 pub mod local_skeptic;
 mod memory;
@@ -101,6 +103,7 @@ pub use agent::turn::TurnPhase;
 pub use census::{CompactionEvent, RequestCensus, census_messages, tool_kind};
 pub use change_ledger::{BackgroundScan, ChangeLedger};
 pub use command::Command;
+pub use compact_arg::CompactArg;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 pub use config::{
     AgentConfig, AgentGates, AgentLoopLimits, AgentMemory, AgentPaths, AgentProgramConfig,
@@ -140,10 +143,10 @@ pub use session_ops::{
     PermissionMode, SessionCommandEffect, UserTurn, agents_report, fork_summary, fork_worktree,
     format_plan, format_tasks_report, format_user_turns, handle_session_command,
     handle_session_command_coordinated, hooks_command, import_claude_report, inspect_report,
-    list_user_turns, local_recap, marketplace_report, mcp_admin_report, parse_fork_args,
-    parse_remember_args, plan_mode_prompt, plugins_and_hooks_report, remember_note,
-    rewind_len_before_user_turn, run_hook, search_messages, set_workspace_trusted, share_report,
-    trust_command, workspace_trusted, worktree_command,
+    list_user_turns, local_recap, marketplace_report, parse_fork_args, parse_remember_args,
+    plan_mode_prompt, plugins_and_hooks_report, remember_note, rewind_len_before_user_turn,
+    run_hook, search_messages, set_workspace_trusted, share_report, trust_command,
+    workspace_trusted, worktree_command,
 };
 pub use session_projection::*;
 pub use session_reducer::*;
@@ -158,6 +161,7 @@ pub use turn_failure::TurnFailure;
 pub fn answer_is_generic_completion_placeholder(content: &str) -> bool {
     steering::answer_is_generic_completion_placeholder(content)
 }
+pub use steering::GoalKind;
 pub use subagent::{DelegateOutcome, DelegateProgress, DelegateRunner, SubagentRoute};
 pub use subagent_progress::{
     DelegateChildEvent, dispatch_delegate_child_event, parse_delegate_child_event,
@@ -306,8 +310,9 @@ pub use events::{
 pub use git_identity::{normalize_git_remote, prompt_section as git_identity_prompt_section};
 pub use goal::{
     CLAIM_NOTE, DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT,
-    GOAL_EVENT_LIMIT, Goal, GoalEvent, GoalPauseReason, GoalStatus, MAX_CAP_CONTINUATIONS,
-    REGRESSION_NOTE, SkepticStatus, SubGoal, UNATTENDED_DRIVE_WARNING, auto_budget_for,
+    GOAL_EVENT_LIMIT, Goal, GoalEvent, GoalPauseReason, GoalPlan, GoalStatus,
+    MAX_CAP_CONTINUATIONS, REGRESSION_NOTE, SkepticStatus, SubGoal, UNATTENDED_DRIVE_WARNING,
+    auto_budget_for,
 };
 pub use heuristics::leftover_plan_summary;
 /// Version of the authoritative native turn/recovery policy.
@@ -491,7 +496,9 @@ pub struct TurnTelemetry {
     /// Whether the turn hit an explicitly configured finite per-turn
     /// tool-execution cap (`max_tool_calls`).
     pub hit_tool_cap: bool,
-    /// Attributions parsed from the last verify failure's output (empty if
+    /// Routing model id for this turn's tool timeline (empty when unknown).
+    pub model: String,
+    /// Attributions parsed from the last verify failure's output (empty if)
     /// verify passed, was skipped, or produced nothing parseable). Points at
     /// the file/line/symbol the model was steered toward.
     pub verify_attributions: Vec<TurnAttribution>,
@@ -615,6 +622,7 @@ impl Default for TurnTelemetry {
             last_no_progress_reason: String::new(),
             hit_step_cap: false,
             hit_tool_cap: false,
+            model: String::new(),
             verify_attributions: Vec::new(),
             verification_executions: Vec::new(),
             tool_calls: 0,
@@ -661,6 +669,18 @@ impl Default for TurnTelemetry {
 }
 
 impl TurnTelemetry {
+    /// Stamp the routing model on the turn and any tool rows that lack one.
+    pub(crate) fn attach_model(&mut self, model: &str) {
+        if self.model.is_empty() {
+            self.model = model.to_string();
+        }
+        for entry in &mut self.tool_timeline {
+            if entry.model.is_empty() {
+                entry.model = model.to_string();
+            }
+        }
+    }
+
     /// Replace the retained verification trail and its aggregate correctness
     /// evidence as one snapshot. This is used immediately after verification
     /// so a later settlement/persistence error cannot expose a partial view.
@@ -835,6 +855,9 @@ pub struct ToolCallEntry {
     /// Coarse kind: `read`, `mutate`, `shell`, `search`, or `other`.
     #[serde(default)]
     pub kind: String,
+    /// Routing model that issued this tool call. Empty when unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
 }
 
 impl ToolCallEntry {
@@ -846,6 +869,12 @@ impl ToolCallEntry {
         if self.kind.is_empty() {
             self.kind = tool_kind(&self.tool).to_string();
         }
+        self
+    }
+
+    /// Stamp the routing model onto this row.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
         self
     }
 }
@@ -1242,59 +1271,17 @@ pub struct Agent {
     pub(crate) mcp: Option<Arc<dyn hi_tools::McpBackend>>,
     /// Markdown memory backend (`.hi/memory.md`). `None` when `--no-memory`.
     pub(crate) memory: Option<Arc<dyn hi_tools::MemoryBackend>>,
+    /// Follow-ups for owned explore/task children (`send_subagent_message`).
+    pub(crate) subagent_mailbox: crate::agent::subagent_mailbox::SubagentMailbox,
+    /// UUID for this turn's spawn/complete events (`EventContext.attempt_id`).
+    pub(crate) turn_attempt_id: String,
 }
-
-/// Cloneable mid-turn interjection queue, drained by the turn loop at safe points.
-/// Cheap to clone because the queue is shared.
-#[derive(Clone, Default)]
-pub struct InterjectionInbox(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
-
-/// Prefix tagging an interjected message as a `/btw` side question. The preferred
-/// path is [`Agent::btw_dispatcher`] →
-/// [`BtwDispatcher::ask`] which answers **immediately** with its own model
-/// calls. The inbox tag remains for tests and frontends that only have the
-/// interjection queue; the loop drains it as a fallback. A control char keeps
-/// it out of the visible transcript and collision-free with real user text.
-pub const BTW_INTERJECTION_PREFIX: &str = "\u{1}btw:";
 
 pub use crate::agent::turn::btw::{BtwDispatcher, BtwSideEvent};
-
-impl InterjectionInbox {
-    /// Queue a user message to be injected into the running turn. Empty/
-    /// whitespace-only messages are ignored.
-    pub fn push(&self, message: impl Into<String>) {
-        let message = message.into();
-        if message.trim().is_empty() {
-            return;
-        }
-        if let Ok(mut queue) = self.0.lock() {
-            queue.push_back(message);
-        }
-    }
-
-    /// Take all queued messages, leaving the queue empty.
-    pub fn drain(&self) -> Vec<String> {
-        self.0
-            .lock()
-            .map(|mut queue| queue.drain(..).collect())
-            .unwrap_or_default()
-    }
-
-    /// Snapshot of messages still waiting (for UI; does not consume).
-    pub fn pending(&self) -> Vec<String> {
-        self.0
-            .lock()
-            .map(|queue| queue.iter().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    pub fn has_pending(&self) -> bool {
-        self.0
-            .lock()
-            .map(|queue| !queue.is_empty())
-            .unwrap_or(false)
-    }
-}
+pub use crate::interjection::{BTW_INTERJECTION_PREFIX, InterjectionInbox};
+pub use crate::steering::{
+    git_command_is_routine, git_command_is_routine_in, is_destructive_git_restore,
+};
 
 #[cfg(test)]
 mod tests;

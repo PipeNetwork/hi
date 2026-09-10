@@ -176,11 +176,12 @@ impl crate::App {
             inspect_subagent: None,
             tasks_overlay: None,
             block_viewer: None,
-            jump_picker: None,
-            rewind_picker: None,
+            turn_picker: None,
             timeline_hits: Vec::new(),
             timeline_rect: ratatui::layout::Rect::default(),
             changed_files_rect: ratatui::layout::Rect::default(),
+            composer_rect: ratatui::layout::Rect::default(),
+            frame_width: 0,
             diff_lab: None,
             race: None,
             plan_workflow_child: None,
@@ -213,8 +214,7 @@ impl crate::App {
             session_changed_files: Vec::new(),
             suggested_prompt: None,
             suggested_prompt_dismissed: false,
-            diff_text: None,
-            review_scroll: 0,
+            review: crate::review::ReviewState::default(),
             auto_approve_session: false,
             auto_approve_paths: Vec::new(),
             auto_approve_mcp: Vec::new(),
@@ -470,6 +470,12 @@ impl crate::App {
         }
         if self.permission_mode == hi_agent::PermissionMode::Auto && request.safe_for_auto() {
             return true;
+        }
+        if self.permission_mode == hi_agent::PermissionMode::Auto
+            && let hi_agent::ConfirmationRequest::ShellMutation { command, cwd } = request
+        {
+            return hi_agent::git_command_is_routine_in(command, Some(std::path::Path::new(cwd)))
+                && !hi_agent::is_destructive_git_restore(command);
         }
         match request {
             hi_agent::ConfirmationRequest::FileEdit { path, .. } => {

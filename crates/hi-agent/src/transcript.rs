@@ -148,6 +148,15 @@ fn immediate_tool_block_end(
 pub(crate) enum NudgeKind {
     /// Sent when the model re-issues the previous round's exact tool calls.
     Repeat,
+    /// Invalid tool JSON / schema. Grok-build injects a reminder and starts a
+    /// new generation; this is local format steering, not a recovery
+    /// intervention. Charging it as Continue exhausts the 3-slot budget
+    /// before the model can emit a valid edit.
+    Protocol,
+    /// Grok-build TodoGate: leftover checklist, content-only ending.
+    TodoGate,
+    /// Grok-build laziness classifier reminder. Not a recovery intervention.
+    Laziness,
     /// Sent by bounded structured plan/goal recovery and other completion
     /// gates. Ordinary prose alone never triggers an automatic continuation.
     Continue,
@@ -192,6 +201,9 @@ pub(crate) enum NudgeKind {
 const fn nudge_marker(kind: NudgeKind) -> &'static str {
     match kind {
         NudgeKind::Repeat => "[hi:nudge:repeat]",
+        NudgeKind::Protocol => "[hi:nudge:protocol]",
+        NudgeKind::TodoGate => "[hi:nudge:todogate]",
+        NudgeKind::Laziness => "[hi:nudge:laziness]",
         NudgeKind::Continue => "[hi:nudge:continue]",
         NudgeKind::Truncation => "[hi:nudge:truncation]",
         NudgeKind::Verify { .. } => "[hi:nudge:verify]",
@@ -915,9 +927,13 @@ impl Transcript {
     }
 
     fn note_recovery(&mut self, kind: NudgeKind) {
+        // Repeat/protocol are local steering (reread guard, malformed tool
+        // JSON). Charging them as recovery lets pagination or invalid-tool
+        // retries exhaust the 3-slot budget before an expected-mutation turn
+        // can demand an edit. Continue / verify / review remain real repair.
         if matches!(
             kind,
-            NudgeKind::Repeat | NudgeKind::Continue | NudgeKind::Verify { .. } | NudgeKind::Review
+            NudgeKind::Continue | NudgeKind::Verify { .. } | NudgeKind::Review
         ) {
             self.pending_recovery = Some(kind);
         }
@@ -1450,7 +1466,6 @@ Read-only review guard: use only the currently advertised read-only inspection t
             "generic documentation intent must not preserve a generated guard"
         );
     }
-
 
     #[test]
     fn resume_stubs_old_images_and_keeps_recent() {
@@ -2282,6 +2297,20 @@ Read-only review guard: use only the currently advertised read-only inspection t
         t.rewind_to(before);
         assert_eq!(t.len(), before);
         t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn repeat_nudge_does_not_request_a_recovery_intervention() {
+        let mut t = Transcript::new(vec![user("do it")]);
+        t.push_nudge(NudgeKind::Repeat, "do not re-read that file");
+        assert_eq!(t.take_recovery_request(), None);
+        t.push_nudge(NudgeKind::Protocol, "retry with valid tool JSON");
+        assert_eq!(t.take_recovery_request(), None);
+        t.push_nudge(NudgeKind::Continue, "edit a file now");
+        assert_eq!(
+            t.take_recovery_request().as_deref(),
+            Some(nudge_marker(NudgeKind::Continue))
+        );
     }
 
     #[test]

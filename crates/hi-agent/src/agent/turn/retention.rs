@@ -42,6 +42,7 @@ mod tests {
             result_chars: 0,
             truncated: false,
             kind: "other".into(),
+            model: String::new(),
         }
     }
 

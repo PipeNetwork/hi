@@ -872,11 +872,11 @@ async fn leftover_goal_rejects_explicit_mutation_decline() {
         ui.statuses
     );
     assert!(
-        agent
-            .messages()
-            .iter()
-            .any(|m| m.text().contains(crate::GOAL_CONTINUE_NUDGE)),
-        "leftover goal work should get the goal-continue nudge, last: {:?}",
+        agent.messages().iter().any(|m| {
+            let text = m.text();
+            text.contains(crate::GOAL_CONTINUE_NUDGE) && text.contains("implement the domain crate")
+        }),
+        "leftover goal work should name the active sub-goal, last: {:?}",
         agent.messages().last().map(|m| m.text())
     );
 }

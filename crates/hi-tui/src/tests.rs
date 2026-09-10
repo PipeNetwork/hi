@@ -5,9 +5,12 @@ use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
 mod composer;
+mod diff_color;
 mod goal;
+mod review_pane;
+mod send_now;
 
-fn dump(term: &Terminal<TestBackend>) -> String {
+pub(crate) fn dump(term: &Terminal<TestBackend>) -> String {
     let buf = term.backend().buffer();
     let mut out = String::new();
     for y in 0..buf.area.height {
@@ -1536,20 +1539,18 @@ fn colorizes_plain_diff_tool_output() {
     assert!(
         colored
             .iter()
-            .any(|(t, fg)| t.contains("+new") && *fg == Some(crate::theme::theme().diff_add)),
-        "added line is green: {colored:?}"
+            .any(|(t, fg)| t.contains("new") && !t.contains('+') && fg.is_some()),
+        "added line is painted: {colored:?}"
     );
     assert!(
         colored
             .iter()
-            .any(|(t, fg)| t.contains("-old") && *fg == Some(crate::theme::theme().diff_del)),
-        "removed line is red"
+            .any(|(t, fg)| t.contains("old") && !t.contains('-') && fg.is_some()),
+        "removed line is painted: {colored:?}"
     );
     assert!(
-        colored
-            .iter()
-            .any(|(t, fg)| t.contains("@@") && *fg == Some(crate::theme::theme().diff_hunk)),
-        "hunk header is cyan"
+        !colored.iter().any(|(t, _)| t.contains("@@")),
+        "grok-build inline diffs omit hunk headers: {colored:?}"
     );
 }
 
@@ -2164,7 +2165,7 @@ fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
     let screen = dump(&term);
 
     assert!(
-        screen.contains("Ctrl-D") && screen.contains("full-screen diff review"),
+        screen.contains("Ctrl-D") && screen.contains("diff review, split when wide"),
         "Ctrl-D help should describe diff toggle:\n{screen}"
     );
     assert!(
@@ -2251,7 +2252,10 @@ fn ctrl_d_toggles_diff_even_when_input_is_empty() {
         app.mode.is_review(),
         "Ctrl-D should open full-screen review"
     );
-    assert!(app.diff_text.is_some(), "opening should cache diff text");
+    assert!(
+        app.review.diff_text.is_some(),
+        "opening should cache diff text"
+    );
 
     assert_eq!(app.edit_key(&ctrl_d), None);
     assert!(
@@ -2263,9 +2267,9 @@ fn ctrl_d_toggles_diff_even_when_input_is_empty() {
 #[test]
 fn ctrl_d_opens_the_full_screen_review() {
     // Ctrl-D is an alias for Ctrl-G: the composer no longer dumps a 20-line
-    // git diff. Set diff_text directly to avoid a real git call.
+    // git diff. Set review.diff_text directly to avoid a real git call.
     let mut app = test_app("openai", "gpt-4o");
-    app.diff_text = Some("--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n+new\n".into());
+    app.review.diff_text = Some("--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n+new\n".into());
     app.mode = crate::mode::UiMode::Review;
     let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -2274,7 +2278,7 @@ fn ctrl_d_opens_the_full_screen_review() {
         screen.contains("Diff review (Ctrl-G)"),
         "review header: {screen}"
     );
-    assert!(screen.contains("+new"), "diff content rendered: {screen}");
+    assert!(screen.contains("new"), "diff content rendered: {screen}");
 
     app.mode.to_insert();
     term.draw(|f| app.render(f)).unwrap();
@@ -2462,6 +2466,29 @@ fn edit_key_submits_on_enter_and_clears() {
 }
 
 #[test]
+fn empty_ctrl_e_toggles_thinking_nonempty_stays_end_of_line() {
+    let mut app = test_app("openai", "gpt-4o");
+    let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+    assert!(!app.show_reasoning);
+    assert_eq!(app.edit_key(&ctrl_e), None);
+    assert!(app.show_reasoning, "empty prompt Ctrl+E expands thinking");
+    assert_eq!(app.edit_key(&ctrl_e), None);
+    assert!(
+        !app.show_reasoning,
+        "second empty Ctrl+E collapses thinking"
+    );
+
+    app.input.set("partial");
+    app.input.cursor = 3;
+    assert_eq!(app.edit_key(&ctrl_e), None);
+    assert!(
+        !app.show_reasoning,
+        "non-empty Ctrl+E must not steal emacs end-of-line"
+    );
+    assert_eq!(app.input.cursor(), app.input.chars.len());
+}
+
+#[test]
 fn empty_enter_submits_suggested_prompt() {
     let mut app = test_app("openai", "gpt-4o");
     app.suggested_prompt = Some("Run the unit tests".into());
@@ -2610,10 +2637,10 @@ fn block_nav_folds_one_block_independently() {
         "only the selected block toggled"
     );
 
-    // k/Up moves to the older block; Space toggles it.
+    // k/Up moves to the older block; Enter toggles it.
     app.edit_key(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     assert_eq!(app.selected_block_ord(), 0);
-    app.edit_key(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    app.edit_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     let both: Vec<bool> = app
         .transcript
         .iter()
@@ -2628,6 +2655,42 @@ fn block_nav_folds_one_block_independently() {
     app.edit_key(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     assert_eq!(app.selected_block_ord(), 0, "clamped at the top");
 
+    // Space leaves nav and lands on the prompt.
+    app.edit_key(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert!(!app.mode.is_block_nav());
+    assert!(app.following);
+    app.edit_key(&KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(
+        app.input.text(),
+        "j",
+        "keys type into the input once nav exits"
+    );
+}
+
+#[test]
+fn space_from_normal_mode_returns_to_the_prompt() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.mode = crate::mode::UiMode::Normal { search: None };
+    app.following = false;
+    assert!(matches!(
+        app.dispatch_key(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        crate::dispatch::DispatchResult::Handled
+    ));
+    assert!(!app.mode.is_normal());
+    assert!(app.following);
+    assert!(app.input.is_empty());
+}
+
+#[test]
+fn block_nav_esc_still_returns_to_insert() {
+    use crate::TranscriptEntry;
+    let mut app = test_app("openai", "gpt-4o");
+    app.transcript.push(TranscriptEntry::ToolOutput {
+        body: vec![Line::raw("line")],
+        expanded: false,
+    });
+    app.edit_key(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(app.mode.is_block_nav());
     // Esc leaves nav mode; keys go back to the input line.
     app.edit_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(!app.mode.is_block_nav());
@@ -2793,8 +2856,8 @@ fn confirmation_modal_colors_file_edit_diff() {
         "modal title shown: {screen}"
     );
     assert!(screen.contains("src/main.rs"), "file path shown: {screen}");
-    assert!(screen.contains("+new"), "added diff line shown: {screen}");
-    assert!(screen.contains("-old"), "removed diff line shown: {screen}");
+    assert!(screen.contains("new"), "added diff line shown: {screen}");
+    assert!(screen.contains("old"), "removed diff line shown: {screen}");
 }
 
 #[test]
@@ -2825,7 +2888,7 @@ fn review_overlay_shows_full_diff_with_title() {
     let mut app = test_app("openai", "gpt-4o");
     app.workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     app.mode = crate::mode::UiMode::Review;
-    app.diff_text = Some(
+    app.review.diff_text = Some(
         "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n".to_string(),
     );
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -2835,8 +2898,8 @@ fn review_overlay_shows_full_diff_with_title() {
         screen.contains("Diff review"),
         "overlay title shown: {screen}"
     );
-    assert!(screen.contains("+new"), "added line visible: {screen}");
-    assert!(screen.contains("-old"), "removed line visible: {screen}");
+    assert!(screen.contains("new"), "added line visible: {screen}");
+    assert!(screen.contains("old"), "removed line visible: {screen}");
     assert!(
         screen.contains("n/p hunks"),
         "keybinding footer shown: {screen}"
@@ -3015,21 +3078,13 @@ fn review_next_hunk_jumps_between_hunk_headers() {
                 @@ -10,1 +10,1 @@\n\
                 -e\n\
                 +f\n";
-    // From line 0 (before first hunk), n → first hunk at line 3.
+    // Painted grok-build layout: hunks at 0, 3, 6 with `…` separators.
     assert_eq!(review_next_hunk(Some(diff), 0, 1), 3);
-    // From line 3 (first hunk), n → second hunk at line 6.
     assert_eq!(review_next_hunk(Some(diff), 3, 1), 6);
-    // From line 6 (second hunk), n → third hunk at line 9.
-    assert_eq!(review_next_hunk(Some(diff), 6, 1), 9);
-    // From line 9 (third hunk), n → clamps to last line (no more hunks).
-    assert_eq!(review_next_hunk(Some(diff), 9, 1), 11);
-    // From line 9, p → previous hunk at line 6.
-    assert_eq!(review_next_hunk(Some(diff), 9, -1), 6);
-    // From line 6, p → previous hunk at line 3.
+    assert_eq!(review_next_hunk(Some(diff), 6, 1), 7);
     assert_eq!(review_next_hunk(Some(diff), 6, -1), 3);
-    // From line 3, p → clamps to 0 (no earlier hunk).
     assert_eq!(review_next_hunk(Some(diff), 3, -1), 0);
-    // None diff → returns `from` unchanged.
+    assert_eq!(review_next_hunk(Some(diff), 0, -1), 0);
     assert_eq!(review_next_hunk(None, 5, 1), 5);
 }
 
@@ -3039,7 +3094,7 @@ fn open_review_with_no_files_shows_full_diff() {
     app.workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     app.open_review(None);
     assert!(app.mode.is_review(), "review overlay opened");
-    assert!(app.review_scroll == 0, "scroll reset to top");
+    assert!(app.review.scroll == 0, "scroll reset to top");
 }
 
 #[test]
@@ -5228,7 +5283,7 @@ fn edit_activity_row_shows_colored_diffstat() {
 fn renders_fetching_spinner() {
     let mut app = test_app("pipenetwork", "ipop/coder-balanced");
     app.fetching = Some(Instant::now());
-    let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(72, 10)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     assert!(
@@ -5357,8 +5412,8 @@ fn completion_opens_filters_and_closes() {
     app.sync_completion();
     assert_eq!(
         app.completion_items().len(),
-        hi_agent::command::COMMANDS.len() + 3,
-        "bare slash lists every agent command and tutorial alias"
+        hi_agent::command::COMMANDS.len() + 1,
+        "bare slash lists every catalog command and /tutorial"
     );
     let tutorial_labels: Vec<String> = app
         .completion_items()
@@ -5366,7 +5421,7 @@ fn completion_opens_filters_and_closes() {
         .map(|item| item.label.clone())
         .filter(|label| matches!(label.as_str(), "/tutorial" | "/tour" | "/onboarding"))
         .collect();
-    assert_eq!(tutorial_labels.len(), 3);
+    assert_eq!(tutorial_labels, ["/tutorial"]);
     app.input.set("/co");
     app.sync_completion();
     let labels: Vec<String> = app
@@ -5638,11 +5693,21 @@ fn completion_move_clamps() {
     assert_eq!(app.completion.as_ref().unwrap().selected, 0);
     app.completion_move(1);
     assert_eq!(app.completion.as_ref().unwrap().selected, 1);
+    app.completion_move(crate::completion::COMPLETION_VISIBLE_ROWS as isize);
+    assert_eq!(
+        app.completion.as_ref().unwrap().selected,
+        (1 + crate::completion::COMPLETION_VISIBLE_ROWS).min(last)
+    );
     // Move past the end to verify clamping.
     for _ in 0..last + 1 {
         app.completion_move(1);
     }
     assert_eq!(app.completion.as_ref().unwrap().selected, last);
+    app.completion_move(-(crate::completion::COMPLETION_VISIBLE_ROWS as isize));
+    assert_eq!(
+        app.completion.as_ref().unwrap().selected,
+        last.saturating_sub(crate::completion::COMPLETION_VISIBLE_ROWS)
+    );
 }
 
 #[test]
@@ -5654,7 +5719,11 @@ fn renders_completion_menu() {
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     assert!(screen.contains("/help"), "lists help: {screen}");
-    assert!(screen.contains("/model"), "lists model: {screen}");
+    assert!(screen.contains("/config"), "lists config: {screen}");
+    assert!(
+        !screen.contains("/model"),
+        "bare slash omits /config aliases: {screen}"
+    );
     assert!(screen.contains("▶"), "highlights a row: {screen}");
 }
 
@@ -6682,6 +6751,12 @@ fn session_chrome_matches_grok_build_stack() {
         "idle session still shows the grok-build mode hint: {compact_screen}"
     );
     assert!(
+        compact_rows
+            .iter()
+            .any(|l| l.contains("ctrl+e") && l.contains("thinking")),
+        "idle session shows Ctrl+E thinking toggle: {compact_screen}"
+    );
+    assert!(
         compact_screen.contains("❯ next") || compact_screen.contains("next"),
         "composer shows the draft: {compact_screen}"
     );
@@ -7042,8 +7117,8 @@ fn ctrl_f_opens_block_viewer_with_expanded_hunks() {
     let viewer = app.block_viewer.as_ref().expect("block viewer");
     let text = viewer.texts.join("\n");
     assert!(
-        text.contains("@@") && (text.contains("+new") || text.contains("new")),
-        "expanded hunk missing: {text}"
+        text.contains("new") && text.contains("old") && !text.contains("@@"),
+        "expanded grok-build hunk missing: {text}"
     );
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     assert!(matches!(
@@ -7067,13 +7142,13 @@ fn jump_picker_scrolls_and_esc_restores() {
     app.following = false;
     let restore = app.scroll;
     app.open_jump_picker();
-    assert!(app.jump_picker.is_some());
+    assert!(app.turn_picker.is_some());
     let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
-    crate::session_pickers::handle_jump_key(&mut app, &key);
+    crate::session_pickers::handle_turn_picker_key(&mut app, &key);
     assert_ne!(app.scroll, restore, "j/k should live-scroll");
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-    crate::session_pickers::handle_jump_key(&mut app, &esc);
-    assert!(app.jump_picker.is_none());
+    crate::session_pickers::handle_turn_picker_key(&mut app, &esc);
+    assert!(app.turn_picker.is_none());
     assert_eq!(app.scroll, restore);
 }
 
@@ -7099,7 +7174,7 @@ fn rewind_transcript_drops_chosen_prompt_and_later_rows() {
 #[test]
 fn rewind_picker_confirm_emits_turn_number() {
     let mut app = test_app("openai", "gpt-4o");
-    app.rewind_picker = crate::session_pickers::RewindPicker::new(vec![
+    app.turn_picker = crate::session_pickers::TurnPicker::rewind(vec![
         hi_agent::UserTurn {
             n: 1,
             message_index: 1,
@@ -7113,11 +7188,11 @@ fn rewind_picker_confirm_emits_turn_number() {
     ]);
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     assert!(matches!(
-        crate::session_pickers::handle_rewind_key(&mut app, &enter),
+        crate::session_pickers::handle_turn_picker_key(&mut app, &enter),
         crate::session_pickers::PickerOutcome::Continue
     ));
     assert!(matches!(
-        crate::session_pickers::handle_rewind_key(&mut app, &enter),
+        crate::session_pickers::handle_turn_picker_key(&mut app, &enter),
         crate::session_pickers::PickerOutcome::Rewind(2)
     ));
 }
@@ -7174,8 +7249,8 @@ async fn rewind_without_arg_opens_picker() {
     let mut app = test_app("openai", "gpt-4o");
     app.handle_command(&mut agent, hi_agent::Command::Rewind(String::new()))
         .await;
-    let picker = app.rewind_picker.as_ref().expect("rewind picker");
-    assert_eq!(picker.turns.len(), 2);
+    let picker = app.turn_picker.as_ref().expect("rewind picker");
+    assert_eq!(picker.rows.len(), 2);
 }
 
 #[test]

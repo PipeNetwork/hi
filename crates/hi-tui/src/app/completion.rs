@@ -16,15 +16,13 @@ impl crate::App {
     pub(crate) fn items_for_ctx(&self, ctx: &CompletionContext) -> Vec<CompletionItem> {
         if let CompletionContext::Command(prefix) = ctx {
             let mut items = completion_items_for(ctx);
-            for alias in ["tutorial", "tour", "onboarding"] {
-                if alias.starts_with(prefix) {
-                    items.push(CompletionItem {
-                        label: format!("/{alias}"),
-                        help: "open the interactive hi tutorial".into(),
-                        insert: format!("/{alias}"),
-                        submit_on_enter: true,
-                    });
-                }
+            if "tutorial".starts_with(prefix) {
+                items.push(CompletionItem {
+                    label: "/tutorial".into(),
+                    help: "open the interactive hi tutorial".into(),
+                    insert: "/tutorial".into(),
+                    submit_on_enter: true,
+                });
             }
             return items;
         }
@@ -311,9 +309,10 @@ impl crate::App {
             && len > 0
         {
             let last = len - 1;
-            c.selected = match delta {
-                d if d < 0 => c.selected.saturating_sub(1),
-                _ => (c.selected + 1).min(last),
+            c.selected = if delta < 0 {
+                c.selected.saturating_sub(delta.unsigned_abs())
+            } else {
+                c.selected.saturating_add(delta as usize).min(last)
             };
         }
     }

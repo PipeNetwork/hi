@@ -35,25 +35,20 @@ impl crate::Agent {
             .structured
             .as_ref()
             .filter(|goal| goal.should_auto_drive())?;
-        let active = goal.active_sub_goal()?;
-        let notes = if active.notes.is_empty() {
-            String::new()
-        } else {
-            format!("\nPrior failed attempts:\n- {}", active.notes.join("\n- "))
-        };
-        Some(format!(
-            "Continue the long-horizon goal.\nObjective: {}\nActive sub-goal: {}{}\nComplete this milestone with concrete work and current-revision validation. Preserve the full goal checklist when calling update_plan and append any newly discovered implementation steps.",
-            goal.objective, active.description, notes
+        let _ = goal.active_sub_goal()?;
+        let plan_file_next = crate::goal::plan_file::first_unchecked_plan_item(
+            &self.runtime.root().join(crate::goal::GOAL_EXPORT_PATH),
+        );
+        Some(crate::goal::continuation::render_drive_continuation(
+            goal,
+            self.goals.plan(),
+            self.last_assistant_text().as_deref(),
+            plan_file_next,
         ))
     }
 
-    /// Long-horizon driver — called at turn end. When a structured goal is set
-    /// and `long_horizon` is on, advance or retry the active sub-goal based on
-    /// the turn's outcome, so the next turn resumes at the right sub-goal (with
-    /// prior-attempt notes if it made no progress, so the model doesn't repeat a failed
-    /// approach). The verify retry itself happens *within* the turn (the 'turn
-    /// loop re-runs the model on a verify failure); this hook handles the
-    /// goal-level progression once the turn settles.
+    /// Long-horizon driver at turn end: advance or retry the active sub-goal
+    /// from the settled turn. Verify retries happen inside the turn loop.
     pub(crate) async fn goal_turn_end(
         &mut self,
         state: GoalTurnState<'_>,
@@ -70,9 +65,7 @@ impl crate::Agent {
             verification_infrastructure_error,
             provider_exhausted,
         } = state;
-        // Drafting a plan is not an execution attempt. In particular, a capped
-        // planning turn must not consume the approved goal's retries or mark
-        // its active milestone barren/failed.
+        // Plan-mode turns must not consume the approved goal's retries.
         if self.plan_mode || !self.config.subagents.long_horizon {
             return false;
         }
@@ -117,39 +110,25 @@ impl crate::Agent {
             (false, true) => "tool-call cap",
             (false, false) => "work cap",
         };
-        // Only verifier-backed success may advance a long-horizon goal.
-        // Phase C: same obligation as the interactive settle path — a done-claim
-        // via update_plan or heuristic advance is not enough without a green seal
-        // and a turn that stayed within its work limit. Skeptic (below) is an extra gate on top.
-        let verified_clean = self.report.verify.passed();
-        let mut clean_success = verified_clean && !hit_work_cap;
+        let goal_kind = start_goal.kind;
+        // Code-change needs a green verify seal. Analysis/research may complete
+        // on a claimed, non-bail write-up (`prose_turn_is_complete`).
+        let mut clean_success = (self.report.verify.passed() && !hit_work_cap)
+            || crate::goal::kind_lens::prose_turn_is_complete(
+                goal_kind,
+                &self.report.verify,
+                hit_work_cap,
+                proposed_goal.as_ref(),
+                Some(start_goal),
+                self.last_assistant_text().as_deref().unwrap_or(""),
+            );
 
-        // Skeptic gate: on a clean-success turn, a second model reviews the work
-        // before its progress stands. It reviews the sub-goal that was active AT
-        // TURN START — because `update_plan` may have marked that sub-goal (or the
-        // whole goal) done mid-turn, and the model's own "done" claim is exactly
-        // what a skeptic should second-guess. On an objection we revert the turn's
-        // goal progress (restore the pre-turn goal) and record the objections as a
-        // retry note; the edits stay on disk for the next turn to build on.
-        // Reviewer transport/protocol failures are diagnostic rather than a
-        // veto: this gate only runs after deterministic verification passed on
-        // concrete workspace changes, and the reviewer transport already uses
-        // bounded retry/backoff. A persistent outage must not turn productive
-        // work into a failed attempt or park an unattended goal. Concrete
-        // OBJECT/ESCALATE verdicts remain authoritative.
-        // Trivial-diff exemption: a full second-model review round-trip buys
-        // nothing when the turn's net change is tiny and verify already passed
-        // — the failures the gate catches (wrong artifact, stub stand-ins,
-        // unhandled required cases) need more than a few bytes of diff to hide
-        // in. Sum the byte deltas of this turn's changes; a delete or a
-        // digest-only change (mode/mtime noise) counts as its full length.
-        // Bounded by `SKEPTIC_TRIVIAL_DIFF_BYTES`; anything bigger reviews as
-        // before. Statuses flips only (no net file change) can't reach here —
-        // `clean_success` requires a verified change.
+        // Skeptic reviews the sub-goal that was active at turn start (the model's
+        // own "done" claim). Objection restores the pre-turn goal; edits stay.
+        // Reviewer unavailability is diagnostic, not a veto. Tiny verified diffs
+        // skip the extra model call; analysis/research still review the write-up.
         let trivial_diff = {
-            // Prose-only paths (docs, `.hi/memory.md`, skills) must not push a
-            // one-line code fix over the trivial-diff exemption — coding-memory
-            // and skill curation write those after verify by design.
+            // Prose-only paths must not push a one-line code fix over the exemption.
             let changed_bytes: u64 = self
                 .workspace
                 .last_file_changes
@@ -164,11 +143,12 @@ impl crate::Agent {
                 .sum();
             changed_bytes <= crate::goal::SKEPTIC_TRIVIAL_DIFF_BYTES
         };
-        if clean_success && trivial_diff {
+        let skip_skeptic_for_trivial = trivial_diff && goal_kind.requires_workspace_evidence();
+        if clean_success && skip_skeptic_for_trivial {
             ui.status("🔍 skeptic skipped — trivial diff under verified pass");
         }
         if clean_success
-            && !trivial_diff
+            && !skip_skeptic_for_trivial
             && let Some((objective, sub_goal, prior_notes)) = goal_before.as_ref().and_then(|g| {
                 if !g.team || g.paused || g.status != GoalStatus::Active {
                     return None;
@@ -190,13 +170,29 @@ impl crate::Agent {
                     if let Some(goal) = self.goals.structured.as_mut() {
                         goal.skeptic_objections = goal.skeptic_objections.saturating_add(1);
                         goal.last_skeptic_status = Some(SkepticStatus::Objected);
+                        goal.last_gaps = crate::goal::clip_chars(&objections, 800);
                         goal.record_failure(
                             format!("reviewer objected — address then continue:\n{objections}"),
                             max_retries,
                         );
                     }
+                    let stalled = self
+                        .goals
+                        .structured
+                        .as_mut()
+                        .is_some_and(Goal::record_repeated_gaps);
                     let first = objections.lines().next().unwrap_or("see notes");
-                    ui.status(&format!("🔍 skeptic objected — retrying: {first}"));
+                    if stalled {
+                        if let Some(goal) = self.goals.structured.as_mut() {
+                            goal.pause(crate::goal::GoalPauseReason::Stall);
+                        }
+                        ui.status(&format!(
+                            "⏸ same verifier gaps twice — pausing. Last: {first}. /goal resume to continue."
+                        ));
+                    } else {
+                        ui.status(&format!("🔍 skeptic objected — retrying: {first}"));
+                        self.maybe_run_goal_strategist(ui).await;
+                    }
                     self.refresh_system_message();
                     self.persist_goal_async(ui).await;
                     self.report.last_turn_telemetry.skeptic_last_status =
@@ -231,6 +227,7 @@ impl crate::Agent {
                 SkepticVerdict::Approve => {
                     if let Some(goal) = self.goals.structured.as_mut() {
                         goal.last_skeptic_status = Some(SkepticStatus::Approved);
+                        goal.clear_repeated_gaps();
                     }
                     self.report.last_turn_telemetry.skeptic_last_status =
                         Some(SkepticStatus::Approved);
@@ -276,7 +273,7 @@ impl crate::Agent {
         // The skeptic is an asynchronous model call. Reconcile again before
         // allowing it to advance the goal so edits made while it was reviewing
         // cannot inherit the earlier deterministic pass.
-        if clean_success {
+        if clean_success && goal_kind.requires_workspace_evidence() {
             match self.runtime.reconcile_ledger_async().await {
                 Ok(reconciled) => {
                     if !reconciled.is_empty() {
@@ -343,7 +340,8 @@ impl crate::Agent {
         // A clean read-only turn (investigation, Q&A — no edits, no verify,
         // no failed check) is neutral: neither advance nor record failure. The sub-goal
         // stays active for the next turn, which should do the actual work.
-        let no_edit_neutral = self.report.verify.as_bool().is_none()
+        let no_edit_neutral = !clean_success
+            && self.report.verify.as_bool().is_none()
             && !hit_work_cap
             && self.workspace.last_changed_files.is_empty();
         if no_edit_neutral {

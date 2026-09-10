@@ -60,6 +60,9 @@ impl crate::App {
         use crossterm::event::{MouseButton, MouseEventKind};
         self.mouse_col = mouse.column;
         self.mouse_row = mouse.row;
+        if self.handle_review_mouse(&mouse) {
+            return;
+        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && crate::btw::cell_in(self.changed_files_rect, mouse.column, mouse.row)
         {

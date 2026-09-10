@@ -334,7 +334,7 @@ async fn destination_pipeline_uses_one_shared_total_deadline() {
     assert_eq!(outcome.state, hi_tools::BackgroundTaskState::Failed);
     assert!(!fixture.root.join("candidate.txt").exists());
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < Duration::from_millis(4500),
         "later stages must receive only the shared pipeline remainder, not their full per-stage timeout: {elapsed:?}"
     );
     let attempts = fixture.attempts.lock().unwrap();

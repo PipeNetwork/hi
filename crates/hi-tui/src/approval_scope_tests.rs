@@ -54,3 +54,29 @@ fn legacy_malformed_prefix_cannot_authorize_parent_path() {
     assert!(!app.path_auto_approved("src/../.env"));
     assert!(!app.path_auto_approved("(unknown)"));
 }
+
+#[test]
+fn auto_mode_approves_routine_git_and_blocks_discards() {
+    let mut app = test_app("custom", "test-model");
+    app.permission_mode = hi_agent::PermissionMode::Auto;
+    let add = hi_agent::ConfirmationRequest::ShellMutation {
+        command: "git add -A".into(),
+        cwd: "/tmp".into(),
+    };
+    let reset = hi_agent::ConfirmationRequest::ShellMutation {
+        command: "git reset --hard".into(),
+        cwd: "/tmp".into(),
+    };
+    let rm = hi_agent::ConfirmationRequest::ShellMutation {
+        command: "rm -rf src".into(),
+        cwd: "/tmp".into(),
+    };
+    assert!(app.should_auto_approve(&add));
+    assert!(!app.should_auto_approve(&reset));
+    assert!(!app.should_auto_approve(&rm));
+    let path_checkout = hi_agent::ConfirmationRequest::ShellMutation {
+        command: "git checkout src/foo".into(),
+        cwd: "/tmp".into(),
+    };
+    assert!(!app.should_auto_approve(&path_checkout));
+}

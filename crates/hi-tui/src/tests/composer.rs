@@ -183,3 +183,79 @@ fn changed_files_and_long_ghost_stay_above_the_box() {
         "changed-files row should sit directly above the prompt box:\n{screen}"
     );
 }
+
+fn composer_inner(screen: &str) -> (usize, String) {
+    let rows: Vec<&str> = screen.lines().collect();
+    let bottom = rows
+        .iter()
+        .rposition(|line| line.trim_start().starts_with('╰'))
+        .expect("composer bottom border");
+    let top = rows[..=bottom]
+        .iter()
+        .rposition(|line| line.trim_start().starts_with('╭'))
+        .expect("composer top border");
+    (
+        bottom.saturating_sub(top).saturating_sub(1),
+        rows[top + 1..bottom].join("\n"),
+    )
+}
+
+#[test]
+fn slash_menu_is_a_small_scrollable_window() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("/");
+    app.sync_completion();
+    let items = app.completion_items();
+    let total = items.len();
+    assert!(
+        total > crate::completion::COMPLETION_VISIBLE_ROWS,
+        "catalog must overflow the window so scrolling is observable"
+    );
+    let first = items[0].label.clone();
+    let last = items.last().unwrap().label.clone();
+    assert_ne!(first, last);
+
+    let mut term = Terminal::new(TestBackend::new(72, 24)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen = dump(&term);
+    let (height, body) = composer_inner(&screen);
+    assert!(body.contains(&first), "first page shows {first}:\n{body}");
+    assert!(
+        !body.contains(&last),
+        "first page hides later command {last}:\n{body}"
+    );
+    assert!(body.contains("↑↓"), "overflow count is visible:\n{body}");
+    assert!(
+        height <= crate::completion::COMPLETION_VISIBLE_ROWS + 3,
+        "slash menu must not grow the composer to fit the catalog:\n{screen}"
+    );
+    assert_composer_closed_with_prompt(&screen);
+
+    app.completion_move(crate::completion::COMPLETION_VISIBLE_ROWS as isize);
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen = dump(&term);
+    let (_, body) = composer_inner(&screen);
+    assert!(
+        !body.contains(&first),
+        "page-down hides the first command {first}:\n{body}"
+    );
+
+    let last_idx = total - 1;
+    app.completion.as_mut().unwrap().selected = last_idx;
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen = dump(&term);
+    let (_, body) = composer_inner(&screen);
+    assert!(
+        body.contains(&last),
+        "scrolled window shows the last command {last}:\n{body}"
+    );
+    assert!(
+        !body.contains(&first),
+        "scrolled window hides the first command {first}:\n{body}"
+    );
+    assert!(
+        body.contains(&format!("{}/{}", last_idx + 1, total)),
+        "count tracks the highlight:\n{body}"
+    );
+    assert_composer_closed_with_prompt(&screen);
+}

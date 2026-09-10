@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use hi_ai::{Content, Message};
 
 use super::implementation::{
-    bash_inspection_signature, bash_no_progress_signature, implementation_tool_call_validates,
+    bash_inspection_paths, bash_inspection_signature, bash_no_progress_signature,
+    implementation_tool_call_validates,
 };
 use super::intent::{
     compact_search_hit_line, evidence_kind_for_tool, grep_match_line_count, search_hit_score,
@@ -70,33 +71,32 @@ impl ImplementationTracker {
         &mut self,
         name: &str,
         arguments: &str,
-        _output: &str,
+        output: &str,
         validation_succeeded: bool,
         mutation_applied: bool,
     ) {
         let validation_observed =
             validation_succeeded && implementation_tool_call_validates(name, arguments);
-        let tests_passed =
-            validation_observed && super::tool_guardrail::command_runs_tests(arguments);
-        // Some mutation-capable tools (notably `delegate`) report their exact
-        // applied effects in the typed outcome rather than in display text.
-        // Keep the typed effect authoritative so a successful delegated edit
-        // does not get mistaken for a no-op by the completeness gate.
+        let tests_passed = super::tool_guardrail::tool_result_shows_passing_tests(
+            name,
+            arguments,
+            output,
+            validation_observed,
+        );
+        // `delegate` reports applied effects in the typed outcome, not display text.
         if mutation_applied {
             self.mutation_seen = true;
             self.tests_seen = false;
             self.background_validations.clear();
-            // A successful validation command can itself create or update a
-            // lockfile. Its validation completed after that side effect, so it
-            // satisfies both the requested-validation and post-mutation gates.
-            self.validation_after_last_mutation = validation_observed;
-            if validation_observed {
+            // A validation command that writes a lockfile still counts after that side effect.
+            self.validation_after_last_mutation = validation_observed || tests_passed;
+            if validation_observed || tests_passed {
                 self.record_validation_success();
                 self.tests_seen |= tests_passed;
             }
             return;
         }
-        if validation_observed {
+        if validation_observed || tests_passed {
             self.record_validation_success();
             self.tests_seen |= tests_passed;
         }
@@ -144,21 +144,10 @@ pub(crate) struct EvidenceTracker {
     pub(crate) search_hit_snippets: Vec<String>,
     pub(crate) first_tool_kind: Option<EvidenceKind>,
     pub(crate) quality_repair_nudges: u32,
-    /// Inspection signatures seen at the current workspace revision, used by the no-new-evidence
-    /// cycle guard. Each entry is a stable key derived from a read-only tool
-    /// call's identity: `read:<path>:<offset>:<limit>`,
-    /// `list:<path>`, `grep:<pattern>:<glob>:<path>:<context>`,
-    /// `glob:<pattern>:<path>`, a stale background handle
-    /// `bash_output:<id>`/`bash_kill:<id>`, or a narrow no-progress bash command.
-    /// A round whose
-    /// every read-only call's signature is already in this set adds no new
-    /// evidence — re-running it can only reproduce prior output. Live
-    /// `bash_output` polls are intentionally not recorded here because a running
-    /// background process can emit new output later; missing/pruned/completed
-    /// handles are recorded because polling them again cannot produce new
-    /// output. Mutating tools are never added here; ordinary bash still counts
-    /// as potentially new, but a tightly recognized no-op/control bash command
-    /// gets a signature so stop/quit/done loops are bounded.
+    /// Inspection signatures at this workspace revision for the no-new-evidence
+    /// cycle guard (`read:…`, `list:…`, `grep:…`, stale `bash_output`/`bash_kill`,
+    /// no-progress bash). Live `bash_output` polls are omitted because a running
+    /// process can emit later; mutating tools are never recorded here.
     pub(crate) seen_signatures: VecDeque<String>,
     pub(crate) seen_signature_set: HashSet<String>,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -224,6 +213,18 @@ impl EvidenceTracker {
         }
         if name == "bash" {
             self.record_inspection_signature(name, arguments);
+            for path in bash_inspection_paths(arguments) {
+                self.saw_read = true;
+                self.file_reads = self.file_reads.saturating_add(1);
+                if !self
+                    .inspected_paths
+                    .iter()
+                    .any(|seen| paths_refer_to_same_file(seen, &path))
+                {
+                    Self::push_path(&mut self.inspected_paths, path.clone());
+                }
+                Self::push_path(&mut self.completed_read_paths, path);
+            }
         }
         let Some(kind) = evidence_kind else {
             return;
@@ -310,15 +311,25 @@ impl EvidenceTracker {
                         _ => return true,
                     }
                 }
-                "list" | "grep" | "glob" | "bash_output" | "bash_kill" | "bash" => {
+                "bash" => {
+                    let paths = bash_inspection_paths(args);
+                    if !paths.is_empty() {
+                        if paths.iter().all(|path| self.has_inspected_path(path)) {
+                            continue;
+                        }
+                        return true;
+                    }
+                    match inspection_signature(name, args) {
+                        Some(sig) if self.has_seen_signature(&sig) => {}
+                        _ => return true,
+                    }
+                }
+                "list" | "grep" | "glob" | "bash_output" | "bash_kill" => {
                     if name == "grep" && self.has_seen_signature("grep:error:unavailable") {
                         continue;
                     }
                     match inspection_signature(name, args) {
                         Some(sig) if self.has_seen_signature(&sig) => {}
-                        // A new signature, or arguments we cannot signature safely,
-                        // should execute. The normal tool path will surface malformed
-                        // arguments; the cycle guard must not hide them.
                         _ => return true,
                     }
                 }
@@ -336,6 +347,14 @@ impl EvidenceTracker {
 
     fn path_already_inspected(&self, path: &str) -> bool {
         self.path_read_is_complete(path) || self.path_read_is_truncated(path)
+    }
+
+    fn has_inspected_path(&self, path: &str) -> bool {
+        self.path_already_inspected(path)
+            || self
+                .inspected_paths
+                .iter()
+                .any(|seen| paths_refer_to_same_file(seen, path))
     }
 
     fn path_read_is_truncated(&self, path: &str) -> bool {
@@ -634,144 +653,8 @@ fn background_handle_is_terminal(name: &str, output: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn evidence_cycle_diagnostics_are_bounded_without_blocking_new_inspections() {
-        let mut evidence = EvidenceTracker::default();
-        for index in 0..5_000 {
-            evidence.record_signature(format!("signature-{index}"));
-        }
-
-        assert_eq!(
-            evidence.seen_signatures.len(),
-            EvidenceTracker::SIGNATURE_LIMIT
-        );
-        assert_eq!(
-            evidence.seen_signature_set.len(),
-            EvidenceTracker::SIGNATURE_LIMIT
-        );
-        assert_eq!(evidence.seen_signatures_dropped, 904);
-        assert!(!evidence.has_seen_signature("signature-0"));
-        assert!(evidence.has_seen_signature("signature-4999"));
-
-        for index in 0..2_100 {
-            evidence.record_success(
-                "read",
-                &serde_json::json!({"path": format!("src/{index}.rs")}).to_string(),
-                "1\tcontents\n",
-            );
-        }
-        assert_eq!(evidence.inspected_paths.len(), EvidenceTracker::PATH_LIMIT);
-        assert_eq!(
-            evidence.completed_read_paths.len(),
-            EvidenceTracker::PATH_LIMIT
-        );
-        assert_eq!(
-            evidence.inspected_paths.front().map(String::as_str),
-            Some("src/52.rs")
-        );
-        assert_eq!(
-            evidence.inspected_paths.back().map(String::as_str),
-            Some("src/2099.rs")
-        );
-    }
-
-    #[test]
-    fn successful_validation_is_recorded_without_a_mutation() {
-        let mut tracker = ImplementationTracker::default();
-        tracker.record_tool_result(
-            "bash",
-            r#"{"command":"cargo test --quiet"}"#,
-            "",
-            true,
-            false,
-        );
-        assert!(tracker.validation_seen);
-        assert!(!tracker.validation_after_last_mutation);
-    }
-
-    #[test]
-    fn validation_that_updates_a_lockfile_still_counts_as_validation() {
-        let mut tracker = ImplementationTracker::default();
-        tracker.record_tool_result(
-            "bash",
-            r#"{"command":"cargo test --quiet"}"#,
-            "",
-            true,
-            true,
-        );
-        assert!(tracker.mutation_seen);
-        assert!(tracker.validation_seen);
-        assert!(tracker.validation_after_last_mutation);
-    }
-
-    #[test]
-    fn elided_completed_read_is_reopened_for_paging() {
-        let mut evidence = EvidenceTracker::default();
-        evidence.record_success(
-            "read",
-            r#"{"path":"crates/hi-tui/src/lib.rs"}"#,
-            "   1\tfn main() {}\n",
-        );
-        assert!(
-            evidence.rereads_only_completed_files(&[(
-                "c".into(),
-                "read".into(),
-                r#"{"path":"crates/hi-tui/src/lib.rs","offset":560}"#.into(),
-            )]),
-            "a full read should block extra pages"
-        );
-        let messages = vec![
-            Message::assistant(vec![Content::ToolCall {
-                id: "r1".into(),
-                name: "read".into(),
-                arguments: r#"{"path":"crates/hi-tui/src/lib.rs"}"#.into(),
-            }]),
-            Message::tool_result("r1", "[elided read output — was 1289 lines]"),
-        ];
-        evidence.reopen_elided_reads(&messages);
-        assert!(
-            !evidence.rereads_only_completed_files(&[(
-                "c".into(),
-                "read".into(),
-                r#"{"path":"crates/hi-tui/src/lib.rs","offset":560}"#.into(),
-            )]),
-            "elided contents are no longer 'returned in full'"
-        );
-        assert!(
-            evidence.round_adds_evidence(&[(
-                "c".into(),
-                "read".into(),
-                r#"{"path":"crates/hi-tui/src/lib.rs","offset":560}"#.into(),
-            )]),
-            "an extra page of an elided file is new evidence"
-        );
-    }
-
-    #[test]
-    fn truncated_file_paging_crosses_the_legacy_eight_page_boundary() {
-        let mut evidence = EvidenceTracker::default();
-        for page in 0..9 {
-            let offset = page * 100 + 1;
-            evidence.record_success(
-                "read",
-                &serde_json::json!({"path": "src/large.rs", "offset": offset}).to_string(),
-                &format!(
-                    "{offset}\tcontent\n— read more with offset {}",
-                    offset + 100
-                ),
-            );
-        }
-
-        assert!(evidence.round_adds_evidence(&[(
-            "next".into(),
-            "read".into(),
-            serde_json::json!({"path": "src/large.rs", "offset": 901}).to_string(),
-        )]));
-    }
-}
+#[path = "types_tests.rs"]
+mod tests;
 
 #[cfg(test)]
 mod implementation_effect_tests {

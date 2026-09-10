@@ -658,6 +658,7 @@ mod tests {
             result_chars: 0,
             truncated: false,
             kind: "shell".into(),
+            model: String::new(),
         }
     }
 

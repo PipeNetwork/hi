@@ -154,6 +154,16 @@ fn pipefs_is_opt_in_and_headless_flag_requires_session_persistence() {
 }
 
 #[test]
+fn worktree_flag_is_opt_in_and_conflicts_with_subagent() {
+    let default = Cli::try_parse_from(["hi"]).unwrap();
+    assert!(!default.worktree);
+    let enabled = Cli::try_parse_from(["hi", "--worktree"]).unwrap();
+    assert!(enabled.worktree);
+    assert!(Cli::try_parse_from(["hi", "--worktree", "--subagent"]).is_err());
+    assert!(Cli::try_parse_from(["hi", "--worktree", "--review-target", "."]).is_err());
+}
+
+#[test]
 fn pipefs_config_round_trips_and_project_overlay_can_only_disable() {
     let configured: Config = toml::from_str("[pipefs]\nenabled = true\n").unwrap();
     assert!(configured.pipefs.is_enabled());

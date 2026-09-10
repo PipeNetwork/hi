@@ -180,7 +180,7 @@ async fn parked_plan_approval_restores_and_view_plan_unparks_once() {
         "restart must not auto-drive parked work"
     );
 
-    app.handle_command(&mut agent, hi_agent::Command::ViewPlan)
+    app.handle_command(&mut agent, hi_agent::Command::Plan("show".into()))
         .await;
 
     assert!(app.plan_approval_capturing());
@@ -193,7 +193,7 @@ async fn parked_plan_approval_restores_and_view_plan_unparks_once() {
         "/view-plan must preserve /plan pause"
     );
 
-    app.handle_command(&mut agent, hi_agent::Command::ViewPlan)
+    app.handle_command(&mut agent, hi_agent::Command::Plan("show".into()))
         .await;
     assert!(
         agent.plan_approval_parked(),

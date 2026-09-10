@@ -136,7 +136,12 @@ pub(super) fn validate_sealed_tool_call(
     })
 }
 
-pub(super) fn emit_capability_request(ui: &mut dyn Ui, id: &str, tool: &str) {
+pub(super) fn emit_capability_request(
+    ui: &mut dyn Ui,
+    id: &str,
+    tool: &str,
+    attempt_id: Option<&str>,
+) {
     let capability = capability_kind_for_tool(tool);
     if capability_is_read_only(&capability) {
         return;
@@ -149,6 +154,7 @@ pub(super) fn emit_capability_request(ui: &mut dyn Ui, id: &str, tool: &str) {
         EventKind::CapabilityRequested,
         EventContext {
             correlation_id: Some(id.to_string()),
+            attempt_id: attempt_id.map(str::to_string),
             ..EventContext::default()
         },
         SemanticActivity {

@@ -651,6 +651,15 @@ async fn productive_verified_skeptic_objections_do_not_exhaust_the_default_goal(
             1,
             1,
         )));
+        if attempt == 3 {
+            steps.push(ProviderStep::Completion(completion(
+                vec![Content::Text(
+                    "Diagnosis: split the tangled unit into smaller shipped functions.".into(),
+                )],
+                1,
+                1,
+            )));
+        }
     }
     let (mut agent, requests) = scripted_agent(steps, cfg);
     let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
@@ -673,8 +682,8 @@ async fn productive_verified_skeptic_objections_do_not_exhaust_the_default_goal(
 
     assert_eq!(
         requests.lock().unwrap().len(),
-        12,
-        "each productive turn must reach write, final answer, and skeptic review"
+        13,
+        "four productive turns plus one fail-open strategist after the third objection"
     );
 }
 
@@ -1440,13 +1449,17 @@ async fn planner_retry_on_mismatched_decomposition_then_success() {
         cfg,
     );
 
-    let steps = agent
+    let plan = agent
         .decompose_goal("review plan.md and fully build this")
         .await
         .expect("retry recovers a grounded decomposition");
 
-    assert_eq!(steps.len(), 3);
-    assert!(steps[0].contains("fake-quantization"), "steps: {steps:?}");
+    assert_eq!(plan.milestones.len(), 3);
+    assert!(
+        plan.milestones[0].contains("fake-quantization"),
+        "steps: {:?}",
+        plan.milestones
+    );
     let recorded = requests.lock().unwrap();
     assert_eq!(recorded.len(), 2, "initial call plus one retry");
     let retry_text = recorded[1]
@@ -1700,6 +1713,11 @@ async fn completion_audit_complete_finishes_goal() {
         ),
         completion(vec![Content::Text("done".into())], 1, 1),
         completion(vec![Content::Text("COMPLETE".into())], 1, 1),
+        completion(
+            vec![Content::Text("Shipped the change in changed.rs.".into())],
+            1,
+            1,
+        ),
     ];
     let mut agent = agent(responses, audit_cfg(&workspace));
     agent.set_structured_goal(Some(single_step_goal())).unwrap();
@@ -1707,7 +1725,13 @@ async fn completion_audit_complete_finishes_goal() {
 
     agent.run_turn("go", &mut ui).await.unwrap();
 
-    assert_eq!(agent.structured_goal().unwrap().status, GoalStatus::Done);
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(goal.status, GoalStatus::Done);
+    assert!(
+        !goal.closing_summary.is_empty(),
+        "summarizer writes a closing recap: {}",
+        goal.closing_summary
+    );
     assert!(
         ui.statuses
             .iter()
@@ -2345,4 +2369,5 @@ async fn skeptic_escalate_skips_step_and_keeps_driving() {
     );
 }
 
+mod kind;
 mod review_evidence;

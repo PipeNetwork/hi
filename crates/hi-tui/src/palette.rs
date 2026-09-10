@@ -46,6 +46,20 @@ impl CommandPalette {
                 section: command_section(spec.name),
             });
         }
+        if !needle.is_empty() {
+            for spec in hi_agent::command::COMMAND_ALIASES {
+                items.push(PaletteItem {
+                    command: if spec.args.is_empty() {
+                        format!("/{}", spec.name)
+                    } else {
+                        format!("/{} ", spec.name)
+                    },
+                    label: format!("/{}", spec.name),
+                    help: spec.help.to_string(),
+                    section: command_section(spec.name),
+                });
+            }
+        }
         // De-dupe by label (builtins may overlap).
         let mut seen = std::collections::HashSet::new();
         items.retain(|i| seen.insert(i.label.clone()));
@@ -209,6 +223,29 @@ mod tests {
         assert!(
             !p.items.iter().any(|i| i.label == "/dashboard"),
             "empty palette hides /dashboard alias"
+        );
+        assert!(
+            !p.items.iter().any(|i| i.label == "/model"),
+            "empty palette hides /model alias"
+        );
+        assert!(
+            !p.items.iter().any(|i| i.label == "/delegate"),
+            "empty palette hides /delegate alias"
+        );
+    }
+
+    #[test]
+    fn filter_finds_config_aliases() {
+        let mut p = CommandPalette::open();
+        p.insert('m');
+        p.insert('o');
+        p.insert('d');
+        p.insert('e');
+        p.insert('l');
+        assert!(
+            p.items.iter().any(|i| i.label == "/model"),
+            "search still finds /model: {:?}",
+            p.items.iter().map(|i| &i.label).collect::<Vec<_>>()
         );
     }
 

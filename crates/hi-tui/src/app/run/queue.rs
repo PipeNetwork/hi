@@ -2,6 +2,63 @@
 
 use crate::App;
 
+/// Empty composer + a queued plain follow-up: offer the selected/front row to
+/// the in-flight turn (grok Send now). Slash commands stay queued.
+pub(crate) fn send_now_queued_follow_up(
+    app: &mut App,
+    inbox: Option<&hi_agent::InterjectionInbox>,
+) -> bool {
+    let Some(inbox) = inbox else {
+        return false;
+    };
+    if app.queue.is_empty() {
+        return false;
+    }
+    let idx = app
+        .queue_selected
+        .unwrap_or(0)
+        .min(app.queue.len().saturating_sub(1));
+    let Some(text) = app.queue.get(idx).cloned() else {
+        return false;
+    };
+    if text.trim().starts_with('/') {
+        return false;
+    }
+    if inbox.pending().iter().any(|msg| msg == &text) {
+        inbox.notify_waiters();
+    } else {
+        inbox.push(text.clone());
+    }
+    if !app.mid_turn_offered.iter().any(|msg| msg == &text) {
+        app.mid_turn_offered.push_back(text);
+    }
+    true
+}
+
+fn combine_queued_prompts_enabled() -> bool {
+    std::env::var("HI_COMBINE_QUEUED_PROMPTS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Merge consecutive plain follow-ups into one prompt when enabled.
+pub(crate) fn combine_plain_queue_head(app: &mut App, first: String) -> String {
+    if !combine_queued_prompts_enabled() || first.trim().starts_with('/') {
+        return first;
+    }
+    let mut combined = first;
+    while let Some(next) = app.queue.front() {
+        if next.trim().starts_with('/') {
+            break;
+        }
+        let next = app.queue.pop_front().expect("front existed");
+        let _ = app.trace_prompt_dequeued(&next);
+        combined.push_str("\n\n");
+        combined.push_str(&next);
+    }
+    combined
+}
+
 /// After `drive` finishes, align `app.queue` with what the agent consumed from
 /// the interjection inbox.
 ///

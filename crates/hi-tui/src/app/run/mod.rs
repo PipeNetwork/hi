@@ -22,6 +22,7 @@ use helpers::{
 pub(crate) use helpers::{handle_normal_mode, review_next_hunk};
 use plan_input::handle_idle_plan_approval_key;
 use queue::reconcile_queue_with_interjections;
+pub(crate) use queue::{combine_plain_queue_head, send_now_queued_follow_up};
 use turn_execution::run_agent_turn;
 
 use std::io;
@@ -36,7 +37,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use futures_util::StreamExt;
-use hi_agent::{Agent, Command, CompactionKind, command};
+use hi_agent::{Agent, Command, command};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::Style;
@@ -110,7 +111,7 @@ fn dequeue_ready_prompt(app: &mut App, agent: &Agent) -> Option<String> {
             || (app.plan_approval.is_none()
                 && agent.explicit_goal_drive_decision() == hi_agent::DriveAction::Enqueue(kind))
         {
-            return Some(prompt);
+            return Some(combine_plain_queue_head(app, prompt));
         }
     }
     None
@@ -1133,6 +1134,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             KeyCode::Esc => app.completion = None,
                             KeyCode::Up => app.completion_move(-1),
                             KeyCode::Down => app.completion_move(1),
+                            KeyCode::PageUp => app.completion_move(
+                                -(crate::completion::COMPLETION_VISIBLE_ROWS as isize),
+                            ),
+                            KeyCode::PageDown => app.completion_move(
+                                crate::completion::COMPLETION_VISIBLE_ROWS as isize,
+                            ),
                             KeyCode::Tab => {
                                 // Completing a command that takes arguments fills
                                 // `/name ` — re-sync so its value menu opens next.
@@ -1271,8 +1278,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     app.dismiss_suggested_prompt();
                                 } else if app.show_help {
                                     app.show_help = false;
-                                } else if app.mode.is_review() {
-                                    app.mode.to_insert();
+                                } else if app.review_is_overlay() {
+                                    app.close_review();
                                 } else if app.dismiss_btw_overlay() {
                                 } else if app.input.is_empty() && !app.working {
                                     if app.mode.is_normal() {
@@ -1373,8 +1380,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     prompt
                 }
                 Command::Compact(arg) => {
-                    let kind =
-                        CompactionKind::from_arg(&arg).unwrap_or_else(|| agent.compaction_kind());
+                    let parsed = hi_agent::CompactArg::parse(&arg);
+                    let kind = parsed.kind.unwrap_or_else(|| agent.compaction_kind());
                     app.set_working(true);
                     app.follow();
                     let (tx, rx) = mpsc::unbounded_channel();
@@ -1388,8 +1395,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     {
                         let bg_tasks = agent.background_task_registry();
                         let cancellation = hi_agent::TurnCancellation::new();
-                        let fut =
-                            agent.compact_with_cancellable(kind, &mut sink, cancellation.clone());
+                        let fut = agent.compact_with_cancellable_instructions(
+                            kind,
+                            parsed.extra_instructions.as_deref(),
+                            &mut sink,
+                            cancellation.clone(),
+                        );
                         drive(
                             &mut terminal,
                             &mut input_rx,
@@ -2845,7 +2856,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 app.accumulate_session_files();
                                 app.last_telemetry = Some(agent.last_turn_telemetry().clone());
                                 app.last_turn_phase = Some(agent.turn_phase().label());
-                                app.diff_text = None;
+                                app.refresh_review_if_open();
                                 app.push_session_face(agent);
                                 app.refresh_goal(agent);
 
@@ -3036,7 +3047,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 // multiple concurrent agent sessions. Runs its own select! loop
                 // over the same terminal/input/ticker; rows persist on `app.fleet`.
                 // `/fleet status` lists this project's resumable fleet sessions.
-                Command::Dashboard(arg) => {
+                Command::Fleet(arg) => {
                     if agent.pipefs_workspace_active() {
                         app.push(Line::styled(
                             "/fleet is unavailable while PipeFS is active because its launcher is bound to the launch workspace",
@@ -3387,7 +3398,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         continue;
                     }
                     app.planning = Some(Instant::now());
-                    let mut decomposed: Option<Result<Vec<String>>> = None;
+                    let mut decomposed: Option<Result<hi_agent::GoalPlan>> = None;
                     let mut cancelled = false;
                     {
                         let fut = agent.decompose_goal(&objective);
@@ -3425,8 +3436,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     }
                     // Fall back to a single sub-goal if the planner errored or
                     // returned nothing usable.
-                    let sub_goals = match decomposed {
-                        Some(Ok(steps)) if !steps.is_empty() => steps,
+                    let plan = match decomposed {
+                        Some(Ok(plan)) if !plan.milestones.is_empty() => plan,
                         other => {
                             if let Some(Err(err)) = other {
                                 app.push(Line::styled(
@@ -3436,10 +3447,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     dim(),
                                 ));
                             }
-                            vec![objective.clone()]
+                            hi_agent::GoalPlan {
+                                milestones: vec![objective.clone()],
+                                ..hi_agent::GoalPlan::default()
+                            }
                         }
                     };
-                    app.set_planned_goal(agent, &goal_argument, sub_goals);
+                    app.set_planned_goal(agent, &goal_argument, plan);
                     // A goal is a contract: start pulling toward it immediately.
                     // The user monitors and steers — pause/Esc stops the drive.
                     agent.reset_goal_drive_stall();

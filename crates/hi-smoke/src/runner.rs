@@ -168,10 +168,7 @@ pub(crate) fn run_suite(options: SuiteOptions) -> Result<()> {
         .count();
     let total = reports.len();
     let summary = suite_summary(options.mode, live_route.as_ref(), &reports);
-    let summary_redactions = vec![
-        "hi-smoke-test-key".to_owned(),
-        live_value("HI_API_KEY").unwrap_or_default(),
-    ];
+    let summary_redactions = live_redaction_values(live_route.as_ref());
     crate::artifacts::write_suite_summary(&options.artifacts, &summary, &summary_redactions)?;
     if passed != total {
         bail!(
@@ -645,8 +642,12 @@ impl CaseRuntime {
                 (
                     route.provider.clone(),
                     route.model.clone(),
-                    live_value("HI_API_KEY")
-                        .ok_or_else(|| anyhow!("live mode requires non-empty HI_API_KEY"))?,
+                    live_api_key(&route.provider).ok_or_else(|| {
+                        anyhow!(
+                            "live mode requires HI_API_KEY, PIPENETWORK_API_KEY, or a saved hi client credential for {}",
+                            route.provider
+                        )
+                    })?,
                 )
             }
         };
@@ -1786,10 +1787,7 @@ impl CaseRuntime {
             "live_route": self.live_route.as_ref(),
         });
         let provider_requests = self.provider_requests();
-        let redaction_values = vec![
-            "hi-smoke-test-key".into(),
-            live_value("HI_API_KEY").unwrap_or_default(),
-        ];
+        let redaction_values = live_redaction_values(self.live_route.as_ref());
         let session_bytes = fs::read(&self.session_path).unwrap_or_default();
         let assertions = json!(self.assertions);
         let timings = serde_json::to_value(&self.timings)?;
@@ -3173,15 +3171,18 @@ fn cleanup_observed_processes(_pids: &BTreeSet<i32>, _groups: &BTreeSet<i32>) ->
 }
 
 fn resolve_live_route(recorded: Option<&LiveRoute>) -> Result<LiveRoute> {
-    resolve_live_route_with(recorded, live_value)
+    resolve_live_route_with(recorded, live_value_or_saved_client)
 }
 
 fn resolve_live_route_with(
     recorded: Option<&LiveRoute>,
     value: impl Fn(&str) -> Option<String>,
 ) -> Result<LiveRoute> {
-    let api_key =
-        value("HI_API_KEY").ok_or_else(|| anyhow!("live mode requires non-empty HI_API_KEY"))?;
+    let api_key = value("HI_API_KEY").ok_or_else(|| {
+        anyhow!(
+            "live mode requires HI_API_KEY, PIPENETWORK_API_KEY, or a saved hi client credential"
+        )
+    })?;
     let route = match recorded {
         Some(route) => LiveRoute::new(&route.provider, &route.model, &route.base_url)?,
         None => LiveRoute::new(
@@ -3199,6 +3200,109 @@ fn live_value(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+/// Live credentials: process env first, then the interactive hi client's
+/// saved pipenetwork/openai profile in `~/.config/hi`.
+fn live_value_or_saved_client(name: &str) -> Option<String> {
+    if let Some(value) = live_value(name) {
+        return Some(value);
+    }
+    match name {
+        "HI_API_KEY" => {
+            let provider = live_value("HI_PROVIDER")
+                .or_else(saved_default_provider)
+                .unwrap_or_else(|| "pipenetwork".to_owned());
+            live_value("PIPENETWORK_API_KEY").or_else(|| saved_client_api_key(&provider))
+        }
+        "HI_PROVIDER" => saved_default_provider(),
+        "HI_MODEL" => saved_profile_field("model"),
+        "HI_BASE_URL" => saved_profile_field("base_url").or_else(|| {
+            matches!(
+                saved_default_provider().as_deref(),
+                Some("pipenetwork" | "pipe")
+            )
+            .then(|| "https://api.pipenetwork.ai/v1".to_owned())
+        }),
+        _ => None,
+    }
+}
+
+fn live_api_key(provider: &str) -> Option<String> {
+    live_value("HI_API_KEY")
+        .or_else(|| {
+            matches!(provider, "pipenetwork" | "pipe")
+                .then(|| live_value("PIPENETWORK_API_KEY"))
+                .flatten()
+        })
+        .or_else(|| saved_client_api_key(provider))
+}
+
+fn live_redaction_values(route: Option<&LiveRoute>) -> Vec<String> {
+    let provider = route
+        .map(|route| route.provider.as_str())
+        .unwrap_or("pipenetwork");
+    vec![
+        "hi-smoke-test-key".to_owned(),
+        live_value("HI_API_KEY").unwrap_or_default(),
+        live_value("PIPENETWORK_API_KEY").unwrap_or_default(),
+        live_api_key(provider).unwrap_or_default(),
+    ]
+}
+
+fn saved_client_api_key(provider: &str) -> Option<String> {
+    let provider = if provider == "pipe" {
+        "pipenetwork"
+    } else {
+        provider
+    };
+    if let Some(reference) = saved_profile_field_for(provider, "api_key_ref")
+        && let Some(key) = reference.strip_prefix("auth-store://")
+        && let Some(token) = hi_ai::auth_store::load(key)
+        && !token.access.trim().is_empty()
+    {
+        return Some(token.access);
+    }
+    hi_ai::auth_store::load(provider)
+        .map(|token| token.access)
+        .filter(|access| !access.trim().is_empty())
+}
+
+fn saved_default_provider() -> Option<String> {
+    hi_user_config_toml()?
+        .get("default_profile")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| saved_client_api_key("pipenetwork").map(|_| "pipenetwork".to_owned()))
+}
+
+fn saved_profile_field(field: &str) -> Option<String> {
+    let provider = live_value("HI_PROVIDER").or_else(saved_default_provider)?;
+    saved_profile_field_for(&provider, field)
+}
+
+fn saved_profile_field_for(provider: &str, field: &str) -> Option<String> {
+    let config = hi_user_config_toml()?;
+    let profiles = config.get("profiles")?.as_table()?;
+    let profile = profiles.get(provider).or_else(|| {
+        config
+            .get("default_profile")
+            .and_then(toml::Value::as_str)
+            .and_then(|name| profiles.get(name))
+    })?;
+    profile
+        .get(field)
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn hi_user_config_toml() -> Option<toml::Value> {
+    let path = hi_ai::auth_store::auth_path()?
+        .parent()?
+        .join("config.toml");
+    std::fs::read_to_string(path).ok()?.parse().ok()
 }
 
 fn unique_case_dir(name: &str, seed: Option<u64>) -> String {
@@ -3288,10 +3392,7 @@ fn write_initialization_failure(
             .ok_or_else(|| anyhow!("artifact case directory has no file name"))?,
     );
     let failure = format!("{error:#}");
-    let redaction_values = vec![
-        "hi-smoke-test-key".to_owned(),
-        live_value("HI_API_KEY").unwrap_or_default(),
-    ];
+    let redaction_values = live_redaction_values(options.live_route.as_ref());
     crate::artifacts::repair_minimal_failure_bundle(
         &options.artifacts,
         relative,

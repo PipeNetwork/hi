@@ -39,6 +39,16 @@ fn auto_classifier_is_conservative() {
         }
         .safe_for_auto()
     );
+    let git_reset = ConfirmationRequest::ShellMutation {
+        command: "git reset --hard HEAD".into(),
+        cwd: ".".into(),
+    };
+    assert!(!git_reset.safe_for_auto());
+    assert!(
+        git_reset.details().contains("discards worktree files"),
+        "{}",
+        git_reset.details()
+    );
     assert!(
         !ConfirmationRequest::AskUser {
             question: "which API?".into(),
@@ -228,6 +238,13 @@ fn labels_bash_by_command_and_grep_by_pattern() {
     assert_eq!(
         tool_label("bash", r#"{"command":"cargo  test\n  --all"}"#),
         "bash cargo test"
+    );
+    assert_eq!(
+        tool_label(
+            "bash",
+            r#"{"command":"cd /Users/david/chat && cargo clippy --all-targets 2>&1 | grep warning"}"#
+        ),
+        "bash cargo clippy"
     );
     assert_eq!(
         tool_label("bash_output", r#"{"id":"sh_1"}"#),

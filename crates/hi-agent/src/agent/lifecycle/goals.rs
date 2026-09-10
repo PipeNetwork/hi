@@ -68,6 +68,13 @@ impl crate::Agent {
         self.goals.set_structured(goal);
         self.pending_legacy_goal_budget_migration =
             migrated_legacy_goal_budget && self.session.is_none();
+        if let Some(live) = self.goals.structured.as_ref()
+            && !self.pipefs_workspace_active()
+        {
+            let root = self.runtime.root();
+            let _ = live.export_markdown_to(root);
+            let _ = crate::goal::scratch::ensure(root);
+        }
         self.refresh_system_message();
         Ok(true)
     }

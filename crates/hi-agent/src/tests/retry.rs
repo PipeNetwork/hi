@@ -1114,7 +1114,17 @@ async fn keep_working_refuses_a_repeated_identical_read() {
         cfg,
     );
     let mut ui = RecUi::default();
-    let outcome = agent.run_turn("inspect notes", &mut ui).await.unwrap();
+    let error = agent
+        .run_turn("inspect notes", &mut ui)
+        .await
+        .expect_err("terminal empty completion after tools is a settled provider failure");
+    let failure = TurnFailure::from_error(&error).expect("typed settled receipt");
+    assert!(failure.body_settled());
+    assert_eq!(
+        hi_ai::provider_error_kind(&error),
+        Some(ProviderErrorKind::EmptyCompletion)
+    );
+    let outcome = &failure.outcome;
     let still_working = ui
         .statuses
         .iter()
@@ -1136,6 +1146,12 @@ async fn keep_working_refuses_a_repeated_identical_read() {
         outcome.status,
         TurnStatus::Completed,
         "repeating the stalled read must not look like progress"
+    );
+    assert_eq!(outcome.status, TurnStatus::Failed);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::InfrastructureFailure,
+        "empty completion after tools must not masquerade as invented no-progress"
     );
     assert!(
         requests.lock().unwrap().len() >= 4,
@@ -1638,6 +1654,39 @@ async fn tool_protocol_after_tool_progress_gets_guidance_nudge() {
             .any(|message| message.text().contains("only available tool names")),
         "expected protocol guidance in retry request: {:?}",
         requests[2]
+    );
+}
+
+#[tokio::test]
+async fn tool_protocol_retries_do_not_spend_task_recovery() {
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(bash_completion("true")),
+            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        config(),
+    );
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+    assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+    assert!(
+        !agent.task_recovery().exhausted,
+        "malformed tool JSON must not drain the recovery budget: {:?}",
+        agent.task_recovery().last_reason
+    );
+    assert_eq!(
+        agent.task_recovery().remaining,
+        agent.task_recovery().limit,
+        "protocol retries are format steering, not recovery interventions"
+    );
+    assert!(
+        requests.lock().unwrap().iter().any(|messages| messages
+            .iter()
+            .any(|message| message.text().contains("[hi:nudge:protocol]"))),
+        "protocol retries should use the protocol nudge, not continue/recovery"
     );
 }
 

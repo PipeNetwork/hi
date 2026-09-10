@@ -1,6 +1,13 @@
 //! Shared agent HTTP construction and inference replay policy.
 
+use std::sync::OnceLock;
+
 use super::*;
+
+static AGENT_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+static AGENT_HTTP_QUICK: OnceLock<reqwest::Client> = OnceLock::new();
+static AGENT_HTTP_BOUNDED: OnceLock<reqwest::Client> = OnceLock::new();
+static INFERENCE_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Build a `reqwest::Client` with connection-pool and keep-alive tuned for an
 /// agent loop that makes many sequential requests to the same endpoint.
@@ -11,61 +18,84 @@ use super::*;
 /// Prefer [`agent_http_client_quick`] for non-streaming calls so those bounded
 /// operations retain a finite read deadline.
 pub fn agent_http_client() -> reqwest::Client {
-    agent_http_client_for_socket(None)
+    AGENT_HTTP
+        .get_or_init(|| {
+            build_agent_http_client(None, connect_secs(), model_stream_read_timeout(), false)
+        })
+        .clone()
+}
+
+fn connect_secs() -> u64 {
+    http_timeout_secs("HI_HTTP_CONNECT_TIMEOUT_SECS", DEFAULT_CONNECT_TIMEOUT_SECS)
+}
+
+/// Build pooled clients so the first model call does not pay TLS setup.
+pub fn warmup_agent_http_clients() {
+    let _ = agent_http_client();
+    let _ = agent_http_client_quick();
+    let _ = agent_http_client_bounded();
 }
 
 /// Like [`agent_http_client`] but with short connect/read timeouts for
 /// metadata, auth, MCP, and other non-streaming requests.
 pub fn agent_http_client_quick() -> reqwest::Client {
-    build_agent_http_client(
-        None,
-        http_timeout_secs(
-            "HI_HTTP_QUICK_CONNECT_TIMEOUT_SECS",
-            DEFAULT_QUICK_CONNECT_TIMEOUT_SECS,
-        ),
-        Some(Duration::from_secs(http_timeout_secs(
-            "HI_HTTP_QUICK_READ_TIMEOUT_SECS",
-            DEFAULT_QUICK_READ_TIMEOUT_SECS,
-        ))),
-        false,
-    )
+    AGENT_HTTP_QUICK
+        .get_or_init(|| {
+            build_agent_http_client(
+                None,
+                http_timeout_secs(
+                    "HI_HTTP_QUICK_CONNECT_TIMEOUT_SECS",
+                    DEFAULT_QUICK_CONNECT_TIMEOUT_SECS,
+                ),
+                Some(Duration::from_secs(http_timeout_secs(
+                    "HI_HTTP_QUICK_READ_TIMEOUT_SECS",
+                    DEFAULT_QUICK_READ_TIMEOUT_SECS,
+                ))),
+                false,
+            )
+        })
+        .clone()
 }
 
 /// Agent client for non-model-stream transfers that retain the historical
 /// finite socket-read deadline.
 pub(crate) fn agent_http_client_bounded() -> reqwest::Client {
-    build_agent_http_client(
-        None,
-        http_timeout_secs("HI_HTTP_CONNECT_TIMEOUT_SECS", DEFAULT_CONNECT_TIMEOUT_SECS),
-        Some(Duration::from_secs(http_timeout_secs(
-            "HI_HTTP_READ_TIMEOUT_SECS",
-            DEFAULT_TRANSFER_READ_TIMEOUT_SECS,
-        ))),
-        false,
-    )
+    AGENT_HTTP_BOUNDED
+        .get_or_init(|| {
+            build_agent_http_client(
+                None,
+                connect_secs(),
+                Some(Duration::from_secs(http_timeout_secs(
+                    "HI_HTTP_READ_TIMEOUT_SECS",
+                    DEFAULT_TRANSFER_READ_TIMEOUT_SECS,
+                ))),
+                false,
+            )
+        })
+        .clone()
 }
 
 /// Build the normal agent client while pinning all HTTP transport to one Unix
 /// socket. The URL still supplies HTTP paths and Host semantics; no TCP or DNS
 /// connection can be made by this client.
 pub fn agent_http_client_for_socket(socket: Option<&std::path::Path>) -> reqwest::Client {
-    build_agent_http_client(
-        socket,
-        http_timeout_secs("HI_HTTP_CONNECT_TIMEOUT_SECS", DEFAULT_CONNECT_TIMEOUT_SECS),
-        model_stream_read_timeout(),
-        false,
-    )
+    if socket.is_none() {
+        return agent_http_client();
+    }
+    build_agent_http_client(socket, connect_secs(), model_stream_read_timeout(), false)
 }
 
 /// Inference clients leave every replay and body-preserving redirect to the
 /// request ledger, so the transport cannot send beyond its physical allowance.
 pub fn inference_http_client_for_socket(socket: Option<&std::path::Path>) -> reqwest::Client {
-    build_agent_http_client(
-        socket,
-        http_timeout_secs("HI_HTTP_CONNECT_TIMEOUT_SECS", DEFAULT_CONNECT_TIMEOUT_SECS),
-        model_stream_read_timeout(),
-        true,
-    )
+    if socket.is_none() {
+        return INFERENCE_HTTP
+            .get_or_init(|| {
+                build_agent_http_client(None, connect_secs(), model_stream_read_timeout(), true)
+            })
+            .clone();
+    }
+    build_agent_http_client(socket, connect_secs(), model_stream_read_timeout(), true)
 }
 
 fn build_agent_http_client(

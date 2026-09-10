@@ -1,6 +1,6 @@
 --- 120x24 ---
 
-  /workspace                                                                           reasoning: off │ sandbox │ undo
+  /workspace                                                                          reasoning: off │ sandbox │ undo
 
   ❯ review the responsive layout
   The layout is stable.
@@ -12,38 +12,38 @@
 
 
 
-  ⠋ Working… 0s                                                                                                 [stop]
+  ⠋ Working… 0s                                                                                                [stop]
 
-  ╭─ /btw why? ─────────────────────────────────────────────────────────────────────────────────────────────── [Esc] ╮
-  │ ⠋ Answering…                                                                                                     │
-  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-  │❯ next step                                                                                                       │
-  ╰───────────────────────────────────────────────────────────────────────────────────────── gpt-4o · always-approve ╯
+  ╭─ /btw why? ────────────────────────────────────────────────────────────────────────────────────────────── [Esc] ╮
+  │ ⠋ Answering…                                                                                                    │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  ╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │❯ next step                                                                                                      │
+  ╰──────────────────────────────────────────────────────────────────────────────────────── gpt-4o · always-approve ╯
 
-  ctrl+c:interrupt  │  Shift+Tab:mode  │  ?:help
+  ctrl+c:interrupt  │  ctrl+e:thinking  │  Shift+Tab:mode  │  ?:help  │  ctrl+g:review
 
 --- 64x14 ---
-  /workspace                   reasoning: off │ sandbox │ undo
+  /workspace                  reasoning: off │ sandbox │ undo
   The layout is stable.
     thought for 3s
     Check spacing and preserve the active input.
   ┃ … +17 more lines · Ctrl-O to expand
-  ⠋ Working… 0s                                         [stop]
+  ⠋ Working… 0s                                        [stop]
 
-  ╭─ /btw why? ─────────────────────────────────────── [Esc] ╮
-  │ ⠋ Answering…                                             │
-  ╰──────────────────────────────────────────────────────────╯
-  ╭──────────────────────────────────────────────────────────╮
-  │❯ next step                                               │
-  ╰───────────────────────────────── gpt-4o · always-approve ╯
-  ctrl+c:interrupt  │  Shift+Tab:mode  │  ?:help
+  ╭─ /btw why? ────────────────────────────────────── [Esc] ╮
+  │ ⠋ Answering…                                            │
+  ╰─────────────────────────────────────────────────────────╯
+  ╭─────────────────────────────────────────────────────────╮
+  │❯ next step                                              │
+  ╰──────────────────────────────── gpt-4o · always-approve ╯
+  ctrl+c:interrupt  │  ctrl+e:thinking  │  Shift+Tab:mode
 --- 24x8 ---
-  Ctrl-O to expand
-  ⠋ Working… 0s [stop]
-  ╭─ /btw wh…  [Esc] ╮
-  │ ⠋ Answering…     │
-  ╰──────────────────╯
-  ╭──────────────────╮
-  │❯ next step       │
-  ╰────────── gpt-4o ╯
+  · Ctrl-O to expand
+  ⠋ Working… 0s[stop]
+  ╭─ /btw w…  [Esc] ╮
+  │ ⠋ Answering…    │
+  ╰─────────────────╯
+  ╭─────────────────╮
+  │❯ next step      │
+  ╰───────── gpt-4o ╯

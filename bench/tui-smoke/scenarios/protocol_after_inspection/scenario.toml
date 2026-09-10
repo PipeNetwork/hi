@@ -1,0 +1,109 @@
+schema_version = 1
+name = "protocol-after-inspection-keeps-working"
+tags = ["curated", "pr", "tool-protocol"]
+timeout_ms = 45000
+
+[hi]
+args = ["--allow-unverified"]
+
+[[provider.steps]]
+id = "inspect-git-status"
+[provider.steps.response]
+kind = "tool_call"
+name = "bash"
+arguments = { command = "printf '%s\\n' '?? src/'" }
+
+[[provider.steps]]
+id = "protocol-400-1"
+[provider.steps.response]
+kind = "http_error"
+status = 400
+body = '{"error":{"message":"invalid tool JSON","code":"tool_protocol_error","retryable":true}}'
+
+[[provider.steps]]
+id = "protocol-400-2"
+[provider.steps.response]
+kind = "http_error"
+status = 400
+body = '{"error":{"message":"invalid tool JSON","code":"tool_protocol_error","retryable":true}}'
+
+[[provider.steps]]
+id = "protocol-400-3"
+[provider.steps.response]
+kind = "http_error"
+status = 400
+body = '{"error":{"message":"invalid tool JSON","code":"tool_protocol_error","retryable":true}}'
+
+[[provider.steps]]
+id = "protocol-400-4"
+[provider.steps.response]
+kind = "http_error"
+status = 400
+body = '{"error":{"message":"invalid tool JSON","code":"tool_protocol_error","retryable":true}}'
+
+[[provider.steps]]
+id = "keep-working-edit"
+[provider.steps.response]
+kind = "tool_call"
+name = "write"
+arguments = { path = "src/lib.rs", content = "pub fn f() { 1 }\n" }
+
+[[provider.steps]]
+id = "recap"
+[provider.steps.response]
+kind = "text"
+text = "Fixed the empty function body after the invalid tool-turn retries."
+
+[[actions]]
+kind = "send_line"
+text = "review for any major issues and fix"
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_result", "/data/name" = "bash" }
+timeout_ms = 15000
+
+[[actions]]
+kind = "wait_event"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed" }
+timeout_ms = 20000
+
+[[actions]]
+kind = "quit"
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/status" = "completed" }
+exact = 1
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "turn_settled", "/data/outcome/stop_reason" = "no_progress" }
+exact = 0
+
+[[assertions]]
+kind = "records"
+source = "events"
+equals = { "/event" = "ui_event", "/data/kind" = "tool_call", "/data/name" = "write" }
+at_least = 1
+
+[[assertions]]
+kind = "file"
+path = "src/lib.rs"
+exists = true
+contains = "pub fn f() { 1 }"
+
+[[assertions]]
+kind = "records"
+source = "session"
+contains = { "/content/0/Text" = "[hi:nudge:protocol]" }
+at_least = 1
+
+[[assertions]]
+kind = "provider_consumed"
+
+[[assertions]]
+kind = "exit"
+code = 0

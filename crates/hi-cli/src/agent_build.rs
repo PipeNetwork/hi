@@ -143,6 +143,11 @@ pub(crate) fn build_agent(
             is_subagent: cli.subagent,
             planner_model: planner_model.clone(),
             skeptic_model,
+            skeptic_count: std::env::var("HI_GOAL_SKEPTIC_COUNT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .map(|n: u8| n.clamp(1, 5))
+                .unwrap_or(3),
             // Opt-in: route the `/goal` skeptic review to a local (or any
             // OpenAI-compatible) endpoint via HI_SKEPTIC_ENDPOINT — e.g. a running
             // hi-local MLX/CUDA server. Requires HI_SKEPTIC_MODEL to name a model it

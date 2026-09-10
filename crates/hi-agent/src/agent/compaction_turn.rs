@@ -474,6 +474,7 @@ impl crate::Agent {
     pub(super) async fn summarize(
         &mut self,
         slice: &[Message],
+        extra_instructions: Option<&str>,
         ui: &mut dyn Ui,
     ) -> Result<Option<String>> {
         ui.status("compacting the conversation…");
@@ -488,7 +489,13 @@ impl crate::Agent {
         let mut messages = Vec::with_capacity(slice_owned.len() + 2);
         messages.push(self.minimal_system_message());
         messages.extend_from_slice(&slice_owned);
-        messages.push(Message::user(SUMMARIZE_PROMPT));
+        let prompt = match extra_instructions.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(extra) => format!(
+                "{SUMMARIZE_PROMPT}\n\nAdditional instructions from the user (follow these while summarizing):\n{extra}"
+            ),
+            None => SUMMARIZE_PROMPT.to_string(),
+        };
+        messages.push(Message::user(prompt));
         repair_invalid_tool_call_arguments_in_messages(&mut messages);
 
         let model = self.config.routing.model.clone();

@@ -124,6 +124,10 @@ pub enum McpError {
     /// The server returned a response for a different request id.
     #[error("json-rpc response id mismatch: expected {expected}, got {actual}")]
     ResponseIdMismatch { expected: u64, actual: String },
+    /// The server asked for user input (MCP elicitation). The in-flight tool
+    /// call was declined so the transport stays synchronized.
+    #[error("MCP_INPUT_REQUIRED: {0}")]
+    InputRequired(String),
 }
 
 /// The transport for an MCP server connection.
@@ -395,11 +399,24 @@ impl McpTransportTrait for StdioTransport {
             request["params"] = params;
         }
         self.write_message(&request).await?;
+        let mut elicitation: Option<String> = None;
         while let Some(line) = next_rpc_line(&mut self.stdout).await? {
             if line.trim().is_empty() {
                 continue;
             }
             let message: serde_json::Value = serde_json::from_str(&line)?;
+            if let Some(prompt) = elicitation_prompt(&message) {
+                if let Some(elicit_id) = message.get("id").cloned() {
+                    let decline = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": elicit_id,
+                        "result": { "action": "decline" }
+                    });
+                    let _ = self.write_message(&decline).await;
+                }
+                elicitation = Some(prompt);
+                continue;
+            }
             // Servers may emit notifications while a request is in flight.
             let Some(response_id) = message.get("id") else {
                 continue;
@@ -415,6 +432,9 @@ impl McpTransportTrait for StdioTransport {
             }
             if let Some(error) = message.get("error") {
                 return Err(McpError::Server(error.to_string()));
+            }
+            if let Some(prompt) = elicitation {
+                return Err(McpError::InputRequired(prompt));
             }
             return Ok(message
                 .get("result")
@@ -1334,6 +1354,21 @@ fn list_resources_from_result(value: serde_json::Value) -> Result<Vec<McpResourc
     Ok(serde_json::from_value(resources)?)
 }
 
+fn elicitation_prompt(message: &serde_json::Value) -> Option<String> {
+    let method = message.get("method")?.as_str()?;
+    if method != "elicitation/create" && method != "elicitation/request" {
+        return None;
+    }
+    Some(
+        message
+            .pointer("/params/message")
+            .or_else(|| message.pointer("/params/prompt"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("MCP tool requested additional user input")
+            .to_string(),
+    )
+}
+
 fn tool_result_from_value(value: &serde_json::Value) -> McpToolResult {
     let content = value
         .get("content")
@@ -1353,13 +1388,19 @@ fn tool_result_from_value(value: &serde_json::Value) -> McpToolResult {
         })
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| value.to_string());
-    McpToolResult {
-        content,
-        is_error: value
-            .get("isError")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-    }
+    let input_required =
+        value.get("status").and_then(serde_json::Value::as_str) == Some("input_required");
+    let is_error = value
+        .get("isError")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || input_required;
+    let content = if input_required {
+        format!("MCP_INPUT_REQUIRED: {content}")
+    } else {
+        content
+    };
+    McpToolResult { content, is_error }
 }
 
 fn resource_text_from_value(value: &serde_json::Value) -> String {
@@ -2557,5 +2598,28 @@ mod tests {
         client.disconnect_transport("test").await;
         let generation2 = client.servers.get("test").unwrap().generation;
         assert!(generation2 > generation);
+    }
+
+    #[test]
+    fn elicitation_prompt_reads_create_requests() {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "elicitation/create",
+            "params": { "message": "API token?" }
+        });
+        assert_eq!(elicitation_prompt(&message).as_deref(), Some("API token?"));
+        assert_eq!(elicitation_prompt(&serde_json::json!({"id": 1})), None);
+    }
+
+    #[test]
+    fn tool_result_marks_input_required_status() {
+        let result = tool_result_from_value(&serde_json::json!({
+            "status": "input_required",
+            "content": [{"type": "text", "text": "need a path"}]
+        }));
+        assert!(result.is_error);
+        assert!(result.content.contains("MCP_INPUT_REQUIRED"));
+        assert!(result.content.contains("need a path"));
     }
 }

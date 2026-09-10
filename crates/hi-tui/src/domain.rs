@@ -61,8 +61,7 @@ impl OverlayDomain {
             || app.inspect_subagent.is_some()
             || app.tasks_overlay.is_some()
             || app.block_viewer.is_some()
-            || app.jump_picker.is_some()
-            || app.rewind_picker.is_some()
+            || app.turn_picker.is_some()
             || app.diff_lab.is_some()
     }
 

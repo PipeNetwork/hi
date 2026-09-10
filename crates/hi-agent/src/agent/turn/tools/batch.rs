@@ -320,7 +320,7 @@ impl crate::Agent {
         // branch. Text-promoted tool calls therefore receive the same typed
         // capability audit as provider-native calls.
         for (id, name, _) in calls {
-            emit_capability_request(&mut *ui, id, name);
+            emit_capability_request(&mut *ui, id, name, Some(self.turn_attempt_id.as_str()));
         }
         let hash_guard_applies = calls
             .iter()
@@ -757,7 +757,7 @@ impl crate::Agent {
             // it's a read-only inspection (pwd/ls/find/rg/grep/cat/head/tail/
             // git), which joins the concurrent batch below for parallelism.
             let bash_idx = ready.iter().copied().find(|&i| {
-                calls[i].1 == "bash"
+                (calls[i].1 == "bash" || calls[i].1 == "monitor")
                     && !matches!(
                         bash_command(&calls[i].2)
                             .map(|c| classify_bash_command(&c))
@@ -767,7 +767,8 @@ impl crate::Agent {
             });
             if let Some(i) = bash_idx {
                 let (id, name, arguments) = &calls[i];
-                let bash_mutates = implementation_tool_call_mutates(name, arguments);
+                let bash_mutates =
+                    name == "monitor" || implementation_tool_call_mutates(name, arguments);
                 if self.config.gates.confirm_edits && bash_mutates {
                     if self.approval_parked {
                         ui.tool_call_id(id, name, arguments);
@@ -1338,6 +1339,7 @@ impl crate::Agent {
                         | "ask_user"
                         | "new_context"
                         | "task"
+                        | "send_subagent_message"
                         | "get_task_output"
                         | "wait_tasks"
                         | "kill_task"
@@ -1456,6 +1458,9 @@ impl crate::Agent {
                     "explore" => self.handle_explore(arguments, &mut *ui).await,
                     "delegate" => self.handle_delegate(arguments, &mut *ui).await,
                     "task" => self.handle_task(arguments, &mut *ui).await,
+                    "send_subagent_message" => {
+                        self.handle_send_subagent_message(arguments, &mut *ui).await
+                    }
                     "get_task_output" => self.handle_get_task_output(arguments).await,
                     "wait_tasks" => self.handle_wait_tasks(arguments).await,
                     "kill_task" => self.handle_kill_task(arguments).await,
@@ -1722,27 +1727,32 @@ impl crate::Agent {
                     let mcp = self.mcp.clone();
                     let memory = self.memory.clone();
                     let calls = &calls;
+                    let file_ops = self.runtime.file_ops().clone();
                     async move {
-                        let output = if let Some(failure) = failure {
-                            failure
-                        } else if let Some(prepared) = prepared {
-                            execute_prepared_in_runtime(lsp, read_cache, prepared).await
-                        } else {
-                            execute_in_runtime_shared_with_runner(
-                                &process_runner,
-                                root,
-                                state_root,
-                                lsp,
-                                background,
-                                read_cache,
-                                &repo_map,
-                                mcp.as_deref(),
-                                memory.as_deref(),
-                                &calls[i].1,
-                                &calls[i].2,
-                            )
-                            .await
-                        };
+                        let output = file_ops
+                            .with_tool_lock(root, &calls[i].1, &calls[i].2, move || async move {
+                                if let Some(failure) = failure {
+                                    failure
+                                } else if let Some(prepared) = prepared {
+                                    execute_prepared_in_runtime(lsp, read_cache, prepared).await
+                                } else {
+                                    execute_in_runtime_shared_with_runner(
+                                        &process_runner,
+                                        root,
+                                        state_root,
+                                        lsp,
+                                        background,
+                                        read_cache,
+                                        &repo_map,
+                                        mcp.as_deref(),
+                                        memory.as_deref(),
+                                        &calls[i].1,
+                                        &calls[i].2,
+                                    )
+                                    .await
+                                }
+                            })
+                            .await;
                         (i, output)
                     }
                 }))
@@ -1857,11 +1867,16 @@ impl crate::Agent {
                     && !self.plan_mode
                     && let Some(plan) = output.plan.as_mut()
                 {
+                    let prose_goal = self
+                        .goals
+                        .structured
+                        .as_ref()
+                        .is_some_and(|goal| !goal.kind.requires_workspace_evidence());
                     unsupported_completion_claims = normalize_unsupported_plan_completion(
                         self.goals.plan(),
                         plan,
                         &calls[i].2,
-                        batch_supplies_plan_completion_evidence,
+                        batch_supplies_plan_completion_evidence || prose_goal,
                     );
                     let corrected = unsupported_completion_claims.len();
                     if corrected > 0 {

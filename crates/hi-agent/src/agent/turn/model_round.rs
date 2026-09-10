@@ -21,7 +21,8 @@ use crate::steering::{
     REREAD_NUDGE, SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_COMPLETED_FILE_REREAD_RESULT,
     SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT, bash_call_waits,
     bash_no_progress_signature, implementation_text_tool_nudge, inspected_paths_for_prompt,
-    should_nudge_read_after_repeated_search, tool_protocol_text_fallback_nudge,
+    reread_action_nudge, should_nudge_read_after_repeated_search,
+    tool_protocol_text_fallback_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::{MAX_TOOL_PROTOCOL_RETRIES, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE, Ui};
@@ -30,7 +31,7 @@ use super::helpers::{build_turn_telemetry, effective_model_route};
 use super::phase::TurnPhase;
 use super::progress::{
     NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, STEP_LIMIT_WRAP_UP_NUDGE,
-    TOOL_LIMIT_WRAP_UP_NUDGE, forced_final_answer_is_unusable, no_progress_signature_for_calls,
+    TOOL_LIMIT_WRAP_UP_NUDGE, no_progress_signature_for_calls,
 };
 
 /// `u32::MAX` is the public "unlimited" sentinel, not a finite cap that can be
@@ -112,6 +113,7 @@ impl crate::Agent {
         let read_only_intent = state.read_only_intent;
         let implementation_intent = state.implementation_intent;
         let expected_mutation = state.expected_mutation;
+        let goal_kind = state.goal_kind;
         let requested_validation = state.requested_validation;
         let input = state.input;
         let _user_prompt_tokens = state.user_prompt_tokens;
@@ -419,6 +421,7 @@ impl crate::Agent {
                 self.report
                     .last_turn_telemetry
                     .inherit_model_diagnostics(model_telemetry);
+                self.report.last_turn_telemetry.attach_model(&self.config.routing.model);
                 let _ = self.persist_async().await;
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
@@ -613,6 +616,10 @@ impl crate::Agent {
                     streamed_assistant_text,
                 ),
                 super::model_retry::ProviderStreamResult::Continue => {
+                    // handle_provider_stream latches wrap-up on the tracker;
+                    // write-back below copies this local, so keep them in sync.
+                    force_no_progress_final_answer_next |=
+                        progress_tracker.force_no_progress_final_answer_next;
                     return Ok(ModelRoundControl::Continue);
                 }
                 super::model_retry::ProviderStreamResult::Finish(hit) => {
@@ -938,10 +945,19 @@ impl crate::Agent {
         // A wait-poll round re-runs a seen inspection signature by
         // design, so it must not trip the no-new-evidence cycle guard
         // either — its staleness is judged by output, below.
+        // After several unique reads on a mutation turn, do not grant a free
+        // "first consecutive" reread: pagination of an already-seen file was
+        // resetting the streak, burning recovery on Repeat, and settling as
+        // no_progress before IMPLEMENTATION_NO_CHANGES could fire.
+        let mutation_inspection_sprawl = goal_kind.requires_workspace_evidence()
+            && !implementation_tracker.mutation_seen
+            && evidence.inspected_paths.len() >= 6;
         let is_repeat = exact_repeat
             || (no_new_evidence
                 && !has_wait_poll_bash
-                && (prev_added_no_evidence || stale_background_handle_call));
+                && (prev_added_no_evidence
+                    || stale_background_handle_call
+                    || mutation_inspection_sprawl));
         let no_new_after_mutation = is_repeat
             && no_new_evidence
             && implementation_tracker.mutation_seen
@@ -1064,7 +1080,8 @@ impl crate::Agent {
                                 self.config.loop_limits.max_repeat_nudges
                             ));
                     READ_AFTER_SEARCH_NUDGE.to_string()
-                } else if implementation_intent.is_some()
+                } else if (implementation_intent.is_some() || expected_mutation)
+                    && !implementation_tracker.mutation_seen
                     && no_new_evidence
                     && (evidence.saw_read || evidence.saw_search)
                 {
@@ -1093,19 +1110,7 @@ impl crate::Agent {
                                 || s.status == PlanStatus::Active
                         })
                         .map(|s| s.title.as_str());
-                    if let Some(step) = plan_step {
-                        format!(
-                            "You already inspected these files: {paths}. Their contents are in the conversation above — do not re-read them. \
-Your plan's next step is: \"{step}\". Execute it now with write/edit/multi_edit/apply_patch. \
-Do not read more files first — you have enough context. Act on the next plan step immediately."
-                        )
-                    } else {
-                        format!(
-                            "You already inspected these files: {paths}. Their contents are in the conversation above — do not re-read them. \
-You have enough context to make progress. Edit one of the inspected files now with write/edit/multi_edit/apply_patch. \
-If the task is already complete, stop and give your final recap."
-                        )
-                    }
+                    reread_action_nudge(&paths, plan_step)
                 } else if has_no_progress_bash {
                     ui.nudge(&format!(
                         "the model kept running no-op shell commands — nudging it to finish without more bash calls ({repeat_nudges}/{})",
@@ -1370,9 +1375,11 @@ If the task is already complete, stop and give your final recap."
             // final answer would bypass the usability gate and be branded a
             // successful completion.
             let background_status_answer = progress_tracker.awaiting_background;
-            let unusable = forced_final_answer_is_unusable(
+            let unusable = crate::steering::no_progress_forced_final_is_unusable(
                 &assistant_text,
-                self.goals.plan_incomplete() && !background_status_answer,
+                goal_kind,
+                implementation_tracker.tests_seen,
+                implementation_tracker.mutation_seen,
             ) && !(background_status_answer && has_text);
             if has_text && (buffer_read_only_review_text || !streamed_assistant_text) {
                 let text_to_emit = if buffered_assistant_text.is_empty() {
@@ -1477,6 +1484,7 @@ If the task is already complete, stop and give your final recap."
                 read_only_intent,
                 implementation_intent,
                 expected_mutation,
+                goal_kind,
                 validation_gate_required,
                 &mut implementation_tracker,
                 &mut evidence,

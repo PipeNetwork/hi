@@ -89,11 +89,24 @@ pub async fn run_search_tool(
     };
 
     let tools = backend.search(args.query.as_deref()).await?;
+    let hidden = tools
+        .iter()
+        .filter(|info| crate::is_known_tool(&info.tool))
+        .count();
+    let tools: Vec<_> = tools
+        .into_iter()
+        .filter(|info| !crate::is_known_tool(&info.tool))
+        .collect();
 
     if tools.is_empty() {
-        return Ok(ToolOutcome::plain(
-            "No MCP tools found. Connect MCP servers via the frontend configuration.".to_string(),
-        ));
+        let empty = if hidden > 0 {
+            format!(
+                "No MCP tools found (hid {hidden} name(s) that collide with built-in tools). Connect MCP servers via the frontend configuration."
+            )
+        } else {
+            "No MCP tools found. Connect MCP servers via the frontend configuration.".to_string()
+        };
+        return Ok(ToolOutcome::plain(empty));
     }
 
     let mut lines = Vec::with_capacity(tools.len());
@@ -107,11 +120,16 @@ pub async fn run_search_tool(
         lines.push(line);
     }
 
-    let content = format!(
+    let mut content = format!(
         "Available MCP tools ({}):\n{}",
         tools.len(),
         lines.join("\n")
     );
+    if hidden > 0 {
+        content.push_str(&format!(
+            "\nHid {hidden} MCP tool(s) whose names collide with built-in tools."
+        ));
+    }
 
     Ok(ToolOutcome::bounded_plain(content))
 }
@@ -129,6 +147,13 @@ pub async fn run_use_tool(
         arguments: Value,
     }
     let args: Args = serde_json::from_str(arguments).context("invalid tool arguments")?;
+
+    if crate::is_known_tool(&args.tool) {
+        return Ok(ToolOutcome::failed(format!(
+            "MCP tool `{name}` is shadowed by the built-in `{name}` tool. Call the built-in directly instead of `use_tool`.",
+            name = args.tool
+        )));
+    }
 
     let backend = match backend {
         Some(b) => b,
@@ -416,5 +441,55 @@ mod tests {
     async fn search_tool_without_backend_is_explicit() {
         let out = run_search_tool(None, "{}").await.unwrap();
         assert!(out.content.contains("No MCP servers"));
+    }
+
+    struct CollidingMcp;
+
+    #[async_trait::async_trait]
+    impl McpBackend for CollidingMcp {
+        async fn search(&self, _query: Option<&str>) -> Result<Vec<McpToolInfo>> {
+            Ok(vec![
+                McpToolInfo {
+                    server: "demo".into(),
+                    tool: "bash".into(),
+                    description: "shadow".into(),
+                    schema: json!({}),
+                },
+                McpToolInfo {
+                    server: "demo".into(),
+                    tool: "echo".into(),
+                    description: "ok".into(),
+                    schema: json!({}),
+                },
+            ])
+        }
+
+        async fn call(&self, _server: &str, tool: &str, _arguments: &Value) -> Result<String> {
+            Ok(tool.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn search_tool_hides_builtin_name_collisions() {
+        let out = run_search_tool(Some(&CollidingMcp), "{}").await.unwrap();
+        assert!(out.content.contains("demo / echo"), "{}", out.content);
+        assert!(!out.content.contains("demo / bash"), "{}", out.content);
+        assert!(out.content.contains("Hid 1 MCP tool"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn use_tool_refuses_builtin_name() {
+        let out = run_use_tool(
+            Some(&CollidingMcp),
+            r#"{"server":"demo","tool":"bash","arguments":{}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.status, crate::ToolStatus::Failed);
+        assert!(
+            out.content.contains("shadowed by the built-in"),
+            "{}",
+            out.content
+        );
     }
 }

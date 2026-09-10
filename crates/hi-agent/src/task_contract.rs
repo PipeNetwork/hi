@@ -470,6 +470,12 @@ fn mutation_check_words(text: &str) -> Vec<&str> {
     .collect()
 }
 
+/// Previous tokens that keep `change` as an imperative ("please change X").
+const CHANGE_IMPERATIVE_CUES: &[&str] = &[
+    "and", "or", "then", "also", "please", "you", "lets", "we", "i", "just", "try", "by", "keep",
+    "go",
+];
+
 fn is_mutation_verb(word: &str) -> bool {
     matches!(
         word,
@@ -557,26 +563,20 @@ fn clause_requests_mutation(clause: &str, question: bool) -> bool {
             // asks about behavior ("does that build hi-mlx?").
             return matches!(previous, Some("you" | "please"));
         }
-        // "Build plans the work, runs up to hundreds of agents…" — a mutation
-        // verb followed by a content word and then a determiner is the
-        // *subject* of a declarative sentence (a product or artifact name),
-        // not an imperative. A real imperative puts the determiner or the
-        // bare object right after the verb: "fix the login bug", "build a
-        // parser", "implement quicksort".
+        // "Build plans the work…" is a product name as subject, not "build a parser".
         if declarative_subject_reading(&words, index) {
             return false;
         }
-        // Outside questions, skip tool/artifact-noun usages ("cargo build",
-        // "apply the patch"), bare infinitives that are not the clause's
-        // imperative ("wait for the download to finish"), and auxiliary/
-        // interrogative frames ("does it build", "will this delete data")
-        // that split across a filename dot.
-        //
-        // A first-person request frame is the narrow exception to the bare
-        // infinitive rule: "we want to build an app" is an instruction even
-        // though the mutation verb follows `to`.
+        // Tool nouns ("cargo build"), non-imperative infinitives ("to finish"),
+        // and interrogative frames. First-person "we want to build" is the exception.
         if previous == Some("to") && first_person_mutation_request_frame(&words, index) {
             return true;
+        }
+        // "the rate limiter change" is a noun; clause-initial "change the limiter" is not.
+        if matches!(*word, "change" | "changing")
+            && previous.is_some_and(|prev| !CHANGE_IMPERATIVE_CUES.contains(&prev))
+        {
+            return false;
         }
         !matches!(
             previous,

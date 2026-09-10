@@ -76,12 +76,16 @@ async fn completion_audit_input_names_the_round() {
 
     let recorded = requests.lock().unwrap();
     let audit_request = recorded
-        .last()
-        .unwrap()
         .iter()
-        .map(Message::text)
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|messages| {
+            messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .find(|text| text.contains("Audit round:"))
+        .unwrap_or_default();
     assert!(
         audit_request.contains("Audit round: 2"),
         "round number anchors the anti-ratchet rule: {audit_request}"

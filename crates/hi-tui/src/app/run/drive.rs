@@ -10,7 +10,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::plan_input::handle_working_plan_approval_key;
-use super::{ChordPipeline, reconcile_queue_with_interjections, run_chord_pipeline};
+use super::{
+    ChordPipeline, reconcile_queue_with_interjections, run_chord_pipeline,
+    send_now_queued_follow_up,
+};
 use crate::event::{ConfirmationControl, UiEvent};
 use crate::{App, TurnState, dim};
 use hi_agent::{Command, command};
@@ -505,9 +508,6 @@ where
                                     }
                                     let open_tasks = matches!(
                                         &parsed,
-                                        Some(Command::Tasks(_))
-                                    ) || matches!(
-                                        &parsed,
                                         Some(Command::Queue(arg)) if arg.trim() == "tasks"
                                     );
                                     if open_tasks {
@@ -542,6 +542,13 @@ where
                                     | ChordPipeline::PlanRequestChanges | ChordPipeline::PlanQuit) => continue,
                                 None => {}
                             }
+                            if matches!(key.code, KeyCode::Enter)
+                                && app.input.is_empty()
+                                && send_now_queued_follow_up(app, interject.as_ref())
+                            {
+                                app.follow();
+                                continue;
+                            }
                             if let Some(submitted) = app.edit_key(&key) {
                                 match command::parse(&submitted).map(command::resolve_command) {
                                     Some(Command::Quit) => {
@@ -552,13 +559,6 @@ where
                                         }
                                     }
                                     Some(Command::Copy(arg)) => app.copy(&arg),
-                                    Some(Command::Tasks(_)) => {
-                                        crate::subagent_overlay::open_tasks(
-                                            app,
-                                            &[],
-                                            &bg_tasks.list_now(),
-                                        );
-                                    }
                                     Some(Command::Queue(arg)) if arg.trim() == "tasks" => {
                                         crate::subagent_overlay::open_tasks(
                                             app,

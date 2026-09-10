@@ -303,6 +303,12 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub review_target: Option<PathBuf>,
 
+    /// Run this session in an isolated copy-on-write worktree of the current
+    /// repo (one-shot `hi "prompt" --worktree` or interactive). The copy is
+    /// removed when the process exits. Distinct from `-p`/`--profile`.
+    #[arg(long, conflicts_with_all = ["subagent", "review_target"])]
+    pub worktree: bool,
+
     /// Compaction strategy: hybrid (default), full, or elide.
     #[arg(long, value_name = "KIND")]
     pub compaction: Option<String>,

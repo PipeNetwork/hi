@@ -583,42 +583,12 @@ fn wrap_text_cols(text: &str, max_cols: usize) -> Vec<String> {
     out
 }
 
-fn edit_body_lines(diff: &str) -> Vec<Line<'static>> {
+pub(crate) fn edit_body_lines(diff: &str) -> Vec<Line<'static>> {
     let plain = strip_ansi(diff);
     if plain.trim().is_empty() {
         return Vec::new();
     }
-    if crate::render::looks_like_diff(&plain) {
-        return crate::render::diff_lines(&plain);
-    }
-    plain
-        .lines()
-        .filter_map(|line| {
-            if line.contains(" addition") || line.contains(" deletion") {
-                return None;
-            }
-            if line.contains('⋯') {
-                return Some(crate::render::banded_diff_line(
-                    crate::render::DiffBand::Meta,
-                    "    ",
-                    line.trim(),
-                ));
-            }
-            if let Some((sign, gutter, content)) = hi_display_line_parts(line) {
-                let band = match sign {
-                    '+' => crate::render::DiffBand::Add,
-                    '-' => crate::render::DiffBand::Del,
-                    _ => crate::render::DiffBand::Context,
-                };
-                return Some(crate::render::banded_diff_line(band, gutter, content));
-            }
-            Some(crate::render::banded_diff_line(
-                crate::render::DiffBand::Meta,
-                "    ",
-                line,
-            ))
-        })
-        .collect()
+    crate::render::diff_lines(&plain)
 }
 
 fn output_body_lines(body: &str) -> Vec<Line<'static>> {
@@ -630,13 +600,7 @@ fn output_body_lines(body: &str) -> Vec<Line<'static>> {
     }
     let plain = strip_ansi(body);
     if crate::render::looks_like_diff(&plain) {
-        return crate::render::diff_lines(&plain)
-            .into_iter()
-            .map(|mut line| {
-                line.spans.insert(0, Span::raw("  "));
-                line
-            })
-            .collect();
+        return crate::render::diff_lines(&plain);
     }
     let th = theme();
     let text = body
@@ -954,7 +918,7 @@ pub(crate) fn classify_diff_line(line: &str) -> DiffLineKind {
     {
         return DiffLineKind::Meta;
     }
-    if let Some(sign) = hi_display_sign(line) {
+    if let Some((sign, _, _)) = hi_display_line_parts(line) {
         return match sign {
             '+' => DiffLineKind::Add,
             '-' => DiffLineKind::Del,
@@ -1047,12 +1011,36 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("-old value"), "{text}");
-        assert!(text.contains("+new value"), "{text}");
+        assert!(text.contains("old value"), "{text}");
+        assert!(text.contains("new value"), "{text}");
+        assert!(!text.contains("-old value"), "{text}");
+        assert!(!text.contains("+new value"), "{text}");
         assert!(
             text.contains("Ctrl-O to expand"),
             "long previews should advertise expansion: {text}"
         );
+    }
+
+    #[test]
+    fn cd_and_cargo_run_title_is_the_validator() {
+        let label = hi_agent::ui::tool_label(
+            "bash",
+            r#"{"command":"cd /Users/david/chat && cargo clippy --all-targets 2>&1 | grep warning"}"#,
+        );
+        let command = run_command("bash", &label);
+        assert_eq!(command, "cargo clippy", "{label} -> {command}");
+        let block = ActivityBlock {
+            kind: ActivityKind::Run {
+                command,
+                body: "[no output]".into(),
+                idle: false,
+                poll_count: 0,
+            },
+            expanded: false,
+        };
+        let text = crate::render::line_text(&block.flatten(false, false, Density::Comfortable)[0]);
+        assert!(text.contains("Run cargo clippy"), "{text}");
+        assert!(!text.contains("Run cd"), "{text}");
     }
 
     #[test]

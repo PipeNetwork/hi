@@ -57,23 +57,12 @@ const PROJECT_COMMANDS: &[&str] = &[
 ];
 
 const MODE_COMMANDS: &[&str] = &[
-    "fleet", "race", "loop", "watch", "digest", "inbox", "delegate", "local", "team", "workflow",
+    "fleet", "race", "loop", "watch", "digest", "inbox", "local", "team", "workflow",
 ];
 
 /// Settings aliases plus renamed dual names — parseable, not a primary `/help` row.
 pub(crate) fn is_help_alias(name: &str) -> bool {
-    matches!(
-        name,
-        "model"
-            | "provider"
-            | "login"
-            | "logout"
-            | "lsp"
-            | "theme"
-            | "density"
-            | "mouse"
-            | "dashboard"
-    )
+    matches!(name, "theme" | "density" | "mouse")
 }
 
 /// Which help bucket a command belongs in. Aliases return `None`.
@@ -267,6 +256,12 @@ mod tests {
                 .lines()
                 .any(|line| line.trim_start().starts_with("/dashboard")),
             "dashboard is an alias, not a modes row:\n{help}"
+        );
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with("/delegate")),
+            "delegate is a /config alias, not a modes row:\n{help}"
         );
     }
 

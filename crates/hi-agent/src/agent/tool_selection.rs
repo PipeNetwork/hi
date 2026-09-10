@@ -190,19 +190,14 @@ pub(super) fn advertised_tools_with_background(
         if !suppress_new_subagents && should_advertise_delegate(config, task_text, mutating) {
             specs.push(hi_tools::delegate_tool_spec());
         }
-        // Background subagent tools: `task` spawns async subagents;
-        // `get_task_output`/`wait_tasks`/`kill_task` poll/wait/cancel them.
-        // Advertise when subagents are enabled and the task is repo-relevant.
         if config.subagents.explore_subagents
             && (repo_relevant || matches!(config.memory.tool_set, ToolSet::Full))
         {
             if !suppress_new_subagents {
                 specs.push(hi_tools::task_tool_spec());
+                specs.push(hi_tools::send_subagent_message_tool_spec());
+                specs.push(hi_tools::monitor_tool_spec());
             }
-            // Polling schemas are useful only after this session has actually
-            // spawned a task. Advertising them on a fresh turn invites models
-            // to invent task ids, and broad reviews can otherwise block on a
-            // wait tool before doing any useful inspection.
             if !suppress_new_subagents || background.tasks {
                 specs.push(hi_tools::get_task_output_tool_spec());
                 specs.push(hi_tools::wait_tasks_tool_spec());
@@ -1198,6 +1193,8 @@ mod tests {
             "get_task_output",
             "wait_tasks",
             "kill_task",
+            "send_subagent_message",
+            "monitor",
         ] {
             assert!(
                 !flash_names.contains(&dropped),

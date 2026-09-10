@@ -1,7 +1,7 @@
 //! Provider stream handling: success path, retryable failures, fatal errors.
 
 use anyhow::Result;
-use hi_ai::{ChatRequest, Completion, ProviderErrorKind, Role, StreamEvent, provider_error_kind};
+use hi_ai::{ChatRequest, Completion, ProviderErrorKind, StreamEvent, provider_error_kind};
 
 use crate::snapshot::changed_files_between;
 use crate::steering::{EvidenceTracker, ImplementationIntent, tool_protocol_retry_nudge};
@@ -24,6 +24,10 @@ use compat_telemetry::record_compat_fallback;
 #[cfg(test)]
 use compat_telemetry::{COMPAT_FALLBACK_LIMIT, COMPAT_FALLBACK_PREFIX};
 pub(super) const COMPLETED_PLAN_EMPTY_RECAP_FALLBACK: &str = "The plan is complete and the successful tool results were retained. The provider did not return a final recap.";
+/// After keep-working has already spent its chance, a further invalid-tool
+/// storm must not fail the turn as `no_progress` with no recap. One ChatOnly
+/// wrap-up is the same closeout the step/tool caps already use.
+pub(super) const PROTOCOL_EXHAUSTION_WRAP_UP_NUDGE: &str = "Structured tool calls kept being rejected as invalid. Stop using tools now. In a short final answer, report what you completed, what remains unfinished, and the exact workspace state (files changed, failed edits, checks not yet run). Do not claim the task is complete unless it actually is.";
 
 #[allow(
     clippy::large_enum_variant,
@@ -440,7 +444,7 @@ impl crate::Agent {
             Err(err)
                 if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
                     && hi_ai::provider_error_retryable(&err) != Some(false)
-                    && retry_state.protocol_retries < MAX_TOOL_PROTOCOL_RETRIES
+                    && retry_state.protocol_retries + 1 < MAX_TOOL_PROTOCOL_RETRIES
                     // Reserve the last physical send for a sealed text-tool
                     // repair when this Auto implementation route admits one.
                     && !(implementation_intent.is_some()
@@ -457,6 +461,10 @@ impl crate::Agent {
                 retry_state.protocol_retries += 1;
                 retry_state.protocol_failures_total += 1;
                 retry_state.record_recovery_attempt();
+                // Grok-build starts a new generation after a format reminder.
+                // Sharing the 4-send ledger turns those retries into
+                // AttemptsExhausted and kills the turn.
+                retry_state.execution = retry_state.execution.fresh_operation();
                 let protocol_retries = retry_state.protocol_retries;
                 if request_no_progress_final_answer {
                     // The live no-progress flag remains sticky in the caller,
@@ -482,17 +490,8 @@ impl crate::Agent {
                 ui.nudge(&format!(
                     "⚠ the model emitted an invalid tool turn — retrying with tool-format guidance ({protocol_retries}/{MAX_TOOL_PROTOCOL_RETRIES})"
                 ));
-                if self
-                    .messages
-                    .as_slice()
-                    .last()
-                    .is_some_and(|message| message.role == Role::User)
-                {
-                    self.messages.push_user_or_fold(&protocol_retry_nudge);
-                } else {
-                    self.messages
-                        .push_nudge(NudgeKind::Continue, &protocol_retry_nudge);
-                }
+                self.messages
+                    .push_nudge(NudgeKind::Protocol, &protocol_retry_nudge);
                 Ok(ProviderStreamResult::Continue)
             }
             Err(err)
@@ -509,6 +508,7 @@ impl crate::Agent {
                 self.emit_usage(ui);
                 retry_state.protocol_text_fallbacks += 1;
                 retry_state.record_recovery_attempt();
+                retry_state.execution = retry_state.execution.fresh_operation();
                 *text_tool_fallback_next = true;
                 *force_tools_next = false;
                 ui.status(
@@ -543,6 +543,31 @@ impl crate::Agent {
                     ui,
                 ) {
                     retry_state.protocol_retries = 0;
+                    // A different next action may succeed as a plain-text call
+                    // even if structured JSON already burned the first fallback.
+                    retry_state.protocol_text_fallbacks = 0;
+                    retry_state.execution = retry_state.execution.fresh_operation();
+                    return Ok(ProviderStreamResult::Continue);
+                }
+
+                // Live ~/chat: keep-working fired, then another invalid-tool
+                // storm settled with no recap — including after retained edits.
+                // One tool-free wrap-up reports leftover work instead.
+                if !request_no_progress_final_answer
+                    && progress_tracker.keep_working_rounds > 0
+                    && progress_tracker.forced_final_answer_attempts == 0
+                {
+                    progress_tracker.force_no_progress_final_answer_next = true;
+                    *force_tools_next = false;
+                    *text_tool_fallback_next = false;
+                    retry_state.protocol_retries = 0;
+                    retry_state.execution = retry_state.execution.fresh_operation();
+                    *continue_total_nudges = continue_total_nudges.saturating_add(1);
+                    self.messages
+                        .push_nudge_or_fold(NudgeKind::Continue, PROTOCOL_EXHAUSTION_WRAP_UP_NUDGE);
+                    ui.status(
+                        "invalid tool turns exhausted; asking for a final answer without tools",
+                    );
                     return Ok(ProviderStreamResult::Continue);
                 }
 
@@ -550,9 +575,10 @@ impl crate::Agent {
                     return Err(err);
                 }
                 ui.status("invalid tool turns exhausted; ending this bounded turn");
-                *provider_exhausted = true;
                 Ok(ProviderStreamResult::Finish(
-                    crate::agent::turn::ModelLoopDecision::Verify,
+                    crate::agent::turn::ModelLoopDecision::Settle(
+                        crate::TurnStopReason::NoProgress,
+                    ),
                 ))
             }
             Err(err)

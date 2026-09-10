@@ -75,14 +75,14 @@ pub mod protocol {
         execute_streaming_in_runtime_with_runner, explore_tool_spec, fast_check_for,
         get_task_output_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
         is_read_only, kill_task_tool_spec, memory_forget_tool_spec, memory_get_tool_spec,
-        memory_search_tool_spec, memory_update_tool_spec, new_context_tool_spec,
+        memory_search_tool_spec, memory_update_tool_spec, monitor_tool_spec, new_context_tool_spec,
         prepare_mutation_in_with_state, prepare_verify_workdir, research_read_tool_spec,
         research_tool_spec, run_check_in, run_check_in_with_timeout, run_fast_check_in,
         run_memory_forget, run_memory_get, run_memory_search, run_memory_update,
         run_program_tool_spec, run_search_tool, run_skill, run_use_tool, search_tool_tool_spec,
-        skill_tool_spec, speculation_class, target_path, target_paths, task_tool_spec,
-        tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in,
-        working_tree_diff_plain_in,
+        send_subagent_message_tool_spec, skill_tool_spec, speculation_class, target_path,
+        target_paths, task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
+        working_tree_diff_in, working_tree_diff_plain_in,
     };
     pub use crate::transaction::{
         MutationPlan, PlannedFileMutation, recover_workspace_transactions,
@@ -136,11 +136,13 @@ pub mod candidate_workspace;
 pub mod catalog;
 pub mod checkpoint;
 mod codebase_graph;
+mod command_display;
 mod condense;
 mod edit;
 mod effects;
 pub mod envelope;
 mod fast_feedback;
+mod file_operation_lock;
 pub mod folder_trust;
 pub mod guard;
 mod hf;
@@ -169,6 +171,7 @@ pub use background_tasks::{
     DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
 };
 pub use codebase_graph::references_by_name;
+pub use command_display::{peel_cd_for_title, strip_redundant_session_cd};
 pub use condense::condense_diagnostics;
 pub use fast_feedback::{
     CargoCheckOutcome, CargoCommandOutcome, affected_any_package_dirs, affected_cargo_package_dirs,
@@ -178,6 +181,7 @@ pub use fast_feedback::{
     python_source_paths, run_affected_cargo_checks, run_affected_cargo_tests,
     run_affected_polyglot_checks, run_affected_polyglot_tests, rust_source_paths,
 };
+pub use file_operation_lock::{FileOperationLockManager, file_lock_need};
 pub use hf::{
     HfCommandResult, HfCommandState, HfMlxRun, available_space_bytes,
     download_repo_keep_foreground, download_repo_keep_quiet, handle_hf_command,
@@ -220,15 +224,15 @@ pub use tools::{
     execute_streaming_in_runtime_with_runner, explore_tool_spec, fast_check_for,
     get_task_output_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
     is_read_only, kill_task_tool_spec, memory_forget_tool_spec, memory_get_tool_spec,
-    memory_search_tool_spec, memory_update_tool_spec, new_context_tool_spec,
+    memory_search_tool_spec, memory_update_tool_spec, monitor_tool_spec, new_context_tool_spec,
     prepare_mutation_in_with_state, prepare_verify_workdir, research_read_tool_spec,
     research_tool_spec, run_check_in, run_check_in_with_runner,
     run_check_in_with_runner_maybe_timeout, run_check_in_with_runner_timeout,
     run_check_in_with_timeout, run_fast_check_in, run_memory_forget, run_memory_get,
     run_memory_search, run_memory_update, run_program_tool_spec, run_search_tool, run_skill,
-    run_use_tool, search_tool_tool_spec, skill_tool_spec, speculation_class, target_path,
-    target_paths, task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
-    working_tree_diff_in, working_tree_diff_plain_in,
+    run_use_tool, search_tool_tool_spec, send_subagent_message_tool_spec, skill_tool_spec,
+    speculation_class, target_path, target_paths, task_tool_spec, tool_metadata,
+    use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in, working_tree_diff_plain_in,
 };
 
 /// Process-wide `browser_exec` gate. Call once at session setup from `[browser]`

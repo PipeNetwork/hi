@@ -35,15 +35,22 @@ process-cleanup boundary without changing Hi's product behavior.
 - `curated` contains every deterministic regression and runs weekly on macOS.
 - `live` contains exactly three small provider-backed canaries and supplies the
   reviewed nightly baseline. `live_extended` covers queued input/resize,
-  plan-drive approval/editing, and workspace mutation in a separate nightly
-  run. Live metrics remain separate from scripted and coding-eval scores.
+  plan-drive approval/editing, workspace mutation, and a multi-round
+  review/fix/verify chat-server case (`live-review-fix-chat`) in a separate
+  nightly run. That case now includes a second verify-only turn whose wording
+  contains the noun "change", so a green `cargo test` cannot settle as
+  no_progress. Live metrics remain separate from scripted and coding-eval scores.
+  The review/fix case is also runnable headless with
+  `PIPENETWORK_API_KEY=… scripts/review_fix_live_e2e.sh`.
 
 The nightly Ubuntu campaign also executes 250 deterministic chaos seeds across
 transport faults and stateful approval, pause/resume, restart, resize, queued
 input, and tool-cancellation templates. The weekly macOS campaign executes 50.
-Live runs use `HI_MODEL`, `HI_API_KEY`, and `HI_BASE_URL`, following the
-evaluation workflow conventions. `HI_PROVIDER` is optional and defaults to
-`openai`; set it to `pipenetwork` to exercise Pipe's production provider path.
+Live runs use `HI_MODEL`, `HI_API_KEY`, and `HI_BASE_URL` when those are set.
+Otherwise they load the interactive hi client's saved credential from
+`~/.config/hi` (`api_key_ref` / `auth.json`), defaulting `HI_PROVIDER` to the
+saved default profile (typically `pipenetwork`). `HI_PROVIDER=pipenetwork`
+still selects Pipe's production provider path explicitly.
 Credentials are forwarded to the child through the provider-specific
 environment variable and never placed in its argument list. Scenario TOML may
 not override any supported provider credential alias or HTTP proxy variable;

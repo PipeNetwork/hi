@@ -31,7 +31,6 @@ pub(crate) async fn repl(
 ) -> Result<()> {
     agent.set_interactive_session(true);
     use hi_agent::Command;
-    use hi_agent::CompactionKind;
     use rustyline::Editor;
     use rustyline::error::ReadlineError;
     use rustyline::history::DefaultHistory;
@@ -53,7 +52,7 @@ pub(crate) async fn repl(
     // before each readline so add/edit changes are visible immediately.
     let profiles: ProfileNames =
         std::rc::Rc::new(std::cell::RefCell::new(config::profile_names(config)));
-    let helper = ReplHelper::new(hi_agent::command::COMMANDS, profiles.clone());
+    let helper = ReplHelper::new(profiles.clone());
     let mut editor =
         Editor::<ReplHelper, DefaultHistory>::with_config(rustyline::Config::default())
             .context("initializing line editor")?;
@@ -169,12 +168,16 @@ pub(crate) async fn repl(
                             prompt
                         }
                         Command::Compact(arg) => {
-                            let kind = CompactionKind::from_arg(&arg)
-                                .unwrap_or_else(|| agent.compaction_kind());
+                            let parsed = hi_agent::CompactArg::parse(&arg);
+                            let kind = parsed.kind.unwrap_or_else(|| agent.compaction_kind());
                             let progress = Arc::new(AtomicBool::new(false));
                             let mut plain = PlainUi::with_progress(progress.clone());
                             let _ = drive_with_spinner(
-                                agent.compact_with(kind, &mut plain),
+                                agent.compact_with_instructions(
+                                    kind,
+                                    parsed.extra_instructions.as_deref(),
+                                    &mut plain,
+                                ),
                                 &progress,
                                 None,
                             )
@@ -822,40 +825,29 @@ pub(crate) async fn repl(
                             continue;
                         }
                         Command::Plan(_)
-                        | Command::ViewPlan
                         | Command::Memory
                         | Command::Fork(_)
                         | Command::Rewind(_)
                         | Command::Permissions(_)
-                        | Command::AlwaysApprove(_)
-                        | Command::Auto(_)
                         | Command::Queue(_)
-                        | Command::Tasks(_)
-                        | Command::Plugins(_)
                         | Command::Remember(_)
                         | Command::UndoMemory
                         | Command::ImportClaude(_)
                         | Command::Recap
                         | Command::Find(_)
                         | Command::Jump(_)
-                        | Command::History(_)
                         | Command::Hooks(_)
                         | Command::Trust(_)
                         | Command::Marketplace(_)
                         | Command::Worktree(_)
                         | Command::Inspect(_)
                         | Command::Agents(_)
-                        | Command::Share(_)
-                        | Command::McpAdmin(_)
-                        | Command::RewindPicker
                         | Command::ScreenMode(_)
                         | Command::VimMode(_)
                         | Command::Multiline(_)
                         | Command::Timeline(_)
                         | Command::Timestamps(_)
-                        | Command::Cd(_)
-                        | Command::Rename(_)
-                        | Command::Resume(_) => {
+                        | Command::Cd(_) => {
                             if let Some(effect) =
                                 hi_agent::handle_session_command_coordinated(agent, &command, &[])
                                     .await

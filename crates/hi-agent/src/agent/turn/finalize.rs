@@ -59,6 +59,8 @@ impl crate::Agent {
                 "Automatic recovery stopped. Final verification passed for the retained workspace, but the overall request was not confirmed complete."
             } else if self.report.verify.failed() {
                 "Automatic recovery stopped. Current edits are retained; verification failed for the current workspace."
+            } else if self.workspace.last_changed_files.is_empty() {
+                "Automatic recovery stopped. No file changes were made."
             } else {
                 "Automatic recovery stopped. Current edits are retained; the current workspace remains unverified."
             }

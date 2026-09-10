@@ -51,6 +51,7 @@ mod rsi_remote;
 mod scheduler_ops;
 mod session;
 mod session_harness;
+mod session_worktree;
 mod setup;
 mod skeptic_review;
 mod sync;
@@ -464,6 +465,16 @@ async fn run() -> Result<()> {
     {
         chdir_to_review_target(target).inspect_err(|error| report_init_failure(error, None))?;
     }
+    let _session_worktree = if cli.worktree && !cli.subagent {
+        let source = std::env::current_dir()
+            .inspect_err(|error| report_init_failure(&anyhow::anyhow!(error.to_string()), None))?;
+        Some(
+            session_worktree::SessionWorktree::create(&source)
+                .inspect_err(|error| report_init_failure(error, None))?,
+        )
+    } else {
+        None
+    };
     let (workspace_root, state_root) =
         resolve_runtime_roots().inspect_err(|error| report_init_failure(error, None))?;
     startup_trace!("runtime roots resolved");
@@ -1221,11 +1232,12 @@ async fn run() -> Result<()> {
                 if !cli.quiet {
                     println!("\x1b[2mplanning goal with the planner model…\x1b[0m");
                 }
-                let steps = match agent.decompose_goal(objective).await {
-                    Ok(steps) if !steps.is_empty() => steps,
-                    _ => vec![objective.to_string()],
-                };
-                hi_agent::Goal::new(objective.to_string(), steps)
+                match agent.decompose_goal(objective).await {
+                    Ok(plan) if !plan.milestones.is_empty() => {
+                        hi_agent::Goal::from_goal_plan(objective.to_string(), plan)
+                    }
+                    _ => hi_agent::Goal::new(objective.to_string(), vec![objective.to_string()]),
+                }
             };
             // The skeptic gate is on by default for new goals; HI_GOAL_TEAM is a
             // two-way headless override — `0`/`false`/`off` disables it (e.g. a

@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use crate::chrome::{self, ShortcutHint};
 use crate::layout::{UiLayout, display_width, truncate_display};
 use crate::model_picker::{display_capabilities, display_price, display_window};
-use crate::render::{diff_lines, dim, lerp_color, markdown_line, wrapped_line_height};
+use crate::render::{dim, lerp_color, markdown_line, wrapped_line_height};
 use crate::theme::UiTone;
 use crate::util::fmt_elapsed;
 use crate::{FORM_LABEL_WIDTH, PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
@@ -43,12 +43,8 @@ fn confirmation_lines(
                 .collect();
             if !diff.is_empty() {
                 lines.push(Line::raw(""));
-                // `diff_lines` colors unified diffs; fall back to plain lines.
-                if crate::render::looks_like_diff(diff) {
-                    lines.extend(crate::render::diff_lines(diff));
-                } else {
-                    lines.extend(diff.lines().map(|l| Line::raw(l.to_string())));
-                }
+                // Compact `edit` previews and unified diffs both color here.
+                lines.extend(crate::activity_feed::edit_body_lines(diff));
             }
             lines
         }
@@ -585,66 +581,24 @@ impl crate::App {
         out
     }
 
-    /// Render the full-screen diff review overlay (Ctrl-G). A bordered block
-    /// filling the screen, showing the entire working-tree diff with
-    /// `diff_lines` coloring, scrollable via j/k/arrows/PgUp/PgDn, with n/p
-    /// jumping between `@@` hunk headers. The footer shows the keybindings and
-    /// the current scroll position.
-    fn render_review(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-        let text = self.diff_text.as_deref().unwrap_or("").trim();
-        let rendered = if text.is_empty() {
-            vec![Line::styled("(no changes in the working tree)", dim())]
-        } else {
-            diff_lines(text)
-        };
-        let total = rendered.len();
-        // The visible height is the area minus 2 border rows minus 1 footer row.
-        let visible = area.height.saturating_sub(3) as usize;
-        let max_scroll = total.saturating_sub(visible);
-        let scroll = self.review_scroll.min(max_scroll);
-        let mut body: Vec<Line<'static>> = rendered
-            .iter()
-            .skip(scroll)
-            .take(visible)
-            .cloned()
-            .collect();
-        // Pad with blank lines so the footer stays at the bottom on short diffs.
-        while body.len() < visible {
-            body.push(Line::raw(""));
-        }
-        // Footer: keybindings + scroll position.
-        let footer = Line::styled(
-            format!(
-                " j/k scroll · n/p hunks · PgUp/PgDn · G end · q/Esc close   [{}/{}]",
-                scroll + 1,
-                total
-            ),
-            dim(),
-        );
-        body.push(footer);
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(crate::theme::theme().chrome(UiTone::Info).border)
-            .title(" Diff review (Ctrl-G) ");
-        frame.render_widget(Paragraph::new(body).block(block), area);
-    }
-
     pub(crate) fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
         let _profile = crate::profiling::FrameTimer::begin("session", area);
+        self.frame_width = area.width;
+        self.sync_review_mode();
         let ui_layout = UiLayout::from_width(area.width);
         let metrics = ui_layout.metrics();
         if self.confirmation.is_none() && self.render_fullscreen_overlay(frame, area) {
             return;
         }
-        // Grok-build chrome floats on the canvas: 2-column side inset, a blank
-        // row above the status bar and below the shortcuts, and a one-row gap
-        // between chrome and the body. `/btw` is an inline overlay above the
-        // prompt, not a side column.
+        // Grok-build chrome floats on the canvas: 2-column left inset, a
+        // 3-column right gutter, a blank row above the status bar and below
+        // the shortcuts, and a one-row gap between chrome and the body.
+        // `/btw` is an inline overlay above the prompt, not a side column.
         let (th, theme_revision) = crate::theme::snapshot();
         chrome::fill_background(frame, area, &th);
-        let (hpad, top_vpad, bottom_vpad) = chrome::outer_pad(area);
-        let inner = chrome::inset(area, hpad, top_vpad, bottom_vpad);
+        let (hpad_left, hpad_right, top_vpad, bottom_vpad) = chrome::outer_pad(area);
+        let inner = chrome::inset(area, hpad_left, hpad_right, top_vpad, bottom_vpad);
         let composer_w = inner.width;
         let overlay_composer = self.confirmation.is_some()
             || self.plan_approval_capturing()
@@ -700,7 +654,9 @@ impl crate::App {
         // Overlay rows inside the composer are built once so box height, paint,
         // and cursor offset cannot drift. The changed-files summary is a
         // separate chrome row immediately above the box.
-        let prefix_lines = self.composer_prefix_lines(help_h, inner_w as usize);
+        let menu_h = crate::completion::COMPLETION_VISIBLE_ROWS
+            .min((area.height as usize).saturating_sub(8).max(3));
+        let prefix_lines = self.composer_prefix_lines(help_h, inner_w as usize, menu_h);
         let changed_files_line = self.changed_files_line();
         let changed_files_h = usize::from(changed_files_line.is_some());
         let body_lines = self.composer_body_lines(input_lines, inner_w as usize);
@@ -891,6 +847,7 @@ impl crate::App {
             composer_area.width,
             composer_area.height.saturating_sub(changed_files_h),
         );
+        self.composer_rect = input_area;
         if let Some(line) = changed_files_line {
             frame.render_widget(Paragraph::new(line), self.changed_files_rect);
         }
@@ -912,6 +869,19 @@ impl crate::App {
         } else {
             (None, transcript_area)
         };
+        let (transcript_area, review_split) = crate::review::split_body(
+            transcript_area,
+            self.review.open && self.can_dock_review(),
+            self.review.width,
+        );
+        if let Some((gap, area)) = review_split {
+            self.review.gap_rect = gap;
+            self.paint_splitter(frame, gap);
+            self.render_review_pane(frame, area);
+        } else if !self.review_is_overlay() {
+            self.review.rect = Rect::default();
+            self.review.gap_rect = Rect::default();
+        }
 
         // --- Transcript ---
         // Status bar: cwd on the left, chips on the right, grok-build's `│`
@@ -1872,9 +1842,14 @@ impl crate::App {
             }
         }
 
-        let hints: &[ShortcutHint] =
+        let thinking_label = if self.show_reasoning {
+            "collapse thinking"
+        } else {
+            "thinking"
+        };
+        let hints: Vec<ShortcutHint> =
             if self.confirmation.is_some() || self.plan_approval_capturing() {
-                &[
+                vec![
                     ShortcutHint {
                         key: "enter",
                         label: "confirm",
@@ -1884,23 +1859,37 @@ impl crate::App {
                         label: "cancel",
                     },
                 ]
+            } else if self.review.open && self.can_dock_review() {
+                crate::review::docked_session_hints(self.review.focused)
             } else if self.working {
-                &[
+                vec![
                     ShortcutHint {
                         key: "ctrl+c",
                         label: "interrupt",
                     },
                     ShortcutHint {
+                        key: "ctrl+e",
+                        label: thinking_label,
+                    },
+                    ShortcutHint {
                         key: "Shift+Tab",
                         label: "mode",
                     },
                     ShortcutHint {
                         key: "?",
                         label: "help",
+                    },
+                    ShortcutHint {
+                        key: "ctrl+g",
+                        label: "review",
                     },
                 ]
             } else {
-                &[
+                vec![
+                    ShortcutHint {
+                        key: "ctrl+e",
+                        label: thinking_label,
+                    },
                     ShortcutHint {
                         key: "Shift+Tab",
                         label: "mode",
@@ -1909,9 +1898,13 @@ impl crate::App {
                         key: "?",
                         label: "help",
                     },
+                    ShortcutHint {
+                        key: "ctrl+g",
+                        label: "review",
+                    },
                 ]
             };
-        chrome::render_shortcuts_bar(frame, shortcuts_area, hints, &th);
+        chrome::render_shortcuts_bar(frame, shortcuts_area, &hints, &th);
     }
 
     /// Rebuild the transcript flatten+wrap cache when its inputs change.

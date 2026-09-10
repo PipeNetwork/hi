@@ -41,6 +41,7 @@ mod chrome;
 mod completion;
 mod confirm_overlay;
 pub mod event;
+mod inline_diff;
 mod input;
 mod layout;
 mod local_picker;
@@ -48,6 +49,7 @@ mod model_picker;
 mod provider_form;
 mod provider_picker;
 mod render;
+mod review;
 mod session_face;
 mod session_pickers;
 mod subagent_overlay;
@@ -726,7 +728,7 @@ pub(crate) fn apply_metadata(
 
 /// One entry in the display transcript. Most content is a plain styled line;
 /// reasoning (CoT) is stored specially so it can be collapsed by default and
-/// expanded on demand via Ctrl-T, rather than flooding the transcript inline.
+/// expanded on demand via Ctrl-T / Ctrl-E, rather than flooding the transcript inline.
 #[derive(Clone)]
 pub(crate) enum TranscriptEntry {
     Line(Line<'static>),
@@ -859,7 +861,7 @@ impl TranscriptEntry {
             TranscriptEntry::Reasoning { text, elapsed } => {
                 let secs = elapsed.as_secs();
                 // Instant CoT is noise in the collapsed feed — grok-build
-                // folds it into the tool row. Keep it for Ctrl-T.
+                // folds it into the tool row. Keep it for Ctrl-T / Ctrl-E.
                 if !show_reasoning && secs == 0 {
                     return Vec::new();
                 }
@@ -1136,8 +1138,8 @@ pub(crate) struct App {
     /// When the current reasoning phase started (for the "thought for Ns" label).
     pub(crate) reasoning_started: Option<Instant>,
     /// Whether reasoning (CoT) blocks are expanded inline. Off by default —
-    /// reasoning is collapsed to a one-line "thought for Ns" summary; Ctrl-T
-    /// toggles this to show/hide the full thinking text.
+    /// reasoning is collapsed to a one-line "thought for Ns" summary; Ctrl-T /
+    /// Ctrl-E toggles this to show/hide the full thinking text.
     pub(crate) show_reasoning: bool,
     /// Whether long tool-output blocks are expanded in full. Off by default —
     /// output beyond [`TOOL_OUTPUT_PREVIEW_LINES`] folds to a preview; Ctrl-O
@@ -1388,13 +1390,16 @@ pub(crate) struct App {
     pub(crate) inspect_subagent: Option<crate::subagent_overlay::InspectOverlay>,
     pub(crate) tasks_overlay: Option<crate::subagent_overlay::TasksOverlay>,
     pub(crate) block_viewer: Option<crate::block_viewer::BlockViewer>,
-    pub(crate) jump_picker: Option<crate::session_pickers::JumpPicker>,
-    pub(crate) rewind_picker: Option<crate::session_pickers::RewindPicker>,
+    pub(crate) turn_picker: Option<crate::session_pickers::TurnPicker>,
     /// Last painted timeline rail hit targets (screen row → tick).
     pub(crate) timeline_hits: Vec<(u16, crate::timeline::TimelineHit)>,
     pub(crate) timeline_rect: ratatui::layout::Rect,
     /// Screen hit target for the single changed-files summary above the prompt.
     pub(crate) changed_files_rect: ratatui::layout::Rect,
+    /// Composer box (input + border), for click-to-unfocus the review pane.
+    pub(crate) composer_rect: ratatui::layout::Rect,
+    /// Last painted frame width, so review can dock vs overlay without a Rect.
+    pub(crate) frame_width: u16,
     /// Interactive differential runner overlay. Large run data lives in
     /// `hi-diff` artifacts; this field only retains the bounded UI snapshot.
     pub(crate) diff_lab: Option<crate::diff_lab::DiffLabOverlay>,
@@ -1485,10 +1490,8 @@ pub(crate) struct App {
     /// dismisses it until the next suggestion.
     pub(crate) suggested_prompt: Option<String>,
     pub(crate) suggested_prompt_dismissed: bool,
-    /// Cached working-tree diff text for the full-screen review overlay.
-    pub(crate) diff_text: Option<String>,
-    /// Scroll position (line index) within the full-screen diff review overlay.
-    pub(crate) review_scroll: usize,
+    /// Docked or overlay working-tree diff review (Ctrl-G).
+    pub(crate) review: crate::review::ReviewState,
     /// When true, all confirmation requests are auto-approved for the rest of
     /// the session without showing the modal. Set by pressing `a` on an
     /// approval prompt ("always allow this session"). Cleared only by quitting
