@@ -464,7 +464,7 @@ impl crate::Agent {
                 // Grok-build starts a new generation after a format reminder.
                 // Sharing the 4-send ledger turns those retries into
                 // AttemptsExhausted and kills the turn.
-                retry_state.execution = retry_state.execution.fresh_operation();
+                retry_state.start_protocol_recovery(&err);
                 let protocol_retries = retry_state.protocol_retries;
                 if request_no_progress_final_answer {
                     // The live no-progress flag remains sticky in the caller,
@@ -508,7 +508,7 @@ impl crate::Agent {
                 self.emit_usage(ui);
                 retry_state.protocol_text_fallbacks += 1;
                 retry_state.record_recovery_attempt();
-                retry_state.execution = retry_state.execution.fresh_operation();
+                retry_state.start_protocol_recovery(&err);
                 *text_tool_fallback_next = true;
                 *force_tools_next = false;
                 ui.status(
@@ -546,7 +546,7 @@ impl crate::Agent {
                     // A different next action may succeed as a plain-text call
                     // even if structured JSON already burned the first fallback.
                     retry_state.protocol_text_fallbacks = 0;
-                    retry_state.execution = retry_state.execution.fresh_operation();
+                    retry_state.start_protocol_recovery(&err);
                     return Ok(ProviderStreamResult::Continue);
                 }
 
@@ -561,7 +561,7 @@ impl crate::Agent {
                     *force_tools_next = false;
                     *text_tool_fallback_next = false;
                     retry_state.protocol_retries = 0;
-                    retry_state.execution = retry_state.execution.fresh_operation();
+                    retry_state.start_protocol_recovery(&err);
                     *continue_total_nudges = continue_total_nudges.saturating_add(1);
                     self.messages
                         .push_nudge_or_fold(NudgeKind::Continue, PROTOCOL_EXHAUSTION_WRAP_UP_NUDGE);
