@@ -54,7 +54,7 @@ jobs:
 
       - name: Core tests
         run: >-
-          cargo nextest run
+          cargo nextest run --no-fail-fast
           -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace -p hi-sqlite-journal
           -p hi-control -p hi-pipefs -p hi-shell
           -p hi-tui -p hi -p hi-eval -p hi-smoke
