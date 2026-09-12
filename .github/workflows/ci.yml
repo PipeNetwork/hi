@@ -20,8 +20,8 @@ jobs:
       HI_PIPE_WRAP: ${{ github.workspace }}/target/pipe-wrap/x86_64-unknown-linux-gnu/pipe-wrap
     steps:
       - uses: actions/checkout@v5
-      - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      - name: Install Linux build and test dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev ripgrep
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
@@ -51,6 +51,12 @@ jobs:
 
       - name: Verify Linux sandbox helper enforcement
         run: '"${HI_PIPE_WRAP}" --unshare-all --ro-bind / / -- true'
+
+      - name: Verify native ripgrep inside the sandbox
+        run: |
+          command -v rg
+          rg --version
+          "${HI_PIPE_WRAP}" --unshare-all --ro-bind / / -- rg --version
 
       - name: Core tests
         run: >-
