@@ -16,6 +16,8 @@ jobs:
   quality:
     name: format · lint · deterministic tests
     runs-on: ubuntu-latest
+    env:
+      HI_PIPE_WRAP: ${{ github.workspace }}/target/pipe-wrap/x86_64-unknown-linux-gnu/pipe-wrap
     steps:
       - uses: actions/checkout@v5
       - name: Install Linux build dependencies
@@ -38,6 +40,17 @@ jobs:
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
           --all-targets -- -A clippy::large-enum-variant -D warnings
+
+      - name: Build Linux sandbox helper
+        run: tools/build-pipe-wrap.sh
+
+      - name: Enable unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+
+      - name: Verify Linux sandbox helper enforcement
+        run: '"${HI_PIPE_WRAP}" --unshare-all --ro-bind / / -- true'
 
       - name: Core tests
         run: >-
