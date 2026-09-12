@@ -48,12 +48,28 @@ impl crate::Agent {
     /// model did not supply an accepted final answer.
     /// This path makes no completion claim that verification cannot support.
     pub(super) fn emit_deterministic_closeout(&mut self, ui: &mut dyn Ui) {
-        if self.messages.as_slice().last().is_some_and(|message| {
-            message.role == hi_ai::Role::Assistant
+        let unresolved_validation = self
+            .task_recovery
+            .unresolved_validation_summary(&self.runtime.ledger().workspace_revision());
+        let needs_evidence_closeout = unresolved_validation.is_some()
+            || self.task_recovery.exhausted
+            || self.report.verify.failed()
+            || (!self.workspace.last_changed_files.is_empty() && !self.report.verify.passed())
+            || self
+                .report
+                .last_turn_outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.status != crate::TurnStatus::Completed);
+        // Keep an accepted answer, while still recording failed checks and
+        // unverified retained changes that its prose cannot override.
+        if !needs_evidence_closeout
+            && self.messages.as_slice().last().is_some_and(|message| {
+                message.role == hi_ai::Role::Assistant
                     && message.content.iter().any(|content| {
                         matches!(content, Content::Text(text) if text_is_user_visible_answer(text))
                     })
-        }) {
+            })
+        {
             return;
         }
         let closeout = if self.task_recovery.exhausted
@@ -87,10 +103,7 @@ impl crate::Agent {
         } else {
             "The turn is closed. No accepted final answer was produced; available results and diagnostics are shown above."
         };
-        let closeout = match self
-            .task_recovery
-            .unresolved_validation_summary(&self.runtime.ledger().workspace_revision())
-        {
+        let closeout = match unresolved_validation {
             Some(summary) => format!("{closeout}\n{summary}"),
             None => closeout.to_owned(),
         };
