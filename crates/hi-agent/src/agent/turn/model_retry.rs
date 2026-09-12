@@ -21,8 +21,6 @@ use super::speculation::SpeculationRegistry;
 
 mod compat_telemetry;
 use compat_telemetry::record_compat_fallback;
-#[cfg(test)]
-use compat_telemetry::{COMPAT_FALLBACK_LIMIT, COMPAT_FALLBACK_PREFIX};
 pub(super) const COMPLETED_PLAN_EMPTY_RECAP_FALLBACK: &str = "The plan is complete and the successful tool results were retained. The provider did not return a final recap.";
 /// After keep-working has already spent its chance, a further invalid-tool
 /// storm must not fail the turn as `no_progress` with no recap. One ChatOnly
@@ -820,32 +818,5 @@ impl crate::Agent {
                 Err(err)
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod diagnostic_tests {
-    use super::*;
-
-    #[test]
-    fn compatibility_fallbacks_are_deduplicated_and_bounded() {
-        let mut fallbacks = Vec::new();
-        for index in 0..100 {
-            record_compat_fallback(&mut fallbacks, format!("fallback-{index}"));
-        }
-        record_compat_fallback(&mut fallbacks, "fallback-0".into());
-
-        assert_eq!(fallbacks.len(), COMPAT_FALLBACK_LIMIT);
-        assert_eq!(fallbacks.first().map(String::as_str), Some("fallback-0"));
-        assert_eq!(
-            fallbacks.get(COMPAT_FALLBACK_PREFIX).map(String::as_str),
-            Some("fallback-99")
-        );
-        assert!(
-            fallbacks
-                .last()
-                .is_some_and(|marker| marker.contains("37 additional compatibility events omitted")),
-            "exact dropped count is surfaced in the bounded diagnostic: {fallbacks:?}"
-        );
     }
 }

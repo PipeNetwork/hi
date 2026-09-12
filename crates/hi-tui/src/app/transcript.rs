@@ -1,10 +1,12 @@
 //! `App` methods: transcript.
 
+mod btw;
 mod outcome;
 mod run_output;
 mod selection;
 mod steering;
 
+use btw::btw_tool_detail;
 use run_output::{bash_output_is_idle, bash_process_live, is_missing_background_process_result};
 use steering::{
     ExploreChrome, absorb_explore_chrome, append_assistant_line, is_steering_assistant_text,
@@ -1242,32 +1244,6 @@ fn could_be_generic_completion_prefix(content: &str) -> bool {
     ]
     .iter()
     .any(|candidate| candidate.starts_with(&normalized))
-}
-
-/// Compact tool-arg detail for the BTW pane timeline (path/pattern/command).
-fn btw_tool_detail(name: &str, arguments: &str) -> String {
-    let v: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
-    let pick = |keys: &[&str]| {
-        keys.iter()
-            .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
-            .unwrap_or("")
-            .to_string()
-    };
-    match name {
-        "read" | "list" | "glob" | "diff" => pick(&["path", "target", "directory"]),
-        "grep" => {
-            let pat = pick(&["pattern", "query"]);
-            let path = pick(&["path", "glob"]);
-            if path.is_empty() {
-                pat
-            } else {
-                format!("{pat} in {path}")
-            }
-        }
-        "repo_map" | "find_symbol" => pick(&["task", "symbol", "query", "name"]),
-        "web_search" | "web_fetch" => pick(&["query", "url"]),
-        _ => pick(&["path", "command", "query", "task"]),
-    }
 }
 
 fn is_legacy_subagent_status(text: &str) -> bool {
