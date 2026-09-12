@@ -154,3 +154,10 @@ pub(in crate::agent::turn) struct ModelRoundState<'a> {
     pub user_prompt_tokens: u64,
     pub verifier: &'a WorkspaceRepairVerifier,
 }
+
+/// `u32::MAX` is the public "unlimited" sentinel, not a finite cap that can be
+/// reached. Keeping that distinction here also prevents the cap's extra wrap-up
+/// request from overflowing the model-round counter at the sentinel boundary.
+pub(super) fn model_step_cap_reached(steps: u32, max_steps: u32) -> bool {
+    max_steps != u32::MAX && steps >= max_steps
+}

@@ -119,6 +119,10 @@ pub(crate) fn build_agent(
             standing_rules: load_standing_rules(),
             context_exclusions: quality.context_exclusions.clone(),
             auto_compact: !cli.no_auto_compact,
+            observation_pack: true,
+            online_context_compact: true,
+            action_fusion: true,
+            evidence_preserving_reducer: false,
             compaction: cli
                 .compaction
                 .as_deref()

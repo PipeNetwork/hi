@@ -145,6 +145,17 @@ impl FileOperationLockManager {
         fut().await
     }
 
+    /// Hold a per-path lock across a fused mutation and its follow-up command.
+    pub async fn with_path_lock<F, Fut, T>(&self, root: &Path, path: &str, fut: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let key = normalize_lock_path(root, path);
+        let _guard = self.wait_for_lock(&key).await;
+        fut().await
+    }
+
     pub async fn acquire_for_tool(
         &self,
         root: &Path,

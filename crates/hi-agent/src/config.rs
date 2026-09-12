@@ -735,6 +735,18 @@ pub struct AgentMemory {
     pub offer_browser: bool,
     /// Allow `browser_exec` to navigate RFC1918 / loopback hosts.
     pub browser_allow_private: bool,
+    /// Request-time packing of large tool results with exact paged recall.
+    pub observation_pack: bool,
+    /// Compact at completed plan steps when cache-write economics repay, or
+    /// under window pressure. The occupancy compact remains the backstop.
+    pub online_context_compact: bool,
+    /// Same-turn mutation then command as one combined observation.
+    pub action_fusion: bool,
+    /// Quote-checked diagnostic reduction after deterministic condense.
+    /// Off unless explicitly enabled.
+    pub evidence_preserving_reducer: bool,
+    /// Cache write/read cost ratio used by plan-boundary compaction.
+    pub cache_write_read_ratio: f64,
 }
 
 impl Default for AgentMemory {
@@ -766,6 +778,11 @@ impl Default for AgentMemory {
             offer_memory: false,
             offer_browser: true,
             browser_allow_private: false,
+            observation_pack: false,
+            online_context_compact: false,
+            action_fusion: false,
+            evidence_preserving_reducer: false,
+            cache_write_read_ratio: crate::compaction_economics::DEFAULT_CACHE_WRITE_READ_RATIO,
         }
     }
 }

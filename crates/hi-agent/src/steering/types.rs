@@ -4,13 +4,17 @@
 //! [`intent`](super::intent) and [`implementation`](super::implementation)
 //! for evidence classification and tool-call inspection.
 
+mod inspection;
+pub(crate) use inspection::{inspection_infrastructure_error_signature, inspection_signature};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use hi_ai::{Content, Message};
 
 use super::implementation::{
-    bash_inspection_paths, bash_inspection_signature, bash_no_progress_signature,
-    implementation_tool_call_validates,
+    BashCommandKind, bash_command, bash_inspection_paths, bash_inspection_signature,
+    bash_no_progress_signature, classify_bash_command, implementation_tool_call_validates,
+    shell_command_likely_mutates_workspace, shell_command_likely_validates,
 };
 use super::intent::{
     compact_search_hit_line, evidence_kind_for_tool, grep_match_line_count, search_hit_score,
@@ -52,12 +56,31 @@ pub(crate) struct ImplementationTracker {
     pub(crate) validation_after_last_mutation: bool,
     pub(crate) preferred_validation: Option<String>,
     pub(crate) no_change_nudges: u32,
+    /// When true, discovery tools are skipped until a file change lands.
+    /// Unique-file investigation nudges an edit without setting this, so a
+    /// review-and-fix turn can still read tests after the first challenge.
+    /// Rereads and validation-without-edit set it immediately.
+    pub(crate) withhold_inspection: bool,
+    /// Rejected review-shaped "insufficient evidence" wrap-ups on a fix
+    /// turn. One retry, then the turn is a stall.
+    pub(crate) unusable_wrapup_nudges: u32,
     pub(crate) requested_validation_nudges: u32,
+    /// Tool rounds on an implementation turn that did not mutate the workspace.
+    pub(crate) tool_rounds_without_mutation: u32,
 }
 
 impl ImplementationTracker {
     pub(crate) fn record_dry_run_plan(&mut self, mutates: bool) {
         self.dry_run_mutation_planned |= mutates;
+    }
+
+    /// Count an edit challenge. `withhold_now` hides read/grep after rereads;
+    /// unique-file sprawl passes false so the model can still inspect tests.
+    pub(crate) fn challenge_edit(&mut self, withhold_now: bool) {
+        self.no_change_nudges = self.no_change_nudges.saturating_add(1);
+        if withhold_now {
+            self.withhold_inspection = true;
+        }
     }
 
     pub(crate) fn record_validation_success(&mut self) {
@@ -117,6 +140,45 @@ pub(crate) fn is_read_only_inspection_tool(name: &str) -> bool {
         name,
         "read" | "list" | "grep" | "glob" | "explore" | "repo_map" | "find_symbol"
     )
+}
+
+/// Discovery calls to skip after an implementation no-change nudge, including
+/// shell dumps that bypass withheld `read`/`grep`.
+pub(crate) fn is_withheld_inspection_call(name: &str, arguments: &str) -> bool {
+    if matches!(
+        name,
+        "read"
+            | "grep"
+            | "glob"
+            | "list"
+            | "find_symbol"
+            | "repo_map"
+            | "obs_recall"
+            | "diff"
+            | "status"
+            | "explore"
+    ) {
+        return true;
+    }
+    if name != "bash" {
+        return false;
+    }
+    let Some(command) = bash_command(arguments) else {
+        return false;
+    };
+    match classify_bash_command(&command) {
+        BashCommandKind::Mutation | BashCommandKind::Validation | BashCommandKind::Background => {
+            false
+        }
+        BashCommandKind::Inspection | BashCommandKind::NoProgress => true,
+        // Live: `python3 -c print(open(file))`, `base64`, `od`, and `2>&1`
+        // pipelines classified as Unknown and kept executing after read/grep
+        // were withheld.
+        BashCommandKind::Unknown => {
+            !shell_command_likely_mutates_workspace(&command)
+                && !shell_command_likely_validates(&command)
+        }
+    }
 }
 
 impl EvidenceKind {
@@ -374,6 +436,16 @@ impl EvidenceTracker {
                 .any(|seen| paths_refer_to_same_file(seen, path))
     }
 
+    /// True when this `read` targets a file already inspected this turn.
+    /// Offset paging of the same path is not new evidence.
+    pub(crate) fn already_inspected_read(&self, name: &str, arguments: &str) -> bool {
+        if name != "read" {
+            return false;
+        }
+        let paths = hi_tools::target_paths(name, arguments);
+        !paths.is_empty() && paths.iter().all(|path| self.has_inspected_path(path))
+    }
+
     fn path_read_is_truncated(&self, path: &str) -> bool {
         self.truncated_read_paths
             .iter()
@@ -603,110 +675,6 @@ fn read_section_for_path<'a>(output: &'a str, path: &str) -> &'a str {
         Some(end) => &rest[..end],
         None => rest,
     }
-}
-
-/// A stable signature for a read-only inspection call, used to detect rounds
-/// that re-inspect already-seen evidence. Returns `None` for mutating or
-/// unclassified tools (those always count as potentially new evidence). The
-/// signature includes read pagination and grep context because those
-/// arguments change the evidence returned by the tool. A malformed read-only
-/// call returns `None`; callers treat that as potentially new evidence so the
-/// normal tool execution path can report the argument error.
-///
-/// [`EvidenceTracker::round_adds_evidence`] treats every new page of a still-
-/// truncated file as new evidence. The offset stays in the signature so
-/// identical pages still fold without imposing an arbitrary page count.
-pub(crate) fn inspection_signature(name: &str, arguments: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
-    match name {
-        "read" => {
-            let mut paths = hi_tools::target_paths("read", arguments);
-            if paths.is_empty() {
-                return None;
-            }
-            paths.sort_unstable();
-            paths.dedup();
-            let path = paths.join("\u{1f}");
-            const DEFAULT_READ_LIMIT: u64 = 2000;
-            let offset = optional_u64_field(&value, "offset")?.unwrap_or(1).max(1);
-            let limit = optional_u64_field(&value, "limit")?
-                .map(|n| n.max(1))
-                .filter(|&n| n != DEFAULT_READ_LIMIT)
-                .map_or_else(|| "default".to_string(), |n| n.to_string());
-            Some(format!("read:{path}:{offset}:{limit}"))
-        }
-        "list" => {
-            let path = value.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            Some(format!("list:{path}"))
-        }
-        "grep" => {
-            let pattern = value.get("pattern")?.as_str()?;
-            let glob = value.get("glob").and_then(|v| v.as_str()).unwrap_or("");
-            let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let context = optional_u64_field(&value, "context")?.unwrap_or(0);
-            Some(format!("grep:{pattern}:{glob}:{path}:{context}"))
-        }
-        "glob" => {
-            let pattern = value.get("pattern")?.as_str()?;
-            let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            Some(format!("glob:{pattern}:{path}"))
-        }
-        "repo_map" => {
-            let task = value.get("task").and_then(|v| v.as_str()).unwrap_or("");
-            let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            Some(format!("repo_map:{task}:{path}"))
-        }
-        "find_symbol" => {
-            let query = value.get("query")?.as_str()?;
-            let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            Some(format!("find_symbol:{query}:{path}"))
-        }
-        "explore" => {
-            let task = value
-                .get("task")
-                .or_else(|| value.get("prompt"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            Some(format!("explore:{task}"))
-        }
-        "bash_output" | "bash_kill" => {
-            let id = value.get("id")?.as_str()?;
-            if id.is_empty() {
-                return None;
-            }
-            Some(format!("{name}:{id}"))
-        }
-        "bash" => bash_inspection_signature(arguments)
-            .map(|command| format!("bash:inspection:{command}"))
-            .or_else(|| bash_no_progress_signature(arguments).map(|sig| format!("bash:{sig}"))),
-        _ => None,
-    }
-}
-
-fn optional_u64_field(value: &serde_json::Value, field: &str) -> Option<Option<u64>> {
-    match value.get(field) {
-        Some(v) if v.is_null() => Some(None),
-        Some(v) => v.as_u64().map(Some),
-        None => Some(None),
-    }
-}
-
-/// Coarse signature for tool failures that cannot produce new evidence on
-/// retry with different arguments (missing `rg` under Seatbelt, etc.).
-pub(crate) fn inspection_infrastructure_error_signature(
-    name: &str,
-    output: &str,
-) -> Option<String> {
-    if !output.starts_with("Error:") && !output.contains("execvp()") {
-        return None;
-    }
-    let lower = output.to_ascii_lowercase();
-    let unavailable = lower.contains("execvp()")
-        || (lower.contains("ripgrep") && lower.contains("unavailable"))
-        || (name == "grep"
-            && lower.contains("no such file")
-            && (lower.contains("'rg'") || lower.contains("of 'rg'")));
-    unavailable.then(|| format!("{name}:error:unavailable"))
 }
 
 fn background_handle_is_terminal(name: &str, output: &str) -> bool {

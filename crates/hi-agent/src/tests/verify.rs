@@ -139,7 +139,7 @@ async fn default_verification_repairs_continue_past_two_productive_cycles() {
 
     assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(agent.last_verify(), Some(true));
-    assert_eq!(agent.last_turn_telemetry().verify_rounds, 5);
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 4);
     assert_eq!(
         std::fs::read_to_string(workspace.path("changed.rs")).unwrap(),
         "3\n"

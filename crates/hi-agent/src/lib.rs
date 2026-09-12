@@ -7,6 +7,7 @@ mod coding_memory;
 pub mod command;
 mod compact_arg;
 pub mod compaction;
+mod compaction_economics;
 mod config;
 mod context_index;
 mod decision;
@@ -28,6 +29,7 @@ pub mod learning;
 pub mod local_skeptic;
 mod memory;
 mod observation;
+mod observation_pack;
 mod outcome;
 mod plan_drive;
 mod plan_ingest;
@@ -1171,6 +1173,9 @@ pub struct Agent {
     /// unchanged prefix of the previous request, so every prefix break here
     /// is real money on long sessions.
     pub(crate) prefix_stability: crate::prefix_stability::PrefixStability,
+    pub(crate) observation_pack: crate::observation_pack::ObservationPack,
+    pub(crate) obs_recall_calls: u32,
+    pub(crate) online_compact: crate::compaction_economics::OnlineCompactState,
     /// Context-window id, threshold notices, and pending `new_context` reset.
     pub(crate) token_budget: crate::token_budget::TokenBudgetState,
     /// Messages the user typed *while a turn was running*, awaiting injection at

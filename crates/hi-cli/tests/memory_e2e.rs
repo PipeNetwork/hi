@@ -150,11 +150,10 @@ fn one_shot_report_creates_parent_directories() {
 }
 
 #[test]
-fn review_repair_report_retains_typed_failure_at_shared_limit() {
+fn status_turn_completes_without_review_repair_cascade() {
     let weak_review = "The repository looks healthy and organized.";
-    // Surplus responses keep a transport failure from masking the policy result.
-    // One initial weak answer and three corrective requests must exhaust shared
-    // recovery, with no automatic continuation or recap inference.
+    // Surplus responses would be consumed if listing-only/format repair came
+    // back. That cascade is gone: a weak `/status` answer is preserved.
     let Some(server) = FakeOpenAiServer::new(
         (0..20)
             .map(|_| Response::sse(sse_with_usage(weak_review)))
@@ -181,8 +180,8 @@ fn review_repair_report_retains_typed_failure_at_shared_limit() {
     );
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "exhausted review repair must return a non-success exit\nstdout: {}\nstderr: {}",
+        Some(0),
+        "weak status answers complete without exhausting review repair\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -194,19 +193,23 @@ fn review_repair_report_retains_typed_failure_at_shared_limit() {
     );
     let visible_lower = visible.to_ascii_lowercase();
     assert!(
+        visible.contains(weak_review),
+        "the model answer must remain visible:\n{visible}"
+    );
+    assert!(
         !visible_lower.contains("insufficient evidence")
             && !visible_lower.contains("quality_rejected")
             && !visible_lower.contains("incomplete")
-            && !visible_lower.contains("stalled"),
-        "review repair text should not leak visibly:\n{visible}"
+            && !visible_lower.contains("stalled")
+            && !visible.contains("Automatic recovery stopped."),
+        "removed review-repair cascade must not leak into the CLI:\n{visible}"
     );
     let bodies = server.bodies();
     assert_eq!(
         bodies.len(),
-        4,
-        "initial request plus three shared corrections"
+        1,
+        "status turns must not spend extra model calls on listing-only repair: {bodies:?}"
     );
-    assert!(visible.contains("Automatic recovery stopped."));
     assert!(
         bodies
             .iter()
@@ -222,10 +225,9 @@ fn review_repair_report_retains_typed_failure_at_shared_limit() {
 
     let text = std::fs::read_to_string(&report).expect("report should be written");
     let json: serde_json::Value = serde_json::from_str(&text).expect("report json");
-    assert_eq!(json["outcome"]["status"], "failed");
-    assert_eq!(json["outcome"]["stop_reason"], "no_progress");
+    assert_eq!(json["outcome"]["status"], "completed");
     let telemetry = &json["telemetry"];
-    assert_eq!(telemetry["quality_repair_nudges"], 4);
+    assert_eq!(telemetry["quality_repair_nudges"], 0);
     assert_eq!(telemetry["stopped_by_step_cap"], false);
     assert_eq!(telemetry["stopped_by_tool_cap"], false);
     assert!(telemetry.get("stalled_unfinished").is_none());

@@ -125,6 +125,7 @@ impl ToolObservations {
         );
         let signature = inspection_signature(name, arguments);
         let signature_was_seen = signature_seen(evidence, &signature);
+        let already_inspected_read = evidence.already_inspected_read(name, arguments);
         let before = implementation.clone();
         // A terminal poll belongs to the original command, not to the
         // `bash_output` arguments. Credit it only on the same stable inputs.
@@ -200,6 +201,7 @@ impl ToolObservations {
                 &before,
                 plan_changed,
                 agent.runtime.root(),
+                already_inspected_read,
             )
         };
         progress_tracker.record_tool(&label);

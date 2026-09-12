@@ -1071,6 +1071,23 @@ mod tests {
     }
 
     #[test]
+    fn login_html_class_secret_is_not_a_credential_assignment() {
+        let html = r#"<label>password <input id="password" class="secret" type="password" autocomplete="current-password"></label>
+<style>input.secret { width:9rem; }</style>"#;
+        let out = redact_secrets(html);
+        assert!(out.contains(r#"id="password""#), "{out}");
+        assert!(out.contains(r#"class="secret""#), "{out}");
+        assert!(out.contains(r#"type="password""#), "{out}");
+        assert!(
+            !out.contains(REDACTED),
+            "login markup must not become a redacted path: {out}"
+        );
+        let assigned = redact_secrets("password = hunter2");
+        assert!(assigned.contains(REDACTED), "{assigned}");
+        assert!(!assigned.contains("hunter2"), "{assigned}");
+    }
+
+    #[test]
     fn quoted_token_assignments_still_redact() {
         let secret = fixture(&["xT7mQ2vR", "9zK4nP8w"]);
         for input in [

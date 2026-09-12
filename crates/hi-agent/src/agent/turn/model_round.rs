@@ -20,8 +20,8 @@ use crate::steering::{
     PLAN_REPOST_NUDGE, READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE,
     REREAD_NUDGE, SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_COMPLETED_FILE_REREAD_RESULT,
     SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT, bash_call_waits,
-    bash_no_progress_signature, implementation_text_tool_nudge, inspected_paths_for_prompt,
-    reread_action_nudge, should_nudge_read_after_repeated_search,
+    bash_no_progress_signature, implementation_text_tool_nudge, implementation_tool_call_validates,
+    inspected_paths_for_prompt, reread_action_nudge, should_nudge_read_after_repeated_search,
     tool_protocol_text_fallback_nudge,
 };
 use crate::transcript::NudgeKind;
@@ -34,20 +34,7 @@ use super::progress::{
     TOOL_LIMIT_WRAP_UP_NUDGE, no_progress_signature_for_calls,
 };
 
-/// `u32::MAX` is the public "unlimited" sentinel, not a finite cap that can be
-/// reached. Keeping that distinction here also prevents the cap's extra wrap-up
-/// request from overflowing the model-round counter at the sentinel boundary.
-fn model_step_cap_reached(steps: u32, max_steps: u32) -> bool {
-    max_steps != u32::MAX && steps >= max_steps
-}
-
 impl crate::Agent {
-    /// Emit one assistant text chunk on the main task stream. `/btw` answers are
-    /// handled off-band by `answer_btw_side_questions` and never pass through here.
-    pub(crate) fn emit_assistant_text(&mut self, ui: &mut dyn Ui, text: &str) {
-        ui.assistant_text(text);
-    }
-
     pub(super) async fn run_model_round(
         &mut self,
         state: &mut ModelRoundState<'_>,
@@ -126,7 +113,7 @@ impl crate::Agent {
         // with no final answer. The sticky flag makes the second hit terminal.
         let mut request_cap_wrap_up = false;
         let mut request_tool_cap_wrap_up = false;
-        let step_cap_reached = model_step_cap_reached(steps, max_steps);
+        let step_cap_reached = state::model_step_cap_reached(steps, max_steps);
         let tool_cap_reached = self
             .config
             .loop_limits
@@ -248,6 +235,12 @@ impl crate::Agent {
             Some(MUTATION_SAFE_CONTEXT_WINDOW)
         };
         self.elide_in_turn_context_if_needed(ui, context_safety_window);
+        if self.maybe_plan_boundary_compact(ui).await? {
+            self.messages.push_nudge_or_fold(
+                NudgeKind::Compaction,
+                crate::compaction_economics::PLAN_BOUNDARY_COMPACT_REORIENT,
+            );
+        }
         evidence.reopen_elided_reads(self.messages.as_slice());
 
         self.refresh_active_task_context(
@@ -334,6 +327,39 @@ impl crate::Agent {
             suppress_bookkeeping_tools_next = false;
             request_tools = super::model_request::apply_bookkeeping_suppress(request_tools, true);
         }
+        if (implementation_intent.is_some() || expected_mutation)
+            && !implementation_tracker.mutation_seen
+            && implementation_tracker.withhold_inspection
+        {
+            let filtered: Vec<_> = request_tools
+                .iter()
+                .filter(|tool| {
+                    !matches!(
+                        tool.name.as_str(),
+                        "read"
+                            | "grep"
+                            | "glob"
+                            | "list"
+                            | "find_symbol"
+                            | "repo_map"
+                            | "obs_recall"
+                            | "diff"
+                            | "status"
+                            | "explore"
+                    )
+                })
+                .cloned()
+                .collect();
+            if filtered.iter().any(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "write" | "edit" | "multi_edit" | "apply_patch" | "bash"
+                )
+            }) {
+                request_tools = filtered.into();
+                ui.status("withholding inspection tools until a file change lands");
+            }
+        }
         let effective_provider_capabilities = self.user_turn_capabilities(context_task).await;
         self.require_tool_route(&request_tools, &effective_provider_capabilities)?;
         tool_mode = super::model_request::provider_constraints::executable_round_mode(
@@ -348,7 +374,7 @@ impl crate::Agent {
             self.config.loop_limits.max_parallel_tools,
             &effective_provider_capabilities.capabilities,
         );
-        let request_tools = request_shape.tools.clone();
+        let mut request_tools = request_shape.tools.clone();
         let tool_mode = request_shape.tool_mode;
         let requested_request_max_tokens = request_shape.max_output_tokens;
         if request_text_tool_fallback {
@@ -452,6 +478,15 @@ impl crate::Agent {
             request_max_tokens_override = Some(request_max_tokens);
         }
         self.refresh_session_resource();
+        let request_messages = self.project_messages_for_provider();
+        if self.observation_pack.has_packed_handles()
+            && self.obs_recall_calls < crate::observation_pack::OBS_RECALL_TURN_BUDGET
+            && !request_tools.iter().any(|tool| tool.name == "obs_recall")
+        {
+            let mut tools = request_tools.to_vec();
+            tools.push(hi_tools::obs_recall_tool_spec());
+            request_tools = tools.into();
+        }
         let advertised_tool_specs = request_tools.clone();
         let mut envelope_limits =
             request_shape.envelope_limits(request_max_tokens, sched_tool_calls);
@@ -466,7 +501,10 @@ impl crate::Agent {
         // Prompt-cache health: measure whether this request extends the
         // previous one append-only (cacheable prefix) or rewrote history.
         self.prefix_stability
-            .record_request(self.messages.as_slice(), &request_tools);
+            .record_request(request_messages.as_slice(), &request_tools);
+        self.online_compact.record_provider_request(
+            crate::compaction::estimate_tokens(request_messages.as_slice()),
+        );
         if !self.admit_recovery_request().await? {
             ui.status("automatic recovery exhausted; settling the current workspace");
             return Ok(ModelRoundControl::Finish(self.recovery_terminal_decision(turn_ledger_revision)));
@@ -478,7 +516,7 @@ impl crate::Agent {
             retry_attempt: retry_state.request_attempt(),
             user_turn: true,
             canonical_objective: Some(context_task.to_string()),
-            messages: self.messages.arc(),
+            messages: request_messages,
             tools: request_tools,
             tool_envelope: Some(super::model_request::request_envelope(&tool_envelope)),
             max_tokens: request_max_tokens,
@@ -787,8 +825,15 @@ impl crate::Agent {
             return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
         }
 
+        let wrap_up_kept_inspecting = (request_text_answer || request_no_progress_final_answer)
+            && completion
+                .tool_calls()
+                .iter()
+                .any(|call| !implementation_tool_call_validates(call.name, call.arguments));
         let calls: Vec<(String, String, String)> =
             if request_text_answer || request_no_progress_final_answer || request_cap_wrap_up {
+                // ChatOnly wrap-up must not execute tools: the envelope admits
+                // none, and retrying as UnavailableTool spends leftover recovery.
                 Vec::new()
             } else {
                 completion
@@ -1256,7 +1301,7 @@ impl crate::Agent {
                     || bookkeeping_only_no_progress);
             if implementation_needs_mutation {
                 if implementation_tracker.no_change_nudges < 2 {
-                    implementation_tracker.no_change_nudges += 1;
+                    implementation_tracker.challenge_edit(true);
                     evidence.quality_repair_nudges =
                         evidence.quality_repair_nudges.saturating_add(1);
                     force_tools_next = false;
@@ -1281,7 +1326,7 @@ impl crate::Agent {
                         );
                     }
                     let nudge = IMPLEMENTATION_NO_CHANGES_NUDGE.to_string();
-                    self.messages.push_nudge(NudgeKind::Continue, nudge);
+                    self.messages.push_nudge(NudgeKind::Steer, nudge);
                     return Ok(ModelRoundControl::Continue);
                 }
 
@@ -1368,42 +1413,107 @@ impl crate::Agent {
             return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::VerifyAtLimit));
         }
 
-        if request_no_progress_final_answer {
+        if request_no_progress_final_answer && calls.is_empty() {
             // Key on the live flag, not `last_progress_reason`: the reason
             // string is sticky (`ProgressKind::None` rounds never overwrite
             // it), so after any background wait earlier in the turn a stalled
             // final answer would bypass the usability gate and be branded a
             // successful completion.
-            let background_status_answer = progress_tracker.awaiting_background;
-            let unusable = crate::steering::no_progress_forced_final_is_unusable(
+            let dump = crate::steering::answer_is_review_shaped_insufficient_evidence(
                 &assistant_text,
-                goal_kind,
-                implementation_tracker.tests_seen,
-                implementation_tracker.mutation_seen,
-            ) && !(background_status_answer && has_text);
-            if has_text && (buffer_read_only_review_text || !streamed_assistant_text) {
-                let text_to_emit = if buffered_assistant_text.is_empty() {
-                    assistant_text.as_str()
-                } else {
-                    buffered_assistant_text.as_str()
-                };
-                self.emit_assistant_text(ui, text_to_emit);
-                ui.assistant_end();
+            );
+            if dump {
+                // Reject through steer_without_tools so the dump is not the
+                // user-visible leftover closeout.
+            } else if !has_text {
+                // Live TUI: wrap-up fired, the next completion was still a
+                // tool call (stripped) or empty. Green checks with no mutation
+                // are the deliverable. Further inspection without checks is
+                // the true stall. A contentless wrap-up with no tools closes
+                // deterministically — retrying it burns another ChatOnly round.
+                let checks_without_mutation = (implementation_tracker.tests_seen
+                    || implementation_tracker.validation_seen)
+                    && !implementation_tracker.mutation_seen;
+                if checks_without_mutation {
+                    const CHECKS_RECAP: &str = "No file changes are needed because the existing checks already pass.";
+                    self.emit_assistant_text(ui, CHECKS_RECAP);
+                    ui.assistant_end();
+                    self.messages
+                        .push_assistant(vec![Content::Text(CHECKS_RECAP.into())]);
+                    force_no_progress_final_answer_next = false;
+                    retry_state.accepted_completion();
+                    self.answer_state = crate::recovery::AnswerState::Accepted;
+                    progress_tracker.record_final_answer();
+                    ui.status("model ran checks without a file change; accepting a no-edit recap");
+                    return Ok(ModelRoundControl::Finish(
+                        crate::agent::turn::ModelLoopDecision::Verify,
+                    ));
+                }
+                if wrap_up_kept_inspecting {
+                    implementation_tracker.no_mutation_exhausted = true;
+                    progress_tracker.record(
+                        ProgressKind::None,
+                        "forced wrap-up kept inspecting",
+                        None,
+                    );
+                    ui.nudge("forced wrap-up kept inspecting; no file changes were made");
+                    return Ok(ModelRoundControl::Finish(
+                        crate::agent::turn::ModelLoopDecision::Verify,
+                    ));
+                }
+                let background_status_answer = progress_tracker.awaiting_background;
+                let unusable = crate::steering::no_progress_forced_final_is_unusable(
+                    &assistant_text,
+                    goal_kind,
+                    implementation_tracker.tests_seen,
+                    implementation_tracker.mutation_seen,
+                ) && !(background_status_answer && has_text);
+                if unusable {
+                    self.messages.push_assistant_text_only(std::mem::take(&mut completion.content));
+                    self.answer_state = crate::recovery::AnswerState::Commentary;
+                    self.task_recovery.stop("forced final answer did not satisfy the task");
+                    self.persist_task_recovery_async().await?;
+                    return Ok(ModelRoundControl::Finish(self.recovery_terminal_decision(turn_ledger_revision)));
+                }
+                force_no_progress_final_answer_next = false;
+                self.messages
+                    .push_assistant(std::mem::take(&mut completion.content));
+                retry_state.accepted_completion();
+                self.answer_state = crate::recovery::AnswerState::Accepted;
+                progress_tracker.record_final_answer();
+                return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
+            } else {
+                let background_status_answer = progress_tracker.awaiting_background;
+                let unusable = crate::steering::no_progress_forced_final_is_unusable(
+                    &assistant_text,
+                    goal_kind,
+                    implementation_tracker.tests_seen,
+                    implementation_tracker.mutation_seen,
+                ) && !(background_status_answer && has_text);
+                if buffer_read_only_review_text || !streamed_assistant_text {
+                    let text_to_emit = if buffered_assistant_text.is_empty() {
+                        assistant_text.as_str()
+                    } else {
+                        buffered_assistant_text.as_str()
+                    };
+                    self.emit_assistant_text(ui, text_to_emit);
+                    ui.assistant_end();
+                }
+                if unusable {
+                    self.messages.push_assistant_text_only(std::mem::take(&mut completion.content));
+                    self.answer_state = crate::recovery::AnswerState::Commentary;
+                    self.task_recovery.stop("forced final answer did not satisfy the task");
+                    self.persist_task_recovery_async().await?;
+                    return Ok(ModelRoundControl::Finish(self.recovery_terminal_decision(turn_ledger_revision)));
+                }
+                force_no_progress_final_answer_next = false;
+                self.messages
+                    .push_assistant(std::mem::take(&mut completion.content));
+                retry_state.accepted_completion();
+                self.answer_state = crate::recovery::AnswerState::Accepted;
+                progress_tracker.record_final_answer();
+                return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
             }
-            if unusable {
-                self.messages.push_assistant_text_only(std::mem::take(&mut completion.content));
-                self.answer_state = crate::recovery::AnswerState::Commentary;
-                self.task_recovery.stop("forced final answer did not satisfy the task");
-                self.persist_task_recovery_async().await?;
-                return Ok(ModelRoundControl::Finish(self.recovery_terminal_decision(turn_ledger_revision)));
-            }
-            force_no_progress_final_answer_next = false;
-            self.messages
-                .push_assistant(std::mem::take(&mut completion.content));
-            retry_state.accepted_completion();
-            self.answer_state = crate::recovery::AnswerState::Accepted;
-            progress_tracker.record_final_answer();
-            return Ok(ModelRoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify));
         }
 
         // Auto-recover from a content-less response — no tool calls and no
@@ -1575,79 +1685,4 @@ impl crate::Agent {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unlimited_step_sentinel_is_never_a_reached_finite_cap() {
-        assert!(!model_step_cap_reached(u32::MAX, u32::MAX));
-        assert!(!model_step_cap_reached(6, 7));
-        assert!(model_step_cap_reached(7, 7));
-        assert!(model_step_cap_reached(8, 7));
-    }
-
-    #[test]
-    fn empty_completion_retry_disables_deepseek_thinking() {
-        assert_eq!(deepseek_thinking_for_round(None, false, false, 0), None);
-        assert_eq!(
-            deepseek_thinking_for_round(None, false, false, 1),
-            Some(false)
-        );
-        assert_eq!(
-            deepseek_thinking_for_round(
-                Some(crate::steering::ReviewIntent::Review),
-                true,
-                false,
-                0
-            ),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn collapse_duplicate_inspection_calls_keeps_first_and_preserves_mutations() {
-        let read_args = r#"{"path":"src/moves.rs","offset":395,"limit":20}"#;
-        let mut content = vec![
-            Content::Text("inspect the file".into()),
-            Content::ToolCall {
-                id: "read-1".into(),
-                name: "read".into(),
-                arguments: read_args.into(),
-            },
-            Content::ToolCall {
-                id: "read-2".into(),
-                name: "read".into(),
-                arguments: read_args.into(),
-            },
-            Content::ToolCall {
-                id: "bash-1".into(),
-                name: "bash".into(),
-                arguments: r#"{"command":"touch marker"}"#.into(),
-            },
-        ];
-        let calls = vec![
-            ("read-1".into(), "read".into(), read_args.into()),
-            ("read-2".into(), "read".into(), read_args.into()),
-            (
-                "bash-1".into(),
-                "bash".into(),
-                r#"{"command":"touch marker"}"#.into(),
-            ),
-        ];
-
-        let (collapsed, duplicate_count) = collapse_duplicate_inspection_calls(&mut content, calls);
-
-        assert_eq!(duplicate_count, 1);
-        assert_eq!(collapsed.len(), 2);
-        assert_eq!(collapsed[0].0, "read-1");
-        assert_eq!(collapsed[1].0, "bash-1");
-        let remaining_ids: Vec<_> = content
-            .iter()
-            .filter_map(|block| match block {
-                Content::ToolCall { id, .. } => Some(id.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(remaining_ids, ["read-1", "bash-1"]);
-    }
-}
+mod tests;

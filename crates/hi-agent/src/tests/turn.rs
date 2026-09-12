@@ -4479,7 +4479,7 @@ async fn capped_mutating_turn_still_runs_workspace_verification() {
         agent.report.verify.passed(),
         "cap exit must not skip verification"
     );
-    assert_eq!(agent.last_turn_telemetry().verification_executions.len(), 2);
+    assert_eq!(agent.last_turn_telemetry().verification_executions.len(), 1);
     assert_eq!(
         outcome.verified_workspace_revision,
         Some(agent.runtime.ledger().workspace_revision())

@@ -16,9 +16,10 @@ pub(super) struct EnrichmentOutcome {
 }
 
 impl crate::Agent {
-    /// A successful stage permits the optional enrichment writers. Their writes
-    /// do not inherit that stage's seal: changed canonical input needs another
-    /// deterministic pass before settlement, under the same verifier ceiling.
+    /// A successful stage permits the optional enrichment writers. Prose-only
+    /// owned memory/skill files rebind the seal without another suite run. Any
+    /// other canonical-input change — including files that landed after the
+    /// attested digest — still needs another deterministic pass.
     pub(super) async fn enrich_verified_turn(
         &mut self,
         turn: &mut TurnState,
@@ -74,15 +75,14 @@ impl crate::Agent {
         self.reconcile_workspace_changes().await?;
         let current_digest = self.runtime.ledger().workspace_revision();
         let changed_by_writers = self.runtime.ledger().changes_since(before_writers);
-        let only_owned_metadata = !changed_by_writers.is_empty()
-            && changed_by_writers.iter().all(|change| {
-                let path = self.runtime.root().join(&change.path);
-                published_paths.contains(&path)
-                    && !reviewed_changes
-                        .iter()
-                        .any(|prior| prior.path == change.path)
-                    && !turn.task_contract.referenced_paths.contains(&change.path)
-            });
+        let post_verify_changes = self.runtime.ledger().changes_since(verified_revision);
+        let only_owned_metadata = changes_are_owned_metadata(
+            changed_by_writers.iter().map(|change| change.path.as_str()),
+            &published_paths,
+            &reviewed_changes,
+            &turn.task_contract.referenced_paths,
+            self.runtime.root(),
+        );
         // Completion review covered the task diff. Preserve that review only
         // when acknowledged maintenance changed separate metadata paths and
         // the exact reviewed bytes remain unchanged. Source edits, explicitly
@@ -99,15 +99,30 @@ impl crate::Agent {
             false
         };
         let mut review_after_reconciliation = turn.independent_review_status;
+        let stages = self
+            .config
+            .gates
+            .verification
+            .resolved_stages(self.runtime.root());
         let recheck = enrichment_requires_revalidation(
-            changed_by_writers.iter().map(|change| change.path.as_str()),
-            &self
-                .config
-                .gates
-                .verification
-                .resolved_stages(self.runtime.root()),
+            post_verify_changes
+                .iter()
+                .map(|change| change.path.as_str()),
+            &stages,
         );
-        let changed = if !recheck && only_owned_metadata {
+        // Inspect every path that moved after the attested digest, not just the
+        // enrichment writers. A source file that lands during review must not
+        // inherit the previous green seal.
+        let only_owned_post_verify = changes_are_owned_metadata(
+            post_verify_changes
+                .iter()
+                .map(|change| change.path.as_str()),
+            &published_paths,
+            &reviewed_changes,
+            &turn.task_contract.referenced_paths,
+            self.runtime.root(),
+        );
+        let changed = if !recheck && only_owned_post_verify {
             // Skill/memory prose is not checked input for cargo test. Rebind
             // the seal instead of a second suite run the model cannot repair.
             let revision = self.runtime.ledger().revision();
@@ -136,6 +151,27 @@ impl crate::Agent {
             preserved_review_at: (changed && preserve_review).then_some(current_digest),
         })
     }
+}
+
+fn changes_are_owned_metadata<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    published_paths: &[std::path::PathBuf],
+    reviewed_changes: &[hi_tools::FileChange],
+    referenced_paths: &[String],
+    root: &std::path::Path,
+) -> bool {
+    let mut any = false;
+    for path in paths {
+        any = true;
+        let absolute = root.join(path);
+        if !published_paths.contains(&absolute)
+            || reviewed_changes.iter().any(|prior| prior.path == path)
+            || referenced_paths.iter().any(|referenced| referenced == path)
+        {
+            return false;
+        }
+    }
+    any
 }
 
 fn enrichment_requires_revalidation<'a>(
@@ -181,5 +217,14 @@ mod tests {
     fn explicit_memory_checks_still_revalidate() {
         let stages = [VerifyStage::new("check", "test ! -e .hi/memory.md")];
         assert!(enrichment_requires_revalidation([".hi/memory.md"], &stages));
+    }
+
+    #[test]
+    fn source_that_lands_with_memory_still_requires_revalidation() {
+        let stages = [VerifyStage::new("test", "true")];
+        assert!(enrichment_requires_revalidation(
+            [".hi/memory.md", "late.rs"],
+            &stages
+        ));
     }
 }

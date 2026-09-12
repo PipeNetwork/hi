@@ -160,19 +160,17 @@ async fn ignored_runtime_database_reset_requires_only_memory_revalidation() {
         .collect::<Vec<_>>();
     assert_eq!(
         verification.len(),
-        4,
-        "one check and one test run for the edit and final memory revision: {verification:?}"
+        2,
+        "one check and one test run for the edit; prose memory does not spend another pipeline: {verification:?}"
     );
-    for round in [1, 2] {
-        assert_eq!(
-            verification
-                .iter()
-                .filter(|status| status.contains(&format!("verifying ({round}/unlimited)")))
-                .count(),
-            2,
-            "each revision should execute one pipeline: {verification:?}"
-        );
-    }
+    assert_eq!(
+        verification
+            .iter()
+            .filter(|status| status.contains("verifying (1/unlimited)"))
+            .count(),
+        2,
+        "the attested revision should execute one pipeline: {verification:?}"
+    );
     assert_eq!(
         outcome.verified_workspace_revision,
         Some(agent.runtime.ledger().workspace_revision())
@@ -236,7 +234,7 @@ async fn default_unlimited_hygiene_stops_after_an_unchanged_repair() {
     assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert_eq!(outcome.review, ReviewStatus::Objected);
     assert_eq!(outcome.stop_reason, TurnStopReason::ReviewObjected);
-    assert_eq!(agent.last_turn_telemetry().verify_rounds, 3);
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
     assert!(
         ui.statuses
             .iter()
@@ -283,7 +281,7 @@ async fn default_unlimited_completion_review_stops_without_a_workspace_change() 
     assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert_eq!(outcome.review, ReviewStatus::Objected);
     assert_eq!(outcome.stop_reason, TurnStopReason::ReviewObjected);
-    assert_eq!(agent.last_turn_telemetry().verify_rounds, 3);
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
     assert!(
         ui.statuses
             .iter()

@@ -153,6 +153,11 @@ pub(crate) enum NudgeKind {
     /// intervention. Charging it as Continue exhausts the 3-slot budget
     /// before the model can emit a valid edit.
     Protocol,
+    /// Implementation completeness / wrap-up recap. Unique-file inspection and
+    /// "run tests then recap" are local steering, not provider recovery.
+    /// Charging them as Continue exhausts the 3-slot budget before a healthy
+    /// review-and-fix recap can be requested.
+    Steer,
     /// Grok-build TodoGate: leftover checklist, content-only ending.
     TodoGate,
     /// Grok-build laziness classifier reminder. Not a recovery intervention.
@@ -202,6 +207,7 @@ const fn nudge_marker(kind: NudgeKind) -> &'static str {
     match kind {
         NudgeKind::Repeat => "[hi:nudge:repeat]",
         NudgeKind::Protocol => "[hi:nudge:protocol]",
+        NudgeKind::Steer => "[hi:nudge:steer]",
         NudgeKind::TodoGate => "[hi:nudge:todogate]",
         NudgeKind::Laziness => "[hi:nudge:laziness]",
         NudgeKind::Continue => "[hi:nudge:continue]",
@@ -2340,6 +2346,8 @@ Read-only review guard: use only the currently advertised read-only inspection t
         t.push_nudge(NudgeKind::Repeat, "do not re-read that file");
         assert_eq!(t.take_recovery_request(), None);
         t.push_nudge(NudgeKind::Protocol, "retry with valid tool JSON");
+        assert_eq!(t.take_recovery_request(), None);
+        t.push_nudge(NudgeKind::Steer, "edit or explain now");
         assert_eq!(t.take_recovery_request(), None);
         t.push_nudge(NudgeKind::Continue, "edit a file now");
         assert_eq!(

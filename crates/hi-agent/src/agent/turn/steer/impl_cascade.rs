@@ -79,7 +79,7 @@ pub(super) fn spend_implementation_gate(
     tracker: &mut ImplementationTracker,
 ) {
     match gate {
-        ImplementationGate::NoChanges => tracker.no_change_nudges += 1,
+        ImplementationGate::NoChanges => tracker.challenge_edit(true),
         ImplementationGate::RequestedValidation => tracker.requested_validation_nudges += 1,
     }
 }

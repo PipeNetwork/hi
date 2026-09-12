@@ -18,14 +18,14 @@
 #
 # Optional:
 #   HI_MODEL   (default: the saved pipenetwork profile model)
-#   HI_BIN     (default: ./target/release/hi)
+#   HI_BIN     (default: freshly built ./target/debug/hi)
 #   HI_LIVE_E2E_KEEP=1  keep the workdir on failure
 #
 # Exit: 0 pass · 1 fail · 2 skipped (no key).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-HI_BIN="${HI_BIN:-$PWD/target/release/hi}"
+HI_BIN="${HI_BIN:-$PWD/target/debug/hi}"
 FIXTURE="$PWD/bench/tui-smoke/scenarios/live_review_fix_chat/fixture"
 
 has_pipe_credential() {
@@ -67,8 +67,8 @@ if [[ ! -d "$FIXTURE" ]]; then
   exit 1
 fi
 if [[ ! -x "$HI_BIN" ]]; then
-  echo "building hi (release)…" >&2
-  cargo build --release -p hi >&2 || exit 1
+  echo "building hi (debug)…" >&2
+  cargo build -p hi >&2 || exit 1
 fi
 
 WD="$(mktemp -d "${TMPDIR:-/tmp}/hi-live-e2e.XXXXXX")"

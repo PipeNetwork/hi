@@ -130,6 +130,21 @@ workspace if needed, then create or edit the necessary files with write/edit/mul
 or a project-local scaffold command. If after inspection the task genuinely requires no edits, \
 state plainly that no file changes are needed and explain why.";
 
+/// After a no-change nudge, skip discovery calls (including `bash sed/grep/cat`)
+/// instead of treating them as unavailable protocol errors.
+pub(crate) const WITHHELD_INSPECTION_RESULT: &str = "[not executed: inspection tools (read/grep/list \
+and shell dumps such as sed/grep/cat) are withheld until a file change lands. Edit a file with \
+write/edit/multi_edit/apply_patch now. cargo check/test remain available.]";
+
+/// A mutation already landed, but the model wrapped up with the
+/// gap/roadmap/status "Insufficient evidence" template instead of finishing
+/// the fix. Live: +1 Create-account button, then this dump, then green
+/// cargo test counted as verified success.
+pub(crate) const IMPLEMENTATION_REVIEW_WRAPUP_NUDGE: &str = "This is a fix request, not a \
+gap/roadmap/status review. An 'insufficient evidence' review dump is not an implementation. \
+Continue the original task: edit the relevant files with write/edit/multi_edit/apply_patch so \
+the requested behavior actually changes. Do not wrap up with a review-style evidence summary.";
+
 pub(crate) const REQUESTED_VALIDATION_NUDGE: &str = "The user explicitly asked you to run tests, \
 but no successful test run is in the transcript. Run the requested command now and \
 report its actual result. Do not claim completion without tool evidence.";

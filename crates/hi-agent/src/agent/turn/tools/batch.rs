@@ -6,6 +6,7 @@
 
 mod admission;
 mod feedback;
+mod fusion;
 mod observations;
 mod outcome;
 mod plan_updates;
@@ -13,6 +14,7 @@ mod policy;
 mod postprocess;
 mod program_guard;
 mod program_output;
+mod program_runner;
 mod program_settlement;
 mod program_speculation;
 mod terminal;
@@ -21,6 +23,7 @@ use admission::{
     ToolBatchAdmission, emit_stale_workspace_denials, stale_workspace_protocol_failure,
 };
 use feedback::{PendingCheck, append_fast_feedback};
+use fusion::{FusedToolContext, fuse_mutation_then_command, fused_tool_step};
 pub(in crate::agent::turn) use outcome::{ToolBatchOutcome, ToolProtocolFailureKind};
 use outcome::{
     append_tool_images, emit_capability_request, sealed_workspace_staleness,
@@ -33,8 +36,11 @@ use policy::{
     terminal_background_requires_reconciliation, workspace_operation_requires_settlement,
     workspace_program_execution_report,
 };
+use program_runner::ProgramToolRunner;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 
 use anyhow::{Context as _, Result};
 use futures_util::StreamExt;
@@ -46,9 +52,9 @@ use hi_tools::protocol::{
 use super::super::speculation::{SpeculationKey, SpeculationRegistry};
 use crate::heuristics::{emit_tool_output, respects_deps, tool_deps};
 use crate::steering::{
-    BashCommandKind, EvidenceTracker, ImplementationTracker, bash_command, classify_bash_command,
-    inspection_signature, read_only_blocked_tool_result, read_only_blocks_tool,
-    tool_result_hash_guard_applies,
+    BashCommandKind, EvidenceTracker, ImplementationTracker, WITHHELD_INSPECTION_RESULT,
+    bash_command, classify_bash_command, inspection_signature, is_withheld_inspection_call,
+    read_only_blocked_tool_result, read_only_blocks_tool, tool_result_hash_guard_applies,
 };
 use crate::verify::Snapshot;
 use crate::{
@@ -64,74 +70,6 @@ use program_guard::ProgramRunGuard;
 pub(crate) use program_speculation::ProgramSpeculator;
 use terminal::DeferredToolTerminals;
 use tokio_util::sync::CancellationToken;
-
-#[derive(Clone)]
-struct ProgramToolRunner {
-    root: std::path::PathBuf,
-    state_root: std::path::PathBuf,
-    process_runner: hi_tools::ProcessRunner,
-    lsp: std::sync::Arc<hi_lsp::LspManager>,
-    background: std::sync::Arc<hi_tools::BackgroundRegistry>,
-    read_cache: std::sync::Arc<std::sync::Mutex<hi_tools::ReadCache>>,
-    repo_map: std::sync::Arc<std::sync::Mutex<hi_tools::RepoMapCache>>,
-    mcp: Option<std::sync::Arc<dyn hi_tools::McpBackend>>,
-    memory: Option<std::sync::Arc<dyn hi_tools::MemoryBackend>>,
-}
-
-impl ProgramToolRunner {
-    async fn execute(
-        &self,
-        call: &ProgramCall,
-    ) -> (
-        std::result::Result<hi_workflow::ProgramToolResult, String>,
-        hi_tools::ToolOutcome,
-    ) {
-        let args = serde_json::to_string(&call.arguments).unwrap_or_default();
-        let allowed = (matches!(
-            hi_tools::speculation_class(&call.name),
-            hi_tools::SpeculationClass::PureLocal | hi_tools::SpeculationClass::IdempotentExternal
-        ) || call.name == "bash_output")
-            && hi_tools::is_read_only(&call.name)
-            && call.name != "run_program"
-            && hi_tools::is_known_tool(&call.name);
-        if !allowed {
-            let message = format!(
-                "tool `{}` requires ordinary structured-tool execution; retry without run_program",
-                call.name
-            );
-            let output = synthetic_tool_outcome(message.clone(), hi_tools::ToolStatus::Denied);
-            return (Err(message), output);
-        }
-        let output = execute_in_runtime_shared_with_runner(
-            &self.process_runner,
-            &self.root,
-            &self.state_root,
-            &self.lsp,
-            &self.background,
-            &self.read_cache,
-            &self.repo_map,
-            self.mcp.as_deref(),
-            self.memory.as_deref(),
-            &call.name,
-            &args,
-        )
-        .await;
-        let status = match output.status {
-            hi_tools::ToolStatus::Succeeded => "succeeded",
-            hi_tools::ToolStatus::Failed => "failed",
-            hi_tools::ToolStatus::Denied => "denied",
-            hi_tools::ToolStatus::TimedOut => "timed_out",
-            hi_tools::ToolStatus::Cancelled => "cancelled",
-        };
-        let result = hi_workflow::ProgramToolResult {
-            index: call.occurrence,
-            name: call.name.clone(),
-            status: status.into(),
-            output: output.content.clone(),
-        };
-        (Ok(result), output)
-    }
-}
 
 use crate::agent::delegate_turn::{
     DelegateJob, delegate_limit_denial, delegate_turn_limit, file_sets_disjoint,
@@ -150,6 +88,9 @@ use super::super::helpers::{synthetic_tool_outcome, tool_entry, tool_satisfies_v
 use super::super::phase::TurnPhase;
 use super::super::progress::{ProgressKind, ProgressTracker, ToolProgressLabel};
 use super::super::retention::ToolTimeline;
+
+type BatchToolFuture<'a> =
+    Pin<Box<dyn Future<Output = Vec<(usize, hi_tools::ToolOutcome)>> + Send + 'a>>;
 
 /// Add a scheduler count without allowing a very long unlimited turn to wrap
 /// the telemetry counter back to zero. `usize` inputs are clamped before the
@@ -277,6 +218,11 @@ impl crate::Agent {
         // Never let that stale signal cancel the model's next action.
         self.interrupt
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Snapshot at batch start: a write in this same batch must not lift
+        // withhold for a sibling `bash sed`, and skipping that sed in the
+        // pre-pass would complete it before its mutation dep.
+        let withhold_discovery =
+            !implementation_tracker.mutation_seen && implementation_tracker.withhold_inspection;
         if calls.iter().any(|(_, name, _)| {
             hi_tools::is_filesystem_mutating(name)
                 || name == "bash"
@@ -434,7 +380,16 @@ impl crate::Agent {
             // path below, never a runtime-mode policy. Checking admission here
             // prevents read-only policy from masking an unavailable tool and
             // feeding it into generic repeat/schema recovery.
-            if completed[i] || !tool_envelope.admits(name) {
+            if completed[i] {
+                continue;
+            }
+            let pending_mutation_dep = (0..i).any(|j| {
+                !completed[j] && implementation_tool_call_mutates(&calls[j].1, &calls[j].2)
+            });
+            let withhold_inspection = withhold_discovery
+                && is_withheld_inspection_call(name, arguments)
+                && !pending_mutation_dep;
+            if !withhold_inspection && !tool_envelope.admits(name) {
                 continue;
             }
             // Block calls forbidden by the review intent (read-only
@@ -444,10 +399,11 @@ impl crate::Agent {
             // bypasses tool *advertisement*, so without an execution-time
             // guard a ChatOnly/ReadOnly session — every `explore` subagent
             // included — could still run a mutating `write`/`bash`.
-            let blocked = if read_only_blocks_tool(read_only_intent, name) {
+            let blocked = if withhold_inspection {
+                Some(WITHHELD_INSPECTION_RESULT.to_string())
+            } else if read_only_blocks_tool(read_only_intent, name) {
                 Some(read_only_blocked_tool_result(name))
             } else {
-                // A mutable session mode may further narrow sealed authority.
                 execution_mode_denial(
                     tool_envelope.payload.execution_mode,
                     self.effective_tool_mode(),
@@ -461,9 +417,18 @@ impl crate::Agent {
                 output.effects.mutation_attempted =
                     implementation_tool_call_mutates(name, arguments);
                 emit_tool_output(&mut *ui, id, name, &output);
+                let withheld_inspection = content == WITHHELD_INSPECTION_RESULT;
                 let progress_label = ToolProgressLabel::new(
-                    ProgressKind::Weak,
-                    "tool denied by active mode",
+                    if withheld_inspection {
+                        ProgressKind::None
+                    } else {
+                        ProgressKind::Weak
+                    },
+                    if withheld_inspection {
+                        "inspection withheld until a file change"
+                    } else {
+                        "tool denied by active mode"
+                    },
                     inspection_signature(name, arguments),
                 );
                 progress_tracker.record_tool(&progress_label);
@@ -1338,6 +1303,7 @@ impl crate::Agent {
                         | "block_step"
                         | "ask_user"
                         | "new_context"
+                        | "obs_recall"
                         | "task"
                         | "send_subagent_message"
                         | "get_task_output"
@@ -1467,6 +1433,7 @@ impl crate::Agent {
                     "block_step" => self.handle_block_step(arguments),
                     "ask_user" => self.handle_ask_user(arguments, &mut *ui).await,
                     "new_context" => self.handle_new_context(),
+                    "obs_recall" => self.handle_obs_recall(arguments),
                     _ => self.handle_record_decision(arguments).await,
                 };
                 let duration_ms = started.elapsed().as_millis() as u64;
@@ -1685,6 +1652,47 @@ impl crate::Agent {
                     approved.retain(|i| !blocked.contains(i));
                 }
             }
+            if withhold_discovery {
+                let discovery: Vec<usize> = approved
+                    .iter()
+                    .copied()
+                    .filter(|&i| is_withheld_inspection_call(&calls[i].1, &calls[i].2))
+                    .collect();
+                for i in discovery {
+                    let name = &calls[i].1;
+                    let arguments = &calls[i].2;
+                    let content = WITHHELD_INSPECTION_RESULT.to_string();
+                    ui.tool_call_id(&calls[i].0, name, arguments);
+                    let mut output =
+                        synthetic_tool_outcome(content.clone(), hi_tools::ToolStatus::Denied);
+                    output.effects.mutation_attempted =
+                        implementation_tool_call_mutates(name, arguments);
+                    emit_tool_output(&mut *ui, &calls[i].0, name, &output);
+                    let progress_label = ToolProgressLabel::new(
+                        ProgressKind::None,
+                        "inspection withheld until a file change",
+                        inspection_signature(name, arguments),
+                    );
+                    progress_tracker.record_tool(&progress_label);
+                    tool_progress_labels.push(progress_label.clone());
+                    tool_timeline.push(tool_entry(
+                        name.clone(),
+                        hi_tools::target_path(name, arguments).unwrap_or_default(),
+                        0,
+                        &output,
+                        &progress_label,
+                    ));
+                    results[i] = Some((calls[i].0.clone(), content));
+                    completed[i] = true;
+                    completion_order.push(i);
+                    if let Some(entry) = tool_timeline.last_mut() {
+                        entry.completion_index = completion_order.len() as u32;
+                    }
+                    done += 1;
+                    approved.retain(|index| *index != i);
+                    denied.retain(|index| *index != i);
+                }
+            }
             let root = self.runtime.root().to_path_buf();
             let state_root = self.runtime.state_root().to_path_buf();
             let lsp = self.runtime.lsp();
@@ -1699,24 +1707,39 @@ impl crate::Agent {
                 )
                 .await,
             )?;
+            let call_names: Vec<&str> = calls.iter().map(|call| call.1.as_str()).collect();
+            let fusion_pairs: BTreeMap<usize, usize> = if self.config.memory.action_fusion {
+                approved
+                    .iter()
+                    .filter_map(|&index| {
+                        hi_tools::fused_command_index(&call_names, index, &completed, &deps)
+                            .map(|command| (index, command))
+                    })
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+            let fused_commands: BTreeSet<usize> = fusion_pairs.values().copied().collect();
             let executions = approved
                 .iter()
+                .filter(|index| !fused_commands.contains(index))
                 .map(|&i| {
                     (
                         i,
                         prepared_mutations.remove(&i),
                         preparation_failures.remove(&i),
+                        fusion_pairs.get(&i).copied(),
                     )
                 })
                 .collect::<Vec<_>>();
-            if executions.iter().any(|(index, _, failure)| {
+            if executions.iter().any(|(index, _, failure, _)| {
                 failure.is_none()
                     && workspace_operation_requires_settlement(&calls[*index].1, &calls[*index].2)
             }) {
                 *effects_may_have_begun = true;
             }
-            let outputs: Vec<_> =
-                futures_util::stream::iter(executions.into_iter().map(|(i, prepared, failure)| {
+            let outputs: Vec<_> = futures_util::stream::iter(executions.into_iter().map(
+                |(i, prepared, failure, fused)| {
                     let root = &root;
                     let state_root = &state_root;
                     let lsp = &lsp;
@@ -1728,37 +1751,133 @@ impl crate::Agent {
                     let memory = self.memory.clone();
                     let calls = &calls;
                     let file_ops = self.runtime.file_ops().clone();
-                    async move {
-                        let output = file_ops
-                            .with_tool_lock(root, &calls[i].1, &calls[i].2, move || async move {
-                                if let Some(failure) = failure {
-                                    failure
-                                } else if let Some(prepared) = prepared {
-                                    execute_prepared_in_runtime(lsp, read_cache, prepared).await
-                                } else {
-                                    execute_in_runtime_shared_with_runner(
-                                        &process_runner,
-                                        root,
-                                        state_root,
-                                        lsp,
-                                        background,
-                                        read_cache,
-                                        &repo_map,
-                                        mcp.as_deref(),
-                                        memory.as_deref(),
-                                        &calls[i].1,
-                                        &calls[i].2,
-                                    )
-                                    .await
-                                }
-                            })
+                    let fut: BatchToolFuture<'_> = if let Some(command_index) = fused {
+                        let background_arc = self.runtime.background_arc();
+                        let read_cache_arc = self.runtime.read_cache_arc();
+                        Box::pin(async move {
+                            let path = hi_tools::target_path(&calls[i].1, &calls[i].2)
+                                .unwrap_or_else(|| ".".into());
+                            let (mutation, command) = fuse_mutation_then_command(
+                                file_ops.clone(),
+                                root.clone(),
+                                path,
+                                {
+                                    let process_runner = process_runner.clone();
+                                    let root = root.clone();
+                                    let state_root = state_root.clone();
+                                    let lsp = lsp.clone();
+                                    let background = background_arc.clone();
+                                    let read_cache = read_cache_arc.clone();
+                                    let repo_map = repo_map.clone();
+                                    let mcp = mcp.clone();
+                                    let memory = memory.clone();
+                                    let name = calls[i].1.clone();
+                                    let arguments = calls[i].2.clone();
+                                    move || {
+                                        fused_tool_step(
+                                            FusedToolContext {
+                                                process_runner,
+                                                root,
+                                                state_root,
+                                                lsp,
+                                                background,
+                                                read_cache,
+                                                repo_map,
+                                                mcp,
+                                                memory,
+                                            },
+                                            name,
+                                            arguments,
+                                            prepared,
+                                            failure,
+                                        )
+                                    }
+                                },
+                                {
+                                    let process_runner = process_runner.clone();
+                                    let root = root.clone();
+                                    let state_root = state_root.clone();
+                                    let lsp = lsp.clone();
+                                    let background = background_arc;
+                                    let read_cache = read_cache_arc;
+                                    let repo_map = repo_map.clone();
+                                    let mcp = mcp.clone();
+                                    let memory = memory.clone();
+                                    let name = calls[command_index].1.clone();
+                                    let arguments = calls[command_index].2.clone();
+                                    move || {
+                                        fused_tool_step(
+                                            FusedToolContext {
+                                                process_runner,
+                                                root,
+                                                state_root,
+                                                lsp,
+                                                background,
+                                                read_cache,
+                                                repo_map,
+                                                mcp,
+                                                memory,
+                                            },
+                                            name,
+                                            arguments,
+                                            None,
+                                            None,
+                                        )
+                                    }
+                                },
+                            )
                             .await;
-                        (i, output)
-                    }
-                }))
-                .buffer_unordered(dynamic_parallel_tools)
-                .collect()
-                .await;
+                            vec![(i, mutation), (command_index, command)]
+                        })
+                    } else {
+                        Box::pin(async move {
+                            let run_one = |prepared: Option<hi_tools::PreparedMutation>,
+                                           failure: Option<hi_tools::ToolOutcome>,
+                                           index: usize| {
+                                let process_runner = process_runner.clone();
+                                let mcp = mcp.clone();
+                                let memory = memory.clone();
+                                let repo_map = repo_map.clone();
+                                async move {
+                                    if let Some(failure) = failure {
+                                        failure
+                                    } else if let Some(prepared) = prepared {
+                                        execute_prepared_in_runtime(lsp, read_cache, prepared).await
+                                    } else {
+                                        execute_in_runtime_shared_with_runner(
+                                            &process_runner,
+                                            root,
+                                            state_root,
+                                            lsp,
+                                            background,
+                                            read_cache,
+                                            &repo_map,
+                                            mcp.as_deref(),
+                                            memory.as_deref(),
+                                            &calls[index].1,
+                                            &calls[index].2,
+                                        )
+                                        .await
+                                    }
+                                }
+                            };
+                            let output = file_ops
+                                .with_tool_lock(root, &calls[i].1, &calls[i].2, || {
+                                    run_one(prepared, failure, i)
+                                })
+                                .await;
+                            vec![(i, output)]
+                        })
+                    };
+                    fut
+                },
+            ))
+            .buffer_unordered(dynamic_parallel_tools)
+            .collect::<Vec<Vec<_>>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
             let batch_duration_ms = batch_started.elapsed().as_millis() as u64;
             // Scheduler telemetry: count every call in the ready batch,
             // but report actual concurrency after the configured cap.
@@ -1962,7 +2081,13 @@ impl crate::Agent {
                     // Publish live state only after its durable write succeeds.
                     // Otherwise an I/O error leaves this process showing a new
                     // plan while restart restores the old one.
+                    let previous = self.goals.plan().to_vec();
                     let _ = self.goals.replace_plan(plan);
+                    if self.config.memory.online_context_compact
+                        && crate::compaction_economics::newly_completed_plan_step(&previous, plan)
+                    {
+                        self.online_compact.record_boundary();
+                    }
                     // Stage long-horizon progress without changing the
                     // live/durable goal. The turn-end gate commits this
                     // proposal only after current-revision verification

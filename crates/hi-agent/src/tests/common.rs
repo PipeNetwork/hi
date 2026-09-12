@@ -417,6 +417,10 @@ pub(crate) fn config() -> AgentConfig {
             inject_stack_skill: false,
             // Off so review-shaped canned turns don't grow by the code-review pack.
             inject_review_skill: false,
+            observation_pack: false,
+            online_context_compact: false,
+            action_fusion: false,
+            evidence_preserving_reducer: false,
             ..crate::AgentMemory::default()
         },
         test_state_root: Some(std::sync::Arc::new(state_guard)),
@@ -629,24 +633,7 @@ pub(crate) fn temp_workspace_path(name: &str) -> TempTestPath {
     }
 }
 
-#[test]
-fn test_file_fixture_is_outside_repository_and_removed_with_its_owner() {
-    let repository = std::env::current_dir().unwrap();
-    let fixture = temp_file("fixture-cleanup");
-    let path = fixture.as_ref().to_path_buf();
-
-    assert!(path.starts_with(std::env::temp_dir()));
-    assert!(!path.starts_with(&repository));
-    std::fs::write(&path, "temporary").unwrap();
-    assert!(path.exists());
-
-    drop(fixture);
-    assert!(!path.exists(), "temporary test fixture was not removed");
-    assert!(
-        !repository.join("hi-test-scratch").exists(),
-        "tests must not recreate repository-relative scratch state"
-    );
-}
+mod fixture_tests;
 
 /// Disposable, per-test workspace for tests that exercise workspace change
 /// detection. Keeping these roots outside the package checkout lets such tests

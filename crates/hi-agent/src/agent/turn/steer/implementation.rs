@@ -3,7 +3,8 @@
 use crate::steering::{
     BACKGROUND_WAIT_FINAL_NUDGE, BACKGROUND_WAIT_STATUS_NUDGE, EvidenceTracker,
     IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker, REREAD_NUDGE,
-    STATIONARITY_NUDGE, WAIT_POLL_STATIC_NUDGE, bash_call_waits, implementation_text_tool_nudge,
+    STATIONARITY_NUDGE, WAIT_POLL_STATIC_NUDGE, bash_call_waits, bash_inspection_signature,
+    implementation_text_tool_nudge, implementation_tool_call_mutates,
     implementation_tool_call_validates, tool_validation_retry_nudge, unavailable_tool_retry_nudge,
 };
 use crate::transcript::NudgeKind;
@@ -19,6 +20,11 @@ use super::RoundControl;
 
 const COMPLETED_PLAN_TOOL_CLOSEOUT: &str =
     "The plan is complete and the successful tool results were retained.";
+/// Unique-file reads are investigation, not a reread stall. Live e2e still
+/// paged `web.rs` → `main.rs` → `index.html` → `ws.rs` → `state.rs` → tests
+/// until leftover request budget died with no edit. After this many
+/// new-evidence inspection rounds on a fix turn, demand an edit.
+const UNIQUE_INSPECTION_ROUNDS_BEFORE_EDIT: u32 = 8;
 
 fn deepseek_schema_recovery_enabled(routing: &crate::config::AgentRouting) -> bool {
     match routing.deepseek_compat {
@@ -90,6 +96,197 @@ impl crate::Agent {
         let read_only_intent = batch.read_only_intent;
         // Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
         self.set_turn_phase(TurnPhase::Steer);
+        let only_obs_recall =
+            !calls.is_empty() && calls.iter().all(|(_, name, _)| name == "obs_recall");
+        if only_obs_recall
+            && (implementation_intent.is_some() || expected_mutation)
+            && !implementation_tracker.mutation_seen
+            && implementation_tracker.no_change_nudges < 2
+        {
+            implementation_tracker.challenge_edit(true);
+            evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
+            *force_tools_next = true;
+            progress_tracker.record(
+                ProgressKind::None,
+                "observation archive paging",
+                no_progress_signature_for_calls(calls),
+            );
+            ui.nudge("observation paging is not an implementation; requesting an edit");
+            self.messages.push_nudge(
+                NudgeKind::Steer,
+                IMPLEMENTATION_NO_CHANGES_NUDGE.to_string(),
+            );
+            return RoundControl::Continue;
+        }
+        let saw_unresolved_diagnostic = tool_progress_labels.iter().any(|label| {
+            label.reason == "unresolved diagnostic in command output"
+                || label.reason == "validation command failed"
+        });
+        if saw_unresolved_diagnostic
+            && (implementation_intent.is_some() || expected_mutation)
+            && !implementation_tracker.mutation_seen
+            && !implementation_tracker.validation_seen
+            && implementation_tracker.no_change_nudges < 2
+        {
+            implementation_tracker.challenge_edit(true);
+            evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
+            *force_tools_next = true;
+            ui.nudge("a compiler or test failure is already in context; requesting an edit");
+            self.messages.push_nudge(
+                NudgeKind::Steer,
+                IMPLEMENTATION_NO_CHANGES_NUDGE.to_string(),
+            );
+            return RoundControl::Continue;
+        }
+        let has_inspection = calls.iter().any(|(_, name, args)| {
+            matches!(
+                name.as_str(),
+                "read"
+                    | "grep"
+                    | "glob"
+                    | "list"
+                    | "find_symbol"
+                    | "repo_map"
+                    | "obs_recall"
+                    | "diff"
+                    | "status"
+            ) || (name == "bash" && bash_inspection_signature(args).is_some())
+        });
+        let added_new_inspection_evidence = tool_progress_labels.iter().any(|label| {
+            matches!(
+                label.reason.as_str(),
+                "new file evidence" | "new targeted search evidence" | "new listing evidence"
+            )
+        });
+        // Rereads demand an edit immediately. Unique files get a short
+        // investigation window, then the same edit challenge — otherwise a
+        // fix prompt can read the whole tree as "new evidence" until leftover
+        // provider budget closes the turn with no mutation.
+        if (implementation_intent.is_some() || expected_mutation)
+            && !implementation_tracker.mutation_seen
+            && has_inspection
+        {
+            implementation_tracker.tool_rounds_without_mutation = implementation_tracker
+                .tool_rounds_without_mutation
+                .saturating_add(1);
+            let threshold = if added_new_inspection_evidence {
+                UNIQUE_INSPECTION_ROUNDS_BEFORE_EDIT
+            } else {
+                1
+            };
+            if implementation_tracker.tool_rounds_without_mutation >= threshold
+                && implementation_tracker.no_change_nudges < 2
+            {
+                // Unique-file investigation must not hide tests/grep after the
+                // first challenge. Live review-and-fix: 4 unique reads, then
+                // withhold, then an insufficient-evidence dump.
+                implementation_tracker.challenge_edit(!added_new_inspection_evidence);
+                evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
+                *force_tools_next = false;
+                ui.nudge("inspection has not produced a file change; requesting an edit");
+                self.messages.push_nudge(
+                    NudgeKind::Steer,
+                    IMPLEMENTATION_NO_CHANGES_NUDGE.to_string(),
+                );
+                return RoundControl::Continue;
+            }
+        }
+        // Live follow-up: two unique reads then cargo check/test set
+        // validation_seen and skipped the inspection cap, burning the
+        // request budget with no file change. A fix prompt still owes an
+        // edit or an explicit no-change explanation.
+        if (implementation_intent.is_some() || expected_mutation)
+            && !implementation_tracker.mutation_seen
+            && implementation_tracker.validation_seen
+            && implementation_tracker.no_change_nudges < 2
+        {
+            implementation_tracker.challenge_edit(true);
+            evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
+            *force_tools_next = false;
+            ui.nudge("validation without a file change does not finish a fix; requesting an edit");
+            self.messages.push_nudge(
+                NudgeKind::Steer,
+                IMPLEMENTATION_NO_CHANGES_NUDGE.to_string(),
+            );
+            return RoundControl::Continue;
+        }
+        // After two edit challenges, another non-mutating round is a stall.
+        // Live: `grep | sed … 2>&1; echo EXIT=$?` grew by one `sed` each
+        // request, so consecutive-identical stationarity never fired and the
+        // turn ran hundreds of model rounds.
+        if (implementation_intent.is_some() || expected_mutation)
+            && !implementation_tracker.mutation_seen
+            && implementation_tracker.no_change_nudges >= 2
+            && !calls.is_empty()
+            && !calls
+                .iter()
+                .any(|(_, name, args)| implementation_tool_call_mutates(name, args))
+        {
+            let ran_validation = calls
+                .iter()
+                .any(|(_, name, args)| implementation_tool_call_validates(name, args));
+            // Live TUI: 9 unique reads, list, cargo test, leftover closeout.
+            // ChatOnly wrap-up must not fire before tests can run — the recap
+            // nudge stays Auto for one round so `cargo test` / python still
+            // execute, then wrap-up is ChatOnly.
+            if ran_validation {
+                *force_tools_next = false;
+                if implementation_tracker.validation_seen || implementation_tracker.tests_seen {
+                    progress_tracker.force_no_progress_final_answer_next = true;
+                    ui.nudge("validation without a file change; requesting a final answer");
+                    self.messages
+                        .push_nudge(NudgeKind::Steer, NO_PROGRESS_FINAL_ANSWER_NUDGE.to_string());
+                    return RoundControl::Continue;
+                }
+                // Failed cargo test / check is not a recap. Keep demanding an
+                // edit instead of ChatOnly wrap-up leftover.
+                if implementation_tracker.no_change_nudges < 4 {
+                    implementation_tracker.challenge_edit(true);
+                    ui.nudge(
+                        "a compiler or test failure is already in context; requesting an edit",
+                    );
+                    self.messages.push_nudge(
+                        NudgeKind::Steer,
+                        IMPLEMENTATION_NO_CHANGES_NUDGE.to_string(),
+                    );
+                    return RoundControl::Continue;
+                }
+                implementation_tracker.no_mutation_exhausted = true;
+                progress_tracker.record(
+                    ProgressKind::None,
+                    "failing checks exhausted without a mutation",
+                    no_progress_signature_for_calls(calls),
+                );
+                ui.nudge("failing checks without a file change; no edit landed");
+                return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
+            }
+            if !progress_tracker.force_no_progress_final_answer_next {
+                *force_tools_next = false;
+                ui.nudge(
+                    "inspection kept going after the edit challenge; requesting a final answer",
+                );
+                self.messages
+                    .push_nudge(NudgeKind::Steer, NO_PROGRESS_FINAL_ANSWER_NUDGE.to_string());
+                if progress_tracker.forced_final_answer_attempts == 0 {
+                    progress_tracker.record_forced_final_answer_attempt();
+                    return RoundControl::Continue;
+                }
+                progress_tracker.force_no_progress_final_answer_next = true;
+                return RoundControl::Continue;
+            }
+            if self.try_no_progress_recovery(progress_tracker, force_tools_next, None, ui) {
+                progress_tracker.prev_call_sig = None;
+                return RoundControl::Continue;
+            }
+            implementation_tracker.no_mutation_exhausted = true;
+            progress_tracker.record(
+                ProgressKind::None,
+                "implementation repair exhausted without a mutation",
+                no_progress_signature_for_calls(calls),
+            );
+            ui.nudge("implementation kept inspecting after the edit challenge");
+            return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
+        }
         if !calls.is_empty() {
             progress_tracker.stationarity.observe_calls(calls);
             if progress_tracker.stationarity.hard_stop() {
@@ -99,6 +296,15 @@ impl crate::Agent {
                     progress_tracker.record_final_answer();
                     return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
                 }
+                if implementation_intent.is_some() || expected_mutation {
+                    implementation_tracker.no_mutation_exhausted = true;
+                    progress_tracker.record(
+                        ProgressKind::None,
+                        "identical inspections reached the stationarity hard stop",
+                        no_progress_signature_for_calls(calls),
+                    );
+                }
+                return RoundControl::Finish(crate::agent::turn::ModelLoopDecision::Verify);
             } else if progress_tracker.stationarity.take_nudge() {
                 ui.nudge("identical tool calls repeating — nudging a different next action");
                 self.messages
@@ -479,7 +685,7 @@ impl crate::Agent {
                 && !implementation_tracker.mutation_seen
             {
                 if implementation_tracker.no_change_nudges < 2 {
-                    implementation_tracker.no_change_nudges += 1;
+                    implementation_tracker.challenge_edit(true);
                     evidence.quality_repair_nudges =
                         evidence.quality_repair_nudges.saturating_add(1);
                     *force_tools_next = false;
@@ -488,7 +694,7 @@ impl crate::Agent {
                         "repeated inspection made no progress; requesting an edit or explanation",
                     );
                     self.messages.push_nudge(
-                        NudgeKind::Continue,
+                        NudgeKind::Steer,
                         IMPLEMENTATION_NO_CHANGES_NUDGE.to_string(),
                     );
                     return RoundControl::Continue;
@@ -519,7 +725,7 @@ impl crate::Agent {
                     "tool results kept repeating after a workspace change; forcing a final answer"
                 });
                 self.messages
-                    .push_nudge(NudgeKind::Continue, NO_PROGRESS_FINAL_ANSWER_NUDGE);
+                    .push_nudge(NudgeKind::Steer, NO_PROGRESS_FINAL_ANSWER_NUDGE);
                 return RoundControl::Continue;
             }
             // No completed mutation is available to summarize. Give the
@@ -550,81 +756,4 @@ impl crate::Agent {
 }
 
 #[cfg(test)]
-mod schema_recovery_tests {
-    use super::deepseek_schema_recovery_enabled;
-
-    fn routing_with_capability(
-        compat: hi_ai::DeepSeekCompat,
-        provider: Option<&str>,
-        capability: Option<&str>,
-        model: &str,
-    ) -> crate::config::AgentRouting {
-        crate::config::AgentRouting {
-            provider_route: provider.map(str::to_string),
-            capability_route: capability.map(str::to_string),
-            model: model.to_string(),
-            deepseek_compat: compat,
-            ..crate::config::AgentRouting::default()
-        }
-    }
-
-    fn routing(
-        compat: hi_ai::DeepSeekCompat,
-        provider: Option<&str>,
-        model: &str,
-    ) -> crate::config::AgentRouting {
-        routing_with_capability(compat, provider, None, model)
-    }
-
-    #[test]
-    fn deepseek_schema_recovery_matches_the_provider_auto_identity_rules() {
-        assert!(deepseek_schema_recovery_enabled(&routing(
-            hi_ai::DeepSeekCompat::On,
-            Some("openai"),
-            "custom-alias",
-        )));
-        assert!(!deepseek_schema_recovery_enabled(&routing(
-            hi_ai::DeepSeekCompat::Off,
-            Some("deepseek"),
-            "deepseek-v4-flash",
-        )));
-        assert!(deepseek_schema_recovery_enabled(&routing(
-            hi_ai::DeepSeekCompat::Auto,
-            Some("deepseek"),
-            "custom-alias",
-        )));
-        assert!(deepseek_schema_recovery_enabled(&routing(
-            hi_ai::DeepSeekCompat::Auto,
-            Some("openai"),
-            "DeepSeek_V4_Pro_0813",
-        )));
-        assert!(!deepseek_schema_recovery_enabled(&routing(
-            hi_ai::DeepSeekCompat::Auto,
-            Some("openai"),
-            "DeepSeek-Coder-V2-Lite",
-        )));
-        assert!(!deepseek_schema_recovery_enabled(&routing(
-            hi_ai::DeepSeekCompat::Auto,
-            Some("not-deepseek"),
-            "generic-model",
-        )));
-        assert!(deepseek_schema_recovery_enabled(&routing_with_capability(
-            hi_ai::DeepSeekCompat::Auto,
-            Some("openai"),
-            Some("deepseek@endpoint:blake3:opaque"),
-            "custom-alias",
-        )));
-        assert!(!deepseek_schema_recovery_enabled(&routing_with_capability(
-            hi_ai::DeepSeekCompat::Off,
-            Some("openai"),
-            Some("deepseek@endpoint:blake3:opaque"),
-            "custom-alias",
-        )));
-        assert!(!deepseek_schema_recovery_enabled(&routing_with_capability(
-            hi_ai::DeepSeekCompat::Auto,
-            Some("openai"),
-            Some("not-deepseek@endpoint:blake3:opaque"),
-            "custom-alias",
-        )));
-    }
-}
+mod schema_recovery_tests;

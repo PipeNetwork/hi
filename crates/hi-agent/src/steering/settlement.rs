@@ -13,6 +13,7 @@
 use hi_ai::Content;
 
 use super::goal_kind::GoalKind;
+use super::intent::contains_any;
 use super::stop_detector::matched_bail_out;
 use crate::heuristics::parse_text_tool_calls;
 
@@ -69,6 +70,12 @@ pub(crate) fn classify_text_answer(
     if plan_incomplete {
         return StallCategory::StalledFalseCompletion;
     }
+    // Live Flash: a one-line HTML edit plus `bash sed/grep`, then a
+    // gap/roadmap/status "Insufficient evidence" dump, still verified
+    // because cargo check/test passed. That wrap-up is not a fix.
+    if answer_is_review_shaped_insufficient_evidence(trimmed) {
+        return StallCategory::StalledFalseCompletion;
+    }
     match matched_bail_out(trimmed) {
         Some(super::stop_detector::PATTERN_PLEASE_DEFLECTION) => {
             StallCategory::StalledPermissionAsking
@@ -101,6 +108,27 @@ pub(crate) fn no_progress_forced_final_is_unusable(
         return !tests_seen || mutation_seen;
     }
     forced_final_answer_is_unusable(text, false, kind)
+}
+
+/// The gap/roadmap/status review recipe taught models this wrap-up. A
+/// real review may use it; a fix/implementation turn may not close with it.
+pub(crate) fn answer_is_review_shaped_insufficient_evidence(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    if !lower.contains("insufficient evidence") {
+        return false;
+    }
+    contains_any(
+        &lower,
+        &[
+            "gap, roadmap, or status",
+            "evidence summary:",
+            "files_read=",
+            "inspected_paths",
+            "insufficient evidence cause",
+            "build-next work",
+            "owning implementation modules",
+        ],
+    )
 }
 
 pub(crate) fn offers_next_work(text: &str) -> bool {
@@ -283,6 +311,64 @@ Let me implement fixes for #1, #2, and #3.";
             text,
             true,
             GoalKind::Research
+        ));
+    }
+
+    fn live_insufficient_evidence_dump() -> &'static str {
+        "Insufficient evidence: I inspected src/web/index.html, src/web.rs, src/state.rs, REDACTED_SECRET, but that evidence is not enough to make concrete gap, roadmap, or status claims for this request. A useful answer would need targeted reads or searches of the owning implementation modules, tests, and validation surface before recommending build-next work.\n\
+Evidence summary: files_read=3, searches=0, listings=1, commands=4, failed_tools=1, inspected_paths=src/web/index.html, src/web.rs, src/state.rs, REDACTED_SECRET.\n\
+Insufficient evidence cause: inaccessible_path"
+    }
+
+    #[test]
+    fn review_shaped_insufficient_evidence_is_a_false_completion_on_a_fix() {
+        let dump = live_insufficient_evidence_dump();
+        assert!(answer_is_review_shaped_insufficient_evidence(dump));
+        assert_eq!(
+            classify_text_answer(GoalKind::CodeChange, dump, false, false),
+            StallCategory::StalledFalseCompletion
+        );
+        assert!(forced_final_answer_is_unusable(
+            dump,
+            false,
+            GoalKind::CodeChange
+        ));
+        // Bare review answers must not trip this — those turns keep the dump.
+        assert!(!answer_is_review_shaped_insufficient_evidence(
+            "Insufficient evidence to determine the cause; the relevant service is unavailable."
+        ));
+        assert!(!answer_is_review_shaped_insufficient_evidence(
+            "Insufficient evidence for the remote caller, but src/lib.rs returns 42."
+        ));
+        assert_eq!(
+            classify_text_answer(GoalKind::Analysis, dump, false, false),
+            StallCategory::NotStalledComplete
+        );
+        assert!(!forced_final_answer_is_unusable(
+            dump,
+            false,
+            GoalKind::Analysis
+        ));
+    }
+
+    #[test]
+    fn giving_up_after_mutation_and_tests_is_still_an_unusable_forced_final() {
+        assert!(no_progress_forced_final_is_unusable(
+            "Giving up.",
+            GoalKind::CodeChange,
+            true,
+            true
+        ));
+        assert!(!no_progress_forced_final_is_unusable(
+            "Giving up.",
+            GoalKind::Analysis,
+            true,
+            true
+        ));
+        assert!(!forced_final_answer_is_unusable(
+            "Giving up.",
+            false,
+            GoalKind::Analysis
         ));
     }
 }

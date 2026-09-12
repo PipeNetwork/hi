@@ -41,7 +41,7 @@ impl hi_ai::Provider for SteeringRequiredProbe {
             .requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match round {
-            0..=11 => Ok(completion(
+            0..=1 => Ok(completion(
                 vec![Content::ToolCall {
                     id: format!("read-{round}"),
                     name: "read".into(),
@@ -53,7 +53,7 @@ impl hi_ai::Provider for SteeringRequiredProbe {
                 1,
                 1,
             )),
-            12 => Ok(completion(
+            2 => Ok(completion(
                 vec![Content::Text("Let me edit the file now.".into())],
                 1,
                 1,
@@ -163,7 +163,7 @@ async fn required_mode_rejects_narration_without_weakening_the_request() {
 async fn fresh_discovery_does_not_turn_narration_into_a_protocol_error() {
     let workspace = IsolatedWorkspace::new("required-mutation-repair");
     std::fs::create_dir_all(workspace.path("src")).unwrap();
-    for round in 0..12 {
+    for round in 0..2 {
         std::fs::write(
             workspace.path(format!("src/context-{round}.rs")),
             format!("pub const CONTEXT_{round}: usize = {round};\n"),
@@ -191,9 +191,9 @@ async fn fresh_discovery_does_not_turn_narration_into_a_protocol_error() {
         Some(ProviderErrorKind::PolicyBlocked)
     );
     let modes = modes.lock().unwrap();
-    assert_eq!(modes.len(), 14);
+    assert_eq!(modes.len(), 4);
     assert_eq!(
-        &modes[12..],
+        &modes[2..],
         &[ToolMode::Auto, ToolMode::Auto],
         "investigation must not force a Required contract"
     );

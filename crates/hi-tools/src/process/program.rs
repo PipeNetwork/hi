@@ -76,7 +76,7 @@ impl ProcessRunner {
             command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
         }
         let child = command.spawn().context("failed to spawn program")?;
-        capture_child_with_output_mode(
+        let execution = capture_child_with_output_mode(
             child,
             timeout,
             &mut |_| {},
@@ -84,6 +84,10 @@ impl ProcessRunner {
             &self.foreground,
             output_mode,
         )
-        .await
+        .await?;
+        Ok(match output_mode {
+            OutputMode::Diagnostics => self.apply_diagnostic_evidence_reducer(execution),
+            OutputMode::Plain => execution,
+        })
     }
 }

@@ -284,7 +284,16 @@ async fn task_review_survives_only_acknowledged_metadata_outside_its_scope() {
     ] {
         let workspace = IsolatedWorkspace::new(scenario);
         let mut cfg = workspace.config();
-        cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+        // Recheck is skipped for prose-only memory unless the stage names that
+        // file. This scenario injects a source mutation at the second
+        // VerificationStarted, so the stage must still require revalidation.
+        let verify_command = if scenario == "source-before-recheck" {
+            "true # .hi/memory.md"
+        } else {
+            "true"
+        };
+        cfg.gates.verification =
+            VerificationMode::Explicit(vec![VerifyStage::new("test", verify_command)]);
         cfg.gates.review = ReviewPolicy::Always;
         cfg.memory.curate_skills = scenario == "owned-only";
         let mut responses = vec![
@@ -342,7 +351,12 @@ async fn task_review_survives_only_acknowledged_metadata_outside_its_scope() {
             "{scenario}: {:?}",
             ui.statuses
         );
-        assert_eq!(subject.last_turn_telemetry().verify_rounds, 2, "{scenario}");
+        let expected_verify_rounds = if scenario == "owned-only" { 1 } else { 2 };
+        assert_eq!(
+            subject.last_turn_telemetry().verify_rounds,
+            expected_verify_rounds,
+            "{scenario}"
+        );
         assert_eq!(
             subject.last_turn_telemetry().model_requests,
             3,

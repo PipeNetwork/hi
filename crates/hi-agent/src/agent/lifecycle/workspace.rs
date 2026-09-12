@@ -266,6 +266,10 @@ impl crate::Agent {
         self.workspace = crate::domain::WorkspaceTurnState::default();
         self.snapshot_cache = crate::snapshot::SnapshotCache::default();
         self.prefix_stability = crate::prefix_stability::PrefixStability::default();
+        self.observation_pack =
+            crate::observation_pack::ObservationPack::new(self.config.paths.state_root.clone());
+        self.obs_recall_calls = 0;
+        self.online_compact = crate::compaction_economics::OnlineCompactState::default();
         *self
             .btw_git_facts_cache
             .lock()

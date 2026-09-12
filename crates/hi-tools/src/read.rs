@@ -89,6 +89,12 @@ pub(crate) fn looks_like_multi_file_read(content: &str) -> bool {
 /// Numbered `read` pages (and pages that invite further paging) keep the
 /// dedicated read budget. Everything else uses the shared ~5k cap.
 pub(crate) fn result_char_budget(content: &str) -> usize {
+    if content.starts_with("[obs_recall ") {
+        // Recall pages are exact archive slices (16 KiB + a short header).
+        // The shared ~5k cap would drop the middle while next_offset still
+        // advanced past it.
+        return 32 * 1024;
+    }
     if read_output_invites_paging(content)
         || looks_like_numbered_read(content)
         || looks_like_multi_file_read(content)

@@ -296,6 +296,32 @@ pub fn new_context_tool_spec() -> ToolSpec {
     }
 }
 
+/// Admission (ADR 002): Structure — paged exact recall of a packed tool result.
+/// Inject-only when a packed handle exists. Side-effect class: none
+/// (Coordination, read-only). Not a substitute for `read` of workspace files.
+pub fn obs_recall_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "obs_recall".into(),
+        description: "Read a stored large tool result by observation id and byte offset. Use only with an id from a packed-handle placeholder; prefer `read` for workspace files. Continue from next_offset until eof=true.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Observation id from a packed tool-result placeholder."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Byte offset, default 0."
+                }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 /// Admission (ADR 002): Structure + Reliability over `web_search`+`web_fetch`.
 /// Inject-only — not in [`super::TOOL_SPECS`], [`super::MINIMAL_TOOL_SPECS`], or
 /// [`super::PROTECTED_TOOLS`]. Side-effect class: network.
