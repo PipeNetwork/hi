@@ -1,7 +1,8 @@
 use super::{
-    DEFAULT_READ_LIMIT, MAX_GREP_FILE_BYTES, MAX_READ_FILE_BYTES, format_read, is_binary,
-    looks_like_numbered_read, read_output_budget, result_char_budget, ripgrep_binary_unavailable,
-    run_grep_fallback_sync, run_grep_with_runner_maybe_timeout, run_list_sync, run_read,
+    DEFAULT_READ_LIMIT, MAX_GREP_FILE_BYTES, MAX_READ_FILE_BYTES, finish_ripgrep_execution,
+    format_read, is_binary, looks_like_numbered_read, read_output_budget, result_char_budget,
+    ripgrep_binary_unavailable, run_grep_fallback_sync, run_grep_with_runner_maybe_timeout,
+    run_list_sync, run_read,
 };
 
 #[test]
@@ -511,4 +512,38 @@ fn sandboxed_missing_rg_is_treated_as_unavailable() {
         truncation: crate::TruncationState::Complete,
     };
     assert!(ripgrep_binary_unavailable(&execution));
+    assert!(
+        finish_ripgrep_execution(execution, ".", "needle")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grep_retains_failed_process_diagnostics_instead_of_reporting_no_matches() {
+    let root = tempfile::tempdir().unwrap();
+    let runner = crate::ProcessRunner::new(root.path()).unwrap();
+    for (script, expected) in [
+        ("exit 1", Ok("no matches for needle")),
+        (
+            "printf 'search launcher failed before execution' >&2; exit 1",
+            Err("search launcher failed before execution"),
+        ),
+        ("printf 'source_symbol'", Ok("source_symbol")),
+    ] {
+        let execution = runner
+            .run_program_plain_maybe_timeout("sh", &["-c", script], None)
+            .await
+            .unwrap();
+        let result = finish_ripgrep_execution(execution, ".", "needle");
+        match expected {
+            Ok(content) => assert_eq!(result.unwrap().unwrap().content, content),
+            Err(diagnostic) => {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(diagnostic), "{error}");
+                assert!(!error.contains("no matches"), "{error}");
+            }
+        }
+    }
 }
