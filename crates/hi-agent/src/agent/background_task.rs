@@ -247,12 +247,8 @@ impl crate::Agent {
                             .await
                         }
                         None => {
-                            let (provider, child_config, capability_registry) =
-                                read_run.expect("read-only background run was prepared");
                             run_bg_readonly(
-                                provider,
-                                child_config,
-                                capability_registry,
+                                read_run.expect("read-only background run was prepared"),
                                 kind,
                                 prompt_for_factory,
                                 child_teardown,
@@ -649,9 +645,11 @@ fn readonly_child_prompt(kind: BgTaskKind, prompt: &str) -> String {
 
 /// Run a background read-only subagent (`explore` / `plan`) to completion.
 async fn run_bg_readonly(
-    provider: std::sync::Arc<dyn hi_ai::Provider>,
-    config: AgentConfig,
-    capability_registry: hi_ai::ProviderCapabilityRegistry,
+    run: (
+        std::sync::Arc<dyn hi_ai::Provider>,
+        AgentConfig,
+        hi_ai::ProviderCapabilityRegistry,
+    ),
     kind: BgTaskKind,
     prompt: String,
     teardown: hi_tools::BackgroundTaskTeardown,
@@ -659,6 +657,7 @@ async fn run_bg_readonly(
     task_id: String,
     ui: &mut dyn Ui,
 ) -> hi_tools::BackgroundTaskOutcome {
+    let (provider, config, capability_registry) = run;
     let kind_label = kind.as_str();
     let child_prompt = readonly_child_prompt(kind, &prompt);
 

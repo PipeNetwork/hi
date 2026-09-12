@@ -98,7 +98,7 @@ pub(crate) fn no_progress_forced_final_is_unusable(
     mutation_seen: bool,
 ) -> bool {
     if text.trim().is_empty() {
-        return !(tests_seen && !mutation_seen);
+        return !tests_seen || mutation_seen;
     }
     forced_final_answer_is_unusable(text, false, kind)
 }
@@ -107,8 +107,7 @@ pub(crate) fn offers_next_work(text: &str) -> bool {
     let last = text
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .last()
+        .rfind(|line| !line.is_empty())
         .unwrap_or(text);
     let lower = last.to_ascii_lowercase();
     [

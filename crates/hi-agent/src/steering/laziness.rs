@@ -7,13 +7,20 @@
 use super::goal_kind::GoalKind;
 use super::settlement::{StallCategory, classify_text_answer, offers_next_work};
 
+#[cfg(test)]
 pub(crate) const LAZINESS_STALLED_NARRATION: &str = "stalled_narration";
+#[cfg(test)]
 pub(crate) const LAZINESS_STALLED_PERMISSION_ASKING: &str = "stalled_permission_asking";
+#[cfg(test)]
 pub(crate) const LAZINESS_STALLED_NO_TODOS_BUT_TASK_IN_FLIGHT: &str =
     "stalled_no_todos_but_task_in_flight";
+#[cfg(test)]
 pub(crate) const LAZINESS_STALLED_FALSE_COMPLETION: &str = "stalled_false_completion";
+#[cfg(test)]
 pub(crate) const LAZINESS_NOT_STALLED_COMPLETE: &str = "not_stalled_complete";
+#[cfg(test)]
 pub(crate) const LAZINESS_NOT_STALLED_WAITING_BG: &str = "not_stalled_waiting_on_background";
+#[cfg(test)]
 pub(crate) const LAZINESS_NOT_STALLED_WAITING_USER: &str = "not_stalled_waiting_on_user";
 
 pub(crate) const LAZINESS_DEFAULT_MIN_CONFIDENCE: f32 = 0.7;
@@ -31,6 +38,7 @@ pub(crate) enum LazinessCategory {
 }
 
 impl LazinessCategory {
+    #[cfg(test)]
     pub(crate) fn as_const_str(self) -> &'static str {
         match self {
             Self::StalledNarration => LAZINESS_STALLED_NARRATION,
@@ -100,12 +108,14 @@ pub(crate) enum NoNudgeReason {
     FeatureDisabled,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClassifierParseError {
     Unparseable,
     ConfidenceOutOfRange,
 }
 
+#[cfg(test)]
 impl std::fmt::Display for ClassifierParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -115,6 +125,7 @@ impl std::fmt::Display for ClassifierParseError {
     }
 }
 
+#[cfg(test)]
 fn strip_code_fence(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     let body = trimmed
@@ -127,6 +138,7 @@ fn strip_code_fence(raw: &str) -> Option<&str> {
         .map(|s| s.trim_end_matches(['\n', '\r']))
 }
 
+#[cfg(test)]
 fn extract_first_balanced_object(raw: &str) -> Option<&str> {
     let bytes = raw.as_bytes();
     let start = bytes.iter().position(|&b| b == b'{')?;
@@ -160,6 +172,7 @@ fn extract_first_balanced_object(raw: &str) -> Option<&str> {
     None
 }
 
+#[cfg(test)]
 pub(crate) fn parse_classifier_output(raw: &str) -> Result<ClassifierOutput, ClassifierParseError> {
     fn try_parse(slice: &str) -> Option<Result<ClassifierOutput, f32>> {
         let parsed: ClassifierOutput = serde_json::from_str(slice).ok()?;
@@ -372,8 +385,10 @@ mod tests {
             r#"{"category":"stalled_narration","confidence":0.9,"evidence":"claimed a launch with no tool"}"#,
         )
         .unwrap();
-        let mut cfg = LazinessConfig::default();
-        cfg.max_nudges_per_session = 1;
+        let cfg = LazinessConfig {
+            max_nudges_per_session: 1,
+            ..LazinessConfig::default()
+        };
         let decision = evaluate_laziness(&parsed, &cfg, 1, 0.7);
         assert!(matches!(
             decision,

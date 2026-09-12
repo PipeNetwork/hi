@@ -23,11 +23,13 @@ pub(crate) enum TodoGateDecision {
 pub(crate) struct TodoGateInput<'a> {
     pub pending: Vec<&'a str>,
     pub in_progress_unbacked: Vec<&'a str>,
+    #[cfg(test)]
     pub in_progress_backed: Vec<&'a str>,
     #[allow(dead_code)]
     pub backing_task_count: usize,
 }
 
+#[cfg(test)]
 impl TodoGateReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -94,11 +96,13 @@ pub(crate) fn todo_gate_input_from_plan<'a>(
     } else {
         0
     };
+    #[cfg(test)]
     let in_progress_backed = in_progress[..backing].to_vec();
     let in_progress_unbacked = in_progress[backing..].to_vec();
     TodoGateInput {
         pending,
         in_progress_unbacked,
+        #[cfg(test)]
         in_progress_backed,
         backing_task_count: backing,
     }

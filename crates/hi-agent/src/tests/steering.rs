@@ -1471,7 +1471,7 @@ async fn repeated_inspection_challenges_allow_a_plain_text_explanation() {
     let workspace = IsolatedWorkspace::new("repeat-inspection-explanation");
     let mut responses = Vec::new();
     for n in 0..3 {
-        let path = workspace.path(&format!("empty-{n}"));
+        let path = workspace.path(format!("empty-{n}"));
         std::fs::create_dir(&path).unwrap();
         responses.push(completion(
             vec![Content::ToolCall {
