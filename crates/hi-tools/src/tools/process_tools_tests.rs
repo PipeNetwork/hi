@@ -170,16 +170,26 @@ async fn denied_managed_handoff_kills_reaps_and_returns_a_tool_failure() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&state_root).unwrap();
     let pid_file = root.join("child.pid");
+    let marker = format!(
+        "hi-denied-handoff-{}-{}",
+        std::process::id(),
+        directory.path().file_name().unwrap().to_string_lossy()
+    );
+    let shell = std::path::Path::new("/bin/sh").canonicalize().unwrap();
     let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root).unwrap());
     let background = crate::BackgroundRegistry::default();
-    background.set_foreground_handoff_budget(Some(Duration::from_secs(1)));
+    background.set_foreground_handoff_budget(Some(Duration::from_secs(2)));
     background.set_job_lifecycle(std::sync::Arc::new(RejectingLifecycle {
         live_writer_supported: true,
     }));
     let read_cache = std::sync::Mutex::new(crate::ReadCache::new());
     let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
     let runner = crate::ProcessRunner::new(&root).unwrap();
-    let command = format!("printf '%s' $$ > {}; sleep 600", pid_file.display());
+    let command = format!(
+        "exec {} -c 'printf %s $$ > child.pid; sleep 600; :' {marker}",
+        shell.display()
+    );
+    let mut on_line = |_: &str| {};
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
@@ -203,13 +213,24 @@ async fn denied_managed_handoff_kills_reaps_and_returns_a_tool_failure() {
                 timeout: None,
                 run_in_background: false,
             },
-            &mut |_| {},
+            &mut on_line,
             true,
         ),
-    )
-    .await
-    .expect("handoff rejection must reap promptly")
-    .unwrap();
+    );
+    tokio::pin!(outcome);
+    let mut host_pid = None;
+    let outcome = loop {
+        tokio::select! {
+            result = &mut outcome => break result
+                .expect("handoff rejection must reap promptly")
+                .unwrap(),
+            _ = tokio::time::sleep(Duration::from_millis(10)), if host_pid.is_none() => {
+                if std::fs::read_to_string(&pid_file).is_ok_and(|text| !text.trim().is_empty()) {
+                    host_pid = host_pid_with_marker(&marker, &shell);
+                }
+            }
+        }
+    };
 
     assert_eq!(outcome.status, ToolStatus::Failed);
     assert!(
@@ -219,17 +240,31 @@ async fn denied_managed_handoff_kills_reaps_and_returns_a_tool_failure() {
     );
     assert!(outcome.background.is_none());
     assert!(background.ids().is_empty());
-    let pid: i32 = std::fs::read_to_string(pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = host_pid.expect("observe the foreground shell before handoff rejection");
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     assert_eq!(
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ESRCH),
         "rejected handoff left foreground process {pid} alive"
     );
+}
+
+#[cfg(unix)]
+fn host_pid_with_marker(marker: &str, shell: &std::path::Path) -> Option<i32> {
+    // Keep default sandbox enforcement: the written $$ is only a readiness
+    // signal. Its namespace-local PID cannot establish host process reaping.
+    let output = std::process::Command::new("ps")
+        .args(["-ww", "-axo", "pid=,command="])
+        .output()
+        .expect("list host processes");
+    assert!(output.status.success(), "list host processes");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            (fields.next()? == shell.to_str()? && fields.next_back()? == marker).then_some(pid)
+        })
 }
 
 #[cfg(unix)]

@@ -7,6 +7,7 @@ use ratatui::style::Color;
 mod composer;
 mod diff_color;
 mod goal;
+mod plan_status;
 mod review_pane;
 mod send_now;
 mod thinking;
@@ -7251,52 +7252,6 @@ fn composer_shows_always_approve_flag_by_default() {
         screen.contains("always-approve"),
         "default Always face is flagged on the prompt:\n{screen}"
     );
-}
-
-#[test]
-fn plan_mode_paints_plan_flag_on_the_composer() {
-    let mut app = test_app("openai", "gpt-4o");
-    app.plan_mode = true;
-    app.permission_mode = hi_agent::PermissionMode::Ask;
-    let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let screen = dump(&term);
-    assert!(screen.contains("plan"), "plan flag shown:\n{screen}");
-    assert!(
-        !screen.contains("always-approve"),
-        "always-approve hidden while planning:\n{screen}"
-    );
-}
-
-#[test]
-fn leaving_plan_with_leftover_opens_approval_card() {
-    let mut app = test_app("openai", "gpt-4o");
-    app.plan_mode = true;
-    app.permission_mode = hi_agent::PermissionMode::Ask;
-    app.plan = vec![hi_agent::PlanStep {
-        title: "wire the scheduler".into(),
-        status: hi_agent::PlanStatus::Pending,
-    }];
-    app.cycle_session_face();
-    assert_eq!(app.session_face(), crate::session_face::SessionFace::Always);
-    assert!(app.plan_approval.is_some());
-}
-
-#[test]
-fn plan_approval_card_renders_choices() {
-    let mut app = test_app("openai", "gpt-4o");
-    app.plan = vec![hi_agent::PlanStep {
-        title: "wire the scheduler".into(),
-        status: hi_agent::PlanStatus::Pending,
-    }];
-    app.open_plan_approval();
-    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let screen = dump(&term);
-    assert!(screen.contains("Plan approval"), "{screen}");
-    assert!(screen.contains("Approve"), "{screen}");
-    assert!(screen.contains("Request changes"), "{screen}");
-    assert!(screen.contains("wire the scheduler"), "{screen}");
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use super::{
     DEFAULT_READ_LIMIT, MAX_GREP_FILE_BYTES, MAX_READ_FILE_BYTES, format_read, is_binary,
-    looks_like_numbered_read, read_output_budget, result_char_budget, ripgrep_binary_unavailable,
-    run_grep_fallback_sync, run_grep_with_runner_maybe_timeout, run_list_sync, run_read,
+    looks_like_numbered_read, read_output_budget, result_char_budget, run_grep_fallback_sync,
+    run_grep_with_runner_maybe_timeout, run_list_sync, run_read,
 };
 
 #[test]
@@ -497,18 +497,5 @@ fn grep_fallback_bounds_a_newline_free_file() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[test]
-fn sandboxed_missing_rg_is_treated_as_unavailable() {
-    let execution = crate::ProcessExecution {
-        status: crate::ToolStatus::Failed,
-        outcome: crate::ProcessOutcome {
-            exit_code: Some(71),
-            stdout_summary: String::new(),
-            stderr_summary: "sandbox-exec: execvp() of 'rg' failed: No such file or directory"
-                .into(),
-            duration_ms: 1,
-        },
-        truncation: crate::TruncationState::Complete,
-    };
-    assert!(ripgrep_binary_unavailable(&execution));
-}
+#[path = "tests/grep_process.rs"]
+mod grep_process;

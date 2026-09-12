@@ -74,11 +74,28 @@ fn test_opts<'a>(exe: &'a Path, verify: &'a str) -> BestOf<'a> {
     }
 }
 
-fn temp_file(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "hi-bestof-{label}-{}-candidate-0.report.json",
-        std::process::id()
-    ))
+fn run_process_fixture(executable: &Path) -> (tempfile::TempDir, CandidateExecution, PathBuf) {
+    let owner = tempfile::tempdir().unwrap();
+    let workspace = owner.path().join("candidate");
+    let source = owner.path().join("source");
+    let state = owner.path().join("state");
+    for path in [&workspace, &source, &state] {
+        std::fs::create_dir(path).unwrap();
+    }
+    // Match real candidate isolation: neither the candidate nor its private
+    // runtime may live inside the denied source or parent-state directories.
+    let child_paths = crate::child_process::CandidateChildPaths::prepare_test(
+        &workspace,
+        &owner.path().join("runtime"),
+    )
+    .unwrap();
+    let mut opts = test_opts(executable, "true");
+    opts.workspace_root = &source;
+    opts.state_root = &state;
+    let report = owner.path().join("candidate.report.json");
+    let log = owner.path().join("candidate.log");
+    let execution = run_candidate(&opts, 0, 0.2, &report, &log, &source, &child_paths);
+    (owner, execution, log)
 }
 
 #[test]
@@ -150,25 +167,15 @@ fn run_candidate_rejects_nonzero_exit_even_without_a_report() {
     if !exe.exists() {
         return;
     }
-    let opts = test_opts(exe, "true");
-    let report = temp_file("failure");
-    let log = report.with_extension("log");
-    let workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
-    let source = temp_file("source-root");
-    std::fs::create_dir_all(&source).unwrap();
-    let runtime_owner = tempfile::tempdir().unwrap();
-    let child_paths = crate::child_process::CandidateChildPaths::prepare_test(
-        &workspace,
-        &runtime_owner.path().join("runtime"),
-    )
-    .unwrap();
-    let execution = run_candidate(&opts, 0, 0.2, &report, &log, &source, &child_paths);
+    let (_owner, execution, log) = run_process_fixture(exe);
     assert!(!execution.process_succeeded);
+    assert_eq!(
+        execution.process_status, "exit_1",
+        "{}",
+        execution.child_gate_reason
+    );
     assert!(!execution.typed_child_succeeded);
     assert!(log.exists(), "candidate log must be persisted");
-    let _ = std::fs::remove_file(report);
-    let _ = std::fs::remove_file(log);
-    let _ = std::fs::remove_dir_all(source);
 }
 
 #[test]
@@ -191,29 +198,19 @@ fn exit_zero_without_typed_report_is_not_eligible() {
     if !exe.exists() {
         return;
     }
-    let opts = test_opts(exe, "true");
-    let report = temp_file("missing-report");
-    let log = report.with_extension("log");
-    let workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
-    let source = temp_file("source-root-missing");
-    std::fs::create_dir_all(&source).unwrap();
-    let runtime_owner = tempfile::tempdir().unwrap();
-    let child_paths = crate::child_process::CandidateChildPaths::prepare_test(
-        &workspace,
-        &runtime_owner.path().join("runtime"),
-    )
-    .unwrap();
-    let execution = run_candidate(&opts, 0, 0.2, &report, &log, &source, &child_paths);
-    assert!(execution.process_succeeded);
+    let (_owner, execution, _log) = run_process_fixture(exe);
+    assert!(
+        execution.process_succeeded,
+        "{}",
+        execution.child_gate_reason
+    );
+    assert_eq!(execution.process_status, "exit_0");
     assert!(!execution.typed_child_succeeded);
     assert!(
         execution
             .child_gate_reason
             .contains("typed child gate failed")
     );
-    let _ = std::fs::remove_file(report);
-    let _ = std::fs::remove_file(log);
-    let _ = std::fs::remove_dir_all(source);
 }
 
 #[test]

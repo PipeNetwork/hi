@@ -10,13 +10,56 @@ use crate::ToolOutcome;
 use super::discovery::is_searchable_entry;
 use super::{MAX_GREP_FILE_BYTES, display_path};
 
-/// `sandbox-exec` reports a missing relative `rg` as a child failure (exit 71
-/// + `execvp()`), not as `ErrorKind::NotFound` from `Command::spawn`.
+/// Sandbox helpers report a missing relative `rg` as a child failure rather
+/// than `ErrorKind::NotFound` from `Command::spawn`.
 pub(super) fn ripgrep_binary_unavailable(execution: &crate::ProcessExecution) -> bool {
+    if execution.status == crate::ToolStatus::Failed
+        && execution.outcome.exit_code == Some(1)
+        && execution.outcome.stdout_summary.trim().is_empty()
+        && execution.outcome.stderr_summary.trim()
+            == "pipe-wrap: child setup failed: exec rg: ENOENT: No such file or directory"
+    {
+        return true;
+    }
     let text = execution.model_content();
     text.contains("execvp()")
         || (execution.outcome.exit_code == Some(71)
             && (text.contains("No such file") || text.contains("sandbox-exec")))
+}
+
+pub(super) fn finish_ripgrep_execution(
+    execution: crate::ProcessExecution,
+    target: &str,
+    pattern: &str,
+) -> Result<Option<ToolOutcome>> {
+    if execution.status == crate::ToolStatus::Succeeded {
+        let text = execution.model_outcome().stdout_summary;
+        let out = if text.trim().is_empty() {
+            format!("no matches for {pattern}")
+        } else {
+            text
+        };
+        return Ok(Some(ToolOutcome::bounded_plain(out)));
+    }
+    // ripgrep's no-match exit is silent. A launcher can also exit 1 before
+    // ripgrep starts; retain its diagnostics instead of claiming a search ran.
+    if execution.status == crate::ToolStatus::Failed
+        && execution.outcome.exit_code == Some(1)
+        && execution.outcome.stdout_summary.trim().is_empty()
+        && execution.outcome.stderr_summary.trim().is_empty()
+    {
+        return Ok(Some(ToolOutcome::plain(format!(
+            "no matches for {pattern}"
+        ))));
+    }
+    if ripgrep_binary_unavailable(&execution) {
+        return Ok(None);
+    }
+    bail!(
+        "ripgrep failed for {}: {}",
+        target,
+        execution.model_content().trim()
+    )
 }
 
 pub(super) fn run_grep_fallback_sync(

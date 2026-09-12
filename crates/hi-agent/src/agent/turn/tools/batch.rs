@@ -6,6 +6,7 @@
 
 mod admission;
 mod feedback;
+mod fusion;
 mod observations;
 mod outcome;
 mod plan_updates;
@@ -13,6 +14,7 @@ mod policy;
 mod postprocess;
 mod program_guard;
 mod program_output;
+mod program_runner;
 mod program_settlement;
 mod program_speculation;
 mod terminal;
@@ -21,6 +23,7 @@ use admission::{
     ToolBatchAdmission, emit_stale_workspace_denials, stale_workspace_protocol_failure,
 };
 use feedback::{PendingCheck, append_fast_feedback};
+use fusion::{FusedToolContext, fuse_mutation_then_command, fused_tool_step};
 pub(in crate::agent::turn) use outcome::{ToolBatchOutcome, ToolProtocolFailureKind};
 use outcome::{
     append_tool_images, emit_capability_request, sealed_workspace_staleness,
@@ -33,6 +36,7 @@ use policy::{
     terminal_background_requires_reconciliation, workspace_operation_requires_settlement,
     workspace_program_execution_report,
 };
+use program_runner::ProgramToolRunner;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -67,74 +71,6 @@ pub(crate) use program_speculation::ProgramSpeculator;
 use terminal::DeferredToolTerminals;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone)]
-struct ProgramToolRunner {
-    root: std::path::PathBuf,
-    state_root: std::path::PathBuf,
-    process_runner: hi_tools::ProcessRunner,
-    lsp: std::sync::Arc<hi_lsp::LspManager>,
-    background: std::sync::Arc<hi_tools::BackgroundRegistry>,
-    read_cache: std::sync::Arc<std::sync::Mutex<hi_tools::ReadCache>>,
-    repo_map: std::sync::Arc<std::sync::Mutex<hi_tools::RepoMapCache>>,
-    mcp: Option<std::sync::Arc<dyn hi_tools::McpBackend>>,
-    memory: Option<std::sync::Arc<dyn hi_tools::MemoryBackend>>,
-}
-
-impl ProgramToolRunner {
-    async fn execute(
-        &self,
-        call: &ProgramCall,
-    ) -> (
-        std::result::Result<hi_workflow::ProgramToolResult, String>,
-        hi_tools::ToolOutcome,
-    ) {
-        let args = serde_json::to_string(&call.arguments).unwrap_or_default();
-        let allowed = (matches!(
-            hi_tools::speculation_class(&call.name),
-            hi_tools::SpeculationClass::PureLocal | hi_tools::SpeculationClass::IdempotentExternal
-        ) || call.name == "bash_output")
-            && hi_tools::is_read_only(&call.name)
-            && call.name != "run_program"
-            && hi_tools::is_known_tool(&call.name);
-        if !allowed {
-            let message = format!(
-                "tool `{}` requires ordinary structured-tool execution; retry without run_program",
-                call.name
-            );
-            let output = synthetic_tool_outcome(message.clone(), hi_tools::ToolStatus::Denied);
-            return (Err(message), output);
-        }
-        let output = execute_in_runtime_shared_with_runner(
-            &self.process_runner,
-            &self.root,
-            &self.state_root,
-            &self.lsp,
-            &self.background,
-            &self.read_cache,
-            &self.repo_map,
-            self.mcp.as_deref(),
-            self.memory.as_deref(),
-            &call.name,
-            &args,
-        )
-        .await;
-        let status = match output.status {
-            hi_tools::ToolStatus::Succeeded => "succeeded",
-            hi_tools::ToolStatus::Failed => "failed",
-            hi_tools::ToolStatus::Denied => "denied",
-            hi_tools::ToolStatus::TimedOut => "timed_out",
-            hi_tools::ToolStatus::Cancelled => "cancelled",
-        };
-        let result = hi_workflow::ProgramToolResult {
-            index: call.occurrence,
-            name: call.name.clone(),
-            status: status.into(),
-            output: output.content.clone(),
-        };
-        (Ok(result), output)
-    }
-}
-
 use crate::agent::delegate_turn::{
     DelegateJob, delegate_limit_denial, delegate_turn_limit, file_sets_disjoint,
     parallel_delegate_limit, run_delegate_job,
@@ -153,135 +89,15 @@ use super::super::phase::TurnPhase;
 use super::super::progress::{ProgressKind, ProgressTracker, ToolProgressLabel};
 use super::super::retention::ToolTimeline;
 
+type BatchToolFuture<'a> =
+    Pin<Box<dyn Future<Output = Vec<(usize, hi_tools::ToolOutcome)>> + Send + 'a>>;
+
 /// Add a scheduler count without allowing a very long unlimited turn to wrap
 /// the telemetry counter back to zero. `usize` inputs are clamped before the
 /// addition so this remains correct on 64-bit hosts as well.
 fn saturating_add_scheduler_count(total: &mut u32, additional: usize) {
     let additional = u32::try_from(additional).unwrap_or(u32::MAX);
     *total = total.saturating_add(additional);
-}
-
-type FusedStep = Pin<Box<dyn Future<Output = hi_tools::ToolOutcome> + Send + 'static>>;
-
-fn fused_tool_step(
-    process_runner: hi_tools::ProcessRunner,
-    root: std::path::PathBuf,
-    state_root: std::path::PathBuf,
-    lsp: std::sync::Arc<hi_lsp::LspManager>,
-    background: std::sync::Arc<hi_tools::BackgroundRegistry>,
-    read_cache: std::sync::Arc<std::sync::Mutex<hi_tools::ReadCache>>,
-    repo_map: std::sync::Arc<std::sync::Mutex<hi_tools::RepoMapCache>>,
-    mcp: Option<std::sync::Arc<dyn hi_tools::McpBackend>>,
-    memory: Option<std::sync::Arc<dyn hi_tools::MemoryBackend>>,
-    name: String,
-    arguments: String,
-    prepared: Option<hi_tools::PreparedMutation>,
-    failure: Option<hi_tools::ToolOutcome>,
-) -> FusedStep {
-    Box::pin(async move {
-        if let Some(failure) = failure {
-            failure
-        } else if let Some(prepared) = prepared {
-            execute_prepared_in_runtime(&lsp, read_cache.as_ref(), prepared).await
-        } else {
-            execute_in_runtime_shared_with_runner(
-                &process_runner,
-                &root,
-                &state_root,
-                &lsp,
-                background.as_ref(),
-                read_cache.as_ref(),
-                &repo_map,
-                mcp.as_deref(),
-                memory.as_deref(),
-                &name,
-                &arguments,
-            )
-            .await
-        }
-    })
-}
-
-/// Heap-allocate tool futures so the batch state machine does not store two
-/// copies of `execute_in_runtime` on the stack. The path lock lives only in
-/// [`hi_tools::execute_mutation_then_command`].
-async fn fuse_mutation_then_command<Mut, Cmd>(
-    file_ops: hi_tools::FileOperationLockManager,
-    root: std::path::PathBuf,
-    path: String,
-    mutate: Mut,
-    command: Cmd,
-) -> (hi_tools::ToolOutcome, hi_tools::ToolOutcome)
-where
-    Mut: FnOnce() -> FusedStep,
-    Cmd: FnOnce() -> FusedStep,
-{
-    let mutation_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<hi_tools::ToolOutcome>));
-    let command_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<hi_tools::ToolOutcome>));
-    let mutation_slot_m = mutation_slot.clone();
-    let command_slot_c = command_slot.clone();
-    let fusion = hi_tools::execute_mutation_then_command(
-        &file_ops,
-        &root,
-        &path,
-        || {
-            let fut = mutate();
-            async move {
-                let mutation = fut.await;
-                let step = hi_tools::MutationStep {
-                    ok: mutation.status == hi_tools::ToolStatus::Succeeded,
-                    output: mutation.content.clone(),
-                };
-                *mutation_slot_m.lock().unwrap() = Some(mutation);
-                step
-            }
-        },
-        Some(|| {
-            let fut = command();
-            async move {
-                let command = fut.await;
-                let step = hi_tools::CommandStep {
-                    ok: command.status == hi_tools::ToolStatus::Succeeded,
-                    output: command.content.clone(),
-                };
-                *command_slot_c.lock().unwrap() = Some(command);
-                step
-            }
-        }),
-    )
-    .await;
-    let mut mutation = mutation_slot
-        .lock()
-        .unwrap()
-        .take()
-        .expect("fused mutation ran");
-    mutation.content = fusion.combined();
-    let command = if fusion.command_ran {
-        let mut command = command_slot
-            .lock()
-            .unwrap()
-            .take()
-            .expect("fused command ran");
-        // Never stub the bash slot. Models look there for cargo check/test
-        // output; a "look at the write result" stub is how a failed E0425
-        // turned into "check passed" and stalled recovery.
-        let marker = if fusion.command_ok == Some(true) {
-            hi_tools::FUSED_COMMAND_SUCCEEDED
-        } else {
-            hi_tools::FUSED_COMMAND_FAILED
-        };
-        command.content = format!("{marker}\n{}", command.content);
-        command
-    } else {
-        synthetic_tool_outcome(
-            format!(
-                "{}\nThe file mutation did not complete successfully; the command was not run.",
-                hi_tools::FUSED_COMMAND_SKIPPED
-            ),
-            hi_tools::ToolStatus::Failed,
-        )
-    };
-    (mutation, command)
 }
 
 impl crate::Agent {
@@ -320,35 +136,37 @@ impl crate::Agent {
         // failure and leaves post-dispatch proof to failed-turn cleanup.
         let active_operation_before = self.workspace_coordination.active_parent_operation();
         let mut effects_may_have_begun = false;
-        let result = self
-            .execute_tool_batch_inner(
-                calls,
-                completion_content,
-                tool_specs,
-                tool_envelope,
-                read_only_intent,
-                max_parallel_tools,
-                task_contract,
-                implementation_tracker,
-                evidence,
-                progress_tracker,
-                tool_timeline,
-                sched_tool_calls,
-                sched_max_concurrent,
-                sched_serial_runs,
-                speculation_registry,
-                program_fallback_next,
-                program_fallback_used,
-                plan_updated_goal,
-                proposed_goal,
-                turn_snapshot,
-                turn_checkpoint_allowed,
-                turn_checkpoint_created,
-                fast_feedback,
-                &mut effects_may_have_begun,
-                ui,
-            )
-            .await;
+        // Keep the large batch state off the enclosing turn futures. Inline
+        // storage compounds across the polling chain and can exhaust a
+        // normal worker stack when a tool initializes the secret scrubber.
+        let result = Box::pin(self.execute_tool_batch_inner(
+            calls,
+            completion_content,
+            tool_specs,
+            tool_envelope,
+            read_only_intent,
+            max_parallel_tools,
+            task_contract,
+            implementation_tracker,
+            evidence,
+            progress_tracker,
+            tool_timeline,
+            sched_tool_calls,
+            sched_max_concurrent,
+            sched_serial_runs,
+            speculation_registry,
+            program_fallback_next,
+            program_fallback_used,
+            plan_updated_goal,
+            proposed_goal,
+            turn_snapshot,
+            turn_checkpoint_allowed,
+            turn_checkpoint_created,
+            fast_feedback,
+            &mut effects_may_have_begun,
+            ui,
+        ))
+        .await;
         match result {
             Ok(outcome) => Ok(outcome),
             Err(error) => Err(self
@@ -587,14 +405,12 @@ impl crate::Agent {
                 Some(WITHHELD_INSPECTION_RESULT.to_string())
             } else if read_only_blocks_tool(read_only_intent, name) {
                 Some(read_only_blocked_tool_result(name))
-            } else if let Some(denial) = execution_mode_denial(
-                tool_envelope.payload.execution_mode,
-                self.effective_tool_mode(),
-                name,
-            ) {
-                Some(denial)
             } else {
-                None
+                execution_mode_denial(
+                    tool_envelope.payload.execution_mode,
+                    self.effective_tool_mode(),
+                    name,
+                )
             };
             if let Some(content) = blocked {
                 ui.tool_call_id(id, name, arguments);
@@ -1937,9 +1753,7 @@ impl crate::Agent {
                     let memory = self.memory.clone();
                     let calls = &calls;
                     let file_ops = self.runtime.file_ops().clone();
-                    let fut: Pin<
-                        Box<dyn Future<Output = Vec<(usize, hi_tools::ToolOutcome)>> + Send + '_>,
-                    > = if let Some(command_index) = fused {
+                    let fut: BatchToolFuture<'_> = if let Some(command_index) = fused {
                         let background_arc = self.runtime.background_arc();
                         let read_cache_arc = self.runtime.read_cache_arc();
                         Box::pin(async move {
@@ -1963,15 +1777,17 @@ impl crate::Agent {
                                     let arguments = calls[i].2.clone();
                                     move || {
                                         fused_tool_step(
-                                            process_runner,
-                                            root,
-                                            state_root,
-                                            lsp,
-                                            background,
-                                            read_cache,
-                                            repo_map,
-                                            mcp,
-                                            memory,
+                                            FusedToolContext {
+                                                process_runner,
+                                                root,
+                                                state_root,
+                                                lsp,
+                                                background,
+                                                read_cache,
+                                                repo_map,
+                                                mcp,
+                                                memory,
+                                            },
                                             name,
                                             arguments,
                                             prepared,
@@ -1993,15 +1809,17 @@ impl crate::Agent {
                                     let arguments = calls[command_index].2.clone();
                                     move || {
                                         fused_tool_step(
-                                            process_runner,
-                                            root,
-                                            state_root,
-                                            lsp,
-                                            background,
-                                            read_cache,
-                                            repo_map,
-                                            mcp,
-                                            memory,
+                                            FusedToolContext {
+                                                process_runner,
+                                                root,
+                                                state_root,
+                                                lsp,
+                                                background,
+                                                read_cache,
+                                                repo_map,
+                                                mcp,
+                                                memory,
+                                            },
                                             name,
                                             arguments,
                                             None,

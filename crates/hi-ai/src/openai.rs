@@ -1761,10 +1761,9 @@ mod tests {
             auth.clone(),
         )
         .with_x402(settler.clone(), 1.0);
-        let completion = provider
-            .stream(request(vec![], Default::default()), &mut |_| {})
-            .await
-            .unwrap();
+        let mut req = request(vec![], Default::default());
+        req.request_id = Some("hi_paid_retry_identity".into());
+        let completion = provider.stream(req, &mut |_| {}).await.unwrap();
         assert!(matches!(
             completion.content.first(),
             Some(Content::Text(text)) if text == "paid"
@@ -1777,6 +1776,18 @@ mod tests {
             bodies[0], bodies[1],
             "paid retry must freeze the quote body"
         );
+        assert_eq!(
+            server.request_ids(),
+            vec![Some("hi_paid_retry_identity".into()); 2]
+        );
+        let keys = server.idempotency_keys();
+        assert!(
+            keys[0]
+                .as_deref()
+                .is_some_and(|key| key.starts_with("hi_paid_retry_identity:")
+                    && key.len() > "hi_paid_retry_identity:".len())
+        );
+        assert_eq!(keys[0], keys[1]);
         assert_eq!(server.authorizations()[0], None);
         assert_eq!(server.authorizations()[1], None);
         assert!(

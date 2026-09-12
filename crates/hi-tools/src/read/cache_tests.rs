@@ -1,6 +1,28 @@
 use super::*;
 
 #[tokio::test]
+async fn reread_checks_content_when_metadata_matches_a_stale_cache_entry() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.rs");
+    std::fs::write(&path, "after!\n").unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let mut cache = ReadCache::new();
+    // Rapid same-size writes can share mtime and ctime. Reproduce that
+    // collision independently of the filesystem's timestamp resolution.
+    cache.insert_file(
+        cache_key(&path),
+        "before\n".into(),
+        FileVersion::from_metadata(&metadata),
+    );
+    let cache = std::sync::Mutex::new(cache);
+    let output = run_read(root.path(), &cache, r#"{"path":"source.rs"}"#)
+        .await
+        .unwrap();
+    assert!(output.content.contains("after!"), "{}", output.content);
+    assert!(!output.content.contains("before"));
+}
+
+#[tokio::test]
 async fn reread_observes_external_same_length_edit_in_the_same_turn() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("source.rs");

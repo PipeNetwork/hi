@@ -256,9 +256,15 @@ impl ReadCache {
         self.insert_file(key, value, None);
     }
 
-    /// Use a filesystem entry only while its observed identity is unchanged.
-    pub(crate) fn get_file(&mut self, key: &str, version: &FileVersion) -> Option<&String> {
-        if self.map.get(key)?.version.as_ref() != Some(version) {
+    /// Reuse decoded text only when both metadata and freshly read bytes match.
+    pub(crate) fn get_file(
+        &mut self,
+        key: &str,
+        version: &FileVersion,
+        bytes: &[u8],
+    ) -> Option<&String> {
+        let entry = self.map.get(key)?;
+        if entry.version.as_ref() != Some(version) || entry.content.as_bytes() != bytes {
             self.remove(key);
             return None;
         }

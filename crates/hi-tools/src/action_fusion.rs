@@ -263,7 +263,7 @@ mod tests {
         )
         .await;
         assert!(observation.mutation_ok);
-        assert_eq!(observation.command_ran, true);
+        assert!(observation.command_ran);
         assert_eq!(observation.command_ok, Some(true));
         let combined = observation.combined();
         assert!(combined.contains("edited"), "{combined}");

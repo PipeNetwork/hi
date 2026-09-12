@@ -258,14 +258,10 @@ impl crate::Agent {
         }
         let write_tokens = crate::compaction::estimate_tokens(self.messages.as_slice());
         let archive_tokens = write_tokens.saturating_sub(DEFAULT_KEEP_RECENT_TOKENS);
-        let increment = if self.online_compact.positive_context_delta_count == 0 {
-            None
-        } else {
-            Some(
-                self.online_compact.positive_context_delta_total
-                    / self.online_compact.positive_context_delta_count,
-            )
-        };
+        let increment = self
+            .online_compact
+            .positive_context_delta_total
+            .checked_div(self.online_compact.positive_context_delta_count);
         let decision = decide_compaction(DecideCompactionInput {
             write_tokens,
             archive_tokens,

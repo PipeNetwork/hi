@@ -2665,8 +2665,7 @@ mod tests {
 
         {
             let mut sink = |_: &str| {};
-            let fut =
-                run_bash_streaming_with_timeout(&command, &mut sink, Duration::from_secs(600));
+            let fut = run_host_process_group_fixture(&command, &mut sink, Duration::from_secs(600));
             tokio::pin!(fut);
 
             let child_started = async {
@@ -2724,7 +2723,7 @@ mod tests {
             sh_quote(&pid_path)
         );
         let mut sink = |_: &str| {};
-        let out = run_bash_streaming_with_timeout(&command, &mut sink, Duration::from_secs(5))
+        let out = run_host_process_group_fixture(&command, &mut sink, Duration::from_secs(5))
             .await
             .expect("foreground command returns");
         crate::preserve_detached_descendants(false);
@@ -2765,7 +2764,7 @@ mod tests {
         );
         let mut sink = |_: &str| {};
 
-        let out = run_bash_streaming_with_timeout(&command, &mut sink, Duration::from_secs(5))
+        let out = run_host_process_group_fixture(&command, &mut sink, Duration::from_secs(5))
             .await
             .expect("foreground command returns");
         assert!(out.contains("done"), "got: {out:?}");
@@ -2784,6 +2783,25 @@ mod tests {
         }
         let _ = std::fs::remove_file(&pid_file);
         panic!("foreground bash left detached descendant process {pid} running");
+    }
+
+    #[cfg(unix)]
+    async fn run_host_process_group_fixture(
+        command: &str,
+        sink: &mut (dyn FnMut(&str) + Send),
+        timeout: Duration,
+    ) -> anyhow::Result<String> {
+        // These three fixtures signal host PIDs and read host /tmp. Keep their
+        // process-group contract separate from namespace isolation; the enforced
+        // long-tool-cancellation smoke gate checks sandboxed descendant cleanup.
+        let runner = crate::ProcessRunner::new_with_policy(
+            std::env::current_dir()?,
+            crate::sandbox::SandboxPolicy::Off,
+        )?;
+        Ok(runner
+            .run_shell_streaming(command, timeout, sink)
+            .await?
+            .model_content())
     }
 
     #[cfg(unix)]

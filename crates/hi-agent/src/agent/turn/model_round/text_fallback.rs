@@ -80,3 +80,11 @@ pub(super) fn promote(
         (calls, false)
     }
 }
+
+impl crate::Agent {
+    /// Emit one assistant text chunk on the main task stream. `/btw` answers are
+    /// handled off-band by `answer_btw_side_questions` and never pass through here.
+    pub(crate) fn emit_assistant_text(&mut self, ui: &mut dyn crate::Ui, text: &str) {
+        ui.assistant_text(text);
+    }
+}

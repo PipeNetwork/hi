@@ -27,6 +27,7 @@ impl SessionWorktree {
         Ok(Self { path, prev_cwd })
     }
 
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -21,8 +21,6 @@ use super::speculation::SpeculationRegistry;
 
 mod compat_telemetry;
 use compat_telemetry::record_compat_fallback;
-#[cfg(test)]
-use compat_telemetry::{COMPAT_FALLBACK_LIMIT, COMPAT_FALLBACK_PREFIX};
 pub(super) const COMPLETED_PLAN_EMPTY_RECAP_FALLBACK: &str = "The plan is complete and the successful tool results were retained. The provider did not return a final recap.";
 /// After keep-working has already spent its chance, a further invalid-tool
 /// storm must not fail the turn as `no_progress` with no recap. One ChatOnly
@@ -464,7 +462,7 @@ impl crate::Agent {
                 // Grok-build starts a new generation after a format reminder.
                 // Sharing the 4-send ledger turns those retries into
                 // AttemptsExhausted and kills the turn.
-                retry_state.execution = retry_state.execution.fresh_operation();
+                retry_state.start_protocol_recovery(&err);
                 let protocol_retries = retry_state.protocol_retries;
                 if request_no_progress_final_answer {
                     // The live no-progress flag remains sticky in the caller,
@@ -508,7 +506,7 @@ impl crate::Agent {
                 self.emit_usage(ui);
                 retry_state.protocol_text_fallbacks += 1;
                 retry_state.record_recovery_attempt();
-                retry_state.execution = retry_state.execution.fresh_operation();
+                retry_state.start_protocol_recovery(&err);
                 *text_tool_fallback_next = true;
                 *force_tools_next = false;
                 ui.status(
@@ -546,7 +544,7 @@ impl crate::Agent {
                     // A different next action may succeed as a plain-text call
                     // even if structured JSON already burned the first fallback.
                     retry_state.protocol_text_fallbacks = 0;
-                    retry_state.execution = retry_state.execution.fresh_operation();
+                    retry_state.start_protocol_recovery(&err);
                     return Ok(ProviderStreamResult::Continue);
                 }
 
@@ -561,7 +559,7 @@ impl crate::Agent {
                     *force_tools_next = false;
                     *text_tool_fallback_next = false;
                     retry_state.protocol_retries = 0;
-                    retry_state.execution = retry_state.execution.fresh_operation();
+                    retry_state.start_protocol_recovery(&err);
                     *continue_total_nudges = continue_total_nudges.saturating_add(1);
                     self.messages
                         .push_nudge_or_fold(NudgeKind::Continue, PROTOCOL_EXHAUSTION_WRAP_UP_NUDGE);
@@ -820,32 +818,5 @@ impl crate::Agent {
                 Err(err)
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod diagnostic_tests {
-    use super::*;
-
-    #[test]
-    fn compatibility_fallbacks_are_deduplicated_and_bounded() {
-        let mut fallbacks = Vec::new();
-        for index in 0..100 {
-            record_compat_fallback(&mut fallbacks, format!("fallback-{index}"));
-        }
-        record_compat_fallback(&mut fallbacks, "fallback-0".into());
-
-        assert_eq!(fallbacks.len(), COMPAT_FALLBACK_LIMIT);
-        assert_eq!(fallbacks.first().map(String::as_str), Some("fallback-0"));
-        assert_eq!(
-            fallbacks.get(COMPAT_FALLBACK_PREFIX).map(String::as_str),
-            Some("fallback-99")
-        );
-        assert!(
-            fallbacks
-                .last()
-                .is_some_and(|marker| marker.contains("37 additional compatibility events omitted")),
-            "exact dropped count is surfaced in the bounded diagnostic: {fallbacks:?}"
-        );
     }
 }

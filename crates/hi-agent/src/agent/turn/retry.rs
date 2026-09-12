@@ -87,7 +87,7 @@ pub(super) fn keep_working_nudge(no_progress_reason: &str, signature: Option<&st
 #[derive(Default)]
 pub(super) struct TurnRetryState {
     pub(super) execution: std::sync::Arc<hi_ai::RequestExecution>,
-    /// Stable across every recovery attempt for one logical model request.
+    /// Stable across transport recovery for one logical model request.
     /// The OpenAI adapter includes the payload digest in its idempotency key,
     /// so payload-changing repairs can safely retain this correlation id.
     request_id: Option<String>,
@@ -166,6 +166,28 @@ impl TurnRetryState {
         self.request_attempt = self.request_attempt.saturating_add(1).min(16);
     }
 
+    pub(super) fn start_protocol_recovery(&mut self, err: &anyhow::Error) {
+        self.execution = self.execution.fresh_operation();
+        // A typed terminal rejection is a completed generation, so a
+        // deliberate bounded resample needs a new identity even if its body
+        // is unchanged. A fresh execution ledger alone retains the caller's
+        // request id for its first wire shape. Preserve that identity for
+        // uncertain outcomes: transport failures, local errors without this
+        // API contract, partial streams without HTTP 503, and untyped 5xx
+        // responses do not meet the predicate below.
+        if err
+            .downcast_ref::<hi_ai::ProviderError>()
+            .is_some_and(|error| {
+                error.kind == hi_ai::ProviderErrorKind::ToolProtocol
+                    && error.code.as_deref() == Some("tool_protocol_error")
+                    && error.retryable == Some(true)
+                    && error.http_status == Some(503)
+            })
+        {
+            self.request_id = None;
+        }
+    }
+
     pub(super) fn request_attempt(&self) -> u32 {
         self.request_attempt
     }
@@ -178,6 +200,10 @@ impl TurnRetryState {
         self.capacity_retries = 0;
     }
 }
+
+#[cfg(test)]
+#[path = "retry_identity_tests.rs"]
+mod retry_identity_tests;
 
 pub(super) fn output_cap_retry_tokens(current: u32, cap: OutputCapError) -> Option<u32> {
     let next = if let Some(available) = cap.available_output_tokens {

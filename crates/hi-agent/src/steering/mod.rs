@@ -46,9 +46,9 @@ pub(crate) use settlement::forced_final_answer_is_unusable;
 pub(crate) use settlement::{
     answer_is_review_shaped_insufficient_evidence, no_progress_forced_final_is_unusable,
 };
-pub(crate) use stationarity::{
-    IdenticalToolCallRun, MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS, STATIONARITY_NUDGE,
-};
+#[cfg(test)]
+pub(crate) use stationarity::MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS;
+pub(crate) use stationarity::{IdenticalToolCallRun, STATIONARITY_NUDGE};
 pub(crate) use stop_detector::{BAIL_CONTINUE_NUDGE, matched_bail_out};
 pub(crate) use todo_gate::{
     TodoGateDecision, TodoGateReason, evaluate_todo_gate, todo_gate_input_from_plan,

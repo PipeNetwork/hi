@@ -861,34 +861,35 @@ impl crate::Agent {
                         turn.flags.clear_one_shot_forces();
                         self.set_turn_phase(TurnPhase::Tools);
                         let tool_started = std::time::Instant::now();
-                        let batch_result = self
-                            .execute_tool_batch(
-                                &calls,
-                                &mut completion_content,
-                                &tool_specs,
-                                &tool_envelope,
-                                turn.read_only_intent,
-                                turn.max_parallel_tools,
-                                &turn.task_contract,
-                                &mut turn.implementation_tracker,
-                                &mut turn.evidence,
-                                &mut turn.progress_tracker,
-                                &mut turn.tool_timeline,
-                                &mut turn.sched_tool_calls,
-                                &mut turn.sched_max_concurrent,
-                                &mut turn.sched_serial_runs,
-                                &turn.speculation_registry,
-                                &mut turn.program_fallback_next,
-                                &mut turn.program_fallback_used,
-                                &mut turn.plan_updated_goal,
-                                &mut turn.proposed_goal,
-                                &mut turn.turn_snapshot,
-                                &mut turn.turn_checkpoint_allowed,
-                                &mut turn.turn_checkpoint_created,
-                                &mut turn.fast_feedback,
-                                ui,
-                            )
-                            .await;
+                        // A batch retains several tool futures; boxing this
+                        // boundary keeps their state out of the loop future.
+                        let batch_result = Box::pin(self.execute_tool_batch(
+                            &calls,
+                            &mut completion_content,
+                            &tool_specs,
+                            &tool_envelope,
+                            turn.read_only_intent,
+                            turn.max_parallel_tools,
+                            &turn.task_contract,
+                            &mut turn.implementation_tracker,
+                            &mut turn.evidence,
+                            &mut turn.progress_tracker,
+                            &mut turn.tool_timeline,
+                            &mut turn.sched_tool_calls,
+                            &mut turn.sched_max_concurrent,
+                            &mut turn.sched_serial_runs,
+                            &turn.speculation_registry,
+                            &mut turn.program_fallback_next,
+                            &mut turn.program_fallback_used,
+                            &mut turn.plan_updated_goal,
+                            &mut turn.proposed_goal,
+                            &mut turn.turn_snapshot,
+                            &mut turn.turn_checkpoint_allowed,
+                            &mut turn.turn_checkpoint_created,
+                            &mut turn.fast_feedback,
+                            ui,
+                        ))
+                        .await;
                         turn.phase_latencies.tool_batch_ms = turn
                             .phase_latencies
                             .tool_batch_ms
@@ -1707,44 +1708,7 @@ impl crate::Agent {
         // The final cancellation check commits the body's outcome. Entry owns
         // the awaitable diagnostic append after this future returns, so a
         // cancellation during publication cannot append a conflicting receipt.
-        // Automatic post-mortem intake: bad outcomes become findings-ledger
-        // records so `hi metrics` surfaces failure patterns without anyone
-        // spelunking raw transcripts. Best-effort by design.
-        if self.config.memory.learning && crate::learning::outcome_warrants_finding(&outcome) {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let state_root = self.runtime.state_root().to_path_buf();
-            let finding = crate::learning::Finding {
-                ts,
-                session_id: self.session.as_deref().and_then(crate::SessionSink::id),
-                turn: Some(self.turn_count),
-                status: outcome.status,
-                stop_reason: outcome.stop_reason,
-                verification: outcome.verification,
-                review: outcome.review,
-                review_unavailable_reason: self
-                    .report
-                    .last_turn_telemetry
-                    .review_unavailable_reason
-                    .clone(),
-                last_no_progress_reason: self
-                    .report
-                    .last_turn_telemetry
-                    .last_no_progress_reason
-                    .clone(),
-                changed_files: outcome.changed_files.len(),
-                model: outcome.effective_route.model.clone(),
-                hint_active: self.task.active_hint_shape.clone(),
-                failure_shape: crate::learning::tool_failure_shape(
-                    &self.report.last_turn_telemetry.tool_timeline,
-                ),
-            };
-            tokio::task::spawn_blocking(move || {
-                crate::learning::append_finding(&state_root, &finding);
-            });
-        }
+        self.record_terminal_finding(&outcome);
         self.workspace.clear_active_baselines();
         Ok(outcome)
         }.await;

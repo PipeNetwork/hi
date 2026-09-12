@@ -343,10 +343,10 @@ fn break_account_surface(html: &str) -> String {
         "    <button id=\"register\" type=\"button\">Create account</button>\n",
         "",
     );
-    if let Some(start) = out.find("$(\"register\").addEventListener") {
-        if let Some(rel) = out[start..].find("\n$(\"composer\")") {
-            out.replace_range(start..start + rel, "");
-        }
+    if let Some(start) = out.find("$(\"register\").addEventListener")
+        && let Some(rel) = out[start..].find("\n$(\"composer\")")
+    {
+        out.replace_range(start..start + rel, "");
     }
     out
 }

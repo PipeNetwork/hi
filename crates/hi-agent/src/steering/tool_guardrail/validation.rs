@@ -610,7 +610,7 @@ pub(crate) fn command_runs_tests(arguments: &str) -> bool {
                         "--no-run" | "--list" | "--collect-only" | "--collectonly" | "--listTests"
                     )
                 })
-                || !shell_command_preserves_exit_status(&command)
+                || !shell_command_preserves_exit_status(command)
             {
                 return false;
             }
@@ -658,10 +658,10 @@ fn skip_timeout_args(mut rest: &str) -> &str {
         };
         if word.starts_with('-') {
             rest = rest[word.len()..].trim_start();
-            if matches!(word, "-k" | "--kill-after" | "-s" | "--signal") {
-                if let Some(arg) = rest.split_whitespace().next() {
-                    rest = rest[arg.len()..].trim_start();
-                }
+            if matches!(word, "-k" | "--kill-after" | "-s" | "--signal")
+                && let Some(arg) = rest.split_whitespace().next()
+            {
+                rest = rest[arg.len()..].trim_start();
             }
             continue;
         }

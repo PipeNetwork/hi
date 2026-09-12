@@ -205,141 +205,19 @@ fn sqlite_parent(db_path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-/// Atomically create a new database owner-only, or tighten an existing
-/// writable database before SQLite touches it. Non-Unix platforms retain the
-/// native ACL/permission behavior.
-fn prepare_writable_database(db_path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+mod permissions;
+#[cfg(unix)]
+use permissions::{prepare_writable_database, tighten_existing_sidecars};
 
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(db_path)
-        {
-            Ok(file) => set_open_file_owner_only(&file, db_path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                set_owner_only(db_path, false)?;
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("securely creating sqlite db {}", db_path.display()));
-            }
-        }
-        tighten_existing_sidecars(db_path)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = db_path;
-        Ok(())
-    }
-}
-
-fn tighten_existing_sidecars(db_path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        for suffix in ["-wal", "-shm", "-journal"] {
-            set_owner_only(&sidecar_path(db_path, suffix), true)?;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = db_path;
-    }
+#[cfg(not(unix))]
+fn prepare_writable_database(_db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn set_owner_only(path: &Path, allow_missing: bool) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading mode for {}", path.display()));
-        }
-    };
-    ensure!(
-        !metadata.file_type().is_symlink(),
-        "refusing symbolic link for sqlite file: {}",
-        path.display()
-    );
-    ensure!(
-        metadata.is_file(),
-        "sqlite path is not a regular file: {}",
-        path.display()
-    );
-    ensure!(
-        metadata.nlink() == 1,
-        "refusing multiply-linked sqlite file: {}",
-        path.display()
-    );
-    let file = match std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "opening sqlite file without following links {}",
-                    path.display()
-                )
-            });
-        }
-    };
-    let opened = file
-        .metadata()
-        .with_context(|| format!("reading opened sqlite file metadata {}", path.display()))?;
-    ensure!(
-        opened.is_file(),
-        "opened sqlite path is not a regular file: {}",
-        path.display()
-    );
-    ensure!(
-        opened.nlink() == 1,
-        "refusing multiply-linked sqlite file: {}",
-        path.display()
-    );
-    ensure!(
-        metadata.dev() == opened.dev() && metadata.ino() == opened.ino(),
-        "sqlite path changed while securing it: {}",
-        path.display()
-    );
-    set_open_file_owner_only(&file, path)
-}
-
-#[cfg(unix)]
-fn set_open_file_owner_only(file: &std::fs::File, path: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("reading opened sqlite file metadata {}", path.display()))?;
-    ensure!(
-        metadata.is_file(),
-        "opened sqlite path is not a regular file: {}",
-        path.display()
-    );
-    ensure!(
-        metadata.nlink() == 1,
-        "refusing multiply-linked sqlite file: {}",
-        path.display()
-    );
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(0o600);
-    file.set_permissions(permissions)
-        .with_context(|| format!("setting owner-only mode on {}", path.display()))
+#[cfg(not(unix))]
+fn tighten_existing_sidecars(_db_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
@@ -822,3 +700,6 @@ mod tests {
         assert_eq!(JournalMode::Truncate.as_str(), "truncate");
     }
 }
+
+#[cfg(all(test, unix))]
+mod lock_tests;

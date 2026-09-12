@@ -345,7 +345,7 @@ fn ignored_config_and_explicit_pruned_paths_remain_authoritative() {
     let generated = root.join("target/generated.txt");
     std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
     std::fs::write(&generated, "generated\n").unwrap();
-    let after = read_state(&generated, None).unwrap().unwrap();
+    let after = read_state(&generated).unwrap().unwrap();
     ledger
         .record_tool_effects(&ToolEffects {
             mutation_attempted: true,
@@ -425,9 +425,9 @@ fn goal_export_is_metadata_until_a_task_explicitly_edits_it() {
     }
 
     let path = crate::goal::GOAL_EXPORT_PATH;
-    let before = read_state(&root.join(path), None).unwrap().unwrap();
+    let before = read_state(&root.join(path)).unwrap().unwrap();
     std::fs::write(root.join(path), "explicitly requested content").unwrap();
-    let after = read_state(&root.join(path), None).unwrap().unwrap();
+    let after = read_state(&root.join(path)).unwrap().unwrap();
     let before_edit = ledger.revision();
     ledger
         .record_tool_effects(&ToolEffects {

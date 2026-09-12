@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::edit::sh_quote;
 use crate::paths::{FileVersion, ReadCache, cache_key};
-use crate::{ProcessRunner, ToolOutcome, ToolStatus};
+use crate::{ProcessRunner, ToolOutcome};
 
 mod cursor_rules;
 mod discovery;
@@ -29,7 +29,9 @@ pub(crate) use discovery::{run_glob, run_list};
 #[cfg(test)]
 use formatting::{format_read, format_read_with_budget};
 use formatting::{format_read_for_output, render_read_with_budget};
-use grep_fallback::{ripgrep_binary_unavailable, run_grep_fallback_sync};
+#[cfg(test)]
+use grep_fallback::ripgrep_binary_unavailable;
+use grep_fallback::{finish_ripgrep_execution, run_grep_fallback_sync};
 
 const DEFAULT_READ_LIMIT: usize = 2000;
 
@@ -230,9 +232,13 @@ pub(super) async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) ->
     let metadata = tokio::fs::metadata(path)
         .await
         .with_context(|| format!("reading metadata for {path}"))?;
+    // Timestamps (including ctime) can coalesce across same-size writes.
+    // Confirm the bytes through the bounded regular-file reader before
+    // reusing decoded text, even when the metadata stamp is unchanged.
+    let bytes = read_regular_file_bytes_async(path).await?;
     let version = FileVersion::from_metadata(&metadata);
     let cached = match (cache.lock(), version.as_ref()) {
-        (Ok(mut cache), Some(version)) => cache.get_file(&key, version).cloned(),
+        (Ok(mut cache), Some(version)) => cache.get_file(&key, version, &bytes).cloned(),
         // Poisoned lock — treat as a cache miss and re-read the file, rather than
         // turning every subsequent `read` into a panic (as `.unwrap()` did).
         _ => None,
@@ -242,7 +248,6 @@ pub(super) async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) ->
     }
     // Read as bytes first so we can detect binary files and
     // give a clear message instead of an opaque UTF-8 error.
-    let bytes = read_regular_file_bytes_async(path).await?;
     if is_binary(&bytes) {
         bail!(
             "{path} is a binary file ({} bytes) — the `read` tool is for text. \
@@ -347,28 +352,11 @@ async fn run_grep_with_runner_maybe_timeout(
             .run_program_plain_maybe_timeout("rg", &cmd_args, timeout)
             .await;
         match output {
-            Ok(execution) if execution.status == ToolStatus::Succeeded => {
-                let text = execution.model_outcome().stdout_summary;
-                let out = if text.trim().is_empty() {
-                    format!("no matches for {}", args.pattern)
-                } else {
-                    text
-                };
-                return Ok(ToolOutcome::bounded_plain(out));
+            Ok(execution) => {
+                if let Some(outcome) = finish_ripgrep_execution(execution, &target, pattern)? {
+                    return Ok(outcome);
+                }
             }
-            Ok(execution) if execution.outcome.exit_code == Some(1) => {
-                // rg exit 1 = no matches (not an error)
-                return Ok(ToolOutcome::plain(format!(
-                    "no matches for {}",
-                    args.pattern
-                )));
-            }
-            Ok(execution) if ripgrep_binary_unavailable(&execution) => {}
-            Ok(execution) => bail!(
-                "ripgrep failed for {}: {}",
-                target,
-                execution.model_content().trim()
-            ),
             // A missing rg binary falls through to the hermetic walker. Other
             // launch errors should remain visible instead of being disguised
             // as a slow fallback search. Sandboxed `rg` that fails execvp

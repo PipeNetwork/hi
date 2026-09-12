@@ -16,10 +16,12 @@ jobs:
   quality:
     name: format · lint · deterministic tests
     runs-on: ubuntu-latest
+    env:
+      HI_PIPE_WRAP: ${{ github.workspace }}/target/pipe-wrap/x86_64-unknown-linux-gnu/pipe-wrap
     steps:
       - uses: actions/checkout@v5
-      - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      - name: Install Linux build and test dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev ripgrep
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
@@ -33,16 +35,33 @@ jobs:
       - name: Clippy (0.2 core only)
         run: >-
           cargo clippy
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace -p hi-sqlite-journal
           -p hi-control -p hi-pipefs -p hi-shell
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
           --all-targets -- -A clippy::large-enum-variant -D warnings
 
+      - name: Build Linux sandbox helper
+        run: tools/build-pipe-wrap.sh
+
+      - name: Enable unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+
+      - name: Verify Linux sandbox helper enforcement
+        run: '"${HI_PIPE_WRAP}" --unshare-all --ro-bind / / -- true'
+
+      - name: Verify native ripgrep inside the sandbox
+        run: |
+          command -v rg
+          rg --version
+          "${HI_PIPE_WRAP}" --unshare-all --ro-bind / / -- rg --version
+
       - name: Core tests
         run: >-
-          cargo nextest run
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace
+          cargo nextest run --no-fail-fast
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace -p hi-sqlite-journal
           -p hi-control -p hi-pipefs -p hi-shell
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
@@ -50,7 +69,7 @@ jobs:
       - name: Core doctests
         run: >-
           cargo test --doc
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace -p hi-sqlite-journal
           -p hi-control -p hi-pipefs -p hi-shell
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
@@ -164,6 +183,23 @@ jobs:
             artifacts/tui-smoke-fuzz
           if-no-files-found: error
           retention-days: 30
+
+  sqlite-macos:
+    name: SQLite permissions and live locks (macOS)
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sqlite-macos
+      - name: Lint portable permission handling
+        run: cargo clippy -p hi-sqlite-journal --all-targets -- -D warnings
+      - name: Verify permissions and live SQLite locks
+        run: cargo test -p hi-sqlite-journal --lib
 
   # PR CI is deliberately provider-free. Network/model-backed evaluation runs
   # only in the scheduled workflow and cannot make pull-request checks flaky.
