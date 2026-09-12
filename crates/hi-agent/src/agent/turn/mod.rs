@@ -44,6 +44,7 @@ mod speculation;
 mod state;
 mod steer;
 mod suggest;
+mod terminal_finding;
 mod terminal_receipt;
 mod terminal_verification;
 mod terminal_workspace;
