@@ -440,12 +440,14 @@ impl crate::Agent {
             );
         }
         if plan_incomplete {
-            if expected_mutation
+            if *silent_continues > 0
+                && expected_mutation
                 && !implementation_tracker.mutation_seen
                 && !implementation_tracker.validation_seen
             {
-                // A bounded implementation drive must not renew its model
-                // allowance by settling another unchanged recap as success.
+                // An enabled continuation gate that spent its allowance must
+                // not renew it by settling another unchanged recap as success.
+                // A disabled gate still permits the existing bounded wrap-up.
                 // Keep inspection evidence and the unfinished plan, and let an
                 // explicit resume authorize the next drive.
                 progress_tracker.bounded_plan_answer_recovery_exhausted = true;
