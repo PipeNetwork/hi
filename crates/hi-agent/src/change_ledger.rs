@@ -10,6 +10,10 @@ use tokio_util::sync::CancellationToken;
 
 use hi_tools::{FileChange, FileChangeKind, ToolEffects};
 
+#[path = "change_ledger/hashing.rs"]
+mod hashing;
+use hashing::hash_file_streaming;
+
 // Automatic reconciliation is for source/configuration state, not model
 // weights, database images, or other multi-gigabyte artifacts. Tool-mediated
 // edits remain exact through `explicit_paths`, regardless of their size.
@@ -21,10 +25,6 @@ struct FileState {
     digest: String,
     len: u64,
     mode: u32,
-    /// Used only to skip re-hashing unchanged files during reconcile. Not part
-    /// of content equality — a touch that preserves bytes must not look like a
-    /// mutation once the digest is reused.
-    mtime_ns: u64,
 }
 
 impl PartialEq for FileState {
@@ -195,7 +195,6 @@ impl BackgroundScan {
                     &scan_root,
                     &scan_excluded,
                     &scan_explicit,
-                    None,
                     Some(&worker_cancellation),
                 );
                 // Swallow a poisoned mutex rather than panicking the scan
@@ -242,7 +241,7 @@ impl ChangeLedger {
             .into_iter()
             .collect::<Vec<_>>();
         let explicit_paths = BTreeSet::new();
-        let observed = scan_workspace(&root, &excluded_roots, &explicit_paths, None, None)?;
+        let observed = scan_workspace(&root, &excluded_roots, &explicit_paths, None)?;
         Ok(Self {
             root,
             excluded_roots,
@@ -551,8 +550,7 @@ impl ChangeLedger {
             for relative in paths.iter().map(|path| normalize(path)) {
                 ensure_scan_active(cancellation)?;
                 let absolute = self.root.join(&relative);
-                match read_state_cancellable(&absolute, self.observed.get(&relative), cancellation)?
-                {
+                match read_state_cancellable(&absolute, cancellation)? {
                     Some(state) => {
                         current.insert(relative, state);
                     }
@@ -567,7 +565,6 @@ impl ChangeLedger {
                 &self.root,
                 &self.excluded_roots,
                 &self.explicit_paths,
-                Some(&self.observed),
                 cancellation,
             )?
         };
@@ -807,7 +804,7 @@ impl ChangeLedger {
             let path = self.root.join(relative);
             // Tool-mediated paths always re-hash: the typed mutation is the
             // correctness boundary and must not reuse a stale fingerprint.
-            match read_state(&path, None)? {
+            match read_state(&path)? {
                 Some(state) => {
                     self.observed.insert(normalize(relative), state);
                 }
@@ -917,7 +914,6 @@ fn scan_workspace(
     root: &Path,
     excluded_roots: &[PathBuf],
     explicit_paths: &BTreeSet<String>,
-    previous: Option<&BTreeMap<String, FileState>>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<BTreeMap<String, FileState>> {
     ensure_scan_active(cancellation)?;
@@ -984,8 +980,7 @@ fn scan_workspace(
         if metadata.is_file() && metadata.len() > MAX_AUTOMATIC_FILE_BYTES {
             continue;
         }
-        let prior = previous.and_then(|map| map.get(&relative));
-        if let Some(state) = read_state_cancellable(path, prior, cancellation)? {
+        if let Some(state) = read_state_cancellable(path, cancellation)? {
             states.insert(relative, state);
         }
     }
@@ -998,8 +993,7 @@ fn scan_workspace(
             continue;
         }
         let path = root.join(relative);
-        let prior = previous.and_then(|map| map.get(relative));
-        if let Some(state) = read_state_cancellable(&path, prior, cancellation)? {
+        if let Some(state) = read_state_cancellable(&path, cancellation)? {
             states.insert(relative.clone(), state);
         } else {
             states.remove(relative);
@@ -1008,13 +1002,12 @@ fn scan_workspace(
     Ok(states)
 }
 
-fn read_state(path: &Path, previous: Option<&FileState>) -> Result<Option<FileState>> {
-    read_state_cancellable(path, previous, None)
+fn read_state(path: &Path) -> Result<Option<FileState>> {
+    read_state_cancellable(path, None)
 }
 
 fn read_state_cancellable(
     path: &Path,
-    previous: Option<&FileState>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Option<FileState>> {
     ensure_scan_active(cancellation)?;
@@ -1028,7 +1021,6 @@ fn read_state_cancellable(
         }
     };
     let mode = file_mode(&metadata);
-    let mtime_ns = mtime_as_ns(&metadata);
     if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(path)
             .with_context(|| format!("reading symlink {}", path.display()))?;
@@ -1037,28 +1029,20 @@ fn read_state_cancellable(
             digest: format!("symlink:sha256:{:x}", Sha256::digest(&bytes)),
             len: bytes.len() as u64,
             mode,
-            mtime_ns,
         }));
     }
     if !metadata.is_file() {
         return Ok(None);
     }
     let len = metadata.len();
-    // Cheap fingerprint: reuse the prior digest when len/mode/mtime match so
-    // reconcile does not re-read and re-hash every unchanged source file.
-    if let Some(prev) = previous
-        && prev.len == len
-        && prev.mode == mode
-        && prev.mtime_ns == mtime_ns
-    {
-        return Ok(Some(prev.clone()));
-    }
+    // This ledger authorizes execution and verification. Same-size writes can
+    // preserve every metadata timestamp, so its revision must use fresh bytes.
+    // The walker still prunes generated trees and bounds automatic file sizes.
     if len > MAX_AUTOMATIC_FILE_BYTES {
         return Ok(Some(FileState {
             digest: format!("oversized:{len}"),
             len,
             mode,
-            mtime_ns,
         }));
     }
     let (digest, hashed_len) = hash_file_streaming(path, cancellation)?;
@@ -1066,32 +1050,7 @@ fn read_state_cancellable(
         digest,
         len: hashed_len,
         mode,
-        mtime_ns,
     }))
-}
-
-fn hash_file_streaming(
-    path: &Path,
-    cancellation: Option<&CancellationToken>,
-) -> Result<(String, u64)> {
-    use std::io::Read;
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut hashed_len = 0u64;
-    loop {
-        ensure_scan_active(cancellation)?;
-        let n = file
-            .read(&mut buf)
-            .with_context(|| format!("reading {}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        hashed_len += n as u64;
-    }
-    Ok((format!("sha256:{:x}", hasher.finalize()), hashed_len))
 }
 
 fn ensure_scan_active(cancellation: Option<&CancellationToken>) -> Result<()> {
@@ -1216,15 +1175,6 @@ fn wait_for_test_gate(
     gate.exited
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     ensure_scan_active(cancellation)
-}
-
-fn mtime_as_ns(metadata: &std::fs::Metadata) -> u64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 #[cfg(unix)]

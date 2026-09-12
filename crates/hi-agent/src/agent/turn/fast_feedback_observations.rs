@@ -6,6 +6,7 @@ use crate::recovery::{ValidationObservation, ValidationResult};
 use crate::workspace_runtime::WorkspaceRuntime;
 
 pub(super) async fn input_revision(runtime: &WorkspaceRuntime) -> Option<String> {
+    runtime.ensure_ledger_scan_complete_async().await.ok()?;
     runtime.reconcile_ledger_async().await.ok()?;
     Some(runtime.ledger().workspace_revision())
 }
@@ -390,9 +391,17 @@ mod tests {
         let workspace = IsolatedWorkspace::new("fast-feedback-revision");
         let agent = crate::Agent::new(Arc::new(Canned(Mutex::new(Vec::new()))), workspace.config())
             .unwrap();
-        std::fs::write(agent.runtime.root().join("value.rs"), "one").unwrap();
+        let path = agent.runtime.root().join("value.rs");
+        std::fs::write(&path, "one").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         let input = input_revision(&agent.runtime).await;
-        std::fs::write(agent.runtime.root().join("value.rs"), "two").unwrap();
+        std::fs::write(&path, "two").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
         let mut observations = Vec::new();
         let result = package_outcome(
             &agent.runtime,

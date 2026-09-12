@@ -1069,11 +1069,9 @@ impl WorkspaceRepairVerifier {
                 exact_results.push(execution.model_content());
             }
             let all_stage_changes = if let Some(ledger) = ledger.as_ref() {
-                // Ledger path: reconcile (cheap via dir-stamp fast path when
-                // nothing changed) and diff against the pre-stage revision.
-                // The reconcile still walks the filesystem on a cold stamp, so
-                // run it on the blocking pool instead of freezing the drive
-                // loop while a verification stage is finishing.
+                // Reconcile current source bytes against the pre-stage revision.
+                // Keep filesystem reads on the blocking pool while verification
+                // finishes; metadata alone cannot establish unchanged inputs.
                 let before_revision = stage_ledger_revision.expect("set when ledger is Some");
                 let ledger = std::sync::Arc::clone(ledger);
                 let reconciled = tokio::task::spawn_blocking(move || {
