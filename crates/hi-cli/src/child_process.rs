@@ -487,26 +487,42 @@ mod tests {
         std::fs::create_dir_all(&state).unwrap();
         let child_paths = CandidateChildPaths::prepare_test(&dir, &owner.join("runtime")).unwrap();
         let pid_path = dir.join("child.pid");
+        let marker = format!(
+            "hi-child-cancel-{}",
+            owner.file_name().unwrap().to_string_lossy()
+        );
         let cancel = hi_agent::TurnCancellation::new();
         let cancel_thread = cancel.clone();
         let cancel_pid_path = pid_path.clone();
-        std::thread::spawn(move || {
-            while std::fs::read_to_string(&cancel_pid_path)
-                .map(|text| text.trim().is_empty())
-                .unwrap_or(true)
-            {
+        let cancel_marker = marker.clone();
+        let shell = Path::new("/bin/sh").canonicalize().unwrap();
+        let observed_shell = shell.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut host_pid = None;
+            while Instant::now() < deadline {
+                if std::fs::read_to_string(&cancel_pid_path)
+                    .is_ok_and(|text| !text.trim().is_empty())
+                {
+                    host_pid = host_pid_with_marker(&cancel_marker, &observed_shell);
+                    if host_pid.is_some() {
+                        break;
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
             cancel_thread.cancel();
+            host_pid
         });
         let started = Instant::now();
         let execution = run_maybe_cancelled(CandidateChildLaunch {
             workspace_root: &dir,
             runtime_root: child_paths.runtime_root(),
-            executable: Path::new("/bin/sh"),
+            executable: &shell,
             arguments: vec![
                 OsString::from("-c"),
-                OsString::from("echo $$ > child.pid; exec sleep 30"),
+                OsString::from("echo $$ > child.pid; sleep 30; :"),
+                OsString::from(marker),
             ],
             environment: Vec::new(),
             timeout: None,
@@ -515,6 +531,10 @@ mod tests {
             isolation: CandidateProcessIsolation::new(&source, &state),
         })
         .unwrap();
+        let host_pid = cancel_thread
+            .join()
+            .unwrap()
+            .expect("observe the candidate shell before cancelling");
         assert_eq!(execution.status, hi_tools::ToolStatus::Cancelled);
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -523,18 +543,35 @@ mod tests {
         );
         #[cfg(unix)]
         {
-            let pid = std::fs::read_to_string(&pid_path)
-                .unwrap()
-                .trim()
-                .parse::<i32>()
-                .unwrap();
-            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child must be reaped");
+            assert_eq!(
+                unsafe { libc::kill(host_pid, 0) },
+                -1,
+                "child must be reaped"
+            );
             assert_eq!(
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(libc::ESRCH)
             );
         }
         let _ = std::fs::remove_dir_all(&owner);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn host_pid_with_marker(marker: &str, shell: &Path) -> Option<i32> {
+        // The candidate's $$ belongs to its PID namespace. Observe the uniquely
+        // marked shell from the host before cancellation to check actual reaping.
+        let output = std::process::Command::new("ps")
+            .args(["-ww", "-axo", "pid=,command="])
+            .output()
+            .expect("list host processes");
+        assert!(output.status.success(), "list host processes");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse().ok()?;
+                (fields.next()? == shell.to_str()? && fields.next_back()? == marker).then_some(pid)
+            })
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
