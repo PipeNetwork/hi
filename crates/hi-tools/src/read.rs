@@ -230,9 +230,13 @@ pub(super) async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) ->
     let metadata = tokio::fs::metadata(path)
         .await
         .with_context(|| format!("reading metadata for {path}"))?;
+    // Timestamps (including ctime) can coalesce across same-size writes.
+    // Confirm the bytes through the bounded regular-file reader before
+    // reusing decoded text, even when the metadata stamp is unchanged.
+    let bytes = read_regular_file_bytes_async(path).await?;
     let version = FileVersion::from_metadata(&metadata);
     let cached = match (cache.lock(), version.as_ref()) {
-        (Ok(mut cache), Some(version)) => cache.get_file(&key, version).cloned(),
+        (Ok(mut cache), Some(version)) => cache.get_file(&key, version, &bytes).cloned(),
         // Poisoned lock — treat as a cache miss and re-read the file, rather than
         // turning every subsequent `read` into a panic (as `.unwrap()` did).
         _ => None,
@@ -242,7 +246,6 @@ pub(super) async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) ->
     }
     // Read as bytes first so we can detect binary files and
     // give a clear message instead of an opaque UTF-8 error.
-    let bytes = read_regular_file_bytes_async(path).await?;
     if is_binary(&bytes) {
         bail!(
             "{path} is a binary file ({} bytes) — the `read` tool is for text. \

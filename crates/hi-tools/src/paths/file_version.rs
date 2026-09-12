@@ -1,4 +1,5 @@
-//! File identity used to keep per-turn reads fresh after external writes.
+//! Metadata hint for per-turn reads. Cache reuse must also check fresh bytes:
+//! same-size writes can share timestamps, including ctime.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileVersion {
