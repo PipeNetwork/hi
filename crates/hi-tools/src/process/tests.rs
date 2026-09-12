@@ -230,16 +230,25 @@ async fn process_children_receive_the_isolated_cargo_home() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn timeout_kills_process_group_descendants() {
-    let runner = ProcessRunner::from_current_dir().unwrap();
-    let run = runner
-        .run_shell(
-            "sleep 60 & child=$!; printf '%s\\n' \"$child\"; wait",
-            Duration::from_millis(100),
-        )
-        .await
-        .unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let marker = format!("hi-timeout-sleep-{}", std::process::id());
+    std::os::unix::fs::symlink("/bin/sleep", workspace.path().join(&marker)).unwrap();
+    let executable = format!("./{marker}");
+    let command = format!("{executable} 60 & wait");
+    let runner = ProcessRunner::new(workspace.path()).unwrap();
+    let run = runner.run_shell(&command, Duration::from_secs(1));
+    tokio::pin!(run);
+    let mut host_pid = None;
+    let run = loop {
+        tokio::select! {
+            result = &mut run => break result.unwrap(),
+            _ = tokio::time::sleep(Duration::from_millis(5)), if host_pid.is_none() => {
+                host_pid = host_pid_with_executable(&executable);
+            }
+        }
+    };
     assert_eq!(run.status, ToolStatus::TimedOut);
-    let pid = run.outcome.stdout_summary.trim().parse::<u32>().unwrap();
+    let pid = host_pid.expect("observe the sleep descendant before timeout");
     let proc_stat = format!("/proc/{pid}/stat");
     for _ in 0..100 {
         let gone_or_zombie = match std::fs::read_to_string(&proc_stat) {
@@ -257,6 +266,20 @@ async fn timeout_kills_process_group_descendants() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed-out descendant {pid} remained alive");
+}
+
+#[cfg(target_os = "linux")]
+fn host_pid_with_executable(executable: &str) -> Option<u32> {
+    // A child's printed PID belongs to the sandbox namespace. Identify the
+    // actual sleep process by its unique argv[0], then inspect its host PID.
+    std::fs::read_dir("/proc")
+        .expect("list host processes")
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse().ok()?;
+            let command = std::fs::read(entry.path().join("cmdline")).ok()?;
+            (command.split(|byte| *byte == 0).next()? == executable.as_bytes()).then_some(pid)
+        })
 }
 
 #[tokio::test]
