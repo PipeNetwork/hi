@@ -168,12 +168,13 @@ impl TurnRetryState {
 
     pub(super) fn start_protocol_recovery(&mut self, err: &anyhow::Error) {
         self.execution = self.execution.fresh_operation();
-        // A structured pre-commit rejection is a completed generation, so a
+        // A typed terminal rejection is a completed generation, so a
         // deliberate bounded resample needs a new identity even if its body
         // is unchanged. A fresh execution ledger alone retains the caller's
         // request id for its first wire shape. Preserve that identity for
-        // uncertain outcomes: transport failures, inferred/local errors,
-        // partial streams, and untyped 5xx responses are not this contract.
+        // uncertain outcomes: transport failures, local errors without this
+        // API contract, partial streams without HTTP 503, and untyped 5xx
+        // responses do not meet the predicate below.
         if err
             .downcast_ref::<hi_ai::ProviderError>()
             .is_some_and(|error| {
