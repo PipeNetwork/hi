@@ -139,7 +139,9 @@ async fn forced_final_requests(
 #[tokio::test]
 async fn rejected_generation_gets_fresh_key_then_lost_response_reuses_it() {
     let requests = forced_final_requests(
-        r#"{"error":{"message":"generation rejected","code":"tool_protocol_error","retryable":true}}"#,
+        // The public API's flat envelope must keep the same typed contract as
+        // nested OpenAI-compatible errors; message wording is not authority.
+        r#"{"error":"the model repeated an identical tool call without advancing the conversation","message":"the model repeated an identical tool call without advancing the conversation","error_type":"service_unavailable_error","code":"tool_protocol_error","retryable":true,"request_id":"err_typed_fixture"}"#,
         true,
     )
     .await;
