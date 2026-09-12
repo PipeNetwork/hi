@@ -10,9 +10,17 @@ use crate::ToolOutcome;
 use super::discovery::is_searchable_entry;
 use super::{MAX_GREP_FILE_BYTES, display_path};
 
-/// `sandbox-exec` reports a missing relative `rg` as a child failure (exit 71
-/// + `execvp()`), not as `ErrorKind::NotFound` from `Command::spawn`.
+/// Sandbox helpers report a missing relative `rg` as a child failure rather
+/// than `ErrorKind::NotFound` from `Command::spawn`.
 pub(super) fn ripgrep_binary_unavailable(execution: &crate::ProcessExecution) -> bool {
+    if execution.status == crate::ToolStatus::Failed
+        && execution.outcome.exit_code == Some(1)
+        && execution.outcome.stdout_summary.trim().is_empty()
+        && execution.outcome.stderr_summary.trim()
+            == "pipe-wrap: child setup failed: exec rg: ENOENT: No such file or directory"
+    {
+        return true;
+    }
     let text = execution.model_content();
     text.contains("execvp()")
         || (execution.outcome.exit_code == Some(71)
