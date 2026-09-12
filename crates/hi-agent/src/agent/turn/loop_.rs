@@ -861,34 +861,35 @@ impl crate::Agent {
                         turn.flags.clear_one_shot_forces();
                         self.set_turn_phase(TurnPhase::Tools);
                         let tool_started = std::time::Instant::now();
-                        let batch_result = self
-                            .execute_tool_batch(
-                                &calls,
-                                &mut completion_content,
-                                &tool_specs,
-                                &tool_envelope,
-                                turn.read_only_intent,
-                                turn.max_parallel_tools,
-                                &turn.task_contract,
-                                &mut turn.implementation_tracker,
-                                &mut turn.evidence,
-                                &mut turn.progress_tracker,
-                                &mut turn.tool_timeline,
-                                &mut turn.sched_tool_calls,
-                                &mut turn.sched_max_concurrent,
-                                &mut turn.sched_serial_runs,
-                                &turn.speculation_registry,
-                                &mut turn.program_fallback_next,
-                                &mut turn.program_fallback_used,
-                                &mut turn.plan_updated_goal,
-                                &mut turn.proposed_goal,
-                                &mut turn.turn_snapshot,
-                                &mut turn.turn_checkpoint_allowed,
-                                &mut turn.turn_checkpoint_created,
-                                &mut turn.fast_feedback,
-                                ui,
-                            )
-                            .await;
+                        // A batch retains several tool futures; boxing this
+                        // boundary keeps their state out of the loop future.
+                        let batch_result = Box::pin(self.execute_tool_batch(
+                            &calls,
+                            &mut completion_content,
+                            &tool_specs,
+                            &tool_envelope,
+                            turn.read_only_intent,
+                            turn.max_parallel_tools,
+                            &turn.task_contract,
+                            &mut turn.implementation_tracker,
+                            &mut turn.evidence,
+                            &mut turn.progress_tracker,
+                            &mut turn.tool_timeline,
+                            &mut turn.sched_tool_calls,
+                            &mut turn.sched_max_concurrent,
+                            &mut turn.sched_serial_runs,
+                            &turn.speculation_registry,
+                            &mut turn.program_fallback_next,
+                            &mut turn.program_fallback_used,
+                            &mut turn.plan_updated_goal,
+                            &mut turn.proposed_goal,
+                            &mut turn.turn_snapshot,
+                            &mut turn.turn_checkpoint_allowed,
+                            &mut turn.turn_checkpoint_created,
+                            &mut turn.fast_feedback,
+                            ui,
+                        ))
+                        .await;
                         turn.phase_latencies.tool_batch_ms = turn
                             .phase_latencies
                             .tool_batch_ms

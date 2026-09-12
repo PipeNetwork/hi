@@ -136,35 +136,37 @@ impl crate::Agent {
         // failure and leaves post-dispatch proof to failed-turn cleanup.
         let active_operation_before = self.workspace_coordination.active_parent_operation();
         let mut effects_may_have_begun = false;
-        let result = self
-            .execute_tool_batch_inner(
-                calls,
-                completion_content,
-                tool_specs,
-                tool_envelope,
-                read_only_intent,
-                max_parallel_tools,
-                task_contract,
-                implementation_tracker,
-                evidence,
-                progress_tracker,
-                tool_timeline,
-                sched_tool_calls,
-                sched_max_concurrent,
-                sched_serial_runs,
-                speculation_registry,
-                program_fallback_next,
-                program_fallback_used,
-                plan_updated_goal,
-                proposed_goal,
-                turn_snapshot,
-                turn_checkpoint_allowed,
-                turn_checkpoint_created,
-                fast_feedback,
-                &mut effects_may_have_begun,
-                ui,
-            )
-            .await;
+        // Keep the large batch state off the enclosing turn futures. Inline
+        // storage compounds across the polling chain and can exhaust a
+        // normal worker stack when a tool initializes the secret scrubber.
+        let result = Box::pin(self.execute_tool_batch_inner(
+            calls,
+            completion_content,
+            tool_specs,
+            tool_envelope,
+            read_only_intent,
+            max_parallel_tools,
+            task_contract,
+            implementation_tracker,
+            evidence,
+            progress_tracker,
+            tool_timeline,
+            sched_tool_calls,
+            sched_max_concurrent,
+            sched_serial_runs,
+            speculation_registry,
+            program_fallback_next,
+            program_fallback_used,
+            plan_updated_goal,
+            proposed_goal,
+            turn_snapshot,
+            turn_checkpoint_allowed,
+            turn_checkpoint_created,
+            fast_feedback,
+            &mut effects_may_have_begun,
+            ui,
+        ))
+        .await;
         match result {
             Ok(outcome) => Ok(outcome),
             Err(error) => Err(self

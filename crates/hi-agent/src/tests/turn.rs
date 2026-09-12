@@ -1,6 +1,31 @@
 use super::common::*;
 use super::*;
 
+#[test]
+fn tool_turns_fit_default_stack_before_secret_scrubber_initialization() {
+    // A shared test process can warm the lazy redaction regexes before these
+    // deep tool paths run. Each child must exercise its first tool output on
+    // the ordinary test-thread stack, regardless of the parent's settings.
+    for test in [
+        "tests::turn::useful_distinct_bash_commands_are_not_no_progress_bounded",
+        "tests::turn::interrupted_bookkeeping_forces_concrete_recovery_round",
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env_remove("RUST_MIN_STACK")
+            .output()
+            .expect("run fresh-process tool turn");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+            "{test} failed on a fresh default stack ({:?}):\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
 struct FailingCheckpointSession;
 
 struct ImmediateAuditProvider {
