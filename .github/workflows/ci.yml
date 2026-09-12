@@ -35,7 +35,7 @@ jobs:
       - name: Clippy (0.2 core only)
         run: >-
           cargo clippy
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace -p hi-sqlite-journal
           -p hi-control -p hi-pipefs -p hi-shell
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
@@ -55,7 +55,7 @@ jobs:
       - name: Core tests
         run: >-
           cargo nextest run
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace -p hi-sqlite-journal
           -p hi-control -p hi-pipefs -p hi-shell
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
@@ -63,7 +63,7 @@ jobs:
       - name: Core doctests
         run: >-
           cargo test --doc
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace -p hi-sqlite-journal
           -p hi-control -p hi-pipefs -p hi-shell
           -p hi-tui -p hi -p hi-eval -p hi-smoke
           --no-default-features
@@ -177,6 +177,23 @@ jobs:
             artifacts/tui-smoke-fuzz
           if-no-files-found: error
           retention-days: 30
+
+  sqlite-macos:
+    name: SQLite permissions and live locks (macOS)
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sqlite-macos
+      - name: Lint portable permission handling
+        run: cargo clippy -p hi-sqlite-journal --all-targets -- -D warnings
+      - name: Verify permissions and live SQLite locks
+        run: cargo test -p hi-sqlite-journal --lib
 
   # PR CI is deliberately provider-free. Network/model-backed evaluation runs
   # only in the scheduled workflow and cannot make pull-request checks flaky.
