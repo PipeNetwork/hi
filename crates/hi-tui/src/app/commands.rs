@@ -1924,7 +1924,9 @@ impl crate::App {
                 ));
                 self.follow();
             }
-            Command::Plan(ref arg) if hi_agent::command::plan_is_view(arg) => {
+            Command::Plan(ref arg)
+                if hi_agent::command::plan_is_view(arg) && arg.trim() != "status" =>
+            {
                 if self.plan_approval.is_some() {
                     if self.unpark_plan_approval() {
                         self.push_session_face(agent);
