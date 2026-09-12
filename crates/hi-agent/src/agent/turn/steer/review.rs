@@ -3,10 +3,11 @@
 use hi_ai::Content;
 
 use crate::steering::{
-    BAIL_CONTINUE_NUDGE, EvidenceTracker, GoalKind, ImplementationIntent, ImplementationTracker,
-    LazinessCategory, LazinessConfig, LazinessDecision, NoNudgeReason, ReviewIntent,
-    TodoGateDecision, build_laziness_nudge, claim_evidence_category, evaluate_laziness,
-    evaluate_todo_gate, matched_bail_out, todo_gate_input_from_plan,
+    BAIL_CONTINUE_NUDGE, EvidenceTracker, GoalKind, IMPLEMENTATION_REVIEW_WRAPUP_NUDGE,
+    ImplementationIntent, ImplementationTracker, LazinessCategory, LazinessConfig,
+    LazinessDecision, NoNudgeReason, ReviewIntent, TodoGateDecision, build_laziness_nudge,
+    claim_evidence_category, evaluate_laziness, evaluate_todo_gate, matched_bail_out,
+    todo_gate_input_from_plan,
 };
 use crate::transcript::NudgeKind;
 use crate::{GOAL_CONTINUE_NUDGE, PLAN_CONTINUE_NUDGE, Ui};
@@ -42,6 +43,10 @@ impl crate::Agent {
         ui: &mut dyn Ui,
     ) -> anyhow::Result<RoundControl> {
         self.set_turn_phase(TurnPhase::Steer);
+        // ChatOnly wrap-up can still parse a textual tool call into
+        // `completion_content`. This path records text only; pairing those
+        // calls would require results that never executed.
+        completion_content.retain(|content| !matches!(content, Content::ToolCall { .. }));
         // Text but no tool call (the content-less case was handled
         // above). Silently re-prompt the model to continue — no
         // status line, no steer counter, no visible nudge.
@@ -103,6 +108,28 @@ impl crate::Agent {
         // each cycle a full model round). The waiting classifier in
         // steer_after_tools sets `awaiting_background` after consecutive
         // waiting rounds; any non-waiting tool round clears it.
+        // Live: "review for any major issues and fix", 4 unique reads, withhold,
+        // this dump, outstanding todos continue, cargo test green, no_progress.
+        // Reject it on a fix turn even with no mutation and even if a plan is
+        // still incomplete — todo-gate must not keep the dump alive.
+        if read_only_intent.is_none()
+            && (expected_mutation || implementation_intent.is_some())
+            && crate::steering::answer_is_review_shaped_insufficient_evidence(assistant_text)
+        {
+            return self.reject_review_shaped_wrapup_on_fix(
+                assistant_text,
+                completion_content,
+                implementation_tracker,
+                evidence,
+                progress_tracker,
+                continue_total_nudges,
+                force_tools_next,
+                text_tool_fallback_next,
+                buffer_read_only_review_text,
+                force_text_answer_next,
+                ui,
+            );
+        }
         if progress_tracker.awaiting_background && !assistant_text.trim().is_empty() {
             if buffer_read_only_review_text {
                 let text_to_emit = if buffered_assistant_text.is_empty() {
@@ -216,7 +243,7 @@ impl crate::Agent {
                     ui.nudge(status);
                     self.messages
                         .push_assistant(std::mem::take(completion_content));
-                    self.messages.push_nudge(NudgeKind::Continue, nudge_body);
+                    self.messages.push_nudge(NudgeKind::Steer, nudge_body);
                     return Ok(RoundControl::Continue);
                 }
                 Some(super::impl_cascade::ImplementationCascadeAction::Exhausted {
@@ -422,6 +449,61 @@ impl crate::Agent {
             progress_tracker.last_no_progress_reason.clear();
             progress_tracker.record_final_answer();
         }
+        Ok(RoundControl::Finish(
+            crate::agent::turn::ModelLoopDecision::Verify,
+        ))
+    }
+
+    fn reject_review_shaped_wrapup_on_fix(
+        &mut self,
+        _assistant_text: &str,
+        completion_content: &mut Vec<Content>,
+        implementation_tracker: &mut ImplementationTracker,
+        evidence: &mut EvidenceTracker,
+        progress_tracker: &mut ProgressTracker,
+        continue_total_nudges: &mut u32,
+        force_tools_next: &mut bool,
+        text_tool_fallback_next: &mut bool,
+        buffer_read_only_review_text: bool,
+        force_text_answer_next: &mut bool,
+        ui: &mut dyn Ui,
+    ) -> anyhow::Result<RoundControl> {
+        if implementation_tracker.unusable_wrapup_nudges < 1 {
+            implementation_tracker.unusable_wrapup_nudges = implementation_tracker
+                .unusable_wrapup_nudges
+                .saturating_add(1);
+            evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
+            *continue_total_nudges = continue_total_nudges.saturating_add(1);
+            *force_tools_next = true;
+            *text_tool_fallback_next = false;
+            ui.nudge("review-shaped wrap-up is not an implementation; requesting the actual fix");
+            self.messages.push_assistant(vec![Content::Text(
+                "[answer retry: review-shaped wrap-up rejected on a fix request; continue implementing]"
+                    .into(),
+            )]);
+            self.messages
+                .push_nudge(NudgeKind::Steer, IMPLEMENTATION_REVIEW_WRAPUP_NUDGE);
+            return Ok(RoundControl::Continue);
+        }
+        const FALLBACK: &str = "The requested fix was not completed. A review-style 'insufficient evidence' wrap-up is not an implementation.";
+        if buffer_read_only_review_text || !*force_text_answer_next {
+            self.emit_assistant_text(ui, FALLBACK);
+            ui.assistant_end();
+        }
+        self.messages
+            .push_assistant(vec![Content::Text(FALLBACK.into())]);
+        if !implementation_tracker.mutation_seen {
+            implementation_tracker.no_mutation_exhausted = true;
+        }
+        let _ = completion_content;
+        progress_tracker.record(
+            ProgressKind::None,
+            "review-shaped wrap-up on a fix request",
+            None,
+        );
+        ui.status(
+            "review-shaped wrap-up is not an implementation; ending without treating the turn as complete",
+        );
         Ok(RoundControl::Finish(
             crate::agent::turn::ModelLoopDecision::Verify,
         ))

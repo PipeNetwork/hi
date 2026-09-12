@@ -7,7 +7,7 @@
 //! two-tier auto policy (elide first, summarize only if still heavy) — see
 //! `Agent::compact_with`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hi_ai::{Content, Message, Role};
 
@@ -191,6 +191,52 @@ fn tool_names(messages: &[Message]) -> HashMap<String, String> {
     names
 }
 
+/// Newest read/write/edit result for each path stays verbatim even when it
+/// falls outside the global keep-recent window. Eliding `index.html` so the
+/// model "cannot safely edit" it is the live inspection stall.
+fn newest_file_result_ids(messages: &[Message]) -> HashSet<String> {
+    let mut calls = HashMap::new();
+    for message in messages {
+        for block in &message.content {
+            if let Content::ToolCall {
+                id,
+                name,
+                arguments,
+            } = block
+            {
+                calls.insert(id.clone(), (name.clone(), arguments.clone()));
+            }
+        }
+    }
+    let mut seen_paths = HashSet::new();
+    let mut keep = HashSet::new();
+    for message in messages.iter().rev() {
+        for block in message.content.iter().rev() {
+            let Content::ToolResult { call_id, .. } = block else {
+                continue;
+            };
+            let Some((name, arguments)) = calls.get(call_id) else {
+                continue;
+            };
+            if !matches!(
+                name.as_str(),
+                "read" | "write" | "edit" | "multi_edit" | "apply_patch"
+            ) {
+                continue;
+            }
+            for path in hi_tools::target_paths(name, arguments) {
+                if path.is_empty() {
+                    continue;
+                }
+                if seen_paths.insert(path) {
+                    keep.insert(call_id.clone());
+                }
+            }
+        }
+    }
+    keep
+}
+
 /// Replace tool-result outputs in `messages[1..up_to]` longer than
 /// [`ELIDE_MIN_CHARS`] with a short stub, keeping the call/result skeleton (and
 /// `call_id`) intact so tool pairing stays valid. Idempotent — already-elided
@@ -278,6 +324,7 @@ pub(crate) fn elide_tool_outputs_except_recent(
     }
 
     let names = tool_names(messages);
+    let newest_file_ids = newest_file_result_ids(messages);
     let mut recent_ids = std::collections::HashSet::new();
     let mut kept = 0usize;
     'outer: for message in messages.iter().rev() {
@@ -310,6 +357,7 @@ pub(crate) fn elide_tool_outputs_except_recent(
             .any(|c| matches!(c, Content::ToolCall { id, .. } if recent_ids.contains(id)));
         for block in &mut message.content {
             match block {
+                Content::ToolResult { call_id, .. } if newest_file_ids.contains(call_id) => {}
                 Content::ToolResult { call_id, output } if eligible > 0 => {
                     eligible -= 1;
                     if output.len() > ELIDE_MIN_CHARS && !output.starts_with(ELIDED_MARK) {
@@ -678,6 +726,65 @@ mod tests {
         assert!(outputs[2].starts_with("3\n"), "{outputs:?}");
         assert!(outputs[3].starts_with("4\n"), "{outputs:?}");
         assert_eq!(elide_tool_outputs_except_recent(&mut m, 2), 0);
+    }
+
+    #[test]
+    fn in_turn_elide_keeps_newest_read_of_each_path() {
+        let bulky = "x".repeat(500);
+        let mut m = vec![Message::system("sys"), Message::user("q")];
+        m.push(Message::assistant(vec![Content::ToolCall {
+            id: "html".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"src/web/index.html"}"#.into(),
+        }]));
+        m.push(Message::tool_result(
+            "html",
+            format!("<span>offline</span>\n{bulky}"),
+        ));
+        m.push(Message::assistant(vec![Content::ToolCall {
+            id: "rs".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"src/web.rs"}"#.into(),
+        }]));
+        m.push(Message::tool_result(
+            "rs",
+            format!("fn register()\n{bulky}"),
+        ));
+        for i in 1..=3 {
+            let id = format!("g{i}");
+            m.push(Message::assistant(vec![Content::ToolCall {
+                id: id.clone(),
+                name: "grep".into(),
+                arguments: format!(r#"{{"pattern":"p{i}"}}"#),
+            }]));
+            m.push(Message::tool_result(&id, format!("grep-{i}\n{bulky}")));
+        }
+        let freed = elide_tool_outputs_except_recent(&mut m, 1);
+        assert!(freed > 0);
+        let outputs: Vec<String> = m
+            .iter()
+            .flat_map(|msg| &msg.content)
+            .filter_map(|c| match c {
+                Content::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            outputs.iter().any(|output| output.contains("offline")),
+            "newest index.html read must survive elision: {outputs:?}"
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|output| output.contains("fn register()")),
+            "newest web.rs read must survive elision: {outputs:?}"
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|output| output.starts_with(ELIDED_MARK) && output.contains("grep")),
+            "old greps may be stubbed: {outputs:?}"
+        );
     }
 
     #[test]

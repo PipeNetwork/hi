@@ -385,7 +385,7 @@ mod tests {
     /// this table documents the shared side-effect vocabulary.
     fn interactive_tool_side_effect(name: &str) -> Option<SideEffect> {
         match name {
-            "update_plan" | "record_decision" => Some(SideEffect::None),
+            "update_plan" | "record_decision" | "obs_recall" => Some(SideEffect::None),
             "read" | "list" | "grep" | "glob" | "repo_map" | "find_symbol" | "diff"
             | "diagnostics" | "definition" | "references" | "hover" => {
                 Some(SideEffect::WorkspaceRead)

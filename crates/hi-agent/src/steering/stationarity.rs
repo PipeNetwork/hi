@@ -80,7 +80,9 @@ impl IdenticalToolCallRun {
 pub(crate) fn step_signature(calls: &[(String, String, String)]) -> String {
     let mut parts: Vec<String> = calls
         .iter()
-        .map(|(_, name, args)| format!("{name}\u{1f}{args}"))
+        .map(|(_, name, args)| {
+            super::inspection_signature(name, args).unwrap_or_else(|| format!("{name}\u{1f}{args}"))
+        })
         .collect();
     parts.sort();
     parts.join("\u{1e}")
@@ -88,11 +90,11 @@ pub(crate) fn step_signature(calls: &[(String, String, String)]) -> String {
 
 pub(crate) fn step_is_problematically_repeating(calls: &[(String, String, String)]) -> bool {
     !calls.is_empty()
-        && calls.iter().all(|(_, name, _)| {
+        && calls.iter().all(|(_, name, args)| {
             matches!(
                 name.as_str(),
                 "read" | "grep" | "glob" | "update_plan" | "bash_output"
-            )
+            ) || (name == "bash" && super::bash_inspection_signature(args).is_some())
         })
 }
 
@@ -151,5 +153,26 @@ mod tests {
             MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS
         );
         assert_eq!(run.nudge_threshold(), NUDGE_AFTER_IDENTICAL_TOOL_CALLS);
+    }
+
+    #[test]
+    fn growing_stderr_redirect_greps_are_the_same_problematic_run() {
+        let mut run = IdenticalToolCallRun::default();
+        let first = serde_json::json!({
+            "command": "grep -nE 'pub fn' src/db.rs | sed 's/^/GOT: /' 2>&1; echo \"EXIT=$?\""
+        })
+        .to_string();
+        let grown = serde_json::json!({
+            "command": "grep -nE 'pub fn' src/db.rs | sed 's/^/GOT: /' | sed 's/[a-z]/x/g' 2>&1; echo \"EXIT=$?\""
+        })
+        .to_string();
+        assert!(step_is_problematically_repeating(&[call("bash", &first)]));
+        run.observe_calls(&[call("bash", &first)]);
+        run.observe_calls(&[call("bash", &grown)]);
+        assert_eq!(run.run_len, 2);
+        assert_eq!(
+            run.hard_stop_threshold(),
+            MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS
+        );
     }
 }

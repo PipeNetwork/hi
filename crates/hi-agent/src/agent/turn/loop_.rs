@@ -62,6 +62,7 @@ impl crate::Agent {
         // its documented per-turn contract — so a file changed outside `hi`
         // between turns is re-read fresh, not served from a prior turn's cache.
         self.runtime.clear_read_cache();
+        self.obs_recall_calls = 0;
         // The initial ledger scan is allowed to run in the background during
         // startup, but a turn baseline must not be established against an
         // incomplete snapshot: otherwise external edits made during setup can
@@ -385,6 +386,16 @@ impl crate::Agent {
             model_turn_input.push('\n');
             model_turn_input.push('\n');
             model_turn_input.push_str(crate::token_budget::FRESH_WINDOW_REORIENT);
+        } else if self.maybe_plan_boundary_compact(ui).await? {
+            model_turn_input.push('\n');
+            model_turn_input.push('\n');
+            model_turn_input.push_str(crate::compaction_economics::PLAN_BOUNDARY_COMPACT_REORIENT);
+        }
+        if self.online_compact.pending_reorient {
+            model_turn_input.push('\n');
+            model_turn_input.push('\n');
+            model_turn_input.push_str(crate::compaction_economics::PLAN_BOUNDARY_COMPACT_REORIENT);
+            self.online_compact.pending_reorient = false;
         }
 
         self.messages.strip_trailing_nudges();

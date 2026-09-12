@@ -20,12 +20,12 @@ fn natural_build_continuation_uses_implementation_guards() {
 }
 
 #[tokio::test]
-async fn fresh_discovery_keeps_inspection_tools_past_former_cap() {
+async fn early_unique_discovery_keeps_inspection_tools() {
     let workspace = IsolatedWorkspace::new("fresh-discovery-retains-tools");
     let mut responses = Vec::new();
     std::fs::create_dir_all(workspace.path("src")).unwrap();
-    // Fresh evidence must remain available regardless of investigation length.
-    for file in 0..24 {
+    // Two unique files stay under the unique-inspection edit challenge.
+    for file in 0..2 {
         let relative = format!("src/context-{file}.rs");
         std::fs::write(
             workspace.path(&relative),
@@ -72,7 +72,7 @@ async fn fresh_discovery_keeps_inspection_tools_past_former_cap() {
         .iter()
         .filter(|entry| entry.tool == "read")
         .collect::<Vec<_>>();
-    assert_eq!(read_entries.len(), 24);
+    assert_eq!(read_entries.len(), 2);
     assert!(
         read_entries
             .iter()
@@ -84,7 +84,7 @@ async fn fresh_discovery_keeps_inspection_tools_past_former_cap() {
             .any(|status| status.contains("without editing"))
     );
     let recorded_tools = tool_names.lock().unwrap();
-    for tools in recorded_tools.iter().take(25) {
+    for tools in recorded_tools.iter().take(3) {
         assert!(tools.iter().any(|name| name == "read"));
         assert!(tools.iter().any(|name| name == "bash"));
     }
@@ -93,7 +93,7 @@ async fn fresh_discovery_keeps_inspection_tools_past_former_cap() {
             .lock()
             .unwrap()
             .iter()
-            .take(25)
+            .take(3)
             .all(|mode| *mode == ToolMode::Auto)
     );
 }

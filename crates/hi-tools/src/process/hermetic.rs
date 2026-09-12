@@ -1,6 +1,7 @@
 //! Construction of process runners with narrow private temporary storage.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
 
@@ -43,6 +44,7 @@ pub(super) fn build_process_runner(
         sandbox,
         cargo_home,
         private_temp,
+        evidence_reducer: Arc::new(Mutex::new(super::EvidenceReducerState::default())),
     })
 }
 

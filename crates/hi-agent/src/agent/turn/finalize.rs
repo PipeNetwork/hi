@@ -48,6 +48,14 @@ impl crate::Agent {
     /// model did not supply an accepted final answer.
     /// This path makes no completion claim that verification cannot support.
     pub(super) fn emit_deterministic_closeout(&mut self, ui: &mut dyn Ui) {
+        if self.messages.as_slice().last().is_some_and(|message| {
+            message.role == hi_ai::Role::Assistant
+                    && message.content.iter().any(|content| {
+                        matches!(content, Content::Text(text) if text_is_user_visible_answer(text))
+                    })
+        }) {
+            return;
+        }
         let closeout = if self.task_recovery.exhausted
             || self
                 .report
@@ -60,7 +68,13 @@ impl crate::Agent {
             } else if self.report.verify.failed() {
                 "Automatic recovery stopped. Current edits are retained; verification failed for the current workspace."
             } else if self.workspace.last_changed_files.is_empty() {
-                "Automatic recovery stopped. No file changes were made."
+                if super::terminal_verification::request_limit_recovery_exhausted(
+                    &self.task_recovery,
+                ) {
+                    "The provider request budget ran out during inspection before any file changes were made."
+                } else {
+                    "Automatic recovery stopped. No file changes were made."
+                }
             } else {
                 "Automatic recovery stopped. Current edits are retained; the current workspace remains unverified."
             }

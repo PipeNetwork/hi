@@ -417,6 +417,10 @@ pub(crate) fn config() -> AgentConfig {
             inject_stack_skill: false,
             // Off so review-shaped canned turns don't grow by the code-review pack.
             inject_review_skill: false,
+            observation_pack: false,
+            online_context_compact: false,
+            action_fusion: false,
+            evidence_preserving_reducer: false,
             ..crate::AgentMemory::default()
         },
         test_state_root: Some(std::sync::Arc::new(state_guard)),

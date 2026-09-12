@@ -76,9 +76,9 @@ pub mod protocol {
         get_task_output_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
         is_read_only, kill_task_tool_spec, memory_forget_tool_spec, memory_get_tool_spec,
         memory_search_tool_spec, memory_update_tool_spec, monitor_tool_spec, new_context_tool_spec,
-        prepare_mutation_in_with_state, prepare_verify_workdir, research_read_tool_spec,
-        research_tool_spec, run_check_in, run_check_in_with_timeout, run_fast_check_in,
-        run_memory_forget, run_memory_get, run_memory_search, run_memory_update,
+        obs_recall_tool_spec, prepare_mutation_in_with_state, prepare_verify_workdir,
+        research_read_tool_spec, research_tool_spec, run_check_in, run_check_in_with_timeout,
+        run_fast_check_in, run_memory_forget, run_memory_get, run_memory_search, run_memory_update,
         run_program_tool_spec, run_search_tool, run_skill, run_use_tool, search_tool_tool_spec,
         send_subagent_message_tool_spec, skill_tool_spec, speculation_class, target_path,
         target_paths, task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
@@ -129,6 +129,7 @@ pub mod infra {
     pub use crate::repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
     pub use crate::web::{run_web_fetch, run_web_search};
 }
+mod action_fusion;
 mod attribution;
 mod background;
 mod background_tasks;
@@ -141,6 +142,7 @@ mod condense;
 mod edit;
 mod effects;
 pub mod envelope;
+mod evidence_reducer;
 mod fast_feedback;
 mod file_operation_lock;
 pub mod folder_trust;
@@ -164,6 +166,11 @@ mod tools;
 mod transaction;
 mod web;
 pub mod worktree;
+pub use action_fusion::{
+    CommandStep, FUSED_COMMAND_FAILED, FUSED_COMMAND_SKIPPED, FUSED_COMMAND_SUCCEEDED,
+    FusionObservation, MutationStep, execute_mutation_then_command, fused_command_index,
+    is_filesystem_mutation_tool,
+};
 pub use background::{BackgroundRegistry, BackgroundReleaseSummary, shell_title};
 pub use background_tasks::{
     BackgroundTaskCapacityError, BackgroundTaskLimits, BackgroundTaskOutcome,
@@ -173,6 +180,11 @@ pub use background_tasks::{
 pub use codebase_graph::references_by_name;
 pub use command_display::{peel_cd_for_title, strip_redundant_session_cd};
 pub use condense::condense_diagnostics;
+pub use evidence_reducer::{
+    EVIDENCE_RECEIPT_PREFIX, EvidenceReducerConfig, EvidenceReducerHook, REDUCER_RECEIPT_SCHEMA,
+    ReceiptValidation, after_condense, apply_quote_checked_reduction, reduce_from_reducer_result,
+    reduce_or_reject, sha256_hex, validate_receipt,
+};
 pub use fast_feedback::{
     CargoCheckOutcome, CargoCommandOutcome, affected_any_package_dirs, affected_cargo_package_dirs,
     affected_go_package_dirs, affected_javascript_package_dirs, affected_package_dirs,
@@ -225,8 +237,8 @@ pub use tools::{
     get_task_output_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
     is_read_only, kill_task_tool_spec, memory_forget_tool_spec, memory_get_tool_spec,
     memory_search_tool_spec, memory_update_tool_spec, monitor_tool_spec, new_context_tool_spec,
-    prepare_mutation_in_with_state, prepare_verify_workdir, research_read_tool_spec,
-    research_tool_spec, run_check_in, run_check_in_with_runner,
+    obs_recall_tool_spec, prepare_mutation_in_with_state, prepare_verify_workdir,
+    research_read_tool_spec, research_tool_spec, run_check_in, run_check_in_with_runner,
     run_check_in_with_runner_maybe_timeout, run_check_in_with_runner_timeout,
     run_check_in_with_timeout, run_fast_check_in, run_memory_forget, run_memory_get,
     run_memory_search, run_memory_update, run_program_tool_spec, run_search_tool, run_skill,

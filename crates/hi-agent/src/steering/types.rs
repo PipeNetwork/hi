@@ -9,8 +9,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use hi_ai::{Content, Message};
 
 use super::implementation::{
-    bash_inspection_paths, bash_inspection_signature, bash_no_progress_signature,
-    implementation_tool_call_validates,
+    BashCommandKind, bash_command, bash_inspection_paths, bash_inspection_signature,
+    bash_no_progress_signature, classify_bash_command, implementation_tool_call_validates,
+    shell_command_likely_mutates_workspace, shell_command_likely_validates,
 };
 use super::intent::{
     compact_search_hit_line, evidence_kind_for_tool, grep_match_line_count, search_hit_score,
@@ -52,12 +53,31 @@ pub(crate) struct ImplementationTracker {
     pub(crate) validation_after_last_mutation: bool,
     pub(crate) preferred_validation: Option<String>,
     pub(crate) no_change_nudges: u32,
+    /// When true, discovery tools are skipped until a file change lands.
+    /// Unique-file investigation nudges an edit without setting this, so a
+    /// review-and-fix turn can still read tests after the first challenge.
+    /// Rereads and validation-without-edit set it immediately.
+    pub(crate) withhold_inspection: bool,
+    /// Rejected review-shaped "insufficient evidence" wrap-ups on a fix
+    /// turn. One retry, then the turn is a stall.
+    pub(crate) unusable_wrapup_nudges: u32,
     pub(crate) requested_validation_nudges: u32,
+    /// Tool rounds on an implementation turn that did not mutate the workspace.
+    pub(crate) tool_rounds_without_mutation: u32,
 }
 
 impl ImplementationTracker {
     pub(crate) fn record_dry_run_plan(&mut self, mutates: bool) {
         self.dry_run_mutation_planned |= mutates;
+    }
+
+    /// Count an edit challenge. `withhold_now` hides read/grep after rereads;
+    /// unique-file sprawl passes false so the model can still inspect tests.
+    pub(crate) fn challenge_edit(&mut self, withhold_now: bool) {
+        self.no_change_nudges = self.no_change_nudges.saturating_add(1);
+        if withhold_now {
+            self.withhold_inspection = true;
+        }
     }
 
     pub(crate) fn record_validation_success(&mut self) {
@@ -117,6 +137,45 @@ pub(crate) fn is_read_only_inspection_tool(name: &str) -> bool {
         name,
         "read" | "list" | "grep" | "glob" | "explore" | "repo_map" | "find_symbol"
     )
+}
+
+/// Discovery calls to skip after an implementation no-change nudge, including
+/// shell dumps that bypass withheld `read`/`grep`.
+pub(crate) fn is_withheld_inspection_call(name: &str, arguments: &str) -> bool {
+    if matches!(
+        name,
+        "read"
+            | "grep"
+            | "glob"
+            | "list"
+            | "find_symbol"
+            | "repo_map"
+            | "obs_recall"
+            | "diff"
+            | "status"
+            | "explore"
+    ) {
+        return true;
+    }
+    if name != "bash" {
+        return false;
+    }
+    let Some(command) = bash_command(arguments) else {
+        return false;
+    };
+    match classify_bash_command(&command) {
+        BashCommandKind::Mutation | BashCommandKind::Validation | BashCommandKind::Background => {
+            false
+        }
+        BashCommandKind::Inspection | BashCommandKind::NoProgress => true,
+        // Live: `python3 -c print(open(file))`, `base64`, `od`, and `2>&1`
+        // pipelines classified as Unknown and kept executing after read/grep
+        // were withheld.
+        BashCommandKind::Unknown => {
+            !shell_command_likely_mutates_workspace(&command)
+                && !shell_command_likely_validates(&command)
+        }
+    }
 }
 
 impl EvidenceKind {
@@ -372,6 +431,16 @@ impl EvidenceTracker {
                 .inspected_paths
                 .iter()
                 .any(|seen| paths_refer_to_same_file(seen, path))
+    }
+
+    /// True when this `read` targets a file already inspected this turn.
+    /// Offset paging of the same path is not new evidence.
+    pub(crate) fn already_inspected_read(&self, name: &str, arguments: &str) -> bool {
+        if name != "read" {
+            return false;
+        }
+        let paths = hi_tools::target_paths(name, arguments);
+        !paths.is_empty() && paths.iter().all(|path| self.has_inspected_path(path))
     }
 
     fn path_read_is_truncated(&self, path: &str) -> bool {
@@ -660,6 +729,11 @@ pub(crate) fn inspection_signature(name: &str, arguments: &str) -> Option<String
             let query = value.get("query")?.as_str()?;
             let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
             Some(format!("find_symbol:{query}:{path}"))
+        }
+        "obs_recall" => {
+            let id = value.get("id")?.as_str()?;
+            let offset = value.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+            Some(format!("obs_recall:{id}:{offset}"))
         }
         "explore" => {
             let task = value

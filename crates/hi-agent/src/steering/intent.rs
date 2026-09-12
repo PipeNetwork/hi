@@ -121,22 +121,25 @@ pub(crate) fn evidence_kind_for_bash(arguments: &str) -> Option<EvidenceKind> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if command
+    let words = command
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
-        .any(|word| matches!(word, "cat" | "sed" | "nl" | "head" | "tail"))
-    {
-        return Some(EvidenceKind::FileRead);
-    }
-    if command
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
-        .any(|word| matches!(word, "rg" | "grep" | "git"))
+        .collect::<Vec<_>>();
+    // `git log | head` is a search/history dump, not a source-file read.
+    // Matching `head` first branded every git/grep pipeline as new file
+    // evidence and fed unique-read sprawl.
+    if words
+        .iter()
+        .any(|word| matches!(*word, "rg" | "grep" | "git"))
     {
         return Some(EvidenceKind::TargetedSearch);
     }
-    if command
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
-        .any(|word| matches!(word, "ls" | "find"))
+    if words
+        .iter()
+        .any(|word| matches!(*word, "cat" | "sed" | "nl" | "head" | "tail"))
     {
+        return Some(EvidenceKind::FileRead);
+    }
+    if words.iter().any(|word| matches!(*word, "ls" | "find")) {
         return Some(EvidenceKind::Listing);
     }
     None
@@ -1098,6 +1101,20 @@ mod golden_table {
         assert!(!prompt.contains("bounded exact-file review"));
         assert!(prompt.contains("bounded static review"));
         assert!(prompt.contains("Do not repeatedly relist the workspace"));
+    }
+
+    #[test]
+    fn git_log_piped_to_head_is_search_evidence_not_a_file_read() {
+        let git_log = serde_json::json!({
+            "command": "git log --oneline -8 2>/dev/null | head -20"
+        })
+        .to_string();
+        assert_eq!(
+            evidence_kind_for_bash(&git_log),
+            Some(EvidenceKind::TargetedSearch)
+        );
+        let dump = serde_json::json!({ "command": "sed -n '1,20p' src/web.rs" }).to_string();
+        assert_eq!(evidence_kind_for_bash(&dump), Some(EvidenceKind::FileRead));
     }
 
     #[test]

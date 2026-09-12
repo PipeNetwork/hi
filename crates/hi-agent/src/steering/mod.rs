@@ -43,7 +43,9 @@ pub(crate) use review_repair::*;
 pub use routine_git::{git_command_is_routine, git_command_is_routine_in};
 #[cfg(test)]
 pub(crate) use settlement::forced_final_answer_is_unusable;
-pub(crate) use settlement::no_progress_forced_final_is_unusable;
+pub(crate) use settlement::{
+    answer_is_review_shaped_insufficient_evidence, no_progress_forced_final_is_unusable,
+};
 pub(crate) use stationarity::{
     IdenticalToolCallRun, MAX_CONSECUTIVE_IDENTICAL_PROBLEMATIC_TOOL_CALLS, STATIONARITY_NUDGE,
 };

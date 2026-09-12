@@ -46,6 +46,7 @@ fn read_only_tools_are_classified() {
     assert!(is_read_only("record_decision"));
     assert!(is_read_only("ask_user"));
     assert!(is_read_only("new_context"));
+    assert!(is_read_only("obs_recall"));
     assert!(is_read_only("research"));
     assert!(is_read_only("research_read"));
     assert!(is_read_only("bash_output"));
@@ -104,6 +105,7 @@ fn metadata_catalog_covers_every_schema_once() {
     assert!(is_known_tool("delegate"));
     assert!(is_known_tool("ask_user"));
     assert!(is_known_tool("new_context"));
+    assert!(is_known_tool("obs_recall"));
     assert!(is_known_tool("research"));
     assert!(is_known_tool("research_read"));
     assert!(is_known_tool("browser_exec"));
@@ -511,6 +513,7 @@ fn capability_matrix_known_tool_side_effects() {
         ("block_step", "none"),
         ("ask_user", "none"),
         ("new_context", "none"),
+        ("obs_recall", "none"),
         ("read", "workspace_read"),
         ("list", "workspace_read"),
         ("grep", "workspace_read"),

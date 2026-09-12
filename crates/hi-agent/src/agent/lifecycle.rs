@@ -172,6 +172,15 @@ impl crate::Agent {
             sandbox_config,
             !config.suppress_initial_project_hooks,
         )?;
+        if config.memory.evidence_preserving_reducer {
+            runtime.process_runner().set_evidence_reducer(
+                hi_tools::EvidenceReducerConfig {
+                    enabled: true,
+                    ..hi_tools::EvidenceReducerConfig::default()
+                },
+                None,
+            );
+        }
         let tools = advertised_tools(&config, None);
         let last_effective_route = crate::EffectiveModelRoute {
             provider: config.routing.provider_route.clone(),
@@ -203,6 +212,8 @@ impl crate::Agent {
             Some(interjections.abort_pending_flag()),
         );
         hi_ai::warmup_agent_http_clients();
+        let observation_pack =
+            crate::observation_pack::ObservationPack::new(config.paths.state_root.clone());
         Ok(Self {
             provider,
             provider_capability_registry: hi_ai::ProviderCapabilityRegistry::default(),
@@ -241,6 +252,9 @@ impl crate::Agent {
             decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),
             prefix_stability: crate::prefix_stability::PrefixStability::default(),
+            observation_pack,
+            obs_recall_calls: 0,
+            online_compact: crate::compaction_economics::OnlineCompactState::default(),
             token_budget: crate::token_budget::TokenBudgetState::default(),
             interjections,
             btw_jobs,
@@ -728,6 +742,13 @@ impl crate::Agent {
             {
                 specs.push(hi_tools::new_context_tool_spec());
             }
+        }
+        if self.config.memory.observation_pack
+            && self.observation_pack.has_packed_handles()
+            && self.obs_recall_calls < crate::observation_pack::OBS_RECALL_TURN_BUDGET
+            && !specs.iter().any(|spec| spec.name == "obs_recall")
+        {
+            specs.push(hi_tools::obs_recall_tool_spec());
         }
         specs.into()
     }

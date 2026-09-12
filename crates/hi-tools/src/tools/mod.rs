@@ -32,8 +32,8 @@ pub use crate::catalog::{
     delegate_tool_spec, explore_tool_spec, get_task_output_tool_spec, is_coordination,
     is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec,
     memory_forget_tool_spec, memory_get_tool_spec, memory_search_tool_spec,
-    memory_update_tool_spec, monitor_tool_spec, new_context_tool_spec, research_read_tool_spec,
-    research_tool_spec, run_program_tool_spec, search_tool_tool_spec,
+    memory_update_tool_spec, monitor_tool_spec, new_context_tool_spec, obs_recall_tool_spec,
+    research_read_tool_spec, research_tool_spec, run_program_tool_spec, search_tool_tool_spec,
     send_subagent_message_tool_spec, skill_tool_spec, speculation_class, target_path, target_paths,
     task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
 };

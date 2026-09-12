@@ -274,8 +274,8 @@ async fn local_service_verification_case() -> (crate::TurnOutcome, Vec<String>) 
     );
     assert_eq!(outcome.stop_reason, crate::TurnStopReason::Completed);
     assert!(subject.last_verify().is_some());
-    assert_eq!(subject.last_turn_telemetry().verify_rounds, 2);
-    assert_eq!(subject.last_verification_executions().len(), 2);
+    assert_eq!(subject.last_turn_telemetry().verify_rounds, 1);
+    assert_eq!(subject.last_verification_executions().len(), 1);
     assert!(!ui.statuses.iter().any(|line| {
         line.contains("verification deferred")
             || line.contains("verification infrastructure failed")

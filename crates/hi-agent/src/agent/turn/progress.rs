@@ -356,12 +356,23 @@ pub(super) fn classify_tool_progress(
     tracker_before: &ImplementationTracker,
     plan_changed: bool,
     workspace_root: &std::path::Path,
+    already_inspected_read: bool,
 ) -> ToolProgressLabel {
     if plan_changed {
         return ToolProgressLabel::new(ProgressKind::Meaningful, "changed plan state", signature);
     }
     if mutation_applied {
         return ToolProgressLabel::new(ProgressKind::Meaningful, "successful mutation", signature);
+    }
+    if already_inspected_read {
+        return ToolProgressLabel::new(
+            ProgressKind::None,
+            "reread of already-inspected file",
+            signature,
+        );
+    }
+    if name == "obs_recall" {
+        return ToolProgressLabel::new(ProgressKind::None, "observation archive paging", signature);
     }
     if repeated_idempotent_result {
         return ToolProgressLabel::new(
@@ -386,6 +397,16 @@ pub(super) fn classify_tool_progress(
             "repeated inspection signature"
         };
         return ToolProgressLabel::new(ProgressKind::None, reason, signature);
+    }
+    // Failed-tool wrapping prefixes `Error: `. That must not turn `fatal: not
+    // a git repository` into a compiler diagnostic.
+    let diagnostic_text = output.strip_prefix("Error: ").unwrap_or(output);
+    if name == "bash" && crate::observation_pack::looks_like_unresolved_failure(diagnostic_text) {
+        return ToolProgressLabel::new(
+            ProgressKind::Weak,
+            "unresolved diagnostic in command output",
+            signature,
+        );
     }
     if error {
         if implementation_tool_call_validates(name, arguments)
@@ -474,6 +495,68 @@ mod progress_retention_tests {
         assert!(!evidence.round_adds_evidence(&calls));
         assert!(tracker.observe_workspace_revision(&mut evidence, 8, true));
         assert!(evidence.round_adds_evidence(&calls));
+    }
+
+    #[test]
+    fn reread_of_inspected_file_is_not_meaningful_progress() {
+        let label = classify_tool_progress(
+            "read",
+            r#"{"path":"src/web.rs","offset":40,"limit":60}"#,
+            "    40\tfn register() {}",
+            false,
+            false,
+            false,
+            Some("read:src/web.rs:40:60".into()),
+            false,
+            false,
+            &ImplementationTracker::default(),
+            false,
+            std::path::Path::new("."),
+            true,
+        );
+        assert_eq!(label.kind, ProgressKind::None);
+        assert_eq!(label.reason, "reread of already-inspected file");
+    }
+
+    #[test]
+    fn succeeded_bash_with_rustc_error_is_unresolved_diagnostic() {
+        let label = classify_tool_progress(
+            "bash",
+            r#"{"command":"cargo check || true"}"#,
+            "error[E0425]: cannot find function `register` in this scope\n",
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            &ImplementationTracker::default(),
+            false,
+            std::path::Path::new("."),
+            false,
+        );
+        assert_eq!(label.kind, ProgressKind::Weak);
+        assert_eq!(label.reason, "unresolved diagnostic in command output");
+    }
+
+    #[test]
+    fn git_fatal_is_not_a_compiler_diagnostic() {
+        let label = classify_tool_progress(
+            "bash",
+            r#"{"command":"git status"}"#,
+            "Error: fatal: not a git repository (or any of the parent directories): .git",
+            true,
+            false,
+            false,
+            None,
+            false,
+            false,
+            &ImplementationTracker::default(),
+            false,
+            std::path::Path::new("."),
+            false,
+        );
+        assert_ne!(label.reason, "unresolved diagnostic in command output");
     }
 
     #[test]

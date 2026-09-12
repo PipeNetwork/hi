@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -121,10 +122,40 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     out
 }
 
+struct EvidenceReducerState {
+    config: crate::EvidenceReducerConfig,
+    hook: Option<crate::EvidenceReducerHook>,
+}
+
+impl Default for EvidenceReducerState {
+    fn default() -> Self {
+        Self {
+            config: crate::EvidenceReducerConfig::default(),
+            hook: None,
+        }
+    }
+}
+
+fn reduce_condensed_stream(
+    config: &crate::EvidenceReducerConfig,
+    hook: Option<&crate::EvidenceReducerHook>,
+    condensed: &str,
+    is_error: bool,
+) -> String {
+    if condensed.is_empty() {
+        return String::new();
+    }
+    let receipt = match hook {
+        Some(hook) => hook(condensed, is_error),
+        None => return condensed.to_string(),
+    };
+    crate::evidence_reducer::after_condense(condensed, is_error, config, receipt)
+}
+
 /// Hardened process runner bound to one explicit workspace root. Children get
 /// closed stdin, bounded output, a sanitized environment, kill-on-drop, and on
 /// Unix their own process group for complete cancellation.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProcessRunner {
     root: PathBuf,
     foreground: ForegroundProcessRegistry,
@@ -133,6 +164,19 @@ pub struct ProcessRunner {
     sandbox: crate::sandbox::SandboxProfile,
     cargo_home: Option<PathBuf>,
     private_temp: Option<PathBuf>,
+    evidence_reducer: Arc<Mutex<EvidenceReducerState>>,
+}
+
+impl std::fmt::Debug for ProcessRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessRunner")
+            .field("root", &self.root)
+            .field("foreground", &self.foreground)
+            .field("sandbox", &self.sandbox)
+            .field("cargo_home", &self.cargo_home)
+            .field("private_temp", &self.private_temp)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProcessRunner {
@@ -179,6 +223,51 @@ impl ProcessRunner {
         self.sandbox.policy()
     }
 
+    /// Install quote-checked reduction after diagnostic condense. Clones share
+    /// this hook. `None` keeps condensed output (fail-open, no nested model).
+    pub fn set_evidence_reducer(
+        &self,
+        config: crate::EvidenceReducerConfig,
+        hook: Option<crate::EvidenceReducerHook>,
+    ) {
+        let mut state = self
+            .evidence_reducer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.config = config;
+        state.hook = hook;
+    }
+
+    pub(super) fn apply_diagnostic_evidence_reducer(
+        &self,
+        mut execution: ProcessExecution,
+    ) -> ProcessExecution {
+        let (config, hook) = {
+            let state = self
+                .evidence_reducer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.config.enabled {
+                return execution;
+            }
+            (state.config.clone(), state.hook.clone())
+        };
+        let is_error = !matches!(execution.status, ToolStatus::Succeeded);
+        execution.outcome.stdout_summary = reduce_condensed_stream(
+            &config,
+            hook.as_ref(),
+            &execution.outcome.stdout_summary,
+            is_error,
+        );
+        execution.outcome.stderr_summary = reduce_condensed_stream(
+            &config,
+            hook.as_ref(),
+            &execution.outcome.stderr_summary,
+            is_error,
+        );
+        execution
+    }
+
     #[cfg(test)]
     pub(crate) fn from_current_dir() -> Result<Self> {
         Self::new(std::env::current_dir().context("determining working directory")?)
@@ -217,7 +306,8 @@ impl ProcessRunner {
     ) -> Result<ProcessExecution> {
         let started = Instant::now();
         let child = self.spawn_shell(command)?;
-        capture_child(child, timeout, on_line, started, &self.foreground).await
+        let execution = capture_child(child, timeout, on_line, started, &self.foreground).await?;
+        Ok(self.apply_diagnostic_evidence_reducer(execution))
     }
 
     /// Streaming variant of [`Self::run_shell_maybe_timeout`].
@@ -229,7 +319,9 @@ impl ProcessRunner {
     ) -> Result<ProcessExecution> {
         let started = Instant::now();
         let child = self.spawn_shell(command)?;
-        capture_child_maybe_timeout(child, timeout, on_line, started, &self.foreground).await
+        let execution =
+            capture_child_maybe_timeout(child, timeout, on_line, started, &self.foreground).await?;
+        Ok(self.apply_diagnostic_evidence_reducer(execution))
     }
 
     /// Run a shell command in the foreground up to `foreground_budget`; if it is
@@ -245,7 +337,14 @@ impl ProcessRunner {
     ) -> Result<AdoptableOutcome> {
         let started = Instant::now();
         let child = self.spawn_shell(command)?;
-        capture_child_adoptable(child, foreground_budget, on_line, started, &self.foreground).await
+        match capture_child_adoptable(child, foreground_budget, on_line, started, &self.foreground)
+            .await?
+        {
+            AdoptableOutcome::Completed(execution) => Ok(AdoptableOutcome::Completed(
+                self.apply_diagnostic_evidence_reducer(execution),
+            )),
+            other => Ok(other),
+        }
     }
 
     /// Run a trusted executable directly with explicit environment overrides.
@@ -280,7 +379,9 @@ impl ProcessRunner {
             command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
         }
         let child = command.spawn().context("failed to spawn program")?;
-        capture_child(child, timeout, &mut |_| {}, started, &self.foreground).await
+        let execution =
+            capture_child(child, timeout, &mut |_| {}, started, &self.foreground).await?;
+        Ok(self.apply_diagnostic_evidence_reducer(execution))
     }
 
     /// Run a trusted executable with explicit environment overrides and an
@@ -313,7 +414,10 @@ impl ProcessRunner {
             command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
         }
         let child = command.spawn().context("failed to spawn program")?;
-        capture_child_maybe_timeout(child, timeout, &mut |_| {}, started, &self.foreground).await
+        let execution =
+            capture_child_maybe_timeout(child, timeout, &mut |_| {}, started, &self.foreground)
+                .await?;
+        Ok(self.apply_diagnostic_evidence_reducer(execution))
     }
 
     /// Spawn a long-lived direct child with piped stdin/stdout. This is the
@@ -961,5 +1065,174 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn diagnostic_failure_command() -> &'static str {
+        "printf 'running 3 tests\\nerror: mismatch\\nFAILED tests::it_breaks\\n'; \
+i=0; while [ \"$i\" -lt 200 ]; do printf 'ok noise\\n'; i=$((i+1)); done; \
+printf 'UNIQUE_MIDDLE_LINE\\n'; \
+i=0; while [ \"$i\" -lt 200 ]; do printf 'ok noise\\n'; i=$((i+1)); done; \
+printf 'test result: FAILED\\n'; exit 1"
+    }
+
+    fn canned_mismatch_hook() -> crate::EvidenceReducerHook {
+        std::sync::Arc::new(|source: &str, is_error: bool| {
+            let quote = "error: mismatch";
+            if !source.contains(quote) {
+                return Err("missing-quote");
+            }
+            Ok(serde_json::json!({
+                "schema": crate::REDUCER_RECEIPT_SCHEMA,
+                "source_sha256": crate::sha256_hex(source.as_bytes()),
+                "status": if is_error { "failure" } else { "success" },
+                "uncertain": false,
+                "evidence": [{"kind": "failure", "quote": quote}]
+            })
+            .to_string())
+        })
+    }
+
+    #[tokio::test]
+    async fn diagnostic_shell_reduces_after_condense_with_canned_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let runner =
+            ProcessRunner::new_with_policy(root.path(), crate::sandbox::SandboxPolicy::Off)
+                .unwrap();
+        runner.set_evidence_reducer(
+            crate::EvidenceReducerConfig {
+                enabled: true,
+                min_bytes: 16,
+            },
+            Some(canned_mismatch_hook()),
+        );
+        let run = runner
+            .run_shell(diagnostic_failure_command(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(run.status, ToolStatus::Failed);
+        assert!(
+            run.outcome
+                .stdout_summary
+                .starts_with(crate::EVIDENCE_RECEIPT_PREFIX),
+            "{}",
+            run.outcome.stdout_summary
+        );
+        assert!(
+            run.outcome.stdout_summary.contains("error: mismatch"),
+            "{}",
+            run.outcome.stdout_summary
+        );
+        assert!(
+            !run.outcome.stdout_summary.contains("UNIQUE_MIDDLE_LINE"),
+            "condense must run first so omitted middle lines cannot appear: {}",
+            run.outcome.stdout_summary
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_shell_fail_opens_without_receipt_and_when_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let runner =
+            ProcessRunner::new_with_policy(root.path(), crate::sandbox::SandboxPolicy::Off)
+                .unwrap();
+        runner.set_evidence_reducer(
+            crate::EvidenceReducerConfig {
+                enabled: true,
+                min_bytes: 16,
+            },
+            None,
+        );
+        let enabled_no_hook = runner
+            .run_shell(diagnostic_failure_command(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(enabled_no_hook.status, ToolStatus::Failed);
+        assert!(
+            enabled_no_hook
+                .outcome
+                .stdout_summary
+                .contains("error: mismatch"),
+            "{}",
+            enabled_no_hook.outcome.stdout_summary
+        );
+        assert!(
+            !enabled_no_hook
+                .outcome
+                .stdout_summary
+                .contains(crate::EVIDENCE_RECEIPT_PREFIX)
+        );
+
+        let disabled =
+            ProcessRunner::new_with_policy(root.path(), crate::sandbox::SandboxPolicy::Off)
+                .unwrap();
+        let json = serde_json::json!({"schema": "unused"}).to_string();
+        disabled.set_evidence_reducer(
+            crate::EvidenceReducerConfig::default(),
+            Some(std::sync::Arc::new(move |_, _| Ok(json.clone()))),
+        );
+        let run = disabled
+            .run_shell(diagnostic_failure_command(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(run.outcome.stdout_summary.contains("error: mismatch"));
+        assert!(
+            !run.outcome
+                .stdout_summary
+                .contains(crate::EVIDENCE_RECEIPT_PREFIX)
+        );
+    }
+
+    #[tokio::test]
+    async fn adoptable_completed_and_run_program_diagnostics_use_reducer() {
+        let root = tempfile::tempdir().unwrap();
+        let runner =
+            ProcessRunner::new_with_policy(root.path(), crate::sandbox::SandboxPolicy::Off)
+                .unwrap();
+        runner.set_evidence_reducer(
+            crate::EvidenceReducerConfig {
+                enabled: true,
+                min_bytes: 16,
+            },
+            Some(canned_mismatch_hook()),
+        );
+        let adopted = runner
+            .run_shell_adoptable(
+                diagnostic_failure_command(),
+                Duration::from_secs(10),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        match adopted {
+            AdoptableOutcome::Completed(run) => {
+                assert!(
+                    run.outcome
+                        .stdout_summary
+                        .starts_with(crate::EVIDENCE_RECEIPT_PREFIX),
+                    "{}",
+                    run.outcome.stdout_summary
+                );
+            }
+            AdoptableOutcome::StillRunning(_) => {
+                panic!("diagnostic command should finish inside the foreground budget")
+            }
+        }
+
+        let program = runner
+            .run_program(
+                "sh",
+                ["-c", diagnostic_failure_command()],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(
+            program
+                .outcome
+                .stdout_summary
+                .starts_with(crate::EVIDENCE_RECEIPT_PREFIX),
+            "{}",
+            program.outcome.stdout_summary
+        );
     }
 }

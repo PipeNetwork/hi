@@ -358,11 +358,21 @@ async fn cancelled_no_save_goal_export_is_owned_through_later_session_attachment
     let metadata = workspace.path(".hi");
     std::fs::create_dir_all(&metadata).unwrap();
     let fifo = metadata.join("goal-plan.md");
+    // `set_structured_goal` writes this path as a regular file. Replace it with
+    // a FIFO so persist_goal_async blocks on open until the test reader attaches.
+    let _ = std::fs::remove_file(&fifo);
     let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
     // A FIFO gives the export a real blocking filesystem operation, released
     // only by this test's reader. No arbitrary storage delays are injected.
     // SAFETY: path is NUL-terminated and points into this test's temporary directory.
-    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let mkfifo = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+    assert_eq!(
+        mkfifo,
+        0,
+        "mkfifo {}: {}",
+        fifo.display(),
+        std::io::Error::last_os_error()
+    );
     let mut ui = NullUi;
     let mut export = Box::pin(agent.persist_goal_async(&mut ui));
     tokio::select! {

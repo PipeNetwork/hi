@@ -114,6 +114,11 @@ pub(crate) fn answer_declines_mutation(content: &str) -> bool {
             "no edits are needed",
             "no edits were needed",
             "no edits are required",
+            "no file edits are needed",
+            "no file edits are required",
+            "no file edits were needed",
+            "no file edits were required",
+            "nothing to fix",
             "requires no file changes",
             "requires no code changes",
             "no changes necessary",
@@ -225,6 +230,9 @@ mod tests {
         ));
         assert!(answer_declines_mutation(
             "No further file changes were needed — the request was already satisfied by the prior turn's work, and the current state passes all checks."
+        ));
+        assert!(answer_declines_mutation(
+            "No file edits are required for the stated task because verification already passes."
         ));
         for unsupported in [
             "I won't modify the files.",

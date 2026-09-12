@@ -354,6 +354,7 @@ fn slim_pipe_flash_dynamic_tools(config: &AgentConfig, specs: &mut Vec<ToolSpec>
                 | "browser_exec"
                 | "ask_user"
                 | "new_context"
+                | "obs_recall"
                 | "diagnostics"
                 | "definition"
                 | "references"
