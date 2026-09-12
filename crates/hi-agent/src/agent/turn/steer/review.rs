@@ -15,6 +15,13 @@ use super::super::phase::TurnPhase;
 use super::super::progress::{AWAITING_BACKGROUND_REASON, ProgressKind, ProgressTracker};
 use super::RoundControl;
 
+struct TodoGateState<'a> {
+    progress_tracker: &'a mut ProgressTracker,
+    silent_continues: &'a mut u32,
+    continue_total_nudges: &'a mut u32,
+    force_tools_next: &'a mut bool,
+}
+
 impl crate::Agent {
     /// Post-model Steer when the model returned text and no tool calls this round.
     #[allow(clippy::too_many_arguments)]
@@ -130,10 +137,12 @@ impl crate::Agent {
             return self.fire_todo_gate(
                 completion_content,
                 assistant_text,
-                progress_tracker,
-                silent_continues,
-                continue_total_nudges,
-                force_tools_next,
+                TodoGateState {
+                    progress_tracker,
+                    silent_continues,
+                    continue_total_nudges,
+                    force_tools_next,
+                },
                 leftover_goal,
                 &continue_nudge,
                 ui,
@@ -160,8 +169,6 @@ impl crate::Agent {
                 assistant_text,
                 goal_kind,
                 implementation_tracker.tests_seen,
-                false,
-                progress_tracker.awaiting_background,
                 progress_tracker,
                 force_tools_next,
                 ui,
@@ -384,16 +391,37 @@ impl crate::Agent {
         if plan_incomplete && *silent_continues < self.config.loop_limits.max_silent_continues {
             return self.fire_todo_gate_after_assistant(
                 assistant_text,
-                progress_tracker,
-                silent_continues,
-                continue_total_nudges,
-                force_tools_next,
+                TodoGateState {
+                    progress_tracker,
+                    silent_continues,
+                    continue_total_nudges,
+                    force_tools_next,
+                },
                 leftover_goal,
                 &continue_nudge,
                 ui,
             );
         }
         if plan_incomplete {
+            if expected_mutation
+                && !implementation_tracker.mutation_seen
+                && !implementation_tracker.validation_seen
+            {
+                // A bounded implementation drive must not renew its model
+                // allowance by settling another unchanged recap as success.
+                // Keep inspection evidence and the unfinished plan, and let an
+                // explicit resume authorize the next drive.
+                progress_tracker.bounded_plan_answer_recovery_exhausted = true;
+                progress_tracker.record(
+                    ProgressKind::None,
+                    "plan continuation exhausted without implementation progress",
+                    None,
+                );
+                ui.status("plan continuation stopped without implementation progress");
+                return Ok(RoundControl::Finish(
+                    crate::agent::turn::ModelLoopDecision::Verify,
+                ));
+            }
             progress_tracker.record(
                 ProgressKind::Weak,
                 "structured plan has remaining steps",
@@ -409,8 +437,6 @@ impl crate::Agent {
             assistant_text,
             goal_kind,
             implementation_tracker.tests_seen,
-            false,
-            progress_tracker.awaiting_background,
             progress_tracker,
             force_tools_next,
             ui,
@@ -431,10 +457,7 @@ impl crate::Agent {
         &mut self,
         completion_content: &mut Vec<Content>,
         assistant_text: &str,
-        progress_tracker: &mut ProgressTracker,
-        silent_continues: &mut u32,
-        continue_total_nudges: &mut u32,
-        force_tools_next: &mut bool,
+        state: TodoGateState<'_>,
         leftover_goal: bool,
         continue_nudge: &str,
         ui: &mut dyn Ui,
@@ -443,10 +466,7 @@ impl crate::Agent {
             .push_assistant(std::mem::take(completion_content));
         self.fire_todo_gate_after_assistant(
             assistant_text,
-            progress_tracker,
-            silent_continues,
-            continue_total_nudges,
-            force_tools_next,
+            state,
             leftover_goal,
             continue_nudge,
             ui,
@@ -456,14 +476,17 @@ impl crate::Agent {
     fn fire_todo_gate_after_assistant(
         &mut self,
         assistant_text: &str,
-        progress_tracker: &mut ProgressTracker,
-        silent_continues: &mut u32,
-        continue_total_nudges: &mut u32,
-        force_tools_next: &mut bool,
+        state: TodoGateState<'_>,
         leftover_goal: bool,
         continue_nudge: &str,
         ui: &mut dyn Ui,
     ) -> anyhow::Result<RoundControl> {
+        let TodoGateState {
+            progress_tracker,
+            silent_continues,
+            continue_total_nudges,
+            force_tools_next,
+        } = state;
         let input =
             todo_gate_input_from_plan(&self.goals.last_plan, progress_tracker.awaiting_background);
         let decision = if leftover_goal {
@@ -564,8 +587,6 @@ impl crate::Agent {
         assistant_text: &str,
         goal_kind: GoalKind,
         tests_seen: bool,
-        plan_incomplete: bool,
-        awaiting_background: bool,
         progress_tracker: &mut ProgressTracker,
         force_tools_next: &mut bool,
         ui: &mut dyn Ui,
@@ -576,8 +597,8 @@ impl crate::Agent {
             assistant_text,
             goal_kind,
             tests_seen,
-            plan_incomplete,
-            awaiting_background,
+            false,
+            progress_tracker.awaiting_background,
             progress_tracker.laziness_nudges,
         )
         else {

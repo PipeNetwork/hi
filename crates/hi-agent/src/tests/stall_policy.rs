@@ -247,3 +247,79 @@ async fn todo_gate_continues_then_falls_through_without_keep_working() {
     assert_ne!(outcome.stop_reason, TurnStopReason::InfrastructureFailure);
     assert!(agent.plan_incomplete());
 }
+
+#[tokio::test]
+async fn exhausted_implementation_todo_gate_retains_evidence_without_renewing_work() {
+    for mutates in [false, true] {
+        let workspace = IsolatedWorkspace::new(if mutates {
+            "todo-gate-retains-mutation"
+        } else {
+            "todo-gate-stops-inspection"
+        });
+        let path = workspace.path("implementation.txt");
+        std::fs::write(&path, "existing implementation\n").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let mut cfg = workspace.config();
+        cfg.loop_limits.max_silent_continues = 1;
+        cfg.loop_limits.max_keep_working = 2;
+        cfg.gates.allow_unverified = true;
+        cfg.gates.verification = VerificationMode::Disabled;
+        cfg.gates.review = ReviewPolicy::Off;
+        let tool = if mutates {
+            write_content_completion(&path, "retained implementation\n")
+        } else {
+            read_completion(&path)
+        };
+        let (mut agent, requests) = scripted_agent(
+            vec![
+                ProviderStep::Completion(tool),
+                ProviderStep::Completion(completion(
+                    vec![Content::Text(
+                        "The targeted implementation was inspected.".into(),
+                    )],
+                    1,
+                    1,
+                )),
+                ProviderStep::Completion(completion(
+                    vec![Content::Text(
+                        "The next implementation step is still pending.".into(),
+                    )],
+                    1,
+                    1,
+                )),
+            ],
+            cfg,
+        );
+        agent.restore_plan(vec![crate::PlanStep {
+            title: "Implement the remaining lifecycle marker".into(),
+            status: crate::PlanStatus::Pending,
+        }]);
+        let mut ui = RecUi::default();
+        let outcome = agent
+            .run_turn("implement the remaining plan step", &mut ui)
+            .await
+            .unwrap();
+
+        assert_eq!(requests.lock().unwrap().len(), 3, "{outcome:?}");
+        assert!(agent.plan_incomplete());
+        if mutates {
+            assert_eq!(outcome.status, TurnStatus::Completed, "{outcome:?}");
+            assert_ne!(outcome.stop_reason, TurnStopReason::NoProgress);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "retained implementation\n"
+            );
+        } else {
+            assert_eq!(outcome.status, TurnStatus::Failed, "{outcome:?}");
+            assert_eq!(outcome.stop_reason, TurnStopReason::NoProgress);
+            assert!(outcome.changed_files.is_empty());
+            assert!(
+                agent
+                    .messages()
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|content| matches!(content, Content::ToolResult { output, .. } if output.contains("existing implementation")))
+            );
+        }
+    }
+}
