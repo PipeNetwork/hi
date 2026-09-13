@@ -1259,6 +1259,26 @@ impl BackgroundRegistry {
             .collect()
     }
 
+    /// Process-group ids of jobs that are still natively running.
+    ///
+    /// Does not expire or kill monitors — heartbeat sampling must not SIGTERM
+    /// background jobs. Timeouts stay on [`Self::snapshot`] / poll / wake.
+    pub fn running_pgids(&self) -> Vec<i32> {
+        self.processes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter_map(|proc| {
+                let running = proc
+                    .inner
+                    .lock()
+                    .map(|inner| inner.native_running())
+                    .unwrap_or(false);
+                running.then_some(proc.pgid).flatten()
+            })
+            .collect()
+    }
+
     /// A non-consuming snapshot of every tracked job: `(id, command, status)`.
     /// Unlike [`poll`](Self::poll), this does not advance the read cursor — it
     /// is for read-only inspection (e.g. a session snapshot shown to the model).

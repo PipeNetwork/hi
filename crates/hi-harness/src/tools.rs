@@ -301,11 +301,8 @@ fn collect_child_pgids(
     let fg = foreground.active_pgids();
     let current = fg.first().copied();
     let mut all = fg;
-    for (id, _, status) in background.snapshot() {
-        if status == "running"
-            && let Some(pgid) = background.os_pid(&id)
-            && !all.contains(&pgid)
-        {
+    for pgid in background.running_pgids() {
+        if !all.contains(&pgid) {
             all.push(pgid);
         }
     }
