@@ -44,11 +44,17 @@ impl ForegroundProcessRegistry {
     }
 
     pub fn active_count(&self) -> usize {
+        self.active_pgids().len()
+    }
+
+    pub fn active_pgids(&self) -> Vec<i32> {
         self.inner
             .groups
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Signal the process groups which are live right now without fencing

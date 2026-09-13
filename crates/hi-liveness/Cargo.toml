@@ -1,0 +1,16 @@
+[package]
+name = "hi-liveness"
+edition.workspace = true
+version.workspace = true
+description = "Heartbeat schema and OS-thread writer for Hi Sentinel liveness"
+
+[dependencies]
+hi-secrets.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

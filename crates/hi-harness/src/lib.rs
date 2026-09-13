@@ -6,6 +6,7 @@ mod command;
 mod compact;
 mod dashboard;
 mod live;
+mod liveness;
 mod pipe;
 mod prompt;
 mod session;
@@ -37,7 +38,7 @@ pub use pipe::{
     DEFAULT_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, PipeClient, PipeError, default_base_url,
 };
 pub use prompt::SYSTEM_PROMPT;
-pub use session::{JsonlSession, LoadedSession, UserTurn, list_user_turns};
+pub use session::{JsonlSession, LoadedSession, PendingTurn, UserTurn, list_user_turns};
 pub use tools::{ToolHost, ToolInterrupt, advertised_tools};
 pub use usage::{
     BILLING_URL, UsageCategory, UsageSnapshot, UsageTab, fmt_tokens, occupancy_bar,
@@ -128,6 +129,7 @@ pub struct HarnessConfig {
     pub max_tokens: u32,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub session_path: Option<PathBuf>,
+    pub liveness: Option<hi_liveness::Publisher>,
 }
 
 impl HarnessConfig {
@@ -142,6 +144,7 @@ impl HarnessConfig {
             max_tokens: DEFAULT_MAX_TOKENS,
             reasoning_effort: None,
             session_path: None,
+            liveness: None,
         }
     }
 }
@@ -165,12 +168,22 @@ pub struct Harness {
     interrupt: Arc<AtomicBool>,
     turn_cancel: Option<TurnCancellation>,
     steer: SteerQueue,
+    pending_turn: Option<PendingTurn>,
+    turn_index: u32,
+    liveness: hi_liveness::Publisher,
 }
 
 impl Harness {
     pub fn new(config: HarnessConfig) -> Result<Self> {
-        let tools = ToolHost::new(config.workspace_root.clone(), config.state_root.clone())?;
+        let mut tools = ToolHost::new(config.workspace_root.clone(), config.state_root.clone())?;
         let session = open_session(config.session_path.as_deref(), &config.model)?;
+        let liveness = resolve_liveness(&config, &tools);
+        tools.set_liveness(liveness.clone());
+        let workspace = config.workspace_root.display().to_string();
+        liveness.set_workspace(workspace);
+        if let Some(session) = &session {
+            liveness.set_session_path(Some(session.path().display().to_string()));
+        }
         Ok(Self {
             client: Client::new(config.base_url, config.api_key),
             tools,
@@ -190,12 +203,21 @@ impl Harness {
             interrupt: Arc::new(AtomicBool::new(false)),
             turn_cancel: None,
             steer: SteerQueue::default(),
+            pending_turn: None,
+            turn_index: 0,
+            liveness,
         })
     }
 
     /// Test/embedded constructor with a caller-owned process runner (sandbox off).
-    pub fn new_with_tools(config: HarnessConfig, tools: ToolHost) -> Result<Self> {
+    pub fn new_with_tools(config: HarnessConfig, mut tools: ToolHost) -> Result<Self> {
         let session = open_session(config.session_path.as_deref(), &config.model)?;
+        let liveness = resolve_liveness(&config, &tools);
+        tools.set_liveness(liveness.clone());
+        liveness.set_workspace(config.workspace_root.display().to_string());
+        if let Some(session) = &session {
+            liveness.set_session_path(Some(session.path().display().to_string()));
+        }
         Ok(Self {
             client: Client::new(config.base_url, config.api_key),
             tools,
@@ -219,6 +241,9 @@ impl Harness {
             interrupt: Arc::new(AtomicBool::new(false)),
             turn_cancel: None,
             steer: SteerQueue::default(),
+            pending_turn: None,
+            turn_index: 0,
+            liveness,
         })
     }
 
@@ -241,6 +266,13 @@ impl Harness {
                 Err(_) => {}
             }
         }
+        self.pending_turn = loaded.pending_turn;
+        if let Some(pending) = &self.pending_turn {
+            self.turn_index = pending.turn_index;
+            self.liveness.set_turn_index(pending.turn_index);
+            self.liveness
+                .set_pre_checkpoint(pending.pre_checkpoint.clone());
+        }
     }
 
     fn snapshot_state(&self) -> LoadedSession {
@@ -255,13 +287,23 @@ impl Harness {
             effort: self
                 .reasoning_effort()
                 .map(|effort| effort.as_str().to_string()),
+            pending_turn: self.pending_turn.clone(),
         }
     }
 
     pub(crate) fn persist_snapshot(&mut self) {
         let state = self.snapshot_state();
         if let Some(session) = &mut self.session {
-            let _ = session.rewrite(&state);
+            if session.rewrite(&state).is_err() {
+                hi_liveness::report_invariant(
+                    &self.liveness,
+                    hi_liveness::InvariantCode::SessionAppendFailed,
+                );
+            } else {
+                self.liveness.note_progress();
+                self.liveness
+                    .emit(hi_liveness::EventCode::SessionRewrite, None, None, None);
+            }
         }
     }
 
@@ -269,8 +311,17 @@ impl Harness {
     pub fn truncate_messages(&mut self, len: usize) {
         if len < self.messages.len() {
             self.messages.truncate(len);
+            self.pending_turn = None;
             self.persist_snapshot();
         }
+    }
+
+    pub fn liveness(&self) -> hi_liveness::Publisher {
+        self.liveness.clone()
+    }
+
+    pub fn pending_turn(&self) -> Option<&PendingTurn> {
+        self.pending_turn.as_ref()
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -431,6 +482,7 @@ impl Harness {
         self.messages.clear();
         self.plan.clear();
         self.last_changed_files.clear();
+        self.pending_turn = None;
         self.persist_snapshot();
     }
 
@@ -548,6 +600,22 @@ fn lock_mut_vec<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn resolve_liveness(config: &HarnessConfig, tools: &ToolHost) -> hi_liveness::Publisher {
+    config
+        .liveness
+        .clone()
+        .or_else(hi_liveness::installed_publisher)
+        .unwrap_or_else(|| tools.liveness())
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        if self.pending_turn.is_some() {
+            hi_liveness::report_invariant(&self.liveness, hi_liveness::InvariantCode::TurnUnclosed);
+        }
+    }
 }
 
 fn open_session(path: Option<&Path>, model: &str) -> Result<Option<SessionFile>> {

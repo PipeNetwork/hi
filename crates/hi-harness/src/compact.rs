@@ -133,7 +133,9 @@ mod tests {
     use super::*;
     use crate::pipe::test_support::{MockPipe, Scripted, text_chunk, usage_chunk};
     use crate::ui::TestUi;
-    use crate::{Harness, HarnessConfig, LoadedSession, TurnCancellation};
+    use crate::{
+        Harness, HarnessConfig, JsonlSession, LoadedSession, PendingTurn, TurnCancellation,
+    };
     use hi_ai::Usage;
     use hi_tools::ProcessRunner;
     use hi_tools::sandbox::SandboxPolicy;
@@ -282,5 +284,56 @@ mod tests {
                 .iter()
                 .all(|message| message.role != Role::Tool)
         );
+    }
+
+    #[tokio::test]
+    async fn compact_then_load_keeps_unmatched_pending_turn() {
+        let Some(server) = MockPipe::new(vec![Scripted::Sse(vec![
+            text_chunk("<summary>\nreviewed src/main.rs and cargo test is green\n</summary>"),
+            usage_chunk(20, 8),
+        ])]) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let state = dir.path().join(".hi");
+        let runner =
+            ProcessRunner::new_with_policy(dir.path(), SandboxPolicy::Off).expect("runner");
+        let tools =
+            crate::ToolHost::new_with_runner(dir.path().to_path_buf(), state.clone(), runner)
+                .unwrap();
+        let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+        config.base_url = server.url.clone();
+        config.state_root = state;
+        config.session_path = Some(path.clone());
+        let mut harness = Harness::new_with_tools(config, tools).unwrap();
+        harness.apply_loaded_session(LoadedSession {
+            messages: vec![
+                Message::user("review this"),
+                Message::tool_result("c1", "fn main"),
+                Message::assistant(vec![Content::Text("looking".into())]),
+                Message::user("keep going"),
+            ],
+            pending_turn: Some(PendingTurn {
+                turn_index: 4,
+                started_unix_ms: 99,
+                pre_checkpoint: Some("pre".into()),
+            }),
+            ..LoadedSession::default()
+        });
+        let mut ui = TestUi::default();
+        assert!(
+            harness
+                .compact(None, &mut ui, &TurnCancellation::new())
+                .await
+                .unwrap()
+        );
+        assert!(harness.pending_turn().is_some());
+        let loaded = JsonlSession::load(&path).unwrap();
+        let pending = loaded
+            .pending_turn
+            .expect("compact rewrite must keep unmatched PendingTurn");
+        assert_eq!(pending.turn_index, 4);
+        assert_eq!(pending.pre_checkpoint.as_deref(), Some("pre"));
     }
 }

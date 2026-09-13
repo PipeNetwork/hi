@@ -14,7 +14,7 @@ mod foreground;
 mod hermetic;
 mod program;
 
-use environment::{SECRET_ENV_VARS, sensitive_environment_name, workspace_cargo_home};
+use environment::{strip_inherited_secrets, workspace_cargo_home};
 #[cfg(test)]
 use execution::kill_process_group;
 pub use execution::{AdoptableOutcome, RunningChild, preserve_detached_descendants};
@@ -461,14 +461,7 @@ impl ProcessRunner {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .env("AI_AGENT", "hi");
-        for var in SECRET_ENV_VARS {
-            command.env_remove(var);
-        }
-        for (name, _) in std::env::vars_os() {
-            if sensitive_environment_name(&name) {
-                command.env_remove(name);
-            }
-        }
+        strip_inherited_secrets(command);
         command
             .env("GIT_TERMINAL_PROMPT", "0")
             // Cargo suppresses ANSI diagnostics when stdout/stderr are pipes;
@@ -933,17 +926,6 @@ mod tests {
             "expected redaction marker in reassembled output: ...{}",
             &content[content.len().saturating_sub(90)..]
         );
-    }
-
-    #[test]
-    fn sensitive_environment_names_are_removed_conservatively() {
-        assert!(sensitive_environment_name(OsStr::new("GITHUB_TOKEN")));
-        assert!(sensitive_environment_name(OsStr::new(
-            "AWS_SECRET_ACCESS_KEY"
-        )));
-        assert!(sensitive_environment_name(OsStr::new("DATABASE_PASSWORD")));
-        assert!(!sensitive_environment_name(OsStr::new("PATH")));
-        assert!(!sensitive_environment_name(OsStr::new("RUSTUP_HOME")));
     }
 
     #[tokio::test]

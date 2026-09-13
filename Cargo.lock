@@ -3493,6 +3493,7 @@ dependencies = [
  "hi-eval-adapters",
  "hi-events",
  "hi-harness",
+ "hi-liveness",
  "hi-lsp",
  "hi-mcp",
  "hi-observability",
@@ -3505,6 +3506,7 @@ dependencies = [
  "hi-research",
  "hi-routing",
  "hi-rsi-runtime",
+ "hi-secrets",
  "hi-sqlite-journal",
  "hi-tools",
  "hi-trace",
@@ -3780,10 +3782,12 @@ name = "hi-harness"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "eventsource-stream",
  "futures-util",
  "hi-ai",
  "hi-dashboard-store",
+ "hi-liveness",
  "hi-lsp",
  "hi-test-utils",
  "hi-tools",
@@ -3829,6 +3833,16 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "hi-liveness"
+version = "0.3.1"
+dependencies = [
+ "hi-secrets",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

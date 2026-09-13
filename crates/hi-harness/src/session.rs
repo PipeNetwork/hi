@@ -38,6 +38,21 @@ enum SessionMeta {
         #[serde(default)]
         effort: Option<String>,
     },
+    PendingTurn {
+        turn_index: u32,
+        started_unix_ms: u64,
+        pre_checkpoint: Option<String>,
+    },
+    TurnClosed {
+        turn_index: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingTurn {
+    pub turn_index: u32,
+    pub started_unix_ms: u64,
+    pub pre_checkpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -50,6 +65,7 @@ pub struct LoadedSession {
     pub name: Option<String>,
     pub permission: Option<u8>,
     pub effort: Option<String>,
+    pub pending_turn: Option<PendingTurn>,
 }
 
 pub struct JsonlSession {
@@ -79,6 +95,7 @@ impl JsonlSession {
         let file = fs::File::open(path.as_ref())
             .with_context(|| format!("opening session {}", path.as_ref().display()))?;
         let mut loaded = LoadedSession::default();
+        let mut pending: Option<PendingTurn> = None;
         for line in BufReader::new(file).lines() {
             let line = line?;
             let line = line.trim();
@@ -113,6 +130,25 @@ impl JsonlSession {
                         loaded.permission = Some(permission);
                         loaded.effort = effort;
                     }
+                    SessionMeta::PendingTurn {
+                        turn_index,
+                        started_unix_ms,
+                        pre_checkpoint,
+                    } => {
+                        pending = Some(PendingTurn {
+                            turn_index,
+                            started_unix_ms,
+                            pre_checkpoint,
+                        });
+                    }
+                    SessionMeta::TurnClosed { turn_index } => {
+                        if pending
+                            .as_ref()
+                            .is_some_and(|open| open.turn_index == turn_index)
+                        {
+                            pending = None;
+                        }
+                    }
                 }
                 continue;
             }
@@ -120,6 +156,7 @@ impl JsonlSession {
                 loaded.messages.push(message);
             }
         }
+        loaded.pending_turn = pending;
         Ok(loaded)
     }
 
@@ -132,7 +169,22 @@ impl JsonlSession {
             serde_json::to_writer(&mut file, message)?;
             file.write_all(b"\n")?;
         }
+        // Turn-start persist must survive a mid-turn crash.
+        file.flush()?;
+        file.sync_all()?;
         Ok(())
+    }
+
+    pub fn record_pending_turn(&mut self, pending: &PendingTurn) -> Result<()> {
+        self.write_meta_sync(&SessionMeta::PendingTurn {
+            turn_index: pending.turn_index,
+            started_unix_ms: pending.started_unix_ms,
+            pre_checkpoint: pending.pre_checkpoint.clone(),
+        })
+    }
+
+    pub fn record_turn_closed(&mut self, turn_index: u32) -> Result<()> {
+        self.write_meta_sync(&SessionMeta::TurnClosed { turn_index })
     }
 
     pub fn record_usage(&mut self, usage: Usage) -> Result<()> {
@@ -222,6 +274,16 @@ impl JsonlSession {
                     },
                 )?;
             }
+            if let Some(pending) = &state.pending_turn {
+                write_meta_to(
+                    &mut file,
+                    &SessionMeta::PendingTurn {
+                        turn_index: pending.turn_index,
+                        started_unix_ms: pending.started_unix_ms,
+                        pre_checkpoint: pending.pre_checkpoint.clone(),
+                    },
+                )?;
+            }
             file.flush()?;
             file.sync_all()?;
             drop(file);
@@ -241,6 +303,17 @@ impl JsonlSession {
             .append(true)
             .open(&self.path)?;
         write_meta_to(&mut file, meta)
+    }
+
+    fn write_meta_sync(&mut self, meta: &SessionMeta) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        write_meta_to(&mut file, meta)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
     }
 }
 
@@ -315,5 +388,57 @@ mod tests {
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].text(), "new");
         assert_eq!(loaded.model.as_deref(), Some("pipe/kept"));
+    }
+
+    #[test]
+    fn load_restores_unmatched_pending_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut session = JsonlSession::create(&path).unwrap();
+        session
+            .record_messages(&[Message::user("in flight")])
+            .unwrap();
+        session
+            .record_pending_turn(&PendingTurn {
+                turn_index: 3,
+                started_unix_ms: 9,
+                pre_checkpoint: Some("pre".into()),
+            })
+            .unwrap();
+        let loaded = JsonlSession::load(&path).unwrap();
+        let pending = loaded.pending_turn.expect("unmatched pending");
+        assert_eq!(pending.turn_index, 3);
+        assert_eq!(pending.pre_checkpoint.as_deref(), Some("pre"));
+        session.record_turn_closed(3).unwrap();
+        let loaded = JsonlSession::load(&path).unwrap();
+        assert!(loaded.pending_turn.is_none());
+    }
+
+    #[test]
+    fn rewrite_round_trips_pending_turn_without_turn_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut session = JsonlSession::create(&path).unwrap();
+        session.record_messages(&[Message::user("old")]).unwrap();
+        session.record_turn_closed(1).unwrap();
+        session
+            .rewrite(&LoadedSession {
+                messages: vec![Message::user("in flight")],
+                pending_turn: Some(PendingTurn {
+                    turn_index: 2,
+                    started_unix_ms: 11,
+                    pre_checkpoint: None,
+                }),
+                ..LoadedSession::default()
+            })
+            .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("pending_turn"));
+        assert!(
+            !raw.contains("turn_closed"),
+            "rewrite must not emit TurnClosed for an unmatched pending turn"
+        );
+        let loaded = JsonlSession::load(&path).unwrap();
+        assert_eq!(loaded.pending_turn.unwrap().turn_index, 2);
     }
 }

@@ -55,10 +55,10 @@ impl Harness {
                 }
             };
 
-        let mut persisted_before = self.messages.len();
         self.compact_suppressed = false;
         self.tools.reset_bash_repeats();
         self.messages.push(Message::user(input));
+        let mut persisted_before = self.begin_persisted_turn(input, pre.as_deref());
         let mut turn_usage = Usage::default();
         let mut changed = Vec::new();
         let mut mutated = false;
@@ -104,11 +104,17 @@ impl Harness {
                 }
             }
             ui.status(&format!("pipe · {}", self.model()));
+            self.liveness
+                .set_state(hi_liveness::HarnessState::AwaitingModel);
             let messages = self.request_messages();
             let tools = advertised_tools();
-            let mut on_event = |delta: StreamDelta| match delta {
-                StreamDelta::Text(text) => ui.assistant_text(&text),
-                StreamDelta::Reasoning(text) => ui.assistant_reasoning(&text),
+            let liveness = self.liveness.clone();
+            let mut on_event = |delta: StreamDelta| {
+                liveness.note_progress();
+                match delta {
+                    StreamDelta::Text(text) => ui.assistant_text(&text),
+                    StreamDelta::Reasoning(text) => ui.assistant_reasoning(&text),
+                }
             };
             let model = self.model();
             let completion = match self
@@ -158,7 +164,7 @@ impl Harness {
                     }
                     ui.turn_error("request", &format!("{err:#}"), "check the Pipe API");
                     self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
-                    self.persist_new_messages(persisted_before);
+                    self.close_persisted_turn(persisted_before, TurnStopReason::Error);
                     return Err(err);
                 }
             };
@@ -183,7 +189,7 @@ impl Harness {
                 self.session_usage.add(turn_usage);
                 ui.session_usage(self.session_usage);
                 self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
-                self.persist_new_messages(persisted_before);
+                self.close_persisted_turn(persisted_before, TurnStopReason::Completed);
                 let verification = self.run_verify(ui, cancel).await;
                 ui.changed_files(changed.clone());
                 ui.turn_end(&summary(&completion, round));
@@ -197,6 +203,8 @@ impl Harness {
             }
 
             self.messages.push(assistant_message(&completion));
+            self.liveness
+                .set_state(hi_liveness::HarnessState::ExecutingTool);
             for call in &completion.tool_calls {
                 if cancel.is_cancelled() {
                     self.messages.push(Message::tool_result(
@@ -230,6 +238,7 @@ impl Harness {
                 }
                 if outcome.effects.mutation_applied {
                     mutated = true;
+                    self.liveness.note_progress();
                 }
                 for change in &outcome.effects.file_changes {
                     if !changed.contains(&change.path) {
@@ -247,7 +256,7 @@ impl Harness {
                 self.session_usage.add(turn_usage);
                 ui.session_usage(self.session_usage);
                 self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
-                self.persist_new_messages(persisted_before);
+                self.close_persisted_turn(persisted_before, TurnStopReason::Completed);
                 ui.changed_files(changed.clone());
                 ui.turn_end("stopped repeating a detached binary probe");
                 return Ok(TurnOutcome {
@@ -275,7 +284,7 @@ impl Harness {
         ui: &mut dyn Ui,
     ) -> Result<TurnOutcome> {
         self.seal_checkpoint(pre, mutated, ui).await;
-        self.persist_new_messages(persisted_before);
+        self.close_persisted_turn(persisted_before, stop_reason);
         Ok(TurnOutcome {
             stop_reason,
             usage,
@@ -296,11 +305,19 @@ impl Harness {
             return Ok(false);
         }
         ui.status("compacting conversation");
+        let previous = self.liveness.state();
+        self.liveness
+            .set_state(hi_liveness::HarnessState::Compacting);
+        self.liveness
+            .emit(hi_liveness::EventCode::CompactStart, None, None, None);
         let mut request = vec![Message::system(SYSTEM_PROMPT)];
         request.extend(self.messages.iter().cloned());
         request.push(Message::user(compact_prompt(user_context)));
         let model = self.model();
-        let mut ignore = |_delta: StreamDelta| {};
+        let liveness = self.liveness.clone();
+        let mut on_delta = |_delta: StreamDelta| {
+            liveness.note_progress();
+        };
         let completion = self
             .client
             .stream(
@@ -309,10 +326,14 @@ impl Harness {
                 &[],
                 self.max_tokens,
                 self.reasoning_effort(),
-                &mut ignore,
+                &mut on_delta,
                 cancel,
             )
-            .await?;
+            .await;
+        self.liveness
+            .emit(hi_liveness::EventCode::CompactEnd, None, None, None);
+        self.liveness.set_state(previous);
+        let completion = completion?;
         self.record_context_occupancy(completion.usage);
         if !completion.tool_calls.is_empty() {
             bail!("compaction model called a tool; refusing to replace history");
@@ -344,14 +365,6 @@ impl Harness {
         out
     }
 
-    fn persist_new_messages(&mut self, from: usize) {
-        if let Some(session) = &mut self.session {
-            let _ = session.record_messages(&self.messages[from..]);
-            let _ = session.record_usage(self.session_usage);
-            let _ = session.record_checkpoints(&self.checkpoints);
-        }
-    }
-
     async fn seal_checkpoint(&mut self, pre: Option<&str>, mutated: bool, ui: &mut dyn Ui) {
         if !mutated {
             return;
@@ -377,24 +390,32 @@ impl Harness {
             return None;
         }
         ui.status(&format!("verify · {command}"));
-        match hi_tools::run_check_in_with_runner(self.tools.runner_ref(), command).await {
-            Ok(execution) => {
-                let text = execution.display_content();
-                ui.tool_call("verify", command);
-                ui.tool_result("verify", &text);
-                Some(
-                    if execution.status == hi_tools::ToolStatus::Succeeded {
+        self.liveness
+            .set_state(hi_liveness::HarnessState::Verifying);
+        self.liveness
+            .emit(hi_liveness::EventCode::VerifyStart, None, None, None);
+        let result =
+            match hi_tools::run_check_in_with_runner(self.tools.runner_ref(), command).await {
+                Ok(execution) => {
+                    let text = execution.display_content();
+                    ui.tool_call("verify", command);
+                    ui.tool_result("verify", &text);
+                    self.liveness.note_progress();
+                    Some(if execution.status == hi_tools::ToolStatus::Succeeded {
                         "passed".into()
                     } else {
                         "failed".into()
-                    },
-                )
-            }
-            Err(err) => {
-                ui.status(&format!("verify failed to start: {err:#}"));
-                Some("failed".into())
-            }
-        }
+                    })
+                }
+                Err(err) => {
+                    ui.status(&format!("verify failed to start: {err:#}"));
+                    Some("failed".into())
+                }
+            };
+        self.liveness
+            .emit(hi_liveness::EventCode::VerifyEnd, None, None, None);
+        self.liveness.set_state(hi_liveness::HarnessState::Idle);
+        result
     }
 }
 

@@ -14,6 +14,7 @@ use hi_tools::{
     prepare_mutation_in_with_state,
 };
 
+use crate::liveness::tool_fingerprint;
 use crate::ui::{ConfirmationRequest, ConfirmationResult, PermissionMode, Ui};
 
 const ADVERTISED: &[&str] = &[
@@ -67,6 +68,7 @@ pub struct ToolHost {
     background: Arc<BackgroundRegistry>,
     read_cache: Mutex<ReadCache>,
     repo_map: Mutex<RepoMapCache>,
+    liveness: hi_liveness::Publisher,
 }
 
 impl ToolHost {
@@ -89,7 +91,16 @@ impl ToolHost {
             background: Arc::new(BackgroundRegistry::default()),
             read_cache: Mutex::new(ReadCache::new()),
             repo_map: Mutex::new(RepoMapCache::new()),
+            liveness: hi_liveness::Publisher::new(),
         })
+    }
+
+    pub fn set_liveness(&mut self, liveness: hi_liveness::Publisher) {
+        self.liveness = liveness;
+    }
+
+    pub fn liveness(&self) -> hi_liveness::Publisher {
+        self.liveness.clone()
     }
 
     pub fn interrupt_handle(&self) -> ToolInterrupt {
@@ -142,8 +153,12 @@ impl ToolHost {
         {
             return denied;
         }
+        self.liveness.note_tool_start(id, name);
+        self.liveness
+            .note_tool_fingerprint(&tool_fingerprint(name, arguments));
+        self.publish_pgids();
         ui.tool_started_id(id, name, arguments);
-        if matches!(name, "write" | "edit" | "multi_edit" | "apply_patch") {
+        let outcome = if matches!(name, "write" | "edit" | "multi_edit" | "apply_patch") {
             match prepare_mutation_in_with_state(&self.root, &self.state_root, name, arguments)
                 .await
             {
@@ -153,7 +168,11 @@ impl ToolHost {
                 Err(error) => failed_outcome(format!("Error: {error:#}")),
             }
         } else {
-            let mut on_line = |line: &str| ui.tool_stream(name, line);
+            let liveness = self.liveness.clone();
+            let mut on_line = |line: &str| {
+                liveness.note_progress();
+                ui.tool_stream(name, line);
+            };
             execute_streaming_in_runtime_with_runner(
                 &self.runner,
                 &self.root,
@@ -167,7 +186,31 @@ impl ToolHost {
                 &mut on_line,
             )
             .await
+        };
+        if outcome.status == ToolStatus::Failed {
+            self.liveness.note_tool_error(&outcome.content);
         }
+        let leaked = !self.runner.detached_descendants_preserved()
+            && !run_in_background(name, arguments)
+            && self.runner.foreground_registry().active_count() > 0;
+        self.liveness.note_tool_end(leaked);
+        self.publish_pgids();
+        outcome
+    }
+
+    fn publish_pgids(&self) {
+        let fg = self.runner.foreground_registry().active_pgids();
+        let current = fg.first().copied();
+        let mut all = fg;
+        for (id, _, status) in self.background.snapshot() {
+            if status == "running"
+                && let Some(pgid) = self.background.os_pid(&id)
+                && !all.contains(&pgid)
+            {
+                all.push(pgid);
+            }
+        }
+        self.liveness.set_child_pgids(all, current);
     }
 
     async fn confirm_if_needed(
@@ -213,14 +256,58 @@ impl ToolHost {
         if mode == PermissionMode::Auto && request.safe_for_auto() {
             return None;
         }
-        match ui.confirm(request).await {
+        self.liveness
+            .set_state(hi_liveness::HarnessState::AwaitingConfirmation);
+        self.liveness
+            .emit(hi_liveness::EventCode::ConfirmShown, None, None, None);
+        self.liveness.note_progress();
+        let mut guard = ConfirmGuard {
+            liveness: self.liveness.clone(),
+            answered: false,
+        };
+        let result = ui.confirm(request).await;
+        guard.answered = true;
+        self.liveness
+            .emit(hi_liveness::EventCode::ConfirmAnswered, None, None, None);
+        self.liveness.note_progress();
+        match result {
             ConfirmationResult::Approved => None,
-            ConfirmationResult::Rejected => Some(denied_outcome("rejected by user")),
-            ConfirmationResult::Cancelled | ConfirmationResult::Unavailable => {
-                Some(denied_outcome("confirmation unavailable"))
+            denied => {
+                self.liveness
+                    .set_state(hi_liveness::HarnessState::AwaitingModel);
+                match denied {
+                    ConfirmationResult::Rejected => Some(denied_outcome("rejected by user")),
+                    _ => Some(denied_outcome("confirmation unavailable")),
+                }
             }
         }
     }
+}
+
+struct ConfirmGuard {
+    liveness: hi_liveness::Publisher,
+    answered: bool,
+}
+
+impl Drop for ConfirmGuard {
+    fn drop(&mut self) {
+        if !self.answered {
+            hi_liveness::report_invariant(
+                &self.liveness,
+                hi_liveness::InvariantCode::ConfirmUnanswered,
+            );
+        }
+    }
+}
+
+fn run_in_background(name: &str, arguments: &str) -> bool {
+    if name != "bash" {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| value.get("run_in_background")?.as_bool())
+        .unwrap_or(false)
 }
 
 fn path_from_args(arguments: &str) -> Option<String> {
@@ -316,6 +403,19 @@ mod tests {
             out.content.contains("ok"),
             "echo should run: {}",
             out.content
+        );
+    }
+
+    #[test]
+    fn tool_unclosed_sets_invariant_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path().to_path_buf());
+        host.liveness.note_tool_start("c1", "bash");
+        host.liveness.note_tool_start("c2", "bash");
+        let snap = host.liveness.snapshot();
+        assert_eq!(
+            snap.invariant.expect("sticky invariant").code,
+            hi_liveness::InvariantCode::ToolUnclosed
         );
     }
 }

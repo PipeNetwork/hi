@@ -6,7 +6,9 @@ description = "Pipe Network coding-agent harness: inference, tools, sessions."
 
 [dependencies]
 hi-ai.workspace = true
+hi-liveness.workspace = true
 hi-tools.workspace = true
+blake3.workspace = true
 hi-lsp.workspace = true
 hi-dashboard-store.workspace = true
 anyhow.workspace = true

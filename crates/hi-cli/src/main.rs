@@ -4,6 +4,7 @@ mod auth;
 mod bootstrap;
 mod browser_cmd;
 mod config;
+mod liveness;
 mod paths;
 mod pipe_session;
 mod prompt;
@@ -19,7 +20,6 @@ mod trace_cmd;
 #[cfg(test)]
 pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::io::IsTerminal;
-use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -38,9 +38,7 @@ fn main() {
 fn run_main() -> Result<()> {
     // Process signal actions must be installed before Tokio creates workers.
     // The install call also registers the main thread's per-thread alt stack.
-    let crash_dir = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".hi/crash"))
-        .unwrap_or_else(|_| PathBuf::from(".hi/crash"));
+    let crash_dir = liveness::crash_dir();
     if let Some(report) = hi_crash_handler::check_previous_crash(&crash_dir) {
         eprintln!(
             "hi crashed during your last session: {} (version {})",
@@ -52,6 +50,7 @@ fn run_main() -> Result<()> {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         crash_dir,
     });
+    let _heartbeat = liveness::install_supervised();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -202,7 +201,7 @@ async fn run() -> Result<()> {
     // covers `hi "some prompt"` — a one-shot is a natural first command, and
     // answering it with onboarding text instead of login is a dead end.
     let settings = if config::needs_setup(&cli, &file) && std::io::stdin().is_terminal() {
-        let mut settings = setup::run(&mut file).await?;
+        let mut settings = liveness::awaiting_user(setup::run(&mut file)).await?;
         // Apply the ordinary contextual default after the wizard so a first
         // saved session is durable while first-run `--no-save` remains valid.
         settings.execution = config::resolve_execution_mode(&cli, None, file.execution)?;
@@ -303,7 +302,7 @@ async fn run_setup_command() -> Result<()> {
             std::process::exit(2);
         }
     };
-    let settings = setup::run(&mut file).await?;
+    let settings = liveness::awaiting_user(setup::run(&mut file)).await?;
     println!("Ready: {} · {}", settings.model, settings.provider.as_str());
     println!("Run `hi` to start a session.");
     Ok(())

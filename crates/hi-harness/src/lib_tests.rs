@@ -480,3 +480,105 @@ async fn python_popen_sleep_probes_stop_the_turn() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn persist_at_start_does_not_duplicate_user_line_on_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.jsonl");
+    let args = serde_json::json!({"command": "cat session.jsonl"}).to_string();
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![
+            tool_chunk(0, "call_c", "bash", &args),
+            usage_chunk(8, 4),
+        ]),
+        Scripted::Sse(vec![text_chunk("done"), usage_chunk(10, 3)]),
+    ]) else {
+        return;
+    };
+    let state = dir.path().join(".hi");
+    let runner = ProcessRunner::new_with_policy(dir.path(), SandboxPolicy::Off).expect("runner");
+    let tools = ToolHost::new_with_runner(dir.path().to_path_buf(), state.clone(), runner).unwrap();
+    let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+    config.base_url = server.url.clone();
+    config.state_root = state;
+    config.session_path = Some(session_path.clone());
+    let mut harness = Harness::new_with_tools(config, tools).unwrap();
+    harness.set_permission_mode(PermissionMode::Always);
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable("unique-prompt-xyz", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, TurnStopReason::Completed);
+    assert!(
+        ui.tool_results
+            .iter()
+            .any(|(_, result)| result.contains("unique-prompt-xyz")
+                && result.contains("pending_turn")),
+        "user line and PendingTurn must be in JSONL before tools run: {:?}",
+        ui.tool_results
+    );
+    let loaded = JsonlSession::load(&session_path).unwrap();
+    let user_lines = loaded
+        .messages
+        .iter()
+        .filter(|message| message.role == hi_ai::Role::User)
+        .filter(|message| message.text() == "unique-prompt-xyz")
+        .count();
+    assert_eq!(user_lines, 1, "finish must not append a second user line");
+    assert!(loaded.pending_turn.is_none());
+}
+
+#[tokio::test]
+async fn heartbeat_seq_advances_during_run_turn() {
+    let Some(server) = MockPipe::new(vec![Scripted::Sse(vec![
+        text_chunk("all good"),
+        usage_chunk(4, 2),
+    ])]) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let hb = dir.path().join("heartbeat.json");
+    let publisher = hi_liveness::Publisher::new();
+    let _writer = hi_liveness::spawn(
+        hi_liveness::WriterConfig {
+            heartbeat_path: hb.clone(),
+            events_path: None,
+            instance: "turn-test".into(),
+            generation: 0,
+            workspace: dir.path().display().to_string(),
+            session_path: None,
+            period: std::time::Duration::from_millis(20),
+        },
+        publisher.clone(),
+    )
+    .unwrap();
+    let state = dir.path().join(".hi");
+    let runner = ProcessRunner::new_with_policy(dir.path(), SandboxPolicy::Off).expect("runner");
+    let tools = ToolHost::new_with_runner(dir.path().to_path_buf(), state.clone(), runner).unwrap();
+    let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+    config.base_url = server.url.clone();
+    config.state_root = state;
+    config.liveness = Some(publisher);
+    let mut harness = Harness::new_with_tools(config, tools).unwrap();
+    let mut ui = TestUi::default();
+    harness
+        .run_turn_cancellable("hello", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut beat = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(parsed) = hi_liveness::read_heartbeat(&hb)
+            && parsed.seq >= 1
+        {
+            beat = Some(parsed);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
+    let beat = beat.expect("heartbeat seq should advance during run_turn");
+    assert!(beat.seq >= 1);
+    assert_eq!(beat.pid, std::process::id());
+    assert!(beat.last_progress_unix_ms > 0);
+}
