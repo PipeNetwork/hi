@@ -183,6 +183,44 @@ impl JsonlSession {
         })
     }
 
+    /// User line + `PendingTurn` in one append/fsync so success/failure is one unit.
+    pub fn record_turn_start(&mut self, message: &Message, pending: &PendingTurn) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        serde_json::to_writer(&mut file, message)?;
+        file.write_all(b"\n")?;
+        write_meta_to(
+            &mut file,
+            &SessionMeta::PendingTurn {
+                turn_index: pending.turn_index,
+                started_unix_ms: pending.started_unix_ms,
+                pre_checkpoint: pending.pre_checkpoint.clone(),
+            },
+        )?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn last_recorded_user_text(&self) -> Option<String> {
+        let file = fs::File::open(&self.path).ok()?;
+        let mut last = None;
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(message) = serde_json::from_str::<Message>(line)
+                && message.role == Role::User
+            {
+                last = Some(message.text().to_string());
+            }
+        }
+        last
+    }
+
     pub fn record_turn_closed(&mut self, turn_index: u32) -> Result<()> {
         self.write_meta_sync(&SessionMeta::TurnClosed { turn_index })
     }
@@ -440,5 +478,29 @@ mod tests {
         );
         let loaded = JsonlSession::load(&path).unwrap();
         assert_eq!(loaded.pending_turn.unwrap().turn_index, 2);
+    }
+
+    #[test]
+    fn record_turn_start_writes_user_and_pending_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut session = JsonlSession::create(&path).unwrap();
+        session
+            .record_turn_start(
+                &Message::user("in flight"),
+                &PendingTurn {
+                    turn_index: 1,
+                    started_unix_ms: 7,
+                    pre_checkpoint: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            session.last_recorded_user_text().as_deref(),
+            Some("in flight")
+        );
+        let loaded = JsonlSession::load(&path).unwrap();
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.pending_turn.unwrap().turn_index, 1);
     }
 }

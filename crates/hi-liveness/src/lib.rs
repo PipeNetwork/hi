@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 pub use events::EventLog;
 pub use invariants::report as report_invariant;
-pub use publisher::Publisher;
+pub use publisher::{PgidSource, Publisher};
 pub use schema::{
     AUTO_REPAIR_SET, ENV_CRASH_DIR, ENV_EVENTS, ENV_GENERATION, ENV_HEARTBEAT, ENV_HI_BINARY,
     ENV_INSTANCE, ENV_PANIC_FILE, ENV_RESUME_INCOMPLETE, ENV_ROLE, ENV_SUPERVISED, ENV_TURN_INTENT,
@@ -56,6 +56,8 @@ pub fn set_state_if_installed(state: HarnessState) {
 pub fn write_turn_intent(path: &std::path::Path, intent: &TurnIntent) -> std::io::Result<()> {
     write_atomic_json(path, intent)
 }
+
+pub use atomic::write_private_file;
 
 pub fn write_turn_intent_from_env(intent: &TurnIntent) -> std::io::Result<()> {
     let Some(path) = std::env::var_os(ENV_TURN_INTENT) else {
@@ -197,5 +199,48 @@ mod tests {
         let parsed: TurnIntent = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(parsed.prompt, "fix the parser");
         assert!(parsed.oneshot);
+    }
+
+    #[test]
+    fn pgid_source_is_sampled_and_spawn_wait_count_as_progress() {
+        let publisher = Publisher::new();
+        let before = publisher.snapshot().last_progress_unix_ms;
+        let live = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+        let live_src = live.clone();
+        publisher.set_pgid_source(std::sync::Arc::new(move || {
+            let pgids = live_src.lock().unwrap().clone();
+            let current = pgids.first().copied();
+            (pgids, current)
+        }));
+        live.lock().unwrap().push(4242);
+        let spawned = publisher.snapshot();
+        assert_eq!(spawned.child_pgids, vec![4242]);
+        assert_eq!(spawned.current_tool_pgid, Some(4242));
+        assert_eq!(spawned.last_event.as_deref(), Some("child_spawn"));
+        assert!(spawned.last_progress_unix_ms >= before);
+        live.lock().unwrap().clear();
+        let waited = publisher.snapshot();
+        assert!(waited.child_pgids.is_empty());
+        assert_eq!(waited.last_event.as_deref(), Some("child_wait"));
+    }
+
+    #[test]
+    fn private_file_is_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("panic.txt");
+        write_private_file(&path, b"redacted\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"redacted\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            let dir_mode = fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+        }
     }
 }

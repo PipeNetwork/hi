@@ -66,8 +66,7 @@ pub async fn run(
     } else if !cli.verify.is_empty() {
         harness.set_verify_command(Some(cli.verify.join(" && ")));
     }
-    // TUI keeps Ask (or resumed knobs). One-shot/`--plain` default to Always so
-    // scripts are not blocked; `--confirm-edits` restores the Ask ladder.
+    // TUI keeps Ask; one-shot/`--plain` defaults to Always unless `--confirm-edits`.
     if !use_tui {
         if cli.confirm_edits {
             harness.set_permission_mode(hi_harness::PermissionMode::Ask);
@@ -126,7 +125,6 @@ pub async fn run(
         return Ok(());
     }
 
-    // Non-TUI interactive REPL.
     use rustyline::Editor;
     use rustyline::history::DefaultHistory;
     let mut editor = Editor::<(), DefaultHistory>::new()?;
@@ -476,6 +474,7 @@ async fn apply_repl_auth(
     explicit: Option<&std::path::Path>,
     key: &str,
 ) -> Result<()> {
+    let _awaiting = harness.awaiting_user();
     let path = match explicit {
         Some(path) => path.to_path_buf(),
         None => default_config_path().context("could not determine config directory")?,
@@ -729,6 +728,7 @@ async fn run_repl_login(
     harness: &mut Harness,
     explicit: Option<&std::path::Path>,
 ) -> Result<PathBuf> {
+    let _awaiting = harness.awaiting_user();
     hi_ai::pipenetwork_auth::login().await?;
     let token = hi_ai::auth_store::load(hi_ai::pipenetwork_auth::PROVIDER_ID)
         .context("sign-in reported success but stored no credential")?;

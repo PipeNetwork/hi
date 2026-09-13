@@ -74,6 +74,21 @@ fn set_dir_0700(path: &Path) {
     }
 }
 
+pub fn write_private_file(path: &Path, body: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(body)?;
+    file.flush()?;
+    set_file_0600(path);
+    Ok(())
+}
+
 fn json_err(err: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
 }

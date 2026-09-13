@@ -36,13 +36,11 @@ pub struct SessionOptions {
     pub model: String,
     pub history_path: Option<PathBuf>,
     pub startup_prompt: Option<String>,
-    /// After a successful `/login pipenetwork` pairing, write `[profiles.pipenetwork]`
-    /// so the minted key is used on the next launch without pasting.
+    /// After `/login pipenetwork`, persist `[profiles.pipenetwork]`.
     pub on_pipenetwork_login: Option<PipenetworkLoginHook>,
     /// Saved sessions for `/sessions`.
     pub list_sessions: Option<crate::SessionLister>,
-    /// Configured OpenAI profile, if the user set one. Dashboard `openai/…`
-    /// rows use this; gpt-6 otherwise stays on Pipe.
+    /// Configured OpenAI profile for dashboard `openai/…` rows.
     pub openai_api_key: Option<String>,
     pub openai_base_url: Option<String>,
 }
@@ -696,6 +694,7 @@ async fn paste_pipenetwork_key(
     arg: &str,
     on_login: &mut Option<PipenetworkLoginHook>,
 ) -> Result<()> {
+    let _awaiting = harness.awaiting_user();
     let key = match parse_tui_auth_key(arg) {
         Ok(key) => key,
         Err(message) => {
@@ -1182,6 +1181,7 @@ async fn start_pipenetwork_login(
     arg: &str,
     on_login: &mut Option<PipenetworkLoginHook>,
 ) -> Result<()> {
+    let _awaiting = harness.awaiting_user();
     if let Err(message) = pipenetwork_login_arg(arg) {
         app.push(Line::styled(message, dim()));
         app.follow();

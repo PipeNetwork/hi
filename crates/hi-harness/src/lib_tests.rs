@@ -240,6 +240,50 @@ fn opening_an_existing_session_does_not_clobber_its_model() {
 }
 
 #[test]
+fn loaded_pending_turn_does_not_fire_turn_unclosed_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let publisher = hi_liveness::Publisher::new();
+    {
+        let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+        config.state_root = dir.path().join(".hi");
+        config.liveness = Some(publisher.clone());
+        let mut harness = Harness::new(config).unwrap();
+        harness.apply_loaded_session(LoadedSession {
+            messages: vec![Message::user("in flight")],
+            pending_turn: Some(crate::PendingTurn {
+                turn_index: 3,
+                started_unix_ms: 1,
+                pre_checkpoint: None,
+            }),
+            ..LoadedSession::default()
+        });
+        assert!(harness.pending_turn().is_some());
+    }
+    assert!(
+        publisher.snapshot().invariant.is_none(),
+        "loaded PendingTurn must not stamp turn_unclosed"
+    );
+}
+
+#[test]
+fn dropping_an_open_turn_sets_turn_unclosed() {
+    let dir = tempfile::tempdir().unwrap();
+    let publisher = hi_liveness::Publisher::new();
+    {
+        let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+        config.state_root = dir.path().join(".hi");
+        config.liveness = Some(publisher.clone());
+        let mut harness = Harness::new(config).unwrap();
+        harness.messages.push(Message::user("open"));
+        let _ = harness.begin_persisted_turn("open", None);
+    }
+    assert_eq!(
+        publisher.snapshot().invariant.unwrap().code,
+        hi_liveness::InvariantCode::TurnUnclosed
+    );
+}
+
+#[test]
 fn clear_history_rewrites_the_session_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.jsonl");

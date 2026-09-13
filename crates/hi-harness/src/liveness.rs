@@ -16,6 +16,7 @@ impl Harness {
             pre_checkpoint: pre.map(str::to_string),
         };
         self.pending_turn = Some(pending.clone());
+        self.turn_open = true;
         self.liveness.reset_turn_tools();
         self.liveness.set_state(HarnessState::AwaitingModel);
         self.liveness.set_turn_index(self.turn_index);
@@ -24,14 +25,16 @@ impl Harness {
         self.liveness.note_progress();
         self.liveness.emit(EventCode::TurnStart, None, None, None);
 
+        let persisted_before_user = self.messages.len().saturating_sub(1);
         if let Some(session) = &mut self.session {
-            let failed = match self.messages.last() {
-                Some(last) => session.record_messages(std::slice::from_ref(last)).is_err(),
-                None => false,
+            let Some(last) = self.messages.last() else {
+                return self.messages.len();
             };
-            let pending_failed = session.record_pending_turn(&pending).is_err();
-            if failed || pending_failed {
+            if session.record_turn_start(last, &pending).is_err() {
                 hi_liveness::report_invariant(&self.liveness, InvariantCode::SessionAppendFailed);
+                if session.last_recorded_user_text().as_deref() != Some(input) {
+                    return persisted_before_user;
+                }
             } else {
                 self.liveness.note_progress();
                 self.liveness
@@ -58,6 +61,7 @@ impl Harness {
     }
 
     pub(crate) fn close_persisted_turn(&mut self, from: usize, reason: TurnStopReason) {
+        self.turn_open = false;
         let turn_index = self.pending_turn.take().map(|pending| pending.turn_index);
         self.persist_new_messages(from);
         if let Some(turn_index) = turn_index
@@ -86,6 +90,25 @@ impl Harness {
             } else {
                 self.liveness.note_progress();
             }
+        }
+    }
+}
+
+pub struct AwaitingUserGuard {
+    liveness: hi_liveness::Publisher,
+}
+
+impl Drop for AwaitingUserGuard {
+    fn drop(&mut self) {
+        self.liveness.set_state(HarnessState::Idle);
+    }
+}
+
+impl Harness {
+    pub fn awaiting_user(&self) -> AwaitingUserGuard {
+        self.liveness.set_state(HarnessState::AwaitingUser);
+        AwaitingUserGuard {
+            liveness: self.liveness.clone(),
         }
     }
 }

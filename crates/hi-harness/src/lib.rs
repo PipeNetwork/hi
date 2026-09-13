@@ -34,6 +34,7 @@ pub use dashboard::{
 };
 pub use hi_ai::ReasoningEffort;
 pub use live::LiveSettings;
+pub use liveness::AwaitingUserGuard;
 pub use pipe::{
     DEFAULT_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, PipeClient, PipeError, default_base_url,
 };
@@ -170,6 +171,7 @@ pub struct Harness {
     steer: SteerQueue,
     pending_turn: Option<PendingTurn>,
     turn_index: u32,
+    turn_open: bool,
     liveness: hi_liveness::Publisher,
 }
 
@@ -184,6 +186,7 @@ impl Harness {
         if let Some(session) = &session {
             liveness.set_session_path(Some(session.path().display().to_string()));
         }
+        liveness.set_state(hi_liveness::HarnessState::Idle);
         Ok(Self {
             client: Client::new(config.base_url, config.api_key),
             tools,
@@ -205,6 +208,7 @@ impl Harness {
             steer: SteerQueue::default(),
             pending_turn: None,
             turn_index: 0,
+            turn_open: false,
             liveness,
         })
     }
@@ -218,6 +222,7 @@ impl Harness {
         if let Some(session) = &session {
             liveness.set_session_path(Some(session.path().display().to_string()));
         }
+        liveness.set_state(hi_liveness::HarnessState::Idle);
         Ok(Self {
             client: Client::new(config.base_url, config.api_key),
             tools,
@@ -243,6 +248,7 @@ impl Harness {
             steer: SteerQueue::default(),
             pending_turn: None,
             turn_index: 0,
+            turn_open: false,
             liveness,
         })
     }
@@ -612,7 +618,7 @@ fn resolve_liveness(config: &HarnessConfig, tools: &ToolHost) -> hi_liveness::Pu
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        if self.pending_turn.is_some() {
+        if self.turn_open {
             hi_liveness::report_invariant(&self.liveness, hi_liveness::InvariantCode::TurnUnclosed);
         }
     }

@@ -64,7 +64,7 @@ impl InvariantCode {
     }
 }
 
-/// Invariants the supervisor may treat as a harness bug (PR2). Storms are report-only.
+/// Codes the supervisor may treat as a harness bug. `IdenticalToolStorm` is excluded.
 pub const AUTO_REPAIR_SET: &[InvariantCode] = &[
     InvariantCode::ToolUnclosed,
     InvariantCode::TurnUnclosed,

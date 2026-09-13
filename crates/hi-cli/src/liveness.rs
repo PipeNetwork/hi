@@ -1,7 +1,5 @@
 //! Supervised heartbeat writer, incident-scoped crash dir, and panic file.
 
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 
 use hi_liveness::{ENV_CRASH_DIR, ENV_PANIC_FILE, ENV_SUPERVISED, HarnessState, WriterHandle};
@@ -46,7 +44,7 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let payload = panic_text(info);
         let redacted = hi_secrets::redact_secrets(&payload);
-        let _ = write_panic_file(&path, &redacted);
+        let _ = hi_liveness::write_private_file(&path, redacted.as_bytes());
         previous(info);
     }));
 }
@@ -55,21 +53,6 @@ fn panic_text(info: &std::panic::PanicHookInfo<'_>) -> String {
     let mut text = info.to_string();
     text.truncate(64 * 1024);
     text
-}
-
-fn write_panic_file(path: &std::path::Path, body: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(body.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.flush()?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -83,7 +83,7 @@ impl ToolHost {
     ) -> Result<Self> {
         std::fs::create_dir_all(&state_root)?;
         let lsp = Arc::new(LspManager::new(&root)?);
-        Ok(Self {
+        let host = Self {
             root,
             state_root,
             runner,
@@ -92,11 +92,22 @@ impl ToolHost {
             read_cache: Mutex::new(ReadCache::new()),
             repo_map: Mutex::new(RepoMapCache::new()),
             liveness: hi_liveness::Publisher::new(),
-        })
+        };
+        host.bind_pgid_source();
+        Ok(host)
     }
 
     pub fn set_liveness(&mut self, liveness: hi_liveness::Publisher) {
         self.liveness = liveness;
+        self.bind_pgid_source();
+    }
+
+    fn bind_pgid_source(&self) {
+        let foreground = self.runner.foreground_registry();
+        let background = Arc::clone(&self.background);
+        self.liveness.set_pgid_source(Arc::new(move || {
+            collect_child_pgids(&foreground, &background)
+        }));
     }
 
     pub fn liveness(&self) -> hi_liveness::Publisher {
@@ -156,7 +167,6 @@ impl ToolHost {
         self.liveness.note_tool_start(id, name);
         self.liveness
             .note_tool_fingerprint(&tool_fingerprint(name, arguments));
-        self.publish_pgids();
         ui.tool_started_id(id, name, arguments);
         let outcome = if matches!(name, "write" | "edit" | "multi_edit" | "apply_patch") {
             match prepare_mutation_in_with_state(&self.root, &self.state_root, name, arguments)
@@ -194,23 +204,7 @@ impl ToolHost {
             && !run_in_background(name, arguments)
             && self.runner.foreground_registry().active_count() > 0;
         self.liveness.note_tool_end(leaked);
-        self.publish_pgids();
         outcome
-    }
-
-    fn publish_pgids(&self) {
-        let fg = self.runner.foreground_registry().active_pgids();
-        let current = fg.first().copied();
-        let mut all = fg;
-        for (id, _, status) in self.background.snapshot() {
-            if status == "running"
-                && let Some(pgid) = self.background.os_pid(&id)
-                && !all.contains(&pgid)
-            {
-                all.push(pgid);
-            }
-        }
-        self.liveness.set_child_pgids(all, current);
     }
 
     async fn confirm_if_needed(
@@ -298,6 +292,24 @@ impl Drop for ConfirmGuard {
             );
         }
     }
+}
+
+fn collect_child_pgids(
+    foreground: &hi_tools::ForegroundProcessRegistry,
+    background: &BackgroundRegistry,
+) -> (Vec<i32>, Option<i32>) {
+    let fg = foreground.active_pgids();
+    let current = fg.first().copied();
+    let mut all = fg;
+    for (id, _, status) in background.snapshot() {
+        if status == "running"
+            && let Some(pgid) = background.os_pid(&id)
+            && !all.contains(&pgid)
+        {
+            all.push(pgid);
+        }
+    }
+    (all, current)
 }
 
 fn run_in_background(name: &str, arguments: &str) -> bool {
@@ -416,6 +428,40 @@ mod tests {
         assert_eq!(
             snap.invariant.expect("sticky invariant").code,
             hi_liveness::InvariantCode::ToolUnclosed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silent_child_pgids_are_visible_mid_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path().to_path_buf());
+        let liveness = host.liveness();
+        let interrupt = host.interrupt_handle();
+        let args = serde_json::json!({"command": "sleep 30"}).to_string();
+        let mut ui = TestUi::default();
+        let exec = host.execute("c1", "bash", &args, || PermissionMode::Always, &mut ui);
+        tokio::pin!(exec);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut saw_pgids = false;
+        loop {
+            tokio::select! {
+                _ = &mut exec => break,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(15)) => {
+                    let snap = liveness.snapshot();
+                    if !snap.child_pgids.is_empty() {
+                        saw_pgids = true;
+                        interrupt.interrupt();
+                    }
+                    if std::time::Instant::now() > deadline {
+                        interrupt.interrupt();
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_pgids,
+            "heartbeat must show live child_pgids during a silent tool"
         );
     }
 }
