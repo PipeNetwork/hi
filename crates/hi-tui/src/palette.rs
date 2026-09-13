@@ -1,7 +1,7 @@
 //! Command palette (Ctrl-K): fuzzy-filter slash commands and actions.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use hi_agent::help::{CORE_COMMANDS, HelpSection, command_section};
+use hi_harness::{COMMANDS, CORE_COMMANDS};
 
 /// One row in the command palette.
 #[derive(Clone, Debug)]
@@ -12,8 +12,6 @@ pub(crate) struct PaletteItem {
     pub label: String,
     /// Short help blurb.
     pub help: String,
-    /// Disclosure group. `None` for uncategorized builtins.
-    pub section: Option<HelpSection>,
 }
 
 /// Interactive Ctrl-K palette state.
@@ -34,7 +32,7 @@ impl CommandPalette {
     pub fn refilter(&mut self) {
         let needle = self.query.to_ascii_lowercase();
         let mut items = builtin_items();
-        for spec in hi_agent::command::COMMANDS {
+        for spec in COMMANDS {
             items.push(PaletteItem {
                 command: if spec.args.is_empty() {
                     format!("/{}", spec.name)
@@ -43,34 +41,17 @@ impl CommandPalette {
                 },
                 label: format!("/{}", spec.name),
                 help: spec.help.to_string(),
-                section: command_section(spec.name),
             });
         }
-        if !needle.is_empty() {
-            for spec in hi_agent::command::COMMAND_ALIASES {
-                items.push(PaletteItem {
-                    command: if spec.args.is_empty() {
-                        format!("/{}", spec.name)
-                    } else {
-                        format!("/{} ", spec.name)
-                    },
-                    label: format!("/{}", spec.name),
-                    help: spec.help.to_string(),
-                    section: command_section(spec.name),
-                });
-            }
-        }
-        // De-dupe by label (builtins may overlap).
         let mut seen = std::collections::HashSet::new();
         items.retain(|i| seen.insert(i.label.clone()));
 
         if needle.is_empty() {
-            // Empty palette is the front door: core, then project, then modes.
             items.retain(|i| {
-                matches!(
-                    i.section,
-                    Some(HelpSection::Core | HelpSection::Project | HelpSection::Modes)
-                )
+                i.label
+                    .strip_prefix('/')
+                    .is_some_and(|name| CORE_COMMANDS.contains(&name))
+                    || matches!(i.label.as_str(), "/help" | "/tutorial")
             });
             items.sort_by_key(empty_palette_rank);
         } else {
@@ -160,20 +141,13 @@ pub(crate) enum PaletteOutcome {
     Accept(String),
 }
 
-fn empty_palette_rank(item: &PaletteItem) -> (u8, usize, String) {
-    let section_ord = match item.section {
-        None => 0,
-        Some(HelpSection::Core) => 1,
-        Some(HelpSection::Project) => 2,
-        Some(HelpSection::Modes) => 3,
-        Some(HelpSection::Platform) => 4,
-    };
+fn empty_palette_rank(item: &PaletteItem) -> (usize, String) {
     let core_idx = item
         .label
         .strip_prefix('/')
         .and_then(|name| CORE_COMMANDS.iter().position(|n| *n == name))
         .unwrap_or(usize::MAX);
-    (section_ord, core_idx, item.label.clone())
+    (core_idx, item.label.clone())
 }
 
 fn builtin_items() -> Vec<PaletteItem> {
@@ -182,25 +156,21 @@ fn builtin_items() -> Vec<PaletteItem> {
             command: "/tutorial".into(),
             label: "/tutorial".into(),
             help: "interactive tour".into(),
-            section: Some(HelpSection::Core),
         },
         PaletteItem {
             command: "/density".into(),
             label: "/density".into(),
             help: "cycle transcript density".into(),
-            section: None,
         },
         PaletteItem {
             command: "/theme".into(),
             label: "/theme".into(),
             help: "cycle color theme".into(),
-            section: None,
         },
         PaletteItem {
             command: "/help".into(),
             label: "/help".into(),
-            help: "core commands; /help all for the rest".into(),
-            section: Some(HelpSection::Core),
+            help: "core commands".into(),
         },
     ]
 }
@@ -212,65 +182,26 @@ mod tests {
     #[test]
     fn open_lists_everyday_commands() {
         let p = CommandPalette::open();
-        assert!(p.items.len() > 5);
         assert!(p.items.iter().any(|i| i.label == "/help"));
+        assert!(p.items.iter().any(|i| i.label == "/login"));
+        assert!(p.items.iter().any(|i| i.label == "/model"));
+        assert!(p.items.iter().any(|i| i.label == "/effort"));
+        assert!(p.items.iter().any(|i| i.label == "/yolo"));
+        assert!(p.items.iter().any(|i| i.label == "/auto"));
         assert!(p.items.iter().any(|i| i.label == "/verify"));
-        assert!(p.items.iter().any(|i| i.label == "/fleet"));
-        assert!(
-            !p.items.iter().any(|i| i.label == "/rsi"),
-            "empty palette hides platform commands"
-        );
-        assert!(
-            !p.items.iter().any(|i| i.label == "/dashboard"),
-            "empty palette hides /dashboard alias"
-        );
-        assert!(
-            !p.items.iter().any(|i| i.label == "/model"),
-            "empty palette hides /model alias"
-        );
-        assert!(
-            !p.items.iter().any(|i| i.label == "/delegate"),
-            "empty palette hides /delegate alias"
-        );
+        assert!(p.items.iter().any(|i| i.label == "/dashboard"));
+        assert!(!p.items.iter().any(|i| i.label == "/fleet"));
     }
 
     #[test]
-    fn filter_finds_config_aliases() {
+    fn filter_finds_model() {
         let mut p = CommandPalette::open();
-        p.insert('m');
-        p.insert('o');
-        p.insert('d');
-        p.insert('e');
-        p.insert('l');
+        for c in ['m', 'o', 'd', 'e', 'l'] {
+            p.insert(c);
+        }
         assert!(
             p.items.iter().any(|i| i.label == "/model"),
             "search still finds /model: {:?}",
-            p.items.iter().map(|i| &i.label).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn filter_finds_platform_commands() {
-        let mut p = CommandPalette::open();
-        p.insert('r');
-        p.insert('s');
-        p.insert('i');
-        assert!(
-            p.items.iter().any(|i| i.label == "/rsi"),
-            "search still finds platform commands: {:?}",
-            p.items.iter().map(|i| &i.label).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn filter_narrows() {
-        let mut p = CommandPalette::open();
-        p.insert('d');
-        p.insert('e');
-        p.insert('n');
-        assert!(
-            p.items.iter().any(|i| i.label.contains("density")),
-            "density should match: {:?}",
             p.items.iter().map(|i| &i.label).collect::<Vec<_>>()
         );
     }

@@ -9,6 +9,43 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::action::{Action, KeySurface};
 
+/// True for grok's thinking chord: Ctrl+E (and Ctrl+T).
+///
+/// Terminals disagree on the encoding: classic bytes are ASCII ENQ (`\x05`)
+/// which crossterm usually maps to `Char('e')` + CONTROL, but some send
+/// `\x05` with no modifier, `Char('E')` with Caps Lock, or Ctrl+E as End.
+pub(crate) fn is_toggle_reasoning_key(key: &KeyEvent) -> bool {
+    is_ctrl_letter(key, 'e')
+        || is_ctrl_letter(key, 't')
+        || matches!(key.code, KeyCode::Char('\x05'))
+}
+
+fn is_ctrl_letter(key: &KeyEvent, letter: char) -> bool {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Char(c) => c.eq_ignore_ascii_case(&letter),
+        _ => false,
+    }
+}
+
+/// Grok paste-into-prompt: Ctrl+V, Cmd+V, Alt+V (Windows image chord), Shift+Insert.
+pub(crate) fn is_paste_key(key: &KeyEvent) -> bool {
+    let mods = key.modifiers;
+    match key.code {
+        KeyCode::Char('v' | 'V')
+            if mods.contains(KeyModifiers::CONTROL)
+                || mods.contains(KeyModifiers::SUPER)
+                || mods.contains(KeyModifiers::ALT) =>
+        {
+            true
+        }
+        KeyCode::Insert if mods.contains(KeyModifiers::SHIFT) => true,
+        _ => false,
+    }
+}
+
 /// Where a binding applies. Used to section the help overlay and to filter
 /// which surfaces a runtime chord is active on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,7 +182,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::Input,
         keys: "Shift-Tab",
-        help: "cycle ask / plan / always-approve",
+        help: "cycle ask / auto / always (yolo)",
         in_help: true,
         action: None,
         matches: &[],
@@ -170,6 +207,14 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
         context: BindContext::Input,
         keys: "Alt-Enter / \\",
         help: "insert a newline (multi-line prompt)",
+        in_help: true,
+        action: None,
+        matches: &[],
+    },
+    KeyBinding {
+        context: BindContext::Input,
+        keys: "Ctrl-V / Cmd-V / Shift-Insert",
+        help: "paste clipboard into the prompt (middle-click pastes PRIMARY)",
         in_help: true,
         action: None,
         matches: &[],
@@ -291,6 +336,14 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         context: BindContext::Navigation,
+        keys: "Ctrl-\\",
+        help: "open the agent dashboard",
+        in_help: true,
+        action: Some(Action::ToggleDashboard),
+        matches: &[KeyMatch::ctrl(KeyCode::Char('\\'))],
+    },
+    KeyBinding {
+        context: BindContext::Navigation,
         keys: "Ctrl-P/N",
         help: "jump to previous/next user prompt",
         in_help: true,
@@ -357,15 +410,13 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         context: BindContext::ReviewTools,
-        keys: "Ctrl-T / Ctrl-E",
-        help: "expand/collapse thinking (Ctrl-E also works on an empty prompt)",
+        keys: "Ctrl-E",
+        help: "expand/collapse all thinking blocks",
         in_help: true,
         action: Some(Action::ToggleReasoning),
         matches: &[
+            KeyMatch::ctrl(KeyCode::Char('e')),
             KeyMatch::ctrl(KeyCode::Char('t')),
-            // Scrollback/normal: grok-build Ctrl+E. Insert keeps emacs
-            // end-of-line unless the prompt is empty (see `edit_key`).
-            KeyMatch::ctrl(KeyCode::Char('e')).on_surface(KeySurface::Normal),
         ],
     },
     KeyBinding {
@@ -827,6 +878,55 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_e_matches_every_terminal_encoding() {
+        assert!(is_toggle_reasoning_key(&key(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_toggle_reasoning_key(&key(
+            KeyCode::Char('E'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_toggle_reasoning_key(&key(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(is_toggle_reasoning_key(&key(
+            KeyCode::Char('\x05'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_toggle_reasoning_key(&key(
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_toggle_reasoning_key(&key(
+            KeyCode::Char('e'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_toggle_reasoning_key(&key(
+            KeyCode::End,
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn paste_keys_match_grok() {
+        assert!(is_paste_key(&key(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_paste_key(&key(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_paste_key(&key(KeyCode::Char('v'), KeyModifiers::SUPER)));
+        assert!(is_paste_key(&key(KeyCode::Char('v'), KeyModifiers::ALT)));
+        assert!(is_paste_key(&key(KeyCode::Insert, KeyModifiers::SHIFT)));
+        assert!(!is_paste_key(&key(KeyCode::Char('v'), KeyModifiers::NONE)));
+        assert!(!is_paste_key(&key(KeyCode::Insert, KeyModifiers::NONE)));
+    }
+
+    #[test]
     fn help_sections_are_non_empty() {
         let rows = help_overlay_rows();
         assert!(
@@ -889,6 +989,13 @@ mod tests {
                 &key(KeyCode::Char('k'), KeyModifiers::CONTROL)
             ),
             Action::OpenPalette
+        );
+        assert_eq!(
+            resolve_from_table(
+                KeySurface::Insert,
+                &key(KeyCode::Char('\\'), KeyModifiers::CONTROL)
+            ),
+            Action::ToggleDashboard
         );
         assert_eq!(
             resolve_from_table(

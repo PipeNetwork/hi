@@ -898,7 +898,13 @@ async fn run(
     let effective_max_verify_repairs = max_verify_repairs.unwrap_or(quality.max_verify_repairs);
     let verify_command = verify_override
         .or_else(|| {
-            crate::report::pipeline_command(&quality.verification.resolved_stages(&workspace_root))
+            crate::report::pipeline_command(
+                quality
+                    .verification
+                    .resolved_stages(&workspace_root)
+                    .iter()
+                    .map(|stage| stage.command.as_str()),
+            )
         })
         .filter(|command| !command.trim().is_empty())
         .ok_or_else(|| {

@@ -282,16 +282,8 @@ async fn run_request(
 }
 
 fn resolved_verify(commands: &[String]) -> Result<String> {
-    pipeline_command(
-        &commands
-            .iter()
-            .enumerate()
-            .map(|(index, command)| {
-                hi_agent::VerifyStage::new(format!("race-verify-{}", index + 1), command.clone())
-            })
-            .collect::<Vec<_>>(),
-    )
-    .context("coding race requires a verification pipeline")
+    pipeline_command(commands.iter().map(String::as_str))
+        .context("coding race requires a verification pipeline")
 }
 
 async fn apply_saved_candidate(

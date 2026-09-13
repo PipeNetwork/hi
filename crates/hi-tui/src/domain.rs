@@ -50,19 +50,14 @@ impl OverlayDomain {
     #[inline]
     pub(crate) fn any_hard(app: &App) -> bool {
         app.confirmation.is_some()
-            || app.plan_approval_capturing()
-            || app.memory_browser.is_some()
             || app.picker.is_some()
             || app.provider_picker.is_some()
             || app.provider_form.is_some()
             || app.palette.is_some()
             || app.tutorial.is_some()
-            || app.workflow_overlay.is_some()
-            || app.inspect_subagent.is_some()
-            || app.tasks_overlay.is_some()
+            || app.usage_overlay.is_some()
+            || crate::dashboard::is_open(app)
             || app.block_viewer.is_some()
-            || app.turn_picker.is_some()
-            || app.diff_lab.is_some()
     }
 
     #[inline]
@@ -91,6 +86,9 @@ mod tests {
         app.palette = None;
         app.tutorial = Some(crate::tutorial::TutorialOverlay::fresh());
         assert!(OverlayDomain::any_hard(&app));
+        app.tutorial = None;
+        app.dashboard = None;
+        assert!(!OverlayDomain::any_hard(&app));
     }
 
     #[test]

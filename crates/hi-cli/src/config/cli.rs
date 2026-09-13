@@ -2,27 +2,22 @@ use super::*;
 
 const CLI_COMMANDS_HELP: &str = "\
 Commands:
-  setup              Interactive provider wizard (bare `hi setup` only)
-  auth               Paste and verify an API key (openai / anthropic / pipenetwork / xai)
+  setup              Sign in to pipenetwork.ai (same as `hi login`, or paste a key)
+  login              Sign in to pipenetwork.ai and write the API key into config.toml
+  logout             Forget the stored pipenetwork.ai credential
+  auth               Paste and verify an API key (pipenetwork / openai / anthropic / xai)
   browser            Install the Chrome debugger extension (`install`)
-  doctor             Diagnose config, credentials, git, and MCP
-  debug tui          Deterministic TUI JSONL harness (`--stdio`)
-  workspace          Inspect and salvage local PipeFS recovery state
   update             Update the hi binary
-  workflow           Run or inspect a workflow
-  trace              List, show, or verify local traces
   resume             Continue the latest session (same as -c)
-  runtime            Manage the local model sidecar
-  hf                 Hugging Face / local-model helpers
-  mcp                Workspace MCP (`status`, `pipe`, `test`, `add`, `serve`)
-  diff-lab           Differential fuzzing lab
-  rsi                Laptop RSI loopback (`up` / `down`)
-  tickets            Claim project tickets and run `--goal --verify` until they pass
-  inbox              List or allow/deny parked confirms (`allow|deny <id>`)
+  tickets            Claim project tickets
+  trace              List, show, or verify local traces
+  announcements      Show product announcements
+  --verify CMD       Post-turn check (repeatable; joined with &&)
+  --quiet            Assistant text only (one-shot / --plain)
+  --confirm-edits    Ask before mutations outside the TUI
 
-`hi setup fix nginx` is a prompt, not the wizard. Power commands (eval, bench,
-metrics) stay available as argv[1] dispatchers; `hi --help` lists the ones
-people look for first.
+`hi setup fix nginx` is a prompt, not sign-in. `hi --list-sessions` lists
+saved sessions; `hi --resume <id>` opens one.
 ";
 
 fn parse_finite_u32_cap(value: &str) -> std::result::Result<u32, String> {
@@ -333,13 +328,8 @@ pub struct Cli {
     #[arg(long)]
     pub keep_background: bool,
 
-    /// Soft wall-clock budget per turn, in seconds. When it expires hi stops
-    /// starting new model/repair rounds and finishes normally — workspace
-    /// reconciled, report written — instead of being killed mid-edit by an
-    /// outer timeout. Set it a little below any external deadline (CI step,
-    /// benchmark harness, wrapper timeout). There is no whole-turn deadline by
-    /// default; 0 is an explicit equivalent of omitting this option.
-    #[arg(long, value_name = "SECS", env = "HI_TURN_DEADLINE_SECS")]
+    /// Unused by the Pipe session. Hidden so a default cap is not advertised.
+    #[arg(long, value_name = "SECS", env = "HI_TURN_DEADLINE_SECS", hide = true)]
     pub turn_deadline: Option<u64>,
 
     /// Legacy compatibility flag. Reviewer outages no longer block verified
@@ -351,10 +341,8 @@ pub struct Cli {
     #[arg(long)]
     pub allow_no_checkpoint: bool,
 
-    /// Optional finite repair/check cycles after the initial verification
-    /// check. By default productive repairs continue until verification passes
-    /// or a no-progress/fault circuit fires.
-    #[arg(long, value_parser = parse_finite_u32_cap)]
+    /// Unused by the Pipe session. Hidden so a default cap is not advertised.
+    #[arg(long, value_parser = parse_finite_u32_cap, hide = true)]
     pub max_verify_repairs: Option<u32>,
 
     /// Independent-review policy.
@@ -369,14 +357,12 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub tool_set: Option<CliToolSet>,
 
-    /// Optional hard cap on model calls per turn. There is no model-call cap by
-    /// default; an explicitly capped turn gets one tool-free wrap-up round.
-    #[arg(long, value_parser = parse_positive_finite_u32_cap)]
+    /// Unused by the Pipe session. Hidden so a default cap is not advertised.
+    #[arg(long, value_parser = parse_positive_finite_u32_cap, hide = true)]
     pub max_steps: Option<u32>,
 
-    /// Optional cap on tool executions per turn, independent of model calls.
-    /// There is no tool-execution cap by default.
-    #[arg(long, value_name = "N", value_parser = parse_finite_u32_cap)]
+    /// Unused by the Pipe session. Hidden so a default cap is not advertised.
+    #[arg(long, value_name = "N", value_parser = parse_finite_u32_cap, hide = true)]
     pub max_tool_calls: Option<u32>,
 
     /// Execute coding turns remotely through the authenticated Pipe RSI service.

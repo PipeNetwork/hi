@@ -2,7 +2,7 @@
 
 mod overlays;
 
-use hi_agent::{Agent, PlanStatus};
+use hi_tools::PlanStatus;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -24,13 +24,13 @@ use crate::{FORM_LABEL_WIDTH, PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 /// - `ShellMutation`: the `$ command` line is highlighted bold so the exact
 ///   command being approved stands out.
 fn confirmation_lines(
-    request: &hi_agent::ConfirmationRequest,
+    request: &hi_harness::ConfirmationRequest,
     details: &str,
 ) -> Vec<Line<'static>> {
-    use hi_agent::ConfirmationRequest;
+    use hi_harness::ConfirmationRequest;
     let th = crate::theme::theme();
     match request {
-        ConfirmationRequest::FileEdit { .. } | ConfirmationRequest::DelegateApply { .. } => {
+        ConfirmationRequest::FileEdit { .. } => {
             // The details are "file: <path>\n\n<diff>" or "<summary>\n\n<diff>".
             // Split off the diff portion (after the blank line) and color it.
             let (header, diff) = match details.split_once("\n\n") {
@@ -71,39 +71,6 @@ fn confirmation_lines(
                 })
                 .collect()
         }
-        ConfirmationRequest::AskUser { question, options } => {
-            let mut lines = vec![Line::styled(
-                question.clone(),
-                Style::default()
-                    .fg(th.text_primary)
-                    .add_modifier(Modifier::BOLD),
-            )];
-            if !options.is_empty() {
-                lines.push(Line::raw(""));
-                for (i, option) in options.iter().enumerate() {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {} ", i + 1), Style::default().fg(th.accent_tool)),
-                        Span::raw(option.clone()),
-                    ]));
-                }
-            }
-            lines
-        }
-        ConfirmationRequest::External { .. } => details
-            .lines()
-            .map(|l| {
-                if l.starts_with("warning:") {
-                    Line::styled(
-                        l.to_string(),
-                        Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
-                    )
-                } else if l.starts_with("tool:") || l.starts_with("target:") {
-                    Line::styled(l.to_string(), Style::default().fg(th.text_secondary))
-                } else {
-                    Line::raw(l.to_string())
-                }
-            })
-            .collect(),
     }
 }
 
@@ -196,12 +163,7 @@ impl crate::App {
     }
 
     fn live_subagent_tick(&self) -> u64 {
-        self.subagents
-            .values()
-            .filter(|info| info.live())
-            .map(|info| info.started_at.elapsed().as_secs())
-            .max()
-            .unwrap_or(0)
+        0
     }
 
     /// Turn activity sits between scrollback and the prompt. Idle and done
@@ -216,7 +178,7 @@ impl crate::App {
         true
     }
 
-    pub(crate) fn report_status(&mut self, agent: &Agent) {
+    pub(crate) fn report_status(&mut self) {
         let (input, output) = self.usage;
         let state = match &self.last_turn_state {
             TurnState::Idle => "idle".to_string(),
@@ -231,13 +193,10 @@ impl crate::App {
             .context_pct()
             .map(|p| format!("{}{p}%", if self.usage_estimated { "~" } else { "" }))
             .unwrap_or_else(|| "unknown".to_string());
-        let goal = agent.goal_summary();
-        let verify = agent.verify_summary();
-        let tel = agent.last_turn_telemetry();
         let error = self.last_error.as_deref().unwrap_or("none");
         for line in [
             format!("status: {state}"),
-            format!("execution: {}", agent.execution_mode().as_str()),
+            format!("permissions: {}", self.permission_mode.label()),
             format!("provider/model: {} · {}", self.provider, self.model),
             format!(
                 "local MLX: {}",
@@ -261,16 +220,6 @@ impl crate::App {
                 "context: {ctx}; user prompt estimate: {input}; turn output across all model calls: {}{output}",
                 if self.usage_estimated { "~" } else { "" }
             ),
-            format!("goal: {goal}"),
-            format!("verify: {verify}"),
-            format!(
-                "evidence: {} (reads {}, searches {}, listing_only {}, repair nudges {})",
-                tel.discovery_depth,
-                tel.file_reads,
-                tel.targeted_searches,
-                tel.listing_only,
-                tel.quality_repair_nudges
-            ),
             format!("last error: {error}"),
             format!(
                 "session $: {}",
@@ -283,7 +232,7 @@ impl crate::App {
             format!(
                 "queued: {}; checkpoints: {}",
                 self.queue.len(),
-                agent.checkpoint_count()
+                self.plan.len()
             ),
         ] {
             self.push(Line::styled(line, dim()));
@@ -331,26 +280,6 @@ impl crate::App {
         // Prefer the structured-goal view when a long-horizon goal is active: it's
         // the authoritative decomposition the executor's `update_plan` maps onto, so
         // showing both would be redundant.
-        if let Some(goal) = &self.goal
-            && !goal.sub_goals.is_empty()
-        {
-            if !self.plan_pane_expanded {
-                return vec![Line::styled(
-                    format!(
-                        "▸ goal · {}/{}  Ctrl-L",
-                        goal.sub_goals
-                            .iter()
-                            .filter(|s| s.status == hi_agent::GoalStatus::Done)
-                            .count(),
-                        goal.sub_goals.len()
-                    ),
-                    Style::default()
-                        .fg(crate::theme::theme().accent_plan)
-                        .add_modifier(Modifier::BOLD),
-                )];
-            }
-            return self.goal_lines(goal, max_steps);
-        }
         if self.plan.is_empty() {
             return Vec::new();
         }
@@ -372,14 +301,6 @@ impl crate::App {
                 let mut header = format!("plan · {done}/{total}");
                 if self.plan_drive_paused {
                     header.push_str(" · paused");
-                } else if matches!(
-                    self.last_drive,
-                    hi_agent::DriveAction::Idle {
-                        reason: hi_agent::DriveIdleReason::PlanParked
-                            | hi_agent::DriveIdleReason::PlanApprovalParked
-                    }
-                ) {
-                    header.push_str(" · parked");
                 }
                 if !self.plan_pane_expanded {
                     header.push_str("  Ctrl-L");
@@ -453,132 +374,8 @@ impl crate::App {
         out
     }
 
-    fn live_task_lines(&self, max: usize) -> Vec<Line<'static>> {
-        if max == 0 {
-            return Vec::new();
-        }
-        let th = crate::theme::theme();
-        let mut live: Vec<_> = self.subagents.values().filter(|info| info.live()).collect();
-        live.sort_by_key(|info| std::cmp::Reverse(info.started_at));
-        if live.is_empty() {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        let item_budget = if max >= 2 {
-            out.push(Line::from(vec![
-                Span::styled("▾ ", dim()),
-                Span::styled(
-                    "Subagents",
-                    Style::default()
-                        .fg(th.gray_bright)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" {}", live.len()), dim()),
-            ]));
-            max - 1
-        } else {
-            max
-        };
-        for info in live.iter().take(item_budget) {
-            let kind = if info.background {
-                "task"
-            } else {
-                info.kind.as_str()
-            };
-            let status = if info.activity.trim().is_empty() {
-                "Responding"
-            } else {
-                info.activity.as_str()
-            };
-            out.push(Line::from(vec![
-                Span::styled("  ", dim()),
-                Span::styled(
-                    format!("○ {kind} {}", crate::util::clip_reason(&info.description)),
-                    Style::default().fg(th.text_primary),
-                ),
-                Span::styled(format!(" — {status}"), dim()),
-                Span::styled(
-                    format!(
-                        "  {}",
-                        crate::util::fmt_elapsed(info.started_at.elapsed().as_secs())
-                    ),
-                    dim(),
-                ),
-            ]));
-        }
-        if live.len() > item_budget {
-            out.push(Line::styled(
-                format!("  … +{} more · /tasks", live.len() - item_budget),
-                dim(),
-            ));
-        }
-        out
-    }
-
-    /// The pinned block for an active long-horizon goal: a `goal · done/total ·
-    /// objective` header plus the planner-decomposed sub-goal checklist.
-    fn goal_lines(&self, goal: &hi_agent::Goal, max_steps: usize) -> Vec<Line<'static>> {
-        const HARD_CAP: usize = 8;
-        let max_steps = max_steps.min(HARD_CAP);
-        let total = goal.sub_goals.len();
-        let done = goal
-            .sub_goals
-            .iter()
-            .filter(|s| s.status == hi_agent::GoalStatus::Done)
-            .count();
-        let state = match self.last_drive {
-            hi_agent::DriveAction::Idle {
-                reason: hi_agent::DriveIdleReason::GoalPaused,
-            } => " · paused",
-            hi_agent::DriveAction::Idle {
-                reason: hi_agent::DriveIdleReason::GoalParked,
-            } => " · parked",
-            _ if goal.is_paused() => " · paused",
-            _ => "",
-        };
-        let mut header = format!("goal · {done}/{total}{state}");
-        if !goal.objective.is_empty() {
-            header.push_str(" · ");
-            header.push_str(&goal.objective);
-        }
-        let th = crate::theme::theme();
-        let mut out = vec![Line::styled(
-            header,
-            Style::default()
-                .fg(th.accent_goal)
-                .add_modifier(Modifier::BOLD),
-        )];
-        for s in goal.sub_goals.iter().take(max_steps) {
-            let (glyph, glyph_style, title_style) = match s.status {
-                hi_agent::GoalStatus::Done => ('✓', Style::default().fg(th.accent_success), dim()),
-                hi_agent::GoalStatus::Active => (
-                    '▸',
-                    Style::default()
-                        .fg(th.accent_goal)
-                        .add_modifier(Modifier::BOLD),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                hi_agent::GoalStatus::Failed => ('✗', Style::default().fg(th.accent_error), dim()),
-                // Warning, not error: a blocked step is waiting on the user to
-                // supply something, and reading as a failure would send them
-                // looking for a defect in work that was never judged.
-                hi_agent::GoalStatus::Blocked => {
-                    ('⛔', Style::default().fg(th.accent_running), dim())
-                }
-                hi_agent::GoalStatus::Pending => ('○', dim(), Style::default()),
-            };
-            out.push(Line::from(vec![
-                Span::styled(format!("  {glyph} "), glyph_style),
-                Span::styled(s.description.clone(), title_style),
-            ]));
-        }
-        if total > max_steps {
-            out.push(Line::styled(
-                format!("  … +{} more", total - max_steps),
-                dim(),
-            ));
-        }
-        out
+    fn live_task_lines(&self, _max: usize) -> Vec<Line<'static>> {
+        Vec::new()
     }
 
     pub(crate) fn render(&mut self, frame: &mut ratatui::Frame) {
@@ -601,16 +398,8 @@ impl crate::App {
         let inner = chrome::inset(area, hpad_left, hpad_right, top_vpad, bottom_vpad);
         let composer_w = inner.width;
         let overlay_composer = self.confirmation.is_some()
-            || self.plan_approval_capturing()
             || self.fetching.is_some()
             || self.picker.is_some()
-            || self.local_directory_prompt.is_some()
-            || self.local_picker.is_some()
-            || self.local_download_confirmation.is_some()
-            || ((self.local_startup_blocked || self.local_startup_error.is_some())
-                && self.provider_picker.is_none()
-                && self.provider_form.is_none()
-                && self.picker.is_none())
             || self.provider_picker.is_some()
             || self.provider_form.is_some();
         let turn_visible = if overlay_composer && self.confirmation.is_none() {
@@ -714,17 +503,13 @@ impl crate::App {
         // box keeps a closed border.
         let max_steps = if !show_lists
             || avail_inner == 0
-            || (self.plan.is_empty() && self.goal.is_none())
+            || self.plan.is_empty()
             || !self.plan_pane_expanded
         {
             0
         } else {
             const HARD_CAP: usize = 8;
-            let total = if self.goal.as_ref().is_some_and(|g| !g.sub_goals.is_empty()) {
-                self.goal.as_ref().map(|g| g.sub_goals.len()).unwrap_or(0)
-            } else {
-                self.plan.len()
-            };
+            let total = self.plan.len();
             let upper = total.min(HARD_CAP);
             let mut n = upper;
             while n > 0 && 1 + n + usize::from(total > n) > avail_inner {
@@ -757,29 +542,28 @@ impl crate::App {
             )
             .max(1);
         let composer_box_max = composer_max.saturating_sub(changed_files_h as u16).max(1);
-        let input_box_h = if self.confirmation.is_some() || self.plan_approval_capturing() {
-            inner
+        let command_entry_during_confirm =
+            self.confirmation.is_some() && (self.completion.is_some() || !self.input.is_empty());
+        let input_box_h = if self.confirmation.is_some() {
+            let confirm_h = inner
                 .height
                 .saturating_sub(3 + chrome_rows)
                 .clamp(12, 28)
-                .min(composer_box_max)
+                .min(composer_box_max);
+            if command_entry_during_confirm {
+                let composer_h = (prefix_h + body_lines.len() + 2).max(3) as u16;
+                confirm_h
+                    .saturating_add(composer_h)
+                    .min(composer_box_max.max(confirm_h))
+            } else {
+                confirm_h
+            }
         } else if self.fetching.is_some() {
             3.min(composer_box_max)
         } else if let Some(p) = &self.picker {
             // filter line + visible model rows + borders, bounded by the screen.
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
             (rows + 3).min(composer_box_max)
-        } else if self.local_directory_prompt.is_some() {
-            5.min(composer_box_max)
-        } else if let Some(p) = &self.local_picker {
-            let rows = (p.matches.len().clamp(1, PICKER_ROWS) + 2) as u16;
-            (rows + 2).min(composer_box_max)
-        } else if (self.local_startup_blocked || self.local_startup_error.is_some())
-            && self.provider_picker.is_none()
-            && self.provider_form.is_none()
-            && self.picker.is_none()
-        {
-            5.min(composer_box_max)
         } else if let Some(p) = &self.provider_picker {
             // filter line + visible rows + borders, bounded by the screen.
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
@@ -887,35 +671,6 @@ impl crate::App {
         // Status bar: cwd on the left, chips on the right, grok-build's `│`
         // separators. Model identity lives in the prompt's bottom divider.
         let mut info_spans: Vec<Span<'static>> = Vec::new();
-        if let Some(goal) = &self.goal {
-            let total = goal.sub_goals.len();
-            if total > 0 {
-                let done = goal
-                    .sub_goals
-                    .iter()
-                    .filter(|s| s.status == hi_agent::GoalStatus::Done)
-                    .count();
-                let label = if goal.paused {
-                    format!("[Goal: {done}/{total} ⏸]")
-                } else if done == total {
-                    "[Goal: Done]".to_string()
-                } else {
-                    format!("[Goal: {done}/{total}]")
-                };
-                chrome::push_chip(
-                    &mut info_spans,
-                    &th,
-                    Span::styled(label, Style::default().fg(th.accent_goal)),
-                );
-            }
-        }
-        if ui_layout.show_secondary_chrome() && self.execution.is_durable() {
-            chrome::push_chip(
-                &mut info_spans,
-                &th,
-                Span::styled("durable", Style::default().fg(th.accent_success)),
-            );
-        }
         if ui_layout.show_secondary_chrome() {
             let reasoning = self
                 .reasoning_effort
@@ -1012,7 +767,7 @@ impl crate::App {
             .saturating_sub(info.width() as u16)
             .saturating_sub(1) as usize;
         let title = if let Some(notice) = &self.top_notice {
-            let notice = hi_agent::ui::without_leading_warning_marker(notice);
+            let notice = notice.trim_start_matches(['⚠', ' ']);
             let text = truncate_display(&format!("⚠ {notice}"), cwd_budget.max(4));
             Line::from(Span::styled(
                 text,
@@ -1066,16 +821,10 @@ impl crate::App {
                 .saturating_sub(2);
             self.scroll = want.min(max_scroll as u32) as u16;
             self.following = false;
-        }
-        if self.page_flip_on_send
-            && self.working
-            && let Some(&idx) = self.view_cache.prompt_line_starts.last()
-        {
-            self.scroll = self.view_cache.prefix.get(idx).copied().unwrap_or(0) as u16;
-            self.following = false;
-        }
-        let scroll = if self.following {
             self.page_flip_on_send = false;
+        }
+        self.apply_page_flip(inner_h, total);
+        let scroll = if self.following {
             max_scroll
         } else {
             self.scroll.min(max_scroll)
@@ -1166,6 +915,33 @@ impl crate::App {
                 }
             }
         }
+        if th.paints_backgrounds() {
+            let band = th.band_user;
+            for &abs in &self.view_cache.prompt_line_starts {
+                if abs >= line_lo
+                    && abs < line_hi
+                    && let Some(line) = lines.get_mut(abs - line_lo)
+                {
+                    line.style = line.style.bg(band);
+                    let used: usize = line
+                        .spans
+                        .iter()
+                        .map(|s| display_width(s.content.as_ref()))
+                        .sum();
+                    if used < inner_w as usize {
+                        line.spans.push(Span::styled(
+                            " ".repeat(inner_w as usize - used),
+                            Style::default().bg(band),
+                        ));
+                    }
+                    for span in &mut line.spans {
+                        if span.style.bg.is_none() {
+                            span.style = span.style.bg(band);
+                        }
+                    }
+                }
+            }
+        }
 
         // Cache geometry for mouse click / drag outside render.
         self.view_inner = ratatui::layout::Rect {
@@ -1197,39 +973,33 @@ impl crate::App {
         }
 
         // Sticky header: most recent prompt strictly above the viewport.
-        let sticky_prompt: Option<Line<'static>> = if self.following {
-            None
-        } else {
-            self.view_cache
-                .prompt_line_starts
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, idx)| {
-                    (self.view_cache.prefix.get(**idx).copied().unwrap_or(0) as u16) < scroll
-                })
-                .and_then(|(prompt_i, idx)| {
-                    let mut line = self.view_cache.lines.get(*idx).cloned()?;
-                    if self.timestamps_enabled
-                        && let Some(at) = self
-                            .transcript
-                            .iter()
-                            .filter_map(|e| match e {
-                                crate::TranscriptEntry::UserPrompt { at, .. } => Some(*at),
-                                _ => None,
-                            })
-                            .nth(prompt_i)
-                    {
-                        chrome::overlay_right(
-                            &mut line,
-                            &crate::util::fmt_clock(at),
-                            inner_w,
-                            dim(),
-                        );
-                    }
-                    Some(line)
-                })
-        };
+        // Grok pins this while following the tail so the running prompt stays
+        // visible at the top of the transcript.
+        let sticky_prompt: Option<Line<'static>> = self
+            .view_cache
+            .prompt_line_starts
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, idx)| {
+                (self.view_cache.prefix.get(**idx).copied().unwrap_or(0) as u16) < scroll
+            })
+            .and_then(|(prompt_i, idx)| {
+                let mut line = self.view_cache.lines.get(*idx).cloned()?;
+                if self.timestamps_enabled
+                    && let Some(at) = self
+                        .transcript
+                        .iter()
+                        .filter_map(|e| match e {
+                            crate::TranscriptEntry::UserPrompt { at, .. } => Some(*at),
+                            _ => None,
+                        })
+                        .nth(prompt_i)
+                {
+                    chrome::overlay_right(&mut line, &crate::util::fmt_clock(at), inner_w, dim());
+                }
+                Some(line)
+            });
 
         let mut pad = Block::new();
         if th.paints_backgrounds() {
@@ -1270,7 +1040,7 @@ impl crate::App {
         }
 
         let mut status_right = info;
-        if !self.following {
+        if !self.following && !self.page_flip_on_send {
             let new = total.saturating_sub(self.total_when_unpinned);
             let label = if new > 0 {
                 format!("↓{new} new")
@@ -1367,45 +1137,19 @@ impl crate::App {
                 .saturating_sub(6 + options.len() as u16) as usize;
             let max_scroll = all.len().saturating_sub(visible.max(1));
             let scroll = self.confirmation_scroll.min(max_scroll);
-            let is_ask = matches!(request, hi_agent::ConfirmationRequest::AskUser { .. });
             let mut body = vec![Line::styled(
-                if is_ask {
-                    "The agent needs a decision before it can continue."
-                } else if matches!(request, hi_agent::ConfirmationRequest::External { .. }) {
-                    "This action reaches the network or an external system. Review it before approving."
-                } else {
-                    "This action can change your workspace. Review it before approving."
-                },
+                "This action can change your workspace. Review it before approving.",
                 Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
             )];
-            if is_ask {
-                // Options replace the numbered dump from confirmation_lines.
-                if let hi_agent::ConfirmationRequest::AskUser { question, .. } = request {
-                    body.push(Line::styled(
-                        question.clone(),
-                        Style::default()
-                            .fg(th.text_primary)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    body.push(Line::raw(""));
-                }
-                body.extend(options);
+            body.extend(all.iter().skip(scroll).take(visible.max(1)).cloned());
+            body.push(Line::raw(""));
+            body.extend(options);
+            if self.confirm_focus == crate::confirm_overlay::ConfirmFocus::Followup {
                 body.push(Line::raw(""));
                 body.push(Line::from(vec![
-                    Span::styled("answer: ", dim()),
+                    Span::styled("follow-up: ", dim()),
                     Span::raw(self.ask_user_draft.clone()),
                 ]));
-            } else {
-                body.extend(all.iter().skip(scroll).take(visible.max(1)).cloned());
-                body.push(Line::raw(""));
-                body.extend(options);
-                if self.confirm_focus == crate::confirm_overlay::ConfirmFocus::Followup {
-                    body.push(Line::raw(""));
-                    body.push(Line::from(vec![
-                        Span::styled("follow-up: ", dim()),
-                        Span::raw(self.ask_user_draft.clone()),
-                    ]));
-                }
             }
             let hint = crate::confirm_overlay::hint(
                 request,
@@ -1415,121 +1159,41 @@ impl crate::App {
             let block = th
                 .panel_block(request.title(), UiTone::Warning)
                 .title_bottom(Line::styled(hint, dim()));
-            frame.render_widget(
-                Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
-                input_area,
-            );
-        } else if let Some(model) = &self.local_download_confirmation {
-            let block = th
-                .panel_block(" download local MLX model? ", UiTone::Warning)
-                .title_bottom(
-                    Line::styled(" Enter/y start · n/Esc cancel ", dim()).right_aligned(),
+            let command_entry = self.completion.is_some() || !self.input.is_empty();
+            if command_entry {
+                let composer_h = ((prefix_h + body_lines.len() + 2).max(3) as u16)
+                    .min(input_area.height.saturating_sub(8).max(3));
+                let split = Layout::vertical([Constraint::Min(8), Constraint::Length(composer_h)])
+                    .split(input_area);
+                frame.render_widget(
+                    Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+                    split[0],
                 );
-            let detail = crate::local_picker::option_detail(model);
-            let body = vec![
-                Line::styled(
-                    model.display_name.to_string(),
-                    Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
-                ),
-                Line::styled(detail, th.text_secondary),
-                Line::styled(
-                    "The model will download in the background and can be resumed later.",
-                    dim(),
-                ),
-            ];
-            frame.render_widget(Paragraph::new(body).block(block), composer_area);
-        } else if let Some(path) = &self.local_directory_prompt {
-            let block = th
-                .panel_block(" existing MLX directory ", UiTone::Info)
-                .title_bottom(Line::styled(" Enter start · Esc cancel ", dim()).right_aligned());
-            let body = vec![
-                Line::styled(
-                    "Path (supports ~ and workspace-relative paths):",
-                    Style::default().fg(th.text_secondary),
-                ),
-                Line::from(vec![
-                    Span::styled("› ", th.chrome(UiTone::Active).selected),
-                    Span::raw(path.clone()),
-                ]),
-            ];
-            frame.render_widget(Paragraph::new(body).block(block), composer_area);
-            let cx = composer_area.x + 3 + display_width(path) as u16;
-            frame.set_cursor_position((
-                cx.min(composer_area.right().saturating_sub(2)),
-                composer_area.y + 2,
-            ));
-        } else if let Some(p) = &self.local_picker {
-            let block = th
-                .panel_block(" local MLX models ", UiTone::Info)
-                .title_top(
-                    Line::from(format!(" {}/{} ", p.selected + 1, p.matches.len().max(1)))
-                        .right_aligned(),
-                );
-            let mut plines: Vec<Line> = vec![Line::from(vec![
-                Span::styled("filter: ", dim()),
-                Span::raw(p.filter.clone()),
-                Span::styled(
-                    "   ↑↓ select · Enter inspect/start · d existing directory · Esc cancel",
-                    Style::default().fg(th.gray_dim),
-                ),
-            ])];
-            for (name, model, selected) in p.visible().into_iter().take(PICKER_ROWS) {
-                let name = name.unwrap_or("Use existing MLX directory…");
-                let detail = model
-                    .map(crate::local_picker::option_detail)
-                    .unwrap_or_else(|| "validate a local config.json and weight shards".into());
-                if selected {
-                    plines.push(Line::from(vec![
-                        Span::styled(format!("▶ {name}"), th.chrome(UiTone::Active).selected),
-                        Span::styled(format!("  {detail}"), th.chrome(UiTone::Warning).body),
-                    ]));
-                } else {
-                    plines.push(Line::from(vec![
-                        Span::raw(format!("  {name}")),
-                        Span::styled(format!("  {detail}"), th.chrome(UiTone::Muted).hint),
-                    ]));
+                let th = crate::theme::theme();
+                let mut input_block = Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(th.input_border(true))
+                    .title(" / command ");
+                if th.paints_backgrounds() {
+                    input_block = input_block.style(Style::default().bg(th.bg_base));
                 }
-            }
-            if p.matches.is_empty() {
-                plines.push(Line::styled("  (no matching local models)", dim()));
-            }
-            frame.render_widget(Paragraph::new(plines).block(block), composer_area);
-            let cx = composer_area.x + 1 + 8 + display_width(&p.filter) as u16;
-            frame.set_cursor_position((
-                cx.min(composer_area.right().saturating_sub(2)),
-                composer_area.y + 1,
-            ));
-        } else if (self.local_startup_blocked || self.local_startup_error.is_some())
-            && self.provider_picker.is_none()
-            && self.provider_form.is_none()
-            && self.picker.is_none()
-        {
-            let block = th
-                .panel_block(" local MLX startup ", UiTone::Warning)
-                .title_bottom(
-                    Line::styled(" r retry · f fallback · /provider choose · /quit ", dim())
-                        .right_aligned(),
+                let mut ilines = prefix_lines;
+                ilines.extend(body_lines);
+                frame.render_widget(Paragraph::new(ilines).block(input_block), split[1]);
+                if !self.mode.is_normal() {
+                    let cx = split[1].x + 1 + cursor_col;
+                    let cy = split[1].y + 1 + prefix_h as u16 + cursor_row;
+                    frame.set_cursor_position((
+                        cx.min(split[1].right().saturating_sub(2)),
+                        cy.min(split[1].bottom().saturating_sub(2)),
+                    ));
+                }
+            } else {
+                frame.render_widget(
+                    Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+                    input_area,
                 );
-            let detail = self
-                .local_startup_error
-                .as_deref()
-                .map(|error| format!("startup failed: {error}"))
-                .unwrap_or_else(|| "loading the persisted model; prompts are paused".into());
-            let model = self
-                .local_runtime
-                .as_ref()
-                .map(|runtime| runtime.model_id.as_str())
-                .unwrap_or("unknown model");
-            let body = vec![
-                Line::styled(format!("{model} · {detail}"), th.text_secondary),
-                Line::styled(
-                    "The previous provider remains active until local MLX is ready or you choose another route.",
-                    dim(),
-                ),
-            ];
-            frame.render_widget(Paragraph::new(body).block(block), composer_area);
-        } else if self.plan_approval_visible() {
-            crate::plan_approval::render(frame, composer_area, self);
+            }
         } else if let Some(started) = self.fetching.or(self.planning) {
             let frame_ch = SPINNER[self.spinner % SPINNER.len()];
             let elapsed = fmt_elapsed(started.elapsed().as_secs());
@@ -1847,63 +1511,66 @@ impl crate::App {
         } else {
             "thinking"
         };
-        let hints: Vec<ShortcutHint> =
-            if self.confirmation.is_some() || self.plan_approval_capturing() {
-                vec![
-                    ShortcutHint {
-                        key: "enter",
-                        label: "confirm",
-                    },
-                    ShortcutHint {
-                        key: "esc",
-                        label: "cancel",
-                    },
-                ]
-            } else if self.review.open && self.can_dock_review() {
-                crate::review::docked_session_hints(self.review.focused)
-            } else if self.working {
-                vec![
-                    ShortcutHint {
-                        key: "ctrl+c",
-                        label: "interrupt",
-                    },
-                    ShortcutHint {
-                        key: "ctrl+e",
-                        label: thinking_label,
-                    },
-                    ShortcutHint {
-                        key: "Shift+Tab",
-                        label: "mode",
-                    },
-                    ShortcutHint {
-                        key: "?",
-                        label: "help",
-                    },
-                    ShortcutHint {
-                        key: "ctrl+g",
-                        label: "review",
-                    },
-                ]
-            } else {
-                vec![
-                    ShortcutHint {
-                        key: "ctrl+e",
-                        label: thinking_label,
-                    },
-                    ShortcutHint {
-                        key: "Shift+Tab",
-                        label: "mode",
-                    },
-                    ShortcutHint {
-                        key: "?",
-                        label: "help",
-                    },
-                    ShortcutHint {
-                        key: "ctrl+g",
-                        label: "review",
-                    },
-                ]
-            };
+        let hints: Vec<ShortcutHint> = if self.confirmation.is_some() {
+            vec![
+                ShortcutHint {
+                    key: "enter",
+                    label: "confirm",
+                },
+                ShortcutHint {
+                    key: "esc",
+                    label: "cancel",
+                },
+            ]
+        } else if self.review.open && self.can_dock_review() {
+            crate::review::docked_session_hints(self.review.focused)
+        } else if self.working {
+            vec![
+                ShortcutHint {
+                    key: "ctrl+c",
+                    label: "interrupt",
+                },
+                ShortcutHint {
+                    key: "ctrl+e",
+                    label: thinking_label,
+                },
+                ShortcutHint {
+                    key: "Shift+Tab",
+                    label: "mode",
+                },
+                ShortcutHint {
+                    key: "?",
+                    label: "help",
+                },
+                ShortcutHint {
+                    key: "ctrl+g",
+                    label: "review",
+                },
+            ]
+        } else {
+            vec![
+                ShortcutHint {
+                    key: "ctrl+e",
+                    label: thinking_label,
+                },
+                ShortcutHint {
+                    key: "Shift+Tab",
+                    label: "mode",
+                },
+                ShortcutHint {
+                    key: "?",
+                    label: "help",
+                },
+                ShortcutHint {
+                    key: "ctrl+g",
+                    label: "review",
+                },
+                ShortcutHint {
+                    key: "ctrl+\\",
+                    label: "dashboard",
+                },
+            ]
+        };
         chrome::render_shortcuts_bar(frame, shortcuts_area, &hints, &th);
     }
 
@@ -2001,7 +1668,7 @@ impl crate::App {
         }
         let committed_entries = self.transcript.len();
         let committed_flat_lines = lines.len();
-        lines.extend(self.live_thinking_lines());
+        lines.extend(self.live_thinking_lines_wrapped(inner_w));
         if let Some((style, markdown, text)) = &self.pending {
             let mut line = if *markdown {
                 markdown_line(text, &mut self.code_lang.clone())
@@ -2131,7 +1798,7 @@ impl crate::App {
         let committed_entries = self.transcript.len();
         let committed_flat_lines = lines.len();
 
-        for line in self.live_thinking_lines() {
+        for line in self.live_thinking_lines_wrapped(inner_w) {
             let h = wrapped_line_height(&line, inner_w) as u32;
             let cum = prefix.last().copied().unwrap_or(0).saturating_add(h);
             prefix.push(cum);

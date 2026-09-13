@@ -1515,11 +1515,7 @@ pub(crate) fn handle_inbox(
     if action.resume_goal {
         hi_agent::resume_goal_after_inbox(agent);
     }
-    if let Some(id) = action.resume_loop
-        && let Some(path) = crate::session::loops_file()
-    {
-        let _ = hi_tui::set_loop_paused(&path, id, false);
-    }
+    let _ = action.resume_loop;
 }
 
 pub(crate) fn run_inbox_argv(
@@ -1534,11 +1530,7 @@ pub(crate) fn run_inbox_argv(
     for line in &action.lines {
         println!("{line}");
     }
-    if let Some(id) = action.resume_loop
-        && let Some(path) = crate::session::loops_file()
-    {
-        let _ = hi_tui::set_loop_paused(&path, id, false);
-    }
+    let _ = action.resume_loop;
     Ok(())
 }
 

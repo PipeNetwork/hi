@@ -42,23 +42,33 @@ const RUST_TUI_MARKERS: &[&str] = &[
 /// path read the entire file just to decide whether it looks like a TUI.
 const INTERACTIVE_SCAN_MAX_BYTES: u64 = 256 * 1024;
 
-/// Resolve an optional bash deadline. Ordinary commands have no implicit
-/// lifetime ceiling: they run until completion, explicit cancellation, or the
-/// foreground-to-background handoff below. A positive tool argument wins over
-/// `HI_BASH_TIMEOUT_SECS`; omitted, invalid, and zero values mean unlimited.
+/// Resolve an optional bash deadline. A positive tool argument wins unless it
+/// exceeds `HI_BASH_TIMEOUT_MAX_SECS`. `0` and omitted use `HI_BASH_TIMEOUT_SECS`
+/// (Grok defaults to 120s) or stay unlimited for foreground handoff.
 pub(crate) fn resolve_bash_timeout(requested: Option<u64>) -> Option<Duration> {
     let configured = std::env::var("HI_BASH_TIMEOUT_SECS").ok();
-    resolve_bash_timeout_from_values(requested, configured.as_deref())
+    let max = std::env::var("HI_BASH_TIMEOUT_MAX_SECS").ok();
+    resolve_bash_timeout_from_values(requested, configured.as_deref(), max.as_deref())
 }
 
 pub(crate) fn resolve_bash_timeout_from_values(
     requested: Option<u64>,
     configured: Option<&str>,
+    max: Option<&str>,
 ) -> Option<Duration> {
-    requested
-        .or_else(|| configured.and_then(|value| value.trim().parse().ok()))
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
+    let parsed = |value: Option<&str>| {
+        value
+            .and_then(|value| value.trim().parse().ok())
+            .filter(|seconds: &u64| *seconds > 0)
+    };
+    let max = parsed(max);
+    let mut seconds = requested
+        .filter(|value| *value > 0)
+        .or_else(|| parsed(configured));
+    if let Some(max) = max {
+        seconds = Some(seconds.unwrap_or(max).min(max));
+    }
+    seconds.map(Duration::from_secs)
 }
 
 /// Whether a foreground bash command that outlasts its budget is handed to the
@@ -181,10 +191,10 @@ pub(crate) async fn run_bash_streaming_with_timeout(
 #[derive(Deserialize)]
 pub(super) struct BashArgs {
     pub command: String,
-    /// Optional hard process-lifetime limit in seconds. Omitted or zero means
-    /// unlimited unless `HI_BASH_TIMEOUT_SECS` supplies a positive value. An
-    /// unlimited command may be handed off after the foreground attachment
-    /// budget. Ignored when `run_in_background` is set.
+    /// Optional hard process-lifetime limit in seconds. Omitted or zero uses
+    /// `HI_BASH_TIMEOUT_SECS` when set (Grok defaults to 120). Otherwise the
+    /// command is unlimited and may be handed off after the foreground
+    /// attachment budget. Ignored when `run_in_background` is set.
     #[serde(default)]
     pub timeout: Option<u64>,
     /// Run detached: return a handle immediately instead of waiting for exit.
@@ -241,10 +251,15 @@ pub(super) async fn run_bash_tool_with_auto_background(
         .is_none()
         .then(|| ProcessRunner::new(root))
         .transpose()?;
+    let mut args = args;
+    args.command = strip_trailing_output_pager(&args.command);
     let runner = resources
         .process_runner
         .or(owned_runner.as_ref())
         .expect("process runner is either borrowed or constructed above");
+    if let Some(message) = runner.admit_bash_repeat(&args.command) {
+        return Ok(ToolOutcome::failed(message));
+    }
     // DeepSeek Flash prefers `cat`/`sed -n`/`head` for SPEC.md. Those dumps
     // go through the 5k bash condenser and lose the middle of the spec.
     // Workspace file dumps that fit the read cache become numbered `read`
@@ -503,6 +518,54 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
 /// while a false positive would weaken effect attribution.
 fn definitely_read_only_shell(command: &str) -> bool {
     crate::shell_policy::classify_shell_command(command).is_proven_read_only()
+}
+
+/// Drop a trailing `tail`/`head` count pager (`cmd 2>&1 | tail -40`).
+///
+/// Those pagers hold every byte until the producer exits, so a 15s
+/// auto-background sees silence, then `bash_output` waits forever. Grok's
+/// bash tool does not babysit; running the producer directly lets output
+/// stream. `tail -f` and pagers with extra operands are left alone.
+pub(super) fn strip_trailing_output_pager(command: &str) -> String {
+    let trimmed = command.trim();
+    let Some((head, pager)) = trimmed.rsplit_once('|') else {
+        return command.to_string();
+    };
+    let words: Vec<&str> = pager.split_whitespace().collect();
+    let Some(program) = words.first() else {
+        return command.to_string();
+    };
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    if !matches!(name, "tail" | "head") || !pager_count_args_only(&words[1..]) {
+        return command.to_string();
+    }
+    let stripped = head.trim_end();
+    if stripped.is_empty() {
+        command.to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+fn pager_count_args_only(args: &[&str]) -> bool {
+    match args {
+        [] => true,
+        [count] if is_pager_count_token(count) => true,
+        ["-n", count] if is_uint_token(count) => true,
+        _ => false,
+    }
+}
+
+fn is_pager_count_token(token: &str) -> bool {
+    let digits = token
+        .strip_prefix('-')
+        .map(|rest| rest.strip_prefix('n').unwrap_or(rest))
+        .unwrap_or(token);
+    is_uint_token(digits)
+}
+
+fn is_uint_token(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|ch| ch.is_ascii_digit())
 }
 
 #[cfg(test)]

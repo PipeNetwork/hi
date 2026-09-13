@@ -32,7 +32,8 @@ pub(crate) fn run_best_of(
     report_path: Option<&Path>,
 ) -> Result<bool> {
     let judge = bestof::effective_judge(cli.judge.as_deref(), !verify_stages.is_empty());
-    let verify = pipeline_command(verify_stages).unwrap_or_default();
+    let verify = pipeline_command(verify_stages.iter().map(|stage| stage.command.as_str()))
+        .unwrap_or_default();
     if judge != hi_research::JudgeChoice::Model && verify.trim().is_empty() {
         anyhow::bail!("--best-of requires a resolved verification pipeline");
     }

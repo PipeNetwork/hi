@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
-use hi_agent::{ExecutionMode, LspMode, ReviewPolicy, ToolSet, VerificationMode, VerifyStage};
 use hi_ai::{CompatMode, DeepSeekCompat, OutputTokenParameter, ReasoningEffort, ToolMode};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +25,7 @@ mod profile_edit;
 mod quality;
 mod session;
 mod settings;
+mod types;
 
 #[cfg(test)]
 mod credential_refs_tests;
@@ -40,3 +40,4 @@ pub use profile_edit::*;
 pub use quality::*;
 pub use session::*;
 pub use settings::*;
+pub use types::*;

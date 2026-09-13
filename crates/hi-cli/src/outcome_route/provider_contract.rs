@@ -32,7 +32,7 @@ impl OutcomeRouteProvider {
             // than inherit capabilities that route cannot honor.
             return true;
         };
-        let contract = TaskContract::derive(objective, self.quality.verification.clone());
+        let contract = TaskContract::derive(objective, self.quality.verification.clone().into());
         should_submit_outcome(self.mode, true, self.has_cargo(), &contract)
     }
 

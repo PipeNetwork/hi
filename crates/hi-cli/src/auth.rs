@@ -106,6 +106,95 @@ fn upsert_key_profile(
     upsert_profile_as_default(config, &name, profile, Some(config_path))
 }
 
+/// Profile name written by browser pairing (`hi login pipenetwork`).
+pub const LOGIN_PROFILE: &str = "pipenetwork";
+
+fn pipenetwork_login_profile(existing: Option<&Profile>) -> Profile {
+    let mut profile = existing.cloned().unwrap_or_default();
+    profile.provider = Some(ProviderName::Pipenetwork);
+    if profile
+        .model
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        profile.model = ProviderName::Pipenetwork
+            .default_model()
+            .map(str::to_string);
+    }
+    profile.api_key_ref = Some(format!(
+        "auth-store://{}",
+        hi_ai::pipenetwork_auth::PROVIDER_ID
+    ));
+    profile.api_key = None;
+    profile.api_key_env = None;
+    profile
+}
+
+/// Point `[profiles.pipenetwork]` at the pairing key in `auth.json` and select
+/// it as the default profile.
+pub fn install_pipenetwork_login_profile_at(config: &mut Config, config_path: &Path) -> Result<()> {
+    let profile = pipenetwork_login_profile(config.profiles.get(LOGIN_PROFILE));
+    upsert_profile_as_default(config, LOGIN_PROFILE, profile, Some(config_path))
+}
+
+/// Write the login profile to the user config path (`~/.config/hi/config.toml`).
+pub fn install_pipenetwork_login_profile(config: &mut Config) -> Result<std::path::PathBuf> {
+    let path = default_config_path().context("could not determine config directory")?;
+    install_pipenetwork_login_profile_at(config, &path)?;
+    Ok(path)
+}
+
+/// `hi login [pipenetwork]` — browser pairing, then write the minted key into
+/// `config.toml` so the next session uses it without pasting.
+pub async fn run_login_cli(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        None | Some("pipenetwork") | Some("pipe") => {}
+        Some("-h" | "--help" | "help") => {
+            println!("usage: hi login pipenetwork");
+            println!(
+                "  Opens a browser pairing flow, stores the API key, and writes\n  \
+                 [profiles.pipenetwork] to ~/.config/hi/config.toml."
+            );
+            return Ok(());
+        }
+        Some(other) => bail!(
+            "usage: hi login pipenetwork\n\
+             '{other}' has no CLI login; this build signs in to pipenetwork.ai."
+        ),
+    }
+    hi_ai::pipenetwork_auth::login().await?;
+    if !hi_ai::pipenetwork_auth::has_credential() {
+        bail!("sign-in reported success but stored no credential");
+    }
+    let path = default_config_path().context("could not determine config directory")?;
+    let mut config = if path.exists() {
+        read_config_file(&path)?
+    } else {
+        Config::default()
+    };
+    install_pipenetwork_login_profile_at(&mut config, &path)?;
+    println!(
+        "Configured pipenetwork profile in {} (api_key_ref = \"auth-store://pipenetwork\")",
+        path.display()
+    );
+    Ok(())
+}
+
+/// `hi logout [pipenetwork]` — drop the stored pairing key. The profile stays
+/// so the next `hi login pipenetwork` reuses it.
+pub fn run_logout_cli(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        None | Some("pipenetwork") | Some("pipe") => hi_ai::pipenetwork_auth::logout(),
+        Some("-h" | "--help" | "help") => {
+            println!("usage: hi logout pipenetwork");
+            Ok(())
+        }
+        Some(other) => bail!("usage: hi logout pipenetwork (got '{other}')"),
+    }
+}
+
 /// `hi auth <provider>` — paste a key, probe it, write the matching profile.
 pub async fn run_cli(args: &[String]) -> Result<()> {
     let provider = match args.first().map(String::as_str) {
@@ -336,5 +425,109 @@ mod tests {
         assert!(!std::fs::read_to_string(&path).unwrap().contains("api_test"));
         hi_ai::auth_store::delete(key).unwrap();
         assert_eq!(saved.default_profile.as_deref(), Some("pipenetwork"));
+    }
+
+    #[test]
+    fn login_profile_points_at_auth_store_pipenetwork() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        install_pipenetwork_login_profile_at(&mut config, &path).unwrap();
+        let saved = read_config_file(&path).unwrap();
+        let profile = saved
+            .profiles
+            .get("pipenetwork")
+            .expect("pipenetwork profile");
+        assert_eq!(profile.provider, Some(ProviderName::Pipenetwork));
+        assert_eq!(
+            profile.model.as_deref(),
+            Some("pipe/deepseek-v4-flash-0731")
+        );
+        assert_eq!(
+            profile.api_key_ref.as_deref(),
+            Some("auth-store://pipenetwork")
+        );
+        assert!(profile.api_key.is_none());
+        assert!(profile.api_key_env.is_none());
+        assert_eq!(saved.default_profile.as_deref(), Some("pipenetwork"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("pk_live"),
+            "pairing key must not land in config.toml: {text}"
+        );
+    }
+
+    #[test]
+    fn login_profile_keeps_an_existing_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.profiles.insert(
+            "pipenetwork".into(),
+            Profile {
+                provider: Some(ProviderName::Pipenetwork),
+                model: Some("pipe/custom-model".into()),
+                api_key: Some("pk_old".into()),
+                ..Default::default()
+            },
+        );
+        install_pipenetwork_login_profile_at(&mut config, &path).unwrap();
+        let saved = read_config_file(&path).unwrap();
+        let profile = saved.profiles.get("pipenetwork").unwrap();
+        assert_eq!(profile.model.as_deref(), Some("pipe/custom-model"));
+        assert_eq!(
+            profile.api_key_ref.as_deref(),
+            Some("auth-store://pipenetwork")
+        );
+        assert!(profile.api_key.is_none());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("pk_old"), "old literal leaked: {text}");
+    }
+
+    fn run_with_isolated_credentials(test: &str) -> bool {
+        const CHILD: &str = "HI_TEST_PIPE_LOGIN_PROFILE";
+        if std::env::var(CHILD).as_deref() == Ok(test) {
+            return false;
+        }
+        let config_home = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, test)
+            .env("XDG_CONFIG_HOME", config_home.path())
+            .status()
+            .expect("run login-profile resolution in an isolated process");
+        assert!(
+            status.success(),
+            "isolated login-profile regression failed: {status}"
+        );
+        true
+    }
+
+    #[test]
+    fn login_profile_resolves_the_pairing_key() {
+        let test = std::thread::current().name().unwrap().to_string();
+        if run_with_isolated_credentials(&test) {
+            return;
+        }
+        hi_ai::auth_store::save(
+            hi_ai::pipenetwork_auth::PROVIDER_ID,
+            &hi_ai::StoredToken::static_access("pk_live_from_login".into()),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        install_pipenetwork_login_profile_at(&mut config, &path).unwrap();
+        let saved = read_config_file(&path).unwrap();
+        let key = crate::config::resolve_api_key_for_endpoint(
+            saved.profiles.get("pipenetwork"),
+            ProviderName::Pipenetwork,
+            "https://api.pipenetwork.ai/v1",
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(key, "pk_live_from_login");
+        hi_ai::auth_store::delete(hi_ai::pipenetwork_auth::PROVIDER_ID).unwrap();
     }
 }

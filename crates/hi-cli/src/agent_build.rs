@@ -50,7 +50,7 @@ pub(crate) fn build_agent(
         execution: if cli.subagent || cli.eval_input.is_some() {
             hi_agent::ExecutionMode::Ephemeral
         } else {
-            settings.execution
+            settings.execution.into()
         },
         paths: hi_agent::AgentPaths {
             workspace_root: workspace_root.clone(),
@@ -63,13 +63,13 @@ pub(crate) fn build_agent(
             cli.temperature,
         ),
         gates: hi_agent::AgentGates {
-            verification: quality.verification.clone(),
+            verification: quality.verification.clone().into(),
             max_verify_repairs: quality.max_verify_repairs,
-            review: quality.review,
+            review: quality.review.into(),
             allow_unverified: cli.allow_unverified,
             skeptic_fail_open: cli.skeptic_fail_open,
             allow_no_checkpoint: permits_missing_checkpoint(cli),
-            lsp_mode: quality.lsp_mode,
+            lsp_mode: quality.lsp_mode.into(),
             confirm_edits: cli.confirm_edits,
             dry_run: cli.dry_run,
             ..hi_agent::AgentGates::default()
@@ -78,7 +78,7 @@ pub(crate) fn build_agent(
         harness: settings.harness.clone(),
         harness_session: Some(settings.session_harness.clone()),
         memory: hi_agent::AgentMemory {
-            tool_set: quality.tool_set,
+            tool_set: quality.tool_set.into(),
             disabled_tools: crate::tool_trim::disabled_tools(&state_root),
             // Env override lets you flip on skill auto-curation without editing a profile.
             // `--eval-input` and `--report` skip it the same way they skip finalize:
@@ -289,14 +289,14 @@ fn resolved_loop_limits(
 fn resolved_write_subagent_policy(
     rsi_requested: RsiRequested,
     env_force: bool,
-    configured: hi_agent::WriteSubagentPolicy,
+    configured: crate::config::WriteSubagentPolicy,
 ) -> hi_agent::WriteSubagentPolicy {
     if rsi_requested == RsiRequested::Managed {
         hi_agent::WriteSubagentPolicy::Off
     } else if env_force {
         hi_agent::WriteSubagentPolicy::On
     } else {
-        configured
+        configured.into()
     }
 }
 
@@ -378,20 +378,19 @@ mod tests {
 
     #[test]
     fn managed_workers_disable_external_write_subagents_even_when_forced() {
-        use crate::config::RsiRequested;
-        use hi_agent::WriteSubagentPolicy;
+        use crate::config::{RsiRequested, WriteSubagentPolicy};
 
         assert_eq!(
             resolved_write_subagent_policy(RsiRequested::Managed, true, WriteSubagentPolicy::On,),
-            WriteSubagentPolicy::Off
+            hi_agent::WriteSubagentPolicy::Off
         );
         assert_eq!(
             resolved_write_subagent_policy(RsiRequested::Off, true, WriteSubagentPolicy::Off,),
-            WriteSubagentPolicy::On
+            hi_agent::WriteSubagentPolicy::On
         );
         assert_eq!(
             resolved_write_subagent_policy(RsiRequested::Off, false, WriteSubagentPolicy::Risk,),
-            WriteSubagentPolicy::Risk
+            hi_agent::WriteSubagentPolicy::Risk
         );
     }
 }

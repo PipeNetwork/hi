@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::{self, Config, ProfileForm, ProviderName};
 use crate::landing::profile_infos;
-use crate::provider::{build_chain, switched_routing};
+use crate::provider::build_chain;
 
 pub(crate) struct TuiProfileCallbacks {
     pub(crate) profiles: Vec<hi_tui::ProfileInfo>,
@@ -33,7 +33,7 @@ pub(crate) fn callbacks(file: Config, config_path: Option<PathBuf>) -> TuiProfil
             let provider = build_chain(&settings, fallbacks);
             Ok(hi_tui::SwitchedProvider {
                 provider,
-                routing: switched_routing(&settings),
+                model: settings.model.clone(),
                 local_runtime: None,
             })
         }
@@ -175,11 +175,7 @@ mod tests {
 
         let switched =
             (callbacks.resolver)("pipenetwork").expect("resolve just-saved Pipe profile");
-        assert_eq!(switched.routing.model, "pipe/deepseek-v4-flash-0731");
-        assert_eq!(
-            switched.routing.provider_route.as_deref(),
-            Some("pipenetwork")
-        );
+        assert_eq!(switched.model, "pipe/deepseek-v4-flash-0731");
         assert!(
             hi_ai::auth_store::load("pipenetwork").is_none(),
             "profile save must not create a provider-wide pairing credential"

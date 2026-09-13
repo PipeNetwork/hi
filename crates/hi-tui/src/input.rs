@@ -1,5 +1,11 @@
 //! Terminal-free input line: text + cursor + history.
 
+fn hides_from_history(line: &str) -> bool {
+    let rest = line.trim().strip_prefix('/').unwrap_or("");
+    let name = rest.split_whitespace().next().unwrap_or("");
+    matches!(name, "auth")
+}
+
 /// Terminal-free input line: text + cursor + history. Unit-tested below.
 #[derive(Default, Clone)]
 pub(crate) struct InputLine {
@@ -171,7 +177,7 @@ impl InputLine {
     }
     pub fn submit(&mut self) -> String {
         let line = self.text();
-        let skip_history = self.secret || hi_agent::command::hides_from_history(&line);
+        let skip_history = self.secret || hides_from_history(&line);
         self.secret = false;
         self.clear();
         if !skip_history && !line.trim().is_empty() && self.history.last() != Some(&line) {

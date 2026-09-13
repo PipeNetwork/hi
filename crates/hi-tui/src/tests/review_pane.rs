@@ -75,6 +75,10 @@ fn idle_shortcuts_advertise_ctrl_g_review() {
         screen.contains("ctrl+g:review"),
         "idle bar should advertise review:\n{screen}"
     );
+    assert!(
+        screen.contains("ctrl+\\:dashboard"),
+        "idle bar should advertise dashboard:\n{screen}"
+    );
 }
 
 #[test]

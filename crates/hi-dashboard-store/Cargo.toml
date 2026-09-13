@@ -1,0 +1,18 @@
+[package]
+name = "hi-dashboard-store"
+version.workspace = true
+edition.workspace = true
+description = "SQLite-backed persistent dashboard workspace (ported from xai-grok-dashboard-store, Apache-2.0)"
+license = "Apache-2.0"
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hi-sqlite-journal.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

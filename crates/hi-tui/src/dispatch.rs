@@ -129,6 +129,11 @@ impl App {
     pub(crate) fn apply_action(&mut self, action: Action) {
         match action {
             Action::None | Action::OpenPalette => {}
+            Action::ToggleDashboard => {
+                if let Err(err) = crate::dashboard::toggle_from_app(self) {
+                    self.top_notice = Some(err);
+                }
+            }
             Action::ToggleHelp => {
                 self.show_help = !self.show_help;
             }
@@ -224,12 +229,7 @@ impl App {
             Action::BlockNavExit => self.mode.to_insert(),
             Action::OpenBlockViewer => crate::block_viewer::open_selected(self),
             Action::TogglePlanPane => {
-                if self.plan.is_empty()
-                    && self
-                        .goal
-                        .as_ref()
-                        .is_none_or(|goal| goal.sub_goals.is_empty())
-                {
+                if self.plan.is_empty() {
                     return;
                 }
                 self.plan_pane_expanded = !self.plan_pane_expanded;

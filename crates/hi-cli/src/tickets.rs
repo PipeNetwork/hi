@@ -96,7 +96,7 @@ async fn execute_ticket(
     agent_id: &str,
     ticket: &TicketView,
 ) -> Result<()> {
-    let session = crate::session::new_fleet_session_path()?;
+    let session = crate::paths::new_session_path()?;
     let report = session.with_extension("report.json");
     let _ = std::fs::remove_file(&report);
     let mut child = spawn_goal_child(ticket, &session, &report)?;

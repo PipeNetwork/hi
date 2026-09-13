@@ -7,11 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::config::ReviewPolicy;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-#[cfg(test)]
-use hi_agent::VerificationMode;
-use hi_agent::{ReviewPolicy, RsiControl, TaskContract};
+use hi_agent::{RsiControl, TaskContract};
 use hi_ai::{
     ChatRequest, Completion, Content, Provider, Role, StreamEvent, ToolCallChannel, Usage,
     estimate_text_tokens,
@@ -378,7 +377,7 @@ impl OutcomeRouteProvider {
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion, OutcomeError> {
         let prompt = user_prompt(&request);
-        let contract = TaskContract::derive(&prompt, self.quality.verification.clone());
+        let contract = TaskContract::derive(&prompt, self.quality.verification.clone().into());
         let has_cargo = self.has_cargo();
         if !should_submit_outcome(self.mode, request.user_turn, has_cargo, &contract) {
             return Err(OutcomeError::fail_open(
@@ -741,11 +740,14 @@ mod tests {
 
     #[test]
     fn auto_routes_cargo_mutation_and_keeps_qa_on_chat() {
-        let qa = TaskContract::derive("what does this parser do?", VerificationMode::Auto);
+        let qa = TaskContract::derive(
+            "what does this parser do?",
+            hi_agent::VerificationMode::Auto,
+        );
         assert!(!should_submit_outcome(OutcomeMode::Auto, true, true, &qa));
         let fix = TaskContract::derive(
             "fix the failing tests in the parser",
-            VerificationMode::Auto,
+            hi_agent::VerificationMode::Auto,
         );
         assert!(should_submit_outcome(OutcomeMode::Auto, true, true, &fix));
         assert!(!should_submit_outcome(OutcomeMode::Auto, true, false, &fix));

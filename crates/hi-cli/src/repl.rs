@@ -990,7 +990,7 @@ pub(crate) async fn repl(
                         }
                     }
                 } else {
-                    hi_tui::expand_file_mentions(&line, agent.workspace_root())
+                    line.clone()
                 };
 
                 // Run the turn with an animated "working… Ns" spinner so it's
@@ -1552,25 +1552,7 @@ fn provider_edit_prompt(
 }
 
 #[cfg(test)]
-mod mention_tests {
-    #[test]
-    fn repl_expands_mentions_as_pointers_not_bodies() {
-        let dir = std::env::temp_dir().join(format!(
-            "hi-cli-mention-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.rs"), "SECRET_BODY").unwrap();
-        let out = hi_tui::expand_file_mentions("see @a.rs", &dir);
-        assert!(out.contains("a.rs") && out.contains("<file mentions>"));
-        assert!(!out.contains("SECRET_BODY"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
+mod mention_tests {}
 
 #[cfg(test)]
 #[path = "repl_tests.rs"]

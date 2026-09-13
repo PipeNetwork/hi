@@ -8,13 +8,7 @@ use std::ffi::OsString;
 use anyhow::Result;
 use clap::Parser;
 
-use crate::config::{self, Cli, ProviderName, RsiRequested};
-use crate::provider::{
-    LiveModelMetadata, build_provider, effective_max_tokens_for_model, provider_label,
-    resolve_live_model_metadata,
-};
-use crate::session;
-
+use crate::config::{self, Cli, RsiRequested};
 /// Parse argv and reject incompatible flag combinations (exits process on error).
 pub(crate) fn parse_and_validate_cli() -> Cli {
     // Keep the common interactive workflow discoverable without introducing a
@@ -23,13 +17,13 @@ pub(crate) fn parse_and_validate_cli() -> Cli {
     // `hi resume "finish the migration"` behaves like `hi -c "finish the migration"`.
     let cli = Cli::parse_from(normalize_resume_command(std::env::args_os().collect()));
     if let Some(id) = cli.sync_session_id.as_deref()
-        && let Err(err) = crate::sync::validate_session_id(id)
+        && let Err(err) = crate::paths::validate_session_id(id)
     {
         eprintln!("{err}");
         std::process::exit(2);
     }
     if let Some(id) = cli.attach.as_deref()
-        && let Err(err) = crate::sync::validate_session_id(id)
+        && let Err(err) = crate::paths::validate_session_id(id)
     {
         eprintln!("{err}");
         std::process::exit(2);
@@ -92,7 +86,7 @@ pub(crate) async fn maybe_short_circuit(cli: &Cli) -> Option<Result<()>> {
         return Some(print_show_config(cli).await);
     }
     if cli.list_sessions {
-        return Some(session::list_sessions());
+        return Some(crate::paths::list_sessions());
     }
     None
 }
@@ -107,30 +101,14 @@ async fn print_show_config(cli: &Cli) -> Result<()> {
     };
     match config::resolve(cli, &file) {
         Ok(settings) => {
-            let live = if settings.provider == ProviderName::Pipenetwork {
-                let provider = build_provider(&settings);
-                resolve_live_model_metadata(provider.as_ref(), &settings.model).await
-            } else {
-                LiveModelMetadata {
-                    context_window: None,
-                    max_output_tokens: None,
-                    price: None,
-                    provider_capabilities: None,
-                }
-            };
-            let effective_max_tokens =
-                effective_max_tokens_for_model(&settings, live.max_output_tokens);
-            println!("provider:   {}", provider_label(settings.provider));
+            println!("provider:   {}", settings.provider.as_str());
             println!("model:      {}", settings.model);
             println!("execution:  {}", settings.execution.as_str());
             println!("base_url:   {}", settings.base_url);
             if let Some(mcp_url) = &settings.mcp_url {
                 println!("mcp_url:    {mcp_url}");
             }
-            println!("max_tokens: {}", effective_max_tokens);
-            if let Some(limit) = live.max_output_tokens {
-                println!("model_max_output_tokens: {limit}");
-            }
+            println!("max_tokens: {}", settings.max_tokens);
             println!(
                 "thinking:   {}",
                 settings

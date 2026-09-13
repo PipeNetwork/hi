@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use hi_agent::{Agent, Observation, ObservationSink, ReviewStatus, TurnOutcome, VerifyStage};
+use hi_agent::{Agent, Observation, ObservationSink, ReviewStatus, TurnOutcome};
 use hi_rsi_runtime::ManagedRuntimeDescriptor;
 use hi_trace::{TraceIdentity, TraceMode, TraceSummary, TraceWriter};
 
@@ -12,17 +12,20 @@ use crate::config::{Cli, RsiRequested};
 use crate::goal_report;
 use crate::rsi_observation::TraceObservationSink;
 
-pub(crate) fn pipeline_command(stages: &[VerifyStage]) -> Option<String> {
-    if stages.is_empty() {
-        return None;
+pub(crate) fn pipeline_command<'a, I>(commands: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let commands: Vec<&str> = commands
+        .into_iter()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .collect();
+    if commands.is_empty() {
+        None
+    } else {
+        Some(commands.join(" && "))
     }
-    Some(
-        stages
-            .iter()
-            .map(|s| s.command.as_str())
-            .collect::<Vec<_>>()
-            .join(" && "),
-    )
 }
 
 pub(crate) fn one_shot_exit_code(

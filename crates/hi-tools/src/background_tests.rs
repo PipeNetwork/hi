@@ -517,6 +517,7 @@ async fn empty_polls_escalate_and_fresh_output_resets() {
     let _ = registry.poll(&id).unwrap();
     let _ = registry.poll(&id).unwrap();
     assert_eq!(strikes(&registry, &id), 2);
+    assert_eq!(registry.consecutive_empty_polls(&id).unwrap(), 2);
     registry.kill(&id).unwrap();
 }
 

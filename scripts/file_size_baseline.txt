@@ -60,7 +60,7 @@
 1445 crates/hi-cli/src/bestof.rs
 856 crates/hi-cli/src/candidate_gate.rs
 1658 crates/hi-cli/src/commands.rs
-1124 crates/hi-cli/src/config/file.rs
+1125 crates/hi-cli/src/config/file.rs
 3664 crates/hi-cli/src/config/tests.rs
 1289 crates/hi-cli/src/delegate.rs
 843 crates/hi-cli/src/delegate_tests.rs
@@ -70,7 +70,7 @@
 854 crates/hi-cli/src/outcome_route.rs
 1333 crates/hi-cli/src/pipefs.rs
 1620 crates/hi-cli/src/repl.rs
-818 crates/hi-cli/src/report.rs
+821 crates/hi-cli/src/report.rs
 812 crates/hi-cli/src/rsi_observation.rs
 1262 crates/hi-cli/src/resource_governor.rs
 1840 crates/hi-cli/src/rsi_remote.rs
@@ -78,7 +78,7 @@
 3384 crates/hi-cli/src/sync.rs
 945 crates/hi-cli/src/sync_store.rs
 900 crates/hi-cli/src/team_bench.rs
-1781 crates/hi-cli/src/workflow_cmd.rs
+1787 crates/hi-cli/src/workflow_cmd.rs
 1662 crates/hi-eval/src/artifacts.rs
 840 crates/hi-eval/src/baseline.rs
 1080 crates/hi-eval/src/judge.rs
@@ -89,7 +89,8 @@
 1149 crates/hi-lsp/src/manager.rs
 1959 crates/hi-tools/src/background.rs
 2668 crates/hi-tools/src/background_tasks.rs
-1072 crates/hi-tools/src/catalog.rs
+811 crates/hi-tools/src/background_tests.rs
+1081 crates/hi-tools/src/catalog.rs
 3411 crates/hi-tools/src/checkpoint.rs
 1197 crates/hi-tools/src/edit.rs
 1939 crates/hi-tools/src/fast_feedback.rs
@@ -97,8 +98,8 @@
 1286 crates/hi-tools/src/hf.rs
 1548 crates/hi-tools/src/hf_downloader.rs
 1102 crates/hi-tools/src/internal_snapshot.rs
-1392 crates/hi-tools/src/lib.rs
-993 crates/hi-tools/src/process.rs
+1406 crates/hi-tools/src/lib.rs
+1238 crates/hi-tools/src/process.rs
 941 crates/hi-tools/src/read.rs
 1539 crates/hi-tools/src/repo_map.rs
 2012 crates/hi-tools/src/sandbox.rs
@@ -118,7 +119,7 @@
 846 crates/hi-tui/src/app/voice.rs
 4567 crates/hi-tui/src/dashboard.rs
 820 crates/hi-tui/src/event.rs
-984 crates/hi-tui/src/keys.rs
+1012 crates/hi-tui/src/keys.rs
 1795 crates/hi-tui/src/lib.rs
 3842 crates/hi-tui/src/loops.rs
 1686 crates/hi-tui/src/render.rs

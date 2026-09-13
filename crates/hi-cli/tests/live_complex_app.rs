@@ -35,14 +35,59 @@ fn copy_tree(src: &Path, dest: &Path) {
 }
 
 fn run_turn(workspace: &Path, report: &Path, prompt: &str) -> serde_json::Value {
-    let output = Command::new(hi_bin())
+    let state = report.parent().expect("report parent").join("xdg-state");
+    let child = Command::new(hi_bin())
         .current_dir(workspace)
         .arg("--report")
         .arg(report)
+        .arg("--no-save")
+        .arg("--no-memory")
+        .arg("--no-finalize")
         .arg(prompt)
         .env("HI_SUGGEST_NEXT_PROMPT", "0")
-        .output()
+        .env("HI_DISABLE_UPDATE_CHECK", "1")
+        .env("HI_DISABLE_FEEDBACK", "1")
+        .env("XDG_STATE_HOME", &state)
+        // Grok's bash tool defaults to a 120s foreground timeout. hi's
+        // unlimited path can sit on `cargo test | tail` forever.
+        .env("HI_BASH_TIMEOUT_SECS", "120")
+        .env("HI_BASH_TIMEOUT_MAX_SECS", "120")
+        // Temp-dir copies otherwise isolate Cargo into `.hi/state/cargo-home`
+        // and rebuild aws-lc from scratch on every live run.
+        .env("HI_SANDBOX", "off")
+        .env("HI_PIPE_SSE_IDLE_SECS", "60")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("spawn live hi");
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = match rx.recv_timeout(Duration::from_secs(8 * 60)) {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => panic!("live hi wait failed: {error}"),
+        Err(_) => {
+            let _ = Command::new("pkill")
+                .args(["-P", &pid.to_string()])
+                .status();
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            let dump = rx
+                .recv_timeout(Duration::from_secs(2))
+                .ok()
+                .and_then(Result::ok)
+                .map(|output| {
+                    format!(
+                        "stdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                })
+                .unwrap_or_default();
+            panic!("live hi exceeded 8 minutes (pid {pid})\n{dump}");
+        }
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -86,6 +131,26 @@ fn tool_names(report: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+fn tool_entries(report: &serde_json::Value) -> &[serde_json::Value] {
+    report
+        .pointer("/tools")
+        .and_then(|value| value.as_array())
+        .map(|values| values.as_slice())
+        .unwrap_or(&[])
+}
+
+fn is_source_inspect_loop(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let inspects_bytes = lower.contains("od -")
+        || lower.contains("| od")
+        || lower.contains("xxd")
+        || lower.contains("cat -a")
+        || lower.contains("cat -v");
+    let hunts_redacted_password = lower.contains("password=")
+        && (lower.contains("python") || lower.contains("sed -n") || inspects_bytes);
+    inspects_bytes || hunts_redacted_password
+}
+
 fn outcome_status(report: &serde_json::Value) -> String {
     report
         .pointer("/outcome/status")
@@ -125,6 +190,10 @@ struct LiveTurn {
     visible: String,
     requests: u64,
     elapsed: Duration,
+    inspect_loops: Vec<String>,
+    redacted_source: Vec<String>,
+    admitted_probes: usize,
+    refused_probes: usize,
 }
 
 struct LiveExpect {
@@ -134,6 +203,9 @@ struct LiveExpect {
     forbid_no_progress_empty: bool,
     forbid_withhold_before_edit: bool,
     forbid_request_limit: bool,
+    forbid_inspect_loop: bool,
+    forbid_source_password_redaction: bool,
+    forbid_detached_probe_spam: bool,
     require_files: bool,
     require_completed_if_empty: bool,
 }
@@ -147,6 +219,9 @@ impl LiveExpect {
             forbid_no_progress_empty: true,
             forbid_withhold_before_edit: true,
             forbid_request_limit: true,
+            forbid_inspect_loop: true,
+            forbid_source_password_redaction: true,
+            forbid_detached_probe_spam: true,
             require_files: false,
             require_completed_if_empty: false,
         }
@@ -162,6 +237,10 @@ fn copy_chat_fixture() -> (tempfile::TempDir, PathBuf) {
     let root = tempfile::TempDir::new().unwrap();
     let workspace = root.path().join("chat");
     copy_tree(&src, &workspace);
+    let _ = Command::new("cargo")
+        .current_dir(&workspace)
+        .args(["test", "--offline", "--no-run"])
+        .status();
     (root, workspace)
 }
 
@@ -170,9 +249,62 @@ fn collect_turn(workspace: &Path, report_path: &Path, prompt: &str) -> LiveTurn 
     let report = run_turn(workspace, report_path, prompt);
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_secs(8 * 60),
+        elapsed < Duration::from_secs(8 * 60 + 15),
         "live turn hung: {elapsed:?}"
     );
+    let inspect_loops = tool_entries(&report)
+        .iter()
+        .filter(|entry| entry.get("name").and_then(|name| name.as_str()) == Some("bash"))
+        .filter_map(|entry| entry.get("arguments").and_then(|value| value.as_str()))
+        .filter(|arguments| is_source_inspect_loop(arguments))
+        .map(str::to_owned)
+        .collect();
+    let redacted_source = tool_entries(&report)
+        .iter()
+        .filter_map(|entry| {
+            let output = entry.get("output").and_then(|value| value.as_str())?;
+            if output.contains("password=[REDACTED_SECRET]")
+                || output.contains("password=\"[REDACTED_SECRET]")
+                || output.contains("contains(\"password=\"[REDACTED_SECRET]")
+            {
+                Some(output.chars().take(240).collect::<String>())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut admitted_probes = 0usize;
+    let mut refused_probes = 0usize;
+    for entry in tool_entries(&report) {
+        if entry.get("name").and_then(|name| name.as_str()) != Some("bash") {
+            continue;
+        }
+        let arguments = entry
+            .get("arguments")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let command = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("command")
+                    .and_then(|command| command.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| arguments.to_string());
+        if hi_tools::bash_repeat_key(&command).is_none() {
+            continue;
+        }
+        let output = entry
+            .get("output")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if hi_tools::is_probe_refusal(output) {
+            refused_probes += 1;
+        } else {
+            admitted_probes += 1;
+        }
+    }
     LiveTurn {
         files: changed_files(&report),
         status: outcome_status(&report),
@@ -185,6 +317,10 @@ fn collect_turn(workspace: &Path, report_path: &Path, prompt: &str) -> LiveTurn 
             .and_then(|value| value.as_u64())
             .unwrap_or(0),
         elapsed,
+        inspect_loops,
+        redacted_source,
+        admitted_probes,
+        refused_probes,
     }
 }
 
@@ -256,6 +392,38 @@ fn assert_live_turn(label: &str, turn: &LiveTurn, expect: LiveExpect) {
             turn.stop,
             turn.requests,
             turn.assistant
+        );
+    }
+    if expect.forbid_inspect_loop {
+        assert!(
+            turn.inspect_loops.len() < 4,
+            "{label} fell into a bash/od/xxd inspect loop: status={} stop={} requests={} tools={:?} loops={:?}",
+            turn.status,
+            turn.stop,
+            turn.requests,
+            turn.names,
+            turn.inspect_loops
+        );
+    }
+    if expect.forbid_source_password_redaction {
+        assert!(
+            turn.redacted_source.is_empty(),
+            "{label} redacted source fixture passwords: status={} stop={} requests={} samples={:?}",
+            turn.status,
+            turn.stop,
+            turn.requests,
+            turn.redacted_source
+        );
+    }
+    if expect.forbid_detached_probe_spam {
+        assert!(
+            turn.admitted_probes < 3,
+            "{label} spawned too many detached target/debug|cargo-run probes: admitted={} refused={} status={} stop={} tools={:?}",
+            turn.admitted_probes,
+            turn.refused_probes,
+            turn.status,
+            turn.stop,
+            turn.names
         );
     }
     if expect.require_files {
@@ -343,10 +511,10 @@ fn break_account_surface(html: &str) -> String {
         "    <button id=\"register\" type=\"button\">Create account</button>\n",
         "",
     );
-    if let Some(start) = out.find("$(\"register\").addEventListener") {
-        if let Some(rel) = out[start..].find("\n$(\"composer\")") {
-            out.replace_range(start..start + rel, "");
-        }
+    if let Some(start) = out.find("$(\"register\").addEventListener")
+        && let Some(rel) = out[start..].find("\n$(\"composer\")")
+    {
+        out.replace_range(start..start + rel, "");
     }
     out
 }
@@ -605,6 +773,62 @@ $("composer").addEventListener("submit", (event) => {
         html_wires_register(form),
         "a register form that POSTs /register must count as wired:\n{form}"
     );
+}
+
+#[test]
+fn source_inspect_loop_detects_od_xxd_and_password_hunts() {
+    assert!(is_source_inspect_loop(
+        r#"sed -n '576,579p' src/web.rs | od -c"#
+    ));
+    assert!(is_source_inspect_loop(
+        r#"python3 -c "print(open('src/ws.rs','rb').read())" | xxd"#
+    ));
+    assert!(is_source_inspect_loop(
+        r#"python3 -c "data=open('src/ws.rs','rb').read(); print(data[data.find(b'password='):])""#
+    ));
+    assert!(!is_source_inspect_loop("cargo test --offline --quiet"));
+    assert!(!is_source_inspect_loop("rg -n password src/web.rs"));
+}
+
+#[test]
+fn copied_chat_fixture_keeps_integration_rs() {
+    let src = PathBuf::from("/Users/david/chat");
+    if !src.join("tests/integration.rs").exists() {
+        return;
+    }
+    let root = tempfile::TempDir::new().unwrap();
+    let workspace = root.path().join("chat");
+    copy_tree(&src, &workspace);
+    assert!(
+        workspace.join("tests/integration.rs").is_file(),
+        "live copy must keep tests/integration.rs so the TUI stall is exercised"
+    );
+}
+
+#[test]
+fn live_tui_probe_shapes_share_one_repeat_key() {
+    let chat = "cd /Users/david/chat && CHAT_ADDR=127.0.0.1:0 ./target/debug/chat > /tmp/chat-out.txt &\nsleep 1\nADDR=$(grep listening /tmp/chat-out.txt)";
+    let env_tweak =
+        "RUST_LOG=debug CHAT_ADDR=127.0.0.1:0 ./target/debug/chat > /tmp/out.txt &\nsleep 1";
+    let cargo_run = "cargo run >/tmp/srv.log 2>/tmp/srv.err &\nsleep 2\ncat /tmp/srv.log";
+    let python = "python3 -c 'import subprocess,time; subprocess.Popen([\"./target/debug/chat\"]); time.sleep(1.2)'";
+    assert_eq!(
+        hi_tools::bash_repeat_key(chat),
+        Some("detached-binary-probe")
+    );
+    assert_eq!(
+        hi_tools::bash_repeat_key(chat),
+        hi_tools::bash_repeat_key(env_tweak)
+    );
+    assert_eq!(
+        hi_tools::bash_repeat_key(cargo_run),
+        Some("detached-binary-probe")
+    );
+    assert_eq!(
+        hi_tools::bash_repeat_key(python),
+        Some("detached-binary-probe")
+    );
+    assert_eq!(hi_tools::bash_repeat_key("cargo test --offline"), None);
 }
 
 #[test]

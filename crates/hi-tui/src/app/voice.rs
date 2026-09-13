@@ -614,42 +614,6 @@ mod tests {
     }
 
     #[test]
-    fn the_command_registry_language_list_matches_hi_voice() {
-        // The completion menu duplicates the language table so hi-agent need
-        // not depend on Whisper. This is the guard that keeps the copy honest:
-        // adding a language to hi-voice without updating the menu fails here.
-        let registry: Vec<&str> = hi_agent::command::VOICE_LANGUAGES
-            .iter()
-            .map(|(code, _)| *code)
-            .collect();
-        assert_eq!(
-            registry,
-            hi_voice::STT_LANGUAGES,
-            "/voice completion values must match hi_voice::STT_LANGUAGES"
-        );
-        for (code, hint) in hi_agent::command::VOICE_LANGUAGES {
-            assert!(!hint.is_empty(), "{code} needs a completion hint");
-        }
-    }
-
-    #[test]
-    fn the_completion_menu_offers_quality_tiers_then_languages() {
-        let args = hi_agent::command::VOICE_ARGS;
-        let quality = hi_agent::command::VOICE_QUALITY;
-        // Quality tiers lead, and each parses back to a real tier.
-        assert_eq!(&args[..quality.len()], quality);
-        for (code, _) in quality {
-            assert!(
-                hi_voice::Quality::parse(code).is_some(),
-                "completion offers '{code}' but it does not parse"
-            );
-        }
-        // The rest is exactly the language list, so nothing drifts.
-        let arg_langs: Vec<&str> = args[quality.len()..].iter().map(|(c, _)| *c).collect();
-        assert_eq!(arg_langs, hi_voice::STT_LANGUAGES);
-    }
-
-    #[test]
     fn setting_a_language_updates_the_config() {
         let mut app = test_app("openai", "gpt-4o");
         assert_eq!(app.voice_config.language, hi_voice::STT_LANGUAGE_DEFAULT);

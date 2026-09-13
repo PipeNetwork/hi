@@ -133,6 +133,7 @@ mod action_fusion;
 mod attribution;
 mod background;
 mod background_tasks;
+mod bash_repeat;
 pub mod candidate_workspace;
 pub mod catalog;
 pub mod checkpoint;
@@ -177,6 +178,7 @@ pub use background_tasks::{
     BackgroundTaskRegistry, BackgroundTaskState, BackgroundTaskTeardown, BgFuture,
     DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
 };
+pub use bash_repeat::{STOP_AFTER_PROBE_REFUSALS, bash_repeat_key, is_probe_refusal};
 pub use codebase_graph::references_by_name;
 pub use command_display::{peel_cd_for_title, strip_redundant_session_cd};
 pub use condense::condense_diagnostics;
@@ -633,6 +635,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_facing_read_output_keeps_source_fixture_passwords() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-tool-fixture-pw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ws.rs"),
+            "/// `/ws/<channel>?user=bob&password=secret`\n\
+             // A raw `password=` query is still accepted.\n\
+             assert!(!INDEX_HTML.contains(\"password=\"),\n\
+             \"password leaked into a URL\");\n\
+             parse_ws_password(\"/ws/general?user=bob&password=secret\");\n",
+        )
+        .unwrap();
+
+        let outcome = crate::execute_in(&dir, "read", r#"{"path":"ws.rs"}"#).await;
+        assert!(
+            outcome.content.contains("password=secret"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("contains(\"password=\")"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            !outcome.content.contains("REDACTED_SECRET"),
+            "{}",
+            outcome.content
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn read_of_chat_fixture_keeps_password_secret_literals() {
+        let chat = std::path::Path::new("/Users/david/chat");
+        if !chat.join("src/ws.rs").is_file() {
+            return;
+        }
+        for path in ["src/ws.rs", "src/web.rs"] {
+            let args = serde_json::json!({ "path": path }).to_string();
+            let outcome = crate::execute_in(chat, "read", &args).await;
+            assert_eq!(
+                outcome.status,
+                crate::ToolStatus::Succeeded,
+                "{path}: {}",
+                outcome.content
+            );
+            assert!(
+                !outcome.content.contains("password=[REDACTED_SECRET]"),
+                "{path} assignment redacted:\n{}",
+                outcome.content
+            );
+            assert!(
+                !outcome
+                    .content
+                    .contains("contains(\"password=\"[REDACTED_SECRET]"),
+                "{path} assert literal redacted:\n{}",
+                outcome.content
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn multi_edit_applies_in_order_and_is_atomic() {
         let dir = std::env::temp_dir().join(format!("hi-medit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -910,6 +982,148 @@ mod tests {
             clock.elapsed()
         );
         let _ = background.kill(&id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bash_output_second_wait_on_silent_handle_returns_immediately() {
+        let dir = unique_test_dir("hi-silent-handle-peek");
+        let state = dir.join(".hi/state");
+        std::fs::create_dir_all(&state).unwrap();
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir).unwrap());
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
+
+        let started = crate::execute_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            &repo_map,
+            "bash",
+            r#"{"command":"sleep 600","run_in_background":true}"#,
+        )
+        .await;
+        let id = started.background.as_ref().unwrap().id.clone();
+        let _ = crate::execute_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            &repo_map,
+            "bash_output",
+            &serde_json::json!({ "id": id, "wait_secs": 0 }).to_string(),
+        )
+        .await;
+
+        let clock = std::time::Instant::now();
+        let second = crate::execute_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            &repo_map,
+            "bash_output",
+            &serde_json::json!({ "id": id, "wait_secs": 120 }).to_string(),
+        )
+        .await;
+        assert!(
+            clock.elapsed() < std::time::Duration::from_secs(2),
+            "second wait on a silent handle must not block: {:?}",
+            clock.elapsed()
+        );
+        assert!(
+            second.content.contains("Do not poll this handle again"),
+            "{}",
+            second.content
+        );
+        let _ = background.kill(&id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bash_strips_trailing_tail_pager_so_output_can_stream() {
+        let dir = unique_test_dir("hi-strip-tail-pager");
+        let state = dir.join(".hi/state");
+        std::fs::create_dir_all(&state).unwrap();
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir).unwrap());
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
+
+        let started = crate::execute_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            &repo_map,
+            "bash",
+            r#"{"command":"sh -c 'echo streamed; sleep 600' 2>&1 | tail -60","run_in_background":true}"#,
+        )
+        .await;
+        let id = started.background.as_ref().unwrap().id.clone();
+        let polled = crate::execute_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            &repo_map,
+            "bash_output",
+            &serde_json::json!({ "id": id, "wait_secs": 5 }).to_string(),
+        )
+        .await;
+        assert!(
+            polled.content.contains("streamed"),
+            "stripped pager must let producer output through: {}",
+            polled.content
+        );
+        let _ = background.kill(&id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn third_detached_chat_probe_is_refused_on_shared_runner() {
+        let dir = unique_test_dir("hi-probe-repeat");
+        let state = dir.join(".hi/state");
+        std::fs::create_dir_all(&state).unwrap();
+        let runner = crate::ProcessRunner::new(&dir).unwrap();
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir).unwrap());
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Arc::new(std::sync::Mutex::new(crate::RepoMapCache::new()));
+        let cmd = r#"{"command":"./target/debug/chat > /tmp/out.txt &\nsleep 0.01\necho PORT=1"}"#;
+        let mut last = None;
+        for _ in 0..3 {
+            last = Some(
+                crate::execute_in_runtime_shared_with_runner(
+                    &runner,
+                    &dir,
+                    &state,
+                    &lsp,
+                    &background,
+                    &cache,
+                    &repo_map,
+                    None,
+                    None,
+                    "bash",
+                    cmd,
+                )
+                .await,
+            );
+        }
+        let last = last.unwrap();
+        assert_eq!(last.status, crate::ToolStatus::Failed);
+        assert!(
+            last.content.contains("already ran this turn"),
+            "{}",
+            last.content
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -122,18 +122,10 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     out
 }
 
+#[derive(Default)]
 struct EvidenceReducerState {
     config: crate::EvidenceReducerConfig,
     hook: Option<crate::EvidenceReducerHook>,
-}
-
-impl Default for EvidenceReducerState {
-    fn default() -> Self {
-        Self {
-            config: crate::EvidenceReducerConfig::default(),
-            hook: None,
-        }
-    }
 }
 
 fn reduce_condensed_stream(
@@ -165,6 +157,7 @@ pub struct ProcessRunner {
     cargo_home: Option<PathBuf>,
     private_temp: Option<PathBuf>,
     evidence_reducer: Arc<Mutex<EvidenceReducerState>>,
+    bash_repeats: Arc<Mutex<std::collections::HashMap<String, u32>>>,
 }
 
 impl std::fmt::Debug for ProcessRunner {
@@ -221,6 +214,14 @@ impl ProcessRunner {
     /// Policy requested via `HI_SANDBOX` (may be unenforced on this OS).
     pub fn sandbox_policy(&self) -> crate::sandbox::SandboxPolicy {
         self.sandbox.policy()
+    }
+
+    pub fn reset_bash_repeats(&self) {
+        crate::bash_repeat::reset_bash_repeats(&self.bash_repeats);
+    }
+
+    pub fn admit_bash_repeat(&self, command: &str) -> Option<String> {
+        crate::bash_repeat::admit_bash_repeat(&self.bash_repeats, command)
     }
 
     /// Install quote-checked reduction after diagnostic condense. Clones share

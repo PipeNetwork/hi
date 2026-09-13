@@ -13,7 +13,7 @@ use steering::{
 
 use std::time::Instant;
 
-use hi_agent::ui::tool_label;
+use crate::util::tool_label;
 use ratatui::style::Style;
 use ratatui::text::Line;
 
@@ -64,9 +64,9 @@ impl crate::App {
     pub(crate) fn push_user_prompt(&mut self, line: Line<'static>) {
         self.record_projected_user_prompt(&line);
         self.freeze_verb_group();
-        if self.following {
-            self.page_flip_on_send = true;
-        }
+        // Grok `page_flip_on_send`: pin this prompt at the top of the
+        // viewport so the response starts on a fresh page.
+        self.page_flip_on_send = true;
         self.transcript.push(crate::review::user_prompt_entry(
             line,
             std::time::SystemTime::now(),
@@ -318,9 +318,9 @@ impl crate::App {
         }
     }
 
-    /// Commit any buffered reasoning as a single collapsible entry, then clear
-    /// the buffer. Called when the reasoning phase ends (first text arrives, or
-    /// the message ends) so the reasoning isn't flooded inline.
+    /// Commit any buffered reasoning as a standalone collapsible `Thought for Xs`
+    /// row. Grok keeps thinking as its own scrollback block so Ctrl+E / click
+    /// can expand it; do not fold it into a Read/Search group.
     pub(crate) fn flush_reasoning(&mut self) {
         if self.reasoning_buffer.is_empty() {
             self.reasoning_started = None;
@@ -331,19 +331,26 @@ impl crate::App {
             .map(|t| t.elapsed())
             .unwrap_or_default();
         let text = std::mem::take(&mut self.reasoning_buffer);
+        self.reasoning_started = None;
         self.transcript.push(TranscriptEntry::Reasoning {
             text,
             elapsed,
             expanded: false,
         });
         self.bump_transcript();
-        self.reasoning_started = None;
         self.cap_transcript();
     }
 
-    /// In-flight thinking row (grok-build "Thinking…") while chunks are still
+    /// In-flight thinking row (grok "Thinking...") while chunks are still
     /// arriving and have not been committed as a `Reasoning` entry.
     pub(crate) fn live_thinking_lines(&self) -> Vec<ratatui::text::Line<'static>> {
+        self.live_thinking_lines_wrapped(crate::thinking::THINKING_WRAP_COLS as u16)
+    }
+
+    pub(crate) fn live_thinking_lines_wrapped(
+        &self,
+        wrap_cols: u16,
+    ) -> Vec<ratatui::text::Line<'static>> {
         if self.reasoning_buffer.trim().is_empty() {
             return Vec::new();
         }
@@ -351,11 +358,12 @@ impl crate::App {
             .reasoning_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
-        crate::thinking::thinking_block_lines(
+        crate::thinking::thinking_block_lines_wrapped(
             &self.reasoning_buffer,
             elapsed,
             self.show_reasoning,
             true,
+            wrap_cols,
         )
     }
 
@@ -489,18 +497,9 @@ impl crate::App {
                 if self.reasoning_started.is_none() {
                     self.reasoning_started = Some(Instant::now());
                 }
-                // Grok-build folds thoughts among an open explore burst into
-                // that row instead of a standalone thinking block.
-                let elapsed = self
-                    .reasoning_started
-                    .map(|started| started.elapsed())
-                    .unwrap_or_default();
-                if let Some(group) = self.open_verb_group_mut() {
-                    group.thinking.push_str(&text);
-                    group.thinking_elapsed = elapsed;
-                    self.bump_transcript();
-                    return;
-                }
+                // Live thoughts stay in the buffer so the tail `Thinking...`
+                // row keeps streaming. Finished thoughts fold into an open
+                // explore group on flush (grok `group_tool_verbs`).
                 self.reasoning_buffer.push_str(&text);
                 self.bump_transcript();
             }
@@ -511,7 +510,7 @@ impl crate::App {
                 self.turn_rounds = self.turn_rounds.saturating_add(1);
                 self.flush_reasoning();
                 let generic = generic_completion_guards_enabled()
-                    && hi_agent::answer_is_generic_completion_placeholder(&self.current_assistant);
+                    && could_be_generic_completion_prefix(&self.current_assistant);
                 if !generic && self.current_assistant_streamed_bytes < self.current_assistant.len()
                 {
                     let unstreamed =
@@ -610,10 +609,10 @@ impl crate::App {
                 // leftover ↳ subagent notes (typed Subagent rows own that),
                 // and paint the rest as an unguttered dim line so it cannot be
                 // mistaken for a Read/Edit/Run row.
-                let Some(text) = hi_agent::ui::user_facing_status(&text) else {
+                if text.trim().is_empty() {
                     return;
-                };
-                if hi_agent::ui::is_live_progress_status(&text) {
+                }
+                if text.contains("…") && text.len() < 80 {
                     self.event_log.push(format!("live_status {text}"));
                     self.last_turn_event = Some(TurnEventKind::Status);
                     self.working_status = Some(text);
@@ -644,9 +643,9 @@ impl crate::App {
                 }
             }
             UiEvent::TopStatus { text } => {
-                let Some(text) = hi_agent::ui::user_facing_status(&text) else {
+                if text.trim().is_empty() {
                     return;
-                };
+                }
                 self.event_log.push(format!("top_status {text}"));
                 self.top_notice = Some(text);
             }
@@ -775,13 +774,7 @@ impl crate::App {
                 self.bump_transcript();
                 self.cap_transcript();
             }
-            UiEvent::DiffRunUpdated { snapshot } => {
-                if let Some(overlay) = self.diff_lab.as_mut()
-                    && overlay.snapshot.run_id == snapshot.run_id
-                {
-                    overlay.snapshot = snapshot;
-                }
-            }
+            UiEvent::DiffRunUpdated { .. } => {}
             UiEvent::SubagentSpawned {
                 id,
                 subagent_kind,
@@ -813,24 +806,6 @@ impl crate::App {
     ) {
         self.event_log.push(format!("subagent_spawned {kind} {id}"));
         let started_at = Instant::now();
-        self.subagents.insert(
-            id.clone(),
-            crate::subagent_overlay::SubagentInfo {
-                id: id.clone(),
-                kind: kind.clone(),
-                description: description.clone(),
-                background,
-                activity: if background {
-                    String::new()
-                } else {
-                    "running".into()
-                },
-                started_at,
-                finished: None,
-                summary: String::new(),
-                lines: Vec::new(),
-            },
-        );
         self.freeze_verb_group();
         self.flush_pending();
         self.push_activity(ActivityKind::Subagent {
@@ -849,23 +824,8 @@ impl crate::App {
         });
     }
 
-    fn apply_subagent_progress(&mut self, id: String, activity: String, line: Option<String>) {
-        if let Some(info) = self.subagents.get_mut(&id) {
-            if !activity.is_empty() {
-                info.activity = activity.clone();
-            }
-            if let Some(line) = line {
-                let line = line.trim();
-                if !line.is_empty() && info.lines.len() < 200 {
-                    info.lines.push(line.to_string());
-                }
-            }
-        }
+    fn apply_subagent_progress(&mut self, id: String, activity: String, _line: Option<String>) {
         if activity.is_empty() {
-            return;
-        }
-        let background = self.subagents.get(&id).is_some_and(|info| info.background);
-        if background {
             return;
         }
         if let Some(block) = self.subagent_block_mut(&id)
@@ -890,34 +850,7 @@ impl crate::App {
     ) {
         self.event_log
             .push(format!("subagent_finished {id} {status}"));
-        let background = self.subagents.get(&id).is_some_and(|info| info.background);
-        let (kind, description, started_at) = self
-            .subagents
-            .get(&id)
-            .map(|info| (info.kind.clone(), info.description.clone(), info.started_at))
-            .unwrap_or_else(|| ("task".into(), id.clone(), Instant::now()));
-        if let Some(info) = self.subagents.get_mut(&id) {
-            info.finished = Some((status.clone(), elapsed_ms));
-            info.summary = summary.clone();
-            if !summary.is_empty() && info.lines.len() < 200 {
-                info.lines.push(summary.clone());
-            }
-        }
-        if background {
-            self.freeze_verb_group();
-            self.flush_pending();
-            self.push_activity(ActivityKind::Subagent {
-                id,
-                kind,
-                description,
-                background: true,
-                activity: String::new(),
-                status: Some(status),
-                started_at,
-                elapsed_ms,
-            });
-            return;
-        }
+        let _ = summary;
         if let Some(block) = self.subagent_block_mut(&id)
             && let ActivityKind::Subagent {
                 status: row_status,
@@ -948,7 +881,7 @@ impl crate::App {
         if activity_feed::is_parent_subagent_tool(name) {
             return;
         }
-        let display_result = hi_agent::ui::user_visible_tool_result(result);
+        let display_result = result.to_string();
         if let Some(verb) = ExploreVerb::from_tool(name) {
             self.note_explore_result(verb, label_detail(label), &display_result);
             return;
@@ -1124,28 +1057,18 @@ impl crate::App {
         self.cap_transcript();
     }
 
-    /// Steal trailing CoT and short steering lines so they live inside the
-    /// explore row instead of sitting above it.
+    /// Steal short steering lines so they live inside the explore row.
+    /// Thinking stays a first-class `Reasoning` row so Ctrl+E / click can
+    /// expand it (grok keeps thought blocks separate from Read/Search groups).
     fn take_explore_chrome(&mut self) -> ExploreChrome {
         let mut steal: Vec<usize> = Vec::new();
         for i in (0..self.transcript.len()).rev() {
             match &self.transcript[i] {
-                TranscriptEntry::Reasoning { .. } => steal.push(i),
-                TranscriptEntry::Line(_) => continue,
+                TranscriptEntry::Reasoning { .. } | TranscriptEntry::Line(_) => continue,
                 TranscriptEntry::AssistantMessage { text } if is_steering_assistant_text(text) => {
                     steal.push(i);
                 }
-                TranscriptEntry::AssistantMessage { .. } => {
-                    if let Some(&reason_at) = steal
-                        .iter()
-                        .find(|&&j| matches!(self.transcript[j], TranscriptEntry::Reasoning { .. }))
-                    {
-                        steal.retain(|&j| j >= reason_at);
-                    } else {
-                        steal.clear();
-                    }
-                    break;
-                }
+                TranscriptEntry::AssistantMessage { .. } => break,
                 TranscriptEntry::Activity(_)
                 | TranscriptEntry::UserPrompt { .. }
                 | TranscriptEntry::Btw { .. }
@@ -1156,23 +1079,12 @@ impl crate::App {
         steal.sort_unstable();
         let mut chrome = ExploreChrome::default();
         for i in steal.into_iter().rev() {
-            match self.transcript.remove(i) {
-                TranscriptEntry::Reasoning { text, elapsed, .. } => {
-                    if chrome.thinking.is_empty() {
-                        chrome.thinking = text;
-                    } else {
-                        chrome.thinking = format!("{text}\n{}", chrome.thinking);
-                    }
-                    chrome.thinking_elapsed = chrome.thinking_elapsed.saturating_add(elapsed);
-                }
-                TranscriptEntry::AssistantMessage { text } => {
-                    for line in text.lines().rev() {
-                        if !line.trim().is_empty() {
-                            chrome.steering.insert(0, line.to_string());
-                        }
+            if let TranscriptEntry::AssistantMessage { text } = self.transcript.remove(i) {
+                for line in text.lines().rev() {
+                    if !line.trim().is_empty() {
+                        chrome.steering.insert(0, line.to_string());
                     }
                 }
-                _ => {}
             }
         }
         chrome

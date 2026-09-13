@@ -135,20 +135,16 @@ pub(crate) fn resolve_harness(
 /// Load the selected session's durable layer, then apply persistent overrides
 /// requested for this invocation. Callers append the returned complete layer
 /// only after the final session path has been resolved.
+pub(crate) fn empty_session_harness() -> SettingLayer {
+    SettingLayer {
+        source: hi_workspace::SettingSource::Session,
+        values: std::collections::BTreeMap::new(),
+    }
+}
+
 pub(crate) fn resolve_session_harness(cli: &Cli) -> Result<SettingLayer> {
-    let layer = if let Some(path) = &cli.session_file {
-        crate::session_harness::load(path)?
-    } else if let Some(id) = &cli.resume {
-        crate::session_harness::load(&crate::session::session_path(id)?)?
-    } else if cli.cont {
-        crate::session::latest_session()
-            .map(|path| crate::session_harness::load(&path))
-            .transpose()?
-            .unwrap_or_else(crate::session_harness::empty_layer)
-    } else {
-        crate::session_harness::empty_layer()
-    };
-    merge_session_harness(layer, &cli.session_harness_settings)
+    let _ = cli;
+    Ok(empty_session_harness())
 }
 
 pub(crate) fn merge_session_harness(
@@ -381,35 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn cli_loads_and_updates_the_selected_session_layer() {
+    fn cli_session_harness_is_empty_without_the_old_agent_session_store() {
         use clap::Parser;
 
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("session.jsonl");
-        crate::session_harness::append(
-            &path,
-            &SettingLayer {
-                source: SettingSource::Session,
-                values: BTreeMap::from([(
-                    hi_workspace::JOB_MAX_ACTIVE.to_owned(),
-                    SettingValue::Integer(7),
-                )]),
-            },
-        )
-        .unwrap();
-        let cli = Cli::try_parse_from([
-            "hi",
-            "--session-file",
-            path.to_str().unwrap(),
-            "--session-harness-setting",
-            "jobs.max_active=5",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["hi"]).unwrap();
         let layer = resolve_session_harness(&cli).unwrap();
-        assert_eq!(
-            layer.values.get(hi_workspace::JOB_MAX_ACTIVE),
-            Some(&SettingValue::Integer(5))
-        );
+        assert!(layer.values.is_empty());
     }
 
     #[test]

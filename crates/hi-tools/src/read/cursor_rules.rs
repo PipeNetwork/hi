@@ -142,9 +142,7 @@ fn scan_scope(scope: &Path) -> Vec<ParsedRule> {
 fn parse_rule(path: &Path) -> Option<ParsedRule> {
     let raw = std::fs::read_to_string(path).ok()?;
     let (front, body) = split_frontmatter(&raw);
-    let meta: CursorRuleFrontmatter = front
-        .and_then(|text| serde_yaml_frontmatter(text))
-        .unwrap_or_default();
+    let meta: CursorRuleFrontmatter = front.and_then(serde_yaml_frontmatter).unwrap_or_default();
     Some(ParsedRule {
         path: path.to_path_buf(),
         body: body.trim().to_string(),

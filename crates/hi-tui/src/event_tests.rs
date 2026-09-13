@@ -3,6 +3,7 @@ use hi_events::{
     ActivityObject, ActivityState, ActivityVerb, EventContext, EventError, EventKind, EventReceipt,
     EventSink, RunEvent, SemanticActivity,
 };
+use hi_harness::Ui;
 
 #[derive(Default)]
 struct RecordingEventSink(std::sync::Mutex<Vec<RunEvent>>);
@@ -76,7 +77,7 @@ fn plan_result_closes_semantic_tool_without_visible_result_row() {
     };
     let steps = vec![PlanStep {
         title: "verify the harness".into(),
-        status: hi_agent::PlanStatus::Active,
+        status: hi_tools::PlanStatus::Active,
     }];
 
     ui.plan_result_id(

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::session;
+use crate::paths;
 
 pub(crate) fn absolutize_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
@@ -16,35 +16,7 @@ pub(crate) fn absolutize_path(path: &Path) -> Result<PathBuf> {
 }
 
 pub(crate) fn resolve_runtime_roots() -> Result<(PathBuf, PathBuf)> {
-    let workspace_root = std::env::current_dir()
-        .context("determining workspace root")?
-        .canonicalize()
-        .context("canonicalizing workspace root")?;
-    ensure!(
-        workspace_root.is_dir(),
-        "workspace root is not a directory: {}",
-        workspace_root.display()
-    );
-    let state_root = session::data_root()
-        .map(|root| {
-            root.join("projects")
-                .join(session::cwd_digest())
-                .join("runtime")
-        })
-        .unwrap_or_else(|| workspace_root.join(".hi/state"));
-    std::fs::create_dir_all(&state_root)
-        .with_context(|| format!("creating workspace state root {}", state_root.display()))?;
-    let state_root = state_root.canonicalize().with_context(|| {
-        format!(
-            "canonicalizing workspace state root {}",
-            state_root.display()
-        )
-    })?;
-    ensure!(
-        state_root != workspace_root && !workspace_root.starts_with(&state_root),
-        "workspace state root must not equal or contain the workspace root"
-    );
-    Ok((workspace_root, state_root))
+    crate::paths::resolve_runtime_roots()
 }
 
 /// Change into an explicitly supplied review-target directory.

@@ -8,6 +8,11 @@ use ratatui::text::Line;
 use crate::TranscriptEntry;
 use crate::theme::theme;
 
+/// Trackpad / window-focus jitter still counts as a click so `›` rows expand
+/// instead of becoming a one-character "drag copy". A real drag must change
+/// line or move more than this many columns.
+const CLICK_SLOP_COLS: usize = 2;
+
 /// Drop the decorative left gutter baked into painted transcript lines so
 /// whole-line selection copies content, not chrome. Matches the prefixes used
 /// by [`crate::render::gutter`] (`┃ `) and fenced-code rendering (`▏ `).
@@ -102,13 +107,11 @@ impl crate::App {
             }
             // Left press/drag/release drive text selection; a press with no drag
             // falls through to a fold on release.
+            MouseEventKind::Down(MouseButton::Middle) => {
+                // Grok: unmodified middle click pastes PRIMARY (CLIPBOARD fallback).
+                self.paste_from_primary();
+            }
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.plan_approval.as_ref().is_some_and(|c| c.parked)
-                    && crate::btw::cell_in(self.turn_status_rect, mouse.column, mouse.row)
-                {
-                    self.unpark_plan_approval();
-                    return;
-                }
                 if self.apply_timeline_click(mouse.column, mouse.row) {
                     return;
                 }
@@ -173,7 +176,7 @@ impl crate::App {
     }
 
     /// Left-button release: a real drag copies the selection; a plain click (no
-    /// motion) folds the tool-output block under it.
+    /// motion, or only trackpad slop) folds the `›` block under it, like grok.
     ///
     /// Some terminals omit intermediate `Drag` events and only deliver
     /// Down + Up at different cells. Apply the release point here so that
@@ -188,18 +191,23 @@ impl crate::App {
             return;
         }
         // Finalize the cursor from the release cell even when Drag was dropped.
-        if let Some(point) = self.point_at_clamped(col, row)
-            && self.select_cursor != Some(point)
-        {
+        if let Some(point) = self.point_at_clamped(col, row) {
             self.select_cursor = Some(point);
-            self.select_dragged = true;
         }
-        if self.select_dragged {
+        if self.is_drag_selection() {
+            self.select_dragged = true;
             self.copy_selection();
         } else {
             self.clear_selection();
             self.handle_click(col, row);
         }
+    }
+
+    fn is_drag_selection(&self) -> bool {
+        let (Some(anchor), Some(cursor)) = (self.select_anchor, self.select_cursor) else {
+            return false;
+        };
+        anchor.0 != cursor.0 || anchor.1.abs_diff(cursor.1) > CLICK_SLOP_COLS
     }
 
     /// The selected flattened-line range `(lo, hi)` inclusive, if a selection is
@@ -389,5 +397,87 @@ impl crate::App {
             self.page_flip_on_send = false;
             self.scroll = next as u16;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::activity_feed::{ActivityBlock, ExploreVerb};
+    use crate::tests::test_app;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn foldable_read_group() -> ActivityBlock {
+        let mut block = ActivityBlock::verb_group(ExploreVerb::Read, Some("a.rs".into()));
+        if let Some(group) = block.as_verb_group_mut() {
+            group.add(ExploreVerb::Read, Some("b.rs".into()));
+            group.add(ExploreVerb::List, Some("src".into()));
+            group.live = false;
+        }
+        block
+    }
+
+    fn primed_click_app() -> crate::App {
+        let mut app = test_app("openai", "gpt-4o");
+        app.transcript
+            .push(crate::TranscriptEntry::Activity(foldable_read_group()));
+        app.view_inner = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        app.view_scroll = 0;
+        app.view_prefix = vec![0, 1];
+        app.view_line_texts = vec!["◆ Read 2 files, Listed 1 dir ›".into()];
+        app.block_row_spans = vec![(0, 1, 0)];
+        app
+    }
+
+    fn group_expanded(app: &crate::App) -> bool {
+        match app.transcript.first() {
+            Some(crate::TranscriptEntry::Activity(block)) => block.expanded,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn click_expands_and_collapses_a_read_group() {
+        let mut app = primed_click_app();
+        assert!(app.transcript[0].is_foldable());
+        assert!(!group_expanded(&app));
+        app.handle_click(4, 0);
+        assert!(group_expanded(&app), "click expands the › row");
+        app.handle_click(4, 0);
+        assert!(!group_expanded(&app), "second click collapses");
+    }
+
+    #[test]
+    fn click_with_trackpad_jitter_still_toggles_fold() {
+        let mut app = primed_click_app();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, 0));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 0));
+        assert!(
+            group_expanded(&app),
+            "a 1-column jitter must not become a drag-copy"
+        );
+    }
+
+    #[test]
+    fn mouse_capture_defaults_on_like_grok() {
+        let app = test_app("openai", "gpt-4o");
+        assert!(
+            app.mouse_capture,
+            "click-to-expand needs mouse reporting, as in grok"
+        );
     }
 }

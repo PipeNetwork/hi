@@ -228,8 +228,8 @@ pub async fn login() -> Result<()> {
     if has_credential() {
         println!("already signed in to pipenetwork");
         println!(
-            "  \x1b[2mUse `/provider pipenetwork` (or `hi --provider pipenetwork`).\n  \
-             `/logout pipenetwork` first to pair a different account.\x1b[0m"
+            "  \x1b[2mAPI key is in ~/.config/hi/auth.json.\n  \
+             `hi logout pipenetwork` first to pair a different account.\x1b[0m"
         );
         return Ok(());
     }
@@ -245,7 +245,7 @@ pub async fn login() -> Result<()> {
     println!("\n\x1b[32m  ✓ signed in to pipenetwork\x1b[0m");
     println!(
         "  \x1b[2mAPI key stored in ~/.config/hi/auth.json. \
-         Use it with `hi --provider pipenetwork` or `/provider pipenetwork`.\x1b[0m\n"
+         `hi login pipenetwork` also writes [profiles.pipenetwork] into config.toml.\x1b[0m\n"
     );
     Ok(())
 }

@@ -3,6 +3,7 @@ use std::time::Duration;
 use super::{
     BashArgs, RuntimeResources, definitely_read_only_shell, file_dump_read_arguments,
     managed_handoff_enabled, process_tool_outcome, run_bash_tool_with_auto_background,
+    strip_trailing_output_pager,
 };
 use crate::{ProcessExecution, ProcessOutcome, ToolStatus, TruncationState};
 
@@ -89,6 +90,10 @@ fn file_dump_commands_map_to_read_arguments() {
         Some(serde_json::json!({"path":"SPEC.md","offset":200,"limit":201}))
     );
     assert_eq!(
+        parsed("cd /Users/david/chat && sed -n '125,200p' src/web.rs"),
+        Some(serde_json::json!({"path":"src/web.rs","offset":125,"limit":76}))
+    );
+    assert_eq!(
         parsed("head -n 50 crates/api/src/lib.rs"),
         Some(serde_json::json!({"path":"crates/api/src/lib.rs","limit":50}))
     );
@@ -117,6 +122,38 @@ fn file_dump_commands_map_to_read_arguments() {
     assert!(parsed(r#"grep -n TODO src/ws.rs"#).is_none());
     assert!(parsed(r#"grep -n "" src/ws.rs | wc -l"#).is_none());
     assert!(parsed("cat SPEC.md | wc -l").is_none());
+}
+
+#[test]
+fn trailing_count_pagers_are_stripped_from_bash() {
+    assert_eq!(
+        strip_trailing_output_pager("cd /Users/david/chat && cargo test 2>&1 | tail -60"),
+        "cd /Users/david/chat && cargo test 2>&1"
+    );
+    assert_eq!(
+        strip_trailing_output_pager("timeout 60 cargo test --test integration foo 2>&1 | tail -40"),
+        "timeout 60 cargo test --test integration foo 2>&1"
+    );
+    assert_eq!(
+        strip_trailing_output_pager("cargo test 2>&1 | tail -n 40"),
+        "cargo test 2>&1"
+    );
+    assert_eq!(
+        strip_trailing_output_pager("cargo test | head -20"),
+        "cargo test"
+    );
+    assert_eq!(
+        strip_trailing_output_pager("cargo test | tail -f"),
+        "cargo test | tail -f"
+    );
+    assert_eq!(
+        strip_trailing_output_pager("echo a | wc -l"),
+        "echo a | wc -l"
+    );
+    assert_eq!(
+        strip_trailing_output_pager("tail -20 file"),
+        "tail -20 file"
+    );
 }
 
 #[test]

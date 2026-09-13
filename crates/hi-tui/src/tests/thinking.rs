@@ -22,7 +22,11 @@ fn collapsed_thinking_is_header_only() {
     );
     assert!(
         collapsed_text[0].contains("Thought for"),
-        "grok-build collapsed header: {collapsed_text:?}"
+        "grok collapsed header: {collapsed_text:?}"
+    );
+    assert!(
+        collapsed_text[0].contains('›'),
+        "collapsed thought shows grok's expand chevron: {collapsed_text:?}"
     );
     assert!(
         !collapsed_text.iter().any(|l| l.contains("Check spacing")),
@@ -85,7 +89,7 @@ fn live_thinking_shows_header_until_ctrl_e() {
         .collect();
     assert!(
         live_text.iter().any(|l| l.contains("Thinking")),
-        "running thought uses grok-build Thinking… header: {live_text:?}"
+        "running thought uses grok Thinking... header: {live_text:?}"
     );
     assert!(
         live_text.iter().any(|l| l.contains("inspect the parser")),
@@ -157,7 +161,7 @@ fn expanded_thinking_renders_markdown_and_a_rail() {
         expanded
             .iter()
             .any(|l| l.contains("◆") && l.contains("Thought")),
-        "header keeps the grok-build diamond: {expanded:?}"
+        "header keeps the grok diamond: {expanded:?}"
     );
     assert!(
         expanded.iter().any(|l| l.contains("Why")),
@@ -216,5 +220,143 @@ fn click_or_block_nav_expands_one_thought() {
         closed.len(),
         1,
         "Ctrl-E off collapses per-block thoughts: {closed:?}"
+    );
+}
+
+#[test]
+fn paste_into_prompt_keeps_newlines() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.paste_into_prompt("line one\nline two");
+    assert_eq!(app.input.text(), "line one\nline two");
+    let paste = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('v'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    assert!(app.edit_key(&paste).is_none(), "Ctrl+V must not submit");
+}
+
+#[test]
+fn ctrl_e_expands_thinking_even_with_a_draft() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("follow-up");
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('e'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    assert!(app.edit_key(&key).is_none());
+    assert!(
+        app.show_reasoning,
+        "Ctrl+E toggles thinking while the prompt has text"
+    );
+    assert_eq!(app.input.text(), "follow-up");
+    assert!(app.edit_key(&key).is_none());
+    assert!(!app.show_reasoning);
+    assert_eq!(app.input.text(), "follow-up");
+}
+
+#[test]
+fn ctrl_e_enq_byte_and_block_nav_still_toggle() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.transcript.push(TranscriptEntry::Reasoning {
+        text: "secret plan".into(),
+        elapsed: Duration::from_secs(2),
+        expanded: false,
+    });
+    app.mode = crate::mode::UiMode::BlockNav;
+    let enq = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('\x05'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    assert!(app.edit_key(&enq).is_none());
+    assert!(
+        app.show_reasoning,
+        "ASCII ENQ (raw Ctrl+E) must expand thinking even in block-nav"
+    );
+    let capital = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('E'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    assert!(app.edit_key(&capital).is_none());
+    assert!(!app.show_reasoning);
+}
+
+#[test]
+fn finished_thought_stays_visible_when_explore_tools_start() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Reasoning {
+        text: "I will inspect the parser next.".into(),
+    });
+    app.apply(UiEvent::ToolCall {
+        name: "read".into(),
+        arguments: r#"{"path":"src/lib.rs"}"#.into(),
+    });
+    let lines: Vec<String> = app
+        .transcript
+        .iter()
+        .flat_map(|entry| entry.flatten(false, false, Density::Comfortable))
+        .map(|line| crate::render::line_text(&line))
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Thought for") || l.contains("Thought")),
+        "grok keeps the collapsed thought header after tools start: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("inspect the parser")),
+        "body stays folded until Ctrl+E: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Reading") || l.contains("Read")),
+        "explore tools still group: {lines:?}"
+    );
+
+    app.show_reasoning = true;
+    let expanded: Vec<String> = app
+        .transcript
+        .iter()
+        .flat_map(|entry| entry.flatten(true, false, Density::Comfortable))
+        .map(|line| crate::render::line_text(&line))
+        .collect();
+    assert!(
+        expanded.iter().any(|l| l.contains("inspect the parser")),
+        "Ctrl+E reveals the thought folded into the explore row: {expanded:?}"
+    );
+}
+
+#[test]
+fn live_thinking_after_a_tool_stays_a_thinking_row() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolCall {
+        name: "read".into(),
+        arguments: r#"{"path":"src/lib.rs"}"#.into(),
+    });
+    app.apply(UiEvent::Reasoning {
+        text: "next I will check spacing".into(),
+    });
+    let live: Vec<String> = app
+        .live_thinking_lines()
+        .iter()
+        .map(crate::render::line_text)
+        .collect();
+    assert!(
+        live.iter().any(|l| l.contains("Thinking")),
+        "in-flight thought stays a grok Thinking... row: {live:?}"
+    );
+    assert!(
+        live.iter().any(|l| l.contains("check spacing")),
+        "live tail shows the current thought: {live:?}"
+    );
+    let grouped: Vec<String> = app
+        .transcript
+        .iter()
+        .flat_map(|entry| entry.flatten(false, false, Density::Comfortable))
+        .map(|line| crate::render::line_text(&line))
+        .collect();
+    assert!(
+        !grouped.iter().any(|l| l.contains("check spacing")),
+        "live thought is not swallowed into the tool row: {grouped:?}"
     );
 }

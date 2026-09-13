@@ -41,7 +41,7 @@ version = "0.3.1"
 # use unsafe (mmap/alloc, libc kill, or test-only env set_var guards) opt out
 # with `[lints.rust] unsafe_code = "allow"` in their own Cargo.toml and a
 # comment naming the reason. Currently opted out: hi-cli, hi-eval, hi-tools,
-# hi-tui, hi-verifier, hi-race, and hi-agent (real process/platform work), plus
+# hi-tui, hi-verifier, hi-race (real process/platform work), plus
 # hi-ai (test-only).
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -84,7 +84,7 @@ hi-x402 = { version = "0.3.1", path = "crates/hi-x402" }
 hi-diff = { version = "0.3.1", path = "crates/hi-diff" }
 hi-race = { version = "0.3.1", path = "crates/hi-race" }
 hi-tools = { version = "0.3.1", path = "crates/hi-tools" }
-hi-agent = { version = "0.3.1", path = "crates/hi-agent" }
+hi-harness = { version = "0.3.1", path = "crates/hi-harness" }
 hi-tui = { version = "0.3.1", path = "crates/hi-tui", default-features = false }
 hi-lsp = { version = "0.3.1", path = "crates/hi-lsp" }
 hi-trace = { version = "0.3.1", path = "crates/hi-trace" }
@@ -92,9 +92,7 @@ hi-rsi-runtime = { version = "0.3.1", path = "crates/hi-rsi-runtime" }
 hi-protocol = { version = "0.3.1", path = "crates/hi-protocol" }
 hi-agent-runtime = { version = "0.3.1", path = "crates/hi-agent-runtime" }
 hi-tool-host = { version = "0.3.1", path = "crates/hi-tool-host" }
-hi-shell = { version = "0.3.1", path = "crates/hi-shell" }
 hi-verifier = { version = "0.3.1", path = "crates/hi-verifier" }
-hi-replay = { version = "0.3.1", path = "crates/hi-replay" }
 hi-repo-intelligence = { version = "0.3.1", path = "crates/hi-repo-intelligence" }
 hi-memory = { version = "0.3.1", path = "crates/hi-memory" }
 hi-secrets = { version = "0.3.1", path = "crates/hi-secrets" }
@@ -102,6 +100,7 @@ hi-provider-config = { version = "0.3.1", path = "crates/hi-provider-config" }
 hi-hooks = { version = "0.3.1", path = "crates/hi-hooks" }
 hi-crash-handler = { version = "0.3.1", path = "crates/hi-crash-handler" }
 hi-sqlite-journal = { version = "0.3.1", path = "crates/hi-sqlite-journal" }
+hi-dashboard-store = { version = "0.3.1", path = "crates/hi-dashboard-store" }
 hi-update = { version = "0.3.1", path = "crates/hi-update" }
 hi-announcements = { version = "0.3.1", path = "crates/hi-announcements" }
 hi-observability = { version = "0.3.1", path = "crates/hi-observability" }

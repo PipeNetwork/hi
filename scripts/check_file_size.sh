@@ -40,7 +40,7 @@ done < <(
       "$ROOT/crates/hi-lsp/src" \
       "$ROOT/crates/hi-rsi-runtime/src" \
       "$ROOT/crates/hi-trace/src" \
-      "$ROOT/crates/hi-agent/src" \
+      "$ROOT/crates/hi-harness/src" \
       "$ROOT/crates/hi-workspace/src" \
       "$ROOT/crates/hi-control/src" \
       "$ROOT/crates/hi-pipefs/src" \

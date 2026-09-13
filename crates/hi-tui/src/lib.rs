@@ -2,8 +2,8 @@
 //!
 //! A ratatui application on the alternate screen in grok-build's session chrome:
 //! a flat status bar, unboxed scrollback, a quiet rounded prompt, and
-//! a shortcuts row. The agent runs behind an mpsc channel ([`ChannelUi`]) and
-//! keeps redrawing while a turn runs, with Ctrl-C cancellation.
+//! a shortcuts row. The harness runs behind an mpsc channel ([`event::ChannelUi`])
+//! and keeps redrawing while a turn runs, with Ctrl-C cancellation.
 
 mod action;
 mod activity;
@@ -11,78 +11,51 @@ mod activity_feed;
 mod app;
 #[doc(hidden)]
 pub mod benchmark;
-mod daemon;
-mod dashboard;
-mod dashboard_goal;
-pub mod debug_harness;
-mod diff_lab;
 mod dispatch;
 mod domain;
 mod file_mentions;
 mod keys;
 mod lock;
-mod loops;
-mod memory_browser;
 mod mode;
 mod notify;
 mod palette;
-mod plan_approval;
 mod profiling;
 mod provider_activity;
-mod race;
-pub use app::run;
-pub use daemon::run_loops_daemon;
-pub use file_mentions::expand_file_mentions;
-pub use loops::set_loop_paused;
-pub use tui_event_trace::{TUI_EVENT_TRACE_SCHEMA_VERSION, TuiEventTrace};
+pub use app::{SessionOptions, run_session};
 mod block_viewer;
 mod btw;
 mod chrome;
 mod completion;
 mod confirm_overlay;
+mod dashboard;
 pub mod event;
 mod inline_diff;
 mod input;
 mod layout;
-mod local_picker;
 mod model_picker;
 mod provider_form;
 mod provider_picker;
 mod render;
 mod review;
-mod session_face;
-mod session_pickers;
-mod subagent_overlay;
-mod sync_tui;
 mod theme;
 mod thinking;
 mod timeline;
-mod tui_event_trace;
 mod turn_status;
 mod tutorial;
+mod usage;
 mod util;
 mod view_cache;
-mod watch;
-mod workflow_tui;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
-use hi_agent::{Agent, AgentStateSnapshot};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 #[cfg(test)]
-use {
-    crate::event::UiEvent,
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
-    hi_agent::PlanStatus,
-    ratatui::Terminal,
-};
+use ratatui::Terminal;
 
 /// Info about a configured profile, for the `/provider` list and picker.
 #[derive(Clone, Debug)]
@@ -115,11 +88,10 @@ pub struct LocalRuntimeIdentity {
 }
 
 /// The result of resolving a profile name at runtime: a built provider, the
-/// model id to use, and the provider's display/cache identities. The caller
-/// swaps the complete routing snapshot into the agent atomically.
+/// model id to use, and optional local-runtime identity.
 pub struct SwitchedProvider {
     pub provider: Box<dyn hi_ai::Provider>,
-    pub routing: hi_agent::AgentRouting,
+    pub model: String,
     pub local_runtime: Option<LocalRuntimeIdentity>,
 }
 
@@ -129,209 +101,20 @@ pub struct MlxProfileSwitch {
     pub profiles: Vec<ProfileInfo>,
 }
 
-/// A callback that persists a managed local runtime profile and builds the
-/// OpenAI-compatible provider once the runtime has passed verification.
-pub type LocalRuntimeSwitcher = Box<
-    dyn Fn(&hi_agent::local_skeptic::ManagedLocalRuntime) -> Result<MlxProfileSwitch> + Send + Sync,
->;
-
 /// A callback that resolves a named profile into a built provider + model +
 /// label, for `/provider` mid-session. `hi-cli` supplies this; the TUI calls
 /// it without needing to know about `Config`/`Settings` (which live in
 /// `hi-cli`).
 pub type ProfileResolver = Box<dyn Fn(&str) -> Result<SwitchedProvider> + Send + Sync>;
 
-/// A single API target selected in Diff Lab. The profile is resolved by
-/// `hi-cli`; only the non-secret profile name and model id cross the TUI seam.
-#[derive(Clone, Debug)]
-pub struct DiffApiTarget {
-    pub name: String,
-    pub profile: String,
-    pub model: String,
-}
-
-/// An explicitly selected canonical request for a Diff Lab API run.
-#[derive(Clone, Debug)]
-pub struct DiffApiRunRequest {
-    pub prompt: String,
-    pub targets: Vec<DiffApiTarget>,
-    pub seed: u64,
-    pub cases: u64,
-    pub max_concurrency: usize,
-    pub max_requests: u64,
-    pub max_tokens: u32,
-}
-
-/// Runtime callback supplied by `hi-cli` so the TUI can launch real provider
-/// comparisons without depending on CLI config types or handling credentials.
-pub type DiffApiRunner = Arc<
-    dyn Fn(
-            DiffApiRunRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<hi_diff::DiffRunSnapshot>> + Send>>
-        + Send
-        + Sync,
->;
-
-/// An explicitly selected coding-race request. Credentials are resolved by
-/// the CLI callback; only project-safe target metadata crosses this seam.
-#[derive(Clone, Debug)]
-pub struct RaceRunRequest {
-    pub task: String,
-    pub targets: Vec<hi_race::RaceTarget>,
-    pub max_candidates: u32,
-    pub max_concurrency: usize,
-    pub verify_commands: Vec<String>,
-    pub fuzz: Option<hi_race::FuzzConfig>,
-    pub apply: bool,
-    pub source_run_id: Option<String>,
-    pub artifact_root: Option<std::path::PathBuf>,
-    pub selected_candidate: Option<String>,
-    pub expected_workspace_digest: Option<String>,
-    /// LLM ranking when there is no verifier. Ignored when verify_commands is set.
-    pub judge_model: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct RaceDefaults {
-    pub targets: Vec<hi_race::RaceTarget>,
-    pub max_candidates: u32,
-    pub max_concurrency: usize,
-    pub verify_commands: Vec<String>,
-    pub fuzz: Option<hi_race::FuzzConfig>,
-    /// `/race --judge model` and `HI_JUDGE=model` when no verifier is set.
-    pub judge_model: bool,
-}
-
-/// Runtime callback supplied by `hi-cli` for provider-backed coding races.
-pub type RaceRunner = Arc<
-    dyn Fn(RaceRunRequest) -> Pin<Box<dyn Future<Output = Result<hi_race::RaceSnapshot>> + Send>>
-        + Send
-        + Sync,
->;
-
-pub type RaceSetupSaver = Arc<dyn Fn(Vec<hi_race::RaceTarget>) -> Result<String> + Send + Sync>;
-
 /// Persist the active profile (if any), provider label, and model so the next
 /// bare `hi` in this workspace restores the same routing. Best-effort: errors
 /// are logged by the callback or ignored.
 pub type SessionRemember = std::sync::Arc<dyn Fn(Option<&str>, &str, &str) + Send + Sync>;
 
-/// Everything the `/dashboard` fleet needs to launch worktree-isolated child
-/// `hi` runs: the binary + provider wiring for the child command line, the
-/// verify pipeline for the merge gate, and a session-path allocator. `hi-cli`
-/// supplies this so the TUI never touches `Settings`/session paths directly.
-pub struct FleetLauncher {
-    /// The `hi` binary to spawn for each row turn.
-    pub exe: std::path::PathBuf,
-    /// Explicit workspace root for trigger, worktree, merge, and verification operations.
-    pub workspace_root: std::path::PathBuf,
-    pub provider: String,
-    pub model: String,
-    pub base_url: String,
-    pub api_key: String,
-    /// Combined verify pipeline command, when the session has one: passed to
-    /// the child (`--verify`) and re-run as the ground-truth merge gate.
-    pub verify: Option<String>,
-    pub max_verify: u32,
-    /// Shared explicit model-round cap for child turns. `0` means omitted / the
-    /// ordinary unlimited default. It is atomic so `/config steps` changes in
-    /// the interactive Agent also govern later loop and fleet children.
-    pub max_steps: std::sync::atomic::AtomicU32,
-    /// Shared explicit tool-execution cap for child turns. `u64::MAX` means
-    /// omitted / the ordinary unlimited default; every `u32` value, including
-    /// zero, is preserved losslessly. This is wider than the CLI value solely
-    /// so the sentinel cannot collide with an explicit cap.
-    pub max_tool_calls: std::sync::atomic::AtomicU64,
-    /// Allocates a unique session file for a new fleet row (collision-safe).
-    pub session_path: Box<dyn Fn() -> Result<std::path::PathBuf> + Send + Sync>,
-    /// Lists this project's resumable fleet sessions (`/fleet status`).
-    pub sessions: Box<dyn Fn() -> Vec<FleetSessionInfo> + Send + Sync>,
-    /// Resolves a fleet session id (or "" = most recent) into everything needed
-    /// to re-adopt it as a dashboard row (`/fleet resume [id]`).
-    pub resume_info: FleetResumeResolver,
-    /// Allocates a session file for a `/loop` (each firing resumes it).
-    pub loop_session_path: Box<dyn Fn() -> Result<std::path::PathBuf> + Send + Sync>,
-    /// Where `/loop` definitions persist across restarts (per project).
-    pub loops_file: Option<std::path::PathBuf>,
-}
-
-impl FleetLauncher {
-    pub(crate) fn model_step_limit(&self) -> Option<u32> {
-        match self.max_steps.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => None,
-            value => Some(value),
-        }
-    }
-
-    pub(crate) fn set_model_step_limit(&self, max_steps: Option<u32>) {
-        self.max_steps
-            .store(max_steps.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn model_tool_call_limit(&self) -> Option<u32> {
-        match self
-            .max_tool_calls
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            u64::MAX => None,
-            value => u32::try_from(value).ok(),
-        }
-    }
-
-    pub(crate) fn model_verify_repair_limit(&self) -> Option<u32> {
-        (self.max_verify != hi_agent::UNLIMITED_REPAIR_CYCLES).then_some(self.max_verify)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_model_tool_call_limit(&self, max_tool_calls: Option<u32>) {
-        self.max_tool_calls.store(
-            max_tool_calls.map(u64::from).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    /// CLI arguments that make a child inherit the parent's explicit model
-    /// and tool caps. Omitted caps stay omitted so children keep hi's ordinary
-    /// unlimited defaults.
-    pub(crate) fn child_execution_cap_args(&self) -> Vec<std::ffi::OsString> {
-        child_execution_cap_args(self.model_step_limit(), self.model_tool_call_limit())
-    }
-}
-
-pub(crate) fn child_execution_cap_args(
-    max_steps: Option<u32>,
-    max_tool_calls: Option<u32>,
-) -> Vec<std::ffi::OsString> {
-    let mut arguments = Vec::new();
-    if let Some(max_steps) = max_steps {
-        arguments.push("--max-steps".into());
-        arguments.push(max_steps.to_string().into());
-    }
-    if let Some(max_tool_calls) = max_tool_calls {
-        arguments.push("--max-tool-calls".into());
-        arguments.push(max_tool_calls.to_string().into());
-    }
-    arguments
-}
-
-/// Resolves a fleet session id into re-adoption info (`/fleet resume`).
-pub type FleetResumeResolver = Box<dyn Fn(&str) -> Option<FleetResumeInfo> + Send + Sync>;
-
 /// Lists sessions cached on this machine. The TUI merges these with synced
 /// sessions before presenting the single `/sessions` view.
 pub type SessionLister = Box<dyn Fn() -> Vec<LocalSessionInfo> + Send + Sync>;
-
-/// Loads a session into the live agent and replaces its persistence sink,
-/// restoring it from sync first when it is not cached on this machine.
-pub type SessionSwitcher = Box<
-    dyn for<'a> Fn(
-            &'a str,
-            &'a mut hi_agent::Agent,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = anyhow::Result<SessionSwitchInfo>> + Send + 'a>,
-        > + Send
-        + Sync,
->;
 
 /// Persists a display name for a session cached on this machine.
 pub type SessionRenamer = Box<dyn Fn(&str, &str) -> anyhow::Result<String> + Send + Sync>;
@@ -346,18 +129,6 @@ pub struct SyncControl {
     pub status: SyncStatusReader,
     pub purge: SyncPurger,
 }
-
-/// Host callback for `/pipefs on|off|status|retry`. The controller lives in
-/// hi-cli because it reuses that frontend's authenticated session-sync lease.
-pub type PipeFsCommand = std::sync::Arc<
-    dyn for<'a> Fn(
-            String,
-            &'a mut hi_agent::Agent,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>,
-        > + Send
-        + Sync,
->;
 
 #[derive(Clone, Debug)]
 pub struct SessionSwitchInfo {
@@ -390,55 +161,6 @@ pub type SessionHostController = Box<
         + Sync,
 >;
 
-/// An in-flight `/team` local-model provisioning task.
-pub(crate) struct PendingTeamProvision {
-    pub(crate) role: String,
-    pub(crate) display: String,
-    /// Set when the user changes this role before setup finishes. The task is
-    /// allowed to reach a safe completion so a spawned server can be stopped;
-    /// its result must not overwrite the newer route choice.
-    pub(crate) cancelled: bool,
-    pub(crate) task: tokio::task::JoinHandle<anyhow::Result<(String, String, String)>>,
-    /// Live phase reported by the provisioning task (download → build →
-    /// load), so the transcript narrates what is actually happening.
-    pub(crate) phase_rx: tokio::sync::watch::Receiver<hi_agent::local_skeptic::ProvisionPhase>,
-    /// The last phase already announced in the transcript.
-    pub(crate) announced_phase: hi_agent::local_skeptic::ProvisionPhase,
-    /// When the current phase began (drives "Ns elapsed" heartbeats).
-    pub(crate) phase_started: std::time::Instant,
-    /// Where the weights land — polled for size so download heartbeats can
-    /// say how much is on disk (the downloader itself is fully quiet; raw
-    /// aria2c output once painted over the alternate screen).
-    pub(crate) model_dir: std::path::PathBuf,
-    /// Ticker calls since the last heartbeat line.
-    pub(crate) ticks_since_report: u32,
-    /// Bytes on disk at the last heartbeat.
-    pub(crate) last_reported_bytes: u64,
-    /// Transcript index of the in-place progress line for the current phase.
-    pub(crate) progress_entry_index: Option<usize>,
-}
-
-/// In-flight driver-provider local runtime provisioning. The old provider is
-/// left untouched until the task returns a verified runtime and the profile
-/// callback succeeds.
-pub(crate) struct PendingLocalProviderProvision {
-    pub(crate) display: String,
-    pub(crate) task:
-        tokio::task::JoinHandle<anyhow::Result<hi_agent::local_skeptic::ManagedLocalRuntime>>,
-    pub(crate) phase_rx: tokio::sync::watch::Receiver<hi_agent::local_skeptic::LocalRuntimePhase>,
-    pub(crate) announced_phase: hi_agent::local_skeptic::LocalRuntimePhase,
-    /// When the current phase began; used for honest elapsed-time heartbeats.
-    pub(crate) phase_started: std::time::Instant,
-    /// Ticker calls since the last in-place progress update.
-    pub(crate) ticks_since_report: u32,
-    /// Model directory polled for download progress.
-    pub(crate) model_dir: std::path::PathBuf,
-    /// Bytes on disk at the last progress update.
-    pub(crate) last_reported_bytes: u64,
-    /// Transcript index of the current in-place progress line.
-    pub(crate) progress_entry_index: Option<usize>,
-}
-
 /// A session cached on this machine, merged into the `/sessions` list view.
 #[derive(Clone, Debug)]
 pub struct LocalSessionInfo {
@@ -447,36 +169,6 @@ pub struct LocalSessionInfo {
     pub age: String,
     pub lines: usize,
 }
-
-/// A fleet session resolved for re-adoption as a dashboard row.
-pub struct FleetResumeInfo {
-    pub id: String,
-    /// The session file (the row's child turns keep appending to it).
-    pub path: std::path::PathBuf,
-    /// The original dispatch prompt (row title).
-    pub title: String,
-    /// Whether the session's goal should keep auto-driving.
-    pub goal_active: bool,
-    pub goal_done: usize,
-    pub goal_total: usize,
-}
-
-/// A resumable fleet session, as shown by `/fleet status`.
-pub struct FleetSessionInfo {
-    /// The `--resume` id.
-    pub id: String,
-    /// The row's dispatch prompt (cleaned first user message).
-    pub title: String,
-    /// Humanized age ("3m ago").
-    pub age: String,
-    /// Session length in lines.
-    pub lines: usize,
-}
-
-/// A callback that persists the `/hf run --mlx` profile and returns a built
-/// provider for immediate use.
-pub type MlxProfileSwitcher =
-    Box<dyn Fn(&hi_tools::HfMlxRun) -> Result<MlxProfileSwitch> + Send + Sync>;
 
 /// Form data for creating or editing a profile, exchanged between the TUI
 /// (which collects it via a form) and `hi-cli` (which writes it to the config
@@ -514,66 +206,9 @@ pub type ProfileRemover = Box<dyn Fn(&str) -> Result<Vec<ProfileInfo>> + Send + 
 pub type ReasoningEffortSaver =
     Box<dyn Fn(&str, Option<hi_ai::ReasoningEffort>) -> Result<bool> + Send + Sync>;
 
-/// Everything needed to start the interactive TUI besides the live [`Agent`].
-///
-/// Prefer this over a long argument list at the `hi-cli` → `hi-tui` seam so new
-/// callbacks/options don't grow another positional parameter.
-pub struct RunOptions {
-    pub provider: String,
-    pub base_url: String,
-    pub model: String,
-    pub history_path: Option<std::path::PathBuf>,
-    pub auto_memory: bool,
-    pub profiles: Vec<ProfileInfo>,
-    pub active_profile: Option<String>,
-    pub resolver: ProfileResolver,
-    pub saver: ProfileSaver,
-    pub loader: ProfileLoader,
-    pub remover: ProfileRemover,
-    pub reasoning_effort_saver: Option<ReasoningEffortSaver>,
-    pub mlx_switcher: MlxProfileSwitcher,
-    pub local_runtime_switcher: LocalRuntimeSwitcher,
-    /// A managed local profile selected on the previous launch. The TUI starts
-    /// this runtime after first paint instead of blocking CLI startup.
-    pub startup_local_runtime: Option<hi_agent::local_skeptic::LocalRuntimeSpec>,
-    /// A prior non-local route to offer when persisted local startup fails.
-    pub startup_fallback_profile: Option<String>,
-    pub session_remember: Option<SessionRemember>,
-    pub resume_summary: Option<String>,
-    pub mcp_url: Option<String>,
-    pub api_key: String,
-    pub diff_api_runner: Option<DiffApiRunner>,
-    pub race_runner: Option<RaceRunner>,
-    pub race_defaults: RaceDefaults,
-    pub race_setup_saver: Option<RaceSetupSaver>,
-    /// Optional canonical lifecycle sink. UI transport remains separate from
-    /// durable semantic events.
-    pub event_sink: Option<Arc<dyn hi_events::EventSink>>,
-    /// Optional durable approval broker. When present, confirmations are
-    /// persisted and consumed before the side effect is allowed to run.
-    pub approval_store: Option<Arc<dyn hi_policy::ApprovalStore>>,
-    pub fleet_launcher: FleetLauncher,
-    /// Optional flushed, redacted lifecycle trace used by the interactive
-    /// smoke harness. This is independent from delegate progress JSONL.
-    pub tui_event_trace: Option<TuiEventTrace>,
-    pub remote_event_tap: Option<RemoteEventTap>,
-    pub remote_flush_callback: Option<RemoteFlushCallback>,
-    pub sync_config: Option<SyncConfig>,
-    pub sync_session_id: Option<String>,
-    pub session_lister: Option<SessionLister>,
-    pub session_switcher: Option<SessionSwitcher>,
-    pub session_renamer: Option<SessionRenamer>,
-    pub session_host: Option<SessionHostController>,
-    pub sync_control: Option<SyncControl>,
-    pub pipefs_command: Option<PipeFsCommand>,
-    /// Shared x402 confirm/paste prompts while a turn's provider hop is blocked.
-    pub x402_broker: Option<std::sync::Arc<hi_ai::X402ConfirmBroker>>,
-}
-
 use completion::CompletionState;
 use input::InputLine;
 use model_picker::ModelPicker;
-pub(crate) use render::dim;
 use render::line_text;
 
 pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -683,53 +318,9 @@ pub(crate) const TICK: Duration = Duration::from_millis(120);
 /// (a proxy for "you probably stepped away").
 pub(crate) const NOTIFY_THRESHOLD: Duration = Duration::from_secs(30);
 
-/// Apply a freshly fetched `/models` result: update the served-metadata map,
-/// re-apply the current model (so its window/price refresh), and persist the
-/// result to the on-disk cache for next startup. A failure or empty list sets a
-/// startup notice instead of panicking.
-pub(crate) fn apply_metadata(
-    app: &mut App,
-    agent: &mut Agent,
-    result: &Result<Vec<hi_ai::ServedModel>>,
-    cache_key: &str,
-) {
-    match result {
-        Ok(served) if !served.is_empty() => {
-            let previous: std::collections::HashSet<String> =
-                app.model_ids.iter().cloned().collect();
-            app.new_model_ids = if previous.is_empty() {
-                std::collections::HashSet::new()
-            } else {
-                served
-                    .iter()
-                    .filter(|m| !previous.contains(&m.id))
-                    .map(|m| m.id.clone())
-                    .collect()
-            };
-            app.served = served.iter().cloned().map(|m| (m.id.clone(), m)).collect();
-            app.model_ids = served.iter().map(|m| m.id.clone()).collect();
-            app.model_ids.sort();
-            let model_id = app.model.clone();
-            app.apply_model(agent, &model_id);
-            // Persist for next startup (best-effort, fire-and-forget).
-            let models = served.clone();
-            let key = cache_key.to_string();
-            tokio::spawn(async move {
-                hi_ai::save_cache(&key, &models).await;
-            });
-        }
-        Ok(_) => {
-            app.startup_notice = Some("model metadata not loaded".into());
-        }
-        Err(err) => {
-            app.startup_notice = Some(format!("model metadata not loaded: {err:#}"));
-        }
-    }
-}
-
 /// One entry in the display transcript. Most content is a plain styled line;
 /// reasoning (CoT) is stored specially so it can be collapsed by default and
-/// expanded on demand via Ctrl-T / Ctrl-E, rather than flooding the transcript inline.
+/// expanded on demand via Ctrl-E, rather than flooding the transcript inline.
 #[derive(Clone)]
 pub(crate) enum TranscriptEntry {
     Line(Line<'static>),
@@ -739,7 +330,7 @@ pub(crate) enum TranscriptEntry {
     /// visible output always shows which request it belongs to. `at` is the
     /// wall-clock stamp grok-build right-aligns on the first prompt row.
     /// `review_hunk` is the attached Ctrl-G quote; hidden unless thinking
-    /// (Ctrl-E / Ctrl-T) is expanded.
+    /// (Ctrl-E) is expanded.
     UserPrompt {
         line: Line<'static>,
         at: SystemTime,
@@ -750,8 +341,8 @@ pub(crate) enum TranscriptEntry {
         text: String,
     },
     /// Assistant reasoning/thinking, buffered until the reasoning phase ends.
-    /// Collapsed is grok-build's header-only row ("Thought for Xs"). Ctrl-E /
-    /// Ctrl-T expands every thought; click / block-nav toggles one (`expanded`).
+    /// Collapsed is grok's header-only row ("Thought for Xs"). Ctrl-E
+    /// expands every thought; click / block-nav toggles one (`expanded`).
     Reasoning {
         text: String,
         elapsed: Duration,
@@ -834,7 +425,7 @@ impl TranscriptEntry {
             } => {
                 let mut prompt = style_user_prompt(line);
                 if th.paints_backgrounds() {
-                    prompt.style = prompt.style.bg(th.bg_highlight);
+                    prompt.style = prompt.style.bg(th.band_user);
                 }
                 let mut lines = vec![prompt];
                 if show_reasoning {
@@ -1098,12 +689,8 @@ impl BtwEntry {
 pub(crate) struct App {
     pub(crate) provider: String,
     pub(crate) model: String,
-    /// Live execution mode shown in the title bar and controlled by
-    /// `/durable`. Mirrored from the agent because rendering does not borrow
-    /// the agent.
-    pub(crate) execution: hi_agent::ExecutionMode,
     /// The current reasoning effort level (`None` = off / endpoint default),
-    /// mirrored from the agent for the title bar.
+    /// mirrored from the harness for the title bar.
     pub(crate) reasoning_effort: Option<hi_ai::ReasoningEffort>,
     /// Explicit workspace root copied from the agent runtime for synchronous
     /// frontend-only operations such as the full-screen diff review overlay.
@@ -1130,10 +717,6 @@ pub(crate) struct App {
     pub(crate) remover: ProfileRemover,
     /// Persists `reasoning_effort` to a profile (for `/config reasoning`).
     pub(crate) reasoning_effort_saver: Option<ReasoningEffortSaver>,
-    /// Saves/selects a managed local MLX profile after `/hf run --mlx`.
-    pub(crate) mlx_switcher: MlxProfileSwitcher,
-    /// Provisions and saves a managed local model selected in the provider picker after verification.
-    pub(crate) local_runtime_switcher: LocalRuntimeSwitcher,
     /// Best-effort persist of active profile/provider/model for next launch.
     pub(crate) session_remember: Option<crate::SessionRemember>,
     pub(crate) transcript: Vec<TranscriptEntry>,
@@ -1155,8 +738,8 @@ pub(crate) struct App {
     /// When the current reasoning phase started (for the "Thought for Xs" label).
     pub(crate) reasoning_started: Option<Instant>,
     /// Whether reasoning (CoT) blocks are expanded inline. Off by default —
-    /// reasoning is collapsed to grok-build's header-only "Thought for Xs"
-    /// row; Ctrl-T / Ctrl-E toggles this to show/hide the full thinking text.
+    /// reasoning is collapsed to grok's header-only "Thought for Xs"
+    /// row; Ctrl-E toggles this to show/hide the full thinking text.
     pub(crate) show_reasoning: bool,
     /// Whether long tool-output blocks are expanded in full. Off by default —
     /// output beyond [`TOOL_OUTPUT_PREVIEW_LINES`] folds to a preview; Ctrl-O
@@ -1239,8 +822,9 @@ pub(crate) struct App {
     /// shown briefly above the input after a drag-copy so the copy is visible.
     pub(crate) copy_toast: Option<(usize, Instant)>,
     /// Whether the app is capturing the mouse (scroll wheel, click-to-fold,
-    /// drag-to-copy). `/mouse off` releases it so the terminal's native text
-    /// selection works; `/mouse on` re-enables. On by default.
+    /// drag-to-copy). On by default, matching grok: click a `›` row to expand.
+    /// `/mouse off` restores the terminal's native highlight-and-copy; Shift-drag
+    /// still selects natively in most terminals while capture is on.
     pub(crate) mouse_capture: bool,
     /// Scrollback-oriented minimal transcript rendering preference.
     pub(crate) minimal_screen: bool,
@@ -1289,10 +873,6 @@ pub(crate) struct App {
     /// Message-history length just before the last turn started, so `/retry`
     /// can drop that turn before re-running.
     pub(crate) last_turn_start: usize,
-    /// Prompt-injected state just before the last turn started, so `/retry` and
-    /// interrupt cleanup do not leak decisions/goals/plans from the discarded
-    /// attempt.
-    pub(crate) last_turn_snapshot: Option<AgentStateSnapshot>,
     /// Active model picker (`/model` with no argument), if any.
     pub(crate) picker: Option<ModelPicker>,
     /// The shared picker is browsing sessions rather than models.
@@ -1302,37 +882,16 @@ pub(crate) struct App {
     pub(crate) session_delete_pending: Option<String>,
     /// Active provider form (`/provider add` or `/provider edit`), if any.
     pub(crate) provider_form: Option<provider_form::ProviderForm>,
-    /// Dedicated local-model picker opened by `/local`.
-    pub(crate) local_picker: Option<local_picker::LocalModelPicker>,
-    /// Path entry mode for the local-model directory action.
-    pub(crate) local_directory_prompt: Option<String>,
-    pub(crate) local_download_confirmation: Option<hi_agent::local_skeptic::LocalModelOption>,
-    /// True while the startup-managed local runtime is being restored.
-    pub(crate) local_startup_blocked: bool,
-    pub(crate) local_startup_error: Option<String>,
-    pub(crate) local_startup_spec: Option<hi_agent::local_skeptic::LocalRuntimeSpec>,
-    pub(crate) local_startup_fallback_profile: Option<String>,
     /// Runtime identity shown in the header/status bar.
     pub(crate) local_runtime: Option<LocalRuntimeIdentity>,
     /// Active `/provider` selector (no arg), if any. Selecting a row queues
     /// `/provider <name>`, so it shares the typed-command switch path.
     pub(crate) provider_picker: Option<provider_picker::ProviderPicker>,
-    /// Background refresh of the Pipe Network local-model catalog. The picker
-    /// opens immediately with built-in rows and updates when this completes.
-    pub(crate) pending_local_catalog: Option<
-        tokio::task::JoinHandle<anyhow::Result<Vec<hi_agent::local_skeptic::LocalCatalogModel>>>,
-    >,
-    /// Background `/login` pairing/device poll. Completing it queues
-    /// `/provider <name>` so the session actually switches off the dead route.
+    /// Background `/login` pairing/device poll.
     pub(crate) pending_login: Option<(String, tokio::task::JoinHandle<anyhow::Result<()>>)>,
     /// `/auth <provider>` waiting for a pasted key (composer is masked).
     pub(crate) pending_auth: Option<String>,
     pub(crate) x402_broker: Option<Arc<hi_ai::X402ConfirmBroker>>,
-    /// Callback for launching configured multi-provider Diff Lab API runs.
-    pub(crate) diff_api_runner: Option<DiffApiRunner>,
-    pub(crate) race_runner: Option<RaceRunner>,
-    pub(crate) race_defaults: RaceDefaults,
-    pub(crate) race_setup_saver: Option<RaceSetupSaver>,
     /// Canonical semantic lifecycle sink; transport events remain separate.
     pub(crate) event_sink: Option<Arc<dyn hi_events::EventSink>>,
     /// Local-only approval broker for recoverable workflow approval resumes.
@@ -1346,17 +905,13 @@ pub(crate) struct App {
     /// The latest task plan from the `update_plan` tool, pinned above the input
     /// as a live checklist. Empty until the model posts a plan; replaced wholesale
     /// on each update so it never drifts.
-    pub(crate) plan: Vec<hi_agent::PlanStep>,
+    pub(crate) plan: Vec<hi_tools::PlanStep>,
     /// Local interactive mutation confirmation currently shown by the turn driver.
-    pub(crate) confirmation: Option<hi_agent::ConfirmationRequest>,
+    pub(crate) confirmation: Option<hi_harness::ConfirmationRequest>,
     pub(crate) confirmation_scroll: usize,
-    /// Highlighted option on the permission / ask-user overlay.
+    /// Highlighted option on the permission overlay.
     pub(crate) confirmation_selected: usize,
     pub(crate) confirm_focus: crate::confirm_overlay::ConfirmFocus,
-    /// Parked leftover-plan card (Approve / Request changes / Quit).
-    pub(crate) plan_approval: Option<crate::plan_approval::PlanApproval>,
-    /// `/memory` split browser over project/global markdown files.
-    pub(crate) memory_browser: Option<crate::memory_browser::MemoryBrowser>,
     /// Confirmations waiting behind the active overlay (`N waiting`).
     pub(crate) confirmation_waiting: usize,
     /// Last mouse cell, for hover chrome (context bar).
@@ -1368,46 +923,18 @@ pub(crate) struct App {
     pub(crate) git_branch: Option<String>,
     /// When false, the plan/todo list above the composer collapses to a header.
     pub(crate) plan_pane_expanded: bool,
-    /// The active long-horizon goal, mirrored from the agent so the pinned plan
-    /// block and header can show sub-goal progress. Refreshed when `/goal` sets it
-    /// and after every turn (the driver may advance it). `None` when no goal is set.
-    pub(crate) goal: Option<hi_agent::Goal>,
-    /// Mirrored from the agent so empty Enter can respect `/plan` draft mode.
+    /// Mirrored from the harness so empty Enter can respect `/plan` draft mode.
     pub(crate) plan_mode: bool,
     /// Mirrored permission ladder (`ask` / `auto` / `always`).
-    pub(crate) permission_mode: hi_agent::PermissionMode,
-    /// Composer flags changed while the agent was borrowed (mid-turn Shift-Tab).
+    pub(crate) permission_mode: hi_harness::PermissionMode,
+    /// Composer flags changed while the harness was borrowed (mid-turn Shift-Tab).
     pub(crate) session_face_dirty: bool,
-    /// Mirrored from the agent so chrome can show paused/parked.
+    /// Mirrored so chrome can show paused/parked plan drive.
     pub(crate) plan_drive_paused: bool,
-    /// A frontend action explicitly changed plan pause state. Keep this
-    /// separate from generic face changes so mirroring an interrupted pause
-    /// cannot turn it into durable manual `/plan pause` intent.
     pub(crate) plan_drive_pause_dirty: bool,
-    /// Cached leftover-work gate, refreshed after each turn and `/plan`/`/goal`.
-    pub(crate) last_drive: hi_agent::DriveAction,
-    /// Last turn's stop reason, used to keep Cancelled / infrastructure idle.
-    pub(crate) last_stop_reason: Option<hi_agent::TurnStopReason>,
-    /// In-progress custom answer while an `ask_user` overlay is open.
+    /// In-progress custom answer while a confirmation overlay is open.
     pub(crate) ask_user_draft: String,
-    /// The `/dashboard` fleet: dispatched agents (one session each), persisted
-    /// across dashboard open/close so rows aren't lost when you drop back to
-    /// the chat. In-flight turns live only inside the dashboard loop.
-    pub(crate) fleet: Vec<crate::dashboard::FleetRow>,
-    /// Monotonic display id for fleet rows (never reused within a session).
-    pub(crate) fleet_next_id: usize,
-    /// Script workflow runs launched via `/workflow <name>`, keyed by their
-    /// durable run ID. The selected ID controls dashboard presentation.
-    pub(crate) workflow_runs: HashMap<String, crate::dashboard::WorkflowRun>,
-    pub(crate) selected_workflow_run: Option<String>,
-    /// Modal multi-run workflow browser opened by `/workflow` with no args.
-    pub(crate) workflow_overlay: Option<crate::workflow_tui::WorkflowOverlay>,
-    /// Live child explore/delegate/task rows, keyed by subagent id.
-    pub(crate) subagents: HashMap<String, crate::subagent_overlay::SubagentInfo>,
-    pub(crate) inspect_subagent: Option<crate::subagent_overlay::InspectOverlay>,
-    pub(crate) tasks_overlay: Option<crate::subagent_overlay::TasksOverlay>,
     pub(crate) block_viewer: Option<crate::block_viewer::BlockViewer>,
-    pub(crate) turn_picker: Option<crate::session_pickers::TurnPicker>,
     /// Last painted timeline rail hit targets (screen row → tick).
     pub(crate) timeline_hits: Vec<(u16, crate::timeline::TimelineHit)>,
     pub(crate) timeline_rect: ratatui::layout::Rect,
@@ -1417,17 +944,9 @@ pub(crate) struct App {
     pub(crate) composer_rect: ratatui::layout::Rect,
     /// Last painted frame width, so review can dock vs overlay without a Rect.
     pub(crate) frame_width: u16,
-    /// Interactive differential runner overlay. Large run data lives in
-    /// `hi-diff` artifacts; this field only retains the bounded UI snapshot.
-    pub(crate) diff_lab: Option<crate::diff_lab::DiffLabOverlay>,
-    /// Active coding-race review overlay.
-    pub(crate) race: Option<crate::race::RaceOverlay>,
     /// Detached `hi workflow run <plan>` child launched via `/workflow plan`:
     /// (pid, log path, plan label). Session-local tracking for status/stop.
     pub(crate) plan_workflow_child: Option<(u32, std::path::PathBuf, String)>,
-    /// Handle to the `/loop` manager (timers + firings run in a background
-    /// task; results drain into the transcript on UI ticks).
-    pub(crate) loops: Option<crate::loops::LoopsHandle>,
     /// Current-turn token display: raw user prompt estimate and output across
     /// all model calls, shown in the observability panel.
     pub(crate) usage: (u64, u64),
@@ -1530,12 +1049,16 @@ pub(crate) struct App {
     pub(crate) palette: Option<crate::palette::CommandPalette>,
     /// Opt-in `/tutorial` modal. Session-local and created fresh on every open.
     pub(crate) tutorial: Option<crate::tutorial::TutorialOverlay>,
-    /// Telemetry from the last turn (verify rounds, recovery retries, nudges,
-    /// stalls), captured post-turn from `agent.last_turn_telemetry()` for the
-    /// observability panel.
-    pub(crate) last_telemetry: Option<hi_agent::TurnTelemetry>,
-    /// Last-seen [`hi_agent::TurnPhase`] label for the debug panel (updated when
-    /// a turn ends, and optionally mid-turn when the agent handle is available).
+    /// Grok-build `/usage` modal (Usage limit / Context usage / Session info).
+    pub(crate) usage_overlay: Option<crate::usage::UsageOverlay>,
+    /// Grok-style `/dashboard` roster of concurrent agent rows.
+    pub(crate) dashboard: Option<crate::dashboard::DashboardOverlay>,
+    /// Pipe base URL copied from the session harness (dashboard child rows).
+    pub(crate) pipe_base_url: String,
+    /// Optional OpenAI profile from config. Only used for `openai/…` dashboard rows.
+    pub(crate) openai_api_key: Option<String>,
+    pub(crate) openai_base_url: Option<String>,
+    /// Last-seen turn-phase label for the debug panel.
     pub(crate) last_turn_phase: Option<&'static str>,
     /// Tool calls seen this turn (incremented on each `UiEvent::ToolCall`),
     /// for the observability panel's "tool calls this turn" line.
@@ -1593,8 +1116,6 @@ pub(crate) struct App {
     /// Snapshot used while session-id completion is open. Avoids rescanning
     /// and rereading every JSONL file on each render tick.
     pub(crate) session_completion_cache: Vec<crate::LocalSessionInfo>,
-    /// Switches the live agent and persistence sink for `/sessions switch <id>`.
-    pub(crate) session_switcher: Option<crate::SessionSwitcher>,
     /// Persists names for `/sessions rename <id> <name>`.
     pub(crate) session_renamer: Option<crate::SessionRenamer>,
     /// Enables/disables remote-input host mode for the active session.
@@ -1603,52 +1124,14 @@ pub(crate) struct App {
     /// role (`/team delegate` with no argument) instead of switching the
     /// driver model.
     pub(crate) team_picker_role: Option<String>,
-    /// When true, the open picker is the `/team` ROLE menu: selecting a row
-    /// opens that role's model picker (or runs auto-setup) instead of
-    /// switching the driver model.
+    /// When true, the open picker is the `/team` ROLE menu.
     pub(crate) team_role_menu: bool,
-    /// Roles waiting behind the single in-flight provisioning slot
-    /// (auto-setup wires delegate → editor → explore in sequence; later
-    /// entries usually reuse the server the first one started).
-    pub(crate) queued_team_assignments: Vec<(String, hi_agent::local_skeptic::ResolvedLocalModel)>,
-    /// After auto-setup's queue drains, also point the skeptic gate at the
-    /// running team server (free local review).
-    pub(crate) auto_setup_skeptic: bool,
-    /// In-flight `/team` local-model provisioning (download + server spawn on
-    /// a background task). The event loop applies the outcome when it lands;
-    /// a 15 GB model fetch must never block the UI.
-    pub(crate) pending_team_provision: Option<PendingTeamProvision>,
-    /// In-flight managed local driver-provider setup.
-    pub(crate) pending_local_provider: Option<PendingLocalProviderProvision>,
-    /// In-flight background host-enable (startup auto-host). The controller's
-    /// network work (portal registration) runs off the UI path; the event
-    /// loop applies the outcome when it completes. A dead portal must never
-    /// delay first paint.
+    /// In-flight background host-enable (startup auto-host).
     pub(crate) pending_host_enable:
         Option<tokio::task::JoinHandle<anyhow::Result<Option<crate::SessionHostEnable>>>>,
     pub(crate) sync_control: Option<crate::SyncControl>,
-    pub(crate) pipefs_command: Option<crate::PipeFsCommand>,
-    /// Handle for typed interactive lifecycle records and propagation of a
-    /// write failure observed inside the composed `RemoteEventTap`.
-    pub(crate) tui_event_trace: Option<crate::TuiEventTrace>,
-    /// The remote event tap for live streaming. When set, the `drive` function
-    /// calls this after each `UiEvent` is applied to `App`, forwarding events
-    /// to the `RemoteUi` for ipop sync. Set at startup or by `/sync on`.
     pub(crate) remote_event_tap: Option<crate::RemoteEventTap>,
-    /// The startup tap exactly as main.rs installed it (it publishes to the
-    /// local runtime and the swappable startup RemoteUi slot). `/sync` and
-    /// session-switch commands COMPOSE their TUI-local streamer onto this
-    /// instead of chaining onto `remote_event_tap`, so cycles can't grow the
-    /// chain or orphan RemoteUis, and restoring it is what `/sync off` does.
     pub(crate) base_event_tap: Option<crate::RemoteEventTap>,
-    /// A `RemoteUi` created by `/sync on` for mid-session live streaming.
-    /// Flushed after each turn and on `/sync off`.
-    pub(crate) sync_remote_ui: Option<std::sync::Arc<crate::sync_tui::RemoteUi>>,
-    /// A flush callback for the startup `RemoteUi` (created in main.rs). Called
-    /// after each turn so live events are actually streamed during the session,
-    /// not just buffered until exit. This is a `Box<dyn Fn + Send + Sync>` that
-    /// spawns an async flush task internally (since the TUI can't hold a
-    /// `hi-cli` type directly).
     pub(crate) remote_flush_callback: Option<crate::RemoteFlushCallback>,
     /// Live receiver of remote attach prompts while host mode is on.
     pub(crate) remote_input_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
@@ -1656,26 +1139,10 @@ pub(crate) struct App {
     pub(crate) remote_input_poller: Option<tokio::task::AbortHandle>,
     /// True while this TUI is advertising `accepts_input` for the active session.
     pub(crate) hosting_remote_input: bool,
-    /// When set, typed lines are POSTed to this remote host's input queue
-    /// (hosted/steer mode) instead of running on the local agent.
-    pub(crate) steering_remote_session: Option<crate::app::SteeringRemote>,
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        // Do not detach a potentially multi-gigabyte model download on every
-        // exit path. If setup already spawned a server, the run-level local
-        // server guard stops it after App is dropped; aborting the task here
-        // prevents a late spawn after that guard has run.
-        if let Some(pending) = self.pending_team_provision.take() {
-            pending.task.abort();
-        }
-        if let Some(pending) = self.pending_local_provider.take() {
-            pending.task.abort();
-        }
-        if let Some(pending) = self.pending_local_catalog.take() {
-            pending.abort();
-        }
         if let Some((_, pending)) = self.pending_login.take() {
             pending.abort();
         }

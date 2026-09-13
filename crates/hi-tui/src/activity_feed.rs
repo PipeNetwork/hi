@@ -280,15 +280,18 @@ impl ActivityBlock {
         let header = self.header_line();
         match &self.kind {
             ActivityKind::VerbGroup(g) => {
-                let mut lines = vec![header];
-                if show_reasoning && !g.thinking.trim().is_empty() {
+                // Grok folds finished thoughts into the explore row: the
+                // `Thought for Xs` header stays visible; Ctrl+E expands the body.
+                let mut lines = Vec::new();
+                if !g.thinking.trim().is_empty() {
                     lines.extend(crate::thinking::thinking_block_lines(
                         &g.thinking,
                         g.thinking_elapsed,
-                        true,
+                        show_reasoning,
                         false,
                     ));
                 }
+                lines.push(header);
                 // Ctrl-O / verbose expand Edit/Run bodies, not every explore path.
                 if self.expanded {
                     let style = Style::default().fg(theme().gray_dim);
@@ -489,7 +492,10 @@ impl ActivityBlock {
                 ));
             }
         }
-        if self.is_foldable() && !self.expanded && !live {
+        // Grok `expandable_indicator` / `expandable_indicator_running`: a
+        // collapsed foldable row keeps the chevron so it is clickable even
+        // while the burst is still live.
+        if self.is_foldable() && !self.expanded {
             spans.push(Span::styled(" ›", Style::default().fg(th.gray_dim)));
         }
         Line::from(spans)
@@ -935,7 +941,7 @@ mod tests {
 
     #[test]
     fn cd_and_cargo_run_title_is_the_validator() {
-        let label = hi_agent::ui::tool_label(
+        let label = crate::util::tool_label(
             "bash",
             r#"{"command":"cd /Users/david/chat && cargo clippy --all-targets 2>&1 | grep warning"}"#,
         );
@@ -956,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn live_run_has_no_chevron() {
+    fn live_run_keeps_expand_chevron() {
         let block = ActivityBlock {
             kind: ActivityKind::Run {
                 command: "cargo test".into(),
@@ -968,7 +974,49 @@ mod tests {
         };
         let text = crate::render::line_text(&block.flatten(false, false, Density::Comfortable)[0]);
         assert!(text.starts_with("◆ "), "{text}");
-        assert!(!text.contains('›'), "{text}");
+        assert!(
+            text.contains('›'),
+            "grok shows › on running foldable rows: {text}"
+        );
+    }
+
+    #[test]
+    fn grouped_reads_are_clickable() {
+        let mut block = ActivityBlock::verb_group(ExploreVerb::Read, Some("a.rs".into()));
+        if let Some(group) = block.as_verb_group_mut() {
+            group.add(ExploreVerb::Read, Some("b.rs".into()));
+            group.add(ExploreVerb::List, Some("src".into()));
+            group.live = false;
+        }
+        let lines: Vec<String> = block
+            .flatten(false, false, Density::Comfortable)
+            .iter()
+            .map(crate::render::line_text)
+            .collect();
+        let header = lines.iter().find(|l| l.contains("Read")).expect("header");
+        assert!(
+            header.contains('›'),
+            "collapsed group is clickable: {header}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("a.rs")),
+            "paths stay folded until click: {lines:?}"
+        );
+
+        block.expanded = true;
+        let open: Vec<String> = block
+            .flatten(false, false, Density::Comfortable)
+            .iter()
+            .map(crate::render::line_text)
+            .collect();
+        assert!(
+            open.iter().any(|l| l.contains("a.rs")) && open.iter().any(|l| l.contains("b.rs")),
+            "click reveals each path: {open:?}"
+        );
+        assert!(
+            !open.iter().any(|l| l.contains('›')),
+            "expanded group drops the chevron: {open:?}"
+        );
     }
 
     #[test]

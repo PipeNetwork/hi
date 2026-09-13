@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use crate::config::{LspMode, ReviewPolicy, ToolSet, VerificationMode};
 use anyhow::Result;
 use async_trait::async_trait;
-use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode};
 use hi_ai::{
     ChatRequest, Completion, Provider, ProviderCapabilities, ProviderRequestContext,
     RequestProfile, RequestToolEnvelope, StreamEvent,

@@ -393,18 +393,14 @@ pub(crate) fn is_env_var_reference(s: &str) -> bool {
 }
 
 /// Shown when `hi` is run with nothing configured. Actionable, not terse.
-pub(crate) const ONBOARDING: &str = "no model configured. Get started with one of:
+pub(crate) const ONBOARDING: &str = "no Pipe Network credential configured. Get started with:
 
-  pipenetwork.ai:   hi auth pipenetwork  (verified, private credential storage)
-                    or PIPENETWORK_API_KEY=... hi --provider pipenetwork \"...\"
-  OpenRouter:       OPENROUTER_API_KEY=...   hi --provider openai -m anthropic/claude-sonnet-4 \"...\"
-  Anthropic:        ANTHROPIC_API_KEY=...    hi --provider anthropic \"...\"
-  Local (Ollama):   hi --provider ollama -m qwen2.5-coder \"...\"
-  xAI (Grok):       XAI_API_KEY=...          hi --provider xai \"...\"
+  hi login pipenetwork          browser pairing; writes [profiles.pipenetwork]
+  hi auth pipenetwork           paste an API key
+  PIPENETWORK_API_KEY=... hi    one-shot without saving a profile
 
-Or run `hi` on a real terminal for the interactive setup wizard.
-Or set HI_MODEL, or add a profile in ~/.config/hi/config.toml (see README).
-Tip: interactive sessions use the full-screen interface by default; pass --plain for the line REPL.";
+Or run `hi` on a real terminal — first run signs in the same way as `hi login`.
+Tip: interactive sessions use the full-screen TUI; pass --plain for the line REPL.";
 
 /// Provider + model to infer from an exported API key, in precedence order.
 /// Keep the models current: a stale entry here is what a user with a key in
@@ -781,10 +777,9 @@ fn resolve_ambient_api_key(provider: ProviderName) -> Result<String> {
     }
     if matches!(provider, ProviderName::Pipenetwork) {
         bail!(
-            "no pipenetwork credential: run `hi auth pipenetwork` (or \
-             `/auth pipenetwork` inside hi) to paste and verify an API key, \
-             `/login pipenetwork` for subscription pairing, `/login x402` to \
-             pay USDC, or set {hint}"
+            "no pipenetwork credential: run `hi login pipenetwork` to sign in \
+             and configure the API key, `hi auth pipenetwork` (or \
+             `/auth pipenetwork`) to paste and verify a key, or set {hint}"
         );
     }
     bail!("no API key: pass --api-key or set {hint}");

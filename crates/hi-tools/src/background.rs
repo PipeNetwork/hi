@@ -793,6 +793,13 @@ impl BackgroundRegistry {
         poll_from(self, id)
     }
 
+    /// Consecutive empty `bash_output` polls while the process is still
+    /// running. Used to refuse a second wait on a silent handle.
+    pub fn consecutive_empty_polls(&self, id: &str) -> Result<u32> {
+        let proc = lookup(self, id)?;
+        Ok(proc.inner.lock().unwrap().empty_polls)
+    }
+
     /// [`poll_wait`](Self::poll_wait) with an adaptive budget — the default
     /// for a `bash_output` call that names no `wait_secs`. The registry's
     /// change notification is the watcher: an empty poll of a running process

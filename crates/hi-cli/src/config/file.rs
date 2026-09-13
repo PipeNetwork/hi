@@ -265,6 +265,25 @@ pub fn resolve_rsi(cli: &Cli, file: &Config) -> anyhow::Result<RsiRequested> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncMode {
+    On,
+    Paused,
+    #[default]
+    Off,
+}
+
+impl SyncMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Paused => "paused",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// The `[sync]` section in `hi.toml` — configures cross-machine session sync.
 /// All fields optional; unset fields fall back to env vars or the provider's
 /// credentials.
@@ -287,7 +306,7 @@ pub struct SyncSection {
     pub machine_id: Option<String>,
     /// Persisted sync policy. Missing values migrate from legacy `enabled`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<crate::sync_store::SyncMode>,
+    pub mode: Option<SyncMode>,
     /// When true, sync is enabled by default (no need for `--sync` on the CLI).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enabled: bool,
@@ -661,10 +680,7 @@ fn merge_project_sync(base: &mut Option<SyncSection>, project: Option<SyncSectio
     let target = base.get_or_insert_with(SyncSection::default);
     // Repository config may persistently tighten the machine policy, but it
     // must never turn transcript upload on merely because the folder opened.
-    if project
-        .mode
-        .is_some_and(|mode| mode != crate::sync_store::SyncMode::On)
-    {
+    if project.mode.is_some_and(|mode| mode != SyncMode::On) {
         target.mode = project.mode;
     }
     if !project.enabled {
@@ -823,21 +839,6 @@ fn merge_restrictive_lists(
 
 pub(crate) fn local_config_path() -> PathBuf {
     PathBuf::from("hi.toml")
-}
-
-/// Guess a *layered* verification pipeline from marker files in `dir`: a cheap
-/// compile/typecheck (and lint, when obviously configured) before tests, so the
-/// model gets fast, localizable errors before the slower test stage. Used by
-/// automatic verification so the proven verify-loop is zero-config. Empty =
-/// unknown project.
-#[cfg(test)]
-pub fn detect_verify_pipeline(dir: &Path) -> Vec<VerifyStage> {
-    hi_agent::detect_verify_pipeline(dir)
-}
-
-#[cfg(test)]
-pub fn detect_verify_pipeline_with(dir: &Path, clippy: bool) -> Vec<VerifyStage> {
-    hi_agent::detect_verify_pipeline_with(dir, clippy)
 }
 
 /// True when a bare `hi` has no model to run — used to trigger the interactive
