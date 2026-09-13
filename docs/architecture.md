@@ -6,23 +6,23 @@ bound cost, record evidence) but **must not be conflated in code or docs**.
 ## Interactive path (default `hi` CLI)
 
 ```
-hi-cli → hi-agent → hi-ai (providers)
-                 → hi-tools (+ hi-lsp)
-                 → hi-tui
+hi-cli → hi-harness → Pipe Network (`api.pipenetwork.ai`)
+                   → hi-tools (+ hi-lsp)
+                   → hi-tui
+         hi-dashboard-store   persistent /dashboard membership
 ```
 
 | Concern | Crate / type | Role |
 |--------|---------------|------|
-| Turn loop | `hi-agent` (`run_turn` / `TurnPhase`) | Setup → (Model → Tools → Steer)* → WorkspaceRepair → Settle → Finalize → Done |
-| Workspace repair | `hi_agent::verify::WorkspaceRepairVerifier` | compile/lint/test stages; failures feed the model |
-| Answer handling | `hi-agent` Steer | preserves model answers; no evidence-count, disclaimer, or heading-based review repair |
-| Session memory | `hi_agent::memory` | markdown bullets (`.hi/memory.md`, user global) |
-| Runtime | process-local `WorkspaceRuntime` | tools, ledger, LSP, checkpoints |
+| Turn loop | `hi-harness` (`Harness::run_turn`) | Stream chat completions from Pipe, run local tools, repeat until the model stops |
+| Tools | `hi-tools` | `read` / `write` / `edit` / `bash` / `grep` / `glob` / `list` plus repo/LSP helpers |
+| Sessions | `hi-harness` JSONL | one file per session; `/undo` restores the last git checkpoint |
+| Dashboard | `hi-harness::Dashboard` + `hi-dashboard-store` | concurrent in-process rows; peek/reply; optional git worktree; no auto-merge |
 | Shell sandbox | `hi_tools::sandbox` (`HI_SANDBOX`) | default workspace write confine (`off` to disable); see [sandbox.md](sandbox.md) |
 
-This path is what developers run day to day. Verification here is a **workspace
-repair gate**, not a cryptographic attestation. CLI RSI hooks stay thin
-(`hi-cli` `rsi_bootstrap`) — descriptors, budgets, trace observation only.
+This path is what developers run day to day. `/verify` is a **post-turn check**,
+not a cryptographic attestation and not an auto-repair loop. The old `hi-agent`
+crate (multi-provider `run_turn`, fleet auto-merge, `/goal` drive) was removed.
 
 Automatic post-edit checks report intermediate failures without consuming the
 task's repair allowance. Their unresolved failures remain persisted verification
@@ -46,8 +46,7 @@ hi-rsi-runtime          shared budget, identity, report types
 ├── hi-agent-runtime    WorkflowExecutor / trusted stage driver
 ├── hi-verifier         AttestingVerifier + Attestor
 ├── hi-memory           RsiMemoryStore (SQLite, tenant-scoped)
-├── hi-protocol         wire contracts
-└── hi-replay           replay over the runtime
+└── hi-protocol         wire contracts
 ```
 
 | Concern | Crate / type | Role |
@@ -124,7 +123,7 @@ Prefer the disambiguated names in new code and docs:
 - `ReviewRepairMode` / `ReviewRepairState` for read-only answer-quality repair
 - `AttestingVerifier` when you mean RSI attestation
 - `RsiMemoryStore` when you mean control-plane SQLite memory
-- “session memory” when you mean markdown `hi_agent::memory`
+- “session JSONL” when you mean `hi-harness` transcripts under the data dir
 
 Historical type aliases (`RepairVerifier`, `hi_verifier::Verifier`,
 `hi_memory::MemoryStore`) remain for compatibility.
@@ -135,15 +134,14 @@ Historical type aliases (`RepairVerifier`, `hi_verifier::Verifier`,
 
 | Path | State machine | Owner crate | Trust domain |
 |------|---------------|-------------|--------------|
-| Interactive coding | `hi_agent::TurnPhase` / `run_turn` | `hi-agent` (+ `hi-tools`) | User workstation; undo/checkpoint; workspace repair |
+| Interactive coding | `hi_harness::Harness::run_turn` | `hi-harness` (+ `hi-tools`) | User workstation; undo/checkpoint; `/verify` post-turn |
 | RSI managed/candidate | `hi_agent_runtime::WorkflowExecutor` | `hi-rsi-runtime` types + runtime/verifier | Bootstrap-attested; budgets; attestation |
 
 **Keep both.** They share vocabulary (verify, checkpoint, budget) but not authority:
 merging them would either weaken RSI attestation or over-constrain the REPL.
 
-Interactive code may *observe* RSI (`RsiControl`, managed descriptor, trace sinks)
-but must not call `WorkflowExecutor` or `AttestingVerifier`. RSI candidate code must
-not depend on `hi-agent`'s turn loop.
+Interactive code must not call `WorkflowExecutor` or `AttestingVerifier`. RSI
+candidate code must not depend on `hi-harness`'s Pipe turn loop.
 
 See [ADR 001](adr/001-rsi-runtime-boundary.md).
 
@@ -152,13 +150,13 @@ See [ADR 001](adr/001-rsi-runtime-boundary.md).
 `hi-local` is an OpenAI-compatible **sidecar** released from the separate
 [`hi-local-runtime`](https://github.com/PipeNetwork/hi-local-runtime) repository.
 The agent talks to it like any other provider; GPU crates are not linked into
-`hi-agent` or the core workspace.
+`hi-harness` or the core workspace.
 
 ## Benchmark evidence boundary
 
-Harness diagnostics reuse the existing `hi-agent` turn report, change ledger,
-checkpoint store, and `hi-trace` observer; they do not create a parallel
-telemetry or artifact system. Reports remain additive `schema_version: 2`.
+Harness diagnostics reuse session JSONL, git checkpoints, and `hi-trace`
+observers; they do not create a parallel telemetry or artifact system. Reports
+remain additive `schema_version: 2`.
 
 `failure_mode` identifies where a run stopped while `FailKind` remains the
 quality bucket. Provider policy blocks retain provider code and HTTP status and

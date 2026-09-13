@@ -1,5 +1,9 @@
 # Harness simplification implementation
 
+Historical notes from the native `hi-agent` loop. Interactive `hi` now uses
+`hi-harness` (Pipe Network). Keep this file as the implementation log of that
+era; do not treat crate paths here as current.
+
 Baseline: `4d2867f`. Implementation uses the existing native harness, journal,
 workspace controllers and session formats. The pre-existing untracked
 `crates/hi-tui/.hi/` is unrelated to this change.

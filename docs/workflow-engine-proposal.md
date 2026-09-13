@@ -1,5 +1,9 @@
 # Workflow engine for `/dashboard` — design proposal
 
+Historical proposal against the old auto-merge fleet. Current `/dashboard` is
+an in-process Grok-style roster (no child `hi`, no auto-merge); see
+[fleet-dashboard.md](fleet-dashboard.md).
+
 ## Why now
 
 `/dashboard` already runs a fleet: N worktree-isolated child `hi` sessions, each

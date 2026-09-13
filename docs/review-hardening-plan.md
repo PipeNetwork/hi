@@ -1,5 +1,8 @@
 # Hardening Plan: unsafe policy, async-blocking audit, symlink-check consolidation
 
+Note: `crates/hi-agent/…` paths below are historical. The interactive loop is
+`hi-harness`; the `hi-agent` crate was removed.
+
 Three independent workstreams from the codebase review. Each is self-contained and
 lands with its own verification. The core workspace now owns workstreams A–C;
 the backend-specific exception and GGUF split belong in the separately released
