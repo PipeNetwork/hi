@@ -1,5 +1,5 @@
-//! `hi tickets` — claim project tickets and run `hi --goal --verify` until the
-//! report passes or the ticket budget is gone.
+//! `hi tickets` — claim project tickets and run a one-shot `hi` turn with
+//! `--verify` until the report passes or the ticket budget is gone.
 //!
 //! This is the opposite direction of `POST /v1/tasks`: the control plane holds
 //! the work item; this daemon leases a local ticket and executes it in the
@@ -43,7 +43,7 @@ dashboard; then cd into the repo and run:
   hi tickets
 
 The daemon heartbeats, leases one queued local ticket at a time, and
-spawns `hi --goal … --verify …` in this directory. Sandbox tickets are
+spawns a one-shot `hi --verify CMD PROMPT` in this directory. Sandbox tickets are
 not executed here.
 
 Environment:
@@ -204,15 +204,12 @@ fn spawn_goal_child(ticket: &TicketView, session: &Path, report: &Path) -> Resul
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if ticket.acceptance.qa == "skeptic" {
-        cmd.env("HI_GOAL_TEAM", "1");
-    }
     if let Ok(key) = std::env::var("PIPENETWORK_API_KEY")
         && !key.trim().is_empty()
     {
         cmd.env("PIPENETWORK_API_KEY", key);
     }
-    let mut child = cmd.spawn().context("failed to spawn hi --goal")?;
+    let mut child = cmd.spawn().context("failed to spawn hi ticket child")?;
     if let Some(stdout) = child.stdout.take() {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -240,8 +237,6 @@ fn child_argv(ticket: &TicketView, session: &Path, report: &Path) -> Vec<String>
         session.display().to_string(),
         "--report".into(),
         report.display().to_string(),
-        "--goal".into(),
-        ticket.goal.clone(),
     ];
     if let Some(verify) = ticket
         .acceptance
@@ -253,6 +248,10 @@ fn child_argv(ticket: &TicketView, session: &Path, report: &Path) -> Vec<String>
         argv.push("--verify".into());
         argv.push(verify.to_string());
     }
+    // Positional prompt: `--goal` was the old autonomous driver and no longer
+    // runs a turn. `--` so a goal that starts with `-` is not another flag.
+    argv.push("--".into());
+    argv.push(ticket.goal.clone());
     argv
 }
 
@@ -296,7 +295,10 @@ fn status_from_hi_report(report: &Value) -> String {
     if stopped_at_work_limit && matches!(verification, "passed" | "not_applicable") {
         return "repairing".into();
     }
-    if verification == "passed" && matches!(status, "completed" | "") && leftover != "active" {
+    if matches!(verification, "passed" | "not_applicable")
+        && matches!(status, "completed" | "")
+        && leftover != "active"
+    {
         return "succeeded".into();
     }
     if leftover == "active"
@@ -595,7 +597,12 @@ mod tests {
         let argv = child_argv(&sample_ticket("cargo test", "off"), &session, &report);
         assert!(
             argv.windows(2)
-                .any(|pair| pair == ["--goal", "make tests pass"])
+                .any(|pair| pair == ["--", "make tests pass"]),
+            "ticket goal must be the one-shot prompt, not --goal: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg == "--goal"),
+            "--goal no longer runs a turn: {argv:?}"
         );
         assert!(
             argv.windows(2)
@@ -624,6 +631,14 @@ mod tests {
     fn report_passed_maps_to_succeeded() {
         let report = json!({
             "outcome": { "status": "completed", "verification": "passed" }
+        });
+        assert_eq!(status_from_hi_report(&report), "succeeded");
+    }
+
+    #[test]
+    fn report_without_verify_maps_to_succeeded() {
+        let report = json!({
+            "outcome": { "status": "completed", "verification": "not_applicable" }
         });
         assert_eq!(status_from_hi_report(&report), "succeeded");
     }

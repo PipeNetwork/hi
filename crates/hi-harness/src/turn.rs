@@ -184,7 +184,7 @@ impl Harness {
                 ui.session_usage(self.session_usage);
                 self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
                 self.persist_new_messages(persisted_before);
-                self.run_verify(ui, cancel).await;
+                let verification = self.run_verify(ui, cancel).await;
                 ui.changed_files(changed.clone());
                 ui.turn_end(&summary(&completion, round));
                 return Ok(TurnOutcome {
@@ -192,6 +192,7 @@ impl Harness {
                     usage: turn_usage,
                     changed_files: changed,
                     error: None,
+                    verification,
                 });
             }
 
@@ -254,6 +255,7 @@ impl Harness {
                     usage: turn_usage,
                     changed_files: changed,
                     error: None,
+                    verification: None,
                 });
             }
             round += 1;
@@ -279,6 +281,7 @@ impl Harness {
             usage,
             changed_files,
             error,
+            verification: None,
         })
     }
 
@@ -368,12 +371,10 @@ impl Harness {
         }
     }
 
-    async fn run_verify(&self, ui: &mut dyn Ui, cancel: &TurnCancellation) {
-        let Some(command) = self.verify_command.as_deref() else {
-            return;
-        };
+    async fn run_verify(&self, ui: &mut dyn Ui, cancel: &TurnCancellation) -> Option<String> {
+        let command = self.verify_command.as_deref()?;
         if cancel.is_cancelled() {
-            return;
+            return None;
         }
         ui.status(&format!("verify · {command}"));
         match hi_tools::run_check_in_with_runner(self.tools.runner_ref(), command).await {
@@ -381,8 +382,18 @@ impl Harness {
                 let text = execution.display_content();
                 ui.tool_call("verify", command);
                 ui.tool_result("verify", &text);
+                Some(
+                    if execution.status == hi_tools::ToolStatus::Succeeded {
+                        "passed".into()
+                    } else {
+                        "failed".into()
+                    },
+                )
             }
-            Err(err) => ui.status(&format!("verify failed to start: {err:#}")),
+            Err(err) => {
+                ui.status(&format!("verify failed to start: {err:#}"));
+                Some("failed".into())
+            }
         }
     }
 }

@@ -858,6 +858,10 @@ fn write_turn_report(
             "status": status,
             "stop_reason": status,
             "changed_files": outcome.changed_files,
+            "verification": outcome
+                .verification
+                .clone()
+                .unwrap_or_else(|| "not_applicable".into()),
         },
         "model_outcome": {
             "model_requests": model_requests,

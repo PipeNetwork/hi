@@ -247,7 +247,7 @@ async fn run() -> Result<()> {
         );
     }
 
-    let prompt_input = effective_prompt(&cli)?;
+    let prompt_input = effective_prompt(&cli)?.or_else(|| cli.goal.clone());
     if !cli.subagent
         && let Some(target) = cli.review_target.as_deref()
     {

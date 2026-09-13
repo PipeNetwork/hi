@@ -107,6 +107,8 @@ pub struct TurnOutcome {
     pub usage: Usage,
     pub changed_files: Vec<String>,
     pub error: Option<String>,
+    /// `passed` / `failed` after `/verify`; `None` when no check ran.
+    pub verification: Option<String>,
 }
 
 #[derive(Clone, Debug)]
