@@ -221,6 +221,7 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
         tokio::select! {
             status = child.wait() => {
                 let status = status.context("waiting for supervised child")?;
+                abort_slash_repair(&mut repair_task, &runtime, "aborted in-flight slash repair (child exited)").await;
                 terminal.restore();
                 let ctx = classify_ctx(&cfg, &crash_dir, &panic_file, monitor.last_heartbeat(), false);
                 let signal = MonitorSignal::ChildExited {
@@ -292,6 +293,11 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                             );
                         }
                         Err(err) => {
+                            let _ = ipc::write_done(
+                                &runtime,
+                                ipc::REQUEST_DIAGNOSE_DONE,
+                                &format!("error: {err:#}\n"),
+                            );
                             spawn::write_supervisor_log(
                                 &runtime,
                                 &format!("diagnose bundle failed: {err:#}"),
@@ -299,28 +305,36 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                         }
                     }
                 }
-                if repair_task.is_none() && ipc::take_request(&runtime, ipc::REQUEST_REPAIR) {
-                    let cfg_repair = cfg.clone();
-                    let runtime_repair = runtime.clone();
-                    let heartbeat = monitor.last_heartbeat().cloned();
-                    repair_task = Some(tokio::spawn(async move {
-                        let bundle = incident::write_diagnose_bundle(
-                            &cfg_repair,
-                            &runtime_repair,
-                            heartbeat.as_ref(),
+                if ipc::take_request(&runtime, ipc::REQUEST_REPAIR) {
+                    if repair_task.is_some() {
+                        let _ = ipc::write_done(
+                            &runtime,
+                            ipc::REQUEST_REPAIR_DONE,
+                            "repair already in progress",
                         );
-                        let dir = bundle.ok().map(|b| b.dir);
-                        let class = slash::manual_class();
-                        maybe_run_repair(
-                            &cfg_repair,
-                            &class,
-                            dir.as_deref(),
-                            &runtime_repair,
-                            false,
-                        )
-                        .await
-                        .unwrap_or_else(|| "repair finished".into())
-                    }));
+                    } else {
+                        let cfg_repair = cfg.clone();
+                        let runtime_repair = runtime.clone();
+                        let heartbeat = monitor.last_heartbeat().cloned();
+                        repair_task = Some(tokio::spawn(async move {
+                            let bundle = incident::write_diagnose_bundle(
+                                &cfg_repair,
+                                &runtime_repair,
+                                heartbeat.as_ref(),
+                            );
+                            let dir = bundle.ok().map(|b| b.dir);
+                            let class = slash::manual_class();
+                            maybe_run_repair(
+                                &cfg_repair,
+                                &class,
+                                dir.as_deref(),
+                                &runtime_repair,
+                                false,
+                            )
+                            .await
+                            .unwrap_or_else(|| "repair finished".into())
+                        }));
+                    }
                 }
                 if let Some(handle) = repair_task.take() {
                     if handle.is_finished() {
@@ -359,6 +373,12 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                     &format!("classified {} {}", class.class_slug(), class.kind_slug()),
                 );
                 if class.is_harness_bug() {
+                    abort_slash_repair(
+                        &mut repair_task,
+                        &runtime,
+                        "aborted in-flight slash repair (harness bug)",
+                    )
+                    .await;
                     let tool = monitor
                         .last_heartbeat()
                         .and_then(|h| h.current_tool_pgid);
@@ -405,6 +425,12 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                     report_written = Some(bundle.dir);
                 }
                 if cfg.once {
+                    abort_slash_repair(
+                        &mut repair_task,
+                        &runtime,
+                        "aborted in-flight slash repair (once)",
+                    )
+                    .await;
                     return Ok(SupervisorOutcome {
                         class: Some(class),
                         child_status: None,
@@ -484,11 +510,14 @@ async fn maybe_run_repair(
         return Some(note);
     }
     let worktree = paths::worktrees_dir().join(id);
-    eprintln!(
+    let start_line = format!(
         "hi: starting repair for {id}; worktree {}.",
         worktree.display()
     );
-    spawn::write_supervisor_log(runtime, "repair starting");
+    if allow_prompt {
+        eprintln!("{start_line}");
+    }
+    spawn::write_supervisor_log(runtime, &start_line);
     let note = match repair::maybe_repair(cfg, class, dir).await {
         RepairOutcome::Completed {
             branch,
@@ -496,7 +525,13 @@ async fn maybe_run_repair(
             worktree,
             ..
         } if gate.passed => {
-            apply_verified(cfg, class, id, &branch, worktree, &repair_cfg, allow_prompt)
+            if !allow_prompt && !cfg.apply {
+                format!(
+                    "Repair available on branch {branch}. Not applied (session still owns the tty). Enable [autoharnessfix] apply = true, or apply after this session exits. See /autoharnessfix history."
+                )
+            } else {
+                apply_verified(cfg, class, id, &branch, worktree, &repair_cfg, allow_prompt)
+            }
         }
         RepairOutcome::Completed { branch, .. } => {
             format!("Repair produced branch {branch} but verification failed. Not applied.")
@@ -607,6 +642,19 @@ async fn run_manual_repair(
         .unwrap_or_else(|| "repair finished".into());
     eprintln!("{note}");
     Ok(0)
+}
+
+async fn abort_slash_repair(
+    task: &mut Option<tokio::task::JoinHandle<String>>,
+    runtime: &std::path::Path,
+    why: &str,
+) {
+    let Some(handle) = task.take() else {
+        return;
+    };
+    handle.abort();
+    let _ = handle.await;
+    spawn::write_supervisor_log(runtime, why);
 }
 
 fn report_user(class: &Class, dir: Option<&PathBuf>, repair_note: Option<&str>) {

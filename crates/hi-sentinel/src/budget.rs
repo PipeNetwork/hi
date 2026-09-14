@@ -11,10 +11,10 @@ use crate::fsutil;
 
 const HOUR_MS: u64 = 60 * 60 * 1000;
 
-#[derive(Serialize, Deserialize)]
-struct ApplyLogLine {
-    ts_unix_ms: u64,
-    id: String,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApplyLogLine {
+    pub ts_unix_ms: u64,
+    pub id: String,
 }
 
 pub fn gc_incidents(incidents: &Path, ttl: Duration, max_count: usize) {
@@ -78,6 +78,20 @@ pub fn applies_last_hour(path: &Path, now_ms: u64) -> u32 {
 
 pub fn hourly_cap_reached(path: &Path, cap: u32, now_ms: u64) -> bool {
     applies_last_hour(path, now_ms) >= cap
+}
+
+pub fn tail_apply(path: &Path, n: usize) -> Vec<ApplyLogLine> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<ApplyLogLine> = text
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .take(n)
+        .collect();
+    entries.reverse();
+    entries
 }
 
 pub fn append_apply(path: &Path, id: &str, now_ms: u64) -> io::Result<()> {

@@ -137,7 +137,6 @@ pub fn maybe_apply(req: &ApplyRequest) -> ApplyOutcome {
         );
     }
 
-    spawn::prepare_interactive_prompt();
     if !req.auto_apply {
         if !req.stdin_is_tty && req.apply_answer.is_none() {
             eprintln!(
@@ -152,6 +151,8 @@ pub fn maybe_apply(req: &ApplyRequest) -> ApplyOutcome {
                 ),
             );
         }
+        // Un-ignore SIGINT only when we are about to read [y/N].
+        spawn::prepare_interactive_prompt();
         let question = format!(
             "Repair succeeded for {}. Apply sidecar binaries from worktree? [y/N] ",
             req.incident_id

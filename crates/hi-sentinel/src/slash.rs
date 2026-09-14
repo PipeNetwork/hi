@@ -3,7 +3,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use hi_liveness::{ENV_GENERATION, ENV_HI_BINARY, ENV_SUPERVISED, env_flag_on};
@@ -96,13 +95,28 @@ pub fn status_text() -> String {
 }
 
 pub fn history_text() -> String {
-    let lines = history::tail(&paths::history_path(&paths::state_dir()), 20);
-    if lines.is_empty() {
+    let state = paths::state_dir();
+    let incidents = history::tail(&paths::history_path(&state), 20);
+    let applies = budget::tail_apply(&paths::apply_log_path(&state), 20);
+    if incidents.is_empty() && applies.is_empty() {
         return "no Sentinel incidents".into();
     }
     let mut out = Vec::new();
-    for line in lines {
-        out.push(format!("{}  {}  {}", line.id, line.class, line.kind));
+    out.push("incidents:".into());
+    if incidents.is_empty() {
+        out.push("  (none)".into());
+    } else {
+        for line in incidents {
+            out.push(format!("  {}  {}  {}", line.id, line.class, line.kind));
+        }
+    }
+    out.push("applies:".into());
+    if applies.is_empty() {
+        out.push("  (none)".into());
+    } else {
+        for line in applies {
+            out.push(format!("  {}", line.id));
+        }
     }
     out.join("\n")
 }
@@ -147,16 +161,7 @@ pub fn diagnose(workspace: &Path, session_path: Option<&Path>) -> Result<String>
     if let Some(runtime) = ipc::runtime_dir_from_env() {
         ipc::write_request(&runtime, ipc::REQUEST_DIAGNOSE, ipc::REQUEST_DIAGNOSE_DONE)
             .context("writing diagnose request")?;
-        match ipc::wait_done(&runtime, ipc::REQUEST_DIAGNOSE_DONE, Duration::from_secs(3)) {
-            Ok(body) => {
-                let path = body.trim();
-                Ok(format!("diagnose bundle: {path}"))
-            }
-            Err(_) => Ok(
-                "diagnose requested; Sentinel will write a bundle (see /autoharnessfix history)"
-                    .into(),
-            ),
-        }
+        Ok("diagnose requested; Sentinel will write a bundle (see /autoharnessfix history)".into())
     } else {
         let dir = incident::write_local_snapshot(workspace, session_path, crash_dir().as_deref())
             .context("writing diagnose snapshot")?;
@@ -170,7 +175,8 @@ fn repair(workspace: &Path, session_path: Option<&Path>) -> Result<SlashOutcome>
         ipc::write_request(&runtime, ipc::REQUEST_REPAIR, ipc::REQUEST_REPAIR_DONE)
             .context("writing repair request")?;
         return Ok(SlashOutcome::Message(
-            "repair requested; this session stays up. Check /autoharnessfix history.".into(),
+            "repair requested; this session stays up. Result lands in /autoharnessfix history (apply needs [autoharnessfix] apply = true, or a restart)."
+                .into(),
         ));
     }
     let dir = incident::write_local_snapshot(workspace, session_path, crash_dir().as_deref())
@@ -307,5 +313,66 @@ mod tests {
             }
             other => panic!("expected persist-only, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn supervised_diagnose_does_not_wait() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let hb = tmp.path().join("heartbeat.json");
+        std::fs::write(&hb, b"{}").unwrap();
+        let previous = std::env::var_os(hi_liveness::ENV_HEARTBEAT);
+        unsafe {
+            std::env::set_var(hi_liveness::ENV_HEARTBEAT, &hb);
+        }
+        let started = std::time::Instant::now();
+        let text = diagnose(tmp.path(), None);
+        let elapsed = started.elapsed();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(hi_liveness::ENV_HEARTBEAT, value),
+                None => std::env::remove_var(hi_liveness::ENV_HEARTBEAT),
+            }
+        }
+        let text = text.unwrap();
+        assert!(text.contains("diagnose requested"), "{text}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "diagnose blocked the caller for {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn history_text_includes_apply_log() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os(crate::ENV_STATE_DIR);
+        unsafe {
+            std::env::set_var(crate::ENV_STATE_DIR, tmp.path());
+        }
+        crate::fsutil::mkdir_0700(tmp.path()).unwrap();
+        crate::history::append_raw(
+            &crate::paths::history_path(tmp.path()),
+            "incident-1-aaaa",
+            "diagnose",
+            "snapshot",
+        )
+        .unwrap();
+        crate::budget::append_apply(
+            &crate::paths::apply_log_path(tmp.path()),
+            "incident-1-aaaa",
+            1,
+        )
+        .unwrap();
+        let text = history_text();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(crate::ENV_STATE_DIR, value),
+                None => std::env::remove_var(crate::ENV_STATE_DIR),
+            }
+        }
+        assert!(text.contains("incidents:"), "{text}");
+        assert!(text.contains("incident-1-aaaa"), "{text}");
+        assert!(text.contains("applies:"), "{text}");
     }
 }

@@ -160,21 +160,20 @@ fn exec_after_restore(
     Err(anyhow::anyhow!("exec hi-sentinel: {err}"))
 }
 
-/// Test helper: record restore/exec order without touching a real tty.
+/// Mirrors `CrosstermRestore`: `Restore::restore_now_static` already left the
+/// alternate screen, so `leave_alternate_screen` is a no-op.
 #[cfg(test)]
-struct RecordingHost {
+struct RecordingCrossterm {
     order: Vec<&'static str>,
-    session: PathBuf,
 }
 
 #[cfg(test)]
-impl TtyRestore for RecordingHost {
+impl TtyRestore for RecordingCrossterm {
     fn disable_raw_mode(&mut self) {
         self.order.push("disable_raw_mode");
-    }
-    fn leave_alternate_screen(&mut self) {
         self.order.push("LeaveAlternateScreen");
     }
+    fn leave_alternate_screen(&mut self) {}
     fn restore_termios(&mut self) {
         self.order.push("restore_termios");
     }
@@ -183,7 +182,6 @@ impl TtyRestore for RecordingHost {
     }
     fn exec(&mut self) -> io::Error {
         self.order.push("exec");
-        let _ = &self.session;
         io::Error::other("fake exec")
     }
 }
@@ -194,10 +192,7 @@ mod tests {
 
     #[test]
     fn restore_happens_before_exec() {
-        let mut host = RecordingHost {
-            order: Vec::new(),
-            session: PathBuf::from("/tmp/session.jsonl"),
-        };
+        let mut host = RecordingCrossterm { order: Vec::new() };
         let err = restore_then_exec(&mut host);
         assert_eq!(err.to_string(), "fake exec");
         assert_eq!(
@@ -209,6 +204,17 @@ mod tests {
                 "print_restart",
                 "exec",
             ]
+        );
+    }
+
+    #[test]
+    fn restore_now_static_sequence_includes_leave_alternate_screen() {
+        let mut buf = Vec::new();
+        crate::event::write_leave_session_screen(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("1049l"),
+            "CrosstermRestore disable_raw_mode must emit LeaveAlternateScreen: {text:?}"
         );
     }
 }

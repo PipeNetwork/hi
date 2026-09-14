@@ -236,9 +236,13 @@ pub fn set_machine_enabled(enabled: bool) -> anyhow::Result<std::path::PathBuf> 
     let path = paths::default_config_path()
         .ok_or_else(|| anyhow::anyhow!("could not determine ~/.config/hi/config.toml"))?;
     let mut table = if path.exists() {
-        std::fs::read_to_string(&path)?
-            .parse::<toml::Table>()
-            .unwrap_or_default()
+        let text = std::fs::read_to_string(&path)?;
+        text.parse::<toml::Table>().map_err(|err| {
+            anyhow::anyhow!(
+                "machine config {} is not valid TOML ({err}); not rewriting",
+                path.display()
+            )
+        })?
     } else {
         toml::Table::new()
     };
@@ -257,10 +261,7 @@ pub fn set_machine_enabled(enabled: bool) -> anyhow::Result<std::path::PathBuf> 
     if let Some(parent) = path.parent() {
         crate::fsutil::mkdir_0700(parent)?;
     }
-    let tmp = path.with_extension("toml.tmp");
-    crate::fsutil::write_0600(&tmp, body.as_bytes())?;
-    std::fs::rename(&tmp, &path)?;
-    crate::fsutil::chmod_0600(&path)?;
+    crate::fsutil::write_atomic_0600(&path, body.as_bytes())?;
     Ok(path)
 }
 
@@ -366,5 +367,53 @@ mod tests {
             "project hi.toml must stay untouched"
         );
         assert!(project.contains("/tmp/evil"));
+    }
+
+    #[test]
+    fn set_machine_enabled_fails_closed_on_invalid_toml() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_home = tmp.path().join("config");
+        std::fs::create_dir_all(config_home.join("hi")).unwrap();
+        let machine = config_home.join("hi/config.toml");
+        std::fs::write(&machine, "this is not [toml\n").unwrap();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+        let err = set_machine_enabled(true);
+        let after = std::fs::read_to_string(&machine).unwrap();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert!(err.is_err(), "parse failure must not rewrite");
+        assert_eq!(after, "this is not [toml\n");
+    }
+
+    #[test]
+    fn set_machine_enabled_keeps_existing_keys() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_home = tmp.path().join("config");
+        std::fs::create_dir_all(config_home.join("hi")).unwrap();
+        let machine = config_home.join("hi/config.toml");
+        std::fs::write(&machine, "[profiles.pipenetwork]\napi_key = \"pk_keep\"\n").unwrap();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+        set_machine_enabled(true).unwrap();
+        let after = std::fs::read_to_string(&machine).unwrap();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert!(after.contains("pk_keep"), "{after}");
+        assert!(after.contains("enabled = true"), "{after}");
     }
 }

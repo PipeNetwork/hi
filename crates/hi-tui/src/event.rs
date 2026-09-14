@@ -442,14 +442,20 @@ impl Restore {
 
     pub(crate) fn restore_now_static() {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableMouseCapture,
-            DisableFocusChange,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+        let _ = write_leave_session_screen(&mut io::stdout());
     }
+}
+
+/// Crossterm bytes that drop the alternate screen. `exec(2)` skips Drop, so
+/// `/autoharnessfix on` must emit these before replacing the process.
+pub(crate) fn write_leave_session_screen(out: &mut impl io::Write) -> io::Result<()> {
+    execute!(
+        out,
+        DisableMouseCapture,
+        DisableFocusChange,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )
 }
 impl Drop for Restore {
     fn drop(&mut self) {

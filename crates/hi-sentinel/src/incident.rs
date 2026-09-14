@@ -127,15 +127,7 @@ pub fn write_bundle(
         fsutil::write_0600(&dir.join("stderr.log"), b"")?;
     }
 
-    let repro_dir = dir.join("repro");
-    fsutil::mkdir_0700(&repro_dir)?;
-    let repro = repro_dir.join("reproduction.sh");
-    fsutil::write_0600(&repro, REPRO_SCRIPT.as_bytes())?;
-    fsutil::chmod_0700_file(&repro)?;
-    fsutil::write_0600(
-        &repro_dir.join("README"),
-        b"Isolated reproduction. Never exec the live project or installed binary.\n",
-    )?;
+    write_repro(&dir)?;
 
     let checkout = cfg.checkout.as_ref().and_then(|path| {
         crate::checkout::validate(path).ok().map(|v| CheckoutDoc {
@@ -239,6 +231,7 @@ fn write_named_bundle(
     {
         copy_redacted_if_exists(session, &dir.join("transcript.jsonl"))?;
     }
+    write_repro(&dir)?;
     let checkout = cfg.checkout.as_ref().and_then(|path| {
         crate::checkout::validate(path).ok().map(|v| CheckoutDoc {
             path: v.path.display().to_string(),
@@ -296,6 +289,7 @@ pub fn write_local_snapshot(
     if let Some(crash) = crash_dir {
         copy_crash_dir(crash, &dir.join("crash"))?;
     }
+    write_repro(&dir)?;
     let doc = serde_json::json!({
         "schema_version": 1,
         "id": id,
@@ -303,12 +297,26 @@ pub fn write_local_snapshot(
         "kind": "snapshot",
         "user_workspace": workspace.display().to_string(),
         "session_path": session_path.map(|p| p.display().to_string()),
+        "reproduction": "repro/reproduction.sh",
         "redacted": true,
     });
     fsutil::write_0600(&dir.join("incident.json"), doc.to_string().as_bytes())?;
     history::append_raw(&paths::history_path(&state), &id, "diagnose", "snapshot")?;
     fsutil::chmod_0700(&dir)?;
     Ok(dir)
+}
+
+fn write_repro(dir: &Path) -> io::Result<()> {
+    let repro_dir = dir.join("repro");
+    fsutil::mkdir_0700(&repro_dir)?;
+    let repro = repro_dir.join("reproduction.sh");
+    fsutil::write_0600(&repro, REPRO_SCRIPT.as_bytes())?;
+    fsutil::chmod_0700_file(&repro)?;
+    fsutil::write_0600(
+        &repro_dir.join("README"),
+        b"Isolated reproduction. Never exec the live project or installed binary.\n",
+    )?;
+    Ok(())
 }
 
 fn allocate_id(state: &Path) -> io::Result<String> {
@@ -482,5 +490,33 @@ mod tests {
         let out = truncate(&value, 512);
         assert!(out.ends_with('…'));
         assert_eq!(out.chars().count(), 513);
+    }
+
+    #[test]
+    fn local_snapshot_writes_repro_script() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os(crate::ENV_STATE_DIR);
+        unsafe {
+            std::env::set_var(crate::ENV_STATE_DIR, dir.path());
+        }
+        let snap = write_local_snapshot(dir.path(), None, None);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(crate::ENV_STATE_DIR, value),
+                None => std::env::remove_var(crate::ENV_STATE_DIR),
+            }
+        }
+        let snap = snap.unwrap();
+        let script = snap.join("repro/reproduction.sh");
+        assert!(script.is_file(), "missing {}", script.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&script).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        let body = fs::read_to_string(&script).unwrap();
+        assert!(body.contains("HI_BINARY"));
     }
 }

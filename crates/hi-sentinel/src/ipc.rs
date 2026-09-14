@@ -4,7 +4,6 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use hi_liveness::ENV_HEARTBEAT;
 
@@ -34,26 +33,6 @@ pub fn take_request(runtime: &Path, name: &str) -> bool {
 pub fn write_done(runtime: &Path, name: &str, body: &str) -> io::Result<()> {
     fsutil::mkdir_0700(runtime)?;
     fsutil::write_0600(&runtime.join(name), body.as_bytes())
-}
-
-pub fn read_done(runtime: &Path, name: &str) -> Option<String> {
-    fs::read_to_string(runtime.join(name)).ok()
-}
-
-pub fn wait_done(runtime: &Path, name: &str, timeout: Duration) -> io::Result<String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(body) = read_done(runtime, name) {
-            return Ok(body);
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("{name} was not acknowledged"),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 #[cfg(test)]
@@ -105,8 +84,8 @@ mod tests {
         assert!(!take_request(dir.path(), REQUEST_DIAGNOSE));
         write_done(dir.path(), REQUEST_DIAGNOSE_DONE, "/tmp/incident\n").unwrap();
         assert_eq!(
-            read_done(dir.path(), REQUEST_DIAGNOSE_DONE).as_deref(),
-            Some("/tmp/incident\n")
+            fs::read_to_string(dir.path().join(REQUEST_DIAGNOSE_DONE)).unwrap(),
+            "/tmp/incident\n"
         );
         #[cfg(unix)]
         {
