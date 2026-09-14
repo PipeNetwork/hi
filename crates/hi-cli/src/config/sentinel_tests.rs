@@ -58,6 +58,47 @@ fn apply_without_parent_requires_machine_enabled() {
 }
 
 #[test]
+fn apply_parses_without_parent_flag() {
+    let cli = Cli::try_parse_from(["hi", "--autoharnessfix-apply"]).unwrap();
+    assert!(cli.sentinel.autoharnessfix_apply);
+    assert!(!cli.sentinel.autoharnessfix);
+}
+
+#[test]
+fn apply_with_parent_flag_is_legal() {
+    let cli = Cli::try_parse_from(["hi", "--autoharnessfix", "--autoharnessfix-apply"]).unwrap();
+    assert!(cli.sentinel.autoharnessfix);
+    assert!(cli.sentinel.autoharnessfix_apply);
+    assert!(sentinel_flag_error(&cli).is_none());
+}
+
+#[test]
+fn apply_with_machine_enabled_is_legal() {
+    let _lock = crate::CWD_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("hi")).unwrap();
+    std::fs::write(
+        dir.path().join("hi/config.toml"),
+        "[autoharnessfix]\nenabled = true\n",
+    )
+    .unwrap();
+    let previous = std::env::var_os("XDG_CONFIG_HOME");
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+    }
+    let cli = Cli::try_parse_from(["hi", "--autoharnessfix-apply"]).unwrap();
+    let err = sentinel_flag_error(&cli);
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+    assert!(err.is_none(), "{err:?}");
+    assert!(cli.sentinel.autoharnessfix_apply);
+}
+
+#[test]
 fn machine_enabled_requests_sentinel_without_cli_flag() {
     let _lock = crate::CWD_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();

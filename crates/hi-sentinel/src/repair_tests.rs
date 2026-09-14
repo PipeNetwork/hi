@@ -28,6 +28,7 @@ fn timeouts() -> RepairConfig {
         patch_timeout: Duration::from_secs(15),
         max_repairs_per_session: 2,
         max_attempts_per_incident: 1,
+        max_modifications_per_hour: 3,
     }
 }
 

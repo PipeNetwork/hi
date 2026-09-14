@@ -100,7 +100,6 @@ pub struct MachineSection {
     #[allow(dead_code)]
     pub enabled: bool,
     #[serde(default)]
-    #[allow(dead_code)]
     pub apply: bool,
     pub checkout: Option<PathBuf>,
     pub diagnose_model: Option<String>,
@@ -110,6 +109,7 @@ pub struct MachineSection {
     pub live_pgid_report_secs: Option<u64>,
     pub max_repairs_per_session: Option<u32>,
     pub max_attempts_per_incident: Option<u32>,
+    pub max_modifications_per_hour: Option<u32>,
     pub incident_retention_days: Option<u64>,
 }
 
@@ -125,6 +125,7 @@ pub struct RepairConfig {
     pub patch_timeout: Duration,
     pub max_repairs_per_session: u32,
     pub max_attempts_per_incident: u32,
+    pub max_modifications_per_hour: u32,
 }
 
 impl Default for RepairConfig {
@@ -134,6 +135,7 @@ impl Default for RepairConfig {
             patch_timeout: Duration::from_secs(20 * 60),
             max_repairs_per_session: 2,
             max_attempts_per_incident: 1,
+            max_modifications_per_hour: 3,
         }
     }
 }
@@ -147,6 +149,9 @@ impl RepairConfig {
             }
             if let Some(n) = section.max_attempts_per_incident {
                 cfg.max_attempts_per_incident = n.max(1);
+            }
+            if let Some(n) = section.max_modifications_per_hour {
+                cfg.max_modifications_per_hour = n;
             }
         }
         override_ms("HI_SENTINEL_DIAGNOSE_MS", &mut cfg.diagnose_timeout);

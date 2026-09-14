@@ -1,6 +1,7 @@
 //! Classify-then-act loop. Kill only on HarnessBug or true process death.
 
 use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::Instant;
@@ -14,16 +15,19 @@ use hi_liveness::{
 use tokio::process::Child;
 
 use crate::ENV_CHECKOUT;
+use crate::ENV_KNOWN_GOOD;
 use crate::ENV_SESSION_TOKEN;
+use crate::apply::{self, ApplyOutcome, ApplyRefuse, ApplyRequest};
 use crate::args::{find_on_path, strip_sentinel_args};
 use crate::budget;
 use crate::classify::{self, Class, ClassifyContext};
-use crate::config::{MonitorConfig, SupervisorConfig, instance_token, peek_machine};
+use crate::config::{MonitorConfig, RepairConfig, SupervisorConfig, instance_token, peek_machine};
 use crate::fsutil;
 use crate::incident;
 use crate::monitor::{Monitor, MonitorSignal};
 use crate::paths;
 use crate::repair::{self, RepairOutcome};
+use crate::rollback::{self, RecordInput};
 use crate::spawn;
 
 #[derive(Parser, Debug)]
@@ -95,7 +99,7 @@ async fn run_async() -> Result<i32> {
         hi_binary,
         original_argv,
         checkout,
-        apply: cli.apply || stripped.apply,
+        apply: cli.apply || stripped.apply || peek_machine().is_some_and(|s| s.apply),
         monitor: MonitorConfig::from_machine_and_env(),
         state_dir,
         workspace,
@@ -122,6 +126,20 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
         std::time::Duration::from_secs(ttl_days.saturating_mul(86400)),
         50,
     );
+
+    if cfg.generation == 0 && cfg.hi_binary.is_file() {
+        let validated = cfg
+            .checkout
+            .as_ref()
+            .and_then(|path| crate::checkout::validate(path).ok());
+        let _ = rollback::record(&RecordInput {
+            state_dir: &cfg.state_dir,
+            checkout_path: validated.as_ref().map(|v| v.path.as_path()),
+            checkout_sha: validated.as_ref().map(|v| v.head_sha.as_str()),
+            binary_path: &cfg.hi_binary,
+            prev_binary_path: None,
+        });
+    }
 
     let instance = instance_token();
     let runtime = paths::runtime_dir(&cfg.state_dir, &instance);
@@ -154,6 +172,10 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
             cfg.hi_binary.display().to_string(),
         ),
         (ENV_SESSION_TOKEN.to_string(), instance.clone()),
+        (
+            ENV_KNOWN_GOOD.to_string(),
+            paths::known_good_path(&cfg.state_dir).display().to_string(),
+        ),
     ];
     env_pairs.extend(cfg.extra_env.iter().cloned());
 
@@ -344,6 +366,27 @@ async fn maybe_run_repair(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("incident");
+    let repair_cfg = RepairConfig::from_machine_and_env();
+    if cfg.generation >= repair_cfg.max_repairs_per_session {
+        let kg = rollback::load(&cfg.state_dir).ok();
+        let current_b3 = rollback::hash_file(&cfg.hi_binary).unwrap_or_default();
+        let current_sha = cfg
+            .checkout
+            .as_ref()
+            .and_then(|path| crate::checkout::validate(path).ok())
+            .map(|v| v.head_sha);
+        let note = apply::halt_user_line(
+            cfg.generation,
+            id,
+            kg.as_ref(),
+            current_sha.as_deref(),
+            &current_b3,
+            cfg.checkout.as_deref(),
+            &paths::incidents_dir(&cfg.state_dir),
+        );
+        spawn::write_supervisor_log(runtime, &note);
+        return Some(note);
+    }
     let worktree = paths::worktrees_dir().join(id);
     eprintln!(
         "hi: starting repair for {id}; worktree {}.",
@@ -351,9 +394,12 @@ async fn maybe_run_repair(
     );
     spawn::write_supervisor_log(runtime, "repair starting");
     let note = match repair::maybe_repair(cfg, class, dir).await {
-        RepairOutcome::Completed { branch, gate, .. } if gate.passed => {
-            format!("Repair available on branch {branch}. Not applied.")
-        }
+        RepairOutcome::Completed {
+            branch,
+            gate,
+            worktree,
+            ..
+        } if gate.passed => apply_verified(cfg, class, id, &branch, worktree, &repair_cfg),
         RepairOutcome::Completed { branch, .. } => {
             format!("Repair produced branch {branch} but verification failed. Not applied.")
         }
@@ -363,7 +409,71 @@ async fn maybe_run_repair(
     Some(note)
 }
 
+fn apply_verified(
+    cfg: &SupervisorConfig,
+    class: &Class,
+    id: &str,
+    branch: &str,
+    worktree: PathBuf,
+    repair_cfg: &RepairConfig,
+) -> String {
+    let validated = cfg
+        .checkout
+        .as_ref()
+        .and_then(|path| crate::checkout::validate(path).ok());
+    let outcome = apply::maybe_apply(&ApplyRequest {
+        incident_id: id.to_string(),
+        worktree,
+        checkout: validated
+            .as_ref()
+            .map(|v| v.path.clone())
+            .or_else(|| cfg.checkout.clone())
+            .unwrap_or_default(),
+        checkout_dirty: validated.as_ref().is_some_and(|v| v.dirty),
+        hi_binary: cfg.hi_binary.clone(),
+        state_dir: cfg.state_dir.clone(),
+        generation: cfg.generation,
+        auto_apply: cfg.apply,
+        stdin_is_tty: std::io::stdin().is_terminal(),
+        apply_answer: None,
+        overwrite_answer: None,
+        cargo: apply::cargo_bin(),
+        max_repairs_per_session: repair_cfg.max_repairs_per_session,
+        max_modifications_per_hour: repair_cfg.max_modifications_per_hour,
+    });
+    match outcome {
+        ApplyOutcome::Applied { note } => {
+            let mut out = format!(
+                "hi: internal harness error ({id}, {}) repaired and verified; sidecar applied.",
+                class.kind_slug()
+            );
+            if !note.is_empty() {
+                out.push(' ');
+                out.push_str(&note);
+            }
+            out
+        }
+        ApplyOutcome::Refused {
+            reason: ApplyRefuse::GenerationHalt,
+            note,
+        } => note,
+        ApplyOutcome::Refused { note, .. } => {
+            if note.contains("Not applied.") {
+                note
+            } else {
+                format!("Repair available on branch {branch}. Not applied. {note}")
+            }
+        }
+    }
+}
+
 fn report_user(class: &Class, dir: Option<&PathBuf>, repair_note: Option<&str>) {
+    if let Some(note) = repair_note
+        && note.starts_with("hi:")
+    {
+        eprintln!("{note}");
+        return;
+    }
     let id = dir
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
@@ -373,6 +483,8 @@ fn report_user(class: &Class, dir: Option<&PathBuf>, repair_note: Option<&str>) 
         class.kind_slug()
     );
     if let Some(note) = repair_note {
-        eprintln!("    {note}");
+        for line in note.lines() {
+            eprintln!("    {line}");
+        }
     }
 }

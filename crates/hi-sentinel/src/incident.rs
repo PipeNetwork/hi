@@ -109,6 +109,10 @@ pub fn write_bundle(
     if let Some(checkout) = &cfg.checkout {
         write_git_status(&dir.join("git-status-checkout.txt"), checkout)?;
     }
+    copy_redacted_if_exists(
+        &paths::known_good_path(&cfg.state_dir),
+        &dir.join("known-good.json"),
+    )?;
     if let Some(session) = heartbeat.and_then(|h| h.session_path.as_ref()) {
         copy_redacted_if_exists(Path::new(session), &dir.join("transcript.jsonl"))?;
     }

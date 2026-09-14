@@ -4,9 +4,10 @@
 //! `rsi-hi-worker`) and is not clap's "unlimited internal sentinel" cap
 //! (`parse_finite_u32_cap`). It observes a child, classifies failures, writes
 //! forensic bundles, and on a classified harness bug may run a locked-down
-//! repair agent in a detached worktree. It does not apply binaries or move
-//! `main`.
+//! repair agent in a detached worktree. Verified repairs install sidecar
+//! binaries; they never move `main`.
 
+mod apply;
 mod args;
 mod budget;
 mod checkout;
@@ -19,6 +20,7 @@ mod incident;
 mod monitor;
 mod paths;
 mod repair;
+mod rollback;
 mod spawn;
 mod supervise;
 mod worktree;

@@ -29,6 +29,19 @@ pub fn next_id_path(state: &Path) -> PathBuf {
     state.join("next-id")
 }
 
+pub fn known_good_path(state: &Path) -> PathBuf {
+    state.join("known-good.json")
+}
+
+pub fn apply_log_path(state: &Path) -> PathBuf {
+    state.join("apply-log.jsonl")
+}
+
+/// `cargo install --root` target: `{state}/bin/{hi,hi-sentinel}`.
+pub fn sidecar_bin_dir(state: &Path) -> PathBuf {
+    state.join("bin")
+}
+
 /// Live heartbeat + crash dir for this supervisor instance.
 pub fn runtime_dir(state: &Path, instance: &str) -> PathBuf {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
