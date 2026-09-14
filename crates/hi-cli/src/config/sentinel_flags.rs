@@ -13,7 +13,6 @@ pub struct SentinelFlags {
     pub no_autoharnessfix: bool,
 
     /// After a verified repair, apply without prompting (still never pushes).
-    // Parent flag is not clap-required: machine `[autoharnessfix] enabled` is also enough.
     #[arg(long)]
     pub autoharnessfix_apply: bool,
 

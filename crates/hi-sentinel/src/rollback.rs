@@ -70,18 +70,19 @@ pub fn load(state_dir: &Path) -> io::Result<KnownGood> {
     serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+pub fn is_corrupt(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::InvalidData
+}
+
+pub fn is_missing(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::NotFound
+}
+
 pub fn write_known_good(state_dir: &Path, kg: &KnownGood) -> io::Result<()> {
     fsutil::mkdir_0700(state_dir)?;
     let json =
         serde_json::to_vec_pretty(kg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     fsutil::write_0600(&paths::known_good_path(state_dir), &json)
-}
-
-pub fn ensure_recorded(input: &RecordInput<'_>) -> io::Result<KnownGood> {
-    match load(input.state_dir) {
-        Ok(kg) => Ok(kg),
-        Err(_) => record(input),
-    }
 }
 
 pub fn binary_matches(kg: &KnownGood, binary: &Path) -> bool {
@@ -143,5 +144,47 @@ mod tests {
             fsutil::unix_mode(&paths::known_good_path(&state)).unwrap(),
             0o600
         );
+    }
+
+    #[test]
+    fn load_rejects_corrupt_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fsutil::mkdir_0700(&state).unwrap();
+        fsutil::write_0600(&paths::known_good_path(&state), b"{not-json").unwrap();
+        let err = load(&state).unwrap_err();
+        assert!(is_corrupt(&err), "{err}");
+    }
+
+    #[test]
+    fn record_refreshes_hash_and_keeps_prev_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fsutil::mkdir_0700(&state).unwrap();
+        let bin = dir.path().join("hi");
+        let prev = state.join("bin/hi.prev");
+        fs::write(&bin, b"gen0").unwrap();
+        copy_prev(&bin, &prev).unwrap();
+        record(&RecordInput {
+            state_dir: &state,
+            checkout_path: Some(Path::new("/tmp/hi")),
+            checkout_sha: Some("aaa"),
+            binary_path: &bin,
+            prev_binary_path: Some(&prev),
+        })
+        .unwrap();
+        fs::write(&bin, b"gen1-sidecar").unwrap();
+        let kg = record(&RecordInput {
+            state_dir: &state,
+            checkout_path: Some(Path::new("/tmp/hi")),
+            checkout_sha: Some("bbb"),
+            binary_path: &bin,
+            prev_binary_path: Some(&prev),
+        })
+        .unwrap();
+        assert_eq!(kg.checkout_sha, "bbb");
+        assert!(binary_matches(&kg, &bin));
+        assert_eq!(kg.prev_binary_path, prev.display().to_string());
+        assert_eq!(fs::read_to_string(&prev).unwrap(), "gen0");
     }
 }

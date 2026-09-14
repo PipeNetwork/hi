@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -127,17 +127,18 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
         50,
     );
 
-    if cfg.generation == 0 && cfg.hi_binary.is_file() {
+    if cfg.hi_binary.is_file() {
         let validated = cfg
             .checkout
             .as_ref()
             .and_then(|path| crate::checkout::validate(path).ok());
+        let prev = paths::sidecar_bin_dir(&cfg.state_dir).join("hi.prev");
         let _ = rollback::record(&RecordInput {
             state_dir: &cfg.state_dir,
             checkout_path: validated.as_ref().map(|v| v.path.as_path()),
             checkout_sha: validated.as_ref().map(|v| v.head_sha.as_str()),
             binary_path: &cfg.hi_binary,
-            prev_binary_path: None,
+            prev_binary_path: prev.is_file().then_some(prev.as_path()),
         });
     }
 
@@ -430,6 +431,7 @@ fn apply_verified(
             .or_else(|| cfg.checkout.clone())
             .unwrap_or_default(),
         checkout_dirty: validated.as_ref().is_some_and(|v| v.dirty),
+        checkout_sha: validated.as_ref().map(|v| v.head_sha.clone()),
         hi_binary: cfg.hi_binary.clone(),
         state_dir: cfg.state_dir.clone(),
         generation: cfg.generation,
@@ -440,6 +442,7 @@ fn apply_verified(
         cargo: apply::cargo_bin(),
         max_repairs_per_session: repair_cfg.max_repairs_per_session,
         max_modifications_per_hour: repair_cfg.max_modifications_per_hour,
+        install_timeout: Duration::from_secs(15 * 60),
     });
     match outcome {
         ApplyOutcome::Applied { note } => {

@@ -54,7 +54,8 @@ impl TerminalGuard {
         }
         if let (Some(fd), Some(orig)) = (self.tty_fd, self.orig.as_ref()) {
             unsafe {
-                libc::tcsetattr(fd, libc::TCSANOW, orig);
+                // Drop leftover TUI keystrokes so they cannot answer a later [y/N].
+                libc::tcsetattr(fd, libc::TCSAFLUSH, orig);
                 libc::tcsetpgrp(fd, self.supervisor_pgid);
             }
         }
@@ -182,6 +183,25 @@ fn ignore_job_signals() {
         libc::signal(libc::SIGTSTP, libc::SIG_IGN);
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+    }
+}
+
+/// Job-control ignore is for the live child. The apply prompt and cargo install must be interruptible.
+pub fn prepare_interactive_prompt() {
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+    }
+    let Some(fd) = stdin_tty_fd() else {
+        return;
+    };
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+    if rc == 0 {
+        let termios = unsafe { termios.assume_init() };
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSAFLUSH, &termios);
+        }
     }
 }
 

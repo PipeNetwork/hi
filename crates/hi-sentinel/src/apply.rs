@@ -2,8 +2,10 @@
 
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -11,13 +13,17 @@ use crate::budget;
 use crate::fsutil;
 use crate::paths;
 use crate::rollback::{self, KnownGood, RecordInput};
+use crate::spawn;
 use hi_liveness::unix_ms;
+
+const INSTALL_TERM_GRACE: Duration = Duration::from_secs(2);
 
 pub struct ApplyRequest {
     pub incident_id: String,
     pub worktree: PathBuf,
     pub checkout: PathBuf,
     pub checkout_dirty: bool,
+    pub checkout_sha: Option<String>,
     pub hi_binary: PathBuf,
     pub state_dir: PathBuf,
     pub generation: u32,
@@ -28,6 +34,7 @@ pub struct ApplyRequest {
     pub cargo: PathBuf,
     pub max_repairs_per_session: u32,
     pub max_modifications_per_hour: u32,
+    pub install_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -43,6 +50,7 @@ pub enum ApplyRefuse {
     GenerationHalt,
     HourlyCap,
     Blake3Mismatch,
+    CorruptKnownGood,
     InstallFailed(String),
 }
 
@@ -118,20 +126,9 @@ pub fn maybe_apply(req: &ApplyRequest) -> ApplyOutcome {
         );
     }
 
-    let recorded = match rollback::ensure_recorded(&RecordInput {
-        state_dir: &req.state_dir,
-        checkout_path: Some(req.checkout.as_path()).filter(|p| !p.as_os_str().is_empty()),
-        checkout_sha: None,
-        binary_path: &req.hi_binary,
-        prev_binary_path: None,
-    }) {
+    let recorded = match load_or_record_known_good(req) {
         Ok(kg) => kg,
-        Err(err) => {
-            return refused(
-                ApplyRefuse::InstallFailed(err.to_string()),
-                format!("could not record known-good: {err}"),
-            );
-        }
+        Err(outcome) => return outcome,
     };
     if !rollback::binary_matches(&recorded, &req.hi_binary) {
         return refused(
@@ -140,6 +137,7 @@ pub fn maybe_apply(req: &ApplyRequest) -> ApplyOutcome {
         );
     }
 
+    spawn::prepare_interactive_prompt();
     if !req.auto_apply {
         if !req.stdin_is_tty && req.apply_answer.is_none() {
             eprintln!(
@@ -233,6 +231,7 @@ fn install_sidecar(req: &ApplyRequest, mut known_good: KnownGood) -> Result<Appl
 }
 
 fn cargo_install(req: &ApplyRequest, package_path: &str, root: &Path) -> Result<()> {
+    spawn::prepare_interactive_prompt();
     let mut cmd = Command::new(&req.cargo);
     cmd.args([
         "install",
@@ -244,7 +243,10 @@ fn cargo_install(req: &ApplyRequest, package_path: &str, root: &Path) -> Result<
         &root.display().to_string(),
     ])
     .current_dir(&req.worktree)
-    .env("CARGO_TERM_COLOR", "never");
+    .env("CARGO_TERM_COLOR", "never")
+    .stdin(Stdio::null())
+    .stdout(Stdio::inherit())
+    .stderr(Stdio::inherit());
     // Keep install artifacts inside the worktree; do not inherit the live tree's CARGO_TARGET_DIR.
     let target = req.worktree.join("target");
     let cargo_home = req.worktree.join(".hi/cargo-home");
@@ -252,16 +254,88 @@ fn cargo_install(req: &ApplyRequest, package_path: &str, root: &Path) -> Result<
     let _ = fsutil::mkdir_0700(&cargo_home);
     cmd.env("CARGO_TARGET_DIR", &target);
     cmd.env("CARGO_HOME", &cargo_home);
-    let output = cmd
-        .output()
+    // Own a process group so a timeout can SIGTERM/SIGKILL descendants, not just cargo.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("running {} install {package_path}", req.cargo.display()))?;
-    if !output.status.success() {
-        bail!(
-            "cargo install {package_path} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    let pid = child.id();
+    unsafe {
+        libc::setpgid(pid as i32, pid as i32);
+    }
+    let status = wait_install(&mut child, pid, req.install_timeout)?;
+    if !status.success() {
+        bail!("cargo install {package_path} failed with {status}");
     }
     Ok(())
+}
+
+fn wait_install(
+    child: &mut std::process::Child,
+    pid: u32,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("wait cargo install")? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            spawn::signal_group(pid as i32, libc::SIGTERM);
+            let kill_at = Instant::now() + INSTALL_TERM_GRACE;
+            loop {
+                if child.try_wait().context("wait cargo after term")?.is_some() {
+                    break;
+                }
+                if Instant::now() >= kill_at {
+                    spawn::signal_group(pid as i32, libc::SIGKILL);
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            bail!("cargo install timed out");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn load_or_record_known_good(req: &ApplyRequest) -> Result<KnownGood, ApplyOutcome> {
+    match rollback::load(&req.state_dir) {
+        Ok(kg) => Ok(kg),
+        Err(err) if rollback::is_missing(&err) => record_current(req).map_err(|e| {
+            refused(
+                ApplyRefuse::InstallFailed(e.to_string()),
+                format!("could not record known-good: {e}"),
+            )
+        }),
+        Err(err) if rollback::is_corrupt(&err) => Err(refused(
+            ApplyRefuse::CorruptKnownGood,
+            "known-good.json is corrupt; not applying.".into(),
+        )),
+        Err(err) => Err(refused(
+            ApplyRefuse::InstallFailed(err.to_string()),
+            format!("could not read known-good: {err}"),
+        )),
+    }
+}
+
+fn record_current(req: &ApplyRequest) -> io::Result<KnownGood> {
+    let prev = paths::sidecar_bin_dir(&req.state_dir).join("hi.prev");
+    rollback::record(&RecordInput {
+        state_dir: &req.state_dir,
+        checkout_path: Some(req.checkout.as_path()).filter(|p| !p.as_os_str().is_empty()),
+        checkout_sha: req.checkout_sha.as_deref(),
+        binary_path: &req.hi_binary,
+        prev_binary_path: prev.is_file().then_some(prev.as_path()),
+    })
 }
 
 fn maybe_overwrite_running(req: &ApplyRequest, sidecar_hi: &Path) -> Option<String> {
@@ -352,18 +426,28 @@ mod tests {
         req: ApplyRequest,
         checkout: PathBuf,
         running_hi: PathBuf,
+        cargo_log: PathBuf,
         head: String,
         branch: String,
     }
 
-    fn write_fake_cargo(path: &Path) {
+    fn write_fake_cargo(path: &Path, log: &Path) {
+        let log = log.display();
         fs::write(
             path,
-            r#"#!/bin/sh
+            format!(
+                r#"#!/bin/sh
 set -eu
+log='{log}'
 root=""
 pkg=""
 prev=""
+n=0
+if [ -f "$log/count" ]; then
+  n=$(cat "$log/count")
+fi
+n=$((n+1))
+echo "$n" > "$log/count"
 for arg in "$@"; do
   if [ "$prev" = "--root" ]; then root=$arg; prev=""; continue; fi
   if [ "$prev" = "--path" ]; then pkg=$arg; prev=""; continue; fi
@@ -371,6 +455,12 @@ for arg in "$@"; do
     --root|--path) prev=$arg ;;
   esac
 done
+{{
+  echo "PWD=$(pwd)"
+  echo "CARGO_HOME=${{CARGO_HOME-}}"
+  echo "CARGO_TARGET_DIR=${{CARGO_TARGET_DIR-}}"
+  echo "pkg=$pkg"
+}} > "$log/spawn-$n.env"
 mkdir -p "$root/bin"
 case "$pkg" in
   crates/hi-cli)
@@ -387,7 +477,8 @@ case "$pkg" in
     ;;
 esac
 exit 0
-"#,
+"#
+            ),
         )
         .unwrap();
         fsutil::chmod_0700_file(path).unwrap();
@@ -409,7 +500,9 @@ exit 0
         fs::write(running_dir.join("hi-sentinel"), b"old-sentinel").unwrap();
         fsutil::chmod_0700_file(&running_dir.join("hi-sentinel")).unwrap();
         let cargo = root.path().join("fake-cargo");
-        write_fake_cargo(&cargo);
+        let cargo_log = root.path().join("cargo-log");
+        fsutil::mkdir_0700(&cargo_log).unwrap();
+        write_fake_cargo(&cargo, &cargo_log);
         let worktree = root.path().join("wt");
         fsutil::mkdir_0700(&worktree).unwrap();
         rollback::record(&RecordInput {
@@ -425,6 +518,7 @@ exit 0
             worktree,
             checkout: checkout.clone(),
             checkout_dirty: true,
+            checkout_sha: Some(head.clone()),
             hi_binary: running_hi.clone(),
             state_dir: state,
             generation: 0,
@@ -435,15 +529,25 @@ exit 0
             cargo,
             max_repairs_per_session: 2,
             max_modifications_per_hour: 3,
+            install_timeout: Duration::from_secs(30),
         };
         Fixture {
             _root: root,
             req,
             checkout,
             running_hi,
+            cargo_log,
             head,
             branch,
         }
+    }
+
+    fn env_path(env: &str, key: &str) -> PathBuf {
+        let value = env
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("missing {key} in {env}"));
+        fs::canonicalize(value).unwrap_or_else(|_| PathBuf::from(value))
     }
 
     fn git_stdout(dir: &Path, args: &[&str]) -> String {
@@ -531,6 +635,24 @@ exit 0
             kg.binary_blake3 == rollback::hash_file(&fx.running_hi).unwrap(),
             "known-good must stay the pre-apply binary"
         );
+        let env1 = fs::read_to_string(fx.cargo_log.join("spawn-1.env")).unwrap();
+        let env2 = fs::read_to_string(fx.cargo_log.join("spawn-2.env")).unwrap();
+        let want_target = fs::canonicalize(fx.req.worktree.join("target")).unwrap();
+        let want_home = fs::canonicalize(fx.req.worktree.join(".hi/cargo-home")).unwrap();
+        let want_cwd = fs::canonicalize(&fx.req.worktree).unwrap();
+        let checkout = fs::canonicalize(&fx.checkout).unwrap();
+        for env in [&env1, &env2] {
+            let target = env_path(env, "CARGO_TARGET_DIR");
+            let home = env_path(env, "CARGO_HOME");
+            let cwd = env_path(env, "PWD");
+            assert_eq!(target, want_target, "{env}");
+            assert_eq!(home, want_home, "{env}");
+            assert_eq!(cwd, want_cwd, "{env}");
+            assert!(
+                !target.starts_with(&checkout) && !home.starts_with(&checkout),
+                "cargo dirs must not be under the checkout: {env}"
+            );
+        }
     }
 
     #[test]
@@ -602,5 +724,49 @@ exit 0
         assert_eq!(fs::read_to_string(&target_hi).unwrap(), "debug-build");
         assert!(note.contains("replace"));
         assert!(note.contains("manually"));
+    }
+
+    #[test]
+    fn corrupt_known_good_refuses_without_rewrite() {
+        let fx = fixture(true, false);
+        let path = paths::known_good_path(&fx.req.state_dir);
+        fs::write(&path, b"{not-json").unwrap();
+        let outcome = maybe_apply(&fx.req);
+        match outcome {
+            ApplyOutcome::Refused {
+                reason: ApplyRefuse::CorruptKnownGood,
+                ..
+            } => {}
+            other => panic!("expected CorruptKnownGood, got {other:?}"),
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"{not-json");
+        assert!(
+            !paths::sidecar_bin_dir(&fx.req.state_dir)
+                .join("hi")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn cargo_install_times_out_and_kills_the_group() {
+        let mut fx = fixture(true, false);
+        let hang = fx._root.path().join("hang-cargo");
+        fs::write(&hang, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fsutil::chmod_0700_file(&hang).unwrap();
+        fx.req.cargo = hang;
+        fx.req.install_timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let outcome = maybe_apply(&fx.req);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout must not wait out sleep 30"
+        );
+        match outcome {
+            ApplyOutcome::Refused {
+                reason: ApplyRefuse::InstallFailed(msg),
+                ..
+            } => assert!(msg.contains("timed out"), "{msg}"),
+            other => panic!("expected InstallFailed timeout, got {other:?}"),
+        }
     }
 }
