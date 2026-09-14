@@ -1,9 +1,9 @@
 //! Permission and ask-user overlay: j/k select, Enter activate, followup reject.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use hi_agent::ConfirmationRequest;
+use hi_harness::ConfirmationRequest;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 
 use crate::App;
 use crate::render::dim;
@@ -48,13 +48,6 @@ fn perm_actions(request: &ConfirmationRequest) -> Vec<PermAction> {
             actions.extend([PermAction::Reject, PermAction::RejectFollowup]);
             actions
         }
-        ConfirmationRequest::DelegateApply { .. } => {
-            vec![
-                PermAction::Approve,
-                PermAction::Reject,
-                PermAction::RejectFollowup,
-            ]
-        }
         ConfirmationRequest::ShellMutation { .. } => {
             vec![
                 PermAction::Approve,
@@ -62,39 +55,13 @@ fn perm_actions(request: &ConfirmationRequest) -> Vec<PermAction> {
                 PermAction::RejectFollowup,
             ]
         }
-        ConfirmationRequest::External {
-            mcp_grant: Some(_), ..
-        } => vec![
-            PermAction::Approve,
-            PermAction::AlwaysSession,
-            PermAction::Reject,
-            PermAction::RejectFollowup,
-        ],
-        ConfirmationRequest::External { .. } => vec![
-            PermAction::Approve,
-            PermAction::Reject,
-            PermAction::RejectFollowup,
-        ],
-        ConfirmationRequest::AskUser { .. } => Vec::new(),
     }
 }
 
-fn perm_label(action: PermAction, request: &ConfirmationRequest) -> &'static str {
+fn perm_label(action: PermAction, _request: &ConfirmationRequest) -> &'static str {
     match action {
         PermAction::Approve => "Approve once",
-        PermAction::AlwaysSession => {
-            if matches!(
-                request,
-                ConfirmationRequest::External {
-                    mcp_grant: Some(_),
-                    ..
-                }
-            ) {
-                "Always allow this MCP tool this session"
-            } else {
-                "Always allow file edits this session"
-            }
-        }
+        PermAction::AlwaysSession => "Always allow file edits this session",
         PermAction::AlwaysPath => "Always allow this path prefix this session",
         PermAction::Reject => "Reject",
         PermAction::RejectFollowup => "Reject and follow up",
@@ -102,19 +69,13 @@ fn perm_label(action: PermAction, request: &ConfirmationRequest) -> &'static str
 }
 
 pub(crate) fn clamp_selected(app: &mut App, request: &ConfirmationRequest) {
-    let n = match request {
-        ConfirmationRequest::AskUser { options, .. } => options.len().saturating_add(1).max(1),
-        other => perm_actions(other).len().max(1),
-    };
+    let n = perm_actions(request).len().max(1);
     if app.confirmation_selected >= n {
         app.confirmation_selected = n - 1;
     }
 }
 
 pub(crate) fn hint(request: &ConfirmationRequest, focus: ConfirmFocus, waiting: usize) -> String {
-    if matches!(request, ConfirmationRequest::AskUser { .. }) {
-        return " j/k · Enter pick · 1-9 pick · type an answer · Esc cancel ".into();
-    }
     let extra = if waiting > 0 {
         format!(" · {waiting} waiting ")
     } else {
@@ -127,10 +88,12 @@ pub(crate) fn hint(request: &ConfirmationRequest, focus: ConfirmFocus, waiting: 
         ConfirmFocus::Options => {
             if always {
                 format!(
-                    " j/k · Enter · y approve · a always allow · n/Esc reject · x follow up{extra}"
+                    " j/k · Enter · y approve · a always · /yolo · Shift-Tab · n/Esc reject · x follow up{extra}"
                 )
             } else {
-                format!(" j/k · Enter · y approve · n/Esc reject · x follow up{extra}")
+                format!(
+                    " j/k · Enter · y approve · /yolo · Shift-Tab · n/Esc reject · x follow up{extra}"
+                )
             }
         }
     }
@@ -138,74 +101,24 @@ pub(crate) fn hint(request: &ConfirmationRequest, focus: ConfirmFocus, waiting: 
 
 pub(crate) fn option_lines(app: &App, request: &ConfirmationRequest) -> Vec<Line<'static>> {
     let th = theme();
-    match request {
-        ConfirmationRequest::AskUser { options, .. } => {
-            let mut lines = Vec::new();
-            for (i, option) in options.iter().enumerate() {
-                let selected = app.confirmation_selected == i;
-                let mark = if selected { "▶ " } else { "  " };
-                let num = format!("{} ", i + 1);
-                if selected {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            mark,
-                            Style::default()
-                                .fg(th.accent_plan)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(num, Style::default().fg(th.accent_tool)),
-                        Span::styled(
-                            option.clone(),
-                            Style::default()
-                                .fg(th.text_primary)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::raw(mark),
-                        Span::styled(num, Style::default().fg(th.accent_tool)),
-                        Span::raw(option.clone()),
-                    ]));
-                }
+    perm_actions(request)
+        .into_iter()
+        .enumerate()
+        .map(|(i, action)| {
+            let selected = app.confirmation_selected == i;
+            let label = perm_label(action, request);
+            if selected {
+                Line::styled(
+                    format!("▶ {label}"),
+                    Style::default()
+                        .fg(th.accent_plan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Line::styled(format!("  {label}"), dim())
             }
-            let custom_idx = options.len();
-            let selected = app.confirmation_selected == custom_idx || options.is_empty();
-            let mark = if selected { "▶ " } else { "  " };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    mark,
-                    if selected {
-                        Style::default()
-                            .fg(th.accent_plan)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    },
-                ),
-                Span::styled("type an answer", dim()),
-            ]));
-            lines
-        }
-        other => perm_actions(other)
-            .into_iter()
-            .enumerate()
-            .map(|(i, action)| {
-                let selected = app.confirmation_selected == i;
-                let label = perm_label(action, other);
-                if selected {
-                    Line::styled(
-                        format!("▶ {label}"),
-                        Style::default()
-                            .fg(th.accent_plan)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    Line::styled(format!("  {label}"), dim())
-                }
-            })
-            .collect(),
-    }
+        })
+        .collect()
 }
 
 pub(crate) fn handle_key(
@@ -215,9 +128,6 @@ pub(crate) fn handle_key(
 ) -> ConfirmDecision {
     clamp_selected(app, request);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    if matches!(request, ConfirmationRequest::AskUser { .. }) {
-        return handle_ask(app, key, request, ctrl);
-    }
     handle_perm(app, key, request, ctrl)
 }
 
@@ -305,79 +215,5 @@ fn handle_perm(
             }
             _ => ConfirmDecision::Unhandled,
         }
-    }
-}
-
-#[cfg(test)]
-#[path = "approval_scope_tests.rs"]
-mod approval_scope_tests;
-
-fn handle_ask(
-    app: &mut App,
-    key: &KeyEvent,
-    request: &ConfirmationRequest,
-    ctrl: bool,
-) -> ConfirmDecision {
-    let ConfirmationRequest::AskUser { options, .. } = request else {
-        return ConfirmDecision::Unhandled;
-    };
-    let custom_idx = options.len();
-    match key.code {
-        KeyCode::Up => {
-            app.confirmation_selected = app.confirmation_selected.saturating_sub(1);
-            ConfirmDecision::Redraw
-        }
-        KeyCode::Down => {
-            app.confirmation_selected = (app.confirmation_selected + 1).min(custom_idx);
-            ConfirmDecision::Redraw
-        }
-        KeyCode::Char('k') if !ctrl && app.confirmation_selected < custom_idx => {
-            app.confirmation_selected = app.confirmation_selected.saturating_sub(1);
-            ConfirmDecision::Redraw
-        }
-        KeyCode::Char('j') if !ctrl && app.confirmation_selected < custom_idx => {
-            app.confirmation_selected = (app.confirmation_selected + 1).min(custom_idx);
-            ConfirmDecision::Redraw
-        }
-        KeyCode::Char(c) if !ctrl && c.is_ascii_digit() && c != '0' => {
-            let idx = (c as u8 - b'1') as usize;
-            if let Some(option) = options.get(idx) {
-                ConfirmDecision::Ask(option.clone())
-            } else {
-                app.ask_user_draft.push(c);
-                app.confirmation_selected = custom_idx;
-                ConfirmDecision::Redraw
-            }
-        }
-        KeyCode::Char(c) if !ctrl => {
-            app.confirmation_selected = custom_idx;
-            app.ask_user_draft.push(c);
-            ConfirmDecision::Redraw
-        }
-        KeyCode::Backspace => {
-            app.ask_user_draft.pop();
-            ConfirmDecision::Redraw
-        }
-        KeyCode::Enter => {
-            let draft = app.ask_user_draft.trim().to_string();
-            if !draft.is_empty() {
-                ConfirmDecision::Ask(draft)
-            } else if let Some(option) = options.get(app.confirmation_selected) {
-                ConfirmDecision::Ask(option.clone())
-            } else {
-                ConfirmDecision::Redraw
-            }
-        }
-        KeyCode::Esc => ConfirmDecision::Cancel,
-        KeyCode::Char('c') if ctrl => ConfirmDecision::Cancel,
-        KeyCode::PageUp => {
-            app.confirmation_scroll = app.confirmation_scroll.saturating_sub(10);
-            ConfirmDecision::Redraw
-        }
-        KeyCode::PageDown => {
-            app.confirmation_scroll = app.confirmation_scroll.saturating_add(10);
-            ConfirmDecision::Redraw
-        }
-        _ => ConfirmDecision::Unhandled,
     }
 }

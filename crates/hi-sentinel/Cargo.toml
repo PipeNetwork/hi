@@ -1,0 +1,28 @@
+[package]
+name = "hi-sentinel"
+edition.workspace = true
+version.workspace = true
+description = "Hi Sentinel: interactive process supervisor (not hi-bootstrap / RSI)"
+
+[[bin]]
+name = "hi-sentinel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+hi-liveness.workspace = true
+hi-secrets.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+# setpgid / tcsetpgrp / tcgetattr / flock / pre_exec only
+unsafe_code = "allow"

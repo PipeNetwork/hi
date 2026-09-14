@@ -14,36 +14,36 @@ pub(crate) const LESSON_COUNT: usize = 8;
 
 const LESSONS: [(&str, &str); LESSON_COUNT] = [
     (
+        "Sign in",
+        "hi talks to pipenetwork.ai. Run /login (or `hi login pipenetwork` in a shell) to pair a browser session; the API key is stored privately and [profiles.pipenetwork] is written so the next launch just works. Paste a key instead with `hi auth pipenetwork`. /logout forgets it.",
+    ),
+    (
         "Ask for outcomes",
         "Say what you want changed, what good looks like, and any constraints. Concrete prompts such as “fix the failing parser test without changing the public API” give hi a useful target and a finish line.",
     ),
     (
-        "Tests decide",
-        "hi’s distinguishing loop is verification. After edits it runs cargo test, pytest, go test, or a command you set with /verify. Failures go back to the model. /verify off turns that off; /status shows the current command.",
+        "The coding loop",
+        "The model streams from Pipe, then calls local tools (read, edit, bash, grep, …) until it stops. You do not pick a provider mid-session. Keep typing while a turn runs — the next line is queued.",
+    ),
+    (
+        "Confirm edits",
+        "File edits and mutating shell commands ask first (Shift-Tab cycles ask / auto / always). /yolo skips confirms for this session; /auto allows safe file edits without asking. Ctrl-C or Esc stops an in-flight turn.",
+    ),
+    (
+        "Verify when you want",
+        "/verify cargo test (or pytest, go test, …) runs that command after a turn. It does not auto-repair: failures stay in the transcript for you to send back. /verify off turns it off; /status shows the current command.",
     ),
     (
         "Take it back",
-        "hi does not nag for every edit. Before a mutating turn it checkpoints the tree. /undo restores the last turn’s files. Risky irreversible commands (sudo, force-push, curl|sh) are refused. Interrupt an in-flight turn with Ctrl-C.",
+        "Before a mutating turn hi checkpoints the tree. /undo restores the last turn’s files. /retry drops the last model turn and resubmits the prompt. /diff and Ctrl-G show the working-tree changes.",
     ),
     (
-        "Queue and steer",
-        "Keep typing while hi works — the next message is queued and can steer the current turn. Ctrl-K opens a command palette grouped like /help: core first, type to find the rest.",
+        "Sessions",
+        "Work is saved as JSONL. `hi resume` (or -c) continues the latest session in this directory; `hi --list-sessions` lists ids; `hi --resume <id>` opens one. /clear resets the conversation without deleting the file’s replacement snapshot.",
     ),
     (
-        "Sessions and recovery",
-        "Sessions preserve conversation and work. Use /sessions to inspect, rename, switch, or recover prior work; /retry returns to the last safe message checkpoint when a turn needs another attempt.",
-    ),
-    (
-        "Goals",
-        "Use /goal for long-horizon work. hi can keep a visible objective and sub-goal plan, pause when blocked, and continue across several focused turns instead of improvising one giant response.",
-    ),
-    (
-        "Fleet",
-        "Open /fleet to dispatch and monitor multiple agent sessions. Each row is its own git worktree; verified, non-overlapping diffs merge back. Best for independent tasks.",
-    ),
-    (
-        "Workflows",
-        "Use /workflow for scripted multi-phase work. Inspect available workflows, launch one with a clear objective, then follow its agents from the overlay or /fleet.",
+        "Commands",
+        "Ctrl-K is the palette (core commands first; type to search). /help is the same grouping. /model and /effort switch the Pipe model; /compact summarizes the conversation. Click a › row to expand it (Read/Edit/Run/Thought). Drag to copy; Shift-drag uses the terminal's own selection. /mouse off restores highlight-to-copy. /copy copies the last reply. /tutorial opens this tour again.",
     ),
 ];
 
@@ -202,11 +202,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_lessons_are_ask_verify_undo() {
-        assert_eq!(LESSONS[0].0, "Ask for outcomes");
-        assert_eq!(LESSONS[1].0, "Tests decide");
-        assert_eq!(LESSONS[2].0, "Take it back");
-        assert_eq!(LESSONS[6].0, "Fleet");
+    fn first_lessons_are_login_then_the_pipe_loop() {
+        assert_eq!(LESSONS[0].0, "Sign in");
+        assert!(LESSONS[0].1.contains("/login"), "{}", LESSONS[0].1);
+        assert_eq!(LESSONS[1].0, "Ask for outcomes");
+        assert_eq!(LESSONS[5].0, "Take it back");
+        assert!(
+            !LESSONS.iter().any(|(title, body)| {
+                title.contains("Fleet")
+                    || title.contains("Goals")
+                    || body.contains("/goal")
+                    || body.contains("/fleet")
+            }),
+            "tutorial must not teach removed commands"
+        );
     }
 
     #[test]

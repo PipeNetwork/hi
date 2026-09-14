@@ -793,6 +793,13 @@ impl BackgroundRegistry {
         poll_from(self, id)
     }
 
+    /// Consecutive empty `bash_output` polls while the process is still
+    /// running. Used to refuse a second wait on a silent handle.
+    pub fn consecutive_empty_polls(&self, id: &str) -> Result<u32> {
+        let proc = lookup(self, id)?;
+        Ok(proc.inner.lock().unwrap().empty_polls)
+    }
+
     /// [`poll_wait`](Self::poll_wait) with an adaptive budget — the default
     /// for a `bash_output` call that names no `wait_secs`. The registry's
     /// change notification is the watcher: an empty poll of a running process
@@ -1249,6 +1256,26 @@ impl BackgroundRegistry {
             .rev()
             .cloned()
             .map(Into::into)
+            .collect()
+    }
+
+    /// Process-group ids of jobs that are still natively running.
+    ///
+    /// Does not expire or kill monitors — heartbeat sampling must not SIGTERM
+    /// background jobs. Timeouts stay on [`Self::snapshot`] / poll / wake.
+    pub fn running_pgids(&self) -> Vec<i32> {
+        self.processes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter_map(|proc| {
+                let running = proc
+                    .inner
+                    .lock()
+                    .map(|inner| inner.native_running())
+                    .unwrap_or(false);
+                running.then_some(proc.pgid).flatten()
+            })
             .collect()
     }
 

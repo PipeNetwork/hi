@@ -38,6 +38,8 @@ pub(crate) enum Action {
     /// Cycled via `/density` (table lists it for help; applicator supports it).
     CycleDensity,
     OpenPalette,
+    /// Ctrl+\ — Grok agent dashboard.
+    ToggleDashboard,
     /// Jump to next/prev user prompt in the transcript (`dir` = ±1).
     JumpPrompt {
         dir: i32,
@@ -152,8 +154,8 @@ mod tests {
                 KeySurface::Insert,
                 &key(KeyCode::Char('e'), KeyModifiers::CONTROL)
             ),
-            Action::None,
-            "insert Ctrl+E stays emacs end-of-line unless the prompt is empty"
+            Action::ToggleReasoning,
+            "Ctrl+E expands thinking even while the prompt is focused"
         );
     }
 

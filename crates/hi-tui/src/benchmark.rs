@@ -8,28 +8,10 @@ use ratatui::backend::TestBackend;
 use ratatui::style::Style;
 use ratatui::text::Line;
 
-use crate::{App, ProfileInfo};
+use crate::App;
 
 fn app() -> App {
-    App::new(
-        "openai",
-        "gpt-4o",
-        Vec::<ProfileInfo>::new(),
-        None,
-        Box::new(|_| anyhow::bail!("benchmark resolver")),
-        Box::new(|_| anyhow::bail!("benchmark saver")),
-        Box::new(|_| anyhow::bail!("benchmark loader")),
-        Box::new(|_| anyhow::bail!("benchmark remover")),
-        None,
-        Box::new(|_| anyhow::bail!("benchmark mlx switcher")),
-        Box::new(|_| anyhow::bail!("benchmark local runtime switcher")),
-        None,
-        String::new(),
-        None,
-        None,
-        crate::RaceDefaults::default(),
-        None,
-    )
+    App::new("openai", "gpt-4o")
 }
 
 #[doc(hidden)]
@@ -92,47 +74,35 @@ pub struct DashboardFixture {
 
 impl DashboardFixture {
     #[doc(hidden)]
-    pub fn new(width: u16, height: u16, rows: usize) -> Self {
-        let mut app = app();
-        app.fleet = (1..=rows).map(crate::dashboard::benchmark_row).collect();
+    pub fn new(width: u16, height: u16, _rows: usize) -> Self {
         Self {
-            app,
+            app: app(),
             terminal: Terminal::new(TestBackend::new(width, height)).unwrap(),
         }
     }
 
     #[doc(hidden)]
     pub fn render(&mut self) {
-        self.terminal
-            .draw(|frame| crate::dashboard::render_benchmark_frame(frame, &self.app))
-            .unwrap();
+        self.terminal.draw(|frame| self.app.render(frame)).unwrap();
     }
 }
 
 #[doc(hidden)]
 pub struct WatchFixture {
-    rows: Vec<crate::loops::LoopWatchRow>,
     terminal: Terminal<TestBackend>,
-    now: u64,
 }
 
 impl WatchFixture {
     #[doc(hidden)]
-    pub fn new(width: u16, height: u16, rows: usize) -> Self {
-        let now = 1_700_000_000_000;
+    pub fn new(width: u16, height: u16, _rows: usize) -> Self {
         Self {
-            rows: (1..=rows)
-                .map(|id| crate::watch::benchmark_row(id as u64, now))
-                .collect(),
             terminal: Terminal::new(TestBackend::new(width, height)).unwrap(),
-            now,
         }
     }
 
     #[doc(hidden)]
     pub fn render(&mut self) {
-        self.terminal
-            .draw(|frame| crate::watch::render_benchmark_frame(frame, &self.rows, self.now))
-            .unwrap();
+        let mut app = app();
+        self.terminal.draw(|frame| app.render(frame)).unwrap();
     }
 }

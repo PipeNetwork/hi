@@ -4,7 +4,9 @@ Full reference for hi 0.3.1. Everyday getting started lives in the [README](../R
 
 `hi` is an agentic coding tool written in Rust. Point it at any model — local or remote — and it reads, writes, and edits files and runs shell commands in your project to do what you ask.
 
-Its distinguishing feature is **verification-in-the-loop**: give it a test command and it runs the model, checks the result, feeds failures back, and iterates until the tests pass — something a single-shot completion endpoint structurally can't do.
+Default inference is Pipe Network (`api.pipenetwork.ai`, model
+`pipe/deepseek-v4-flash-0731`). `/verify <cmd>` is a **post-turn check**; it
+does not auto-repair. `/undo` restores the last turn's git checkpoint.
 
 Workspace version **0.3.1** continues the post-0.2 core API. The intentional
 0.2 break (CLI, report, and benchmark schema) is documented in the
@@ -23,27 +25,19 @@ hi "the tests in test_parser.py are failing — fix the parser"
 ## Quick start
 
 ```bash
-cargo build --release           # fast core binary at target/release/hi
+cargo build --release                    # hi + hi-sentinel (workspace default members)
 cargo build --release --features voice  # include microphone + local Whisper
 cargo install --path crates/hi-cli --locked
+cargo install --path crates/hi-sentinel --locked
 
-# OpenRouter (default endpoint)
-HI_API_KEY=sk-or-... hi -m anthropic/claude-sonnet-4 "add a --json flag to the CLI"
-
-# pipenetwork.ai (OpenAI-compatible coding endpoint; defaults to pipe/deepseek-v4-flash-0731)
-PIPENETWORK_API_KEY=... hi --provider pipenetwork "add a --json flag to the CLI"
-
-# A local Ollama model (no API key needed)
-hi --provider ollama -m qwen2.5-coder "..."
-
-# Native Anthropic
-HI_API_KEY=sk-ant-... hi --provider anthropic -m claude-sonnet-4-20250514 "..."
-
-# xAI (Grok); defaults to grok-4.6
-XAI_API_KEY=xai-... hi --provider xai "add a --json flag to the CLI"
+hi login pipenetwork            # browser pairing; writes the API key into config.toml
+PIPENETWORK_API_KEY=pk_live_... hi "add a --json flag"
+hi auth pipenetwork             # paste a key, probe /models, store it
+hi -m pipe/deepseek-v4-flash-0731 "…"
 ```
 
-`--provider` accepts `openai` (any OpenAI-compatible URL), `anthropic`, `pipenetwork`, `ollama`, and `xai`. All but the first two are presets that set the right base URL, key env var, and — for pipenetwork and xai — a default model, so they work with no extra flags.
+Interactive `hi` talks to Pipe Network. An optional `openai` profile in config
+is only used for dashboard rows whose model id is prefixed `openai/`.
 
 Run with no prompt for an interactive session; pass a prompt for one-shot. Piped stdin is folded into a one-shot prompt as context, so `hi` composes with other tools:
 
@@ -237,148 +231,26 @@ is the right mode for parser, runtime, refactor, and optimization differential t
 
 ## Long-horizon goals
 
-`/goal <objective>` is for the tasks you'd normally break into a week of tickets — "port this
-service from Python to Rust," "get coverage above 80% in this crate." A goal isn't a prompt,
-it's a contract: every top-level provider gets a durable structured goal; when a planner model is
-configured (glm-5.2 by default on Pipenetwork), it decomposes the objective into sub-goals,
-otherwise the executor grows an initial single milestone as it discovers work. Explicitly
-referenced workspace documents are read before decomposition, so this is supported directly:
+`/goal` was removed with the old harness. For concurrent work, use `/dashboard`
+and dispatch several sub-agents yourself.
 
-```text
-/goal review the plan.md document and fully build this
-```
+## Agent dashboard
 
-The agent keeps pulling toward the goal **turn after turn on its own** — through compactions, test
-failures, session resume, and refactors-within-refactors — while you monitor and steer. Checklist
-progress is provisional until the settled workspace revision passes deterministic verification and
-review. Type at any time to redirect; Esc pauses; `/goal resume` continues; the plan grows as work
-is discovered, with no default cap (`/goal limit N` sets one). A pinned checklist + `goal d/t`
-badge track progress in the TUI.
-
-**Skeptic gate (`/goal team`, experimental).** By default a single agent plans, implements, and
-verifies each turn. Point a reviewer model at it (`HI_SKEPTIC_MODEL=<model>`, or a profile
-`skeptic_model`) and turn on `/goal team`, and before a turn may mark a sub-goal *done* a second
-model reviews the turn's diff — plus the sub-goal and verify result — and can send it back to retry
-with concrete objections, which become notes the next turn must address. It's off by default (an
-extra model call per advance), fail-open (a reviewer error or timeout never blocks progress), and
-scoped to where orchestration has a real shot: a long-horizon goal, not a single bounded turn.
-`/goal team` alone reports the state and how many advances the skeptic has blocked. Headless runs
-(one-shot `--goal`, the daemon, fleet rows) enable it with `HI_GOAL_TEAM=1`. The review covers both
-ways a turn claims a sub-goal done — the heuristic advance and an explicit `update_plan` — and an
-objection reverts the turn's goal progress (the edits stay on disk for the next turn to fix).
-
-## Fleet dashboard
-
-`/fleet` scales that to a fleet: the dispatch box at the bottom always spawns a *new*
-session — type a prompt, hit Enter, and you've launched another agent without leaving the
-screen. Each row works in its **own git worktree**; verified, non-overlapping diffs
-**auto-merge back** (collisions hold visibly, `m` forces). Select a row for a peek panel with
-a live reply input — answer an idle agent with a single keystroke (`1`–`9`) or queue a
-follow-up; `Ctrl+S` dispatches *and* attaches. Prefix a dispatch with `/goal ` and the row
-drives a whole objective autonomously. Every row is its own resumable session. Details:
+`/dashboard` (aliases `/fleet`, `/agents-dashboard`, `Ctrl+\`) is a roster of
+**independent** coding sessions. You are the manager (this hi session). Each
+dispatch creates a sub-agent in-process. There is no auto-merge and no
+parent-child tool. `Ctrl+M` sets the next sub-agent to `pipe/gpt-6` on Pipe;
+`Ctrl+W` optionally isolates it in a git worktree. Details:
 [fleet-dashboard.md](fleet-dashboard.md).
 
-## Loops
+## Loops, watch, digest, inbox
 
-`/loop 30m check whether CI on main is green` — the same prompt, on a cadence. Intervals run
-from 60 seconds to days (`90s`, `30m`, `2h`, `1d`); loops run until explicitly cancelled by id
-(`/loop list`, `/loop cancel 3`). The shape is built for **watching things**:
-CI logs, a canary deploy, a live service, a flaky test you're trying to catch in the act.
-
-Each firing is a full agent turn, not a dumb cron job: it resumes the loop's own session, so it
-*remembers* previous checks, compares instead of re-describing, and replies `NOTHING NEW` when
-nothing changed — quiet firings land as a dim one-liner, real changes land loud (with a terminal
-ping when you're unfocused). Loops persist per project and re-arm when `hi` restarts (they fire
-while `hi` is running).
-
-`/loop trio <prompt>` is the transient plan→execute→review workflow: a planner drafts the approach,
-the session agent implements it, and a reviewer sends concrete objections back for another round.
-It has no round limit by default and continues until approval, cancellation, or a typed execution
-failure. Use `/loop trio --rounds N <prompt>` only when you want an explicit finite round cap.
-
-`/watch` opens a **full-screen dashboard of every active loop**: a live table with per-loop
-countdowns to the next firing, a spinner while one is checking, each loop's last result
-(dim `· nothing new` or a loud one-line change), and its **running token spend**. Select a loop
-to peek its recent firing history; `f` fires the selected loop immediately, `p` pauses/resumes it,
-`c` cancels it, and `n` arms a new one from the same `<interval> <prompt>` box — all without
-leaving the screen. The loops keep firing in the background; Esc returns to the chat.
-
-**Cost guard.** Each firing is a full agent turn, so a fast long-running loop adds up. Every loop
-tracks its cumulative token spend, and you can cap it:
-`/loop budget 3 500k` auto-**pauses** loop #3 once it has spent 500k tokens (it stays resumable —
-raise the budget or `/loop resume 3` to continue). Pause and resume any loop by hand with
-`/loop pause <id>` / `/loop resume <id>` (or `p` in `/watch`); a paused loop holds its place and
-its cost without firing.
-
-**PR review.** The mirror image of auto-fix (which *opens* PRs): `/loop review` arms a watcher that,
-on each firing, lists your repo's open pull requests, reviews any it hasn't seen yet (`gh pr diff` →
-assess correctness, tests, risks), and **posts a review comment** with `gh pr review <n> --comment`.
-Its session remembers what it's reviewed, so a firing with nothing new is a silent `NOTHING NEW`.
-`/loop review 1h` sets the cadence (default 30m). Needs `gh` authenticated; it posts real
-review comments (a comment — never approve/request-changes), so it's opt-in by arming it.
-
-**Windows & cost.** Loops fire 24/7 by default; give one a local-time window so it only fires when
-it matters: `/loop window 3 9-17` (or `9-17 weekdays`, or `off` to clear) — outside it, the loop
-quietly defers to the next interval. And `/loop cost` shows a token-spend breakdown across loops
-(each loop's spend, its budget, and the total) — cheap control for running many watchers.
-
-**Triggers — a watcher that acts.** Attach a shell command that runs whenever a firing reports a
-real change: `/loop on 3 notify-send "CI is red"`. It runs via `sh -c` only on a *loud* firing
-(never on `NOTHING NEW` or an error), with the change summary in `$HI_LOOP_SUMMARY` (plus
-`$HI_LOOP_ID` / `$HI_LOOP_NAME`), and its outcome surfaced in the transcript and the
-`/watch` peek. Triggers have no execution deadline by default; set a positive
-`HI_LOOP_TRIGGER_TIMEOUT_SECS` when you explicitly want one. Compose anything — desktop
-notifications, a webhook `curl`, a file touch, even
-another `hi -p "…"` to kick off a fix. `/loop on 3 off` clears it. (The command is yours and runs
-with your shell's privileges — treat it like a git hook.)
-
-**Auto-fix — a watcher that repairs.** Take the trigger idea to its conclusion: `/loop fix 3 on`
-makes loop #3, on a loud change, dispatch a **worktree-isolated agent to fix the problem** — and
-land the fix **only if it passes your verify command** (`/verify`). It's the fleet's
-detect→fix→verify→merge cycle, driven by a watcher: *"watch CI; when it goes red, an agent fixes it
-and the fix lands only if it's green."* Guardrails are the point — an unverified change is never
-landed (no verify command → the fix is reported but not applied), one fix runs per loop at a time,
-and every attempt lands in the transcript and the digest.
-
-Two landing modes: `/loop fix 3 on` **merges** the verified fix into your working tree (great for a
-scratch repo); `/loop fix 3 pr` instead commits it to a branch, pushes, and **opens a PR** (`gh`)
-for review (great for a real one — nothing touches your tree until you merge). No remote or `gh`?
-It degrades gracefully to a local/pushed branch and tells you. `/loop fix 3 off` disables it.
-
-**Digest — what changed while you were away.** Loops write every loud event (a change they found, a
-budget pause, an expiry) to a per-project activity feed that survives restarts — and so do **fleet
-rows** (verified merges, combined-tree verify failures, goal completions). `/digest` shows the feed
-grouped by source (each loop, each fleet row) — how many changes each produced and the most recent,
-with a `•` on everything new since you last looked. Start `hi` after leaving work running and you'll
-see a one-line `⟳ N loop change(s) since you last looked — /digest to review` nudge. It's one pane
-for everything autonomous that happened. `/inbox` is the other pane: parked confirms the unattended
-goal or loop could not answer live (`hi inbox allow|deny <id>`). Digest is what changed; inbox is
-blocked on you.
-
-**Daemon — keep firing when the terminal's closed.** Loops only fire while a `hi` is running. Run
-`hi --loops-daemon` to keep this project's loops firing (and auto-fixing) headless in the background,
-logging each change, until you `Ctrl-C` (or `kill`) it. A per-project lock guarantees exactly one
-firer — the daemon and a TUI never both fire the same loops; whichever starts second reads the shared
-feed instead (`/digest`) and says so. Set your loops up in the TUI, close it, `hi --loops-daemon &`,
-and come back later to `/digest` what it caught.
-
-**Project tickets — dashboard Board executed by hi.** Org Projects hold `ticket_*` work items (not one `task_*` per card). Pair with `/login pipenetwork` and pick the project, `cd` into the repo, then `hi tickets`. The daemon heartbeats, claims a queued **local** ticket, and spawns `hi --goal "<goal>" --verify "<cmd>"` until the report passes or the ticket ceiling is hit. A child crash with remaining budget completes as `repairing` so the next claim retries. Do not send sandbox tickets to the laptop; those dispatch to `POST /v1/tasks`. Session `--daemon` free-text input is not a ticket.
-
-**Notifications — reach you when you're away.** A background daemon logs to a transcript you're not
-watching, so loud events (a change a firing found, a landed fix, a budget pause) can also be pushed
-to you, opt-in via the environment:
-
-```bash
-HI_NOTIFY_DESKTOP=1 hi --loops-daemon                 # macOS terminal-notifier / Linux notify-send
-HI_NOTIFY_WEBHOOK=https://hooks.slack.com/… hi --loops-daemon   # JSON {"text":…} POST (Slack-compatible)
-```
-
-Both sinks are best-effort — a missing tool or a failed POST never blocks a firing — and work in the
-TUI too. The daemon prints which sinks are active on startup.
+`/loop`, `/watch`, `/digest`, `/inbox`, and `hi --loops-daemon` were removed with
+the old harness. Use `/dashboard` for concurrent sessions.
 
 ## Sessions
 
-Every session is saved as JSONL under `~/.local/share/hi/sessions/`.
+Every session is saved as JSONL under `~/.local/share/hi/projects/<workspace>/sessions/`.
 
 ```bash
 hi -c "and now add tests"          # --continue the latest session
@@ -386,16 +258,7 @@ hi resume                           # TUI resume of the latest session here
 hi --resume <id> "..."             # resume a specific one
 hi --list-sessions                 # list saved sessions
 hi --no-save "..."                 # don't persist
-hi --durable "..."                 # explicitly require boundary checkpointing
 ```
-
-Saved ordinary sessions use durable execution by default, checkpointing the
-prompt and each completed tool batch. Set `execution = "ephemeral"` globally
-or per profile to opt out. In the full-screen TUI, it is a live, visible session control:
-run `/durable on` before a long task, watch the `durable` badge in the title bar,
-and use `/durable status` to confirm the mode. It requires a persisted session
-and checkpoints after the user prompt and each completed tool batch; use
-`--continue` or `/sessions` after a restart to pick up the recorded state.
 
 ## In-session commands & context
 
@@ -403,38 +266,35 @@ Slash commands (TUI or plain REPL):
 
 | command | does |
 |---|---|
-| `/help` | core commands; `/help project`, `/help modes`, `/help platform`, or `/help all` for the rest |
+| `/help` | list slash commands |
 | `/model [id]` | set by id, or — with no id — open an interactive picker over the live model list (type to filter, ↑/↓, Enter). |
-| `/provider [name\|add\|edit]` | use a configured profile (no name lists them), `add` to create a new profile interactively, `edit [name]` to modify one. |
-| `/durable [on\|off\|status]` | TUI-first live execution control; checkpoint the current saved session at prompt and completed tool boundaries. |
-| `/verify [cmd\|off]` | show, set, or clear the test command turns iterate against — turn the verify-loop on without restarting |
-| `/race <task>` | run two to four configured model/profile candidates in isolated worktrees, independently verify them, and open the review scoreboard |
-| `/race setup\|status\|cancel\|apply` | configure saved-profile targets or manage, review, and explicitly apply a completed race |
-| `/diff` | show what files have changed this session (`git diff` + new files) |
-| `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
-| `/goal [obj\|pause\|resume\|limit N\|team on\|off\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default); `team on` adds a skeptic reviewer that must approve each advance (needs `HI_SKEPTIC_MODEL`) |
-| `/loop trio [--rounds N] <prompt>` | transient plan→execute→review workflow. It continues until approval by default; `--rounds N` opts into a finite revision cap. |
-| `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed, and the loop runs until cancelled. `/loop list`, `/loop cancel <id>`, `/loop pause\|resume <id>`, `/loop budget <id> <count\|off>` (token cap → auto-pause), `/loop on <id> <cmd\|off>` (run a shell command on each change, `$HI_LOOP_SUMMARY` in env), `/loop fix <id> <on\|pr\|off>` (verify-gated auto-fix on a loud change — `on` merges, `pr` opens a PR), `/loop window <id> <9-17 [weekdays]\|off>` (local-time fire window), `/loop cost` (token-spend breakdown), `/loop review [interval]` (a PR-review watcher — reviews open PRs via `gh`) |
-| `/watch` | full-screen live dashboard of all active loops: per-loop countdowns, firing spinners, last result, token spend, and recent history — with `f` fire-now, `p` pause, `c` cancel, `n` arm a new loop |
-| `/digest` (`/activity`) | what your loops have noticed, grouped by loop, with what's new since you last looked (a persisted, cross-restart feed of every loud change) |
-| `/inbox [allow\|deny <id>]` | parked confirms blocked on you (unattended/daemon). `/digest` is what changed; inbox is what needs a decision. `hi inbox` works from the shell |
-| `/fleet` (`/dashboard`) | control a fleet, not an agent: dispatch, monitor, and steer multiple concurrent sessions — each in its own git worktree with verified diffs auto-merging back; `/fleet status` lists this project's resumable fleet sessions ([docs](fleet-dashboard.md)) |
-| `/delegate [on\|off\|risk]` | write-capable delegate subagent: worktree-isolated child; changes land only if they verify. Default **risk** (multi-file / isolation-shaped tasks); `on` = every mutation; `off` = never. Read-only `explore` is on by default for repo tasks |
-| `/init` | scan the repo and write an `HI.md` project guide (loaded as context in future sessions) |
-| `/compact [kind] [instructions]` | reclaim context — `hybrid` (summarize old turns, keep recent), `full` (summarize everything), or `elide` (drop old tool output, no model call). Trailing text is extra summarizer instructions. |
-| `/context` (`/context-doctor`) | occupancy breakdown plus a fresh-session **injection census** (system, guides, skills, tool schemas, volatile memory) |
-| `/retry` | re-run your last message (drops the previous attempt — pairs with `/model`) |
-| `/undo` | revert the file changes the last turn made (restores its git checkpoint) |
-| `/commit` | commit files this session touched (never `git add -A`; refuses a secret-looking staged diff) |
-| `/status` | show provider, model, queue, context, last turn state, and session `$` when the model publishes a price |
-| `/login <provider>` | subscription pairing only: `xai`, `pipenetwork`, or `x402` |
-| `/auth <openai\|anthropic\|pipenetwork\|xai> [key]` | paste an API key, probe `/models`, then write a profile. HTTP 401/403 is never saved. The key is masked, omitted from ↑ history, and sealed in the private credential store. Pipe subscription pairing remains `/login pipenetwork`. `hi auth <provider>` does the same outside a session |
-| `/mcp [pipe\|name reconnect\|allow\|deny]\|add` | workspace MCP status table (includes auto-attached `pipe`); `pipe` inspects the unfiltered provider `mcp_url`; `allow`/`deny` persist per-server tool lists; `add` writes `.hi/mcp/<name>.json` |
-| `/log` | write a local debug log for this session (`.hi-debug.log`) |
-| `/export [path]` | export the conversation to a file (default: `transcript.md`) |
-| `/version` | show version |
-| `/clear` | start a fresh conversation |
+| `/verify [cmd\|off]` | post-turn check command (does not auto-repair) |
+| `/files` | list files changed this session |
+| `/config [reasoning <level>]` | show or set request settings |
+| `/mouse [on\|off]` | click-to-expand vs terminal highlight-to-copy |
+| `/diff` | show working-tree changes |
+| `/copy` | copy the last assistant reply |
+| `/compact [context]` | summarize the conversation to reclaim context |
+| `/context` | context-window breakdown (`/usage` Context tab) |
+| `/retry` | re-run the last prompt |
+| `/undo` | restore files from the last turn checkpoint |
+| `/status` | session status |
+| `/usage` (`/cost`) | credit/token usage modal; `/usage manage` opens billing |
+| `/login [pipenetwork]` | sign in to pipenetwork.ai |
+| `/auth pipenetwork [key]` | store a Pipe API key |
+| `/logout` | forget the stored Pipe credential |
+| `/sessions` | list saved sessions |
+| `/rewind <n>` | drop back to user turn n |
+| `/dashboard` (`/fleet`, `/agents-dashboard`) | concurrent agent roster — you are the manager; each dispatch is a sub-agent ([docs](fleet-dashboard.md)) |
+| `/permissions [ask\|auto\|always]` | confirm ladder (`/auto`, `/yolo`) |
+| `/effort [low\|medium\|high\|xhigh\|off]` | reasoning effort |
+| `/doctor` | check key, Pipe `/models`, git, and sandbox |
+| `/tutorial` | interactive tour |
+| `/clear` | reset the conversation |
+| `/version` | show hi version |
 | `/exit` | quit |
+
+Removed with the old harness (the command prints a short notice): `/goal`, `/loop`, `/watch`, `/digest`, `/inbox`, `/delegate`, `/race`, `/mcp`, `/workflow`, `/btw`.
 
 Drop an `HI.md` or `AGENTS.md` in your project and its contents are appended to the system prompt — per-project conventions, for free. `/init` scans the repo and writes an `HI.md` for you. Put standing user rules in `~/.config/hi/me.md` (stable prefix, not volatile `.hi/memory.md`). Scan also picks up workspace `.agents/skills/*/SKILL.md` (Agent Skills spec; `.hi/skills` wins on name). Built-in packs include stack loops (`rust-workspace`, `pytest-package`, `ts-monorepo`), `code-review`, and optional `/skill` recipes `secret-scan` and `dep-audit` (not auto-injected; they hint to stay on `/permissions`). `/agents` remains user markdown.
 
@@ -562,14 +422,14 @@ A cargo workspace:
 
 | crate | role |
 |---|---|
-| `hi-ai` | provider-neutral types, the `Provider` trait, OpenAI + Anthropic adapters, retry |
-| `hi-tools` | the tools: `read` / `write` / `edit` / `multi_edit` / `apply_patch` / `bash` / `bash_output` / `bash_kill` / `list` / `grep` / `glob` / `diff` / `commit` / `update_plan` / `record_decision` |
-| `hi-agent` | the agent loop, verify-loop, sessions, the `Ui` trait |
+| `hi-ai` | provider types, HTTP, Pipe / OpenAI / Anthropic adapters |
+| `hi-tools` | local tools: `read` / `write` / `edit` / `bash` / `list` / `grep` / `glob` plus repo/LSP helpers |
+| `hi-harness` | Pipe coding loop, JSONL sessions, `/undo`, `/dashboard` runtime |
+| `hi-dashboard-store` | SQLite membership for `/dashboard` (ported from Grok dashboard-store) |
 | `hi-rsi-runtime` | managed candidate descriptor, workflow, budget, checkpoint, verification, failure, and exact-replay contracts |
 | `hi-trace` | bounded content-addressed RSI artifacts and crash-safe hash-chained event journals |
-| `hi-tui` | full-screen terminal UI (transcript, spinner, queue, slash commands) |
-| `hi-race` | local-first race contracts, workspace snapshots, stage execution, and deterministic ranking |
-| `hi-cli` | the `hi` binary: config, sessions, best-of-N, slash commands |
+| `hi-tui` | full-screen terminal UI (transcript, slash commands, agent dashboard) |
+| `hi-cli` | the `hi` binary: config, Pipe session, login |
 | `hi-local-runtime` | optional external sidecar repository containing `hi-local`, `hi-local-core`, `hi-gguf`, `hi-cuda`, and `hi-mlx` |
 | `hi-eval` | the benchmark runner (see below) |
 
@@ -635,9 +495,9 @@ Use focused commands while editing. Voice support (`cpal` and Whisper) is
 opt-in so ordinary coding builds avoid the native audio stack:
 
 ```bash
-cargo check -p hi-agent --lib
-cargo test -p hi-agent --lib
-cargo test -p hi-shell --lib
+cargo check -p hi-harness --lib
+cargo test -p hi-harness --lib
+cargo test -p hi-dashboard-store --lib
 
 # One-time setup for parallel test execution:
 cargo install cargo-nextest --locked
@@ -663,8 +523,8 @@ all targets so CI still catches feature, example, and benchmark regressions.
 ## Core 0.2 release checklist
 
 - `cargo fmt --all`
-- `cargo clippy -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-tui -p hi -p hi-eval --all-targets -- -D warnings`
-- `cargo test -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-tui -p hi -p hi-eval`
+- `cargo clippy -p hi-ai -p hi-tools -p hi-lsp -p hi-harness -p hi-tui -p hi -p hi-eval --all-targets -- -D warnings`
+- `cargo test -p hi-ai -p hi-tools -p hi-lsp -p hi-harness -p hi-tui -p hi -p hi-eval`
 - `cargo install --path crates/hi-cli --locked`
 - Smoke an OpenAI-compatible endpoint with `--compat auto` and `--tool-mode auto`
 - Validate eval tasks and immutable oracles with `cargo run -p hi-eval -- bench --validate`

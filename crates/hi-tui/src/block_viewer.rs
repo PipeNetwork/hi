@@ -298,10 +298,7 @@ pub(crate) fn open_selected(app: &mut App) {
     } else {
         n - 1
     };
-    if let Some(id) = subagent_id_at(app, ord) {
-        crate::subagent_overlay::open_inspect(app, &id);
-        return;
-    }
+    let _ = subagent_id_at(app, ord);
     match BlockViewer::open(app, ord) {
         Some(viewer) => app.block_viewer = Some(viewer),
         None => app.status = "couldn't open that block".into(),

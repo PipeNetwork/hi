@@ -3,7 +3,7 @@ use super::*;
 /// Fully-resolved settings used to build a provider and run the agent.
 #[derive(Debug)]
 pub struct Settings {
-    pub execution: hi_agent::ExecutionMode,
+    pub execution: ExecutionMode,
     pub provider: ProviderName,
     pub model: String,
     pub base_url: String,
@@ -22,8 +22,8 @@ pub struct Settings {
     pub explore_subagents: bool,
     /// Claude-style suggested next prompt after turns (ghost text in TUI).
     pub suggest_next_prompt: bool,
-    /// Off / Risk (default) / On — see [`hi_agent::WriteSubagentPolicy`].
-    pub write_subagents: hi_agent::WriteSubagentPolicy,
+    /// Off / Risk (default) / On — see [`WriteSubagentPolicy`].
+    pub write_subagents: WriteSubagentPolicy,
     pub planner_model: Option<String>,
     pub skeptic_model: Option<String>,
     pub moa: hi_ai::MoaConfig,
@@ -303,11 +303,11 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
 /// end-of-turn-only behavior unless the user explicitly selects a mode.
 pub(crate) fn resolve_execution_mode(
     cli: &Cli,
-    profile_mode: Option<hi_agent::ExecutionMode>,
-    global_mode: Option<hi_agent::ExecutionMode>,
-) -> Result<hi_agent::ExecutionMode> {
+    profile_mode: Option<ExecutionMode>,
+    global_mode: Option<ExecutionMode>,
+) -> Result<ExecutionMode> {
     if cli.durable {
-        return Ok(hi_agent::ExecutionMode::Durable);
+        return Ok(ExecutionMode::Durable);
     }
     if let Some(mode) = profile_mode.or(global_mode).or(resolve_execution_env()?) {
         return Ok(mode);
@@ -315,21 +315,19 @@ pub(crate) fn resolve_execution_mode(
     Ok(default_execution_for_cli(cli))
 }
 
-fn default_execution_for_cli(cli: &Cli) -> hi_agent::ExecutionMode {
+fn default_execution_for_cli(cli: &Cli) -> ExecutionMode {
     if cli.no_save || cli.subagent || cli.eval_input.is_some() || cli.report.is_some() {
-        hi_agent::ExecutionMode::Ephemeral
+        ExecutionMode::Ephemeral
     } else {
-        hi_agent::ExecutionMode::Durable
+        ExecutionMode::Durable
     }
 }
 
-fn resolve_execution_env() -> Result<Option<hi_agent::ExecutionMode>> {
+fn resolve_execution_env() -> Result<Option<ExecutionMode>> {
     match std::env::var("HI_EXECUTION_MODE") {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "durable" | "on" | "true" | "1" => Ok(Some(hi_agent::ExecutionMode::Durable)),
-            "ephemeral" | "off" | "false" | "0" | "" => {
-                Ok(Some(hi_agent::ExecutionMode::Ephemeral))
-            }
+            "durable" | "on" | "true" | "1" => Ok(Some(ExecutionMode::Durable)),
+            "ephemeral" | "off" | "false" | "0" | "" => Ok(Some(ExecutionMode::Ephemeral)),
             other => {
                 anyhow::bail!("HI_EXECUTION_MODE must be durable or ephemeral (got {other:?})")
             }
@@ -459,8 +457,8 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         .and_then(|profile| profile.execution)
         .or(config.execution)
         .or(resolve_execution_env()?)
-        .unwrap_or(hi_agent::ExecutionMode::Durable);
-    let session_harness = crate::session_harness::empty_layer();
+        .unwrap_or(ExecutionMode::Durable);
+    let session_harness = super::empty_session_harness();
     let harness = resolve_harness(config, profile, Some(session_harness.clone()), &[])?;
 
     Ok(Settings {
@@ -619,13 +617,11 @@ pub(crate) fn suggest_next_prompt_default(profile_value: Option<bool>) -> bool {
 
 /// Write-capable `delegate` policy. Profile `write_subagents = true` → On;
 /// `false` → Off; unset → Risk (multi-file / isolation-shaped mutations only).
-pub(crate) fn write_subagents_default(
-    profile_value: Option<bool>,
-) -> hi_agent::WriteSubagentPolicy {
+pub(crate) fn write_subagents_default(profile_value: Option<bool>) -> WriteSubagentPolicy {
     match profile_value {
-        Some(true) => hi_agent::WriteSubagentPolicy::On,
-        Some(false) => hi_agent::WriteSubagentPolicy::Off,
-        None => hi_agent::WriteSubagentPolicy::Risk,
+        Some(true) => WriteSubagentPolicy::On,
+        Some(false) => WriteSubagentPolicy::Off,
+        None => WriteSubagentPolicy::Risk,
     }
 }
 
@@ -728,10 +724,7 @@ mod execution_default_tests {
     #[test]
     fn saved_ordinary_sessions_default_durable() {
         let cli = Cli::try_parse_from(["hi"]).unwrap();
-        assert_eq!(
-            default_execution_for_cli(&cli),
-            hi_agent::ExecutionMode::Durable
-        );
+        assert_eq!(default_execution_for_cli(&cli), ExecutionMode::Durable);
     }
 
     #[test]
@@ -743,10 +736,7 @@ mod execution_default_tests {
             vec!["hi", "--report", "report.json"],
         ] {
             let cli = Cli::try_parse_from(args).unwrap();
-            assert_eq!(
-                default_execution_for_cli(&cli),
-                hi_agent::ExecutionMode::Ephemeral
-            );
+            assert_eq!(default_execution_for_cli(&cli), ExecutionMode::Ephemeral);
         }
     }
 
@@ -756,11 +746,11 @@ mod execution_default_tests {
         assert_eq!(
             resolve_execution_mode(
                 &cli,
-                Some(hi_agent::ExecutionMode::Ephemeral),
-                Some(hi_agent::ExecutionMode::Durable),
+                Some(ExecutionMode::Ephemeral),
+                Some(ExecutionMode::Durable),
             )
             .unwrap(),
-            hi_agent::ExecutionMode::Ephemeral
+            ExecutionMode::Ephemeral
         );
     }
 }

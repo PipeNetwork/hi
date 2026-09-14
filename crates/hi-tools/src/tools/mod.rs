@@ -1243,23 +1243,41 @@ async fn run_bash_output(
         wait_secs: Option<u64>,
     }
     let args: Args = parse(arguments)?;
-    let result = match args.wait_secs {
-        None => {
-            resources
-                .background
-                .poll_wait_default_streaming(&args.id, on_line)
-                .await?
+    // A second wait on a silent handle is the babysit loop Grok forbids
+    // ("never re-poll in a loop; one call does the waiting"). Peek instead.
+    let already_silent = resources
+        .background
+        .consecutive_empty_polls(&args.id)
+        .unwrap_or(0)
+        >= 1;
+    let result = if already_silent && args.wait_secs != Some(0) {
+        let mut text = resources.background.poll(&args.id)?;
+        if text.contains("still running — no new output") {
+            text.push_str(
+                "\nAlready waited with no output. Do not poll this handle again; \
+                 bash_kill if the command should have finished.",
+            );
         }
-        Some(0) => resources.background.poll(&args.id)?,
-        Some(secs) => {
-            resources
-                .background
-                .poll_wait_streaming(
-                    &args.id,
-                    std::time::Duration::from_secs(secs.min(600)),
-                    on_line,
-                )
-                .await?
+        text
+    } else {
+        match args.wait_secs {
+            None => {
+                resources
+                    .background
+                    .poll_wait_default_streaming(&args.id, on_line)
+                    .await?
+            }
+            Some(0) => resources.background.poll(&args.id)?,
+            Some(secs) => {
+                resources
+                    .background
+                    .poll_wait_streaming(
+                        &args.id,
+                        std::time::Duration::from_secs(secs.min(600)),
+                        on_line,
+                    )
+                    .await?
+            }
         }
     };
     let background = resources.background.outcome(&args.id)?;
@@ -2829,23 +2847,35 @@ mod tests {
     #[test]
     fn bash_timeout_resolution_has_no_implicit_or_maximum_ceiling() {
         use super::process_tools::resolve_bash_timeout_from_values;
-        assert_eq!(resolve_bash_timeout_from_values(None, None), None);
-        assert_eq!(resolve_bash_timeout_from_values(None, Some("0")), None);
+        assert_eq!(resolve_bash_timeout_from_values(None, None, None), None);
         assert_eq!(
-            resolve_bash_timeout_from_values(None, Some("invalid")),
+            resolve_bash_timeout_from_values(None, Some("0"), None),
             None
         );
         assert_eq!(
-            resolve_bash_timeout_from_values(None, Some("86400")).map(|value| value.as_secs()),
-            Some(86_400)
+            resolve_bash_timeout_from_values(None, Some("invalid"), None),
+            None
         );
-        // Explicit positive requests are honored without a one-hour clamp.
         assert_eq!(
-            resolve_bash_timeout_from_values(Some(86_400), Some("1")).map(|value| value.as_secs()),
+            resolve_bash_timeout_from_values(None, Some("86400"), None)
+                .map(|value| value.as_secs()),
             Some(86_400)
         );
-        // Zero explicitly selects the same continual mode as omission.
-        assert_eq!(resolve_bash_timeout_from_values(Some(0), Some("1")), None);
+        assert_eq!(
+            resolve_bash_timeout_from_values(Some(86_400), Some("1"), None)
+                .map(|value| value.as_secs()),
+            Some(86_400)
+        );
+        assert_eq!(
+            resolve_bash_timeout_from_values(Some(0), Some("1"), None).map(|value| value.as_secs()),
+            Some(1)
+        );
+        assert_eq!(resolve_bash_timeout_from_values(Some(0), None, None), None);
+        assert_eq!(
+            resolve_bash_timeout_from_values(Some(300), Some("120"), Some("120"))
+                .map(|value| value.as_secs()),
+            Some(120)
+        );
     }
 
     #[test]

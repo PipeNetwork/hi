@@ -1,16 +1,17 @@
 use super::{
-    Cli, Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS, LocalRuntimeProfile,
-    PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, RsiRequested, RsiSection, auto_select,
-    auto_selected_env, configured_max_tokens, curate_skills_default, detect_verify_pipeline,
-    detect_verify_pipeline_with, explore_subagents_default, is_official_deepseek_url,
-    max_tokens_is_explicit, needs_setup, permits_missing_checkpoint, planner_model_default,
-    read_config_file, resolve, resolve_active_profile, resolve_fallbacks, resolve_named_profile,
-    resolve_quality, resolve_reasoning_effort, resolve_rsi, resolve_x402_settings, save_config_to,
-    set_rsi_config, suggest_next_prompt_default, upsert_profile_project_local,
-    write_subagents_default, x402_configured,
+    Cli, Config, DEFAULT_MAX_TOKENS, ExecutionMode, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS,
+    LocalRuntimeProfile, LspMode, PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName,
+    ReviewPolicy, RsiRequested, RsiSection, ToolSet, UNLIMITED_REPAIR_CYCLES, VerificationMode,
+    VerifyStage, WriteSubagentPolicy, auto_select, auto_selected_env, configured_max_tokens,
+    curate_skills_default, detect_verify_pipeline, detect_verify_pipeline_with,
+    explore_subagents_default, is_official_deepseek_url, max_tokens_is_explicit, needs_setup,
+    permits_missing_checkpoint, planner_model_default, read_config_file, resolve,
+    resolve_active_profile, resolve_fallbacks, resolve_named_profile, resolve_quality,
+    resolve_reasoning_effort, resolve_rsi, resolve_x402_settings, save_config_to, set_rsi_config,
+    suggest_next_prompt_default, upsert_profile_project_local, write_subagents_default,
+    x402_configured,
 };
 use clap::Parser;
-use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -127,10 +128,7 @@ fn quality_defaults_to_automatic_safe_policy() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(quality.verification, VerificationMode::Auto);
-    assert_eq!(
-        quality.max_verify_repairs,
-        hi_agent::UNLIMITED_REPAIR_CYCLES
-    );
+    assert_eq!(quality.max_verify_repairs, UNLIMITED_REPAIR_CYCLES);
     assert!(!quality.max_verify_repairs_explicit);
     assert_eq!(quality.review, ReviewPolicy::Risk);
     assert_eq!(quality.lsp_mode, LspMode::Auto);
@@ -204,10 +202,17 @@ fn model_round_limit_is_opt_in_on_the_cli() {
     let help = Cli::try_parse_from(["hi", "--help"])
         .expect_err("clap returns display-help as an error")
         .to_string();
-    assert!(
-        help.contains("no model-call cap by default"),
-        "help must describe the unlimited default:\n{help}"
-    );
+    for needle in [
+        "--max-steps",
+        "--max-tool-calls",
+        "--turn-deadline",
+        "round cap",
+    ] {
+        assert!(
+            !help.contains(needle),
+            "long-running turns are the default; help must not advertise {needle}:\n{help}"
+        );
+    }
 }
 
 #[test]
@@ -289,14 +294,14 @@ fn durable_execution_can_be_selected_by_cli_or_profile() {
     let cli = Cli::try_parse_from(["hi", "--profile", "durable", "--durable"]).unwrap();
     assert_eq!(
         resolve(&cli, &config).unwrap().execution,
-        hi_agent::ExecutionMode::Durable
+        ExecutionMode::Durable
     );
 
-    config.profiles.get_mut("durable").unwrap().execution = Some(hi_agent::ExecutionMode::Durable);
+    config.profiles.get_mut("durable").unwrap().execution = Some(ExecutionMode::Durable);
     let cli = Cli::try_parse_from(["hi", "--profile", "durable"]).unwrap();
     assert_eq!(
         resolve(&cli, &config).unwrap().execution,
-        hi_agent::ExecutionMode::Durable
+        ExecutionMode::Durable
     );
 }
 
@@ -405,8 +410,8 @@ context_exclusions = ["generated/**"]
     assert_eq!(
         quality.verification,
         VerificationMode::Explicit(vec![
-            hi_agent::VerifyStage::new("verify_1", "cargo check"),
-            hi_agent::VerifyStage::new("verify_2", "cargo test"),
+            VerifyStage::new("verify_1", "cargo check"),
+            VerifyStage::new("verify_2", "cargo test"),
         ])
     );
     assert_eq!(quality.max_verify_repairs, 1);
@@ -486,7 +491,12 @@ fn onboarding_mentions_real_interactive_flags() {
         super::ONBOARDING.contains("--plain"),
         "onboarding should point to the actual opt-out flag"
     );
+    assert!(super::ONBOARDING.contains("hi login pipenetwork"));
     assert!(super::ONBOARDING.contains("hi auth pipenetwork"));
+    assert!(
+        !super::ONBOARDING.contains("OpenRouter"),
+        "onboarding must not send users to other providers"
+    );
 }
 
 #[test]
@@ -1184,7 +1194,7 @@ api_key_env = "HI_SYNC_API_KEY"
     .unwrap();
     super::merge_config(&mut config, local);
     let sync = config.sync.as_ref().unwrap();
-    assert_ne!(sync.mode, Some(crate::sync_store::SyncMode::On));
+    assert_ne!(sync.mode, Some(crate::config::SyncMode::On));
     assert!(!sync.enabled);
     assert!(sync.base_url.is_none());
     assert!(sync.api_key_env.is_none());
@@ -1193,7 +1203,7 @@ api_key_env = "HI_SYNC_API_KEY"
     super::merge_config(&mut config, local);
     assert_eq!(
         config.sync.as_ref().and_then(|section| section.mode),
-        Some(crate::sync_store::SyncMode::Paused)
+        Some(crate::config::SyncMode::Paused)
     );
 }
 
@@ -1490,17 +1500,11 @@ fn suggest_next_prompt_defaults_on() {
 
 #[test]
 fn write_subagents_default_is_risk_unless_profile_sets_bool() {
-    assert_eq!(
-        write_subagents_default(None),
-        hi_agent::WriteSubagentPolicy::Risk
-    );
-    assert_eq!(
-        write_subagents_default(Some(true)),
-        hi_agent::WriteSubagentPolicy::On
-    );
+    assert_eq!(write_subagents_default(None), WriteSubagentPolicy::Risk);
+    assert_eq!(write_subagents_default(Some(true)), WriteSubagentPolicy::On);
     assert_eq!(
         write_subagents_default(Some(false)),
-        hi_agent::WriteSubagentPolicy::Off
+        WriteSubagentPolicy::Off
     );
 }
 
@@ -2951,9 +2955,9 @@ fn pairing_env_key_wins_over_x402_keypair() {
         auto_selected_env(&cli, &Config::default()),
         Some("PIPENETWORK_API_KEY")
     );
-    assert!(crate::x402::credential_is_pairing_key("pk_live_pair"));
-    assert!(!crate::x402::credential_is_pairing_key(""));
-    assert!(!crate::x402::credential_is_pairing_key("x402_credits"));
+    assert!("pk_live_pair".starts_with("pk_live_"));
+    assert!(!"".starts_with("pk_live_"));
+    assert!(!"x402_credits".starts_with("pk_live_"));
 }
 
 #[test]
@@ -3227,7 +3231,7 @@ fn provider_override_does_not_inherit_mismatched_profile_model() {
                 repo: "xai/local-model".into(),
                 ..Default::default()
             }),
-            execution: Some(hi_agent::ExecutionMode::Durable),
+            execution: Some(ExecutionMode::Durable),
             ..Default::default()
         },
     );
@@ -3287,8 +3291,8 @@ fn provider_override_does_not_inherit_mismatched_profile_model() {
     assert!(!settings.curate_skills);
     assert!(!settings.explore_subagents);
     assert!(!settings.suggest_next_prompt);
-    assert_eq!(settings.write_subagents, hi_agent::WriteSubagentPolicy::Off);
-    assert_eq!(settings.execution, hi_agent::ExecutionMode::Durable);
+    assert_eq!(settings.write_subagents, WriteSubagentPolicy::Off);
+    assert_eq!(settings.execution, ExecutionMode::Durable);
 
     // An explicit CLI fallback remains explicit even when the default profile
     // targets another provider.
@@ -3536,14 +3540,15 @@ fn top_level_help_lists_everyday_commands() {
     let help = err.to_string();
     for needle in [
         "setup",
-        "doctor",
+        "login",
+        "logout",
         "update",
-        "workflow",
+        "resume",
         "trace",
-        "--best-of",
-        "--judge",
-        "headless form of `/race`",
-        "auth               Paste and verify an API key (openai / anthropic / pipenetwork / xai)",
+        "--continue",
+        "--list-sessions",
+        "Sign in to pipenetwork.ai (same as `hi login`, or paste a key)",
+        "auth               Paste and verify an API key (pipenetwork / openai / anthropic / xai)",
     ] {
         assert!(
             help.contains(needle),

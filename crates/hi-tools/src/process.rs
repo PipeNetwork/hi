@@ -14,7 +14,7 @@ mod foreground;
 mod hermetic;
 mod program;
 
-use environment::{SECRET_ENV_VARS, sensitive_environment_name, workspace_cargo_home};
+use environment::{strip_inherited_secrets, workspace_cargo_home};
 #[cfg(test)]
 use execution::kill_process_group;
 pub use execution::{AdoptableOutcome, RunningChild, preserve_detached_descendants};
@@ -157,6 +157,7 @@ pub struct ProcessRunner {
     cargo_home: Option<PathBuf>,
     private_temp: Option<PathBuf>,
     evidence_reducer: Arc<Mutex<EvidenceReducerState>>,
+    bash_repeats: Arc<Mutex<std::collections::HashMap<String, u32>>>,
 }
 
 impl std::fmt::Debug for ProcessRunner {
@@ -213,6 +214,14 @@ impl ProcessRunner {
     /// Policy requested via `HI_SANDBOX` (may be unenforced on this OS).
     pub fn sandbox_policy(&self) -> crate::sandbox::SandboxPolicy {
         self.sandbox.policy()
+    }
+
+    pub fn reset_bash_repeats(&self) {
+        crate::bash_repeat::reset_bash_repeats(&self.bash_repeats);
+    }
+
+    pub fn admit_bash_repeat(&self, command: &str) -> Option<String> {
+        crate::bash_repeat::admit_bash_repeat(&self.bash_repeats, command)
     }
 
     /// Install quote-checked reduction after diagnostic condense. Clones share
@@ -452,14 +461,7 @@ impl ProcessRunner {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .env("AI_AGENT", "hi");
-        for var in SECRET_ENV_VARS {
-            command.env_remove(var);
-        }
-        for (name, _) in std::env::vars_os() {
-            if sensitive_environment_name(&name) {
-                command.env_remove(name);
-            }
-        }
+        strip_inherited_secrets(command);
         command
             .env("GIT_TERMINAL_PROMPT", "0")
             // Cargo suppresses ANSI diagnostics when stdout/stderr are pipes;

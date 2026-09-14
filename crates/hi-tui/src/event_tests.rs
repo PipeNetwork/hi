@@ -3,6 +3,7 @@ use hi_events::{
     ActivityObject, ActivityState, ActivityVerb, EventContext, EventError, EventKind, EventReceipt,
     EventSink, RunEvent, SemanticActivity,
 };
+use hi_harness::Ui;
 
 #[derive(Default)]
 struct RecordingEventSink(std::sync::Mutex<Vec<RunEvent>>);
@@ -76,7 +77,7 @@ fn plan_result_closes_semantic_tool_without_visible_result_row() {
     };
     let steps = vec![PlanStep {
         title: "verify the harness".into(),
-        status: hi_agent::PlanStatus::Active,
+        status: hi_tools::PlanStatus::Active,
     }];
 
     ui.plan_result_id(
@@ -102,4 +103,15 @@ fn plan_result_closes_semantic_tool_without_visible_result_row() {
     assert_eq!(semantic[0].activity.state, ActivityState::Succeeded);
     assert_eq!(semantic[0].activity.group_key, "tool:plan-call-1");
     assert_eq!(semantic[0].activity.title, "update_plan");
+}
+
+#[test]
+fn restore_sequence_emits_leave_alternate_screen() {
+    let mut buf = Vec::new();
+    write_leave_session_screen(&mut buf).unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    assert!(
+        text.contains("1049l") || buf.windows(5).any(|w| w == b"1049l"),
+        "LeaveAlternateScreen missing from restore bytes: {text:?}"
+    );
 }

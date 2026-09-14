@@ -1,13 +1,15 @@
 # hi
 
-`hi` is a verification-first coding agent. Point it at a model — local or remote — and it reads, writes, and edits files and runs shell commands until your tests pass.
+`hi` is a coding agent that talks to [Pipe Network](https://pipenetwork.ai) inference. It reads, writes, and edits files and runs shell commands in your project.
 
 ```bash
 # Install (needs a Rust toolchain):
 ./scripts/install.sh
 
-# First run opens a provider wizard. Then:
-hi "the tests in test_parser.py are failing — fix the parser"
+# Auth once, then:
+hi login pipenetwork
+# or: PIPENETWORK_API_KEY=... hi "the tests in test_parser.py are failing — fix the parser"
+# or: hi auth pipenetwork
 ```
 
 Interactive sessions open a full-screen TUI. Pass a prompt for one-shot. Piped stdin is folded in as context:
@@ -19,93 +21,55 @@ cargo test 2>&1 | hi "fix the failing tests"
 ## Everyday path
 
 1. Ask for an outcome, not a patch recipe.
-2. After edits, hi runs an auto-detected check pipeline (`cargo test`, `pytest`, `go test`, …) or `/verify <cmd>`.
-3. Failures go back to the model. `/undo` restores the last turn.
+2. The model streams from `api.pipenetwork.ai`, calls local tools, and repeats until it stops.
+3. `/verify <cmd>` runs a check after the turn (it does not auto-repair). `/undo` restores the last turn.
 
-In the TUI: **Ctrl-K** is the command palette (core commands first; type to search). `/help` is the same grouping. `/tutorial` is an eight-lesson tour, offered once on a fresh session.
+In the TUI: **Ctrl-K** is the command palette (core commands first; type to search). `/help` is the same grouping. `/tutorial` is an eight-lesson tour that starts with `/login`, offered once on a fresh session.
 
 | Job | Command |
 |---|---|
+| Sign in | `/login` or `hi login pipenetwork` |
 | Finish line | `/verify [cmd\|off]` |
 | Take it back | `/undo` |
 | See the diff | `/diff` or Ctrl-G |
-| Resume work | `hi resume` / `/sessions` |
+| Resume work | `hi resume` / `hi --list-sessions` |
 | Settings | `/config` |
 
-## Providers
+## Pipe Network
 
-`--provider` accepts `openai` (OpenRouter and any OpenAI-compatible URL), `anthropic`, `pipenetwork`, `ollama`, and `xai`. First-run `hi` or `hi setup` walks through all of them.
-
-```bash
-HI_API_KEY=sk-or-... hi -m anthropic/claude-sonnet-4 "add a --json flag"
-PIPENETWORK_API_KEY=... hi --provider pipenetwork "…"
-hi --provider ollama -m qwen2.5-coder "…"
-XAI_API_KEY=xai-... hi --provider xai "…"
-HI_API_KEY=sk-... hi --provider openai --base-url https://api.openai.com/v1 -m gpt-6-astra "add a --json flag"
-```
-
-For persistent Pipe setup without an environment variable, run
-`hi auth pipenetwork` (or `/auth pipenetwork` inside an interactive session).
-hi verifies the key against `/models`, stores it in the private credential
-store, and creates a Pipe profile that defaults to DeepSeek V4 Flash.
-
-GPT-6 Astra uses the Responses API automatically, including tool calls and
-encrypted reasoning replay. See [Astra harness support](docs/gpt-6-astra.md)
-for parameter handling and transport limits.
-
-Profiles live in `./hi.toml` or `~/.config/hi/config.toml`. `/provider` switches mid-session.
-User-owned config stores credentials by reference (`env://...` or the private
-`auth-store://...` store); profile/config writers seal pasted keys and migrate
-legacy literal fields best-effort. Repository config is never rewritten merely
-because it was inspected.
-
-## Named modes (when you need them)
-
-| Intent | Name | How |
-|---|---|---|
-| Several attempts at one task | Race | `/race <task>` — headless: `hi --best-of N "…"` |
-| Several tasks at once | Fleet | `/fleet` (`/dashboard` is an alias) |
-| Helpers inside a turn | Delegates | `/delegate` · explore is on by default |
-| Work for a week | Goal | `/goal <objective>` |
-| Keep watching | Watch | `/loop`, `/watch`, `hi --loops-daemon` |
-| Project tickets | Tickets | Dashboard Board + `hi tickets` after `/login pipenetwork` |
-| This machine | Local | `/local` (MLX) or `--provider ollama` |
-
-Power commands (RSI, Diff Lab, traces, eval) are in `/help platform` and the [handbook](docs/handbook.md).
-
-Interactive `hi` auto-submits Cargo mutation turns to `POST /v1/tasks` when Outcome is reachable (`--tasks` / `--no-tasks` override). Q&A stays on local chat. `--rsi` still exists as a fallback to `/v1/rsi/runs` when the tasks route is absent. Fail-open to local chat on `tasks_unavailable`, 401/404, missing key, or a missing RSI worker heartbeat.
-
-Laptop loopback (dev-only unsandboxed worker):
+Default inference is `https://api.pipenetwork.ai/v1` with model `pipe/deepseek-v4-flash-0731`.
 
 ```bash
-ipop/scripts/rsi-dev-up.sh
-# or: IPOP_ROOT=/path/to/ipop hi rsi up
+hi login pipenetwork         # browser pairing; writes the API key into config.toml
+PIPENETWORK_API_KEY=pk_live_... hi "add a --json flag"
+hi auth pipenetwork          # paste a key, probe /models, store it
+hi -m pipe/deepseek-v4-flash-0731 "…"
 ```
 
-Then set:
+The coding harness is `hi-harness`: stream chat completions from Pipe, execute local tools (`read`/`write`/`edit`/`bash`/`grep`/`glob`/`list` plus repo/LSP helpers), persist JSONL sessions, `/undo` via git checkpoints. Turns run until the model stops or you cancel. `/verify` is a post-turn check, not auto-repair.
 
-```toml
-[outcome]
-mode = "auto"
-base_url = "http://127.0.0.1:13000/v1"
+```bash
+hi --verify "cargo test" "fix the failing tests"
+hi -q "summarize src/lib.rs"
+hi --confirm-edits "edit README.md"
+hi --plain                    # line REPL
+hi resume                     # latest session in this directory
+hi --list-sessions
+hi --resume <id>
 ```
 
-`json_schema` tasks can succeed without a sandbox. `cargo_test` / `cargo_clippy` / `review` need that worker plus a local `hi`. Cargo-backed `code.change` is not GA until a verified worker run.
+Profiles live in `./hi.toml` or `~/.config/hi/config.toml`. Credentials are stored by reference (`env://...` or `auth-store://pipenetwork`). `/login` and `hi login pipenetwork` write `[profiles.pipenetwork]`. `/auth pipenetwork <key>` pastes a key. `/doctor` checks the key, Pipe `/models`, git, and sandbox.
 
-Project tickets on the dashboard Board are a different unit of work than `POST /v1/tasks`. Start an interactive `hi`, run `/login pipenetwork`, and pick the project; then run `hi tickets` in the repo to claim local tickets and drive `--goal --verify` until the report passes. Sandbox tickets stay on the control plane (`POST /v1/tasks` plus server-side `POST /v1/repairs`).
+`/sessions` lists saved ids. `/rewind n` drops back to user turn n. `/yolo` and `/effort` persist on the session. Type while a turn runs to steer the next model call.
 
 ## Trust
 
-Default is YOLO with a seatbelt: no nag prompts, a denylist for irreversible commands, checkpoints for `/undo`. Shell writes stay in the project on macOS (Seatbelt) and on Linux when `pipe-wrap` is available. `HI_SANDBOX=off` disables that. The status bar shows **sandbox** and **undo**. Tool results, web/research pages, browser output, and MCP payloads are treated as untrusted data, not instructions. Ask/Auto confirm browser and MCP `use_tool`; session standing grants are MCP `server`+`tool` only.
+The TUI starts in **ask** (confirm file edits and mutating shell). `/auto` allows safe file edits; `/yolo` skips confirms for the session. One-shot and `--plain` default to always-approve unless you pass `--confirm-edits`. Shell writes stay in the project on macOS (Seatbelt) and on Linux when `pipe-wrap` is available. `HI_SANDBOX=off` disables that. `/status` shows sandbox and context occupancy. Tool results are untrusted data, not instructions.
 
 ## Docs
 
-- [Handbook](docs/handbook.md) — full CLI, TUI, loops, RSI, local GPU, eval
-- [Architecture](docs/architecture.md) — interactive agent vs RSI control plane
-- [Fleet](docs/fleet-dashboard.md)
-- [PipeFS](docs/pipefs.md) — opt-in portable session workspaces
-- [Harness v2](docs/harness-v2.md) — workspace settlement, jobs, candidates, and recovery
+- [Handbook](docs/handbook.md)
+- [Architecture](docs/architecture.md)
 - [Sandbox](docs/sandbox.md)
-- [0.2 migration](docs/0.2-migration.md)
 
 Homebrew formula (tap yourself or `brew install --build-from-source`): [packaging/homebrew/hi.rb](packaging/homebrew/hi.rb). Binary archives can follow; `cargo install --path crates/hi-cli --locked` is still the supported build.

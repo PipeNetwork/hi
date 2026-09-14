@@ -4,12 +4,12 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-hi-agent.workspace = true
+hi-harness.workspace = true
+hi-sentinel.workspace = true
 hi-events.workspace = true
 hi-policy.workspace = true
 hi-ai.workspace = true
 hi-diff.workspace = true
-hi-race.workspace = true
 hi-tools.workspace = true
 hi-workflow.workspace = true
 hi-voice = { workspace = true }
@@ -35,20 +35,21 @@ ratatui-core = { version = "0.1", optional = true }
 [lints.rust]
 # Real unsafe lives here (env set_var in single-threaded TUI cmd path); see workspace root.
 unsafe_code = "allow"
+# The Pipe session loop left Agent TUI chrome in place; fields and helpers
+# that the new drive does not read are follow-up cleanup, not a compile gate.
+dead_code = "allow"
 
 [features]
 # Voice dictation (microphone + local Whisper) is opt-in so ordinary TUI builds
 # do not compile the heavy native audio stack.
 default = []
 voice = ["hi-voice/audio"]
-codebase-graph = ["hi-tools/codebase-graph", "hi-agent/codebase-graph"]
+codebase-graph = ["hi-tools/codebase-graph"]
 eye-declare-spike = ["dep:eye-declare", "dep:ratatui-core"]
 # INTERNAL SMOKE NEGATIVE CONTROL ONLY. This intentionally lets rejected
-# generic completion text reach the transcript and also disables the matching
-# agent guard. Never enable it in normal, packaged, or release binaries.
-smoke-negative-control-disable-generic-completion-guards = [
-    "hi-agent/smoke-negative-control-disable-generic-completion-guards",
-]
+# generic completion text reach the transcript. Never enable it in normal,
+# packaged, or release binaries.
+smoke-negative-control-disable-generic-completion-guards = []
 
 [dev-dependencies]
 criterion.workspace = true

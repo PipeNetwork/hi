@@ -27,6 +27,8 @@ pub struct Config {
     pub pipefs: PipeFsSection,
     #[serde(default)]
     pub rsi: Option<RsiSection>,
+    #[serde(default)]
+    pub autoharnessfix: Option<AutoHarnessFixSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<OutcomeSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,6 +267,25 @@ pub fn resolve_rsi(cli: &Cli, file: &Config) -> anyhow::Result<RsiRequested> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncMode {
+    On,
+    Paused,
+    #[default]
+    Off,
+}
+
+impl SyncMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Paused => "paused",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// The `[sync]` section in `hi.toml` — configures cross-machine session sync.
 /// All fields optional; unset fields fall back to env vars or the provider's
 /// credentials.
@@ -287,7 +308,7 @@ pub struct SyncSection {
     pub machine_id: Option<String>,
     /// Persisted sync policy. Missing values migrate from legacy `enabled`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<crate::sync_store::SyncMode>,
+    pub mode: Option<SyncMode>,
     /// When true, sync is enabled by default (no need for `--sync` on the CLI).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enabled: bool,
@@ -311,7 +332,7 @@ impl serde::Serialize for Config {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Config", 14)?;
+        let mut s = serializer.serialize_struct("Config", 15)?;
         if let Some(v) = &self.default_profile {
             s.serialize_field("default_profile", v)?;
         }
@@ -337,6 +358,9 @@ impl serde::Serialize for Config {
         }
         if let Some(rsi) = &self.rsi {
             s.serialize_field("rsi", rsi)?;
+        }
+        if let Some(autoharnessfix) = &self.autoharnessfix {
+            s.serialize_field("autoharnessfix", autoharnessfix)?;
         }
         if let Some(outcome) = &self.outcome {
             s.serialize_field("outcome", outcome)?;
@@ -566,6 +590,7 @@ pub(crate) fn merge_config_with_project_trust(
     mut overlay: Config,
     trusted: bool,
 ) {
+    super::drop_project_overlay(&mut overlay);
     base.harness.merge_project(&mut overlay.harness, trusted);
     for profile in overlay.profiles.values_mut() {
         profile.project_local = true;
@@ -661,10 +686,7 @@ fn merge_project_sync(base: &mut Option<SyncSection>, project: Option<SyncSectio
     let target = base.get_or_insert_with(SyncSection::default);
     // Repository config may persistently tighten the machine policy, but it
     // must never turn transcript upload on merely because the folder opened.
-    if project
-        .mode
-        .is_some_and(|mode| mode != crate::sync_store::SyncMode::On)
-    {
+    if project.mode.is_some_and(|mode| mode != SyncMode::On) {
         target.mode = project.mode;
     }
     if !project.enabled {
@@ -825,21 +847,6 @@ pub(crate) fn local_config_path() -> PathBuf {
     PathBuf::from("hi.toml")
 }
 
-/// Guess a *layered* verification pipeline from marker files in `dir`: a cheap
-/// compile/typecheck (and lint, when obviously configured) before tests, so the
-/// model gets fast, localizable errors before the slower test stage. Used by
-/// automatic verification so the proven verify-loop is zero-config. Empty =
-/// unknown project.
-#[cfg(test)]
-pub fn detect_verify_pipeline(dir: &Path) -> Vec<VerifyStage> {
-    hi_agent::detect_verify_pipeline(dir)
-}
-
-#[cfg(test)]
-pub fn detect_verify_pipeline_with(dir: &Path, clippy: bool) -> Vec<VerifyStage> {
-    hi_agent::detect_verify_pipeline_with(dir, clippy)
-}
-
 /// True when a bare `hi` has no model to run — used to trigger the interactive
 /// setup wizard on a fresh terminal.
 ///
@@ -921,23 +928,6 @@ pub fn writable_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
         return Some(local);
     }
     default_config_path()
-}
-
-/// Mask an API key (or env var name) for display: first and last four
-/// characters with an ellipsis. Char-based, so a key containing multi-byte
-/// characters (e.g. pasted with a stray curly quote) can't panic a byte slice.
-pub fn mask_key(key: &str) -> String {
-    if key.is_empty() {
-        return "(none)".to_string();
-    }
-    let chars: Vec<char> = key.chars().collect();
-    if chars.len() > 8 {
-        let head: String = chars[..4].iter().collect();
-        let tail: String = chars[chars.len() - 4..].iter().collect();
-        format!("{head}…{tail}")
-    } else {
-        "***".to_string()
-    }
 }
 
 /// Serialize `config` to TOML and write it to `path`, creating parent dirs.

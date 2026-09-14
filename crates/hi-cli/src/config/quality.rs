@@ -129,23 +129,22 @@ pub fn resolve_quality(cli: &Cli, root: &Path) -> Result<QualitySettings> {
     };
     let clippy = cli.clippy || quality.clippy.unwrap_or(false);
     if clippy && matches!(verification, VerificationMode::Auto) {
-        let stages = hi_agent::detect_verify_pipeline_with(root, true);
+        let stages = super::detect_verify_pipeline_with(root, true);
         if !stages.is_empty() {
             verification = VerificationMode::Explicit(stages);
         }
     }
 
     let configured_max_verify_repairs = cli.max_verify_repairs.or(quality.max_verify_repairs);
-    if configured_max_verify_repairs == Some(hi_agent::UNLIMITED_REPAIR_CYCLES) {
+    if configured_max_verify_repairs == Some(super::UNLIMITED_REPAIR_CYCLES) {
         bail!(
             "[quality].max_verify_repairs must be at most {}; omit it for unlimited repairs",
-            hi_agent::UNLIMITED_REPAIR_CYCLES - 1
+            super::UNLIMITED_REPAIR_CYCLES - 1
         );
     }
     Ok(QualitySettings {
         verification,
-        max_verify_repairs: configured_max_verify_repairs
-            .unwrap_or(hi_agent::UNLIMITED_REPAIR_CYCLES),
+        max_verify_repairs: configured_max_verify_repairs.unwrap_or(super::UNLIMITED_REPAIR_CYCLES),
         max_verify_repairs_explicit: configured_max_verify_repairs.is_some(),
         review: cli
             .review

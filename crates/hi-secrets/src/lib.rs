@@ -20,3 +20,29 @@ mod sanitizer;
 pub use sanitizer::{
     redact_json_string_values, redact_secrets, redact_url, redact_user_paths, walk_json_strings,
 };
+
+/// Environment variable names that must never be inherited by untrusted
+/// subprocesses or copied into incident bundles.
+pub const SECRET_ENV_NAMES: &[&str] = &[
+    "HI_API_KEY",
+    "HI_WEB_SEARCH_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "PIPENETWORK_API_KEY",
+    "OLLAMA_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "HUGGING_FACE_HUB_TOKEN",
+    "HF_TOKEN",
+];
+
+#[cfg(test)]
+mod secret_env_tests {
+    #[test]
+    fn secret_env_names_include_pipe_and_hi_keys() {
+        assert!(super::SECRET_ENV_NAMES.contains(&"PIPENETWORK_API_KEY"));
+        assert!(super::SECRET_ENV_NAMES.contains(&"HI_API_KEY"));
+    }
+}

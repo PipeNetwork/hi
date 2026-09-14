@@ -45,6 +45,7 @@ pub(super) fn build_process_runner(
         cargo_home,
         private_temp,
         evidence_reducer: Arc::new(Mutex::new(super::EvidenceReducerState::default())),
+        bash_repeats: Arc::new(Mutex::new(std::collections::HashMap::new())),
     })
 }
 

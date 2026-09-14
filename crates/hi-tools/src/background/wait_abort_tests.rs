@@ -46,6 +46,34 @@ async fn monitor_wake_skips_own_turn_and_fires_for_later_turns() {
 }
 
 #[tokio::test]
+async fn running_pgids_does_not_expire_monitors() {
+    let registry = BackgroundRegistry::default();
+    let runner = crate::ProcessRunner::from_current_dir().unwrap();
+    let id = registry.spawn(&runner, "sleep 30").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while registry.running_pgids().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("spawned job must expose a pgid");
+    registry.arm_monitor(&id, Some(1), false);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !registry.running_pgids().is_empty(),
+        "read-only pgid sampling must not kill a timed-out monitor"
+    );
+    let _ = registry.snapshot();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !registry.running_pgids().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("snapshot still expires timed-out monitors");
+}
+
+#[tokio::test]
 async fn poll_wait_ignores_stale_abort_notify_without_pending_follow_up() {
     let registry = BackgroundRegistry::default();
     let abort = Arc::new(Notify::new());

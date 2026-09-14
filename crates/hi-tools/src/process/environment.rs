@@ -4,24 +4,31 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use tokio::process::Command;
 
-/// Environment variables which must never be inherited by model-controlled
-/// processes. Everything else is retained so compilers and project-local tool
-/// chains keep working.
-pub(super) const SECRET_ENV_VARS: &[&str] = &[
-    "HI_API_KEY",
-    "HI_WEB_SEARCH_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "OPENROUTER_API_KEY",
-    "PIPENETWORK_API_KEY",
-    "OLLAMA_API_KEY",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
-    "AZURE_OPENAI_API_KEY",
-    "HUGGING_FACE_HUB_TOKEN",
-    "HF_TOKEN",
-];
+pub(super) fn strip_inherited_secrets(command: &mut Command) {
+    for var in hi_secrets::SECRET_ENV_NAMES {
+        command.env_remove(var);
+    }
+    for (name, _) in std::env::vars_os() {
+        if sensitive_environment_name(&name) || is_supervisor_env(&name) {
+            command.env_remove(&name);
+        }
+    }
+    command.env_remove("HI_CRASH_DIR");
+}
+
+fn is_supervisor_env(name: &OsStr) -> bool {
+    name.to_string_lossy().starts_with("HI_SENTINEL_")
+}
+
+impl super::ProcessRunner {
+    #[allow(clippy::unused_self)]
+    pub fn detached_descendants_preserved(&self) -> bool {
+        super::execution::detached_descendants_preserved()
+    }
+}
+
 /// Cargo needs a writable registry/cache, while the sandbox intentionally
 /// protects the user's shared `~/.cargo` from dependency-cache poisoning.
 /// Isolate a cache by canonical workspace identity. Existing project-local
@@ -94,4 +101,90 @@ pub(super) fn sensitive_environment_name(name: &OsStr) -> bool {
     ]
     .iter()
     .any(|marker| name.contains(marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn supervisor_env_names_are_classified() {
+        assert!(is_supervisor_env(OsStr::new("HI_SENTINEL_SUPERVISED")));
+        assert!(is_supervisor_env(OsStr::new("HI_SENTINEL_INSTANCE")));
+        assert!(!is_supervisor_env(OsStr::new("HI_SANDBOX")));
+        assert!(!is_supervisor_env(OsStr::new("HI_CRASH_DIR")));
+    }
+
+    #[test]
+    fn sensitive_environment_names_are_removed_conservatively() {
+        assert!(sensitive_environment_name(OsStr::new("GITHUB_TOKEN")));
+        assert!(sensitive_environment_name(OsStr::new(
+            "AWS_SECRET_ACCESS_KEY"
+        )));
+        assert!(sensitive_environment_name(OsStr::new("DATABASE_PASSWORD")));
+        assert!(!sensitive_environment_name(OsStr::new("PATH")));
+        assert!(!sensitive_environment_name(OsStr::new("RUSTUP_HOME")));
+    }
+
+    struct EnvRestore {
+        keys: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, previous) in self.keys.drain(..) {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tool_children_do_not_inherit_sentinel_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "HI_SENTINEL_SUPERVISED",
+            "HI_SENTINEL_INSTANCE",
+            "HI_CRASH_DIR",
+        ];
+        let restore = EnvRestore {
+            keys: keys
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        };
+        unsafe {
+            std::env::set_var("HI_SENTINEL_SUPERVISED", "1");
+            std::env::set_var("HI_SENTINEL_INSTANCE", "nested-token");
+            std::env::set_var("HI_CRASH_DIR", "/tmp/hi-crash-should-not-leak");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let runner = super::super::ProcessRunner::new(dir.path()).unwrap();
+        let run = runner
+            .run_program(
+                "sh",
+                [
+                    "-c",
+                    "printf %s \"$HI_SENTINEL_SUPERVISED|$HI_SENTINEL_INSTANCE|$HI_CRASH_DIR\"",
+                ],
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        drop(restore);
+        assert_eq!(run.status, crate::ToolStatus::Succeeded);
+        assert_eq!(
+            run.outcome.stdout_summary, "||",
+            "tool children must not inherit HI_SENTINEL_* or HI_CRASH_DIR"
+        );
+    }
 }

@@ -19,9 +19,6 @@ pub(crate) fn build(app: &App, width: u16) -> Option<Line<'static>> {
     if app.confirmation.is_some() {
         return Some(waiting_on_you(app, width));
     }
-    if app.plan_approval.is_some() {
-        return Some(waiting_on_plan(app, width));
-    }
     if app.working {
         return Some(working_line(app, width));
     }
@@ -39,30 +36,6 @@ pub(crate) fn build(app: &App, width: u16) -> Option<Line<'static>> {
         )]));
     }
     settled_line(app)
-}
-
-fn waiting_on_plan(app: &App, width: u16) -> Line<'static> {
-    let th = theme();
-    let diamond = pulse_color(th.bg_base, th.accent_plan, app.spinner);
-    let parked = app.plan_approval.as_ref().is_some_and(|card| card.parked);
-    let label = if parked {
-        "Waiting on plan approval  ·  /view-plan"
-    } else {
-        "Waiting on plan approval"
-    };
-    let left = vec![
-        Span::styled(
-            "◆ ",
-            Style::default().fg(diamond).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            label,
-            Style::default()
-                .fg(th.accent_plan)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    pad_ends(left, Vec::new(), width)
 }
 
 fn waiting_on_you(app: &App, width: u16) -> Line<'static> {
@@ -306,21 +279,12 @@ fn clip_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'static>>
     clipped
 }
 
-fn blocking_subagent(app: &App) -> Option<(std::time::Instant, String)> {
-    app.subagents.values().find_map(|info| {
-        if !info.background && info.live() {
-            Some((info.started_at, info.id.clone()))
-        } else {
-            None
-        }
-    })
+fn blocking_subagent(_app: &App) -> Option<(std::time::Instant, String)> {
+    None
 }
 
-fn live_background_subagents(app: &App) -> usize {
-    app.subagents
-        .values()
-        .filter(|info| info.background && info.live())
-        .count()
+fn live_background_subagents(_app: &App) -> usize {
+    0
 }
 
 #[cfg(test)]

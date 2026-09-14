@@ -1,5 +1,8 @@
 # Context efficiency regression fixtures
 
+The `cargo test -p hi-agent` commands below targeted the removed crate. Use
+`cargo test -p hi-harness --lib` for the current coding loop.
+
 These deterministic fixtures measure fixes to avoidable request and tool-output
 overhead. They do not measure live provider charges or model coding pass rates.
 

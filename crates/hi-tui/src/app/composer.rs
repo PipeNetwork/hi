@@ -76,39 +76,6 @@ fn clip_composer_line(line: Line<'static>, max_width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-fn review_repair_summary(t: &hi_agent::TurnTelemetry) -> Option<String> {
-    if t.quality_repair_nudges == 0
-        && t.review_repair_counts.is_empty()
-        && t.review_repair_exhaustion_reason.is_empty()
-    {
-        return None;
-    }
-
-    let mut parts = vec![format!("total {}", t.quality_repair_nudges)];
-    let mut counts = t.review_repair_counts.iter().collect::<Vec<_>>();
-    counts.sort_by(|(left_mode, left_count), (right_mode, right_count)| {
-        right_count
-            .cmp(left_count)
-            .then_with(|| left_mode.cmp(right_mode))
-    });
-    let top_modes = counts
-        .into_iter()
-        .take(2)
-        .map(|(mode, count)| format!("{}={count}", hi_agent::compact_review_repair_label(mode)))
-        .collect::<Vec<_>>();
-    if !top_modes.is_empty() {
-        parts.push(format!("top {}", top_modes.join(", ")));
-    }
-    let mut summary = format!("review repair: {}", parts.join(" · "));
-    if !t.review_repair_exhaustion_reason.is_empty() {
-        summary.push_str(&format!(
-            "\nexhausted {}",
-            hi_agent::compact_review_repair_label(&t.review_repair_exhaustion_reason)
-        ));
-    }
-    Some(summary)
-}
-
 impl crate::App {
     /// Overlay rows painted inside the editable input (history search, debug,
     /// help, notices, toasts, voice, palette, completion).
@@ -299,85 +266,9 @@ impl crate::App {
                 .fg(crate::theme::theme().accent_system)
                 .add_modifier(Modifier::BOLD),
         ));
-        let t = self.last_telemetry.as_ref();
-        let tel = if let Some(t) = t {
-            format!(
-                "telemetry: {} verify · {} retry · {} repeat · {} continue · {} trunc · cache {}s/{}b{}",
-                t.verify_rounds,
-                t.recovery_retries,
-                t.repeat_nudges,
-                t.continue_nudges,
-                t.truncation_retries,
-                t.prefix_stable_rounds,
-                t.prefix_break_rounds,
-                if t.tool_prefix_break_rounds > 0 {
-                    format!("/{}t", t.tool_prefix_break_rounds)
-                } else {
-                    String::new()
-                }
-            )
-        } else {
-            "telemetry: (no turn yet)".to_string()
-        };
-        lines.push(Line::styled(tel, dim()));
+        lines.push(Line::styled("telemetry: (session)", dim()));
         if let Some(phase) = self.last_turn_phase {
             lines.push(Line::styled(format!("phase: {phase}"), dim()));
-        }
-        if let Some(t) = self.last_telemetry.as_ref() {
-            let limit = match (t.hit_step_cap, t.hit_tool_cap) {
-                (true, true) => Some("limits: step + tool-call"),
-                (true, false) => Some("limit: step"),
-                (false, true) => Some("limit: tool-call"),
-                (false, false) => None,
-            };
-            if let Some(limit) = limit {
-                lines.push(Line::styled(limit.to_string(), dim()));
-            }
-            lines.push(Line::styled(
-                format!(
-                    "evidence: {} · reads {} · searches {} · listing_only {} · repair {}",
-                    t.discovery_depth,
-                    t.file_reads,
-                    t.targeted_searches,
-                    t.listing_only,
-                    t.quality_repair_nudges
-                ),
-                dim(),
-            ));
-            if let Some(repair) = review_repair_summary(t) {
-                for chunk in repair.lines() {
-                    lines.push(Line::styled(chunk.to_string(), dim()));
-                }
-            }
-        }
-        let sched = if let Some(t) = self.last_telemetry.as_ref() {
-            if t.tool_calls > 0 {
-                format!(
-                    "scheduler: {} calls · max batch {} · {} serial",
-                    t.tool_calls, t.max_concurrent_batch, t.serial_runs,
-                )
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-        if !sched.is_empty() {
-            lines.push(Line::styled(sched, dim()));
-        }
-        if let Some(t) = self.last_telemetry.as_ref() {
-            let latency = &t.phase_latencies;
-            lines.push(Line::styled(
-                format!(
-                    "latency: model {}ms · tools {}ms · verify {}ms · review {}ms · finalize {}ms",
-                    latency.model_request_ms,
-                    latency.tool_batch_ms,
-                    latency.verify_ms,
-                    latency.review_ms,
-                    latency.finalize_ms,
-                ),
-                dim(),
-            ));
         }
         lines.push(Line::styled(
             format!("tool calls this turn: {}", self.turn_tool_calls),
@@ -472,10 +363,10 @@ impl crate::App {
     /// the right edge.
     pub(crate) fn input_view(&self, width: u16) -> (Vec<Line<'static>>, u16, u16) {
         let raw = self.input.text();
-        let text = if self.pending_auth.is_some() {
+        let text: String = if self.pending_auth.is_some() {
             raw.chars().map(|_| '•').collect()
         } else {
-            hi_agent::command::mask_secret_input(&raw)
+            raw.clone()
         };
         let before: String = text.chars().take(self.input.cursor()).collect();
         let cursor_col_logical = display_width(

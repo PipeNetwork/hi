@@ -59,37 +59,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-client-protocol"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10eeef5e80864f9c3c148a3f395c3e35a66d37ec7561c7845b2bffae8e841759"
-dependencies = [
- "agent-client-protocol-schema",
- "anyhow",
- "async-broadcast",
- "async-trait",
- "derive_more",
- "futures",
- "log",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "agent-client-protocol-schema"
-version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca68e7e55681ce56546c0cecc6bc8f20493d24b44c6d93ec46174f310730bba2"
-dependencies = [
- "anyhow",
- "derive_more",
- "schemars",
- "serde",
- "serde_json",
- "strum",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -434,18 +403,6 @@ checksum = "47e4f2b81832e72834d7518d8487a0396a28cc408186a2e8854c0f98011faf12"
 dependencies = [
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "async-broadcast"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "435a87a52755b8f27fcf321ac4f04b2802e337c8c4872923137471ec39c37532"
-dependencies = [
- "event-listener 5.4.1",
- "event-listener-strategy",
- "futures-core",
- "pin-project-lite",
 ]
 
 [[package]]
@@ -1770,7 +1727,6 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.119",
- "unicode-xid",
 ]
 
 [[package]]
@@ -1868,12 +1824,6 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
-
-[[package]]
-name = "dyn-clone"
-version = "1.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "ed25519"
@@ -3534,8 +3484,6 @@ dependencies = [
  "clap",
  "flate2",
  "futures-util",
- "hi-agent",
- "hi-agent-runtime",
  "hi-ai",
  "hi-announcements",
  "hi-control",
@@ -3544,6 +3492,8 @@ dependencies = [
  "hi-eval",
  "hi-eval-adapters",
  "hi-events",
+ "hi-harness",
+ "hi-liveness",
  "hi-lsp",
  "hi-mcp",
  "hi-observability",
@@ -3556,6 +3506,8 @@ dependencies = [
  "hi-research",
  "hi-routing",
  "hi-rsi-runtime",
+ "hi-secrets",
+ "hi-sentinel",
  "hi-sqlite-journal",
  "hi-tools",
  "hi-trace",
@@ -3580,38 +3532,6 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "url",
- "uuid",
-]
-
-[[package]]
-name = "hi-agent"
-version = "0.3.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures-util",
- "hi-agent-lifecycle",
- "hi-ai",
- "hi-control",
- "hi-events",
- "hi-hooks",
- "hi-lsp",
- "hi-observability",
- "hi-policy",
- "hi-secrets",
- "hi-tools",
- "hi-workflow",
- "hi-workspace",
- "ignore",
- "libc",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
  "uuid",
 ]
 
@@ -3784,6 +3704,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hi-dashboard-store"
+version = "0.3.1"
+dependencies = [
+ "hi-sqlite-journal",
+ "rusqlite",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "hi-diff"
 version = "0.3.1"
 dependencies = [
@@ -3848,6 +3779,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "hi-harness"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "eventsource-stream",
+ "futures-util",
+ "hi-ai",
+ "hi-dashboard-store",
+ "hi-liveness",
+ "hi-lsp",
+ "hi-test-utils",
+ "hi-tools",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "hi-hooks"
 version = "0.3.1"
 dependencies = [
@@ -3880,6 +3834,16 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "hi-liveness"
+version = "0.3.1"
+dependencies = [
+ "hi-secrets",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -4017,21 +3981,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hi-replay"
-version = "0.3.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "hi-agent",
- "hi-agent-runtime",
- "hi-rsi-runtime",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "hi-repo-intelligence"
 version = "0.3.1"
 dependencies = [
@@ -4096,22 +4045,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "hi-shell"
+name = "hi-sentinel"
 version = "0.3.1"
 dependencies = [
- "agent-client-protocol",
  "anyhow",
- "async-trait",
- "hi-agent",
- "hi-ai",
- "hi-provider-config",
- "hi-tools",
- "hi-workspace",
+ "blake3",
+ "clap",
+ "hi-liveness",
+ "hi-secrets",
+ "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-util",
- "uuid",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -4225,12 +4172,12 @@ dependencies = [
  "crossterm",
  "eye_declare",
  "futures-util",
- "hi-agent",
  "hi-ai",
  "hi-diff",
  "hi-events",
+ "hi-harness",
  "hi-policy",
- "hi-race",
+ "hi-sentinel",
  "hi-tools",
  "hi-voice",
  "hi-workflow",
@@ -6979,31 +6926,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "schemars"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
-dependencies = [
- "dyn-clone",
- "ref-cast",
- "schemars_derive",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "schemars_derive"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d115b50f4aaeea07e79c1912f645c7513d81715d0420f8bc77a18c6260b307f"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde_derive_internals",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7095,17 +7017,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
-]
-
-[[package]]
-name = "serde_derive_internals"
-version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]

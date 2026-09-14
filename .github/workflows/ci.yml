@@ -32,12 +32,13 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
-      - name: Clippy (0.2 core only)
+      - name: Clippy (Pipe-only core)
         run: >-
           cargo clippy
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace -p hi-sqlite-journal
-          -p hi-control -p hi-pipefs -p hi-shell
-          -p hi-tui -p hi -p hi-eval -p hi-smoke
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-harness
+          -p hi-tui -p hi -p hi-workspace -p hi-sqlite-journal
+          -p hi-control -p hi-pipefs -p hi-eval -p hi-smoke
+          -p hi-liveness -p hi-sentinel
           --no-default-features
           --all-targets -- -A clippy::large-enum-variant -D warnings
 
@@ -61,17 +62,19 @@ jobs:
       - name: Core tests
         run: >-
           cargo nextest run --no-fail-fast
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace -p hi-sqlite-journal
-          -p hi-control -p hi-pipefs -p hi-shell
-          -p hi-tui -p hi -p hi-eval -p hi-smoke
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-harness
+          -p hi-tui -p hi -p hi-workspace -p hi-sqlite-journal
+          -p hi-control -p hi-pipefs -p hi-eval -p hi-smoke
+          -p hi-liveness -p hi-sentinel
           --no-default-features
 
       - name: Core doctests
         run: >-
           cargo test --doc
-          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent -p hi-workspace -p hi-sqlite-journal
-          -p hi-control -p hi-pipefs -p hi-shell
-          -p hi-tui -p hi -p hi-eval -p hi-smoke
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-harness
+          -p hi-tui -p hi -p hi-workspace -p hi-sqlite-journal
+          -p hi-control -p hi-pipefs -p hi-eval -p hi-smoke
+          -p hi-liveness -p hi-sentinel
           --no-default-features
 
       - name: Voice feature compile
@@ -89,35 +92,10 @@ jobs:
       - name: Evaluator hermetic/tamper-resistance tests
         run: cargo nextest run -p hi-eval
 
-      - name: Fake-provider end-to-end outcome tests
-        run: cargo nextest run -p hi --test memory_e2e --no-default-features
-
-      - name: Orchestration concurrency and chaos tests
+      - name: Background tool concurrency tests
         run: >-
           cargo nextest run -p hi-tools background --no-default-features &&
-          cargo nextest run -p hi-tools background_tasks --no-default-features &&
-          cargo nextest run -p hi-agent tests::background_task --no-default-features &&
-          cargo nextest run -p hi-agent cancellation_settlement --no-default-features &&
-          cargo nextest run -p hi-agent live_writer_reconciliation --no-default-features &&
-          cargo nextest run -p hi resource_governor::tests --no-default-features &&
-          cargo nextest run -p hi delegate_tests --no-default-features &&
-          cargo nextest run -p hi bestof::tests --no-default-features
-
-      # This PR-only, provider-free suite includes schema v1 -> v2 upgrade and
-      # rollback tests plus the normalized local/fake-PipeFS lifecycle trace.
-      - name: Schema upgrade and local/fake-PipeFS settlement acceptance
-        run: >-
-          cargo nextest run
-          -p hi-workspace -p hi-control -p hi-pipefs
-          --no-default-features
-
-      - name: Orchestration regression benchmark
-        env:
-          HI_BENCH_BASELINE_1_MS: 100
-          HI_BENCH_BASELINE_2_MS: 100
-          HI_BENCH_BASELINE_4_MS: 100
-          HI_BENCH_BASELINE_8_MS: 100
-        run: cargo run -p hi -- --benchmark-orchestration
+          cargo nextest run -p hi-tools background_tasks --no-default-features
 
       - name: Trace hash-chain verification
         run: scripts/check_trace_verify.sh

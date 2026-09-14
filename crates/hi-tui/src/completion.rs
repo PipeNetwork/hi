@@ -1,7 +1,7 @@
 //! The `/`-command completion menu: derives what to offer from the input line
 //! and resolves it to rows (command names or enumerable argument values).
 
-use hi_agent::command;
+use hi_harness::{COMMANDS, CommandSpec};
 
 /// State of the slash-command completion menu.
 pub(crate) struct CompletionState {
@@ -17,8 +17,8 @@ pub(crate) struct CompletionState {
 pub(crate) enum CompletionContext {
     /// Typing the command name itself (`/`, `/co`) — the lowercased prefix.
     Command(String),
-    /// Typing the argument of a command that has enumerable values (`/compact `,
-    /// `/compact hy`) — the canonical command name and the lowercased value prefix.
+    /// Typing the argument of a command that has enumerable values (`/permissions `,
+    /// `/permissions al`) — the canonical command name and the lowercased value prefix.
     Arg { cmd: &'static str, prefix: String },
     /// Typing an `@file` path mention (`@src/`, `@ren`) — the path prefix after
     /// the `@`, resolved against the workspace root at render time. Lets a
@@ -43,8 +43,8 @@ pub(crate) struct CompletionItem {
 
 /// What the completion menu should offer for `input`, or `None` to close it:
 /// the command name while it's being typed (`/`, `/co`), or — once past the name
-/// — the argument of a command that has enumerable values (`/compact `,
-/// `/compact hy`). A freeform-argument command (`/model <id>`) or a second arg
+/// — the argument of a command that has enumerable values (`/permissions `,
+/// `/permissions al`). A freeform-argument command (`/verify <cmd>`) or a second arg
 /// token closes the menu, as does any non-slash input.
 /// The one command whose argument values come from live state (the model
 /// catalog) rather than the static table.
@@ -92,7 +92,7 @@ pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
         None => Some(CompletionContext::Command(rest.to_lowercase())),
         // Past the name, on the first argument token.
         Some((name, arg)) => {
-            let spec = command::spec_by_name(name)?;
+            let spec = spec_by_name(name)?;
             if spec.name == SESSIONS_CMD
                 && let Some((action, remainder)) = arg.split_once(char::is_whitespace)
             {
@@ -113,60 +113,34 @@ pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
                     prefix: remainder.to_lowercase(),
                 });
             }
-            // Nested `/config <key> …` keeps completing the key until a full
-            // key is chosen; values after that are freeform or handled by the
-            // rewritten bare command.
-            if (spec.name == "config" || spec.name == "cfg" || spec.name == "set")
-                && arg.contains(char::is_whitespace)
+            if spec.name == MODEL_CMD
+                && let Some((_, effort_prefix)) = arg.split_once(char::is_whitespace)
             {
-                return None;
+                if effort_prefix.contains(char::is_whitespace) {
+                    return None;
+                }
+                return Some(CompletionContext::Arg {
+                    cmd: "model effort",
+                    prefix: effort_prefix.to_lowercase(),
+                });
             }
             if arg.contains(char::is_whitespace) {
-                return None; // a second token — past the single argument
+                return None;
             }
             let prefix = arg.to_lowercase();
-            if !spec.arg_values.is_empty() {
-                // A static enumerable set (compact, copy, verify, goal, config).
-                // For `/config`, keep the menu open after a full key so the user
-                // can still Tab-accept and type a value (`/config lsp `).
-                let keep_open_after_key =
-                    spec.name == "config" || spec.name == "cfg" || spec.name == "set";
-                if !keep_open_after_key && spec.arg_values.iter().any(|(v, _)| *v == prefix) {
-                    return None; // a full valid value is typed — nothing left to pick
-                }
-                if keep_open_after_key && spec.arg_values.iter().any(|(v, _)| *v == prefix) {
-                    // Full key chosen — leave a trailing space via insert path.
-                    return Some(CompletionContext::Arg {
-                        cmd: "config",
-                        prefix,
-                    });
-                }
-                return Some(CompletionContext::Arg {
-                    cmd: if spec.name == "cfg" || spec.name == "set" {
-                        "config"
-                    } else {
-                        spec.name
-                    },
-                    prefix,
-                });
-            }
-            if spec.name == MODEL_CMD {
-                // Model ids are dynamic — the catalog is filtered at render time,
-                // so emptiness is resolved there, not here.
+            if spec.name == MODEL_CMD || spec.name == PROVIDER_CMD {
                 return Some(CompletionContext::Arg {
                     cmd: spec.name,
                     prefix,
                 });
             }
-            if spec.name == PROVIDER_CMD {
-                // Profile names, hosted presets, and subcommands are dynamic —
-                // resolved at render time from the live profile list + PRESETS.
+            if !arg_values(spec.name).is_empty() {
                 return Some(CompletionContext::Arg {
                     cmd: spec.name,
                     prefix,
                 });
             }
-            None // freeform or no argument — nothing to enumerate
+            None
         }
     }
 }
@@ -244,69 +218,96 @@ pub(crate) fn highlight_label(
     spans
 }
 
+fn spec_by_name(name: &str) -> Option<&'static CommandSpec> {
+    COMMANDS
+        .iter()
+        .find(|spec| spec.name.eq_ignore_ascii_case(name))
+}
+
+fn matching(prefix: &str) -> Vec<&'static CommandSpec> {
+    COMMANDS
+        .iter()
+        .filter(|spec| spec.name.starts_with(prefix))
+        .collect()
+}
+
+fn arg_values(cmd: &str) -> &'static [(&'static str, &'static str)] {
+    match cmd {
+        "permissions" | "permission" | "perms" => &[
+            ("ask", "confirm each mutation"),
+            ("auto", "safe file edits without asking"),
+            ("always", "approve mutations this session"),
+            ("yolo", "same as always"),
+        ],
+        "density" => &[
+            ("compact", "headers only"),
+            ("comfortable", "default"),
+            ("verbose", "expand tool output"),
+        ],
+        "theme" => &[("dark", "dark theme"), ("light", "light theme")],
+        "mouse" => &[("on", "capture mouse"), ("off", "native selection")],
+        "verify" => &[("off", "disable post-turn check")],
+        "config" => &[("reasoning", "set reasoning effort")],
+        "effort" | "model effort" => &[
+            ("low", "less reasoning"),
+            ("medium", "default reasoning"),
+            ("high", "more reasoning"),
+            ("xhigh", "maximum reasoning"),
+            ("off", "endpoint default"),
+        ],
+        "usage" | "cost" => &[
+            ("show", "open the usage modal"),
+            ("manage", "open Pipe Network billing"),
+            ("context", "context-window breakdown"),
+        ],
+        "autoharnessfix" => &[
+            ("status", "supervised? generation? last incident"),
+            ("on", "enable Sentinel and re-exec if the session is saved"),
+            ("off", "disable Sentinel in machine config"),
+            ("diagnose", "write a forensic snapshot"),
+            ("history", "last 20 incidents"),
+            ("repair", "manual harness repair (no crash required)"),
+        ],
+        _ => &[],
+    }
+}
+
+fn takes_args(spec: &CommandSpec) -> bool {
+    !spec.args.is_empty()
+}
+
 /// Resolve a completion context to the menu rows it offers.
 pub(crate) fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionItem> {
     match ctx {
-        CompletionContext::Command(prefix) => command::matching(prefix)
+        CompletionContext::Command(prefix) => matching(prefix)
             .into_iter()
             .map(|spec| {
-                let takes_args = spec.takes_args();
+                let takes_args = takes_args(spec);
+                // Optional `[show|manage]` must not block Enter — grok `/usage`
+                // opens the modal immediately. `/permissions` still waits.
+                let submit_immediately = !takes_args || matches!(spec.name, "usage" | "cost");
                 CompletionItem {
                     label: format!("/{}", spec.name),
                     help: spec.help.to_string(),
-                    insert: if takes_args {
+                    insert: if takes_args && !submit_immediately {
                         format!("/{} ", spec.name)
                     } else {
                         format!("/{}", spec.name)
                     },
-                    submit_on_enter: !takes_args,
+                    submit_on_enter: submit_immediately,
                 }
             })
             .collect(),
-        CompletionContext::Arg { cmd, prefix } => command::arg_matching(cmd, prefix)
-            .into_iter()
-            .map(|(value, hint)| {
-                let config_key_needs_value = *cmd == "config"
-                    && matches!(
-                        value,
-                        "model"
-                            | "provider"
-                            | "auth"
-                            | "reasoning"
-                            | "temp"
-                            | "steps"
-                            | "verify"
-                            | "lsp"
-                            | "delegate"
-                            | "moe-streaming"
-                            | "skeptic-local"
-                            | "rsi"
-                            | "ui"
-                            | "theme"
-                            | "density"
-                            | "mouse"
-                    );
-                let sessions_needs_id = *cmd == SESSIONS_CMD
-                    && matches!(
-                        value,
-                        "switch" | "rename" | "favorite" | "archive" | "restore" | "delete"
-                    );
-                let needs_more = config_key_needs_value || sessions_needs_id;
-                CompletionItem {
-                    label: value.to_string(),
-                    help: hint.to_string(),
-                    insert: if needs_more {
-                        format!("/{cmd} {value} ")
-                    } else {
-                        format!("/{cmd} {value}")
-                    },
-                    submit_on_enter: !needs_more,
-                }
+        CompletionContext::Arg { cmd, prefix } => arg_values(cmd)
+            .iter()
+            .filter(|(value, _)| value.starts_with(prefix.as_str()))
+            .map(|(value, hint)| CompletionItem {
+                label: (*value).to_string(),
+                help: (*hint).to_string(),
+                insert: format!("/{cmd} {value}"),
+                submit_on_enter: true,
             })
             .collect(),
-        // Path completion is resolved against the workspace root in
-        // `App::items_for_ctx` (it needs `&self`); the free function offers
-        // nothing so the menu closes when no App is available.
         CompletionContext::Path { .. } => Vec::new(),
     }
 }
@@ -315,7 +316,7 @@ pub(crate) fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionIte
 mod tests {
     use super::{
         CompletionContext::{Arg, Command, Path},
-        completion_context, highlight_label, visible_range,
+        completion_context, completion_items_for, highlight_label, visible_range,
     };
 
     #[test]
@@ -330,6 +331,44 @@ mod tests {
     }
 
     #[test]
+    fn slash_opens_the_full_command_menu() {
+        assert_eq!(completion_context("/"), Some(Command(String::new())));
+        let items = completion_items_for(&Command(String::new()));
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        for name in [
+            "/model",
+            "/effort",
+            "/permissions",
+            "/auto",
+            "/yolo",
+            "/always-approve",
+            "/undo",
+            "/help",
+            "/usage",
+            "/dashboard",
+        ] {
+            assert!(
+                labels.contains(&name),
+                "missing {name} in / menu: {labels:?}"
+            );
+        }
+        let yolo = items.iter().find(|item| item.label == "/yolo").unwrap();
+        assert!(yolo.submit_on_enter);
+        let permissions = items
+            .iter()
+            .find(|item| item.label == "/permissions")
+            .unwrap();
+        assert!(!permissions.submit_on_enter);
+        assert_eq!(permissions.insert, "/permissions ");
+        let usage = items.iter().find(|item| item.label == "/usage").unwrap();
+        assert!(
+            usage.submit_on_enter,
+            "/usage must run on Enter, not wait for [show|manage]"
+        );
+        assert_eq!(usage.insert, "/usage");
+    }
+
+    #[test]
     fn completion_context_tracks_name_then_argument() {
         // The command name, until a space is typed.
         assert_eq!(completion_context("/"), Some(Command(String::new())));
@@ -340,32 +379,33 @@ mod tests {
         );
         // Past the name, on the argument of a command with enumerable values.
         assert_eq!(
-            completion_context("/compact "),
+            completion_context("/permissions "),
             Some(Arg {
-                cmd: "compact",
+                cmd: "permissions",
                 prefix: String::new()
             })
         );
         assert_eq!(
-            completion_context("/compact hy"),
+            completion_context("/usage "),
             Some(Arg {
-                cmd: "compact",
-                prefix: "hy".to_string()
+                cmd: "usage",
+                prefix: String::new()
             })
         );
-        // Settings hub: first key is enumerable under /config.
+        assert_eq!(
+            completion_context("/permissions al"),
+            Some(Arg {
+                cmd: "permissions",
+                prefix: "al".to_string()
+            })
+        );
+        // Commands without enumerable argument values close the menu after the name.
+        assert_eq!(completion_context("/compact "), None);
         assert_eq!(
             completion_context("/config "),
             Some(Arg {
                 cmd: "config",
                 prefix: String::new()
-            })
-        );
-        assert_eq!(
-            completion_context("/config ls"),
-            Some(Arg {
-                cmd: "config",
-                prefix: "ls".to_string()
             })
         );
         // Nested value after a full key closes the static menu.
@@ -385,44 +425,49 @@ mod tests {
                 prefix: "gp".to_string()
             })
         );
-        // A fully-typed valid static value has nothing left to complete → no menu.
-        assert_eq!(completion_context("/compact hybrid"), None);
-        assert_eq!(completion_context("/verify off"), None);
-        // The dynamic provider command offers completions (profile names +
-        // subcommands), resolved at render time.
         assert_eq!(
-            completion_context("/provider "),
+            completion_context("/model pipe/deepseek-v4-flash-0731 hi"),
             Some(Arg {
-                cmd: "provider",
+                cmd: "model effort",
+                prefix: "hi".to_string()
+            })
+        );
+        assert_eq!(
+            completion_context("/effort "),
+            Some(Arg {
+                cmd: "effort",
                 prefix: String::new()
             })
         );
         assert_eq!(
-            completion_context("/provider lo"),
+            completion_context("/effort xh"),
             Some(Arg {
-                cmd: "provider",
-                prefix: "lo".to_string()
+                cmd: "effort",
+                prefix: "xh".to_string()
             })
         );
+        assert_eq!(
+            completion_context("/verify off"),
+            Some(Arg {
+                cmd: "verify",
+                prefix: "off".to_string()
+            })
+        );
+        // `/provider` is not in the Pipe command table.
+        assert_eq!(completion_context("/provider "), None);
+        assert_eq!(completion_context("/provider lo"), None);
         // A command that takes no argument, with a trailing space → no menu.
         assert_eq!(completion_context("/diff "), None);
         // A second argument token is past the single arg → no menu.
-        assert_eq!(completion_context("/compact hybrid x"), None);
+        assert_eq!(completion_context("/permissions always x"), None);
+        assert_eq!(completion_context("/yo"), Some(Command("yo".to_string())));
         assert_eq!(
-            completion_context("/sessions switch 1783"),
+            completion_context("/permissions yo"),
             Some(Arg {
-                cmd: "sessions switch",
-                prefix: "1783".to_string()
+                cmd: "permissions",
+                prefix: "yo".to_string()
             })
         );
-        assert_eq!(
-            completion_context("/sessions rename 1783"),
-            Some(Arg {
-                cmd: "sessions rename",
-                prefix: "1783".to_string()
-            })
-        );
-        assert_eq!(completion_context("/sessions rename 1783 new name"), None);
         // Not a slash command at all.
         assert_eq!(completion_context("hello"), None);
     }

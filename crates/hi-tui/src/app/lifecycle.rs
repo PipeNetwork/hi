@@ -5,69 +5,28 @@ use std::time::{Duration, Instant};
 
 use crate::input::InputLine;
 use crate::util::notify_done;
-use crate::{
-    LocalRuntimeSwitcher, MlxProfileSwitcher, NOTIFY_THRESHOLD, ProfileInfo, ProfileLoader,
-    ProfileRemover, ProfileResolver, ProfileSaver, ReasoningEffortSaver, TurnState,
-};
+use crate::{NOTIFY_THRESHOLD, TurnState};
 
 impl crate::App {
-    pub(crate) fn resume_goal_drive(&mut self, agent: &hi_agent::Agent) {
-        self.refresh_goal(agent);
-        self.maybe_queue_goal_drive(agent);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        provider: &str,
-        model: &str,
-        profiles: Vec<ProfileInfo>,
-        active_profile: Option<String>,
-        resolver: ProfileResolver,
-        saver: ProfileSaver,
-        loader: ProfileLoader,
-        remover: ProfileRemover,
-        reasoning_effort_saver: Option<ReasoningEffortSaver>,
-        mlx_switcher: MlxProfileSwitcher,
-        local_runtime_switcher: LocalRuntimeSwitcher,
-        mcp_url: Option<String>,
-        api_key: String,
-        diff_api_runner: Option<crate::DiffApiRunner>,
-        race_runner: Option<crate::RaceRunner>,
-        race_defaults: crate::RaceDefaults,
-        race_setup_saver: Option<crate::RaceSetupSaver>,
-    ) -> Self {
+    pub(crate) fn new(provider: &str, model: &str) -> Self {
         Self {
             provider: provider.to_string(),
             model: model.to_string(),
-            execution: hi_agent::ExecutionMode::Ephemeral,
             reasoning_effort: None,
             workspace_root: std::path::PathBuf::new(),
             input_history_path: std::path::PathBuf::new(),
             interrupt: None,
-            active_profile,
-            profiles,
-            resolver,
-            saver,
-            loader,
-            remover,
-            reasoning_effort_saver,
-            mlx_switcher,
-            local_runtime_switcher,
+            active_profile: None,
+            profiles: Vec::new(),
+            resolver: Box::new(|_| anyhow::bail!("not available in the Pipe Network session")),
+            saver: Box::new(|_| anyhow::bail!("not available in the Pipe Network session")),
+            loader: Box::new(|_| anyhow::bail!("not available in the Pipe Network session")),
+            remover: Box::new(|_| anyhow::bail!("not available in the Pipe Network session")),
+            reasoning_effort_saver: None,
             session_remember: None,
-            local_picker: None,
-            local_directory_prompt: None,
-            local_download_confirmation: None,
-            local_startup_blocked: false,
-            local_startup_error: None,
-            local_startup_spec: None,
-            local_startup_fallback_profile: None,
             local_runtime: None,
-            mcp_url,
-            api_key,
-            diff_api_runner,
-            race_runner,
-            race_defaults,
-            race_setup_saver,
+            mcp_url: None,
+            api_key: String::new(),
             event_sink: None,
             approval_store: None,
             transcript: Vec::new(),
@@ -127,7 +86,6 @@ impl crate::App {
             queue_selected: None,
             last_prompt: None,
             last_turn_start: 0,
-            last_turn_snapshot: None,
             picker: None,
             session_picker: false,
             session_picker_searching: false,
@@ -135,7 +93,6 @@ impl crate::App {
             session_delete_pending: None,
             provider_form: None,
             provider_picker: None,
-            pending_local_catalog: None,
             pending_login: None,
             pending_auth: None,
             x402_broker: None,
@@ -147,8 +104,6 @@ impl crate::App {
             confirmation_scroll: 0,
             confirmation_selected: 0,
             confirm_focus: crate::confirm_overlay::ConfirmFocus::Options,
-            plan_approval: None,
-            memory_browser: None,
             confirmation_waiting: 0,
             mouse_col: 0,
             mouse_row: 0,
@@ -156,36 +111,19 @@ impl crate::App {
             turn_status_rect: ratatui::layout::Rect::default(),
             git_branch: None,
             plan_pane_expanded: true,
-            goal: None,
             plan_mode: false,
-            permission_mode: hi_agent::PermissionMode::Always,
+            permission_mode: hi_harness::PermissionMode::Ask,
             session_face_dirty: false,
             plan_drive_paused: false,
             plan_drive_pause_dirty: false,
-            last_drive: hi_agent::DriveAction::Idle {
-                reason: hi_agent::DriveIdleReason::None,
-            },
-            last_stop_reason: None,
             ask_user_draft: String::new(),
-            fleet: Vec::new(),
-            fleet_next_id: 0,
-            workflow_runs: HashMap::new(),
-            selected_workflow_run: None,
-            workflow_overlay: None,
-            subagents: HashMap::new(),
-            inspect_subagent: None,
-            tasks_overlay: None,
             block_viewer: None,
-            turn_picker: None,
             timeline_hits: Vec::new(),
             timeline_rect: ratatui::layout::Rect::default(),
             changed_files_rect: ratatui::layout::Rect::default(),
             composer_rect: ratatui::layout::Rect::default(),
             frame_width: 0,
-            diff_lab: None,
-            race: None,
             plan_workflow_child: None,
-            loops: None,
             usage: (0, 0),
             usage_estimated: false,
             session_totals: hi_ai::Usage::default(),
@@ -222,7 +160,11 @@ impl crate::App {
             show_help: false,
             palette: None,
             tutorial: None,
-            last_telemetry: None,
+            usage_overlay: None,
+            dashboard: None,
+            pipe_base_url: String::new(),
+            openai_api_key: None,
+            openai_base_url: None,
             last_turn_phase: None,
             turn_tool_calls: 0,
             turn_rounds: 0,
@@ -250,27 +192,18 @@ impl crate::App {
             sync_http: None,
             session_lister: None,
             session_completion_cache: Vec::new(),
-            session_switcher: None,
             session_renamer: None,
             session_host: None,
             pending_host_enable: None,
-            pending_team_provision: None,
-            pending_local_provider: None,
             team_picker_role: None,
             team_role_menu: false,
-            queued_team_assignments: Vec::new(),
-            auto_setup_skeptic: false,
             sync_control: None,
-            pipefs_command: None,
-            tui_event_trace: None,
             remote_event_tap: None,
             base_event_tap: None,
-            sync_remote_ui: None,
             remote_flush_callback: None,
             remote_input_rx: None,
             remote_input_poller: None,
             hosting_remote_input: false,
-            steering_remote_session: None,
         }
     }
 
@@ -295,28 +228,7 @@ impl crate::App {
         }
     }
 
-    /// Surface any completed `/loop` firings: quiet checks land dim, changes
-    /// land loud (cyan) and ping the terminal when you're unfocused. Called
-    /// from the UI tick arms so results appear even while idle.
-    pub(crate) fn drain_loops(&mut self) {
-        let Some(loops) = &self.loops else { return };
-        let lines = loops.drain();
-        if lines.is_empty() {
-            return;
-        }
-        let away = self.focus_known && !self.focused;
-        for (text, loud) in lines {
-            let style = if loud {
-                ratatui::style::Style::default().fg(crate::theme::theme().accent_system)
-            } else {
-                crate::render::dim()
-            };
-            self.push(ratatui::text::Line::styled(text, style));
-            if loud && away {
-                crate::util::notify_done();
-            }
-        }
-    }
+    pub(crate) fn drain_loops(&mut self) {}
 
     /// Mark the turn as running (or done), stamping the start time so the
     /// prompt bar can show elapsed seconds.
@@ -444,14 +356,7 @@ impl crate::App {
 
     /// Persist the current provider/model (and profile, when set) so the next
     /// bare `hi` in this workspace restores the same routing.
-    pub(crate) fn remember_session_routing(&self, agent: &hi_agent::Agent) {
-        // The supplied callback is deliberately rooted at the launch
-        // workspace.  Do not invoke it after a PipeFS rebind, where that would
-        // silently mutate the original local project instead of the active
-        // materialization (and outside its durability fence).
-        if agent.pipefs_workspace_active() {
-            return;
-        }
+    pub(crate) fn remember_session_routing(&self) {
         let Some(cb) = &self.session_remember else {
             return;
         };
@@ -464,29 +369,18 @@ impl crate::App {
 
     /// Whether a confirmation should be skipped because of session-wide or
     /// path-scoped auto-approve.
-    pub(crate) fn should_auto_approve(&self, request: &hi_agent::ConfirmationRequest) -> bool {
-        if matches!(request, hi_agent::ConfirmationRequest::AskUser { .. }) {
-            return false;
-        }
-        if self.permission_mode == hi_agent::PermissionMode::Auto && request.safe_for_auto() {
+    pub(crate) fn should_auto_approve(&self, request: &hi_harness::ConfirmationRequest) -> bool {
+        if self.permission_mode == hi_harness::PermissionMode::Always {
             return true;
         }
-        if self.permission_mode == hi_agent::PermissionMode::Auto
-            && let hi_agent::ConfirmationRequest::ShellMutation { command, cwd } = request
-        {
-            return hi_agent::git_command_is_routine_in(command, Some(std::path::Path::new(cwd)))
-                && !hi_agent::is_destructive_git_restore(command);
+        if self.permission_mode == hi_harness::PermissionMode::Auto && request.safe_for_auto() {
+            return true;
         }
         match request {
-            hi_agent::ConfirmationRequest::FileEdit { path, .. } => {
+            hi_harness::ConfirmationRequest::FileEdit { path, .. } => {
                 self.auto_approve_session || self.path_auto_approved(path)
             }
-            hi_agent::ConfirmationRequest::External { mcp_grant, .. } => mcp_grant
-                .as_ref()
-                .is_some_and(|(server, tool)| self.mcp_auto_approved(server, tool)),
-            hi_agent::ConfirmationRequest::DelegateApply { .. }
-            | hi_agent::ConfirmationRequest::ShellMutation { .. }
-            | hi_agent::ConfirmationRequest::AskUser { .. } => false,
+            hi_harness::ConfirmationRequest::ShellMutation { .. } => false,
         }
     }
 
@@ -668,5 +562,161 @@ impl crate::App {
             self.queue.swap(i, j);
             self.queue_selected = Some(j);
         }
+    }
+
+    /// Grok `page_flip_on_send`: keep the just-sent prompt at the top of the
+    /// transcript until the response fills the page, then follow the tail.
+    pub(crate) fn apply_page_flip(&mut self, inner_h: u16, total: u16) {
+        if !self.page_flip_on_send {
+            return;
+        }
+        let Some(&idx) = self.view_cache.prompt_line_starts.last() else {
+            return;
+        };
+        let prompt_row = self.view_cache.prefix.get(idx).copied().unwrap_or(0);
+        let after = u32::from(total).saturating_sub(prompt_row);
+        if inner_h > 0 && after >= u32::from(inner_h) {
+            self.following = true;
+            self.page_flip_on_send = false;
+        } else {
+            self.following = false;
+            self.scroll = prompt_row.min(u32::from(u16::MAX)) as u16;
+        }
+    }
+
+    pub(crate) fn context_pct(&self) -> Option<u64> {
+        let window = self.context_window? as u64;
+        if window == 0 {
+            return None;
+        }
+        Some((self.context_used.saturating_mul(100) / window).min(100))
+    }
+
+    pub(crate) fn session_cost_chip(&self) -> Option<String> {
+        let (input_rate, output_rate) = self.usage_pricing?;
+        let cost = (self.session_totals.input_tokens as f64) * input_rate / 1_000_000.0
+            + (self.session_totals.output_tokens as f64) * output_rate / 1_000_000.0;
+        if cost <= 0.0 {
+            return None;
+        }
+        Some(format!("${cost:.2}"))
+    }
+
+    pub(crate) fn composer_flags(&self) -> Vec<&'static str> {
+        let mut flags = Vec::new();
+        if self.plan_mode {
+            flags.push("plan");
+        }
+        match self.permission_mode {
+            hi_harness::PermissionMode::Ask => {}
+            mode => flags.push(mode.label()),
+        }
+        flags
+    }
+
+    pub(crate) fn scroll_to_user_prompt(&mut self, index: usize) -> bool {
+        let mut n = 0usize;
+        for (i, entry) in self.transcript.iter().enumerate() {
+            if matches!(entry, crate::TranscriptEntry::UserPrompt { .. }) {
+                if n == index {
+                    self.scroll_to(i as u16);
+                    return true;
+                }
+                n += 1;
+            }
+        }
+        false
+    }
+
+    fn trace_prompt_queued(&self, _prompt: &str) {}
+    fn trace_prompt_removed(&self, _prompt: &str) {}
+
+    /// Apply a completed `/login` poll. Returns the provider name when the
+    /// credential landed.
+    pub(crate) async fn poll_pending_login(&mut self) -> Option<String> {
+        let finished = self
+            .pending_login
+            .as_ref()
+            .is_some_and(|(_, task)| task.is_finished());
+        if !finished {
+            return None;
+        }
+        let (provider, task) = self.pending_login.take()?;
+        match task.await {
+            Ok(Ok(())) => {
+                self.push(ratatui::text::Line::styled(
+                    format!(
+                        "signed in to {provider} — credential stored (run /logout {provider} to pair a different account)"
+                    ),
+                    crate::render::dim(),
+                ));
+                self.follow();
+                Some(provider)
+            }
+            Ok(Err(error)) => {
+                self.push(ratatui::text::Line::styled(
+                    format!("/login {provider} failed: {error:#}"),
+                    ratatui::style::Style::default().fg(crate::theme::theme().warning),
+                ));
+                self.follow();
+                None
+            }
+            Err(error) if error.is_cancelled() => None,
+            Err(error) => {
+                self.push(ratatui::text::Line::styled(
+                    format!("/login {provider} failed: {error}"),
+                    ratatui::style::Style::default().fg(crate::theme::theme().warning),
+                ));
+                self.follow();
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod page_flip_tests {
+    use crate::tests::test_app;
+    use ratatui::text::Line;
+
+    #[test]
+    fn sending_a_prompt_pins_it_at_the_top() {
+        let mut app = test_app("pipe", "m");
+        app.following = true;
+        app.push_user_prompt(Line::raw("❯ hello"));
+        assert!(
+            app.page_flip_on_send,
+            "grok page_flip_on_send after a live send"
+        );
+        app.view_cache.prompt_line_starts = vec![0];
+        app.view_cache.prefix = vec![0, 1];
+        app.apply_page_flip(20, 1);
+        assert!(
+            !app.following,
+            "short page stays top-aligned, not stuck to the composer"
+        );
+        assert_eq!(app.scroll, 0);
+        assert!(app.page_flip_on_send);
+    }
+
+    #[test]
+    fn page_flip_follows_once_the_response_fills_the_viewport() {
+        let mut app = test_app("pipe", "m");
+        app.push_user_prompt(Line::raw("❯ hello"));
+        app.view_cache.prompt_line_starts = vec![0];
+        app.view_cache.prefix = vec![0, 1];
+        app.apply_page_flip(10, 30);
+        assert!(app.following);
+        assert!(!app.page_flip_on_send);
+    }
+
+    #[test]
+    fn resume_follow_cancels_page_flip() {
+        let mut app = test_app("pipe", "m");
+        app.push_user_prompt(Line::raw("❯ old"));
+        assert!(app.page_flip_on_send);
+        app.follow();
+        assert!(!app.page_flip_on_send);
+        assert!(app.following);
     }
 }

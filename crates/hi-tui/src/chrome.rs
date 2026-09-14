@@ -397,7 +397,7 @@ pub(crate) fn welcome_lines(
                     .iter()
                     .take(MAX_WELCOME_SESSIONS.min(remaining.saturating_sub(2) as usize))
                 {
-                    let title = hi_agent::ui::clip(welcome_session_label(session), title_budget);
+                    let title = crate::util::clip(welcome_session_label(session), title_budget);
                     lines.push(Line::from(vec![
                         Span::styled(title, Style::default().fg(theme.text_secondary)),
                         Span::styled(
@@ -410,7 +410,7 @@ pub(crate) fn welcome_lines(
             if area.height as usize > lines.len() + 1 {
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "Shift-Tab plan mode · /sessions resume · /memory notes",
+                    "Shift-Tab ask/auto/yolo · type / for commands · /dashboard agents · /login pipenetwork",
                     Style::default().fg(theme.gray_dim),
                 ));
             }
@@ -581,7 +581,7 @@ mod tests {
             "recent session: {text:?}"
         );
         assert!(
-            text.iter().any(|l| l.contains("Shift-Tab plan")),
+            text.iter().any(|l| l.contains("Shift-Tab ask/auto/yolo")),
             "plan hint: {text:?}"
         );
     }

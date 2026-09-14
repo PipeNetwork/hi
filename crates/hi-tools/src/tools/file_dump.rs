@@ -48,7 +48,10 @@ fn is_banner_shell(command: &str) -> bool {
     else {
         return true;
     };
-    matches!(basename(words[start]), "echo" | "printf" | "true" | ":")
+    matches!(
+        basename(words[start]),
+        "echo" | "printf" | "true" | ":" | "cd" | "pwd"
+    )
 }
 
 fn parse_file_dump_command(trimmed: &str) -> Option<String> {

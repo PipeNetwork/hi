@@ -17,10 +17,46 @@ pub(crate) fn clip_reason(s: &str) -> String {
 }
 
 /// Compact token count for the working line: `1234` → `1.2k`, `45000` → `45k`.
-/// The live working line and the settled usage summary share one humanizer (in
-/// `hi-agent`), so the same count never renders two different ways.
 pub(crate) fn fmt_count(n: u64) -> String {
-    hi_agent::humanize_count(n)
+    humanize_count(n)
+}
+
+pub(crate) fn humanize_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=9_999 => format!("{:.1}k", n as f64 / 1000.0),
+        10_000..=999_999 => format!("{}k", n / 1000),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// Truncate to `max` characters, appending an ellipsis when shortened.
+pub(crate) fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let kept: String = s.chars().take(max).collect();
+        format!("{kept}…")
+    }
+}
+
+/// Short tool-call label: name plus a salient argument when the JSON parses.
+pub(crate) fn tool_label(name: &str, arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return name.to_string();
+    };
+    let str_field = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let arg = match name {
+        "read" | "write" | "edit" => str_field("path"),
+        "list" => Some(str_field("path").unwrap_or_else(|| ".".into())),
+        "grep" => str_field("pattern"),
+        "bash" => str_field("command").map(|command| hi_tools::shell_title(&command)),
+        _ => None,
+    };
+    match arg {
+        Some(arg) => format!("{name} {}", clip(&arg, 80)),
+        None => name.to_string(),
+    }
 }
 
 /// Format an elapsed-seconds count compactly: `45s`, `14m 28s`, `1h 02m`.
@@ -167,6 +203,68 @@ fn copy_native(text: &str) -> io::Result<()> {
     ))
 }
 
+/// Max characters we'll pull from the OS clipboard into the prompt.
+const PASTE_CHAR_CAP: usize = 512 * 1024;
+
+/// Read CLIPBOARD (Ctrl+V / Cmd+V), grok-style: never falls back to PRIMARY.
+pub(crate) fn read_clipboard() -> io::Result<String> {
+    read_from_tools(&[
+        ("pbpaste", &[] as &[&str]),
+        ("wl-paste", &["--no-newline"]),
+        ("xclip", &["-selection", "clipboard", "-o"]),
+        ("xsel", &["--clipboard", "--output"]),
+        (
+            "powershell.exe",
+            &["-NoProfile", "-Command", "Get-Clipboard"],
+        ),
+    ])
+}
+
+/// Read X11/Wayland PRIMARY (middle-click paste).
+pub(crate) fn read_primary() -> io::Result<String> {
+    read_from_tools(&[
+        ("wl-paste", &["--primary", "--no-newline"]),
+        ("xclip", &["-selection", "primary", "-o"]),
+        ("xsel", &["--primary", "--output"]),
+    ])
+    .or_else(|_| read_clipboard())
+}
+
+fn read_from_tools(tools: &[(&str, &[&str])]) -> io::Result<String> {
+    use std::process::{Command, Stdio};
+    for (cmd, args) in tools {
+        let output = Command::new(cmd)
+            .args(*args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        if text.is_empty() {
+            continue;
+        }
+        return Ok(clamp_paste(&text));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no clipboard contents",
+    ))
+}
+
+pub(crate) fn clamp_paste(text: &str) -> String {
+    let mut out: String = text.chars().take(PASTE_CHAR_CAP).collect();
+    if text.chars().count() > PASTE_CHAR_CAP {
+        out.push('…');
+    }
+    out
+}
+
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -216,21 +314,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clamp_paste_caps_huge_clipboard() {
+        let huge: String = "x".repeat(PASTE_CHAR_CAP + 10);
+        let out = clamp_paste(&huge);
+        assert_eq!(out.chars().count(), PASTE_CHAR_CAP + 1);
+        assert!(out.ends_with('…'));
+        assert_eq!(clamp_paste("hi\nthere"), "hi\nthere");
+    }
+
+    #[test]
     fn fmt_count_humanizes() {
         assert_eq!(fmt_count(0), "0");
         assert_eq!(fmt_count(999), "999");
         assert_eq!(fmt_count(1234), "1.2k");
         assert_eq!(fmt_count(45000), "45k");
-    }
-
-    #[test]
-    fn working_and_summary_share_one_humanizer() {
-        // The live working line (fmt_count) and the settled usage summary
-        // (hi_agent::humanize_count) must format a count identically — else the
-        // same number renders two ways as a turn finishes (the regression fixed).
-        for n in [0u64, 999, 1234, 22_864, 12_000, 1_000_000, 1_500_000] {
-            assert_eq!(fmt_count(n), hi_agent::humanize_count(n), "diverged at {n}");
-        }
     }
 
     #[test]

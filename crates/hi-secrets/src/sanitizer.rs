@@ -85,10 +85,16 @@ static SECRET_ASSIGNMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         )
         (?:
             # Consume escaped characters as a unit so an escaped quote cannot
-            # terminate the credential early and expose its suffix.
-            "(?<dq>(?:\\.|[^"\\])+?)"
-          | '(?<sq>(?:\\.|[^'\\])+?)'
-          | (?<bare>[^\s",&]+)
+            # terminate the credential early and expose its suffix. Empty
+            # quotes (`password=""`) and same-line values are allowed; a
+            # newline ends the quoted span so `"password="),\n"msg"` cannot
+            # glue two Rust string literals into one fake secret.
+            "(?<dq>(?:\\.|[^"\\\n])*?)"
+          | '(?<sq>(?:\\.|[^'\\\n])*?)'
+            # Grok's xai-grok-secrets assignment regex uses `{8,}` so short
+            # fixtures (`secret`, `hunter2`) and a lone `password=` in a
+            # comment are not rewritten as `[REDACTED_SECRET]`.
+          | (?<bare>[^\s",&]{8,})
         )
         "#,
     )
@@ -217,12 +223,17 @@ fn looks_like_field_path(value: &str) -> bool {
         })
 }
 
-/// Credential context is stronger evidence than the value's shape. Real
-/// passwords and secret keys may be short, low-entropy, or hexadecimal, so
-/// value-based entropy/hash exemptions are unsafe. Only retain the explicit
-/// source-code syntax defenses for unquoted assignment values.
+/// Credential context is stronger evidence than the value's shape. JSON object
+/// keys still redact short or low-entropy values. Free-text assignments keep
+/// Grok's 8-character floor so source fixtures (`password=secret`) and empty
+/// `password=` in comments are not rewritten.
 fn should_redact_assignment(value: &str, quoted: bool, structured_key: bool) -> bool {
     if value.is_empty() || is_redaction_marker(value) {
+        return false;
+    }
+    // xai-grok-secrets: `{8,}` on assignment values. Applied only outside JSON
+    // object-key context so `{"password":"hunter2"}` still scrubs.
+    if !structured_key && value.len() < 8 {
         return false;
     }
     // Keep unmistakable documentation/config placeholders, but never exempt
@@ -246,7 +257,8 @@ fn is_redaction_marker(value: &str) -> bool {
 }
 
 fn is_obvious_placeholder(value: &str) -> bool {
-    let value = value.trim().trim_end_matches(';');
+    // Markdown often wraps examples in backticks: `password=<password>`.
+    let value = value.trim().trim_matches('`').trim_end_matches(';');
     if value == "..." {
         return true;
     }
@@ -971,22 +983,59 @@ mod tests {
     #[test]
     fn credential_assignments_redact_low_entropy_hex_and_namespaced_values() {
         for (key, value) in [
-            ("password", "hunter2"),
             ("token", "changeme"),
             ("api_key", "aaaaaaaa"),
-            ("pwd", "1234"),
             ("AWS_SECRET_ACCESS_KEY", "deadbeefdeadbeefdeadbeefdeadbeef"),
             ("OPENAI_API_KEY", "0000000000000000"),
-            ("db_password", "guest"),
         ] {
             let input = format!("{key}={value}");
             let out = redact_secrets(&input);
             assert_eq!(out, format!("{key}={REDACTED}"), "secret leaked: {out}");
         }
 
+        for (key, value) in [
+            ("password", "hunter2"),
+            ("password", "secret"),
+            ("pwd", "1234"),
+            ("db_password", "guest"),
+        ] {
+            let input = format!("{key}={value}");
+            assert_eq!(
+                redact_secrets(&input),
+                input,
+                "short source fixture redacted: {input}"
+            );
+        }
+
         let checksum = "checksum=deadbeefdeadbeefdeadbeefdeadbeef";
         assert_eq!(redact_secrets(checksum), checksum);
         assert_eq!(redact_secrets("token=redacted"), "token=redacted");
+    }
+
+    #[test]
+    fn short_source_fixture_passwords_are_not_redacted() {
+        for source in [
+            "/// from the handshake request (`/ws/<channel>?user=bob&password=secret`) so the",
+            "    // the common browser path never pays for Argon2. A raw `password=` query is",
+            "            parse_ws_password(\"/ws/general?user=bob&password=secret\"),",
+            "    // plain `curl -d password=...`.",
+            "        let head = \"GET /ws/%23general?user=alice&password=secret HTTP/1.1\\r\\n\";",
+            "            !INDEX_HTML.contains(\"password=\"),",
+            "            \"password leaked into a URL\"",
+            "`/ws/<channel>?user=<name>&password=<password>` — the channel name is",
+        ] {
+            assert_eq!(redact_secrets(source), source, "source mangled: {source}");
+            assert!(
+                !redact_secrets(source).contains(REDACTED),
+                "fixture redacted: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_quoted_password_does_not_consume_the_next_string() {
+        let source = "        assert!(\n            !INDEX_HTML.contains(\"password=\"),\n            \"password leaked into a URL\"\n        );";
+        assert_eq!(redact_secrets(source), source, "assert mangled: {source}");
     }
 
     #[test]
@@ -1063,9 +1112,10 @@ mod tests {
 
     #[test]
     fn typed_secret_constant_redacts_value_without_corrupting_type() {
-        let source = "const API_KEY: &str = \"hunter2\";";
+        let secret = fixture(&["xT7mQ2vR", "9zK4nP8w"]);
+        let source = format!("const API_KEY: &str = \"{secret}\";");
         assert_eq!(
-            redact_secrets(source),
+            redact_secrets(&source),
             format!("const API_KEY: &str = \"{REDACTED}\";")
         );
     }
@@ -1083,8 +1133,12 @@ mod tests {
             "login markup must not become a redacted path: {out}"
         );
         let assigned = redact_secrets("password = hunter2");
-        assert!(assigned.contains(REDACTED), "{assigned}");
-        assert!(!assigned.contains("hunter2"), "{assigned}");
+        assert_eq!(assigned, "password = hunter2", "{assigned}");
+        let long = fixture(&["xT7mQ2vR", "9zK4nP8w"]);
+        let assigned_long_input = format!("password = {long}");
+        let assigned_long = redact_secrets(&assigned_long_input);
+        assert!(assigned_long.contains(REDACTED), "{assigned_long}");
+        assert!(!assigned_long.contains(&long), "{assigned_long}");
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 fn home() -> PathBuf {
-    crate::session::data_root().unwrap_or_else(|| PathBuf::from(".hi"))
+    crate::paths::data_root().unwrap_or_else(|| PathBuf::from(".hi"))
 }
 
 async fn configured() -> Option<Vec<RemoteAnnouncement>> {

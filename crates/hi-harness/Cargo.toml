@@ -1,0 +1,30 @@
+[package]
+name = "hi-harness"
+edition.workspace = true
+version.workspace = true
+description = "Pipe Network coding-agent harness: inference, tools, sessions."
+
+[dependencies]
+hi-ai.workspace = true
+hi-liveness.workspace = true
+hi-tools.workspace = true
+blake3.workspace = true
+hi-lsp.workspace = true
+hi-dashboard-store.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+eventsource-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+hi-test-utils.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
