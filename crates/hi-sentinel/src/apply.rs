@@ -397,7 +397,11 @@ mod tests {
     use super::*;
     use crate::test_fixture;
     use crate::worktree;
+    use std::sync::Mutex;
     use std::time::Instant;
+
+    /// `wait_install_child` stores a process-wide pgid; these two tests must not overlap.
+    static SIGNAL_INSTALL_TESTS: Mutex<()> = Mutex::new(());
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -727,6 +731,7 @@ exit 0
 
     #[test]
     fn cargo_install_times_out_and_kills_the_group() {
+        let _signal = SIGNAL_INSTALL_TESTS.lock().unwrap();
         let mut fx = fixture(true, false);
         let hang = fx._root.path().join("hang-cargo");
         fs::write(&hang, "#!/bin/sh\nexec sleep 30\n").unwrap();
@@ -750,6 +755,7 @@ exit 0
 
     #[test]
     fn sigint_kills_cargo_install_group() {
+        let _signal = SIGNAL_INSTALL_TESTS.lock().unwrap();
         let mut fx = fixture(true, false);
         let hang = fx._root.path().join("hang-cargo");
         let ready = fx._root.path().join("hang-ready");
