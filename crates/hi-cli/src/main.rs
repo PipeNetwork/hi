@@ -10,6 +10,7 @@ mod pipe_session;
 mod prompt;
 mod review_target;
 mod sentinel_exec;
+mod sentinel_resume;
 mod session_files;
 mod setup;
 mod tickets;

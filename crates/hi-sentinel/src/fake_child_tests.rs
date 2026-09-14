@@ -119,6 +119,7 @@ fn cfg(
             ("HI_FAKE_WORKSPACE".into(), workspace.display().to_string()),
         ],
         once,
+        seed_turn_intent: None,
     }
 }
 

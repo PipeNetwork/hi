@@ -574,6 +574,85 @@ async fn persist_at_start_does_not_duplicate_user_line_on_finish() {
 }
 
 #[tokio::test]
+async fn resume_incomplete_turn_does_not_duplicate_user_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.jsonl");
+    let mut session = JsonlSession::create(&session_path).unwrap();
+    session
+        .record_turn_start(
+            &Message::user("fix the parser"),
+            &crate::PendingTurn {
+                turn_index: 1,
+                started_unix_ms: 1,
+                pre_checkpoint: None,
+            },
+        )
+        .unwrap();
+    drop(session);
+
+    let Some(server) = MockPipe::new(vec![Scripted::Sse(vec![
+        text_chunk("done"),
+        usage_chunk(4, 2),
+    ])]) else {
+        return;
+    };
+    let state = dir.path().join(".hi");
+    let runner = ProcessRunner::new_with_policy(dir.path(), SandboxPolicy::Off).expect("runner");
+    let tools = ToolHost::new_with_runner(dir.path().to_path_buf(), state.clone(), runner).unwrap();
+    let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+    config.base_url = server.url.clone();
+    config.state_root = state;
+    config.session_path = Some(session_path.clone());
+    let mut harness = Harness::new_with_tools(config, tools).unwrap();
+    let loaded = JsonlSession::load(&session_path).unwrap();
+    harness.apply_loaded_session(loaded);
+    assert!(harness.pending_turn().is_some());
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .resume_incomplete_turn(&mut ui, TurnCancellation::new())
+        .await
+        .unwrap()
+        .expect("pending turn should resume");
+    assert_eq!(outcome.stop_reason, TurnStopReason::Completed);
+    let loaded = JsonlSession::load(&session_path).unwrap();
+    let user_lines = loaded
+        .messages
+        .iter()
+        .filter(|message| message.role == hi_ai::Role::User)
+        .filter(|message| message.text() == "fix the parser")
+        .count();
+    assert_eq!(user_lines, 1, "resume must not push a second user Message");
+    assert!(loaded.pending_turn.is_none());
+}
+
+#[tokio::test]
+async fn resume_incomplete_turn_without_pending_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = test_harness("http://127.0.0.1:1", dir.path().to_path_buf());
+    let mut ui = TestUi::default();
+    assert!(
+        harness
+            .resume_incomplete_turn(&mut ui, TurnCancellation::new())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn turn_intent_mode_is_recorded_on_begin_persisted_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+    config.state_root = dir.path().join(".hi");
+    let mut harness = Harness::new(config).unwrap();
+    harness.set_turn_intent_mode(true, true);
+    assert_eq!(harness.turn_intent_mode(), (true, true));
+    harness.messages.push(Message::user("fix the parser"));
+    let _ = harness.begin_persisted_turn("fix the parser", None);
+    assert_eq!(harness.turn_intent_mode(), (true, true));
+}
+
+#[tokio::test]
 async fn heartbeat_seq_advances_during_run_turn() {
     let Some(server) = MockPipe::new(vec![Scripted::Sse(vec![
         text_chunk("all good"),

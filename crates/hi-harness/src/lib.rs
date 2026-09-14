@@ -172,6 +172,8 @@ pub struct Harness {
     pending_turn: Option<PendingTurn>,
     turn_index: u32,
     turn_open: bool,
+    turn_oneshot: bool,
+    turn_plain: bool,
     liveness: hi_liveness::Publisher,
 }
 
@@ -209,6 +211,8 @@ impl Harness {
             pending_turn: None,
             turn_index: 0,
             turn_open: false,
+            turn_oneshot: false,
+            turn_plain: false,
             liveness,
         })
     }
@@ -249,6 +253,8 @@ impl Harness {
             pending_turn: None,
             turn_index: 0,
             turn_open: false,
+            turn_oneshot: false,
+            turn_plain: false,
             liveness,
         })
     }
@@ -328,6 +334,16 @@ impl Harness {
 
     pub fn pending_turn(&self) -> Option<&PendingTurn> {
         self.pending_turn.as_ref()
+    }
+
+    pub fn set_turn_intent_mode(&mut self, oneshot: bool, plain: bool) {
+        self.turn_oneshot = oneshot;
+        self.turn_plain = plain;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_intent_mode(&self) -> (bool, bool) {
+        (self.turn_oneshot, self.turn_plain)
     }
 
     pub fn messages(&self) -> &[Message] {

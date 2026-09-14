@@ -106,6 +106,7 @@ async fn maybe_repair_skips_without_checkout() {
         inherit_stdio: false,
         extra_env: Vec::new(),
         once: true,
+        seed_turn_intent: None,
     };
     let class = Class::HarnessBug {
         kind: BugKind::Invariant,

@@ -133,23 +133,38 @@ pub fn maybe_exec_into_sentinel(cli: &Cli) -> Result<()> {
     }
 }
 
-pub async fn maybe_restore_checkpoint(cli: &Cli) -> Result<()> {
-    let role = std::env::var(ENV_ROLE).unwrap_or_default();
-    let restore_role = role == "restore";
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RestoreCheckpointAction {
+    Skip,
+    Fail { message: &'static str },
+    Restore { id: String },
+}
+
+pub(crate) fn restore_checkpoint_action(cli: &Cli) -> RestoreCheckpointAction {
+    let restore_role = std::env::var(ENV_ROLE).is_ok_and(|value| value == "restore");
     match (
         cli.sentinel.sentinel_restore_checkpoint.as_deref(),
         restore_role,
     ) {
-        (None, false) => Ok(()),
-        (None, true) => {
-            eprintln!("HI_SENTINEL_ROLE=restore requires --sentinel-restore-checkpoint");
+        (None, false) => RestoreCheckpointAction::Skip,
+        (None, true) => RestoreCheckpointAction::Fail {
+            message: "HI_SENTINEL_ROLE=restore requires --sentinel-restore-checkpoint",
+        },
+        (Some(_), false) => RestoreCheckpointAction::Fail {
+            message: "hidden --sentinel-restore-checkpoint requires HI_SENTINEL_ROLE=restore",
+        },
+        (Some(id), true) => RestoreCheckpointAction::Restore { id: id.to_string() },
+    }
+}
+
+pub async fn maybe_restore_checkpoint(cli: &Cli) -> Result<()> {
+    match restore_checkpoint_action(cli) {
+        RestoreCheckpointAction::Skip => Ok(()),
+        RestoreCheckpointAction::Fail { message } => {
+            eprintln!("{message}");
             std::process::exit(2);
         }
-        (Some(_), false) => {
-            eprintln!("hidden --sentinel-restore-checkpoint requires HI_SENTINEL_ROLE=restore");
-            std::process::exit(2);
-        }
-        (Some(id), true) => {
+        RestoreCheckpointAction::Restore { id } => {
             let Some(target) = cli.review_target.as_deref() else {
                 eprintln!("--sentinel-restore-checkpoint requires --review-target DIR");
                 std::process::exit(2);
@@ -157,7 +172,7 @@ pub async fn maybe_restore_checkpoint(cli: &Cli) -> Result<()> {
             crate::review_target::chdir_to_review_target(target)?;
             let (workspace_root, state_root) = crate::paths::resolve_runtime_roots()?;
             let n =
-                hi_tools::checkpoint::restore_with_state(&workspace_root, id, &state_root).await?;
+                hi_tools::checkpoint::restore_with_state(&workspace_root, &id, &state_root).await?;
             println!("restored {n} path(s)");
             std::process::exit(0);
         }

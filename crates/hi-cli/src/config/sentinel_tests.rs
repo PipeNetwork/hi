@@ -1,5 +1,8 @@
 use super::Cli;
-use crate::sentinel_exec::{sentinel_flag_error, sentinel_requested, skip_exec_for_mode};
+use crate::sentinel_exec::{
+    RestoreCheckpointAction, restore_checkpoint_action, sentinel_flag_error, sentinel_requested,
+    skip_exec_for_mode,
+};
 use clap::Parser;
 
 #[test]
@@ -176,5 +179,55 @@ fn autoharnessfix_on_writes_machine_config_not_project_toml() {
     assert_eq!(
         project, "[autoharnessfix]\nenabled = false\ncheckout = \"/tmp/evil\"\n",
         "project hi.toml must not be written"
+    );
+}
+
+#[test]
+fn restore_checkpoint_without_role_exits_closed() {
+    let _lock = crate::CWD_LOCK.lock().unwrap();
+    let previous = std::env::var_os("HI_SENTINEL_ROLE");
+    unsafe {
+        std::env::remove_var("HI_SENTINEL_ROLE");
+    }
+    let cli = Cli::try_parse_from(["hi", "--sentinel-restore-checkpoint", "abc"]).unwrap();
+    let action = restore_checkpoint_action(&cli);
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HI_SENTINEL_ROLE", value),
+            None => std::env::remove_var("HI_SENTINEL_ROLE"),
+        }
+    }
+    assert_eq!(
+        action,
+        RestoreCheckpointAction::Fail {
+            message: "hidden --sentinel-restore-checkpoint requires HI_SENTINEL_ROLE=restore",
+        }
+    );
+    assert!(
+        skip_exec_for_mode(&cli),
+        "restore flag must not start a supervised session"
+    );
+}
+
+#[test]
+fn restore_role_without_flag_exits_closed() {
+    let _lock = crate::CWD_LOCK.lock().unwrap();
+    let previous = std::env::var_os("HI_SENTINEL_ROLE");
+    unsafe {
+        std::env::set_var("HI_SENTINEL_ROLE", "restore");
+    }
+    let cli = Cli::try_parse_from(["hi"]).unwrap();
+    let action = restore_checkpoint_action(&cli);
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HI_SENTINEL_ROLE", value),
+            None => std::env::remove_var("HI_SENTINEL_ROLE"),
+        }
+    }
+    assert_eq!(
+        action,
+        RestoreCheckpointAction::Fail {
+            message: "HI_SENTINEL_ROLE=restore requires --sentinel-restore-checkpoint",
+        }
     );
 }

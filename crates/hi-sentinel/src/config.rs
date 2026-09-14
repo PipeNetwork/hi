@@ -92,6 +92,8 @@ pub struct SupervisorConfig {
     pub extra_env: Vec<(String, String)>,
     /// Tests: return after the first NotHarness/ReportOnly/HarnessBug.
     pub once: bool,
+    /// Copy onto the new runtime `turn-intent.json` before a resume spawn.
+    pub seed_turn_intent: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

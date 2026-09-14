@@ -28,10 +28,40 @@ impl Harness {
             watch_cancel.cancelled().await;
             interrupt.interrupt();
         });
-        let result = self.run_turn_inner(input, ui, &cancellation).await;
+        let result = self.run_turn_inner(input, ui, &cancellation, false).await;
         watcher.abort();
         self.turn_cancel = None;
         result
+    }
+
+    /// Continue an unmatched `PendingTurn` without pushing a second user line.
+    pub async fn resume_incomplete_turn(
+        &mut self,
+        ui: &mut dyn Ui,
+        cancellation: TurnCancellation,
+    ) -> Result<Option<TurnOutcome>> {
+        if self.pending_turn.is_none() {
+            return Ok(None);
+        }
+        if !self
+            .messages
+            .iter()
+            .rev()
+            .any(|message| message.role == hi_ai::Role::User)
+        {
+            return Ok(None);
+        }
+        self.turn_cancel = Some(cancellation.clone());
+        let interrupt = self.tools.interrupt_handle();
+        let watch_cancel = cancellation.clone();
+        let watcher = tokio::spawn(async move {
+            watch_cancel.cancelled().await;
+            interrupt.interrupt();
+        });
+        let result = self.run_turn_inner("", ui, &cancellation, true).await;
+        watcher.abort();
+        self.turn_cancel = None;
+        Ok(Some(result?))
     }
 
     async fn run_turn_inner(
@@ -39,8 +69,13 @@ impl Harness {
         input: &str,
         ui: &mut dyn Ui,
         cancel: &TurnCancellation,
+        resume: bool,
     ) -> Result<TurnOutcome> {
-        let pre =
+        let pre = if resume {
+            self.pending_turn
+                .as_ref()
+                .and_then(|pending| pending.pre_checkpoint.clone())
+        } else {
             match checkpoint::create_detailed_with_state(&self.workspace_root, &self.state_root)
                 .await
             {
@@ -53,12 +88,27 @@ impl Harness {
                     ui.checkpoint_warning(&format!("checkpoint failed: {reason}"));
                     None
                 }
-            };
+            }
+        };
 
         self.compact_suppressed = false;
         self.tools.reset_bash_repeats();
-        self.messages.push(Message::user(input));
-        let mut persisted_before = self.begin_persisted_turn(input, pre.as_deref());
+        let mut persisted_before = if resume {
+            self.turn_open = true;
+            if let Some(pending) = &self.pending_turn {
+                self.turn_index = pending.turn_index;
+                self.liveness.set_turn_index(pending.turn_index);
+                self.liveness
+                    .set_pre_checkpoint(pending.pre_checkpoint.clone());
+            }
+            self.liveness
+                .set_state(hi_liveness::HarnessState::AwaitingModel);
+            self.liveness.note_progress();
+            self.messages.len()
+        } else {
+            self.messages.push(Message::user(input));
+            self.begin_persisted_turn(input, pre.as_deref())
+        };
         let mut turn_usage = Usage::default();
         let mut changed = Vec::new();
         let mut mutated = false;

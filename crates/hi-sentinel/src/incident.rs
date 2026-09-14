@@ -142,7 +142,7 @@ pub fn write_bundle(
     let last_tool = heartbeat.and_then(|h| h.last_tool.clone());
     let pre_checkpoint = heartbeat.and_then(|h| h.pre_checkpoint.clone());
     let session_path = heartbeat.and_then(|h| h.session_path.clone());
-    let plain = cfg.original_argv.iter().any(|a| a == "--plain");
+    let (oneshot, plain) = oneshot_plain(runtime, &cfg.original_argv);
     let doc = IncidentDoc {
         schema_version: 1,
         id: id.clone(),
@@ -161,7 +161,7 @@ pub fn write_bundle(
         last_tool,
         pre_checkpoint,
         original_argv: cfg.original_argv.clone(),
-        oneshot: plain,
+        oneshot,
         plain,
         reproduction: "repro/reproduction.sh".into(),
         redacted: true,
@@ -463,6 +463,17 @@ fn state_slug(state: hi_liveness::HarnessState) -> String {
         .unwrap_or_default()
         .trim_matches('"')
         .to_string()
+}
+
+fn oneshot_plain(runtime: &Path, argv: &[String]) -> (bool, bool) {
+    let path = runtime.join("turn-intent.json");
+    if let Ok(bytes) = fs::read(&path)
+        && let Ok(intent) = serde_json::from_slice::<hi_liveness::TurnIntent>(&bytes)
+    {
+        return (intent.oneshot, intent.plain);
+    }
+    let plain = argv.iter().any(|arg| arg == "--plain");
+    (plain, plain)
 }
 
 fn truncate(value: &str, max: usize) -> String {

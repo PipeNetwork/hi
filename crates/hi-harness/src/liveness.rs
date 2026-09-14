@@ -53,8 +53,8 @@ impl Harness {
             pre_checkpoint: pending.pre_checkpoint.clone(),
             started_unix_ms: pending.started_unix_ms,
             workspace: self.workspace_root.display().to_string(),
-            oneshot: false,
-            plain: false,
+            oneshot: self.turn_oneshot,
+            plain: self.turn_plain,
         };
         let _ = hi_liveness::write_turn_intent_from_env(&intent);
         self.messages.len()

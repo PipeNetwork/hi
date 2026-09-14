@@ -27,7 +27,9 @@ use crate::incident;
 use crate::ipc;
 use crate::monitor::{Monitor, MonitorSignal};
 use crate::paths;
+use crate::relaunch::{self, RelaunchPlan};
 use crate::repair::{self, RepairOutcome};
+use crate::restore::{self, RestoreRequest};
 use crate::rollback::{self, RecordInput};
 use crate::slash;
 use crate::spawn;
@@ -60,6 +62,7 @@ pub struct SupervisorOutcome {
     pub incident_dir: Option<PathBuf>,
     pub exit_code: i32,
     pub leftover: Option<Child>,
+    pub relaunch: Option<RelaunchPlan>,
 }
 
 impl SupervisorOutcome {
@@ -136,13 +139,13 @@ async fn run_async() -> Result<i32> {
         inherit_stdio: true,
         extra_env: Vec::new(),
         once: false,
+        seed_turn_intent: None,
     };
     let outcome = supervise(cfg).await?;
     Ok(outcome.exit_code)
 }
 
-pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
-    let started = Instant::now();
+pub async fn supervise(mut cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
     fsutil::mkdir_0700(&cfg.state_dir)?;
     let ttl_days = peek_machine()
         .and_then(|s| s.incident_retention_days)
@@ -168,6 +171,30 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
         });
     }
 
+    loop {
+        let outcome = run_generation(&cfg).await?;
+        if cfg.once {
+            return Ok(outcome);
+        }
+        let Some(plan) = outcome.relaunch.clone() else {
+            return Ok(outcome);
+        };
+        spawn::prepare_interactive_prompt();
+        eprintln!("{}", relaunch::continuing_line(&plan));
+        let _ = restore::maybe_restore_user_project(&RestoreRequest {
+            hi_binary: cfg.hi_binary.clone(),
+            workspace: cfg.workspace.clone(),
+            pre_checkpoint: plan.pre_checkpoint.clone(),
+            stdin_is_tty: std::io::stdin().is_terminal(),
+            answer: None,
+            flag_present: None,
+        });
+        cfg = relaunch::next_generation(&cfg, &plan);
+    }
+}
+
+async fn run_generation(cfg: &SupervisorConfig) -> Result<SupervisorOutcome> {
+    let started = Instant::now();
     let instance = instance_token();
     let runtime = paths::runtime_dir(&cfg.state_dir, &instance);
     fsutil::mkdir_0700(&runtime)?;
@@ -177,6 +204,12 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
     let events_path = runtime.join("events.jsonl");
     let panic_file = runtime.join("panic.txt");
     let turn_intent = runtime.join("turn-intent.json");
+    if let Some(src) = &cfg.seed_turn_intent
+        && src.is_file()
+    {
+        let _ = std::fs::copy(src, &turn_intent);
+        let _ = fsutil::chmod_0600(&turn_intent);
+    }
 
     let mut env_pairs = vec![
         (ENV_SUPERVISED.to_string(), "1".into()),
@@ -208,7 +241,7 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
 
     spawn::write_supervisor_log(&runtime, "spawning child");
     let terminal = spawn::snapshot_terminal();
-    let spawned = spawn::spawn_child(&cfg, &env_pairs, terminal)?;
+    let spawned = spawn::spawn_child(cfg, &env_pairs, terminal)?;
     let mut child = spawned.child;
     let pid = spawned.pid;
     let pgid = spawned.pgid;
@@ -223,7 +256,7 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                 let status = status.context("waiting for supervised child")?;
                 abort_slash_repair(&mut repair_task, &runtime, "aborted in-flight slash repair (child exited)").await;
                 terminal.restore();
-                let ctx = classify_ctx(&cfg, &crash_dir, &panic_file, monitor.last_heartbeat(), false);
+                let ctx = classify_ctx(cfg, &crash_dir, &panic_file, monitor.last_heartbeat(), false);
                 let signal = MonitorSignal::ChildExited {
                     status,
                     waited: started.elapsed(),
@@ -235,7 +268,7 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                     && incident_dir.is_none()
                 {
                     match incident::write_bundle(
-                        &cfg,
+                        cfg,
                         class,
                         &runtime,
                         monitor.last_heartbeat(),
@@ -252,16 +285,17 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                         }
                     }
                 }
-                let repair_note = match class.as_ref() {
+                let repair = match class.as_ref() {
                     Some(class) if class.is_harness_bug() => {
                         maybe_run_repair(&cfg, class, incident_dir.as_deref(), &runtime, true).await
                     }
-                    _ => None,
+                    _ => RepairReport::default(),
                 };
-                if let Some(class) = &class
+                if repair.relaunch.is_none()
+                    && let Some(class) = &class
                     && (class.is_harness_bug() || matches!(class, Class::ReportOnly { .. }))
                 {
-                    report_user(class, incident_dir.as_ref(), repair_note.as_deref());
+                    report_user(class, incident_dir.as_ref(), repair.note.as_deref());
                 }
                 let exit_code = if class.as_ref().is_some_and(Class::is_harness_bug) {
                     1
@@ -276,6 +310,7 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                     incident_dir,
                     exit_code,
                     leftover: None,
+                    relaunch: repair.relaunch,
                 });
             }
             _ = tokio::time::sleep(cfg.monitor.poll_interval) => {
@@ -332,6 +367,7 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                                 false,
                             )
                             .await
+                            .note
                             .unwrap_or_else(|| "repair finished".into())
                         }));
                     }
@@ -361,7 +397,7 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                 let Some(signal) = monitor.poll(&heartbeat_path) else {
                     continue;
                 };
-                let ctx = classify_ctx(&cfg, &crash_dir, &panic_file, monitor.last_heartbeat(), true);
+                let ctx = classify_ctx(cfg, &crash_dir, &panic_file, monitor.last_heartbeat(), true);
                 let Some(class) = classify::classify(&signal, &ctx) else {
                     continue;
                 };
@@ -391,17 +427,19 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                     .await?;
                     terminal.restore();
                     let bundle = incident::write_bundle(
-                        &cfg,
+                        cfg,
                         &class,
                         &runtime,
                         monitor.last_heartbeat(),
                         started.elapsed(),
                     );
                     let incident_dir = bundle.ok().map(|b| b.dir);
-                    let repair_note =
+                    let repair =
                         maybe_run_repair(&cfg, &class, incident_dir.as_deref(), &runtime, true)
                             .await;
-                    report_user(&class, incident_dir.as_ref(), repair_note.as_deref());
+                    if repair.relaunch.is_none() {
+                        report_user(&class, incident_dir.as_ref(), repair.note.as_deref());
+                    }
                     return Ok(SupervisorOutcome {
                         class: Some(class),
                         child_status: Some(status),
@@ -410,12 +448,13 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                         incident_dir,
                         exit_code: 1,
                         leftover: None,
+                        relaunch: repair.relaunch,
                     });
                 }
                 if matches!(class, Class::ReportOnly { .. })
                     && report_written.is_none()
                     && let Ok(bundle) = incident::write_bundle(
-                        &cfg,
+                        cfg,
                         &class,
                         &runtime,
                         monitor.last_heartbeat(),
@@ -439,6 +478,7 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                         incident_dir: report_written.clone(),
                         exit_code: 0,
                         leftover: Some(child),
+                        relaunch: None,
                     });
                 }
             }
@@ -476,14 +516,22 @@ fn status_code(status: ExitStatus) -> i32 {
     1
 }
 
+#[derive(Default)]
+struct RepairReport {
+    note: Option<String>,
+    relaunch: Option<RelaunchPlan>,
+}
+
 async fn maybe_run_repair(
     cfg: &SupervisorConfig,
     class: &Class,
     incident_dir: Option<&std::path::Path>,
     runtime: &std::path::Path,
     allow_prompt: bool,
-) -> Option<String> {
-    let dir = incident_dir?;
+) -> RepairReport {
+    let Some(dir) = incident_dir else {
+        return RepairReport::default();
+    };
     let id = dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -507,7 +555,10 @@ async fn maybe_run_repair(
             &paths::incidents_dir(&cfg.state_dir),
         );
         spawn::write_supervisor_log(runtime, &note);
-        return Some(note);
+        return RepairReport {
+            note: Some(note),
+            relaunch: None,
+        };
     }
     let worktree = paths::worktrees_dir().join(id);
     let start_line = format!(
@@ -518,7 +569,7 @@ async fn maybe_run_repair(
         eprintln!("{start_line}");
     }
     spawn::write_supervisor_log(runtime, &start_line);
-    let note = match repair::maybe_repair(cfg, class, dir).await {
+    let report = match repair::maybe_repair(cfg, class, dir).await {
         RepairOutcome::Completed {
             branch,
             gate,
@@ -526,20 +577,41 @@ async fn maybe_run_repair(
             ..
         } if gate.passed => {
             if !allow_prompt && !cfg.apply {
-                format!(
-                    "Repair available on branch {branch}. Not applied (session still owns the tty). Enable [autoharnessfix] apply = true, or apply after this session exits. See /autoharnessfix history."
-                )
+                RepairReport {
+                    note: Some(format!(
+                        "Repair available on branch {branch}. Not applied (session still owns the tty). Enable [autoharnessfix] apply = true, or apply after this session exits. See /autoharnessfix history."
+                    )),
+                    relaunch: None,
+                }
             } else {
-                apply_verified(cfg, class, id, &branch, worktree, &repair_cfg, allow_prompt)
+                apply_verified(
+                    cfg,
+                    class,
+                    id,
+                    &branch,
+                    worktree,
+                    &repair_cfg,
+                    allow_prompt,
+                    dir,
+                )
             }
         }
-        RepairOutcome::Completed { branch, .. } => {
-            format!("Repair produced branch {branch} but verification failed. Not applied.")
-        }
-        RepairOutcome::Skipped { reason } => reason.user_line(),
+        RepairOutcome::Completed { branch, .. } => RepairReport {
+            note: Some(format!(
+                "Repair produced branch {branch} but verification failed. Not applied."
+            )),
+            relaunch: None,
+        },
+        RepairOutcome::Skipped { reason } => RepairReport {
+            note: Some(reason.user_line()),
+            relaunch: None,
+        },
     };
-    spawn::write_supervisor_log(runtime, &note);
-    Some(note)
+    };
+    if let Some(note) = &report.note {
+        spawn::write_supervisor_log(runtime, note);
+    }
+    report
 }
 
 fn apply_verified(
@@ -550,7 +622,8 @@ fn apply_verified(
     worktree: PathBuf,
     repair_cfg: &RepairConfig,
     allow_prompt: bool,
-) -> String {
+    incident_dir: &std::path::Path,
+) -> RepairReport {
     let validated = cfg
         .checkout
         .as_ref()
@@ -579,25 +652,44 @@ fn apply_verified(
     });
     match outcome {
         ApplyOutcome::Applied { note } => {
-            let mut out = format!(
-                "hi: internal harness error ({id}, {}) repaired and verified; sidecar applied.",
-                class.kind_slug()
+            let plan = relaunch::plan_from_incident(
+                incident_dir,
+                relaunch::sidecar_or_current(cfg),
+                id,
+                class.kind_slug(),
             );
+            let mut out = relaunch::continuing_line(&plan);
             if !note.is_empty() {
                 out.push(' ');
                 out.push_str(&note);
             }
-            out
+            RepairReport {
+                note: Some(out),
+                relaunch: Some(plan),
+            }
         }
         ApplyOutcome::Refused {
             reason: ApplyRefuse::GenerationHalt,
             note,
-        } => note,
+        } => RepairReport {
+            note: Some(note),
+            relaunch: None,
+        },
         ApplyOutcome::Refused { note, .. } => {
-            if note.contains("Not applied.") {
-                note
+            let note = if note.contains("Not applied.") {
+                if note.starts_with("hi:") {
+                    note
+                } else {
+                    format!("hi: internal harness error recorded as {id}. {note}")
+                }
             } else {
-                format!("Repair available on branch {branch}. Not applied. {note}")
+                format!(
+                    "hi: internal harness error recorded as {id}. Repair available on branch {branch}. Not applied. {note}"
+                )
+            };
+            RepairReport {
+                note: Some(note),
+                relaunch: None,
             }
         }
     }
@@ -639,6 +731,7 @@ async fn run_manual_repair(
     let class = slash::manual_class();
     let note = maybe_run_repair(&cfg, &class, Some(incident.as_path()), &runtime, true)
         .await
+        .note
         .unwrap_or_else(|| "repair finished".into());
     eprintln!("{note}");
     Ok(0)
