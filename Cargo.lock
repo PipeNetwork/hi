@@ -4044,6 +4044,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hi-sentinel"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "hi-liveness",
+ "hi-secrets",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "hi-smoke"
 version = "0.3.1"
 dependencies = [

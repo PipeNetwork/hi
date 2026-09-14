@@ -9,6 +9,7 @@ mod paths;
 mod pipe_session;
 mod prompt;
 mod review_target;
+mod sentinel_exec;
 mod setup;
 mod tickets;
 mod trace_cmd;
@@ -181,6 +182,8 @@ async fn run() -> Result<()> {
         std::io::stdout().is_terminal(),
     )?;
     startup_trace!("cli parsed");
+    sentinel_exec::maybe_restore_checkpoint(&cli).await?;
+    sentinel_exec::maybe_exec_into_sentinel(&cli)?;
     // Install before any tool can run: with `--keep-background`, a completed
     // foreground command must not tree-kill the service it just detached.
     hi_tools::preserve_detached_descendants(cli.keep_background);

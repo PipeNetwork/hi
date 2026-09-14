@@ -124,6 +124,7 @@ Prefer the disambiguated names in new code and docs:
 - `AttestingVerifier` when you mean RSI attestation
 - `RsiMemoryStore` when you mean control-plane SQLite memory
 - “session JSONL” when you mean `hi-harness` transcripts under the data dir
+- `hi-sentinel` for the interactive supervisor (`hi --autoharnessfix`); `hi-bootstrap` remains the RSI candidate launcher (`DESCRIPTOR CANDIDATE SOCKET`). clap's “unlimited internal sentinel” is `parse_finite_u32_cap`, not this crate.
 
 Historical type aliases (`RepairVerifier`, `hi_verifier::Verifier`,
 `hi_memory::MemoryStore`) remain for compatibility.

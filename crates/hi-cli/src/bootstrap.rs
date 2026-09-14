@@ -36,6 +36,10 @@ pub(crate) fn parse_and_validate_cli() -> Cli {
         eprintln!("--attach and --daemon cannot be used together");
         std::process::exit(2);
     }
+    if let Some(msg) = crate::sentinel_exec::sentinel_flag_error(&cli) {
+        eprintln!("{msg}");
+        std::process::exit(2);
+    }
     cli
 }
 

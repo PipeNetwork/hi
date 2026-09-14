@@ -27,6 +27,8 @@ pub struct Config {
     pub pipefs: PipeFsSection,
     #[serde(default)]
     pub rsi: Option<RsiSection>,
+    #[serde(default)]
+    pub autoharnessfix: Option<AutoHarnessFixSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<OutcomeSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,7 +332,7 @@ impl serde::Serialize for Config {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Config", 14)?;
+        let mut s = serializer.serialize_struct("Config", 15)?;
         if let Some(v) = &self.default_profile {
             s.serialize_field("default_profile", v)?;
         }
@@ -356,6 +358,9 @@ impl serde::Serialize for Config {
         }
         if let Some(rsi) = &self.rsi {
             s.serialize_field("rsi", rsi)?;
+        }
+        if let Some(autoharnessfix) = &self.autoharnessfix {
+            s.serialize_field("autoharnessfix", autoharnessfix)?;
         }
         if let Some(outcome) = &self.outcome {
             s.serialize_field("outcome", outcome)?;
@@ -585,6 +590,7 @@ pub(crate) fn merge_config_with_project_trust(
     mut overlay: Config,
     trusted: bool,
 ) {
+    super::drop_project_overlay(&mut overlay);
     base.harness.merge_project(&mut overlay.harness, trusted);
     for profile in overlay.profiles.values_mut() {
         profile.project_local = true;
@@ -922,23 +928,6 @@ pub fn writable_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
         return Some(local);
     }
     default_config_path()
-}
-
-/// Mask an API key (or env var name) for display: first and last four
-/// characters with an ellipsis. Char-based, so a key containing multi-byte
-/// characters (e.g. pasted with a stray curly quote) can't panic a byte slice.
-pub fn mask_key(key: &str) -> String {
-    if key.is_empty() {
-        return "(none)".to_string();
-    }
-    let chars: Vec<char> = key.chars().collect();
-    if chars.len() > 8 {
-        let head: String = chars[..4].iter().collect();
-        let tail: String = chars[chars.len() - 4..].iter().collect();
-        format!("{head}…{tail}")
-    } else {
-        "***".to_string()
-    }
 }
 
 /// Serialize `config` to TOML and write it to `path`, creating parent dirs.

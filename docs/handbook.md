@@ -25,9 +25,10 @@ hi "the tests in test_parser.py are failing — fix the parser"
 ## Quick start
 
 ```bash
-cargo build --release           # fast core binary at target/release/hi
+cargo build --release -p hi -p hi-sentinel   # hi plus the Sentinel supervisor
 cargo build --release --features voice  # include microphone + local Whisper
 cargo install --path crates/hi-cli --locked
+cargo install --path crates/hi-sentinel --locked
 
 hi login pipenetwork            # browser pairing; writes the API key into config.toml
 PIPENETWORK_API_KEY=pk_live_... hi "add a --json flag"

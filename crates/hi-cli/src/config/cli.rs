@@ -466,6 +466,9 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub skeptic_review: bool,
 
+    #[command(flatten)]
+    pub sentinel: SentinelFlags,
+
     /// One-shot prompt. If omitted, starts an interactive session.
     pub prompt: Option<String>,
 }

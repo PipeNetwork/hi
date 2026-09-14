@@ -41,7 +41,7 @@ version = "0.3.1"
 # use unsafe (mmap/alloc, libc kill, or test-only env set_var guards) opt out
 # with `[lints.rust] unsafe_code = "allow"` in their own Cargo.toml and a
 # comment naming the reason. Currently opted out: hi-cli, hi-eval, hi-tools,
-# hi-tui, hi-verifier, hi-race (real process/platform work), plus
+# hi-tui, hi-verifier, hi-race, hi-sentinel (real process/platform work), plus
 # hi-ai (test-only).
 [workspace.lints.rust]
 unsafe_code = "deny"
