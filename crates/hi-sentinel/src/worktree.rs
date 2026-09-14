@@ -26,9 +26,10 @@ pub fn add_detached(checkout: &Path, dest: &Path, base: &str) -> Result<Worktree
     if let Some(parent) = dest.parent() {
         fsutil::mkdir_0700(parent)?;
     }
-    if dest.exists() {
-        let _ = fs::remove_dir_all(dest);
-    }
+    // Drop a leftover registration before add; remove_dir_all alone leaves git's
+    // worktree list stale and the next add fails with "already registered".
+    remove(checkout, dest);
+    let _ = git_in(checkout, &["worktree", "prune"]);
     let output = git_in(
         checkout,
         &["worktree", "add", "--detach", dest_str(dest)?, base],
@@ -256,6 +257,18 @@ mod tests {
         remove(&checkout, &dest);
         assert!(!dest.exists());
         assert_eq!(current_branch(&checkout).unwrap(), before);
+    }
+
+    #[test]
+    fn add_detached_replaces_a_registered_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = test_fixture::minimal_checkout(root.path());
+        let dest = root.path().join("wt");
+        let first = add_detached(&checkout, &dest, "HEAD").unwrap();
+        assert!(first.path.join("crates/hi-cli/Cargo.toml").is_file());
+        let second = add_detached(&checkout, &dest, "HEAD").unwrap();
+        assert!(second.path.join("crates/hi-cli/Cargo.toml").is_file());
+        remove(&checkout, &dest);
     }
 
     #[test]

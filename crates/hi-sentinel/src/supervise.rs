@@ -340,6 +340,15 @@ async fn maybe_run_repair(
     runtime: &std::path::Path,
 ) -> Option<String> {
     let dir = incident_dir?;
+    let id = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("incident");
+    let worktree = paths::worktrees_dir().join(id);
+    eprintln!(
+        "hi: starting repair for {id}; worktree {}.",
+        worktree.display()
+    );
     spawn::write_supervisor_log(runtime, "repair starting");
     let note = match repair::maybe_repair(cfg, class, dir).await {
         RepairOutcome::Completed { branch, gate, .. } if gate.passed => {

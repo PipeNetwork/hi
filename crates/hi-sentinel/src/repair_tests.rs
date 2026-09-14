@@ -126,6 +126,7 @@ async fn diagnose_without_repro_skips_patch() {
     let root = tempfile::tempdir().unwrap();
     let checkout = test_fixture::minimal_checkout(root.path());
     let (req, log, outside, _) = request(root.path(), checkout, false);
+    let incident = req.incident_dir.clone();
     fs::write(log.join("no_repro"), b"1").unwrap();
     let outcome = run_repair(req).await;
     match outcome {
@@ -136,6 +137,7 @@ async fn diagnose_without_repro_skips_patch() {
     }
     assert_eq!(fs::read_to_string(log.join("count")).unwrap().trim(), "1");
     assert!(!log.join("spawn-2.argv").exists());
+    assert!(incident.join("diagnosis.md").is_file());
     assert!(!outside.join("pwned").exists());
     assert!(log.join("outside").is_file());
     let argv = fs::read_to_string(log.join("spawn-1.argv")).unwrap();
@@ -167,6 +169,7 @@ async fn fixture_invariant_repro_commits_only_autofix_branch() {
         .unwrap();
     let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
     let (req, log, outside, _wts) = request(root.path(), checkout.clone(), true);
+    let incident = req.incident_dir.clone();
     let outcome = run_repair(req).await;
     let RepairOutcome::Completed {
         worktree: wt,
@@ -193,6 +196,21 @@ async fn fixture_invariant_repro_commits_only_autofix_branch() {
         gate.layers
             .iter()
             .any(|l| l.layer == 0 && l.passed && !l.skipped)
+    );
+    assert!(
+        gate.layers
+            .iter()
+            .any(|l| l.layer == 3 && l.passed && !l.skipped),
+        "hi-harness diff vs base SHA must run layer 3, got {:?}",
+        gate.layers
+    );
+    assert!(
+        wt.join(".hi/diagnosis.md").is_file(),
+        "agent diagnosis must land inside the worktree"
+    );
+    assert!(
+        incident.join("diagnosis.md").is_file(),
+        "sentinel must copy diagnosis.md into the incident dir"
     );
     assert!(!outside.join("pwned").exists());
     let count: u32 = fs::read_to_string(log.join("count"))

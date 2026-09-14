@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::fsutil;
+use crate::spawn;
 
 const LAYER0: Duration = Duration::from_secs(5 * 60);
 const LAYER12: Duration = Duration::from_secs(5 * 60);
@@ -24,6 +25,8 @@ pub struct GateInput {
     pub head_target_dir: PathBuf,
     pub failing_test: Option<Vec<String>>,
     pub timeouts: GateTimeouts,
+    /// Worktree commit before the repair commit. `git diff HEAD` is empty after `commit_fix`.
+    pub base_sha: String,
 }
 
 #[derive(Clone, Debug)]
@@ -122,7 +125,7 @@ pub async fn run_layers(input: &GateInput) -> Result<GateReport> {
         .await?,
     );
 
-    let touched = touched_crates(&input.worktree, "HEAD")?;
+    let touched = touched_crates(&input.worktree, &input.base_sha)?;
     if touched.iter().any(|c| c == "hi-harness") {
         layers.push(
             run_named(
@@ -258,6 +261,8 @@ async fn layer0(input: &GateInput, offline: bool) -> Result<LayerReport> {
         &script,
         &head_bin,
         &input.head_worktree,
+        &input.cargo_home,
+        &input.head_target_dir,
         input.failing_test.as_deref(),
         input.timeouts.layer0,
     )
@@ -287,6 +292,8 @@ async fn layer0(input: &GateInput, offline: bool) -> Result<LayerReport> {
         &script,
         &repair_bin,
         &input.worktree,
+        &input.cargo_home,
+        &input.cargo_target_dir,
         input.failing_test.as_deref(),
         input.timeouts.layer0,
     )
@@ -381,12 +388,19 @@ async fn run_repro(
     script: &Path,
     hi_binary: &Path,
     worktree: &Path,
+    cargo_home: &Path,
+    target_dir: &Path,
     failing_test: Option<&[String]>,
     timeout: Duration,
 ) -> Result<Output> {
+    let _ = fsutil::mkdir_0700(cargo_home);
+    let _ = fsutil::mkdir_0700(target_dir);
     let mut cmd = tokio::process::Command::new(script);
     cmd.env("HI_BINARY", hi_binary)
         .env("HI_WORKTREE", worktree)
+        .env("CARGO_HOME", cargo_home)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_TERM_COLOR", "never")
         .current_dir(script.parent().unwrap_or(worktree))
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
@@ -405,7 +419,7 @@ pub fn touched_crates(worktree: &Path, base: &str) -> Result<Vec<String>> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(worktree)
-        .args(["diff", "--name-only", base])
+        .args(["diff", "--name-only", base, "HEAD"])
         .output()
         .context("git diff --name-only")?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -523,10 +537,29 @@ async fn cargo_capture(
 }
 
 async fn timed(mut cmd: tokio::process::Command, timeout: Duration) -> Result<Output> {
+    // SAFETY: pre_exec is between fork and exec; setpgid cannot race other threads.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let child = cmd.spawn().context("spawning cargo/repro")?;
+    let pid = child.id().context("cargo/repro pid")?;
+    // Parent setpgid is the fallback if the child has not yet run pre_exec.
+    unsafe {
+        libc::setpgid(pid as i32, pid as i32);
+    }
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(out) => out.context("waiting for cargo/repro"),
-        Err(_) => anyhow::bail!("command timed out after {}s", timeout.as_secs()),
+        Err(_) => {
+            spawn::signal_group(pid as i32, libc::SIGTERM);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            spawn::signal_group(pid as i32, libc::SIGKILL);
+            anyhow::bail!("command timed out after {}s", timeout.as_secs())
+        }
     }
 }
 
@@ -583,5 +616,30 @@ mod tests {
         assert!(parse_failing_test("-p hi-harness invariant_holds").is_some());
         assert!(parse_failing_test("-p hi-harness; rm -rf /").is_none());
         assert!(parse_failing_test("").is_none());
+    }
+
+    #[test]
+    fn touched_crates_uses_base_sha_after_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = crate::test_fixture::minimal_checkout(root.path());
+        let dest = root.path().join("wt");
+        let wt = crate::worktree::add_detached(&checkout, &dest, "HEAD").unwrap();
+        let base = wt.base_sha.clone();
+        std::fs::write(
+            wt.path.join("crates/hi-harness/src/lib.rs"),
+            "pub fn patched() {}\n",
+        )
+        .unwrap();
+        crate::worktree::commit_fix(&wt.path, "incident-1-aaaa", "invariant").unwrap();
+        assert!(
+            touched_crates(&wt.path, "HEAD").unwrap().is_empty(),
+            "diff vs HEAD after commit must be empty"
+        );
+        let vs_base = touched_crates(&wt.path, &base).unwrap();
+        assert!(
+            vs_base.iter().any(|c| c == "hi-harness"),
+            "diff vs base SHA must include hi-harness, got {vs_base:?}"
+        );
+        crate::worktree::remove(&checkout, &dest);
     }
 }

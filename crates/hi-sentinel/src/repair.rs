@@ -166,12 +166,16 @@ pub async fn run_repair(req: RepairRequest) -> RepairOutcome {
     let _ = fsutil::mkdir_0700(&cargo_home);
     let _ = fsutil::mkdir_0700(&cargo_target);
     let _ = fsutil::mkdir_0700(&state_home);
+    // Agent writes stay under the worktree: HI_SANDBOX=workspace cannot create
+    // files in the incident dir under XDG_STATE_HOME.
+    let _ = stage_agent_inputs(&req.incident_dir, &wt.path);
 
     match run_phase(&req, &wt, Phase::Diagnose).await {
         Ok(()) => {}
         Err(reason) => return RepairOutcome::Skipped { reason },
     }
-    let diagnosis = parse_diagnosis(&req.incident_dir.join("diagnosis.md"));
+    let diagnosis = parse_diagnosis(&agent_diagnosis_path(&wt.path));
+    let _ = harvest_diagnosis(&wt.path, &req.incident_dir);
     if !diagnosis.reproduced {
         return RepairOutcome::Skipped {
             reason: RepairSkip::DiagnoseNoRepro,
@@ -235,6 +239,7 @@ pub async fn run_repair(req: RepairRequest) -> RepairOutcome {
         head_target_dir: head_target,
         failing_test: diagnosis.failing_test.clone(),
         timeouts: req.gate_timeouts,
+        base_sha: wt.base_sha.clone(),
     };
     let gate = match gate::run_layers(&gate_input).await {
         Ok(g) => g,
@@ -297,8 +302,9 @@ impl Phase {
 }
 
 async fn run_phase(req: &RepairRequest, wt: &Worktree, phase: Phase) -> Result<(), RepairSkip> {
-    let session = req
-        .incident_dir
+    let session = wt
+        .path
+        .join(".hi")
         .join(format!("{}-session.jsonl", phase.name()));
     let prompt = match phase {
         Phase::Diagnose => diagnose_prompt(req, wt),
@@ -327,6 +333,8 @@ async fn run_phase(req: &RepairRequest, wt: &Worktree, phase: Phase) -> Result<(
             Phase::Patch => RepairSkip::PatchTimeout,
         });
     }
+    let _ = harvest_session(&session, &req.incident_dir, phase.name());
+    let _ = harvest_diagnosis(&wt.path, &req.incident_dir);
     if !status.success() {
         return Err(match phase {
             Phase::Diagnose => RepairSkip::DiagnoseFailed,
@@ -418,6 +426,10 @@ async fn spawn_repair(
         .spawn()
         .with_context(|| format!("spawning repair hi {}", req.hi_binary.display()))?;
     let pid = child.id().context("repair child pid")?;
+    // Parent setpgid is the fallback if the child has not yet run pre_exec.
+    unsafe {
+        libc::setpgid(pid as i32, pid as i32);
+    }
     tokio::select! {
         status = child.wait() => {
             let status = status.context("waiting for repair hi")?;
@@ -471,37 +483,83 @@ fn parse_diagnosis(path: &Path) -> Diagnosis {
     }
 }
 
+fn agent_diagnosis_path(wt: &Path) -> PathBuf {
+    wt.join(".hi/diagnosis.md")
+}
+
+fn stage_agent_inputs(incident: &Path, wt: &Path) -> std::io::Result<()> {
+    let dest = wt.join(".hi");
+    fsutil::mkdir_0700(&dest)?;
+    copy_0600_if_exists(&incident.join("incident.json"), &dest.join("incident.json"))?;
+    let repro_src = incident.join("repro");
+    if repro_src.is_dir() {
+        let repro_dst = dest.join("repro");
+        fsutil::mkdir_0700(&repro_dst)?;
+        if let Ok(entries) = fs::read_dir(&repro_src) {
+            for entry in entries.flatten() {
+                let from = entry.path();
+                if from.is_file() {
+                    let to = repro_dst.join(entry.file_name());
+                    copy_0600_if_exists(&from, &to)?;
+                    if entry.file_name() == "reproduction.sh" {
+                        let _ = fsutil::chmod_0700_file(&to);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn harvest_diagnosis(wt: &Path, incident: &Path) -> std::io::Result<()> {
+    copy_0600_if_exists(&agent_diagnosis_path(wt), &incident.join("diagnosis.md"))
+}
+
+fn harvest_session(session: &Path, incident: &Path, phase: &str) -> std::io::Result<()> {
+    copy_0600_if_exists(session, &incident.join(format!("{phase}-session.jsonl")))
+}
+
+fn copy_0600_if_exists(from: &Path, to: &Path) -> std::io::Result<()> {
+    if !from.is_file() {
+        return Ok(());
+    }
+    let bytes = fs::read(from)?;
+    fsutil::write_0600(to, &bytes)
+}
+
 fn diagnose_prompt(req: &RepairRequest, wt: &Worktree) -> String {
+    let staged = wt.path.join(".hi");
     format!(
         "You are the Hi Sentinel repair agent (diagnose only).\n\
 Read {skill} if it exists in the worktree.\n\
-Incident directory: {incident}\n\
 Writable worktree: {worktree}\n\
+Staged incident files (inside the worktree): {staged}/incident.json and {staged}/repro/\n\
 Checkout (do not write): {checkout}\n\
 Summary: id={id} kind={kind}. Do not include or re-run any original user prompt.\n\
-Tasks: (1) reproduce with cargo test -p … or repro/reproduction.sh and HI_BINARY pointing at a worktree-built hi; \
-(2) write {incident}/diagnosis.md with reproduced/failing_test/root_cause/files; (3) stop — do not patch.\n\
+Tasks: (1) reproduce with cargo test -p … or {staged}/repro/reproduction.sh and HI_BINARY pointing at a worktree-built hi; \
+(2) write {diag} with reproduced/failing_test/root_cause/files; (3) stop — do not patch.\n\
 Bans: no writes outside the worktree; no git push; no commit to main; no ~/.ssh; no secrets; no live-project prompt replay.\n",
         skill = wt.path.join(SKILL_REL).display(),
-        incident = req.incident_dir.display(),
         worktree = wt.path.display(),
+        staged = staged.display(),
         checkout = req.checkout.display(),
         id = req.incident_id,
         kind = req.kind,
+        diag = agent_diagnosis_path(&wt.path).display(),
     )
 }
 
-fn patch_prompt(req: &RepairRequest, wt: &Worktree) -> String {
+fn patch_prompt(_req: &RepairRequest, wt: &Worktree) -> String {
+    let diag = agent_diagnosis_path(&wt.path);
     format!(
         "You are the Hi Sentinel repair agent (patch).\n\
-Read {skill} if it exists and {incident}/diagnosis.md.\n\
-Incident directory: {incident}\n\
+Read {skill} if it exists and {diag}.\n\
 Writable worktree: {worktree}\n\
 Tasks: (1) patch only the worktree files named in diagnosis.md; \
 (2) re-run the same cargo test / reproduction.sh Sentinel will run as the layered gate; (3) stop. Do not commit.\n\
 Bans: no writes outside the worktree; no git push; no commit to main; no ~/.ssh; no secrets; no live-project prompt replay.\n",
         skill = wt.path.join(SKILL_REL).display(),
-        incident = req.incident_dir.display(),
+        diag = diag.display(),
         worktree = wt.path.display(),
     )
 }
@@ -614,6 +672,8 @@ mod tests {
         for text in [&d, &p] {
             assert!(!text.contains("fix the parser"));
             assert!(text.contains("do not patch") || text.contains("Do not commit"));
+            assert!(text.contains(".hi/diagnosis.md"));
+            assert!(!text.contains("/inc/diagnosis.md"));
         }
     }
 }

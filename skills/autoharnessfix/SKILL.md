@@ -27,12 +27,15 @@ one-shots: **diagnose**, then **patch** (only if diagnose confirmed a repro).
 
 ## Diagnose (phase 1) — stop before any patch
 
-1. Read `$INCIDENT/incident.json` and `$INCIDENT/repro/README`.
+Incident files are staged under `$WORKTREE/.hi/` (gitignored, inside the
+sandbox). Do not write to the supervisor incident directory.
+
+1. Read `$WORKTREE/.hi/incident.json` and `$WORKTREE/.hi/repro/README`.
 2. Reproduce **in this worktree**:
    - Preferred: `cargo test -p <crate> <test>` for a deterministic invariant/crash.
-   - Or run `$INCIDENT/repro/reproduction.sh` with `HI_BINARY` pointing at a
+   - Or run `$WORKTREE/.hi/repro/reproduction.sh` with `HI_BINARY` pointing at a
      **worktree-built** `target/debug/hi` (never the installed `hi`).
-3. Write `$INCIDENT/diagnosis.md` using **exactly** these keys (one per line):
+3. Write `$WORKTREE/.hi/diagnosis.md` using **exactly** these keys (one per line):
 
 ```
 reproduced: yes
@@ -49,7 +52,7 @@ test names, `--lib`). Sentinel re-runs them unsandboxed.
 
 ## Patch (phase 2)
 
-Read `$INCIDENT/diagnosis.md`. Patch **only** the worktree files listed there.
+Read `$WORKTREE/.hi/diagnosis.md`. Patch **only** the worktree files listed there.
 Re-run the same reproduction / `cargo test` Sentinel will run. Stop when it
 passes. Do not commit.
 
