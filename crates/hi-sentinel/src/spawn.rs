@@ -4,7 +4,9 @@ use std::cell::Cell;
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::process::{Child, Command};
@@ -132,6 +134,117 @@ pub fn signal_group(pgid: i32, sig: i32) {
     unsafe {
         libc::kill(-pgid, sig);
     }
+}
+
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+static INSTALL_PGID: AtomicI32 = AtomicI32::new(0);
+static INSTALL_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_install_signal(_sig: libc::c_int) {
+    abort_install_group();
+}
+
+fn abort_install_group() {
+    let pgid = INSTALL_PGID.load(Ordering::SeqCst);
+    if pgid > 1 {
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+    }
+    INSTALL_INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+struct InstallSignalGuard {
+    prev_int: libc::sighandler_t,
+    prev_term: libc::sighandler_t,
+}
+
+impl Drop for InstallSignalGuard {
+    fn drop(&mut self) {
+        INSTALL_PGID.store(0, Ordering::SeqCst);
+        unsafe {
+            libc::signal(libc::SIGINT, self.prev_int);
+            libc::signal(libc::SIGTERM, self.prev_term);
+        }
+    }
+}
+
+/// Wait for a process-group child. SIGINT/SIGTERM kill that group instead of leaking it.
+pub fn wait_install_child(
+    child: &mut std::process::Child,
+    pgid: i32,
+    timeout: Duration,
+    term_grace: Duration,
+) -> io::Result<std::process::ExitStatus> {
+    let _lock = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    INSTALL_INTERRUPTED.store(false, Ordering::SeqCst);
+    let prev_int = unsafe {
+        libc::signal(
+            libc::SIGINT,
+            on_install_signal as *const () as libc::sighandler_t,
+        )
+    };
+    let prev_term = unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            on_install_signal as *const () as libc::sighandler_t,
+        )
+    };
+    let _guard = InstallSignalGuard {
+        prev_int,
+        prev_term,
+    };
+    INSTALL_PGID.store(pgid, Ordering::SeqCst);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = child.try_wait()?;
+        if INSTALL_INTERRUPTED.load(Ordering::SeqCst) {
+            if status.is_none() {
+                terminate_group(child, pgid, term_grace);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "cargo install interrupted",
+            ));
+        }
+        if let Some(status) = status {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            terminate_group(child, pgid, term_grace);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "cargo install timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn terminate_group(child: &mut std::process::Child, pgid: i32, grace: Duration) {
+    signal_group(pgid, libc::SIGTERM);
+    let kill_at = Instant::now() + grace;
+    loop {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        if Instant::now() >= kill_at {
+            signal_group(pgid, libc::SIGKILL);
+            let _ = child.wait();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+pub fn interrupt_install() {
+    abort_install_group();
+}
+
+#[cfg(test)]
+pub fn install_pgid() -> i32 {
+    INSTALL_PGID.load(Ordering::SeqCst)
 }
 
 pub async fn abort_harness_child(

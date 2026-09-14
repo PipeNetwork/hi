@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -270,41 +270,17 @@ fn cargo_install(req: &ApplyRequest, package_path: &str, root: &Path) -> Result<
     unsafe {
         libc::setpgid(pid as i32, pid as i32);
     }
-    let status = wait_install(&mut child, pid, req.install_timeout)?;
+    let status = spawn::wait_install_child(
+        &mut child,
+        pid as i32,
+        req.install_timeout,
+        INSTALL_TERM_GRACE,
+    )
+    .map_err(|err| anyhow::anyhow!("cargo install {package_path}: {err}"))?;
     if !status.success() {
         bail!("cargo install {package_path} failed with {status}");
     }
     Ok(())
-}
-
-fn wait_install(
-    child: &mut std::process::Child,
-    pid: u32,
-    timeout: Duration,
-) -> Result<std::process::ExitStatus> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().context("wait cargo install")? {
-            return Ok(status);
-        }
-        if Instant::now() >= deadline {
-            spawn::signal_group(pid as i32, libc::SIGTERM);
-            let kill_at = Instant::now() + INSTALL_TERM_GRACE;
-            loop {
-                if child.try_wait().context("wait cargo after term")?.is_some() {
-                    break;
-                }
-                if Instant::now() >= kill_at {
-                    spawn::signal_group(pid as i32, libc::SIGKILL);
-                    let _ = child.wait();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            bail!("cargo install timed out");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 fn load_or_record_known_good(req: &ApplyRequest) -> Result<KnownGood, ApplyOutcome> {
@@ -420,6 +396,7 @@ mod tests {
     use super::*;
     use crate::test_fixture;
     use crate::worktree;
+    use std::time::Instant;
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -767,6 +744,46 @@ exit 0
                 ..
             } => assert!(msg.contains("timed out"), "{msg}"),
             other => panic!("expected InstallFailed timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sigint_kills_cargo_install_group() {
+        let mut fx = fixture(true, false);
+        let hang = fx._root.path().join("hang-cargo");
+        let ready = fx._root.path().join("hang-ready");
+        fs::write(
+            &hang,
+            format!(
+                "#!/bin/sh\necho started > '{}'\nexec sleep 30\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        fsutil::chmod_0700_file(&hang).unwrap();
+        fx.req.cargo = hang;
+        fx.req.install_timeout = Duration::from_secs(30);
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                if ready.is_file() && spawn::install_pgid() > 1 {
+                    spawn::interrupt_install();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        let outcome = maybe_apply(&fx.req);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "interrupt must not wait out sleep 30"
+        );
+        match outcome {
+            ApplyOutcome::Refused {
+                reason: ApplyRefuse::InstallFailed(msg),
+                ..
+            } => assert!(msg.contains("interrupted"), "{msg}"),
+            other => panic!("expected InstallFailed interrupted, got {other:?}"),
         }
     }
 }
