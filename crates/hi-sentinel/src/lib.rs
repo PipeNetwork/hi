@@ -3,7 +3,7 @@
 //! This crate is not the RSI candidate launcher (`hi-bootstrap` /
 //! `rsi-hi-worker`) and is not clap's "unlimited internal sentinel" cap
 //! (`parse_finite_u32_cap`). It only observes a child, classifies failures,
-//! and writes forensic bundles. Repair/apply live elsewhere.
+//! and writes forensic bundles.
 
 mod args;
 mod budget;

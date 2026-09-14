@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use hi_liveness::{Heartbeat, unix_ms};
+use hi_liveness::{HarnessState, Heartbeat, unix_ms};
 
 use crate::config::MonitorConfig;
 
@@ -38,7 +38,13 @@ pub struct Monitor {
     last_seq: Option<u64>,
     last_seq_change: Instant,
     last_heartbeat: Option<Heartbeat>,
+    last_progress_unix_ms: Option<u64>,
+    last_state: Option<HarnessState>,
+    last_pgids_empty: Option<bool>,
+    /// Set only after classify treated a ProgressStall as Some(class).
     progress_signaled: bool,
+    stale_since: Option<Instant>,
+    live_pgid_cap_emitted: bool,
 }
 
 impl Monitor {
@@ -52,12 +58,21 @@ impl Monitor {
             last_seq: None,
             last_seq_change: now,
             last_heartbeat: None,
+            last_progress_unix_ms: None,
+            last_state: None,
+            last_pgids_empty: None,
             progress_signaled: false,
+            stale_since: None,
+            live_pgid_cap_emitted: false,
         }
     }
 
     pub fn last_heartbeat(&self) -> Option<&Heartbeat> {
         self.last_heartbeat.as_ref()
+    }
+
+    pub fn note_classified_progress_stall(&mut self) {
+        self.progress_signaled = true;
     }
 
     pub fn poll(&mut self, heartbeat_path: &Path) -> Option<MonitorSignal> {
@@ -66,9 +81,8 @@ impl Monitor {
             return None;
         }
         if let Some(hb) = &self.last_heartbeat
-            && let Some(inv) = &hb.invariant
+            && hb.invariant.is_some()
         {
-            let _ = inv;
             return Some(MonitorSignal::Invariant {
                 heartbeat: hb.clone(),
             });
@@ -91,16 +105,25 @@ impl Monitor {
         }
         let hb = self.last_heartbeat.as_ref()?;
         let age = unix_ms().saturating_sub(hb.last_progress_unix_ms);
-        if Duration::from_millis(age) >= self.cfg.progress_timeout {
-            if self.progress_signaled {
-                return None;
-            }
-            self.progress_signaled = true;
-            return Some(MonitorSignal::ProgressStall {
-                heartbeat: hb.clone(),
-            });
+        if Duration::from_millis(age) < self.cfg.progress_timeout {
+            self.stale_since = None;
+            return None;
         }
-        None
+        let stale_since = *self.stale_since.get_or_insert_with(Instant::now);
+        if self.progress_signaled
+            && !self.live_pgid_cap_emitted
+            && !hb.child_pgids.is_empty()
+            && stale_since.elapsed() >= self.cfg.live_pgid_report_cap
+        {
+            self.live_pgid_cap_emitted = true;
+            self.progress_signaled = false;
+        }
+        if self.progress_signaled {
+            return None;
+        }
+        Some(MonitorSignal::ProgressStall {
+            heartbeat: hb.clone(),
+        })
     }
 
     fn read_update(&mut self, path: &Path) {
@@ -114,6 +137,20 @@ impl Monitor {
             self.last_seq = Some(hb.seq);
             self.last_seq_change = Instant::now();
         }
+        let pgids_empty = hb.child_pgids.is_empty();
+        let progress_moved = self.last_progress_unix_ms != Some(hb.last_progress_unix_ms);
+        let state_moved = self.last_state != Some(hb.state);
+        let pgids_moved = self.last_pgids_empty != Some(pgids_empty);
+        if progress_moved || state_moved || pgids_moved {
+            self.progress_signaled = false;
+        }
+        if progress_moved {
+            self.stale_since = None;
+            self.live_pgid_cap_emitted = false;
+        }
+        self.last_progress_unix_ms = Some(hb.last_progress_unix_ms);
+        self.last_state = Some(hb.state);
+        self.last_pgids_empty = Some(pgids_empty);
         self.last_heartbeat = Some(hb);
     }
 }

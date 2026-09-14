@@ -124,17 +124,13 @@ fn classify_exit(status: ExitStatus, ctx: &ClassifyContext) -> Option<Class> {
                 confidence: Confidence::High,
             });
         }
-        if sig == libc::SIGABRT && crash_evidence(ctx) {
-            return Some(Class::HarnessBug {
-                kind: BugKind::Crash,
-                confidence: Confidence::High,
-            });
-        }
         if is_user_stop_signal(sig) {
             return Some(Class::NotHarness {
                 kind: ExternalKind::UserStop,
             });
         }
+        // SIGABRT without a panic file / crash marker is NotHarness: the
+        // crash handler does not register SIGABRT.
     }
     if crash_evidence(ctx) {
         return Some(Class::HarnessBug {
@@ -378,6 +374,24 @@ mod tests {
             class,
             Some(Class::NotHarness {
                 kind: ExternalKind::UserStop
+            })
+        );
+    }
+
+    #[test]
+    fn sigabrt_without_crash_evidence_is_not_harness() {
+        let status = ExitStatus::from_raw(libc::SIGABRT);
+        let class = classify(
+            &MonitorSignal::ChildExited {
+                status,
+                waited: Duration::from_millis(1),
+            },
+            &ctx(),
+        );
+        assert_eq!(
+            class,
+            Some(Class::NotHarness {
+                kind: ExternalKind::UserError
             })
         );
     }

@@ -40,6 +40,23 @@ case "$MODE" in
     write_hb 1 1
     while true; do sleep 1; done
     ;;
+  idle_then_tool)
+    seq=0
+    i=0
+    while [ "$i" -lt 8 ]; do
+      seq=$((seq+1))
+      i=$((i+1))
+      STATE=idle
+      write_hb "$seq" 1
+      sleep 0.03
+    done
+    STATE=executing_tool
+    while true; do
+      seq=$((seq+1))
+      write_hb "$seq" 1
+      sleep 0.02
+    done
+    ;;
   exit1)
     exit 1
     ;;
@@ -284,6 +301,20 @@ async fn sigint_is_user_stop() {
             kind: ExternalKind::UserStop
         })
     );
+}
+
+#[tokio::test]
+async fn idle_ignored_stall_then_executing_tool_reaps() {
+    let outcome = run("idle_then_tool", "idle", "[]", progress_monitor(), false).await;
+    assert_eq!(
+        outcome.class,
+        Some(Class::HarnessBug {
+            kind: BugKind::Stall,
+            confidence: crate::classify::Confidence::High
+        })
+    );
+    assert!(!outcome.child_alive);
+    assert!(outcome.incident_dir.is_some());
 }
 
 #[tokio::test]

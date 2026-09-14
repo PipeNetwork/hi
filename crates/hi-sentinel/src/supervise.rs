@@ -166,28 +166,11 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
     let mut monitor = Monitor::new(cfg.monitor.clone(), pid, instance);
     let mut report_written: Option<PathBuf> = None;
 
-    let finish_dead = |class: Option<Class>, status: ExitStatus, incident_dir: Option<PathBuf>| {
-        spawn::restore_terminal(&terminal);
-        let exit_code = if class.as_ref().is_some_and(Class::is_harness_bug) {
-            1
-        } else {
-            status_code(status)
-        };
-        SupervisorOutcome {
-            class,
-            child_status: Some(status),
-            child_pid: pid,
-            child_alive: false,
-            incident_dir,
-            exit_code,
-            leftover: None,
-        }
-    };
-
     loop {
         tokio::select! {
             status = child.wait() => {
                 let status = status.context("waiting for supervised child")?;
+                terminal.restore();
                 let ctx = classify_ctx(&cfg, &crash_dir, &panic_file, monitor.last_heartbeat(), false);
                 let signal = MonitorSignal::ChildExited {
                     status,
@@ -208,7 +191,6 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                     ) {
                         Ok(bundle) => {
                             incident_dir = Some(bundle.dir);
-                            report_user(class, incident_dir.as_ref());
                         }
                         Err(err) => {
                             spawn::write_supervisor_log(
@@ -218,7 +200,25 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                         }
                     }
                 }
-                return Ok(finish_dead(class, status, incident_dir));
+                if let Some(class) = &class
+                    && (class.is_harness_bug() || matches!(class, Class::ReportOnly { .. }))
+                {
+                    report_user(class, incident_dir.as_ref());
+                }
+                let exit_code = if class.as_ref().is_some_and(Class::is_harness_bug) {
+                    1
+                } else {
+                    status_code(status)
+                };
+                return Ok(SupervisorOutcome {
+                    class,
+                    child_status: Some(status),
+                    child_pid: pid,
+                    child_alive: false,
+                    incident_dir,
+                    exit_code,
+                    leftover: None,
+                });
             }
             _ = tokio::time::sleep(cfg.monitor.poll_interval) => {
                 let Some(signal) = monitor.poll(&heartbeat_path) else {
@@ -228,6 +228,9 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                 let Some(class) = classify::classify(&signal, &ctx) else {
                     continue;
                 };
+                if matches!(signal, MonitorSignal::ProgressStall { .. }) {
+                    monitor.note_classified_progress_stall();
+                }
                 spawn::write_supervisor_log(
                     &runtime,
                     &format!("classified {} {}", class.class_slug(), class.kind_slug()),
@@ -243,6 +246,7 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                         cfg.monitor.term_grace,
                     )
                     .await?;
+                    terminal.restore();
                     let bundle = incident::write_bundle(
                         &cfg,
                         &class,
@@ -251,7 +255,6 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                         started.elapsed(),
                     );
                     let incident_dir = bundle.ok().map(|b| b.dir);
-                    spawn::restore_terminal(&terminal);
                     report_user(&class, incident_dir.as_ref());
                     return Ok(SupervisorOutcome {
                         class: Some(class),
@@ -276,7 +279,6 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                     report_written = Some(bundle.dir);
                 }
                 if cfg.once {
-                    spawn::restore_terminal(&terminal);
                     return Ok(SupervisorOutcome {
                         class: Some(class),
                         child_status: None,

@@ -1,4 +1,4 @@
-//! Generation / retention caps. Repair apply budgets are unused until apply exists.
+//! Incident retention: TTL and count cap.
 
 use std::fs;
 use std::path::Path;

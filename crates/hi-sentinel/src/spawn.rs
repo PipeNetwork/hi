@@ -1,5 +1,6 @@
 //! Job-control spawn. One wait API: tokio `child.wait()` — never waitpid(WNOHANG).
 
+use std::cell::Cell;
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
@@ -15,6 +16,7 @@ pub struct TerminalGuard {
     tty_fd: Option<i32>,
     orig: Option<libc::termios>,
     supervisor_pgid: i32,
+    restored: Cell<bool>,
 }
 
 pub struct Spawned {
@@ -41,6 +43,32 @@ pub fn snapshot_terminal() -> TerminalGuard {
         tty_fd,
         orig,
         supervisor_pgid,
+        restored: Cell::new(false),
+    }
+}
+
+impl TerminalGuard {
+    pub fn restore(&self) {
+        if self.restored.replace(true) {
+            return;
+        }
+        if let (Some(fd), Some(orig)) = (self.tty_fd, self.orig.as_ref()) {
+            unsafe {
+                libc::tcsetattr(fd, libc::TCSANOW, orig);
+                libc::tcsetpgrp(fd, self.supervisor_pgid);
+            }
+        }
+        let mut out = io::stdout();
+        let _ = out.write_all(
+            b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1049l",
+        );
+        let _ = out.flush();
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 
@@ -97,20 +125,6 @@ pub fn spawn_child(
         pgid,
         terminal,
     })
-}
-
-pub fn restore_terminal(terminal: &TerminalGuard) {
-    if let (Some(fd), Some(orig)) = (terminal.tty_fd, terminal.orig.as_ref()) {
-        unsafe {
-            libc::tcsetattr(fd, libc::TCSANOW, orig);
-            libc::tcsetpgrp(fd, terminal.supervisor_pgid);
-        }
-    }
-    let mut out = io::stdout();
-    let _ = out.write_all(
-        b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1049l",
-    );
-    let _ = out.flush();
 }
 
 pub fn signal_group(pgid: i32, sig: i32) {

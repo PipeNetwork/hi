@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-/// Sentinel flags, flattened onto `Cli` so `cli.rs` stays under the line ratchet.
 #[derive(Args, Clone, Debug, Default)]
 pub struct SentinelFlags {
     /// Wrap this process in hi-sentinel (crash/stall/invariant repair).

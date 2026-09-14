@@ -142,7 +142,7 @@ pub fn write_bundle(
     });
     let hi_binary = cfg.hi_binary.display().to_string();
     let hi_binary_blake3 = blake3_file(&cfg.hi_binary).unwrap_or_default();
-    let last_state = heartbeat.map(|h| format!("{:?}", h.state).to_ascii_lowercase());
+    let last_state = heartbeat.map(|h| state_slug(h.state));
     let last_tool = heartbeat.and_then(|h| h.last_tool.clone());
     let pre_checkpoint = heartbeat.and_then(|h| h.pre_checkpoint.clone());
     let session_path = heartbeat.and_then(|h| h.session_path.clone());
@@ -317,10 +317,37 @@ fn blake3_file(path: &Path) -> Option<String> {
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
+fn state_slug(state: hi_liveness::HarnessState) -> String {
+    serde_json::to_string(&state)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string()
+}
+
 fn truncate(value: &str, max: usize) -> String {
-    if value.len() <= max {
-        value.to_string()
-    } else {
-        format!("{}…", &value[..max])
+    let mut out: String = value.chars().take(max).collect();
+    if out.chars().count() < value.chars().count() {
+        out.push('…');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hi_liveness::HarnessState;
+
+    #[test]
+    fn last_state_uses_snake_case() {
+        assert_eq!(state_slug(HarnessState::AwaitingUser), "awaiting_user");
+        assert_eq!(state_slug(HarnessState::ExecutingTool), "executing_tool");
+    }
+
+    #[test]
+    fn truncate_does_not_split_multibyte_chars() {
+        let value = "é".repeat(600);
+        let out = truncate(&value, 512);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 513);
     }
 }
