@@ -89,6 +89,7 @@ pub fn next_generation(cfg: &SupervisorConfig, plan: &RelaunchPlan) -> Superviso
     next.child_program = plan.sidecar_hi.clone();
     next.hi_binary = plan.sidecar_hi.clone();
     next.child_args = relaunch_args(&cfg.child_args, plan.session_path.as_deref());
+    next.leaked_end_of_flags = false;
     next.seed_turn_intent = plan.turn_intent.clone();
     next.extra_env
         .retain(|(key, _)| key != ENV_RESUME_INCOMPLETE);
@@ -262,6 +263,7 @@ mod tests {
             extra_env: Vec::new(),
             once: false,
             seed_turn_intent: None,
+            leaked_end_of_flags: false,
         };
         let plan = RelaunchPlan {
             incident_id: "incident-1".into(),

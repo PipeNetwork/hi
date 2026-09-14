@@ -120,6 +120,7 @@ fn cfg(
         ],
         once,
         seed_turn_intent: None,
+        leaked_end_of_flags: false,
     }
 }
 

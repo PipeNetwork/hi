@@ -108,6 +108,7 @@ async fn run_async() -> Result<i32> {
     if let Some(incident) = incident {
         return run_manual_repair(incident, cli.checkout, cli.apply).await;
     }
+    let leaked_end_of_flags = hi_argv.iter().any(|arg| arg == "--");
     let stripped = strip_sentinel_args(hi_argv);
     let hi_binary = std::env::var_os(ENV_HI_BINARY)
         .map(PathBuf::from)
@@ -140,6 +141,7 @@ async fn run_async() -> Result<i32> {
         extra_env: Vec::new(),
         once: false,
         seed_turn_intent: None,
+        leaked_end_of_flags,
     };
     let outcome = supervise(cfg).await?;
     Ok(outcome.exit_code)
@@ -500,6 +502,7 @@ fn classify_ctx(
         panic_file: panic_file.to_path_buf(),
         last_heartbeat: last.cloned(),
         child_alive: alive,
+        leaked_end_of_flags: cfg.leaked_end_of_flags,
     }
 }
 
@@ -727,6 +730,7 @@ async fn run_manual_repair(
         extra_env: Vec::new(),
         once: true,
         seed_turn_intent: None,
+        leaked_end_of_flags: false,
     };
     let runtime = paths::runtime_dir(&state_dir, "repair");
     fsutil::mkdir_0700(&runtime)?;

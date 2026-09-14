@@ -94,6 +94,8 @@ pub struct SupervisorConfig {
     pub once: bool,
     /// Copy onto the new runtime `turn-intent.json` before a resume spawn.
     pub seed_turn_intent: Option<PathBuf>,
+    /// `hi-sentinel -- --session-file` leaked `--` into the child argv.
+    pub leaked_end_of_flags: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

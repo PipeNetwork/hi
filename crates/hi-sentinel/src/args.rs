@@ -19,6 +19,9 @@ pub fn strip_sentinel_args(args: impl IntoIterator<Item = OsString>) -> Stripped
             continue;
         };
         match text {
+            // Clap trailing args after `hi-sentinel -- ...` may still include `--`.
+            // If forwarded to `hi`, `--session-file` becomes a positional prompt.
+            "--" => {}
             "--autoharnessfix" | "--no-autoharnessfix" => {}
             "--autoharnessfix-apply" | "--apply" => out.apply = true,
             "--autoharnessfix-checkout" | "--checkout" => {
@@ -219,6 +222,22 @@ fn is_value_short(flag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_leaked_double_dash_so_session_file_stays_a_flag() {
+        let stripped = strip_sentinel_args(
+            ["--", "--session-file", "/tmp/s.jsonl"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        assert_eq!(
+            stripped.args,
+            vec![
+                OsString::from("--session-file"),
+                OsString::from("/tmp/s.jsonl"),
+            ]
+        );
+    }
 
     #[test]
     fn strips_parent_flags_and_keeps_prompt() {

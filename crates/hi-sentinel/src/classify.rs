@@ -98,6 +98,8 @@ pub struct ClassifyContext {
     pub panic_file: PathBuf,
     pub last_heartbeat: Option<Heartbeat>,
     pub child_alive: bool,
+    /// Child argv started with `--`, so `--session-file` was a prompt.
+    pub leaked_end_of_flags: bool,
 }
 
 /// `None` means ignored (Idle / AwaitingUser / exit 0).
@@ -146,10 +148,20 @@ fn classify_exit(status: ExitStatus, ctx: &ClassifyContext) -> Option<Class> {
     }
     match status.code() {
         Some(0) => None,
+        _ if ctx.leaked_end_of_flags && startup_death(ctx) => Some(Class::HarnessBug {
+            kind: BugKind::Crash,
+            confidence: Confidence::High,
+        }),
         _ => Some(Class::NotHarness {
             kind: ExternalKind::UserError,
         }),
     }
+}
+
+fn startup_death(ctx: &ClassifyContext) -> bool {
+    ctx.last_heartbeat
+        .as_ref()
+        .is_none_or(|hb| hb.turn_index == 0 && hb.last_tool.is_none())
 }
 
 fn classify_invariant(heartbeat: &Heartbeat) -> Option<Class> {
@@ -287,6 +299,7 @@ mod tests {
             panic_file: PathBuf::from("/tmp/no-panic-sentinel"),
             last_heartbeat: None,
             child_alive: true,
+            leaked_end_of_flags: false,
         }
     }
 
@@ -340,6 +353,32 @@ mod tests {
                 "{state:?}"
             );
         }
+    }
+
+    #[test]
+    fn leaked_double_dash_startup_exit_is_harness_bug() {
+        let mut ctx = ctx();
+        ctx.leaked_end_of_flags = true;
+        ctx.child_alive = false;
+        let mut hb = sample_beat(HarnessState::Idle, vec![], "/tmp/ws");
+        hb.turn_index = 0;
+        hb.last_tool = None;
+        ctx.last_heartbeat = Some(hb);
+        let status = ExitStatus::from_raw(2 << 8);
+        let class = classify(
+            &MonitorSignal::ChildExited {
+                status,
+                waited: Duration::from_millis(50),
+            },
+            &ctx,
+        );
+        assert_eq!(
+            class,
+            Some(Class::HarnessBug {
+                kind: BugKind::Crash,
+                confidence: Confidence::High
+            })
+        );
     }
 
     #[test]
