@@ -290,6 +290,7 @@ pub(crate) fn sample_beat(state: HarnessState, pgids: Vec<i32>, workspace: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hi_liveness::InvariantViolation;
     use std::time::Duration;
 
     fn ctx() -> ClassifyContext {
@@ -459,6 +460,28 @@ mod tests {
         assert_eq!(
             classify(&MonitorSignal::ProgressStall { heartbeat: hb }, &ctx()),
             None
+        );
+    }
+
+    #[test]
+    fn empty_assistant_after_tools_is_harness_bug_even_when_idle() {
+        let mut hb = sample_beat(HarnessState::Idle, vec![], "/tmp/ws");
+        hb.invariant = Some(InvariantViolation {
+            code: InvariantCode::EmptyAssistantAfterTools,
+            ts_unix_ms: 1,
+            detail: None,
+        });
+        let class = classify(&MonitorSignal::Invariant { heartbeat: hb }, &ctx());
+        assert_eq!(
+            class,
+            Some(Class::HarnessBug {
+                kind: BugKind::Invariant,
+                confidence: Confidence::High
+            })
+        );
+        assert!(
+            AUTO_REPAIR_SET.contains(&InvariantCode::EmptyAssistantAfterTools),
+            "sentinel must auto-repair this, not leave the live child idle"
         );
     }
 }

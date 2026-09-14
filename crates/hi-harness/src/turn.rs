@@ -108,11 +108,15 @@ impl Harness {
         let mut mutated = false;
         let mut round = 0usize;
         let mut probe_refusals = 0u32;
+        let mut empty_after_tools = 0u32;
+        let mut continue_hint: Option<&str> = None;
 
         // Continues until the model stops calling tools, the user cancels, or
         // a request fails. There is no round/step cap. Empty streams are
-        // retried in the Pipe client (same request). A still-empty stop ends
-        // the turn the way Grok does — `/retry` or a new prompt continues.
+        // retried in the Pipe client (same request). An empty stop *after
+        // tools* is not a finished turn: continue with a hint, then report
+        // `EmptyAssistantAfterTools` so Sentinel can auto-repair. A round-0
+        // empty stop (no tools) still ends the turn — `/retry` continues.
         loop {
             if cancel.is_cancelled() {
                 return self
@@ -150,7 +154,7 @@ impl Harness {
             ui.status(&format!("pipe · {}", self.model()));
             self.liveness
                 .set_state(hi_liveness::HarnessState::AwaitingModel);
-            let messages = self.request_messages();
+            let messages = self.request_messages(continue_hint);
             let tools = advertised_tools();
             let liveness = self.liveness.clone();
             let mut on_event = |delta: StreamDelta| {
@@ -227,6 +231,41 @@ impl Harness {
             ui.assistant_end();
 
             if completion.tool_calls.is_empty() {
+                if completion.is_empty() && round > 0 {
+                    if empty_after_tools < EMPTY_AFTER_TOOLS_CONTINUATIONS {
+                        empty_after_tools = empty_after_tools.saturating_add(1);
+                        // Compact may have been suppressed after a prior
+                        // failure; try again before the continuation request
+                        // so the model is not asked to finish a 3M-token turn.
+                        self.compact_suppressed = false;
+                        continue_hint = Some(EMPTY_AFTER_TOOLS_HINT);
+                        ui.status("empty model stop after tools; continuing");
+                        continue;
+                    }
+                    hi_liveness::report_invariant(
+                        &self.liveness,
+                        hi_liveness::InvariantCode::EmptyAssistantAfterTools,
+                    );
+                    const MSG: &str = "model stopped after tool work with no user-visible answer";
+                    ui.turn_error(
+                        "empty_stop",
+                        MSG,
+                        "supervised sessions auto-repair; otherwise /retry",
+                    );
+                    self.session_usage.add(turn_usage);
+                    ui.session_usage(self.session_usage);
+                    self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
+                    self.close_persisted_turn(persisted_before, TurnStopReason::Error);
+                    ui.changed_files(changed.clone());
+                    ui.turn_end("empty stop after tools");
+                    return Ok(TurnOutcome {
+                        stop_reason: TurnStopReason::Error,
+                        usage: turn_usage,
+                        changed_files: changed,
+                        error: Some(MSG.into()),
+                        verification: None,
+                    });
+                }
                 if !completion.is_empty() {
                     self.messages.push(assistant_message(&completion));
                 }
@@ -246,6 +285,8 @@ impl Harness {
                 });
             }
 
+            empty_after_tools = 0;
+            continue_hint = None;
             self.messages.push(assistant_message(&completion));
             self.liveness
                 .set_state(hi_liveness::HarnessState::ExecutingTool);
@@ -403,9 +444,14 @@ impl Harness {
             && self.occupancy_percent() >= AUTO_COMPACT_THRESHOLD_PERCENT
     }
 
-    pub(crate) fn request_messages(&self) -> Vec<Message> {
+    pub(crate) fn request_messages(&self, continue_hint: Option<&str>) -> Vec<Message> {
         let mut out = vec![Message::system(SYSTEM_PROMPT)];
         out.extend(self.messages.iter().cloned());
+        if let Some(hint) = continue_hint.map(str::trim).filter(|text| !text.is_empty()) {
+            // Not persisted: the session file stays a record of real user
+            // turns. The hint only exists on the next Pipe request.
+            out.push(Message::user(hint));
+        }
         out
     }
 
@@ -462,6 +508,17 @@ impl Harness {
         result
     }
 }
+
+/// Pipe already retries the same empty stream three times. After that, the
+/// harness asks once more with a continuation hint, then once more, then
+/// reports the invariant. Two continuations is enough to recover a truncated
+/// final answer without looping forever on a model that only returns usage.
+const EMPTY_AFTER_TOOLS_CONTINUATIONS: u32 = 2;
+
+const EMPTY_AFTER_TOOLS_HINT: &str = "\
+Your last response ended with no user-visible answer after tool work. \
+Continue the task and write the complete reply to the user. Do not stop \
+without that reply.";
 
 fn turn_intent_prompt() -> Option<String> {
     let path = std::env::var_os(ENV_TURN_INTENT)?;

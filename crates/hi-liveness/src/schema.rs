@@ -49,6 +49,10 @@ pub enum InvariantCode {
     ChildLeak,
     ConfirmUnanswered,
     IdenticalToolStorm,
+    /// Model stopped after executing tools with no user-visible text. The
+    /// harness continues a bounded number of times, then reports this so
+    /// Sentinel can auto-repair instead of leaving an idle, unfinished turn.
+    EmptyAssistantAfterTools,
 }
 
 impl InvariantCode {
@@ -60,6 +64,7 @@ impl InvariantCode {
             Self::ChildLeak => "child_leak",
             Self::ConfirmUnanswered => "confirm_unanswered",
             Self::IdenticalToolStorm => "identical_tool_storm",
+            Self::EmptyAssistantAfterTools => "empty_assistant_after_tools",
         }
     }
 }
@@ -71,6 +76,7 @@ pub const AUTO_REPAIR_SET: &[InvariantCode] = &[
     InvariantCode::SessionAppendFailed,
     InvariantCode::ChildLeak,
     InvariantCode::ConfirmUnanswered,
+    InvariantCode::EmptyAssistantAfterTools,
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -377,20 +377,74 @@ async fn empty_stop_ends_the_turn_without_a_fake_assistant() {
     );
 }
 
+fn empty_sse() -> Scripted {
+    Scripted::Sse(vec![usage_chunk(10, 0)])
+}
+
+/// Pipe retries an empty stream 4 times (attempts 0..=3). One harness
+/// continuation is another 4. Two continuations plus the first empty
+/// completion is 12 empty scripts after the tool round.
+fn empty_stream_retries() -> Vec<Scripted> {
+    vec![empty_sse(), empty_sse(), empty_sse(), empty_sse()]
+}
+
 #[tokio::test]
-async fn empty_stop_after_tools_ends_the_turn() {
+async fn empty_stop_after_tools_continues_then_errors_and_reports_invariant() {
     let dir = tempfile::tempdir().unwrap();
     let args = serde_json::json!({"path": "."}).to_string();
-    let Some(server) = MockPipe::new(vec![
-        Scripted::Sse(vec![
-            tool_chunk(0, "call_l", "list", &args),
-            usage_chunk(8, 4),
-        ]),
-        Scripted::Sse(vec![usage_chunk(10, 0)]),
-        Scripted::Sse(vec![usage_chunk(10, 0)]),
-        Scripted::Sse(vec![usage_chunk(10, 0)]),
-        Scripted::Sse(vec![usage_chunk(10, 0)]),
-    ]) else {
+    let mut scripts = vec![Scripted::Sse(vec![
+        tool_chunk(0, "call_l", "list", &args),
+        usage_chunk(8, 4),
+    ])];
+    // First empty completion + two harness continuations, each with Pipe's
+    // four empty-stream retries.
+    for _ in 0..3 {
+        scripts.extend(empty_stream_retries());
+    }
+    let Some(server) = MockPipe::new(scripts) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable("review and fix", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, TurnStopReason::Error);
+    assert!(ui.texts.is_empty());
+    assert!(
+        ui.errors.iter().any(|(kind, _)| kind == "empty_stop"),
+        "empty-after-tools must surface a turn error, got {:?}",
+        ui.errors
+    );
+    assert_eq!(
+        harness.liveness().snapshot().invariant.map(|inv| inv.code),
+        Some(hi_liveness::InvariantCode::EmptyAssistantAfterTools),
+        "Sentinel must see a sticky auto-repair invariant on the live child"
+    );
+    assert!(
+        harness.messages().iter().all(|message| {
+            message.role != hi_ai::Role::Assistant || !message.content.is_empty()
+        }),
+        "empty assistant stop is not persisted"
+    );
+}
+
+#[tokio::test]
+async fn empty_stop_after_tools_recovers_on_continuation() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = serde_json::json!({"path": "."}).to_string();
+    let mut scripts = vec![Scripted::Sse(vec![
+        tool_chunk(0, "call_l", "list", &args),
+        usage_chunk(8, 4),
+    ])];
+    scripts.extend(empty_stream_retries());
+    scripts.push(Scripted::Sse(vec![
+        text_chunk("listing looks fine"),
+        usage_chunk(12, 3),
+    ]));
+    let Some(server) = MockPipe::new(scripts) else {
         return;
     };
     let mut harness = test_harness(&server.url, dir.path().to_path_buf());
@@ -401,12 +455,10 @@ async fn empty_stop_after_tools_ends_the_turn() {
         .await
         .unwrap();
     assert_eq!(outcome.stop_reason, TurnStopReason::Completed);
-    assert!(ui.texts.is_empty());
+    assert!(ui.texts.join("").contains("listing looks fine"));
     assert!(
-        harness.messages().iter().all(|message| {
-            message.role != hi_ai::Role::Assistant || !message.content.is_empty()
-        }),
-        "empty assistant stop is not persisted"
+        harness.liveness().snapshot().invariant.is_none(),
+        "a recovered continuation must not stamp the auto-repair invariant"
     );
 }
 
