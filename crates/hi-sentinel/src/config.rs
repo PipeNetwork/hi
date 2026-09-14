@@ -1,5 +1,6 @@
 //! Supervisor and monitor knobs. Machine `[autoharnessfix]` only — never `--config PATH`.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -7,6 +8,13 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::paths;
+
+/// Cheap Pipe id for diagnose. Same string as pipenetwork `planner_model_default`.
+pub const DEFAULT_DIAGNOSE_MODEL: &str = "pipe/glm-5.2-fast";
+/// Stronger Pipe id when the machine profile has no `model` (hi-harness DEFAULT_MODEL).
+pub const DEFAULT_PATCH_MODEL: &str = "pipe/deepseek-v4-flash-0731";
+
+pub const PIPE_MODEL_ERROR: &str = "autoharnessfix diagnose_model/patch_model must be a pipe/… id";
 
 #[derive(Clone, Debug)]
 pub struct MonitorConfig {
@@ -95,26 +103,126 @@ pub struct MachineSection {
     #[allow(dead_code)]
     pub apply: bool,
     pub checkout: Option<PathBuf>,
+    pub diagnose_model: Option<String>,
+    pub patch_model: Option<String>,
     pub stall_progress_secs: Option<u64>,
     pub liveness_secs: Option<u64>,
     pub live_pgid_report_secs: Option<u64>,
-    #[allow(dead_code)]
     pub max_repairs_per_session: Option<u32>,
+    pub max_attempts_per_incident: Option<u32>,
     pub incident_retention_days: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RepairModels {
+    pub diagnose: String,
+    pub patch: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RepairConfig {
+    pub diagnose_timeout: Duration,
+    pub patch_timeout: Duration,
+    pub max_repairs_per_session: u32,
+    pub max_attempts_per_incident: u32,
+}
+
+impl Default for RepairConfig {
+    fn default() -> Self {
+        Self {
+            diagnose_timeout: Duration::from_secs(8 * 60),
+            patch_timeout: Duration::from_secs(20 * 60),
+            max_repairs_per_session: 2,
+            max_attempts_per_incident: 1,
+        }
+    }
+}
+
+impl RepairConfig {
+    pub fn from_machine_and_env() -> Self {
+        let mut cfg = Self::default();
+        if let Some(section) = peek_machine() {
+            if let Some(n) = section.max_repairs_per_session {
+                cfg.max_repairs_per_session = n.max(1);
+            }
+            if let Some(n) = section.max_attempts_per_incident {
+                cfg.max_attempts_per_incident = n.max(1);
+            }
+        }
+        override_ms("HI_SENTINEL_DIAGNOSE_MS", &mut cfg.diagnose_timeout);
+        override_ms("HI_SENTINEL_PATCH_MS", &mut cfg.patch_timeout);
+        cfg
+    }
 }
 
 #[derive(Default, Deserialize)]
 struct MachineFile {
+    default_profile: Option<String>,
     #[serde(default)]
     autoharnessfix: Option<MachineSection>,
+    #[serde(default)]
+    profiles: HashMap<String, ProfilePeek>,
+}
+
+#[derive(Default, Deserialize)]
+struct ProfilePeek {
+    model: Option<String>,
 }
 
 pub fn peek_machine() -> Option<MachineSection> {
+    peek_machine_file()?.autoharnessfix
+}
+
+fn peek_machine_file() -> Option<MachineFile> {
     let path = paths::default_config_path()?;
     let text = std::fs::read_to_string(path).ok()?;
-    toml::from_str::<MachineFile>(&text)
-        .ok()
-        .and_then(|file| file.autoharnessfix)
+    toml::from_str(&text).ok()
+}
+
+pub fn peek_machine_profile_model() -> Option<String> {
+    let file = peek_machine_file()?;
+    let name = file
+        .default_profile
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+    file.profiles
+        .get(name)
+        .and_then(|p| p.model.clone())
+        .filter(|m| !m.trim().is_empty())
+}
+
+/// Both ids must be `pipe/…`. Empty / non-Pipe fail closed (skip repair).
+pub fn resolve_repair_models(
+    section: Option<&MachineSection>,
+) -> Result<RepairModels, &'static str> {
+    let diagnose = match section.and_then(|s| s.diagnose_model.as_deref()) {
+        None => DEFAULT_DIAGNOSE_MODEL.to_string(),
+        Some(id) => require_pipe(id)?,
+    };
+    let patch = match section.and_then(|s| s.patch_model.as_deref()) {
+        None => {
+            let fallback =
+                peek_machine_profile_model().unwrap_or_else(|| DEFAULT_PATCH_MODEL.to_string());
+            require_pipe(&fallback)?
+        }
+        Some(id) => require_pipe(id)?,
+    };
+    Ok(RepairModels { diagnose, patch })
+}
+
+fn require_pipe(id: &str) -> Result<String, &'static str> {
+    let trimmed = id.trim();
+    if is_pipe_model(trimmed) {
+        Ok(trimmed.to_string())
+    } else {
+        Err(PIPE_MODEL_ERROR)
+    }
+}
+
+pub fn is_pipe_model(id: &str) -> bool {
+    let rest = id.strip_prefix("pipe/").unwrap_or("");
+    !rest.is_empty() && !rest.chars().any(char::is_whitespace)
 }
 
 pub fn instance_token() -> String {
@@ -125,4 +233,55 @@ pub fn instance_token() -> String {
         .unwrap_or(0);
     let mixed = pid.wrapping_shl(64) ^ ns ^ 0xA5A5_5A5A_C3C3_3C3C_F00D_D00F_BEEF_FEED;
     format!("{mixed:032x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_pipe_ids() {
+        let models = resolve_repair_models(None).unwrap();
+        assert!(is_pipe_model(&models.diagnose));
+        assert!(is_pipe_model(&models.patch));
+        assert_eq!(models.diagnose, DEFAULT_DIAGNOSE_MODEL);
+        assert_eq!(models.patch, DEFAULT_PATCH_MODEL);
+    }
+
+    #[test]
+    fn empty_or_non_pipe_fails_closed() {
+        let empty = MachineSection {
+            diagnose_model: Some(String::new()),
+            ..MachineSection::default()
+        };
+        assert_eq!(
+            resolve_repair_models(Some(&empty)).unwrap_err(),
+            PIPE_MODEL_ERROR
+        );
+        let openai = MachineSection {
+            patch_model: Some("openai/gpt-4".into()),
+            ..MachineSection::default()
+        };
+        assert_eq!(
+            resolve_repair_models(Some(&openai)).unwrap_err(),
+            PIPE_MODEL_ERROR
+        );
+        let bare = MachineSection {
+            diagnose_model: Some("pipe/".into()),
+            ..MachineSection::default()
+        };
+        assert!(resolve_repair_models(Some(&bare)).is_err());
+    }
+
+    #[test]
+    fn explicit_pipe_ids_win() {
+        let section = MachineSection {
+            diagnose_model: Some("pipe/glm-5.2-fast".into()),
+            patch_model: Some("pipe/deepseek-v4-flash-0731".into()),
+            ..MachineSection::default()
+        };
+        let models = resolve_repair_models(Some(&section)).unwrap();
+        assert_eq!(models.diagnose, "pipe/glm-5.2-fast");
+        assert_eq!(models.patch, "pipe/deepseek-v4-flash-0731");
+    }
 }

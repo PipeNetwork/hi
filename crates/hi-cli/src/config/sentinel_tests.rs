@@ -11,6 +11,24 @@ fn autoharnessfix_parses_and_conflicts_with_rsi() {
 }
 
 #[test]
+fn repair_role_does_not_exec_sentinel() {
+    let _lock = crate::CWD_LOCK.lock().unwrap();
+    let previous = std::env::var_os("HI_SENTINEL_ROLE");
+    unsafe {
+        std::env::set_var("HI_SENTINEL_ROLE", "repair");
+    }
+    let cli = Cli::try_parse_from(["hi", "--autoharnessfix"]).unwrap();
+    let result = crate::sentinel_exec::maybe_exec_into_sentinel(&cli);
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HI_SENTINEL_ROLE", value),
+            None => std::env::remove_var("HI_SENTINEL_ROLE"),
+        }
+    }
+    result.expect("ROLE=repair must skip exec rather than wrap a nested supervisor");
+}
+
+#[test]
 fn show_config_and_daemon_skip_wrap() {
     let show = Cli::try_parse_from(["hi", "--autoharnessfix", "--show-config"]).unwrap();
     assert!(skip_exec_for_mode(&show));

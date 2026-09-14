@@ -23,6 +23,7 @@ use crate::fsutil;
 use crate::incident;
 use crate::monitor::{Monitor, MonitorSignal};
 use crate::paths;
+use crate::repair::{self, RepairOutcome};
 use crate::spawn;
 
 #[derive(Parser, Debug)]
@@ -200,10 +201,16 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                         }
                     }
                 }
+                let repair_note = match class.as_ref() {
+                    Some(class) if class.is_harness_bug() => {
+                        maybe_run_repair(&cfg, class, incident_dir.as_deref(), &runtime).await
+                    }
+                    _ => None,
+                };
                 if let Some(class) = &class
                     && (class.is_harness_bug() || matches!(class, Class::ReportOnly { .. }))
                 {
-                    report_user(class, incident_dir.as_ref());
+                    report_user(class, incident_dir.as_ref(), repair_note.as_deref());
                 }
                 let exit_code = if class.as_ref().is_some_and(Class::is_harness_bug) {
                     1
@@ -255,7 +262,9 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                         started.elapsed(),
                     );
                     let incident_dir = bundle.ok().map(|b| b.dir);
-                    report_user(&class, incident_dir.as_ref());
+                    let repair_note =
+                        maybe_run_repair(&cfg, &class, incident_dir.as_deref(), &runtime).await;
+                    report_user(&class, incident_dir.as_ref(), repair_note.as_deref());
                     return Ok(SupervisorOutcome {
                         class: Some(class),
                         child_status: Some(status),
@@ -324,7 +333,28 @@ fn status_code(status: ExitStatus) -> i32 {
     1
 }
 
-fn report_user(class: &Class, dir: Option<&PathBuf>) {
+async fn maybe_run_repair(
+    cfg: &SupervisorConfig,
+    class: &Class,
+    incident_dir: Option<&std::path::Path>,
+    runtime: &std::path::Path,
+) -> Option<String> {
+    let dir = incident_dir?;
+    spawn::write_supervisor_log(runtime, "repair starting");
+    let note = match repair::maybe_repair(cfg, class, dir).await {
+        RepairOutcome::Completed { branch, gate, .. } if gate.passed => {
+            format!("Repair available on branch {branch}. Not applied.")
+        }
+        RepairOutcome::Completed { branch, .. } => {
+            format!("Repair produced branch {branch} but verification failed. Not applied.")
+        }
+        RepairOutcome::Skipped { reason } => reason.user_line(),
+    };
+    spawn::write_supervisor_log(runtime, &note);
+    Some(note)
+}
+
+fn report_user(class: &Class, dir: Option<&PathBuf>, repair_note: Option<&str>) {
     let id = dir
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
@@ -333,4 +363,7 @@ fn report_user(class: &Class, dir: Option<&PathBuf>) {
         "hi: internal harness error recorded as {id} ({}).",
         class.kind_slug()
     );
+    if let Some(note) = repair_note {
+        eprintln!("    {note}");
+    }
 }

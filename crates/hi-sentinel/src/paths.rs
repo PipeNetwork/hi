@@ -65,3 +65,16 @@ pub fn default_config_path() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     Some(base.join("hi").join("config.toml"))
 }
+
+pub fn cache_dir() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(".cache"))
+        .join("hi")
+}
+
+/// Detached autofix worktrees. Not inside the Hi checkout (that pollutes `git status`).
+pub fn worktrees_dir() -> PathBuf {
+    cache_dir().join("autofix-worktrees")
+}

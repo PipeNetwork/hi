@@ -2,8 +2,10 @@
 //!
 //! This crate is not the RSI candidate launcher (`hi-bootstrap` /
 //! `rsi-hi-worker`) and is not clap's "unlimited internal sentinel" cap
-//! (`parse_finite_u32_cap`). It only observes a child, classifies failures,
-//! and writes forensic bundles.
+//! (`parse_finite_u32_cap`). It observes a child, classifies failures, writes
+//! forensic bundles, and on a classified harness bug may run a locked-down
+//! repair agent in a detached worktree. It does not apply binaries or move
+//! `main`.
 
 mod args;
 mod budget;
@@ -11,12 +13,15 @@ mod checkout;
 mod classify;
 mod config;
 mod fsutil;
+mod gate;
 mod history;
 mod incident;
 mod monitor;
 mod paths;
+mod repair;
 mod spawn;
 mod supervise;
+mod worktree;
 
 pub use classify::{BugKind, Class, ClassifyContext, Confidence, ExternalKind, ReportKind};
 pub use config::{MonitorConfig, SupervisorConfig};
@@ -31,3 +36,7 @@ pub const ENV_CHECKOUT: &str = "HI_CHECKOUT";
 
 #[cfg(test)]
 mod fake_child_tests;
+#[cfg(test)]
+mod repair_tests;
+#[cfg(test)]
+mod test_fixture;
