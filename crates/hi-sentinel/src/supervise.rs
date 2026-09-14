@@ -608,7 +608,6 @@ async fn maybe_run_repair(
             relaunch: None,
         },
     };
-    };
     if let Some(note) = &report.note {
         spawn::write_supervisor_log(runtime, note);
     }
@@ -727,6 +726,7 @@ async fn run_manual_repair(
         inherit_stdio: true,
         extra_env: Vec::new(),
         once: true,
+        seed_turn_intent: None,
     };
     let runtime = paths::runtime_dir(&state_dir, "repair");
     fsutil::mkdir_0700(&runtime)?;
