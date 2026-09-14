@@ -626,3 +626,12 @@ async fn heartbeat_seq_advances_during_run_turn() {
     assert_eq!(beat.pid, std::process::id());
     assert!(beat.last_progress_unix_ms > 0);
 }
+
+#[test]
+fn doctor_sentinel_line_reports_generation() {
+    assert_eq!(
+        super::sentinel_doctor_line_from(true, 0),
+        "sentinel: on (generation 0)"
+    );
+    assert_eq!(super::sentinel_doctor_line_from(false, 9), "sentinel: off");
+}

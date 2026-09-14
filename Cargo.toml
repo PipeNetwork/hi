@@ -100,6 +100,7 @@ hi-provider-config = { version = "0.3.1", path = "crates/hi-provider-config" }
 hi-hooks = { version = "0.3.1", path = "crates/hi-hooks" }
 hi-crash-handler = { version = "0.3.1", path = "crates/hi-crash-handler" }
 hi-liveness = { version = "0.3.1", path = "crates/hi-liveness" }
+hi-sentinel = { version = "0.3.1", path = "crates/hi-sentinel" }
 hi-sqlite-journal = { version = "0.3.1", path = "crates/hi-sqlite-journal" }
 hi-dashboard-store = { version = "0.3.1", path = "crates/hi-dashboard-store" }
 hi-update = { version = "0.3.1", path = "crates/hi-update" }

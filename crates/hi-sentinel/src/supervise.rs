@@ -24,10 +24,12 @@ use crate::classify::{self, Class, ClassifyContext};
 use crate::config::{MonitorConfig, RepairConfig, SupervisorConfig, instance_token, peek_machine};
 use crate::fsutil;
 use crate::incident;
+use crate::ipc;
 use crate::monitor::{Monitor, MonitorSignal};
 use crate::paths;
 use crate::repair::{self, RepairOutcome};
 use crate::rollback::{self, RecordInput};
+use crate::slash;
 use crate::spawn;
 
 #[derive(Parser, Debug)]
@@ -42,7 +44,10 @@ struct SentinelCli {
     /// Git checkout of Hi used for repair worktrees.
     #[arg(long, value_name = "PATH")]
     checkout: Option<PathBuf>,
-    /// `hi` argv forwarded after `--`.
+    /// Manual repair of an existing incident bundle (`/autoharnessfix repair`).
+    #[arg(long, value_name = "PATH")]
+    incident: Option<PathBuf>,
+    /// `hi` argv forwarded after `--`. Leading `repair` selects incident mode.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     hi_argv: Vec<OsString>,
 }
@@ -79,7 +84,28 @@ pub fn run() -> Result<i32> {
 
 async fn run_async() -> Result<i32> {
     let cli = SentinelCli::parse();
-    let stripped = strip_sentinel_args(cli.hi_argv);
+    let mut hi_argv = cli.hi_argv;
+    let mut incident = cli.incident;
+    if hi_argv.first().is_some_and(|arg| arg == "repair") {
+        hi_argv.remove(0);
+        if incident.is_none() {
+            let mut iter = hi_argv.iter();
+            while let Some(arg) = iter.next() {
+                if arg == "--incident" {
+                    incident = iter.next().cloned().map(PathBuf::from);
+                    break;
+                }
+                if let Some(rest) = arg.to_str().and_then(|s| s.strip_prefix("--incident=")) {
+                    incident = Some(PathBuf::from(rest));
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(incident) = incident {
+        return run_manual_repair(incident, cli.checkout, cli.apply).await;
+    }
+    let stripped = strip_sentinel_args(hi_argv);
     let hi_binary = std::env::var_os(ENV_HI_BINARY)
         .map(PathBuf::from)
         .or_else(|| find_on_path("hi"))
@@ -189,6 +215,7 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
     let terminal = spawned.terminal;
     let mut monitor = Monitor::new(cfg.monitor.clone(), pid, instance);
     let mut report_written: Option<PathBuf> = None;
+    let mut repair_task: Option<tokio::task::JoinHandle<String>> = None;
 
     loop {
         tokio::select! {
@@ -226,7 +253,7 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                 }
                 let repair_note = match class.as_ref() {
                     Some(class) if class.is_harness_bug() => {
-                        maybe_run_repair(&cfg, class, incident_dir.as_deref(), &runtime).await
+                        maybe_run_repair(&cfg, class, incident_dir.as_deref(), &runtime, true).await
                     }
                     _ => None,
                 };
@@ -251,6 +278,72 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                 });
             }
             _ = tokio::time::sleep(cfg.monitor.poll_interval) => {
+                if ipc::take_request(&runtime, ipc::REQUEST_DIAGNOSE) {
+                    match incident::write_diagnose_bundle(
+                        &cfg,
+                        &runtime,
+                        monitor.last_heartbeat(),
+                    ) {
+                        Ok(bundle) => {
+                            let _ = ipc::write_done(
+                                &runtime,
+                                ipc::REQUEST_DIAGNOSE_DONE,
+                                &format!("{}\n", bundle.dir.display()),
+                            );
+                        }
+                        Err(err) => {
+                            spawn::write_supervisor_log(
+                                &runtime,
+                                &format!("diagnose bundle failed: {err:#}"),
+                            );
+                        }
+                    }
+                }
+                if repair_task.is_none() && ipc::take_request(&runtime, ipc::REQUEST_REPAIR) {
+                    let cfg_repair = cfg.clone();
+                    let runtime_repair = runtime.clone();
+                    let heartbeat = monitor.last_heartbeat().cloned();
+                    repair_task = Some(tokio::spawn(async move {
+                        let bundle = incident::write_diagnose_bundle(
+                            &cfg_repair,
+                            &runtime_repair,
+                            heartbeat.as_ref(),
+                        );
+                        let dir = bundle.ok().map(|b| b.dir);
+                        let class = slash::manual_class();
+                        maybe_run_repair(
+                            &cfg_repair,
+                            &class,
+                            dir.as_deref(),
+                            &runtime_repair,
+                            false,
+                        )
+                        .await
+                        .unwrap_or_else(|| "repair finished".into())
+                    }));
+                }
+                if let Some(handle) = repair_task.take() {
+                    if handle.is_finished() {
+                        match handle.await {
+                            Ok(note) => {
+                                let _ = ipc::write_done(
+                                    &runtime,
+                                    ipc::REQUEST_REPAIR_DONE,
+                                    &note,
+                                );
+                                spawn::write_supervisor_log(&runtime, &note);
+                            }
+                            Err(err) => {
+                                spawn::write_supervisor_log(
+                                    &runtime,
+                                    &format!("repair task failed: {err}"),
+                                );
+                            }
+                        }
+                    } else {
+                        repair_task = Some(handle);
+                    }
+                }
                 let Some(signal) = monitor.poll(&heartbeat_path) else {
                     continue;
                 };
@@ -286,7 +379,8 @@ pub async fn supervise(cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
                     );
                     let incident_dir = bundle.ok().map(|b| b.dir);
                     let repair_note =
-                        maybe_run_repair(&cfg, &class, incident_dir.as_deref(), &runtime).await;
+                        maybe_run_repair(&cfg, &class, incident_dir.as_deref(), &runtime, true)
+                            .await;
                     report_user(&class, incident_dir.as_ref(), repair_note.as_deref());
                     return Ok(SupervisorOutcome {
                         class: Some(class),
@@ -361,6 +455,7 @@ async fn maybe_run_repair(
     class: &Class,
     incident_dir: Option<&std::path::Path>,
     runtime: &std::path::Path,
+    allow_prompt: bool,
 ) -> Option<String> {
     let dir = incident_dir?;
     let id = dir
@@ -400,7 +495,9 @@ async fn maybe_run_repair(
             gate,
             worktree,
             ..
-        } if gate.passed => apply_verified(cfg, class, id, &branch, worktree, &repair_cfg),
+        } if gate.passed => {
+            apply_verified(cfg, class, id, &branch, worktree, &repair_cfg, allow_prompt)
+        }
         RepairOutcome::Completed { branch, .. } => {
             format!("Repair produced branch {branch} but verification failed. Not applied.")
         }
@@ -417,6 +514,7 @@ fn apply_verified(
     branch: &str,
     worktree: PathBuf,
     repair_cfg: &RepairConfig,
+    allow_prompt: bool,
 ) -> String {
     let validated = cfg
         .checkout
@@ -436,7 +534,7 @@ fn apply_verified(
         state_dir: cfg.state_dir.clone(),
         generation: cfg.generation,
         auto_apply: cfg.apply,
-        stdin_is_tty: std::io::stdin().is_terminal(),
+        stdin_is_tty: allow_prompt && std::io::stdin().is_terminal(),
         apply_answer: None,
         overwrite_answer: None,
         cargo: apply::cargo_bin(),
@@ -468,6 +566,47 @@ fn apply_verified(
             }
         }
     }
+}
+
+async fn run_manual_repair(
+    incident: PathBuf,
+    checkout: Option<PathBuf>,
+    apply: bool,
+) -> Result<i32> {
+    if !incident.is_dir() {
+        anyhow::bail!("incident dir not found: {}", incident.display());
+    }
+    let hi_binary = std::env::var_os(ENV_HI_BINARY)
+        .map(PathBuf::from)
+        .or_else(|| find_on_path("hi"))
+        .or_else(|| std::env::current_exe().ok())
+        .context("hi binary not found")?;
+    let checkout = checkout.or_else(|| peek_machine().and_then(|s| s.checkout));
+    let state_dir = paths::state_dir();
+    fsutil::mkdir_0700(&state_dir)?;
+    let cfg = SupervisorConfig {
+        child_program: hi_binary.clone(),
+        child_args: Vec::new(),
+        hi_binary,
+        original_argv: std::env::args().collect(),
+        checkout,
+        apply,
+        monitor: MonitorConfig::from_machine_and_env(),
+        state_dir: state_dir.clone(),
+        workspace: std::env::current_dir().context("cwd")?,
+        generation: 0,
+        inherit_stdio: true,
+        extra_env: Vec::new(),
+        once: true,
+    };
+    let runtime = paths::runtime_dir(&state_dir, "repair");
+    fsutil::mkdir_0700(&runtime)?;
+    let class = slash::manual_class();
+    let note = maybe_run_repair(&cfg, &class, Some(incident.as_path()), &runtime, true)
+        .await
+        .unwrap_or_else(|| "repair finished".into());
+    eprintln!("{note}");
+    Ok(0)
 }
 
 fn report_user(class: &Class, dir: Option<&PathBuf>, repair_note: Option<&str>) {

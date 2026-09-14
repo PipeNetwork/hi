@@ -23,6 +23,7 @@ hi-lsp.workspace = true
 hi-tui.workspace = true
 hi-crash-handler.workspace = true
 hi-liveness.workspace = true
+hi-sentinel.workspace = true
 hi-secrets.workspace = true
 hi-update.workspace = true
 hi-announcements.workspace = true

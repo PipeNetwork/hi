@@ -17,17 +17,26 @@ mod fsutil;
 mod gate;
 mod history;
 mod incident;
+mod ipc;
 mod monitor;
 mod paths;
 mod repair;
 mod rollback;
+mod slash;
 mod spawn;
 mod supervise;
 mod worktree;
 
 pub use classify::{BugKind, Class, ClassifyContext, Confidence, ExternalKind, ReportKind};
-pub use config::{MonitorConfig, SupervisorConfig};
+pub use config::{MonitorConfig, SupervisorConfig, set_machine_enabled};
+pub use slash::{
+    SlashOutcome, dispatch as dispatch_slash, exec_repair, exec_supervisor, restart_line,
+    status_text,
+};
 pub use supervise::{SupervisorOutcome, run, supervise};
+
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub const ENV_BINARY: &str = "HI_SENTINEL_BINARY";
 pub const ENV_SESSION_TOKEN: &str = "HI_SENTINEL_SESSION_TOKEN";

@@ -135,3 +135,46 @@ fn project_autoharnessfix_is_dropped_on_merge() {
         "project hi.toml must not enable Sentinel"
     );
 }
+
+#[test]
+fn autoharnessfix_on_writes_machine_config_not_project_toml() {
+    let _lock = crate::CWD_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let config_home = tmp.path().join("xdg-config");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let project_toml = proj.join("hi.toml");
+    std::fs::write(
+        &project_toml,
+        "[autoharnessfix]\nenabled = false\ncheckout = \"/tmp/evil\"\n",
+    )
+    .unwrap();
+    let previous_config = std::env::var_os("XDG_CONFIG_HOME");
+    let previous_cwd = std::env::current_dir().ok();
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+    }
+    std::env::set_current_dir(&proj).unwrap();
+    let path = hi_sentinel::set_machine_enabled(true).unwrap();
+    let machine = std::fs::read_to_string(&path).unwrap();
+    let project = std::fs::read_to_string(&project_toml).unwrap();
+    if let Some(cwd) = previous_cwd {
+        let _ = std::env::set_current_dir(cwd);
+    }
+    unsafe {
+        match previous_config {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+    assert!(
+        path.ends_with("hi/config.toml"),
+        "must write default_config_path(), got {}",
+        path.display()
+    );
+    assert!(machine.contains("enabled = true"));
+    assert_eq!(
+        project, "[autoharnessfix]\nenabled = false\ncheckout = \"/tmp/evil\"\n",
+        "project hi.toml must not be written"
+    );
+}

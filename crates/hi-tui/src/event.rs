@@ -435,8 +435,12 @@ impl Ui for ChannelUi {
 
 /// Restores the terminal on drop (covers early returns and panics).
 pub(crate) struct Restore;
-impl Drop for Restore {
-    fn drop(&mut self) {
+impl Restore {
+    pub(crate) fn restore_now(self) {
+        Self::restore_now_static();
+    }
+
+    pub(crate) fn restore_now_static() {
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
@@ -445,6 +449,11 @@ impl Drop for Restore {
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
+    }
+}
+impl Drop for Restore {
+    fn drop(&mut self) {
+        Self::restore_now_static();
     }
 }
 

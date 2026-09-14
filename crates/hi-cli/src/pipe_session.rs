@@ -15,6 +15,7 @@ use crate::config::{
     read_config_file, resolve_api_key_for_endpoint,
 };
 use crate::paths;
+use crate::session_files::resolve_session_path;
 
 const PIPE_LOGIN_HINT: &str = "run `hi login pipenetwork` to sign in and configure the API key, \
      `hi auth pipenetwork` to paste a key, or set PIPENETWORK_API_KEY";
@@ -102,6 +103,10 @@ pub async fn run(
                 })),
                 openai_api_key: optional_openai_key(file),
                 openai_base_url: optional_openai_base(file),
+                session_path: session_path.clone(),
+                no_save: cli.no_save,
+                sentinel_blocked: crate::sentinel_exec::rsi_off_limits(cli)
+                    .then_some("Sentinel cannot wrap RSI".into()),
             },
         )
         .await;
@@ -149,7 +154,7 @@ pub async fn run(
                 Command::Quit => break,
                 Command::Help(_) => {
                     println!(
-                        "/login /logout /auth /model /effort /permissions /undo /diff /retry /verify /compact /files /status /usage /dashboard /doctor /sessions /rewind /exit"
+                        "/login /logout /auth /model /effort /permissions /undo /diff /retry /verify /compact /files /status /usage /dashboard /doctor /autoharnessfix /sessions /rewind /exit"
                     );
                     continue;
                 }
@@ -278,6 +283,31 @@ pub async fn run(
                     println!("{}", harness.doctor_report().await);
                     continue;
                 }
+                Command::AutoHarnessFix(arg) => {
+                    let blocked = crate::sentinel_exec::rsi_off_limits(cli)
+                        .then_some("Sentinel cannot wrap RSI");
+                    match hi_sentinel::dispatch_slash(
+                        &arg,
+                        session_path.as_deref(),
+                        cli.no_save,
+                        blocked,
+                        harness.workspace_root(),
+                    ) {
+                        Ok(hi_sentinel::SlashOutcome::Message(text)) => println!("{text}"),
+                        Ok(hi_sentinel::SlashOutcome::ExecSupervisor { session_file }) => {
+                            println!("{}", hi_sentinel::restart_line());
+                            let err = hi_sentinel::exec_supervisor(&session_file);
+                            return Err(err.into());
+                        }
+                        Ok(hi_sentinel::SlashOutcome::ExecRepair { incident }) => {
+                            println!("{}", hi_sentinel::restart_line());
+                            let err = hi_sentinel::exec_repair(&incident);
+                            return Err(err.into());
+                        }
+                        Err(err) => eprintln!("{err:#}"),
+                    }
+                    continue;
+                }
                 Command::Version => {
                     println!("hi {}", hi_harness::Harness::version());
                     continue;
@@ -367,25 +397,6 @@ pub async fn run(
 
 fn apply_loaded(harness: &mut Harness, loaded: LoadedSession) {
     harness.apply_loaded_session(loaded);
-}
-
-fn resolve_session_path(cli: &Cli) -> Result<Option<PathBuf>> {
-    if let Some(path) = &cli.session_file {
-        return Ok(Some(path.clone()));
-    }
-    if cli.no_save {
-        return Ok(None);
-    }
-    if let Some(id) = &cli.resume {
-        return Ok(Some(paths::session_path(id)?));
-    }
-    if cli.cont {
-        if let Some(path) = paths::latest_session() {
-            return Ok(Some(path));
-        }
-        eprintln!("\x1b[33mno previous session; starting a new one\x1b[0m");
-    }
-    Ok(Some(paths::new_session_path()?))
 }
 
 /// Optional OpenAI profile from config. Absence is not an error: dashboard
@@ -940,33 +951,6 @@ mod tests {
         let settings = openai_settings_with(&config);
         let route = resolve_pipe_route(&cli, &config, &settings).unwrap();
         assert_eq!(route.api_key, "cli-key");
-    }
-
-    #[test]
-    fn session_path_prefers_explicit_file() {
-        let cli = Cli::try_parse_from(["hi", "--session-file", "/tmp/explicit.jsonl"]).unwrap();
-        let path = resolve_session_path(&cli).unwrap();
-        assert_eq!(
-            path.as_deref(),
-            Some(std::path::Path::new("/tmp/explicit.jsonl"))
-        );
-    }
-
-    #[test]
-    fn session_path_no_save_skips_persistence() {
-        let cli = Cli::try_parse_from(["hi", "--no-save"]).unwrap();
-        assert_eq!(resolve_session_path(&cli).unwrap(), None);
-    }
-
-    #[test]
-    fn session_path_resume_id_is_used() {
-        let cli = Cli::try_parse_from(["hi", "--resume", "abc-123"]).unwrap();
-        let path = resolve_session_path(&cli).unwrap().expect("path");
-        assert!(
-            path.ends_with("abc-123.jsonl"),
-            "unexpected resume path {}",
-            path.display()
-        );
     }
 
     #[test]

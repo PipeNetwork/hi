@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 hi-harness.workspace = true
+hi-sentinel.workspace = true
 hi-events.workspace = true
 hi-policy.workspace = true
 hi-ai.workspace = true

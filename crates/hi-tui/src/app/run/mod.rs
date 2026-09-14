@@ -1,5 +1,6 @@
 //! Interactive session loop backed by `hi-harness` (Pipe Network).
 
+mod idle;
 mod session;
 
 pub use session::{SessionOptions, run_session};

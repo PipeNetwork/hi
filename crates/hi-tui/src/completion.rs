@@ -260,6 +260,14 @@ fn arg_values(cmd: &str) -> &'static [(&'static str, &'static str)] {
             ("manage", "open Pipe Network billing"),
             ("context", "context-window breakdown"),
         ],
+        "autoharnessfix" => &[
+            ("status", "supervised? generation? last incident"),
+            ("on", "enable Sentinel and re-exec if the session is saved"),
+            ("off", "disable Sentinel in machine config"),
+            ("diagnose", "write a forensic snapshot"),
+            ("history", "last 20 incidents"),
+            ("repair", "manual harness repair (no crash required)"),
+        ],
         _ => &[],
     }
 }

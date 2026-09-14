@@ -230,6 +230,40 @@ pub fn is_pipe_model(id: &str) -> bool {
     !rest.is_empty() && !rest.chars().any(char::is_whitespace)
 }
 
+/// Read-modify-write `[autoharnessfix].enabled` on the machine file only.
+/// Never `./hi.toml` — a repo must not opt the machine into rewriting Hi.
+pub fn set_machine_enabled(enabled: bool) -> anyhow::Result<std::path::PathBuf> {
+    let path = paths::default_config_path()
+        .ok_or_else(|| anyhow::anyhow!("could not determine ~/.config/hi/config.toml"))?;
+    let mut table = if path.exists() {
+        std::fs::read_to_string(&path)?
+            .parse::<toml::Table>()
+            .unwrap_or_default()
+    } else {
+        toml::Table::new()
+    };
+    match table.get_mut("autoharnessfix") {
+        Some(toml::Value::Table(existing)) => {
+            existing.insert("enabled".into(), toml::Value::Boolean(enabled));
+        }
+        Some(_) => anyhow::bail!("[autoharnessfix] must be a table"),
+        None => {
+            let mut section = toml::Table::new();
+            section.insert("enabled".into(), toml::Value::Boolean(enabled));
+            table.insert("autoharnessfix".into(), toml::Value::Table(section));
+        }
+    }
+    let body = toml::to_string_pretty(&table)?;
+    if let Some(parent) = path.parent() {
+        crate::fsutil::mkdir_0700(parent)?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    crate::fsutil::write_0600(&tmp, body.as_bytes())?;
+    std::fs::rename(&tmp, &path)?;
+    crate::fsutil::chmod_0600(&path)?;
+    Ok(path)
+}
+
 pub fn instance_token() -> String {
     let pid = std::process::id() as u128;
     let ns = std::time::SystemTime::now()
@@ -288,5 +322,49 @@ mod tests {
         let models = resolve_repair_models(Some(&section)).unwrap();
         assert_eq!(models.diagnose, "pipe/glm-5.2-fast");
         assert_eq!(models.patch, "pipe/deepseek-v4-flash-0731");
+    }
+
+    #[test]
+    fn set_machine_enabled_does_not_touch_project_hi_toml() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_home = tmp.path().join("config");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let project_toml = proj.join("hi.toml");
+        std::fs::write(
+            &project_toml,
+            "[autoharnessfix]\nenabled = false\ncheckout = \"/tmp/evil\"\n",
+        )
+        .unwrap();
+        let previous_config = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_cwd = std::env::current_dir().ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+        std::env::set_current_dir(&proj).unwrap();
+        let path = set_machine_enabled(true).unwrap();
+        let machine = std::fs::read_to_string(&path).unwrap();
+        let project = std::fs::read_to_string(&project_toml).unwrap();
+        if let Some(cwd) = previous_cwd {
+            let _ = std::env::set_current_dir(cwd);
+        }
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert!(
+            path.ends_with("hi/config.toml"),
+            "must write default_config_path, got {}",
+            path.display()
+        );
+        assert!(machine.contains("enabled = true"));
+        assert!(
+            project.contains("enabled = false"),
+            "project hi.toml must stay untouched"
+        );
+        assert!(project.contains("/tmp/evil"));
     }
 }

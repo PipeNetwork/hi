@@ -328,12 +328,10 @@ impl DashboardOverlay {
             None => Some(n - 1),
             Some(i) => {
                 let v = i as i32 + dir;
-                if v < 0 {
-                    None
-                } else if v >= n as i32 {
-                    None
-                } else {
+                if (0..n as i32).contains(&v) {
                     Some(v as usize)
+                } else {
+                    None
                 }
             }
         };

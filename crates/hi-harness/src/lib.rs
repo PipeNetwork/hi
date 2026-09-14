@@ -565,7 +565,12 @@ impl Harness {
         } else {
             lines.push(format!("sandbox: off ({})", self.sandbox_backend_name()));
         }
+        lines.push(sentinel_doctor_line());
         lines.join("\n")
+    }
+
+    pub fn session_path(&self) -> Option<&Path> {
+        self.session.as_ref().map(|session| session.path())
     }
 
     pub fn cancel_turn(&self) {
@@ -621,6 +626,27 @@ impl Drop for Harness {
         if self.turn_open {
             hi_liveness::report_invariant(&self.liveness, hi_liveness::InvariantCode::TurnUnclosed);
         }
+    }
+}
+
+fn sentinel_doctor_line() -> String {
+    sentinel_doctor_line_from(
+        std::env::var(hi_liveness::ENV_SUPERVISED)
+            .ok()
+            .as_deref()
+            .is_some_and(hi_liveness::env_flag_on),
+        std::env::var(hi_liveness::ENV_GENERATION)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+    )
+}
+
+fn sentinel_doctor_line_from(supervised: bool, generation: u32) -> String {
+    if supervised {
+        format!("sentinel: on (generation {generation})")
+    } else {
+        "sentinel: off".into()
     }
 }
 

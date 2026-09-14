@@ -15,6 +15,7 @@ pub enum Command {
     Logout(String),
     Status,
     Doctor,
+    AutoHarnessFix(String),
     Permissions(String),
     Rewind(String),
     Verify(String),
@@ -177,7 +178,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "doctor",
         args: "",
-        help: "check key, Pipe /models, git, and sandbox",
+        help: "check key, Pipe /models, git, sandbox, and Sentinel",
+    },
+    CommandSpec {
+        name: "autoharnessfix",
+        args: "[on|off|status|diagnose|history|repair]",
+        help: "Hi Sentinel: wrap this session, inspect, or repair the harness",
     },
     CommandSpec {
         name: "version",
@@ -263,6 +269,7 @@ pub fn parse(line: &str) -> Option<Command> {
             arg
         }),
         "doctor" => Command::Doctor,
+        "autoharnessfix" => Command::AutoHarnessFix(arg),
         "permissions" | "permission" | "perms" => Command::Permissions(arg),
         "always-approve" | "alwaysapprove" | "yolo" => Command::Permissions(if arg.is_empty() {
             "toggle-always".into()
@@ -439,6 +446,19 @@ mod tests {
         assert_eq!(parse("/dashboard"), Some(Command::Dashboard));
         assert_eq!(parse("/fleet"), Some(Command::Dashboard));
         assert_eq!(parse("/agents-dashboard"), Some(Command::Dashboard));
+        assert_eq!(
+            parse("/autoharnessfix status"),
+            Some(Command::AutoHarnessFix("status".into()))
+        );
+        assert_eq!(
+            parse("/autoharnessfix"),
+            Some(Command::AutoHarnessFix(String::new()))
+        );
+        assert_eq!(
+            parse("/autoharnessfix on"),
+            Some(Command::AutoHarnessFix("on".into()))
+        );
+        assert!(COMMANDS.iter().any(|s| s.name == "autoharnessfix"));
         assert!(COMMANDS.iter().any(|s| s.name == "dashboard"));
         assert!(COMMANDS.iter().any(|s| s.name == "fleet"));
         assert!(CORE_COMMANDS.contains(&"dashboard"));

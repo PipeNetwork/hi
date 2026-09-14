@@ -43,14 +43,26 @@ pub struct SessionOptions {
     /// Configured OpenAI profile for dashboard `openai/…` rows.
     pub openai_api_key: Option<String>,
     pub openai_base_url: Option<String>,
+    /// Current session JSONL, if this run is saved.
+    pub session_path: Option<PathBuf>,
+    /// `--no-save`: persist Sentinel enablement but do not exec.
+    pub no_save: bool,
+    /// RSI/managed mode must not wrap this process.
+    pub sentinel_blocked: Option<String>,
 }
 
 pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Result<()> {
     if !io::stdin().is_terminal() {
         anyhow::bail!("TUI requires an interactive stdin");
     }
+    let termios = crate::autoharnessfix::snapshot_termios();
+    let ahf = crate::autoharnessfix::AutoharnessfixOpts {
+        session_path: options.session_path,
+        no_save: options.no_save,
+        sentinel_blocked: options.sentinel_blocked,
+    };
     enable_raw_mode().context("entering raw mode")?;
-    let _restore = Restore;
+    let mut restore = Some(Restore);
     execute!(io::stdout(), EnterAlternateScreen).context("entering alternate screen")?;
     let _ = execute!(io::stdout(), EnableBracketedPaste);
     let _ = execute!(io::stdout(), EnableFocusChange);
@@ -137,6 +149,9 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
                 harness,
                 &mut on_pipenetwork_login,
                 &line,
+                &ahf,
+                &mut restore,
+                termios.as_ref(),
             )
             .await?;
             continue;
@@ -148,7 +163,7 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
             }
             maybe = input_rx.recv() => {
                 let Some(event) = maybe else { break };
-                if let Some(line) = handle_idle_event(&mut app, harness, event, &mut on_pipenetwork_login).await? {
+                if let Some(line) = handle_idle_event(&mut app, harness, event, &mut on_pipenetwork_login, &ahf, &mut restore, termios.as_ref()).await? {
                     if line == "/quit" {
                         break;
                     }
@@ -160,6 +175,9 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
                         harness,
                         &mut on_pipenetwork_login,
                         &line,
+                        &ahf,
+                        &mut restore,
+                        termios.as_ref(),
                     )
                     .await?;
                 }
@@ -174,6 +192,9 @@ async fn handle_idle_event(
     harness: &mut Harness,
     event: Event,
     on_login: &mut Option<PipenetworkLoginHook>,
+    ahf: &crate::autoharnessfix::AutoharnessfixOpts,
+    restore: &mut Option<Restore>,
+    termios: Option<&libc::termios>,
 ) -> Result<Option<String>> {
     match event {
         Event::Resize(..) => Ok(None),
@@ -206,7 +227,7 @@ async fn handle_idle_event(
                 app.apply_action(crate::action::Action::ToggleReasoning);
                 return Ok(None);
             }
-            if handle_dashboard_event(app, harness, &key) {
+            if super::idle::handle_dashboard_event(app, harness, &key) {
                 return Ok(None);
             }
             if matches!(key.code, KeyCode::Char('c')) && ctrl {
@@ -235,7 +256,7 @@ async fn handle_idle_event(
                 }
                 return Ok(None);
             }
-            if handle_picker_key(app, harness, &key) {
+            if super::idle::handle_picker_key(app, harness, &key) {
                 return Ok(None);
             }
             if matches!(key.code, KeyCode::Char('m')) && ctrl && app.input.is_empty() {
@@ -253,7 +274,10 @@ async fn handle_idle_event(
                     return Ok(None);
                 }
                 if let Some(command) = parse_command(&line) {
-                    if let Some(prompt) = handle_command(app, harness, command, on_login).await? {
+                    if let Some(prompt) =
+                        handle_command(app, harness, command, on_login, ahf, restore, termios)
+                            .await?
+                    {
                         return Ok(Some(prompt));
                     }
                     return Ok(None);
@@ -271,14 +295,20 @@ async fn handle_command(
     harness: &mut Harness,
     command: Command,
     on_login: &mut Option<PipenetworkLoginHook>,
+    ahf: &crate::autoharnessfix::AutoharnessfixOpts,
+    restore: &mut Option<Restore>,
+    termios: Option<&libc::termios>,
 ) -> Result<Option<String>> {
     match command {
         Command::Quit => app.exit_requested = true,
         Command::Help(_) => {
             app.push(Line::styled(
-                "/login /auth /sessions /doctor /model /effort /permissions /undo /diff /retry /verify /compact /copy /usage /dashboard /status /exit  (type / for the menu)",
+                "/login /auth /sessions /doctor /autoharnessfix /model /effort /permissions /undo /diff /retry /verify /compact /copy /usage /dashboard /status /exit  (type / for the menu)",
                 dim(),
             ));
+        }
+        Command::AutoHarnessFix(arg) => {
+            return crate::autoharnessfix::handle(app, harness, &arg, ahf, restore, termios);
         }
         Command::Login(arg) => start_pipenetwork_login(app, harness, &arg, on_login).await?,
         Command::Logout(arg) => logout_pipenetwork(app, harness, &arg),
@@ -464,84 +494,6 @@ async fn handle_command(
     Ok(None)
 }
 
-fn handle_dashboard_event(app: &mut App, harness: &Harness, key: &KeyEvent) -> bool {
-    if crate::dashboard::is_open(app) {
-        let action = app.dashboard.as_mut().expect("dashboard").handle_key(key);
-        if action == crate::dashboard::DashAction::Close {
-            crate::dashboard::hide(app);
-            return true;
-        }
-        if let Some(overlay) = app.dashboard.as_mut() {
-            crate::dashboard::apply_action(overlay, action);
-        }
-        return true;
-    }
-    if crate::dashboard::is_dashboard_toggle(key) {
-        if let Err(err) = crate::dashboard::open_from_harness(app, harness) {
-            app.push(Line::styled(err, dim()));
-        }
-        return true;
-    }
-    false
-}
-
-fn handle_picker_key(
-    app: &mut App,
-    harness: &mut Harness,
-    key: &crossterm::event::KeyEvent,
-) -> bool {
-    if app.picker.is_none() {
-        return false;
-    }
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Esc => app.picker = None,
-        KeyCode::Enter => {
-            let id = app
-                .picker
-                .as_ref()
-                .and_then(|picker| picker.current().map(str::to_string));
-            app.picker = None;
-            if let Some(id) = id {
-                apply_model(app, &harness.live(), &id, None);
-                harness.set_model(app.model.clone());
-            }
-        }
-        KeyCode::Up => {
-            if let Some(picker) = app.picker.as_mut() {
-                picker.up();
-            }
-        }
-        KeyCode::Down => {
-            if let Some(picker) = app.picker.as_mut() {
-                picker.down();
-            }
-        }
-        KeyCode::PageUp => {
-            if let Some(picker) = app.picker.as_mut() {
-                picker.page_up();
-            }
-        }
-        KeyCode::PageDown => {
-            if let Some(picker) = app.picker.as_mut() {
-                picker.page_down();
-            }
-        }
-        KeyCode::Backspace => {
-            if let Some(picker) = app.picker.as_mut() {
-                picker.backspace();
-            }
-        }
-        KeyCode::Char(c) if !ctrl => {
-            if let Some(picker) = app.picker.as_mut() {
-                picker.insert(c);
-            }
-        }
-        _ => {}
-    }
-    true
-}
-
 async fn open_model_picker(app: &mut App, harness: &Harness) -> Result<()> {
     match harness.list_models().await {
         Ok(models) => {
@@ -601,7 +553,12 @@ fn set_effort_command(app: &mut App, live: &LiveSettings, arg: &str) {
     }
 }
 
-fn apply_model(app: &mut App, live: &LiveSettings, query: &str, effort: Option<EffortArg>) {
+pub(super) fn apply_model(
+    app: &mut App,
+    live: &LiveSettings,
+    query: &str,
+    effort: Option<EffortArg>,
+) {
     let id = resolve_model_query(query, &app.model_ids);
     live.set_model(id);
     app.model = live.model();
@@ -1255,6 +1212,7 @@ fn logout_pipenetwork(app: &mut App, harness: &mut Harness, arg: &str) {
     app.follow();
 }
 
+#[allow(clippy::too_many_arguments)] // slash handler needs the live Restore so exec can drop it
 async fn run_prompt(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input_rx: &mut mpsc::UnboundedReceiver<Event>,
@@ -1263,12 +1221,17 @@ async fn run_prompt(
     harness: &mut Harness,
     on_login: &mut Option<PipenetworkLoginHook>,
     prompt: &str,
+    ahf: &crate::autoharnessfix::AutoharnessfixOpts,
+    restore: &mut Option<Restore>,
+    termios: Option<&libc::termios>,
 ) -> Result<()> {
     run_turn(terminal, input_rx, ticker, app, harness, prompt).await?;
     while let Some(next) = app.queue.pop_front() {
         app.clamp_queue_selection();
         if let Some(command) = parse_command(&next) {
-            if let Some(prompt) = handle_command(app, harness, command, on_login).await? {
+            if let Some(prompt) =
+                handle_command(app, harness, command, on_login, ahf, restore, termios).await?
+            {
                 run_turn(terminal, input_rx, ticker, app, harness, &prompt).await?;
             }
         } else {

@@ -9,6 +9,7 @@ mod action;
 mod activity;
 mod activity_feed;
 mod app;
+mod autoharnessfix;
 #[doc(hidden)]
 pub mod benchmark;
 mod dispatch;

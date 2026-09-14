@@ -182,6 +182,135 @@ pub fn write_bundle(
     Ok(Bundle { dir })
 }
 
+/// Snapshot from inside a live `hi` (slash `/diagnose`) without a classified failure.
+pub fn write_diagnose_bundle(
+    cfg: &SupervisorConfig,
+    runtime: &Path,
+    heartbeat: Option<&Heartbeat>,
+) -> Result<Bundle> {
+    write_named_bundle(
+        cfg,
+        "diagnose",
+        "snapshot",
+        runtime,
+        heartbeat,
+        Duration::ZERO,
+    )
+}
+
+fn write_named_bundle(
+    cfg: &SupervisorConfig,
+    class: &str,
+    kind: &str,
+    runtime: &Path,
+    heartbeat: Option<&Heartbeat>,
+    duration: Duration,
+) -> Result<Bundle> {
+    let incidents = paths::incidents_dir(&cfg.state_dir);
+    fsutil::mkdir_0700(&incidents)?;
+    let id = allocate_id(&cfg.state_dir)?;
+    let dir = incidents.join(&id);
+    fsutil::mkdir_0700(&dir)?;
+
+    copy_redacted_if_exists(&runtime.join("events.jsonl"), &dir.join("events.jsonl"))?;
+    if let Some(hb) = heartbeat {
+        let json = serde_json::to_vec_pretty(hb).unwrap_or_default();
+        fsutil::write_0600(
+            &dir.join("heartbeat-last.json"),
+            redact_secrets(&String::from_utf8_lossy(&json)).as_bytes(),
+        )?;
+    } else {
+        copy_redacted_if_exists(
+            &runtime.join("heartbeat.json"),
+            &dir.join("heartbeat-last.json"),
+        )?;
+    }
+    copy_redacted_if_exists(
+        &runtime.join("turn-intent.json"),
+        &dir.join("turn-intent.json"),
+    )?;
+    copy_crash_dir(&runtime.join("crash"), &dir.join("crash"))?;
+    write_process_tree(&dir.join("process-tree.txt"), heartbeat)?;
+    write_environment(&dir.join("environment.txt"))?;
+    write_git_status(&dir.join("git-status-user.txt"), &cfg.workspace)?;
+    if let Some(session) = heartbeat
+        .and_then(|h| h.session_path.as_ref())
+        .map(Path::new)
+    {
+        copy_redacted_if_exists(session, &dir.join("transcript.jsonl"))?;
+    }
+    let checkout = cfg.checkout.as_ref().and_then(|path| {
+        crate::checkout::validate(path).ok().map(|v| CheckoutDoc {
+            path: v.path.display().to_string(),
+            head_sha: v.head_sha,
+            dirty: v.dirty,
+        })
+    });
+    let doc = IncidentDoc {
+        schema_version: 1,
+        id: id.clone(),
+        created_unix_ms: unix_ms(),
+        class: class.into(),
+        kind: kind.into(),
+        duration_ms: duration.as_millis() as u64,
+        generation: cfg.generation,
+        hi_version: env!("CARGO_PKG_VERSION").into(),
+        hi_binary: cfg.hi_binary.display().to_string(),
+        hi_binary_blake3: blake3_file(&cfg.hi_binary).unwrap_or_default(),
+        checkout,
+        user_workspace: cfg.workspace.display().to_string(),
+        session_path: heartbeat.and_then(|h| h.session_path.clone()),
+        last_state: heartbeat.map(|h| state_slug(h.state)),
+        last_tool: heartbeat.and_then(|h| h.last_tool.clone()),
+        pre_checkpoint: heartbeat.and_then(|h| h.pre_checkpoint.clone()),
+        original_argv: cfg.original_argv.clone(),
+        oneshot: false,
+        plain: false,
+        reproduction: "repro/reproduction.sh".into(),
+        redacted: true,
+    };
+    let json = serde_json::to_vec_pretty(&doc)?;
+    fsutil::write_0600(&dir.join("incident.json"), &json)?;
+    history::append_raw(&paths::history_path(&cfg.state_dir), &id, class, kind)?;
+    fsutil::chmod_0700(&dir)?;
+    Ok(Bundle { dir })
+}
+
+/// Best-effort bundle from an unsupervised child: crash dir + session + git status.
+pub fn write_local_snapshot(
+    workspace: &Path,
+    session_path: Option<&Path>,
+    crash_dir: Option<&Path>,
+) -> io::Result<PathBuf> {
+    let state = paths::state_dir();
+    fsutil::mkdir_0700(&state)?;
+    let incidents = paths::incidents_dir(&state);
+    fsutil::mkdir_0700(&incidents)?;
+    let id = allocate_id(&state)?;
+    let dir = incidents.join(&id);
+    fsutil::mkdir_0700(&dir)?;
+    write_git_status(&dir.join("git-status-user.txt"), workspace)?;
+    if let Some(session) = session_path {
+        copy_redacted_if_exists(session, &dir.join("transcript.jsonl"))?;
+    }
+    if let Some(crash) = crash_dir {
+        copy_crash_dir(crash, &dir.join("crash"))?;
+    }
+    let doc = serde_json::json!({
+        "schema_version": 1,
+        "id": id,
+        "class": "diagnose",
+        "kind": "snapshot",
+        "user_workspace": workspace.display().to_string(),
+        "session_path": session_path.map(|p| p.display().to_string()),
+        "redacted": true,
+    });
+    fsutil::write_0600(&dir.join("incident.json"), doc.to_string().as_bytes())?;
+    history::append_raw(&paths::history_path(&state), &id, "diagnose", "snapshot")?;
+    fsutil::chmod_0700(&dir)?;
+    Ok(dir)
+}
+
 fn allocate_id(state: &Path) -> io::Result<String> {
     fsutil::mkdir_0700(state)?;
     let path = paths::next_id_path(state);
