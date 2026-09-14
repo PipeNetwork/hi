@@ -1,10 +1,11 @@
 //! Relaunch argv after a verified apply: session file, no positional prompt.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use hi_liveness::{ENV_RESUME_INCOMPLETE, TurnIntent};
 
-use crate::args::relaunch_args;
+use crate::args::{relaunch_args, review_target_from_args};
 use crate::config::SupervisorConfig;
 use crate::paths;
 
@@ -16,6 +17,8 @@ pub struct RelaunchPlan {
     pub pre_checkpoint: Option<String>,
     pub turn_intent: Option<PathBuf>,
     pub sidecar_hi: PathBuf,
+    /// Child workspace after `--review-target` chdir. Never incident `user_workspace`.
+    pub workspace: Option<PathBuf>,
 }
 
 pub fn plan_from_incident(
@@ -23,9 +26,11 @@ pub fn plan_from_incident(
     sidecar_hi: PathBuf,
     id: &str,
     kind: &str,
+    child_args: &[OsString],
 ) -> RelaunchPlan {
     let intent = read_turn_intent(&incident_dir.join("turn-intent.json"));
     let incident = read_json_value(&incident_dir.join("incident.json"));
+    let heartbeat = read_json_value(&incident_dir.join("heartbeat-last.json"));
     let session_path = intent
         .as_ref()
         .and_then(|intent| intent.session_path.clone())
@@ -37,6 +42,17 @@ pub fn plan_from_incident(
         .and_then(|intent| intent.pre_checkpoint.clone())
         .or_else(|| string_field(incident.as_ref(), "pre_checkpoint"))
         .filter(|id| !id.is_empty());
+    let workspace = intent
+        .as_ref()
+        .map(|intent| intent.workspace.as_str())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            string_field(heartbeat.as_ref(), "workspace")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| review_target_from_args(child_args));
     let turn_intent = {
         let path = incident_dir.join("turn-intent.json");
         path.is_file().then_some(path)
@@ -48,7 +64,14 @@ pub fn plan_from_incident(
         pre_checkpoint,
         turn_intent,
         sidecar_hi,
+        workspace,
     }
+}
+
+pub fn restore_workspace(plan: &RelaunchPlan, fallback: &Path) -> PathBuf {
+    plan.workspace
+        .clone()
+        .unwrap_or_else(|| fallback.to_path_buf())
 }
 
 pub fn sidecar_or_current(cfg: &SupervisorConfig) -> PathBuf {
@@ -150,11 +173,17 @@ mod tests {
             plain: true,
         };
         fsutil::write_0600(&intent_path, &serde_json::to_vec(&intent).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join("incident.json"),
+            r#"{"user_workspace":"/wrong/home","session_path":null}"#,
+        )
+        .unwrap();
         let plan = plan_from_incident(
             dir.path(),
             PathBuf::from("/sidecar/hi"),
             "incident-1",
             "crash",
+            &[],
         );
         assert_eq!(
             plan.session_path.as_deref(),
@@ -162,6 +191,51 @@ mod tests {
         );
         assert_eq!(plan.pre_checkpoint.as_deref(), Some("internal:v1:abc"));
         assert_eq!(plan.turn_intent.as_deref(), Some(intent_path.as_path()));
+        assert_eq!(plan.workspace.as_deref(), Some(Path::new("/tmp/ws")));
+    }
+
+    #[test]
+    fn workspace_falls_back_to_review_target_not_incident_user_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("incident.json"),
+            r#"{"user_workspace":"/wrong/home"}"#,
+        )
+        .unwrap();
+        let plan = plan_from_incident(
+            dir.path(),
+            PathBuf::from("/sidecar/hi"),
+            "incident-1",
+            "crash",
+            &[OsString::from("--review-target"), OsString::from("/proj")],
+        );
+        assert_eq!(plan.workspace.as_deref(), Some(Path::new("/proj")));
+    }
+
+    #[test]
+    fn workspace_falls_back_to_heartbeat_not_incident_user_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("incident.json"),
+            r#"{"user_workspace":"/wrong/home"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("heartbeat-last.json"),
+            r#"{"workspace":"/from/heartbeat"}"#,
+        )
+        .unwrap();
+        let plan = plan_from_incident(
+            dir.path(),
+            PathBuf::from("/sidecar/hi"),
+            "incident-1",
+            "crash",
+            &[],
+        );
+        assert_eq!(
+            plan.workspace.as_deref(),
+            Some(Path::new("/from/heartbeat"))
+        );
     }
 
     #[test]
@@ -196,6 +270,7 @@ mod tests {
             pre_checkpoint: None,
             turn_intent: None,
             sidecar_hi: PathBuf::from("/sidecar/hi"),
+            workspace: Some(PathBuf::from("/tmp/ws")),
         };
         let next = next_generation(&cfg, &plan);
         assert_eq!(next.generation, 1);

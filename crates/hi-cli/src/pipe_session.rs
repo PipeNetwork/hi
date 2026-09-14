@@ -81,7 +81,7 @@ pub async fn run(
     let login_config_path = cli.config.clone();
     harness.set_turn_intent_mode(!use_tui && prompt.is_some(), cli.plain);
 
-    if resume.run_incomplete {
+    if resume.run_incomplete && !use_tui {
         let mut ui = StdoutUi {
             quiet: cli.quiet,
             confirm_edits: cli.confirm_edits,
@@ -97,10 +97,8 @@ pub async fn run(
             if let Some(error) = outcome.error {
                 bail!(error);
             }
-            if resume.exit_after_resume {
-                return Ok(());
-            }
-        } else if resume.exit_after_resume {
+        }
+        if resume.exit_after_resume {
             return Ok(());
         }
     }
@@ -114,6 +112,7 @@ pub async fn run(
                 model,
                 history_path: paths::history_path(),
                 startup_prompt: resume.startup_prompt,
+                resume_incomplete: resume.run_incomplete,
                 on_pipenetwork_login: Some(Box::new(move || {
                     write_login_profile(login_config_path.as_deref())
                 })),

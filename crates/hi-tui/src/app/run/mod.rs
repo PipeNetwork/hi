@@ -1,5 +1,6 @@
 //! Interactive session loop backed by `hi-harness` (Pipe Network).
 
+mod hydrate;
 mod idle;
 mod session;
 

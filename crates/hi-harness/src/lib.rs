@@ -336,6 +336,23 @@ impl Harness {
         self.pending_turn.as_ref()
     }
 
+    /// Fail closed unless the last message is the in-flight user line.
+    pub(crate) fn can_resume_incomplete(&self, expected_prompt: Option<&str>) -> bool {
+        if self.pending_turn.is_none() {
+            return false;
+        }
+        let Some(last) = self.messages.last() else {
+            return false;
+        };
+        if last.role != hi_ai::Role::User {
+            return false;
+        }
+        match expected_prompt {
+            Some(expected) => last.text() == expected,
+            None => true,
+        }
+    }
+
     pub fn set_turn_intent_mode(&mut self, oneshot: bool, plain: bool) {
         self.turn_oneshot = oneshot;
         self.turn_plain = plain;

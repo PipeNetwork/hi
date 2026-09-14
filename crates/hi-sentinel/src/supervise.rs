@@ -181,14 +181,15 @@ pub async fn supervise(mut cfg: SupervisorConfig) -> Result<SupervisorOutcome> {
         };
         spawn::prepare_interactive_prompt();
         eprintln!("{}", relaunch::continuing_line(&plan));
-        let _ = restore::maybe_restore_user_project(&RestoreRequest {
+        let restore = restore::maybe_restore_user_project(&RestoreRequest {
             hi_binary: cfg.hi_binary.clone(),
-            workspace: cfg.workspace.clone(),
+            workspace: relaunch::restore_workspace(&plan, &cfg.workspace),
             pre_checkpoint: plan.pre_checkpoint.clone(),
             stdin_is_tty: std::io::stdin().is_terminal(),
             answer: None,
             flag_present: None,
         });
+        restore::report_restore(&restore);
         cfg = relaunch::next_generation(&cfg, &plan);
     }
 }
@@ -657,6 +658,7 @@ fn apply_verified(
                 relaunch::sidecar_or_current(cfg),
                 id,
                 class.kind_slug(),
+                &cfg.child_args,
             );
             let mut out = relaunch::continuing_line(&plan);
             if !note.is_empty() {

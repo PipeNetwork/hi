@@ -36,6 +36,8 @@ pub struct SessionOptions {
     pub model: String,
     pub history_path: Option<PathBuf>,
     pub startup_prompt: Option<String>,
+    /// Retry an unmatched PendingTurn through the Ask overlay (not StdoutUi).
+    pub resume_incomplete: bool,
     /// After `/login pipenetwork`, persist `[profiles.pipenetwork]`.
     pub on_pipenetwork_login: Option<PipenetworkLoginHook>,
     /// Saved sessions for `/sessions`.
@@ -112,7 +114,7 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
             crate::tutorial::mark_offered();
         }
     } else {
-        hydrate_transcript(&mut app, harness.messages());
+        super::hydrate::hydrate_transcript(&mut app, harness.messages());
         app.push(Line::styled(
             format!(
                 "resumed {} message(s) · {} — /help for commands",
@@ -123,6 +125,7 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
         ));
     }
     let mut startup_prompt = options.startup_prompt;
+    let mut resume_incomplete = options.resume_incomplete;
 
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
     tokio::spawn(async move {
@@ -139,6 +142,20 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
         terminal.draw(|frame| app.render(frame))?;
         if app.exit_requested {
             break;
+        }
+        if resume_incomplete {
+            resume_incomplete = false;
+            run_turn(
+                &mut terminal,
+                &mut input_rx,
+                &mut ticker,
+                &mut app,
+                harness,
+                "",
+                true,
+            )
+            .await?;
+            continue;
         }
         if let Some(line) = startup_prompt.take() {
             run_prompt(
@@ -350,7 +367,7 @@ async fn handle_command(
             Ok(n) => match harness.rewind_to_user_turn(n) {
                 Ok(()) => {
                     app.transcript.clear();
-                    hydrate_transcript(app, harness.messages());
+                    super::hydrate::hydrate_transcript(app, harness.messages());
                     app.push(Line::styled(format!("rewound to user turn {n}"), dim()));
                 }
                 Err(err) => app.push(Line::styled(format!("{err:#}"), dim())),
@@ -433,7 +450,7 @@ async fn handle_command(
             {
                 Ok(true) => {
                     app.transcript.clear();
-                    hydrate_transcript(app, harness.messages());
+                    super::hydrate::hydrate_transcript(app, harness.messages());
                     app.push(Line::styled("compacted conversation", dim()));
                 }
                 Ok(false) => app.push(Line::styled("nothing to compact", dim())),
@@ -793,49 +810,6 @@ fn apply_theme_command(app: &mut App, arg: &str) {
         return;
     };
     app.push(Line::styled(format!("theme: {}", mode.label()), dim()));
-}
-
-fn hydrate_transcript(app: &mut App, messages: &[hi_ai::Message]) {
-    for message in messages {
-        match message.role {
-            hi_ai::Role::User => {
-                let text = message.text();
-                if !text.trim().is_empty() {
-                    app.push_user_prompt(Line::styled(
-                        format!("❯ {text}"),
-                        Style::default().fg(crate::theme::theme().accent_user),
-                    ));
-                }
-            }
-            hi_ai::Role::Assistant => {
-                let text = message.text();
-                if !text.trim().is_empty() {
-                    app.transcript
-                        .push(crate::TranscriptEntry::AssistantMessage { text });
-                }
-                for block in &message.content {
-                    if let hi_ai::Content::ToolCall {
-                        name, arguments, ..
-                    } = block
-                    {
-                        let preview: String = arguments.chars().take(80).collect();
-                        app.push(Line::styled(format!("→ {name} {preview}"), dim()));
-                    }
-                }
-            }
-            hi_ai::Role::Tool => {
-                for block in &message.content {
-                    if let hi_ai::Content::ToolResult { output, .. } = block {
-                        let preview: String = output.chars().take(120).collect();
-                        app.push(Line::styled(format!("← {preview}"), dim()));
-                    }
-                }
-            }
-            hi_ai::Role::System => {}
-        }
-    }
-    app.bump_transcript();
-    app.follow();
 }
 
 fn handle_running_key(
@@ -1225,17 +1199,17 @@ async fn run_prompt(
     restore: &mut Option<Restore>,
     termios: Option<&libc::termios>,
 ) -> Result<()> {
-    run_turn(terminal, input_rx, ticker, app, harness, prompt).await?;
+    run_turn(terminal, input_rx, ticker, app, harness, prompt, false).await?;
     while let Some(next) = app.queue.pop_front() {
         app.clamp_queue_selection();
         if let Some(command) = parse_command(&next) {
             if let Some(prompt) =
                 handle_command(app, harness, command, on_login, ahf, restore, termios).await?
             {
-                run_turn(terminal, input_rx, ticker, app, harness, &prompt).await?;
+                run_turn(terminal, input_rx, ticker, app, harness, &prompt, false).await?;
             }
         } else {
-            run_turn(terminal, input_rx, ticker, app, harness, &next).await?;
+            run_turn(terminal, input_rx, ticker, app, harness, &next, false).await?;
         }
     }
     Ok(())
@@ -1248,14 +1222,24 @@ async fn run_turn(
     app: &mut App,
     harness: &mut Harness,
     prompt: &str,
+    resume: bool,
 ) -> Result<()> {
-    app.push_user_prompt(Line::styled(
-        format!("❯ {prompt}"),
-        Style::default().fg(crate::theme::theme().accent_user),
-    ));
+    if resume {
+        app.last_prompt = harness
+            .messages()
+            .last()
+            .filter(|message| message.role == hi_ai::Role::User)
+            .map(|message| message.text());
+        app.last_turn_start = harness.messages().len();
+    } else {
+        app.push_user_prompt(Line::styled(
+            format!("❯ {prompt}"),
+            Style::default().fg(crate::theme::theme().accent_user),
+        ));
+        app.last_prompt = Some(prompt.to_string());
+        app.last_turn_start = harness.messages().len();
+    }
     app.set_working(true);
-    app.last_prompt = Some(prompt.to_string());
-    app.last_turn_start = harness.messages().len();
     let live = harness.live();
     let steer = harness.steer();
     app.interrupt = Some(harness.interrupt_handle());
@@ -1269,8 +1253,20 @@ async fn run_turn(
         approval_store: app.approval_store.clone(),
     };
     {
-        let mut fut =
-            std::pin::pin!(harness.run_turn_cancellable(prompt, &mut sink, cancel.clone()));
+        let turn = async {
+            if resume {
+                harness
+                    .resume_incomplete_turn(&mut sink, cancel.clone())
+                    .await
+                    .map(|_| ())
+            } else {
+                harness
+                    .run_turn_cancellable(prompt, &mut sink, cancel.clone())
+                    .await
+                    .map(|_| ())
+            }
+        };
+        let mut fut = std::pin::pin!(turn);
         let mut pending_confirm: Option<ConfirmationControl> = None;
         loop {
             terminal.draw(|frame| app.render(frame))?;

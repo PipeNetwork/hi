@@ -67,7 +67,7 @@ pub fn drop_positional_prompt(args: impl IntoIterator<Item = OsString>) -> Vec<O
             break;
         }
         if let Some(rest) = text.strip_prefix("--") {
-            let takes_value = !rest.contains('=') && !is_boolean_long(&text);
+            let takes_value = !rest.contains('=') && is_value_long(&text);
             out.push(arg);
             if !takes_value {
                 continue;
@@ -83,9 +83,9 @@ pub fn drop_positional_prompt(args: impl IntoIterator<Item = OsString>) -> Vec<O
             continue;
         }
         if text.starts_with('-') && text.len() == 2 && text != "-" {
-            let boolean = is_boolean_short(&text);
+            let takes_value = is_value_short(&text);
             out.push(arg);
-            if boolean {
+            if !takes_value {
                 continue;
             }
             if let Some(next) = iter.next() {
@@ -102,6 +102,7 @@ pub fn relaunch_args(
     session_path: Option<&std::path::Path>,
 ) -> Vec<OsString> {
     let mut args = drop_positional_prompt(child_args.iter().cloned());
+    args = strip_cwd_resume_flags(args);
     if let Some(path) = session_path
         && !has_flag(&args, "--session-file")
     {
@@ -109,6 +110,43 @@ pub fn relaunch_args(
         args.push(path.as_os_str().to_os_string());
     }
     args
+}
+
+/// `--continue` / `--resume` race cwd-latest; relaunch pins `--session-file`.
+fn strip_cwd_resume_flags(args: Vec<OsString>) -> Vec<OsString> {
+    let mut out = Vec::new();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let Some(text) = arg.to_str() else {
+            out.push(arg);
+            continue;
+        };
+        match text {
+            "--continue" | "-c" => continue,
+            "--resume" => {
+                let _ = iter.next();
+            }
+            flag if flag.starts_with("--resume=") => {}
+            _ => out.push(arg),
+        }
+    }
+    out
+}
+
+pub fn review_target_from_args(args: &[OsString]) -> Option<PathBuf> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let Some(text) = arg.to_str() else {
+            continue;
+        };
+        if text == "--review-target" {
+            return iter.next().map(PathBuf::from);
+        }
+        if let Some(value) = text.strip_prefix("--review-target=") {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
 }
 
 fn has_flag(args: &[OsString], name: &str) -> bool {
@@ -119,53 +157,63 @@ fn has_flag(args: &[OsString], name: &str) -> bool {
     })
 }
 
-fn is_boolean_long(flag: &str) -> bool {
+fn is_value_long(flag: &str) -> bool {
     matches!(
         flag,
-        "--plain"
-            | "--quiet"
-            | "--yes"
-            | "--continue"
-            | "--no-save"
-            | "--durable"
-            | "--pipefs"
-            | "--sync"
-            | "--confirm-edits"
-            | "--dry-run"
-            | "--worktree"
-            | "--no-verify"
-            | "--allow-unverified"
-            | "--keep-background"
-            | "--no-auto-compact"
-            | "--no-finalize"
-            | "--no-memory"
-            | "--skeptic-fail-open"
-            | "--allow-no-checkpoint"
-            | "--rsi"
-            | "--no-rsi"
-            | "--tasks"
-            | "--no-tasks"
-            | "--clippy"
-            | "--rsi-managed"
-            | "--benchmark-orchestration"
-            | "--trace-full"
-            | "--skeptic-review"
-            | "--show-config"
-            | "--list-sessions"
-            | "--loops-daemon"
-            | "--daemon"
-            | "--resume-local"
-            | "--subagent"
-            | "--autoharnessfix"
-            | "--no-autoharnessfix"
-            | "--autoharnessfix-apply"
-            | "--help"
-            | "--version"
+        "--profile"
+            | "--provider"
+            | "--model"
+            | "--base-url"
+            | "--mcp-url"
+            | "--api-key"
+            | "--fallback"
+            | "--max-tokens"
+            | "--temperature"
+            | "--top-p"
+            | "--output-token-parameter"
+            | "--thinking"
+            | "--reasoning-effort"
+            | "--tool-mode"
+            | "--compat"
+            | "--deepseek-compat"
+            | "--config"
+            | "--harness-setting"
+            | "--session-harness-setting"
+            | "--resume"
+            | "--sync-session-id"
+            | "--events-jsonl"
+            | "--tui-events-jsonl"
+            | "--session-file"
+            | "--goal"
+            | "--workflow"
+            | "--attach"
+            | "--input-token"
+            | "--review-target"
+            | "--compaction"
+            | "--verify"
+            | "--turn-deadline"
+            | "--max-verify-repairs"
+            | "--review"
+            | "--lsp"
+            | "--tool-set"
+            | "--max-steps"
+            | "--max-tool-calls"
+            | "--rsi-trace-dir"
+            | "--rsi-max-bytes"
+            | "--api-unix-socket"
+            | "--rsi-context-json"
+            | "--rsi-runtime-descriptor"
+            | "--best-of"
+            | "--judge"
+            | "--report"
+            | "--eval-input"
+            | "--eval-output"
+            | "--trace-capture"
     )
 }
 
-fn is_boolean_short(flag: &str) -> bool {
-    matches!(flag, "-q" | "-c" | "-h" | "-V" | "-y")
+fn is_value_short(flag: &str) -> bool {
+    matches!(flag, "-p" | "-m")
 }
 
 #[cfg(test)]
@@ -261,5 +309,34 @@ mod tests {
                 OsString::from("/tmp/proj"),
             ]
         );
+    }
+
+    #[test]
+    fn relaunch_strips_continue_and_resume() {
+        let relaunch = relaunch_args(
+            &[
+                OsString::from("--continue"),
+                OsString::from("--resume"),
+                OsString::from("old-id"),
+                OsString::from("--plain"),
+                OsString::from("fix the parser"),
+            ],
+            Some(std::path::Path::new("/s.jsonl")),
+        );
+        assert_eq!(
+            relaunch,
+            vec![
+                OsString::from("--plain"),
+                OsString::from("--session-file"),
+                OsString::from("/s.jsonl"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_long_flag_is_boolean_so_prompt_drops() {
+        let args =
+            drop_positional_prompt(["--foo", "fix the parser"].into_iter().map(OsString::from));
+        assert_eq!(args, vec![OsString::from("--foo")]);
     }
 }

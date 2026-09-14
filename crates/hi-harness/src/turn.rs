@@ -2,6 +2,7 @@
 
 use anyhow::{Result, bail};
 use hi_ai::{Content, Message, Usage};
+use hi_liveness::{ENV_TURN_INTENT, TurnIntent};
 use hi_tools::checkpoint;
 
 use crate::compact::{
@@ -40,15 +41,8 @@ impl Harness {
         ui: &mut dyn Ui,
         cancellation: TurnCancellation,
     ) -> Result<Option<TurnOutcome>> {
-        if self.pending_turn.is_none() {
-            return Ok(None);
-        }
-        if !self
-            .messages
-            .iter()
-            .rev()
-            .any(|message| message.role == hi_ai::Role::User)
-        {
+        let expected = turn_intent_prompt();
+        if !self.can_resume_incomplete(expected.as_deref()) {
             return Ok(None);
         }
         self.turn_cancel = Some(cancellation.clone());
@@ -467,6 +461,13 @@ impl Harness {
         self.liveness.set_state(hi_liveness::HarnessState::Idle);
         result
     }
+}
+
+fn turn_intent_prompt() -> Option<String> {
+    let path = std::env::var_os(ENV_TURN_INTENT)?;
+    let bytes = std::fs::read(path).ok()?;
+    let intent: TurnIntent = serde_json::from_slice(&bytes).ok()?;
+    Some(intent.prompt)
 }
 
 fn assistant_message(completion: &PipeCompletion) -> Message {

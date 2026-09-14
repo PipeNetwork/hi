@@ -56,6 +56,17 @@ pub fn maybe_restore_user_project(req: &RestoreRequest) -> RestoreOutcome {
     spawn_restore(&req.hi_binary, &req.workspace, id)
 }
 
+pub fn report_restore(outcome: &RestoreOutcome) {
+    match outcome {
+        RestoreOutcome::Restored { paths } => {
+            eprintln!("hi: restored {paths} path(s)");
+        }
+        RestoreOutcome::Skipped { reason } => {
+            eprintln!("hi: user-project restore skipped ({reason})");
+        }
+    }
+}
+
 fn spawn_restore(hi: &Path, workspace: &Path, id: &str) -> RestoreOutcome {
     let mut cmd = Command::new(hi);
     cmd.args([
@@ -213,6 +224,10 @@ mod tests {
         assert!(logged.contains("--sentinel-restore-checkpoint"), "{logged}");
         assert!(logged.contains("internal:v1:abc"), "{logged}");
         assert!(logged.contains("--review-target"), "{logged}");
+        assert!(
+            logged.contains(&ws.display().to_string()),
+            "restore must target the child workspace: {logged}"
+        );
     }
 
     #[test]

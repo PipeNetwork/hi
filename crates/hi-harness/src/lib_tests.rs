@@ -625,6 +625,42 @@ async fn resume_incomplete_turn_does_not_duplicate_user_line() {
     assert!(loaded.pending_turn.is_none());
 }
 
+#[test]
+fn resume_requires_last_message_to_be_the_pending_user_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+    config.state_root = dir.path().join(".hi");
+    let mut harness = Harness::new(config).unwrap();
+    harness.apply_loaded_session(LoadedSession {
+        messages: vec![Message::user("fix the parser")],
+        pending_turn: Some(crate::PendingTurn {
+            turn_index: 1,
+            started_unix_ms: 1,
+            pre_checkpoint: None,
+        }),
+        ..LoadedSession::default()
+    });
+    assert!(harness.can_resume_incomplete(None));
+    assert!(harness.can_resume_incomplete(Some("fix the parser")));
+    assert!(!harness.can_resume_incomplete(Some("other prompt")));
+    harness.apply_loaded_session(LoadedSession {
+        messages: vec![
+            Message::user("fix the parser"),
+            Message::assistant(vec![hi_ai::Content::Text("partial".into())]),
+        ],
+        pending_turn: Some(crate::PendingTurn {
+            turn_index: 1,
+            started_unix_ms: 1,
+            pre_checkpoint: None,
+        }),
+        ..LoadedSession::default()
+    });
+    assert!(
+        !harness.can_resume_incomplete(Some("fix the parser")),
+        "compact dropping the trailing user line must fail closed"
+    );
+}
+
 #[tokio::test]
 async fn resume_incomplete_turn_without_pending_is_none() {
     let dir = tempfile::tempdir().unwrap();
