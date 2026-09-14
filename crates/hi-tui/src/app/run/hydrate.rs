@@ -48,3 +48,39 @@ pub(super) fn hydrate_transcript(app: &mut App, messages: &[hi_ai::Message]) {
     app.bump_transcript();
     app.follow();
 }
+
+/// Index `/retry` truncates from. The in-flight user line is already in
+/// `messages`, unlike a normal turn which records the index before pushing.
+pub(super) fn resume_last_turn_start(messages: &[hi_ai::Message]) -> usize {
+    match messages.last() {
+        Some(message) if message.role == hi_ai::Role::User => messages.len().saturating_sub(1),
+        _ => messages.len(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hi_ai::Message;
+
+    #[test]
+    fn resume_last_turn_start_points_at_inflight_user_line() {
+        assert_eq!(
+            resume_last_turn_start(&[Message::user("fix the parser")]),
+            0
+        );
+        assert_eq!(
+            resume_last_turn_start(&[Message::user("old"), Message::user("fix the parser")]),
+            1
+        );
+        let empty: [Message; 0] = [];
+        assert_eq!(resume_last_turn_start(&empty), 0);
+        assert_eq!(
+            resume_last_turn_start(&[
+                Message::user("fix the parser"),
+                Message::assistant(vec![hi_ai::Content::Text("partial".into())]),
+            ]),
+            2
+        );
+    }
+}

@@ -1230,7 +1230,7 @@ async fn run_turn(
             .last()
             .filter(|message| message.role == hi_ai::Role::User)
             .map(|message| message.text());
-        app.last_turn_start = harness.messages().len();
+        app.last_turn_start = super::hydrate::resume_last_turn_start(harness.messages());
     } else {
         app.push_user_prompt(Line::styled(
             format!("❯ {prompt}"),

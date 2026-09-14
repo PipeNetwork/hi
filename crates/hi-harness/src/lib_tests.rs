@@ -625,6 +625,69 @@ async fn resume_incomplete_turn_does_not_duplicate_user_line() {
     assert!(loaded.pending_turn.is_none());
 }
 
+#[tokio::test]
+async fn retry_after_resume_does_not_duplicate_user_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.jsonl");
+    let mut session = JsonlSession::create(&session_path).unwrap();
+    session
+        .record_turn_start(
+            &Message::user("fix the parser"),
+            &crate::PendingTurn {
+                turn_index: 1,
+                started_unix_ms: 1,
+                pre_checkpoint: None,
+            },
+        )
+        .unwrap();
+    drop(session);
+
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![text_chunk("done"), usage_chunk(4, 2)]),
+        Scripted::Sse(vec![text_chunk("retried"), usage_chunk(5, 2)]),
+    ]) else {
+        return;
+    };
+    let state = dir.path().join(".hi");
+    let runner = ProcessRunner::new_with_policy(dir.path(), SandboxPolicy::Off).expect("runner");
+    let tools = ToolHost::new_with_runner(dir.path().to_path_buf(), state.clone(), runner).unwrap();
+    let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+    config.base_url = server.url.clone();
+    config.state_root = state;
+    config.session_path = Some(session_path.clone());
+    let mut harness = Harness::new_with_tools(config, tools).unwrap();
+    let loaded = JsonlSession::load(&session_path).unwrap();
+    harness.apply_loaded_session(loaded);
+    let last_turn_start = match harness.messages().last() {
+        Some(message) if message.role == hi_ai::Role::User => {
+            harness.messages().len().saturating_sub(1)
+        }
+        _ => harness.messages().len(),
+    };
+    let mut ui = TestUi::default();
+    harness
+        .resume_incomplete_turn(&mut ui, TurnCancellation::new())
+        .await
+        .unwrap()
+        .expect("pending turn should resume");
+    harness.truncate_messages(last_turn_start);
+    harness
+        .run_turn_cancellable("fix the parser", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    let loaded = JsonlSession::load(&session_path).unwrap();
+    let user_lines = loaded
+        .messages
+        .iter()
+        .filter(|message| message.role == hi_ai::Role::User)
+        .filter(|message| message.text() == "fix the parser")
+        .count();
+    assert_eq!(
+        user_lines, 1,
+        "/retry after resume must not keep then re-push the user line"
+    );
+}
+
 #[test]
 fn resume_requires_last_message_to_be_the_pending_user_line() {
     let dir = tempfile::tempdir().unwrap();
