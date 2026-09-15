@@ -53,6 +53,10 @@ pub enum InvariantCode {
     /// harness continues a bounded number of times, then reports this so
     /// Sentinel can auto-repair instead of leaving an idle, unfinished turn.
     EmptyAssistantAfterTools,
+    /// Model compact failed while occupancy was already over the window.
+    /// Identical-tool storms in that state are a symptom: the harness must
+    /// auto-repair rather than sit in ReportOnly forever.
+    CompactFailedOverWindow,
 }
 
 impl InvariantCode {
@@ -65,11 +69,14 @@ impl InvariantCode {
             Self::ConfirmUnanswered => "confirm_unanswered",
             Self::IdenticalToolStorm => "identical_tool_storm",
             Self::EmptyAssistantAfterTools => "empty_assistant_after_tools",
+            Self::CompactFailedOverWindow => "compact_failed_over_window",
         }
     }
 }
 
-/// Codes the supervisor may treat as a harness bug. `IdenticalToolStorm` is excluded.
+/// Codes the supervisor may treat as a harness bug. A plain
+/// `IdenticalToolStorm` (agent loop under a healthy window) is excluded;
+/// the same storm after compact has already failed is `CompactFailedOverWindow`.
 pub const AUTO_REPAIR_SET: &[InvariantCode] = &[
     InvariantCode::ToolUnclosed,
     InvariantCode::TurnUnclosed,
@@ -77,6 +84,7 @@ pub const AUTO_REPAIR_SET: &[InvariantCode] = &[
     InvariantCode::ChildLeak,
     InvariantCode::ConfirmUnanswered,
     InvariantCode::EmptyAssistantAfterTools,
+    InvariantCode::CompactFailedOverWindow,
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

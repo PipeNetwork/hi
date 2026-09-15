@@ -69,9 +69,10 @@ async fn write_tool_then_final_text() {
 #[tokio::test]
 async fn long_tool_loops_are_not_round_capped() {
     let dir = tempfile::tempdir().unwrap();
-    let args = serde_json::json!({"path": "."}).to_string();
     let mut scripts = Vec::new();
     for i in 0..70 {
+        // Vary arguments so this is a long loop, not an identical-tool storm.
+        let args = serde_json::json!({"path": format!("p{i}")}).to_string();
         scripts.push(Scripted::Sse(vec![
             tool_chunk(0, &format!("call_{i}"), "list", &args),
             usage_chunk(1, 1),
@@ -101,6 +102,43 @@ async fn long_tool_loops_are_not_round_capped() {
             >= 70,
         "expected 70 list rounds, got {:?}",
         ui.tool_calls.len()
+    );
+}
+
+#[tokio::test]
+async fn identical_tool_storm_stops_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = serde_json::json!({"path": "."}).to_string();
+    let mut scripts = Vec::new();
+    for i in 0..hi_liveness::IDENTICAL_TOOL_CONSECUTIVE {
+        scripts.push(Scripted::Sse(vec![
+            tool_chunk(0, &format!("call_s{i}"), "list", &args),
+            usage_chunk(1, 1),
+        ]));
+    }
+    scripts.push(Scripted::Sse(vec![
+        text_chunk("should not be requested"),
+        usage_chunk(1, 1),
+    ]));
+    let Some(server) = MockPipe::new(scripts) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable("loop list", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, TurnStopReason::Error);
+    assert!(
+        ui.errors.iter().any(|(kind, _)| kind == "tool_storm"),
+        "storm must surface a turn error, got {:?}",
+        ui.errors
+    );
+    assert_eq!(
+        harness.liveness().snapshot().invariant.map(|inv| inv.code),
+        Some(hi_liveness::InvariantCode::IdenticalToolStorm)
     );
 }
 

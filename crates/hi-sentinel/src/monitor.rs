@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use hi_liveness::{HarnessState, Heartbeat, unix_ms};
+use hi_liveness::{HarnessState, Heartbeat, InvariantCode, unix_ms};
 
 use crate::config::MonitorConfig;
 
@@ -45,6 +45,11 @@ pub struct Monitor {
     progress_signaled: bool,
     stale_since: Option<Instant>,
     live_pgid_cap_emitted: bool,
+    /// Set after the current sticky invariant has been emitted once, so a
+    /// ReportOnly agent_loop does not re-classify (and flood the supervisor
+    /// log) on every 250ms poll.
+    invariant_signaled: bool,
+    last_invariant: Option<InvariantCode>,
 }
 
 impl Monitor {
@@ -64,6 +69,8 @@ impl Monitor {
             progress_signaled: false,
             stale_since: None,
             live_pgid_cap_emitted: false,
+            invariant_signaled: false,
+            last_invariant: None,
         }
     }
 
@@ -81,11 +88,18 @@ impl Monitor {
             return None;
         }
         if let Some(hb) = &self.last_heartbeat
-            && hb.invariant.is_some()
+            && let Some(inv) = &hb.invariant
         {
-            return Some(MonitorSignal::Invariant {
-                heartbeat: hb.clone(),
-            });
+            if self.last_invariant != Some(inv.code) {
+                self.invariant_signaled = false;
+                self.last_invariant = Some(inv.code);
+            }
+            if !self.invariant_signaled {
+                self.invariant_signaled = true;
+                return Some(MonitorSignal::Invariant {
+                    heartbeat: hb.clone(),
+                });
+            }
         }
         if self.last_seq_change.elapsed() >= self.cfg.liveness_timeout {
             if process_stopped(self.child_pid) {

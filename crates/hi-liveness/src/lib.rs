@@ -102,6 +102,24 @@ mod tests {
     }
 
     #[test]
+    fn report_only_storm_upgrades_to_compact_failed() {
+        let publisher = Publisher::new();
+        publisher.set_invariant(InvariantCode::IdenticalToolStorm);
+        publisher.set_invariant(InvariantCode::CompactFailedOverWindow);
+        assert_eq!(
+            publisher.snapshot().invariant.unwrap().code,
+            InvariantCode::CompactFailedOverWindow,
+            "a report-only storm must upgrade so Sentinel can auto-repair"
+        );
+        publisher.set_invariant(InvariantCode::ChildLeak);
+        assert_eq!(
+            publisher.snapshot().invariant.unwrap().code,
+            InvariantCode::CompactFailedOverWindow,
+            "auto-repair codes stay sticky"
+        );
+    }
+
+    #[test]
     fn writer_seq_advances_and_binds_pid() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("heartbeat.json");

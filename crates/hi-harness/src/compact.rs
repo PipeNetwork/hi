@@ -81,6 +81,17 @@ fn extract_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     Some(&text[start..end])
 }
 
+/// Stub summary used when the compact model fails and occupancy is already
+/// over the window. Keeps the first and latest user lines so a successor
+/// (or this turn after rewrite) can continue without a 50M-token prompt.
+pub(crate) fn emergency_summary(occupancy_percent: u64) -> String {
+    format!(
+        "Local compact: conversation was at {occupancy_percent}% of the context \
+window and model compact failed. Earlier tool transcripts were dropped. \
+Continue from the latest user request."
+    )
+}
+
 pub(crate) fn apply_summary(messages: &[Message], summary: &str) -> Vec<Message> {
     let first_user = messages
         .iter()
@@ -175,6 +186,13 @@ mod tests {
         assert!(compacted[1].text().contains("<conversation_summary>"));
         assert!(compacted[1].text().contains("started building"));
         assert_eq!(compacted[2].text(), "build all of that");
+    }
+
+    #[test]
+    fn emergency_summary_mentions_occupancy() {
+        let text = emergency_summary(400);
+        assert!(text.contains("400%"));
+        assert!(text.contains("compact failed"));
     }
 
     #[test]

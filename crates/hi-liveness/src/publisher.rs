@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use crate::events::EventLog;
 use crate::schema::{
-    EventCode, HarnessState, Heartbeat, IDENTICAL_TOOL_CONSECUTIVE, IDENTICAL_TOOL_ERROR_REPEAT,
-    IDENTICAL_TOOL_IN_TURN, InvariantCode, InvariantViolation, LiveEvent, SCHEMA_VERSION, unix_ms,
+    AUTO_REPAIR_SET, EventCode, HarnessState, Heartbeat, IDENTICAL_TOOL_CONSECUTIVE,
+    IDENTICAL_TOOL_ERROR_REPEAT, IDENTICAL_TOOL_IN_TURN, InvariantCode, InvariantViolation,
+    LiveEvent, SCHEMA_VERSION, unix_ms,
 };
 
 /// Live child pgids sampled each heartbeat beat: `(child_pgids, current_tool_pgid)`.
@@ -400,8 +401,13 @@ fn touch_progress(g: &mut Inner) {
 }
 
 fn set_invariant(g: &mut Inner, code: InvariantCode) {
-    if g.invariant.is_some() {
-        return;
+    if let Some(existing) = &g.invariant {
+        // Sticky for auto-repair codes. A report-only storm may upgrade to a
+        // harness bug (compact failed over the window) so Sentinel actually
+        // repairs instead of logging ReportOnly forever.
+        if AUTO_REPAIR_SET.contains(&existing.code) || !AUTO_REPAIR_SET.contains(&code) {
+            return;
+        }
     }
     g.invariant = Some(InvariantViolation {
         code,

@@ -6,8 +6,8 @@ use hi_liveness::{ENV_TURN_INTENT, TurnIntent};
 use hi_tools::checkpoint;
 
 use crate::compact::{
-    AUTO_COMPACT_THRESHOLD_PERCENT, apply_summary, compact_prompt, estimate_message_tokens,
-    parse_summary,
+    AUTO_COMPACT_THRESHOLD_PERCENT, apply_summary, compact_prompt, emergency_summary,
+    estimate_message_tokens, parse_summary,
 };
 use crate::pipe::{PipeCompletion, PipeError, StreamDelta};
 use crate::prompt::SYSTEM_PROMPT;
@@ -143,8 +143,23 @@ impl Harness {
                     }
                     Ok(false) => {}
                     Err(err) => {
-                        self.compact_suppressed = true;
                         ui.status(&format!("compact failed: {err:#}"));
+                        if self.occupancy_percent() >= AUTO_COMPACT_THRESHOLD_PERCENT {
+                            hi_liveness::report_invariant(
+                                &self.liveness,
+                                hi_liveness::InvariantCode::CompactFailedOverWindow,
+                            );
+                            let summary = emergency_summary(self.occupancy_percent());
+                            self.messages = apply_summary(&self.messages, &summary);
+                            persisted_before = self.messages.len();
+                            self.last_context_occupancy = estimate_message_tokens(&self.messages);
+                            self.session_usage.context_occupancy = self.last_context_occupancy;
+                            self.persist_snapshot();
+                            ui.status("emergency compacted conversation");
+                            self.compact_suppressed = false;
+                        } else {
+                            self.compact_suppressed = true;
+                        }
                     }
                 }
                 if self.should_auto_compact() {
@@ -336,6 +351,35 @@ impl Harness {
                 if hi_tools::is_probe_refusal(&outcome.content) {
                     probe_refusals = probe_refusals.saturating_add(1);
                 }
+                if self.should_stop_for_storm() {
+                    const MSG: &str = "identical tool storm; stopping the turn";
+                    if self.occupancy_percent() >= AUTO_COMPACT_THRESHOLD_PERCENT
+                        || self.compact_suppressed
+                    {
+                        hi_liveness::report_invariant(
+                            &self.liveness,
+                            hi_liveness::InvariantCode::CompactFailedOverWindow,
+                        );
+                    }
+                    ui.turn_error(
+                        "tool_storm",
+                        MSG,
+                        "supervised sessions auto-repair when compact has failed; otherwise /retry",
+                    );
+                    self.session_usage.add(turn_usage);
+                    ui.session_usage(self.session_usage);
+                    self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
+                    self.close_persisted_turn(persisted_before, TurnStopReason::Error);
+                    ui.changed_files(changed.clone());
+                    ui.turn_end("identical tool storm");
+                    return Ok(TurnOutcome {
+                        stop_reason: TurnStopReason::Error,
+                        usage: turn_usage,
+                        changed_files: changed,
+                        error: Some(MSG.into()),
+                        verification: None,
+                    });
+                }
             }
             if probe_refusals >= hi_tools::STOP_AFTER_PROBE_REFUSALS {
                 self.session_usage.add(turn_usage);
@@ -442,6 +486,16 @@ impl Harness {
         !self.compact_suppressed
             && self.messages.len() >= 4
             && self.occupancy_percent() >= AUTO_COMPACT_THRESHOLD_PERCENT
+    }
+
+    fn should_stop_for_storm(&self) -> bool {
+        matches!(
+            self.liveness.snapshot().invariant.map(|inv| inv.code),
+            Some(
+                hi_liveness::InvariantCode::IdenticalToolStorm
+                    | hi_liveness::InvariantCode::CompactFailedOverWindow
+            )
+        )
     }
 
     pub(crate) fn request_messages(&self, continue_hint: Option<&str>) -> Vec<Message> {

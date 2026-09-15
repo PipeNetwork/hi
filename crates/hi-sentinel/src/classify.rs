@@ -484,4 +484,39 @@ mod tests {
             "sentinel must auto-repair this, not leave the live child idle"
         );
     }
+
+    #[test]
+    fn compact_failed_over_window_is_harness_bug() {
+        let mut hb = sample_beat(HarnessState::AwaitingModel, vec![], "/tmp/ws");
+        hb.invariant = Some(InvariantViolation {
+            code: InvariantCode::CompactFailedOverWindow,
+            ts_unix_ms: 1,
+            detail: None,
+        });
+        let class = classify(&MonitorSignal::Invariant { heartbeat: hb }, &ctx());
+        assert_eq!(
+            class,
+            Some(Class::HarnessBug {
+                kind: BugKind::Invariant,
+                confidence: Confidence::High
+            })
+        );
+    }
+
+    #[test]
+    fn plain_identical_tool_storm_is_still_report_only() {
+        let mut hb = sample_beat(HarnessState::ExecutingTool, vec![], "/tmp/ws");
+        hb.invariant = Some(InvariantViolation {
+            code: InvariantCode::IdenticalToolStorm,
+            ts_unix_ms: 1,
+            detail: None,
+        });
+        let class = classify(&MonitorSignal::Invariant { heartbeat: hb }, &ctx());
+        assert_eq!(
+            class,
+            Some(Class::ReportOnly {
+                kind: ReportKind::AgentLoop
+            })
+        );
+    }
 }
