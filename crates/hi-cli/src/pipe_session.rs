@@ -57,6 +57,7 @@ pub async fn run(
     config.reasoning_effort = settings.reasoning_effort;
     let session_path = resolve_session_path(cli)?;
     config.session_path = session_path.clone();
+    config.auto_compact = !cli.no_auto_compact;
     let mut harness = Harness::new(config)?;
     if let Some(path) = &session_path
         && path.is_file()
@@ -470,7 +471,7 @@ fn repl_status(harness: &Harness) -> String {
         "off"
     };
     format!(
-        "{} · {} · reasoning {} · ctx {}/{} · in {} / out {} · undo {} · sandbox {sandbox}",
+        "{} · {} · reasoning {} · ctx {}/{} ({}) · in {} / out {} · undo {} · sandbox {sandbox}",
         harness.model(),
         harness.permission_mode().describe(),
         harness
@@ -479,6 +480,7 @@ fn repl_status(harness: &Harness) -> String {
             .unwrap_or("off"),
         occupancy,
         harness.context_window(),
+        harness.context_window_source(),
         usage.input_tokens,
         usage.output_tokens,
         harness.checkpoint_count()

@@ -74,6 +74,7 @@ pub struct UsageSnapshot {
     pub user_turns: u64,
     pub checkpoints: usize,
     pub window: u64,
+    pub window_source: &'static str,
     pub occupancy: u64,
     pub usage: Usage,
     pub categories: Vec<UsageCategory>,
@@ -144,10 +145,11 @@ impl UsageSnapshot {
 
     fn context_text(&self) -> String {
         let mut lines = vec![format!(
-            "{} / {}  ({}%)",
+            "{} / {}  ({}%, {})",
             fmt_tokens(self.occupancy),
             fmt_tokens(self.window),
-            self.used_pct()
+            self.used_pct(),
+            self.window_source
         )];
         lines.push(occupancy_bar(self.used_pct(), 28));
         lines.push(String::new());
@@ -181,11 +183,12 @@ impl UsageSnapshot {
             format!("  {:<16} {}", "Reasoning", self.reasoning),
             format!("  {:<16} {}", "Turns", self.user_turns),
             format!(
-                "  {:<16} {} / {} ({}%)",
+                "  {:<16} {} / {} ({}%, {})",
                 "Context",
                 fmt_tokens(self.occupancy),
                 fmt_tokens(self.window),
-                self.used_pct()
+                self.used_pct(),
+                self.window_source
             ),
             format!("  {:<16} {}", "Sandbox", self.sandbox),
             format!("  {:<16} {}", "Workspace", self.workspace.display()),
@@ -237,6 +240,7 @@ impl Harness {
             user_turns,
             checkpoints: self.checkpoints.len(),
             window,
+            window_source: self.context_window_source(),
             occupancy,
             usage: self.session_usage,
             categories,

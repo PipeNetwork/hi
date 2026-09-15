@@ -12,6 +12,13 @@ use crate::prompt::SYSTEM_PROMPT;
 /// Grok's default `[session] auto_compact_threshold_percent`.
 pub(crate) const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 85;
 
+/// Stub older tool bodies once occupancy hits this percent of the window.
+/// Matches the handbook's "elide bulky tools" threshold.
+pub(crate) const CHEAP_SHRINK_THRESHOLD_PERCENT: u64 = 45;
+
+/// Newest tool-result bodies kept verbatim; older ones become stubs.
+pub(crate) const KEEP_LAST_TOOL_RESULTS: usize = 6;
+
 const COMPACT_PROMPT: &str = "\
 Your task is to produce a faithful, concise summary of the conversation so far \
 so that a successor assistant can continue the work seamlessly after the earlier \
@@ -121,6 +128,77 @@ out of context. The summary below covers the earlier portion of the conversation
     out
 }
 
+fn is_tool_stub(output: &str) -> bool {
+    output.ends_with(" · omitted")
+}
+
+fn tool_names(messages: &[Message]) -> std::collections::HashMap<String, String> {
+    let mut names = std::collections::HashMap::new();
+    for message in messages {
+        for block in &message.content {
+            if let Content::ToolCall { id, name, .. } = block {
+                names.insert(id.clone(), name.clone());
+            }
+        }
+    }
+    names
+}
+
+fn stub_tool_result(name: &str, output: &str) -> String {
+    format!("{name} · {} chars · omitted", output.len())
+}
+
+/// Deterministic history shrink: stub old tool bodies and drop stale thinking.
+/// Never drops a user line. Idempotent.
+pub(crate) fn cheap_shrink(messages: &[Message]) -> (Vec<Message>, bool) {
+    let names = tool_names(messages);
+    let mut result_slots = Vec::new();
+    for (mi, message) in messages.iter().enumerate() {
+        for (ci, block) in message.content.iter().enumerate() {
+            if matches!(block, Content::ToolResult { .. }) {
+                result_slots.push((mi, ci));
+            }
+        }
+    }
+    let keep_from = result_slots.len().saturating_sub(KEEP_LAST_TOOL_RESULTS);
+    let last_assistant = messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant);
+
+    let mut out = messages.to_vec();
+    let mut shrunk = false;
+    for (mi, message) in out.iter_mut().enumerate() {
+        if Some(mi) == last_assistant {
+            continue;
+        }
+        let before = message.content.len();
+        message
+            .content
+            .retain(|block| !matches!(block, Content::Thinking { .. }));
+        if message.content.len() != before {
+            shrunk = true;
+        }
+    }
+    for (n, &(mi, ci)) in result_slots.iter().enumerate() {
+        if n >= keep_from {
+            continue;
+        }
+        let Some(block) = out.get_mut(mi).and_then(|m| m.content.get_mut(ci)) else {
+            continue;
+        };
+        let Content::ToolResult { call_id, output } = block else {
+            continue;
+        };
+        if is_tool_stub(output) {
+            continue;
+        }
+        let name = names.get(call_id).map(String::as_str).unwrap_or("tool");
+        *output = stub_tool_result(name, output);
+        shrunk = true;
+    }
+    (out, shrunk)
+}
+
 pub(crate) fn estimate_message_tokens(messages: &[Message]) -> u64 {
     let mut chars = SYSTEM_PROMPT.len();
     for message in messages {
@@ -186,6 +264,75 @@ mod tests {
         assert!(compacted[1].text().contains("<conversation_summary>"));
         assert!(compacted[1].text().contains("started building"));
         assert_eq!(compacted[2].text(), "build all of that");
+    }
+
+    #[test]
+    fn cheap_shrink_stubs_old_tool_bodies_keeps_last_six() {
+        let mut messages = vec![Message::user("review this")];
+        for i in 0..8 {
+            let id = format!("c{i}");
+            messages.push(Message::assistant(vec![Content::ToolCall {
+                id: id.clone(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }]));
+            messages.push(Message::tool_result(&id, "x".repeat(100)));
+        }
+        messages.push(Message::user("keep going"));
+        let (shrunk, changed) = cheap_shrink(&messages);
+        assert!(changed);
+        let outputs: Vec<_> = shrunk
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|c| match c {
+                Content::ToolResult { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 8);
+        assert!(outputs[0].contains("omitted"), "{}", outputs[0]);
+        assert!(outputs[1].contains("omitted"));
+        assert_eq!(outputs[2], &"x".repeat(100));
+        assert_eq!(outputs[7], &"x".repeat(100));
+        assert_eq!(shrunk[0].text(), "review this");
+        assert_eq!(shrunk.last().unwrap().text(), "keep going");
+        let (_, again) = cheap_shrink(&shrunk);
+        assert!(!again, "second shrink must be idempotent");
+    }
+
+    #[test]
+    fn cheap_shrink_drops_stale_thinking() {
+        let messages = vec![
+            Message::user("go"),
+            Message::assistant(vec![
+                Content::Thinking {
+                    text: "old thought".into(),
+                    signature: None,
+                },
+                Content::Text("first".into()),
+            ]),
+            Message::assistant(vec![
+                Content::Thinking {
+                    text: "new thought".into(),
+                    signature: None,
+                },
+                Content::Text("second".into()),
+            ]),
+        ];
+        let (shrunk, changed) = cheap_shrink(&messages);
+        assert!(changed);
+        assert!(
+            shrunk[1]
+                .content
+                .iter()
+                .all(|c| !matches!(c, Content::Thinking { .. }))
+        );
+        assert!(
+            shrunk[2]
+                .content
+                .iter()
+                .any(|c| matches!(c, Content::Thinking { .. }))
+        );
     }
 
     #[test]
@@ -268,6 +415,123 @@ mod tests {
         assert!(harness.should_auto_compact());
     }
 
+    #[test]
+    fn occupancy_floor_from_estimate_triggers_cheap_shrink() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+        config.state_root = dir.path().join(".hi");
+        let mut harness = Harness::new(config).unwrap();
+        let mut messages = vec![Message::user("review")];
+        for i in 0..12 {
+            messages.push(Message::tool_result(format!("c{i}"), "y".repeat(20_000)));
+        }
+        messages.push(Message::user("again"));
+        harness.apply_loaded_session(LoadedSession {
+            messages,
+            ..LoadedSession::default()
+        });
+        assert!(
+            harness.should_cheap_shrink(),
+            "bulky tool bodies must count even with no Pipe occupancy yet"
+        );
+        let mut ui = TestUi::default();
+        assert!(harness.apply_cheap_shrink_if_needed(&mut ui));
+        assert!(ui.statuses.iter().any(|s| s.contains("shrunk")));
+        let omitted = harness
+            .messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(
+                |c| matches!(c, Content::ToolResult { output, .. } if output.contains("omitted")),
+            )
+            .count();
+        assert_eq!(omitted, 6, "12 results keep the last 6, stub the older 6");
+        assert!(
+            !harness.should_cheap_shrink(),
+            "after stubbing, estimate should drop below 45%"
+        );
+    }
+
+    #[test]
+    fn cheap_shrink_persists_and_keeps_pending_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let state = dir.path().join(".hi");
+        let runner =
+            ProcessRunner::new_with_policy(dir.path(), SandboxPolicy::Off).expect("runner");
+        let tools =
+            crate::ToolHost::new_with_runner(dir.path().to_path_buf(), state.clone(), runner)
+                .unwrap();
+        let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+        config.state_root = state;
+        config.session_path = Some(path.clone());
+        let mut harness = Harness::new_with_tools(config, tools).unwrap();
+        let mut messages = vec![Message::user("review this")];
+        for i in 0..8 {
+            messages.push(Message::tool_result(format!("c{i}"), "z".repeat(40_000)));
+        }
+        messages.push(Message::user("keep going"));
+        harness.apply_loaded_session(LoadedSession {
+            messages,
+            pending_turn: Some(PendingTurn {
+                turn_index: 4,
+                started_unix_ms: 99,
+                pre_checkpoint: Some("pre".into()),
+            }),
+            ..LoadedSession::default()
+        });
+        let mut ui = TestUi::default();
+        assert!(harness.apply_cheap_shrink_if_needed(&mut ui));
+        assert!(harness.pending_turn().is_some());
+        let loaded = JsonlSession::load(&path).unwrap();
+        assert!(loaded.pending_turn.is_some(), "pending_turn must survive");
+        let omitted = loaded
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(
+                |c| matches!(c, Content::ToolResult { output, .. } if output.contains("omitted")),
+            )
+            .count();
+        assert!(
+            omitted >= 2,
+            "session file must contain stubbed tool bodies"
+        );
+    }
+
+    #[tokio::test]
+    async fn cheap_shrink_runs_mid_turn_without_stopping() {
+        let Some(server) = MockPipe::new(vec![Scripted::Sse(vec![
+            text_chunk("still going"),
+            usage_chunk(20, 4),
+        ])]) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+        let mut messages = vec![Message::user("review")];
+        for i in 0..12 {
+            messages.push(Message::tool_result(format!("c{i}"), "y".repeat(20_000)));
+        }
+        messages.push(Message::user("again"));
+        harness.apply_loaded_session(LoadedSession {
+            messages,
+            ..LoadedSession::default()
+        });
+        let mut ui = TestUi::default();
+        let outcome = harness
+            .run_turn_cancellable("wrap up", &mut ui, TurnCancellation::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome.stop_reason, crate::TurnStopReason::Completed);
+        assert!(ui.texts.join("").contains("still going"));
+        assert!(
+            ui.statuses.iter().any(|s| s.contains("shrunk")),
+            "expected cheap shrink before the Pipe round, got {:?}",
+            ui.statuses
+        );
+    }
+
     #[tokio::test]
     async fn compact_replaces_history_with_model_summary() {
         let Some(server) = MockPipe::new(vec![Scripted::Sse(vec![
@@ -301,6 +565,141 @@ mod tests {
                 .messages()
                 .iter()
                 .all(|message| message.role != Role::Tool)
+        );
+    }
+
+    fn served(id: &str, window: Option<u32>) -> hi_ai::ServedModel {
+        hi_ai::ServedModel {
+            id: id.into(),
+            context_window: window,
+            max_output_tokens: None,
+            price: None,
+            provider_label: None,
+            status: None,
+            available: true,
+            availability_reason: None,
+            capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn context_window_defaults_to_128k() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+        config.state_root = dir.path().join(".hi");
+        let harness = Harness::new(config).unwrap();
+        assert_eq!(harness.context_window(), 128_000);
+        assert_eq!(harness.context_window_source(), "default");
+    }
+
+    #[test]
+    fn cached_provider_window_drives_occupancy_percent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+        config.state_root = dir.path().join(".hi");
+        let mut harness = Harness::new(config).unwrap();
+        harness.remember_model_windows(&[served(&harness.model(), Some(2_000_000))]);
+        assert_eq!(harness.context_window(), 2_000_000);
+        assert_eq!(harness.context_window_source(), "models");
+        harness.record_context_occupancy(Usage {
+            input_tokens: 120_000,
+            context_occupancy: 120_000,
+            ..Usage::default()
+        });
+        harness.apply_loaded_session(LoadedSession {
+            messages: vec![
+                Message::user("a"),
+                Message::tool_result("c1", "b"),
+                Message::assistant(vec![Content::Text("c".into())]),
+                Message::user("d"),
+            ],
+            ..LoadedSession::default()
+        });
+        harness.record_context_occupancy(Usage {
+            input_tokens: 120_000,
+            context_occupancy: 120_000,
+            ..Usage::default()
+        });
+        assert!(!harness.should_auto_compact(), "120k is 6% of a 2M window");
+    }
+
+    #[test]
+    fn unknown_model_keeps_previous_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+        config.state_root = dir.path().join(".hi");
+        let mut harness = Harness::new(config).unwrap();
+        let current = harness.model();
+        harness.remember_model_windows(&[served(&current, Some(2_000_000))]);
+        harness.set_model("pipe/unknown-model".into());
+        assert_eq!(
+            harness.context_window(),
+            2_000_000,
+            "missing metadata must not snap back to 128k"
+        );
+        assert_eq!(harness.context_window_source(), "default");
+        harness.set_model(current);
+        assert_eq!(harness.context_window(), 2_000_000);
+        assert_eq!(harness.context_window_source(), "models");
+    }
+
+    #[test]
+    fn no_auto_compact_skips_shrink_in_the_turn_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+        config.state_root = dir.path().join(".hi");
+        config.auto_compact = false;
+        let mut harness = Harness::new(config).unwrap();
+        let mut messages = vec![Message::user("review")];
+        for i in 0..12 {
+            messages.push(Message::tool_result(format!("c{i}"), "y".repeat(20_000)));
+        }
+        messages.push(Message::user("again"));
+        harness.apply_loaded_session(LoadedSession {
+            messages,
+            ..LoadedSession::default()
+        });
+        assert!(harness.should_cheap_shrink());
+        assert!(!harness.should_auto_compact());
+        assert!(!harness.auto_compact());
+    }
+
+    #[tokio::test]
+    async fn resume_incomplete_shrinks_before_pipe() {
+        let Some(server) = MockPipe::new(vec![Scripted::Sse(vec![
+            text_chunk("resumed"),
+            usage_chunk(20, 4),
+        ])]) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+        let mut messages = vec![Message::user("review")];
+        for i in 0..12 {
+            messages.push(Message::tool_result(format!("c{i}"), "y".repeat(20_000)));
+        }
+        messages.push(Message::user("keep going"));
+        harness.apply_loaded_session(LoadedSession {
+            messages,
+            pending_turn: Some(PendingTurn {
+                turn_index: 2,
+                started_unix_ms: 1,
+                pre_checkpoint: None,
+            }),
+            ..LoadedSession::default()
+        });
+        let mut ui = TestUi::default();
+        let outcome = harness
+            .resume_incomplete_turn(&mut ui, TurnCancellation::new())
+            .await
+            .unwrap()
+            .expect("pending turn");
+        assert_eq!(outcome.stop_reason, crate::TurnStopReason::Completed);
+        assert!(ui.texts.join("").contains("resumed"));
+        assert!(
+            ui.statuses.iter().any(|s| s.contains("shrunk")),
+            "resume must cheap-shrink before the first Pipe call, got {:?}",
+            ui.statuses
         );
     }
 

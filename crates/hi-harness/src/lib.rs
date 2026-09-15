@@ -15,6 +15,7 @@ mod turn;
 mod ui;
 mod usage;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -131,6 +132,9 @@ pub struct HarnessConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub session_path: Option<PathBuf>,
     pub liveness: Option<hi_liveness::Publisher>,
+    /// When false, the turn loop skips cheap shrink and model auto-compact.
+    /// `/compact` still runs.
+    pub auto_compact: bool,
 }
 
 impl HarnessConfig {
@@ -146,6 +150,7 @@ impl HarnessConfig {
             reasoning_effort: None,
             session_path: None,
             liveness: None,
+            auto_compact: true,
         }
     }
 }
@@ -163,6 +168,9 @@ pub struct Harness {
     checkpoints: Vec<String>,
     last_changed_files: Vec<String>,
     last_context_occupancy: u64,
+    context_window: u32,
+    model_windows: HashMap<String, u32>,
+    auto_compact: bool,
     compact_suppressed: bool,
     verify_command: Option<String>,
     session: Option<SessionFile>,
@@ -202,6 +210,9 @@ impl Harness {
             checkpoints: Vec::new(),
             last_changed_files: Vec::new(),
             last_context_occupancy: 0,
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            model_windows: HashMap::new(),
+            auto_compact: config.auto_compact,
             compact_suppressed: false,
             verify_command: None,
             session,
@@ -244,6 +255,9 @@ impl Harness {
             checkpoints: Vec::new(),
             last_changed_files: Vec::new(),
             last_context_occupancy: 0,
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            model_windows: HashMap::new(),
+            auto_compact: config.auto_compact,
             compact_suppressed: false,
             verify_command: None,
             session,
@@ -266,6 +280,7 @@ impl Harness {
         self.verify_command = loaded.verify_command;
         if let Some(model) = loaded.model {
             self.live.set_model(model);
+            self.apply_cached_window();
         }
         if let Some(permission) = loaded.permission {
             self.live
@@ -405,6 +420,7 @@ impl Harness {
             let _ = session.record_model(&model);
         }
         self.live.set_model(model);
+        self.apply_cached_window();
     }
 
     pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
@@ -434,6 +450,14 @@ impl Harness {
         self.persist_knobs();
     }
 
+    pub fn set_auto_compact(&mut self, enabled: bool) {
+        self.auto_compact = enabled;
+    }
+
+    pub fn auto_compact(&self) -> bool {
+        self.auto_compact
+    }
+
     pub fn steer(&self) -> SteerQueue {
         self.steer.clone()
     }
@@ -447,7 +471,36 @@ impl Harness {
     }
 
     pub fn context_window(&self) -> u32 {
-        DEFAULT_CONTEXT_WINDOW
+        self.model_windows
+            .get(&self.model())
+            .copied()
+            .unwrap_or(self.context_window)
+    }
+
+    pub fn context_window_source(&self) -> &'static str {
+        if self.model_windows.contains_key(&self.model()) {
+            "models"
+        } else {
+            "default"
+        }
+    }
+
+    /// Remember `/models` context windows. Unknown ids keep the previous window
+    /// so a missing metadata row cannot snap occupancy back to 128k and
+    /// spuriously auto-compact.
+    pub fn remember_model_windows(&mut self, models: &[ServedModel]) {
+        for model in models {
+            if let Some(window) = model.context_window.filter(|window| *window > 0) {
+                self.model_windows.insert(model.id.clone(), window);
+            }
+        }
+        self.apply_cached_window();
+    }
+
+    fn apply_cached_window(&mut self) {
+        if let Some(window) = self.model_windows.get(&self.model()).copied() {
+            self.context_window = window;
+        }
     }
 
     pub fn version() -> &'static str {
@@ -556,14 +609,11 @@ impl Harness {
     }
 
     pub(crate) fn current_occupancy(&self) -> u64 {
-        if self.last_context_occupancy > 0 {
-            self.last_context_occupancy
-        } else {
-            compact::estimate_message_tokens(&self.messages)
-        }
+        let estimated = compact::estimate_message_tokens(&self.messages);
+        self.last_context_occupancy.max(estimated)
     }
 
-    pub async fn doctor_report(&self) -> String {
+    pub async fn doctor_report(&mut self) -> String {
         let mut lines = vec![format!("hi {version}", version = Self::version())];
         let key = if self.client.has_api_key() {
             "ok"
@@ -572,11 +622,14 @@ impl Harness {
         };
         lines.push(format!("credential: {key}"));
         match self.client.list_models().await {
-            Ok(models) => lines.push(format!(
-                "pipe /models: ok ({} model{})",
-                models.len(),
-                if models.len() == 1 { "" } else { "s" }
-            )),
+            Ok(models) => {
+                self.remember_model_windows(&models);
+                lines.push(format!(
+                    "pipe /models: ok ({} model{})",
+                    models.len(),
+                    if models.len() == 1 { "" } else { "s" }
+                ));
+            }
             Err(err) => lines.push(format!("pipe /models: {err:#}")),
         }
         let git = std::process::Command::new("git")

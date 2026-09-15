@@ -46,6 +46,7 @@ pub(crate) fn snapshot_from_app(app: &App) -> UsageSnapshot {
             .count() as u64,
         checkpoints: 0,
         window,
+        window_source: "default",
         occupancy,
         usage: app.session_totals,
         categories: vec![
@@ -268,6 +269,7 @@ mod tests {
             user_turns: 2,
             checkpoints: 1,
             window: 128_000,
+            window_source: "default",
             occupancy: 4_000,
             usage: hi_ai::Usage {
                 input_tokens: 3_000,

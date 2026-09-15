@@ -6,8 +6,8 @@ use hi_liveness::{ENV_TURN_INTENT, TurnIntent};
 use hi_tools::checkpoint;
 
 use crate::compact::{
-    AUTO_COMPACT_THRESHOLD_PERCENT, apply_summary, compact_prompt, emergency_summary,
-    estimate_message_tokens, parse_summary,
+    AUTO_COMPACT_THRESHOLD_PERCENT, CHEAP_SHRINK_THRESHOLD_PERCENT, apply_summary, cheap_shrink,
+    compact_prompt, emergency_summary, estimate_message_tokens, parse_summary,
 };
 use crate::pipe::{PipeCompletion, PipeError, StreamDelta};
 use crate::prompt::SYSTEM_PROMPT;
@@ -135,35 +135,24 @@ impl Harness {
             for steered in self.steer.drain() {
                 self.messages.push(Message::user(steered));
             }
+            if self.auto_compact && self.apply_cheap_shrink_if_needed(ui) {
+                persisted_before = self.messages.len();
+            }
             if self.should_auto_compact() {
-                match self.compact(None, ui, cancel).await {
+                match self.reclaim_context(None, ui, cancel, false).await {
                     Ok(true) => {
                         persisted_before = self.messages.len();
-                        ui.status("compacted conversation");
                     }
                     Ok(false) => {}
                     Err(err) => {
                         ui.status(&format!("compact failed: {err:#}"));
-                        if self.occupancy_percent() >= AUTO_COMPACT_THRESHOLD_PERCENT {
-                            hi_liveness::report_invariant(
-                                &self.liveness,
-                                hi_liveness::InvariantCode::CompactFailedOverWindow,
-                            );
-                            let summary = emergency_summary(self.occupancy_percent());
-                            self.messages = apply_summary(&self.messages, &summary);
-                            persisted_before = self.messages.len();
-                            self.last_context_occupancy = estimate_message_tokens(&self.messages);
-                            self.session_usage.context_occupancy = self.last_context_occupancy;
-                            self.persist_snapshot();
-                            ui.status("emergency compacted conversation");
-                            self.compact_suppressed = false;
-                        } else {
-                            self.compact_suppressed = true;
-                        }
+                        self.compact_suppressed = true;
                     }
                 }
                 if self.should_auto_compact() {
                     self.compact_suppressed = true;
+                } else {
+                    self.compact_suppressed = false;
                 }
             }
             ui.status(&format!("pipe · {}", self.model()));
@@ -423,15 +412,31 @@ impl Harness {
         })
     }
 
-    /// Grok-style `/compact`: model summary, then original query + summary.
+    /// Grok-style `/compact`: cheap-shrink, then always a model summary.
+    /// Auto-reclaim uses [`Self::reclaim_context`] with `force_model = false`
+    /// so a successful shrink that drops occupancy below 85% skips Pipe.
     pub async fn compact(
         &mut self,
         user_context: Option<&str>,
         ui: &mut dyn Ui,
         cancel: &TurnCancellation,
     ) -> Result<bool> {
+        self.reclaim_context(user_context, ui, cancel, true).await
+    }
+
+    async fn reclaim_context(
+        &mut self,
+        user_context: Option<&str>,
+        ui: &mut dyn Ui,
+        cancel: &TurnCancellation,
+        force_model: bool,
+    ) -> Result<bool> {
         if self.messages.len() < 4 {
             return Ok(false);
+        }
+        let changed = self.apply_cheap_shrink_if_needed(ui);
+        if !force_model && self.occupancy_percent() < AUTO_COMPACT_THRESHOLD_PERCENT {
+            return Ok(changed);
         }
         ui.status("compacting conversation");
         let previous = self.liveness.state();
@@ -447,7 +452,7 @@ impl Harness {
         let mut on_delta = |_delta: StreamDelta| {
             liveness.note_progress();
         };
-        let completion = self
+        let streamed = self
             .client
             .stream(
                 &model,
@@ -462,19 +467,53 @@ impl Harness {
         self.liveness
             .emit(hi_liveness::EventCode::CompactEnd, None, None, None);
         self.liveness.set_state(previous);
-        let completion = completion?;
+        let completion = match streamed {
+            Ok(completion) => completion,
+            Err(err) => {
+                if self.emergency_compact_if_over_window(ui) {
+                    return Ok(true);
+                }
+                return Err(err);
+            }
+        };
         self.record_context_occupancy(completion.usage);
         if !completion.tool_calls.is_empty() {
+            if self.emergency_compact_if_over_window(ui) {
+                return Ok(true);
+            }
             bail!("compaction model called a tool; refusing to replace history");
         }
         let Some(summary) = parse_summary(&completion.text) else {
+            if self.emergency_compact_if_over_window(ui) {
+                return Ok(true);
+            }
             bail!("compaction model did not return a <summary> block");
         };
         self.messages = apply_summary(&self.messages, &summary);
         self.last_context_occupancy = estimate_message_tokens(&self.messages);
         self.session_usage.context_occupancy = self.last_context_occupancy;
         self.persist_snapshot();
+        ui.status("compacted conversation");
+        self.compact_suppressed = false;
         Ok(true)
+    }
+
+    fn emergency_compact_if_over_window(&mut self, ui: &mut dyn Ui) -> bool {
+        if self.occupancy_percent() < AUTO_COMPACT_THRESHOLD_PERCENT {
+            return false;
+        }
+        hi_liveness::report_invariant(
+            &self.liveness,
+            hi_liveness::InvariantCode::CompactFailedOverWindow,
+        );
+        let summary = emergency_summary(self.occupancy_percent());
+        self.messages = apply_summary(&self.messages, &summary);
+        self.last_context_occupancy = estimate_message_tokens(&self.messages);
+        self.session_usage.context_occupancy = self.last_context_occupancy;
+        self.persist_snapshot();
+        ui.status("emergency compacted conversation");
+        self.compact_suppressed = false;
+        true
     }
 
     pub(crate) fn occupancy_percent(&self) -> u64 {
@@ -483,9 +522,32 @@ impl Harness {
     }
 
     pub(crate) fn should_auto_compact(&self) -> bool {
-        !self.compact_suppressed
+        self.auto_compact
+            && !self.compact_suppressed
             && self.messages.len() >= 4
             && self.occupancy_percent() >= AUTO_COMPACT_THRESHOLD_PERCENT
+    }
+
+    pub(crate) fn should_cheap_shrink(&self) -> bool {
+        self.occupancy_percent() >= CHEAP_SHRINK_THRESHOLD_PERCENT
+    }
+
+    /// Stub old tool bodies when occupancy is high. Full rewrite of the session
+    /// file; caller must treat `messages.len()` as the new persist cursor.
+    pub(crate) fn apply_cheap_shrink_if_needed(&mut self, ui: &mut dyn Ui) -> bool {
+        if !self.should_cheap_shrink() {
+            return false;
+        }
+        let (next, shrunk) = cheap_shrink(&self.messages);
+        if !shrunk {
+            return false;
+        }
+        self.messages = next;
+        self.last_context_occupancy = estimate_message_tokens(&self.messages);
+        self.session_usage.context_occupancy = self.last_context_occupancy;
+        self.persist_snapshot();
+        ui.status("shrunk tool results");
+        true
     }
 
     fn should_stop_for_storm(&self) -> bool {
