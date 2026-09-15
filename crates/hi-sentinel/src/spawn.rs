@@ -54,6 +54,7 @@ impl TerminalGuard {
         if self.restored.replace(true) {
             return;
         }
+        restore_job_signals();
         if let (Some(fd), Some(orig)) = (self.tty_fd, self.orig.as_ref()) {
             unsafe {
                 // Drop leftover TUI keystrokes so they cannot answer a later [y/N].
@@ -253,10 +254,14 @@ pub async fn abort_harness_child(
     current_tool_pgid: Option<i32>,
     grace: Duration,
 ) -> Result<std::process::ExitStatus> {
+    // A job-stopped child (Ctrl-Z / SIGSTOP) will not observe SIGTERM until
+    // it is continued. Continue first so a user stop actually ends the session.
+    signal_group(pgid, libc::SIGCONT);
     signal_group(pgid, libc::SIGTERM);
     if let Some(tool) = current_tool_pgid
         && tool != pgid
     {
+        signal_group(tool, libc::SIGCONT);
         signal_group(tool, libc::SIGTERM);
     }
     tokio::select! {
@@ -296,6 +301,17 @@ fn ignore_job_signals() {
         libc::signal(libc::SIGTSTP, libc::SIG_IGN);
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+    }
+}
+
+/// Undo [`ignore_job_signals`]. Called when the TTY is given back to the
+/// supervisor so Ctrl-C after `hi` has stopped actually ends Sentinel.
+fn restore_job_signals() {
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+        libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+        libc::signal(libc::SIGTTIN, libc::SIG_DFL);
     }
 }
 

@@ -63,6 +63,11 @@ case "$MODE" in
   sigint)
     exec perl -e '$SIG{INT}="DEFAULT"; kill INT => $$; sleep 5'
     ;;
+  sigstop)
+    write_hb 1 1
+    kill -STOP $$
+    sleep 30
+    ;;
 esac
 "#;
 
@@ -303,6 +308,23 @@ async fn sigint_is_user_stop() {
             kind: ExternalKind::UserStop
         })
     );
+    assert!(!outcome.child_alive);
+}
+
+#[tokio::test]
+async fn stopped_child_exits_the_supervisor() {
+    let outcome = run("sigstop", "idle", "[]", liveness_monitor(), false).await;
+    assert_eq!(
+        outcome.class,
+        Some(Class::NotHarness {
+            kind: ExternalKind::UserStop
+        })
+    );
+    assert!(
+        !outcome.child_alive,
+        "a stopped hi must not leave Sentinel running"
+    );
+    assert!(outcome.relaunch.is_none());
 }
 
 #[tokio::test]

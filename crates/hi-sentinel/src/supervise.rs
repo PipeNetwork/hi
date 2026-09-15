@@ -20,7 +20,7 @@ use crate::ENV_SESSION_TOKEN;
 use crate::apply::{self, ApplyOutcome, ApplyRefuse, ApplyRequest};
 use crate::args::{find_on_path, strip_sentinel_args};
 use crate::budget;
-use crate::classify::{self, Class, ClassifyContext};
+use crate::classify::{self, Class, ClassifyContext, ExternalKind};
 use crate::config::{MonitorConfig, RepairConfig, SupervisorConfig, instance_token, peek_machine};
 use crate::fsutil;
 use crate::incident;
@@ -252,6 +252,8 @@ async fn run_generation(cfg: &SupervisorConfig) -> Result<SupervisorOutcome> {
     let mut monitor = Monitor::new(cfg.monitor.clone(), pid, instance);
     let mut report_written: Option<PathBuf> = None;
     let mut repair_task: Option<tokio::task::JoinHandle<String>> = None;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
 
     loop {
         tokio::select! {
@@ -315,6 +317,21 @@ async fn run_generation(cfg: &SupervisorConfig) -> Result<SupervisorOutcome> {
                     leftover: None,
                     relaunch: repair.relaunch,
                 });
+            }
+            _ = sigterm.recv() => {
+                spawn::write_supervisor_log(&runtime, "SIGTERM; stopping child and exiting");
+                return exit_user_stop(
+                    &mut child,
+                    pgid,
+                    monitor.last_heartbeat().and_then(|h| h.current_tool_pgid),
+                    cfg.monitor.term_grace,
+                    &terminal,
+                    pid,
+                    &mut repair_task,
+                    &runtime,
+                    "aborted in-flight slash repair (SIGTERM)",
+                )
+                .await;
             }
             _ = tokio::time::sleep(cfg.monitor.poll_interval) => {
                 if ipc::take_request(&runtime, ipc::REQUEST_DIAGNOSE) {
@@ -411,6 +428,27 @@ async fn run_generation(cfg: &SupervisorConfig) -> Result<SupervisorOutcome> {
                     &runtime,
                     &format!("classified {} {}", class.class_slug(), class.kind_slug()),
                 );
+                if matches!(
+                    class,
+                    Class::NotHarness {
+                        kind: ExternalKind::UserStop
+                    }
+                ) {
+                    // Ctrl-Z / SIGSTOP used to leave a stopped `hi` and a live
+                    // Sentinel that ignored Ctrl-C. A user stop ends both.
+                    return exit_user_stop(
+                        &mut child,
+                        pgid,
+                        monitor.last_heartbeat().and_then(|h| h.current_tool_pgid),
+                        cfg.monitor.term_grace,
+                        &terminal,
+                        pid,
+                        &mut repair_task,
+                        &runtime,
+                        "aborted in-flight slash repair (user stop)",
+                    )
+                    .await;
+                }
                 if class.is_harness_bug() {
                     abort_slash_repair(
                         &mut repair_task,
@@ -741,6 +779,35 @@ async fn run_manual_repair(
         .unwrap_or_else(|| "repair finished".into());
     eprintln!("{note}");
     Ok(0)
+}
+
+async fn exit_user_stop(
+    child: &mut Child,
+    pgid: i32,
+    current_tool_pgid: Option<i32>,
+    grace: Duration,
+    terminal: &spawn::TerminalGuard,
+    pid: u32,
+    repair_task: &mut Option<tokio::task::JoinHandle<String>>,
+    runtime: &std::path::Path,
+    why: &str,
+) -> Result<SupervisorOutcome> {
+    abort_slash_repair(repair_task, runtime, why).await;
+    spawn::write_supervisor_log(runtime, "user stopped hi; supervisor exiting");
+    let status = spawn::abort_harness_child(child, pgid, current_tool_pgid, grace).await?;
+    terminal.restore();
+    Ok(SupervisorOutcome {
+        class: Some(Class::NotHarness {
+            kind: ExternalKind::UserStop,
+        }),
+        child_status: Some(status),
+        child_pid: pid,
+        child_alive: false,
+        incident_dir: None,
+        exit_code: status_code(status),
+        leftover: None,
+        relaunch: None,
+    })
 }
 
 async fn abort_slash_repair(
