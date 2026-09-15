@@ -150,17 +150,39 @@ fn stub_tool_result(name: &str, output: &str) -> String {
 
 /// Deterministic history shrink: stub old tool bodies and drop stale thinking.
 /// Never drops a user line. Idempotent.
+///
+/// `preserve_current_turn`: when true (the 45% path), tool results after the
+/// latest user message stay verbatim so an in-progress review can still see
+/// the files it just read. When false (the 85% path, just before model
+/// compact), older current-turn results may be stubbed too, keeping the last
+/// [`KEEP_LAST_TOOL_RESULTS`].
+#[cfg(test)]
 pub(crate) fn cheap_shrink(messages: &[Message]) -> (Vec<Message>, bool) {
+    cheap_shrink_with(messages, true)
+}
+
+pub(crate) fn cheap_shrink_with(
+    messages: &[Message],
+    preserve_current_turn: bool,
+) -> (Vec<Message>, bool) {
     let names = tool_names(messages);
-    let mut result_slots = Vec::new();
+    let last_user = messages
+        .iter()
+        .rposition(|message| message.role == Role::User);
+    let mut eligible = Vec::new();
     for (mi, message) in messages.iter().enumerate() {
         for (ci, block) in message.content.iter().enumerate() {
-            if matches!(block, Content::ToolResult { .. }) {
-                result_slots.push((mi, ci));
+            if !matches!(block, Content::ToolResult { .. }) {
+                continue;
             }
+            let current_turn = last_user.is_some_and(|user| mi > user);
+            if preserve_current_turn && current_turn {
+                continue;
+            }
+            eligible.push((mi, ci));
         }
     }
-    let keep_from = result_slots.len().saturating_sub(KEEP_LAST_TOOL_RESULTS);
+    let keep_from = eligible.len().saturating_sub(KEEP_LAST_TOOL_RESULTS);
     let last_assistant = messages
         .iter()
         .rposition(|message| message.role == Role::Assistant);
@@ -179,7 +201,7 @@ pub(crate) fn cheap_shrink(messages: &[Message]) -> (Vec<Message>, bool) {
             shrunk = true;
         }
     }
-    for (n, &(mi, ci)) in result_slots.iter().enumerate() {
+    for (n, &(mi, ci)) in eligible.iter().enumerate() {
         if n >= keep_from {
             continue;
         }
@@ -298,6 +320,38 @@ mod tests {
         assert_eq!(shrunk.last().unwrap().text(), "keep going");
         let (_, again) = cheap_shrink(&shrunk);
         assert!(!again, "second shrink must be idempotent");
+    }
+
+    #[test]
+    fn cheap_shrink_does_not_stub_current_turn_reads() {
+        let mut messages = vec![Message::user("review this")];
+        for i in 0..8 {
+            let id = format!("c{i}");
+            messages.push(Message::assistant(vec![Content::ToolCall {
+                id: id.clone(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }]));
+            messages.push(Message::tool_result(&id, "x".repeat(100)));
+        }
+        let (shrunk, changed) = cheap_shrink(&messages);
+        assert!(
+            !changed
+                || shrunk.iter().flat_map(|m| m.content.iter()).all(|c| {
+                    !matches!(c, Content::ToolResult { output, .. } if output.contains("omitted"))
+                }),
+            "in-progress turn reads must stay verbatim so the model can see the files"
+        );
+        let (aggressive, aggro) = cheap_shrink_with(&messages, false);
+        assert!(aggro);
+        let omitted = aggressive
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(
+                |c| matches!(c, Content::ToolResult { output, .. } if output.contains("omitted")),
+            )
+            .count();
+        assert_eq!(omitted, 2, "aggressive shrink still keeps the last six");
     }
 
     #[test]

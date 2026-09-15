@@ -6,8 +6,8 @@ use hi_liveness::{ENV_TURN_INTENT, TurnIntent};
 use hi_tools::checkpoint;
 
 use crate::compact::{
-    AUTO_COMPACT_THRESHOLD_PERCENT, CHEAP_SHRINK_THRESHOLD_PERCENT, apply_summary, cheap_shrink,
-    compact_prompt, emergency_summary, estimate_message_tokens, parse_summary,
+    AUTO_COMPACT_THRESHOLD_PERCENT, CHEAP_SHRINK_THRESHOLD_PERCENT, apply_summary,
+    cheap_shrink_with, compact_prompt, emergency_summary, estimate_message_tokens, parse_summary,
 };
 use crate::pipe::{PipeCompletion, PipeError, StreamDelta};
 use crate::prompt::SYSTEM_PROMPT;
@@ -434,7 +434,10 @@ impl Harness {
         if self.messages.len() < 4 {
             return Ok(false);
         }
-        let changed = self.apply_cheap_shrink_if_needed(ui);
+        let mut changed = self.apply_cheap_shrink_if_needed(ui);
+        if self.occupancy_percent() >= AUTO_COMPACT_THRESHOLD_PERCENT {
+            changed |= self.apply_cheap_shrink(ui, false);
+        }
         if !force_model && self.occupancy_percent() < AUTO_COMPACT_THRESHOLD_PERCENT {
             return Ok(changed);
         }
@@ -535,10 +538,14 @@ impl Harness {
     /// Stub old tool bodies when occupancy is high. Full rewrite of the session
     /// file; caller must treat `messages.len()` as the new persist cursor.
     pub(crate) fn apply_cheap_shrink_if_needed(&mut self, ui: &mut dyn Ui) -> bool {
-        if !self.should_cheap_shrink() {
+        self.apply_cheap_shrink(ui, true)
+    }
+
+    fn apply_cheap_shrink(&mut self, ui: &mut dyn Ui, preserve_current_turn: bool) -> bool {
+        if preserve_current_turn && !self.should_cheap_shrink() {
             return false;
         }
-        let (next, shrunk) = cheap_shrink(&self.messages);
+        let (next, shrunk) = cheap_shrink_with(&self.messages, preserve_current_turn);
         if !shrunk {
             return false;
         }
