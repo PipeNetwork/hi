@@ -1,4 +1,3 @@
-
 use super::*;
 fn accepted_value() -> Value {
     json!({"id":"managed-id","choices":[{"index":0,"message":{"role":"assistant","content":"I will inspect the repository."},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":12},"pipe":{"status":"completed","verification":{"status":"passed","scope":"client_reported_execution_evidence"},"total_charge_usd":"0.001000","unresolved_micros":0}})
